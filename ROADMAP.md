@@ -59,10 +59,11 @@ playing audio level visualizer, resuming playback state). read
 - [x] app key-handling state machine (`src/app.rs`): vim-like nav
       (j/k, gg/G, `/` to edit the query live, enter, q/esc), fully
       unit-tested, decoupled from rendering.
-- [ ] app event loop in `main.rs`: replace the smoke-test body with a
-      real render loop driving `App` + `mpv::Mpv` + a rendered results
-      list + now-playing status line together. this is the actual
-      integration point everything else below plugs into.
+- [x] app event loop in `main.rs`: real render loop driving `App` +
+      `mpv::Mpv` + a custom results list + status bar. local
+      music/video items load into mpv on enter; remote items report
+      "not playable yet" since live navidrome search isn't merged into
+      the loop yet (needs a real server to test against).
 - [ ] play queue: add-to-queue / play-next / reorder, not just "play
       the one thing you hit enter on." baseline expected behavior in
       any serious player — see `docs/features.md`.
