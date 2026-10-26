@@ -72,10 +72,13 @@ playing audio level visualizer, resuming playback state). read
       "avoid immediate repeats" smart-shuffle is more meaningful once
       there's a "shuffle whole library into queue" feature — not
       applicable to today's small explicit queue the same way.
-- [ ] gapless playback + optional crossfade (toggle + duration, off by
-      default): preload the next queued track before the current one
-      ends rather than reactively loading on `end-file`. see
-      `docs/features.md`.
+- [x] gapless playback: queue (`a`) now appends to mpv's own native
+      playlist instead of us reactively reloading on `end-file`, so mpv
+      auto-advances internally with no ipc round-trip gap.
+- [ ] optional crossfade (toggle + duration, off by default) — separate
+      from gapless; mpv doesn't do this natively the way it handles
+      playlist auto-advance, needs its own mechanism (likely dual
+      mpv instances or a scripted volume ramp). see `docs/features.md`.
 - [x] 10-band eq (`src/eq.rs`) with presets (flat/bass boost/vocal
       boost/treble boost/rock/classical), `e` cycles. applied via
       chained lavfi `equalizer` filters on mpv's `af` property. preset
