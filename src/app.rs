@@ -10,6 +10,7 @@ pub enum Action {
     None,
     Quit,
     Play(SearchItem),
+    Queued(SearchItem),
 }
 
 pub struct App {
@@ -18,6 +19,12 @@ pub struct App {
     pub results: Vec<SearchItem>,
     pub selected: usize,
     pub editing_query: bool,
+    /// explicit play queue — deliberately *not* auto-populated from
+    /// search results on enter (unlike album-browsing players): in a
+    /// search-first ui the "next" search result usually isn't a related
+    /// track, so implicitly bulk-queuing them would be surprising. `a`
+    /// enqueues explicitly instead. See docs/features.md.
+    pub queue: Vec<SearchItem>,
     /// vim-style pending leader key, currently only used for `gg`.
     pending: Option<char>,
 }
@@ -30,7 +37,19 @@ impl App {
             results: Vec::new(),
             selected: 0,
             editing_query: false,
+            queue: Vec::new(),
             pending: None,
+        }
+    }
+
+    /// Pops and returns the next queued item, for the caller to actually
+    /// hand to mpv on end-of-file (auto-advance). `App` doesn't know
+    /// whether playback succeeds — that's main.rs's concern.
+    pub fn pop_queue(&mut self) -> Option<SearchItem> {
+        if self.queue.is_empty() {
+            None
+        } else {
+            Some(self.queue.remove(0))
         }
     }
 
@@ -85,6 +104,13 @@ impl App {
             KeyCode::Enter => {
                 if let Some(item) = self.results.get(self.selected) {
                     return Action::Play(item.clone());
+                }
+            }
+            KeyCode::Char('a') => {
+                if let Some(item) = self.results.get(self.selected) {
+                    let item = item.clone();
+                    self.queue.push(item.clone());
+                    return Action::Queued(item);
                 }
             }
             KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
@@ -190,5 +216,32 @@ mod tests {
     fn q_quits() {
         let mut app = app_with_three_results();
         assert!(matches!(app.handle_key(KeyCode::Char('q')), Action::Quit));
+    }
+
+    #[test]
+    fn a_enqueues_the_selected_item_without_playing_it() {
+        let mut app = app_with_three_results();
+        app.handle_key(KeyCode::Char('j')); // select track 1
+        match app.handle_key(KeyCode::Char('a')) {
+            Action::Queued(SearchItem::LocalMusic { title, .. }) => {
+                assert_eq!(title, "matchable track 1");
+            }
+            _ => panic!("expected Action::Queued"),
+        }
+        assert_eq!(app.queue.len(), 1);
+    }
+
+    #[test]
+    fn pop_queue_is_fifo_and_empties_cleanly() {
+        let mut app = app_with_three_results();
+        app.handle_key(KeyCode::Char('a')); // queues track 0
+        app.handle_key(KeyCode::Char('j'));
+        app.handle_key(KeyCode::Char('a')); // queues track 1
+
+        let first = app.pop_queue();
+        assert!(matches!(first, Some(SearchItem::LocalMusic { ref title, .. }) if title == "matchable track 0"));
+        let second = app.pop_queue();
+        assert!(matches!(second, Some(SearchItem::LocalMusic { ref title, .. }) if title == "matchable track 1"));
+        assert!(app.pop_queue().is_none());
     }
 }
