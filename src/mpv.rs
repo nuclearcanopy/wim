@@ -164,8 +164,28 @@ impl Mpv {
         Ok(())
     }
 
+    /// Replaces mpv's entire playlist and plays `path_or_url`
+    /// immediately — for "play this now" (enter), not queuing.
     pub fn load_file(&self, path_or_url: &str) -> Result<()> {
-        self.command(&[json!("loadfile"), json!(path_or_url)])?;
+        self.command(&[json!("loadfile"), json!(path_or_url), json!("replace")])?;
+        Ok(())
+    }
+
+    /// Appends to mpv's own playlist (playing immediately if nothing is
+    /// currently loaded, otherwise queued). mpv auto-advances through
+    /// its playlist natively on end-of-file, with none of the IPC
+    /// round-trip gap that reactively reloading on our end introduces —
+    /// this is what actually makes queue playback gapless.
+    pub fn playlist_append(&self, path_or_url: &str) -> Result<()> {
+        self.command(&[json!("loadfile"), json!(path_or_url), json!("append-play")])?;
+        Ok(())
+    }
+
+    /// Clears mpv's playlist except the currently-playing file (mpv's
+    /// own semantics for `playlist-clear`), so the upcoming queue can be
+    /// rebuilt (e.g. after a shuffle) without interrupting playback.
+    pub fn playlist_clear(&self) -> Result<()> {
+        self.command(&[json!("playlist-clear")])?;
         Ok(())
     }
 
