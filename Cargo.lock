@@ -2090,6 +2090,7 @@ dependencies = [
  "ratatui-image",
  "serde",
  "serde_json",
+ "strsim",
  "thiserror 2.0.21",
  "toml",
  "unicode-width 0.2.0",
