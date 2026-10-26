@@ -31,9 +31,7 @@ fn playable_path(item: &SearchItem) -> Option<String> {
     }
 }
 
-/// Attempts to load `item` into mpv, returning the status line to show
-/// either way. Shared by the manual enter-to-play path and queue
-/// auto-advance on end-of-file, so they can't drift out of sync.
+/// Replaces mpv's whole playlist and plays `item` immediately.
 fn try_play(player: &mpv::Mpv, item: &SearchItem) -> String {
     match playable_path(item) {
         Some(path) => match player.load_file(&path) {
@@ -42,6 +40,37 @@ fn try_play(player: &mpv::Mpv, item: &SearchItem) -> String {
         },
         None => "not playable yet — remote items aren't wired into playback this round".to_string(),
     }
+}
+
+/// Appends `item` to mpv's own playlist (plays immediately if nothing
+/// was already loaded, otherwise queues gaplessly — mpv auto-advances
+/// its own playlist on end-of-file with none of the round-trip gap that
+/// reactively reloading on our end would introduce).
+fn try_enqueue(player: &mpv::Mpv, item: &SearchItem) -> String {
+    match playable_path(item) {
+        Some(path) => match player.playlist_append(&path) {
+            Ok(()) => format!("queued: {}", label(item)),
+            Err(e) => format!("error queuing file: {e}"),
+        },
+        None => "not playable yet — remote items aren't wired into playback this round".to_string(),
+    }
+}
+
+/// Resyncs mpv's upcoming playlist to `items` (e.g. after a shuffle)
+/// without disturbing whatever's currently playing — mpv's own
+/// `playlist-clear` semantics already preserve the current file.
+fn resync_queue(player: &mpv::Mpv, items: &[SearchItem]) -> String {
+    if let Err(e) = player.playlist_clear() {
+        return format!("error resyncing queue: {e}");
+    }
+    for item in items {
+        if let Some(path) = playable_path(item) {
+            if let Err(e) = player.playlist_append(&path) {
+                return format!("error resyncing queue: {e}");
+            }
+        }
+    }
+    "shuffled".to_string()
 }
 
 fn main() -> anyhow::Result<()> {
@@ -82,10 +111,12 @@ fn main() -> anyhow::Result<()> {
             );
         })?;
 
-        // non-blocking: auto-advance the queue when the current track ends.
+        // non-blocking: mpv auto-advances its own playlist on
+        // end-of-file (gaplessly) — this just keeps our queue *view* in
+        // sync with what mpv already moved past, nothing to load here.
         if let Ok(mpv::Event::EndFile) = player.events().try_recv() {
             status = match app.pop_queue() {
-                Some(next) => try_play(&player, &next),
+                Some(next) => format!("now playing: {}", label(&next)),
                 None => "queue empty — idle".to_string(),
             };
         }
@@ -95,7 +126,8 @@ fn main() -> anyhow::Result<()> {
                 match app.handle_key(key.code) {
                     Action::Quit => break,
                     Action::Play(item) => status = try_play(&player, &item),
-                    Action::Queued(item) => status = format!("queued: {}", label(&item)),
+                    Action::Queued(item) => status = try_enqueue(&player, &item),
+                    Action::QueueReordered(items) => status = resync_queue(&player, &items),
                     Action::SetLoop(on) => {
                         status = match player.set_loop_file(if on { "inf" } else { "no" }) {
                             Ok(()) => format!("loop: {}", if on { "on" } else { "off" }),

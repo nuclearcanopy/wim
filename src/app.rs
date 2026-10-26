@@ -17,6 +17,10 @@ pub enum Action {
     Quit,
     Play(SearchItem),
     Queued(SearchItem),
+    /// Queue order changed (currently only from shuffle) — caller
+    /// should resync mpv's own playlist to match this new order,
+    /// without disturbing whatever's currently playing.
+    QueueReordered(Vec<SearchItem>),
     SetLoop(bool),
     SetSpeed(f64),
     SetEq(&'static str, [f64; 10]),
@@ -146,6 +150,9 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(item) = self.results.get(self.selected) {
+                    // playing something fresh replaces mpv's whole
+                    // playlist, so our own queue view should match.
+                    self.queue.clear();
                     return Action::Play(item.clone());
                 }
             }
@@ -160,7 +167,10 @@ impl App {
                 self.loop_file = !self.loop_file;
                 return Action::SetLoop(self.loop_file);
             }
-            KeyCode::Char('s') => self.toggle_shuffle(),
+            KeyCode::Char('s') => {
+                self.toggle_shuffle();
+                return Action::QueueReordered(self.queue.clone());
+            }
             KeyCode::Char(']') => {
                 self.speed = (self.speed + SPEED_STEP).min(MAX_SPEED);
                 return Action::SetSpeed(self.speed);
@@ -271,6 +281,21 @@ mod tests {
             }
             _ => panic!("expected Action::Play"),
         }
+    }
+
+    #[test]
+    fn enter_clears_the_queue_since_mpvs_whole_playlist_gets_replaced() {
+        let mut app = app_with_three_results();
+        app.handle_key(KeyCode::Char('a'));
+        app.handle_key(KeyCode::Char('j'));
+        app.handle_key(KeyCode::Char('a'));
+        assert_eq!(app.queue.len(), 2);
+
+        app.handle_key(KeyCode::Enter);
+        assert!(
+            app.queue.is_empty(),
+            "a fresh enter-to-play replaces mpv's whole playlist, so our queue view must match"
+        );
     }
 
     #[test]
