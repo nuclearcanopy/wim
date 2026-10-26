@@ -97,9 +97,12 @@ playing audio level visualizer, resuming playback state). read
 - [ ] transcoding: let navidrome/subsonic transcode server-side per its
       own configured profile by default (stream request params); only
       add client-side bitrate/format override if asked.
-- [ ] lyrics: auto-fetch on now-playing. default to lrclib.net (free, no
-      api key) unless told otherwise — log the choice in a commit so
-      it's easy to swap later.
+- [x] lyrics (`src/lyrics.rs`): lrclib.net (free, no api key), `L` to
+      view/close, j/k to scroll. known gap: blocking fetch on the
+      render thread (visible hitch during lookup), and SearchItem
+      doesn't carry duration so local lookups always use the fuzzy
+      /search endpoint rather than the exact /get one — both noted
+      inline, not blocking, fine to revisit.
 - [ ] album art (`ratatui-image`): wire the `album_art` config mode
       (auto/blocks/sixel/kitty/iterm2/off). `blocks` must desaturate to
       grayscale to match the monochrome ui; other modes show true color
