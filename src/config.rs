@@ -33,21 +33,16 @@ impl NavidromeConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AlbumArtMode {
+    #[default]
     Auto,
     Blocks,
     Sixel,
     Kitty,
     Iterm2,
     Off,
-}
-
-impl Default for AlbumArtMode {
-    fn default() -> Self {
-        AlbumArtMode::Auto
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
