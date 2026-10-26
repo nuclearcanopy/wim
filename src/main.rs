@@ -81,6 +81,9 @@ fn main() -> anyhow::Result<()> {
     corpus.add_local_tracks(tracks);
 
     let player = mpv::Mpv::spawn()?;
+    // per-track normalization is the sensible default; mpv reads the
+    // gain from each file's own embedded tags as it plays.
+    player.set_replaygain("track")?;
     let mut app = app::App::new(corpus);
     let mut status = format!(
         "{} local items indexed — / search, j/k move, gg/G jump, enter play, a queue, q quit",
