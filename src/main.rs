@@ -1,5 +1,6 @@
 mod config;
 mod mpv;
+mod subsonic;
 mod term;
 mod theme;
 mod ui;
