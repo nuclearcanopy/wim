@@ -109,27 +109,66 @@ impl Corpus {
     /// Ranked matches for `query` across the whole corpus, best first.
     /// Returns owned items (the corpus is small; cloning keeps the caller
     /// free of borrowing it across an event loop).
+    ///
+    /// Two signals are combined: nucleo's subsequence fuzzy score (fast,
+    /// handles substrings/skips/case well), and a per-word edit-distance
+    /// fallback (catches genuine typos like transpositions, e.g. "lesna"
+    /// matching "Selena", where the letters aren't even in subsequence
+    /// order so nucleo alone would miss it). An item counts as a match if
+    /// *either* signal fires, so a typo never silently returns nothing.
     pub fn search(&self, query: &str) -> Vec<SearchItem> {
         if query.trim().is_empty() {
             return Vec::new();
         }
         let mut matcher = Matcher::default();
         let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+        let query_lower = query.to_lowercase();
+        let typo_budget = edit_distance_budget(query_lower.chars().count());
 
         let mut scored: Vec<(u32, &SearchItem)> = self
             .items
             .iter()
             .filter_map(|item| {
                 let haystack = item.haystack();
+
                 let mut buf = Vec::new();
                 let utf32 = Utf32Str::new(&haystack, &mut buf);
-                pattern.score(utf32, &mut matcher).map(|score| (score, item))
+                let fuzzy_score = pattern.score(utf32, &mut matcher);
+
+                let typo_score = haystack
+                    .split_whitespace()
+                    .map(|word| strsim::damerau_levenshtein(&query_lower, &word.to_lowercase()))
+                    .filter(|&dist| dist <= typo_budget)
+                    .map(|dist| typo_score(dist))
+                    .max();
+
+                match (fuzzy_score, typo_score) {
+                    (None, None) => None,
+                    (a, b) => Some((a.unwrap_or(0).max(b.unwrap_or(0)), item)),
+                }
             })
             .collect();
 
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         scored.into_iter().map(|(_, item)| item.clone()).collect()
     }
+}
+
+/// How many edits (insert/delete/substitute/adjacent-transpose) we'll
+/// tolerate for a query of this length, scaled generously since missing a
+/// result entirely is worse than a slightly loose match: roughly half the
+/// query length, rounded up, minimum 1.
+fn edit_distance_budget(query_len: usize) -> usize {
+    query_len.div_ceil(2).max(1)
+}
+
+/// Converts an edit distance into a score comparable to nucleo's fuzzy
+/// scores. Deliberately scored below what a real subsequence match gets
+/// for reasonable-length input, so clean matches still rank above
+/// typo-recovered ones when both exist; closer typos still outrank
+/// farther ones among themselves.
+fn typo_score(distance: usize) -> u32 {
+    100u32.saturating_sub(distance as u32 * 15)
 }
 
 #[cfg(test)]
@@ -183,5 +222,32 @@ mod tests {
         let c = corpus();
         assert!(c.search("").is_empty());
         assert!(c.search("   ").is_empty());
+    }
+
+    #[test]
+    fn typos_still_find_the_artist() {
+        let mut c = Corpus::new();
+        c.add_subsonic_search_result(SubsonicSearchResult {
+            artists: vec![Artist { id: "a1".into(), name: "Branimir".into() }],
+            albums: vec![],
+            songs: vec![],
+        });
+
+        // "brnimir": valid letter subsequence of "branimir" (drop the
+        // 'a'), so nucleo's own fuzzy matcher already catches this one.
+        let dropped_letter = c.search("brnimir");
+        assert!(
+            dropped_letter.iter().any(|i| matches!(i, SearchItem::Artist { name, .. } if name == "Branimir")),
+            "subsequence-fuzzy typo should match"
+        );
+
+        // "brainmir": NOT a valid subsequence of "branimir" (the 'n' here
+        // comes after 'i', but in "branimir" the only 'n' is before every
+        // 'i'), so this only matches via the edit-distance fallback.
+        let transposed = c.search("brainmir");
+        assert!(
+            transposed.iter().any(|i| matches!(i, SearchItem::Artist { name, .. } if name == "Branimir")),
+            "transposition typo should still match via edit-distance fallback"
+        );
     }
 }
