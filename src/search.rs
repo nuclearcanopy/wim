@@ -139,7 +139,7 @@ impl Corpus {
                     .split_whitespace()
                     .map(|word| strsim::damerau_levenshtein(&query_lower, &word.to_lowercase()))
                     .filter(|&dist| dist <= typo_budget)
-                    .map(|dist| typo_score(dist))
+                    .map(typo_score)
                     .max();
 
                 match (fuzzy_score, typo_score) {
@@ -149,7 +149,7 @@ impl Corpus {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|a| std::cmp::Reverse(a.0));
         scored.into_iter().map(|(_, item)| item.clone()).collect()
     }
 }
