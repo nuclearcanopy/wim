@@ -1,4 +1,5 @@
 mod config;
+mod library;
 mod mpv;
 mod subsonic;
 mod term;
