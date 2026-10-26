@@ -3,14 +3,21 @@
 //! don't have in this headless build/test context).
 
 use crossterm::event::KeyCode;
+use rand::Rng;
 
 use crate::search::{Corpus, SearchItem};
+
+const MIN_SPEED: f64 = 0.25;
+const MAX_SPEED: f64 = 3.0;
+const SPEED_STEP: f64 = 0.1;
 
 pub enum Action {
     None,
     Quit,
     Play(SearchItem),
     Queued(SearchItem),
+    SetLoop(bool),
+    SetSpeed(f64),
 }
 
 pub struct App {
@@ -25,6 +32,9 @@ pub struct App {
     /// track, so implicitly bulk-queuing them would be surprising. `a`
     /// enqueues explicitly instead. See docs/features.md.
     pub queue: Vec<SearchItem>,
+    pub loop_file: bool,
+    pub shuffle: bool,
+    pub speed: f64,
     /// vim-style pending leader key, currently only used for `gg`.
     pending: Option<char>,
 }
@@ -38,6 +48,9 @@ impl App {
             selected: 0,
             editing_query: false,
             queue: Vec::new(),
+            loop_file: false,
+            shuffle: false,
+            speed: 1.0,
             pending: None,
         }
     }
@@ -50,6 +63,32 @@ impl App {
             None
         } else {
             Some(self.queue.remove(0))
+        }
+    }
+
+    /// Appends to the queue normally, or inserts at a random position
+    /// while shuffle is on, so newly-added items don't just pile up in
+    /// strict order after a shuffle.
+    fn enqueue(&mut self, item: SearchItem) {
+        if self.shuffle && !self.queue.is_empty() {
+            let idx = rand::thread_rng().gen_range(0..=self.queue.len());
+            self.queue.insert(idx, item);
+        } else {
+            self.queue.push(item);
+        }
+    }
+
+    /// Toggles shuffle; turning it on reshuffles the current queue in
+    /// place (Fisher-Yates) so it takes effect immediately rather than
+    /// only affecting items added afterward.
+    fn toggle_shuffle(&mut self) {
+        self.shuffle = !self.shuffle;
+        if self.shuffle {
+            let mut rng = rand::thread_rng();
+            for i in (1..self.queue.len()).rev() {
+                let j = rng.gen_range(0..=i);
+                self.queue.swap(i, j);
+            }
         }
     }
 
@@ -109,9 +148,22 @@ impl App {
             KeyCode::Char('a') => {
                 if let Some(item) = self.results.get(self.selected) {
                     let item = item.clone();
-                    self.queue.push(item.clone());
+                    self.enqueue(item.clone());
                     return Action::Queued(item);
                 }
+            }
+            KeyCode::Char('l') => {
+                self.loop_file = !self.loop_file;
+                return Action::SetLoop(self.loop_file);
+            }
+            KeyCode::Char('s') => self.toggle_shuffle(),
+            KeyCode::Char(']') => {
+                self.speed = (self.speed + SPEED_STEP).min(MAX_SPEED);
+                return Action::SetSpeed(self.speed);
+            }
+            KeyCode::Char('[') => {
+                self.speed = (self.speed - SPEED_STEP).max(MIN_SPEED);
+                return Action::SetSpeed(self.speed);
             }
             KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
             _ => {}
@@ -243,5 +295,68 @@ mod tests {
         let second = app.pop_queue();
         assert!(matches!(second, Some(SearchItem::LocalMusic { ref title, .. }) if title == "matchable track 1"));
         assert!(app.pop_queue().is_none());
+    }
+
+    #[test]
+    fn l_toggles_loop_and_reports_the_new_state() {
+        let mut app = app_with_three_results();
+        assert!(matches!(app.handle_key(KeyCode::Char('l')), Action::SetLoop(true)));
+        assert!(app.loop_file);
+        assert!(matches!(app.handle_key(KeyCode::Char('l')), Action::SetLoop(false)));
+        assert!(!app.loop_file);
+    }
+
+    #[test]
+    fn speed_adjusts_and_clamps_at_bounds() {
+        let mut app = app_with_three_results();
+        assert!(matches!(app.handle_key(KeyCode::Char(']')), Action::SetSpeed(s) if (s - 1.1).abs() < 1e-9));
+        for _ in 0..50 {
+            app.handle_key(KeyCode::Char(']'));
+        }
+        assert!((app.speed - MAX_SPEED).abs() < 1e-9, "clamped at max speed");
+        for _ in 0..100 {
+            app.handle_key(KeyCode::Char('['));
+        }
+        assert!((app.speed - MIN_SPEED).abs() < 1e-9, "clamped at min speed");
+    }
+
+    #[test]
+    fn shuffle_preserves_every_queued_item() {
+        let mut app = app_with_three_results();
+        app.handle_key(KeyCode::Char('a'));
+        app.handle_key(KeyCode::Char('j'));
+        app.handle_key(KeyCode::Char('a'));
+        app.handle_key(KeyCode::Char('j'));
+        app.handle_key(KeyCode::Char('a'));
+        assert_eq!(app.queue.len(), 3);
+
+        app.handle_key(KeyCode::Char('s')); // shuffle on, reshuffles in place
+        assert!(app.shuffle);
+        assert_eq!(app.queue.len(), 3, "shuffle must not drop or duplicate items");
+
+        let mut titles: Vec<String> = app
+            .queue
+            .iter()
+            .map(|i| match i {
+                SearchItem::LocalMusic { title, .. } => title.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        titles.sort();
+        assert_eq!(titles, vec!["matchable track 0", "matchable track 1", "matchable track 2"]);
+    }
+
+    #[test]
+    fn enqueue_while_shuffled_still_lands_in_the_queue() {
+        let mut app = app_with_three_results();
+        app.handle_key(KeyCode::Char('a')); // one item, shuffle has nothing to reorder yet
+        app.handle_key(KeyCode::Char('s')); // shuffle on
+        app.handle_key(KeyCode::Char('j'));
+        app.handle_key(KeyCode::Char('a')); // enqueue track 1 while shuffled
+
+        assert_eq!(app.queue.len(), 2);
+        assert!(app.queue.iter().any(
+            |i| matches!(i, SearchItem::LocalMusic { title, .. } if title == "matchable track 1")
+        ));
     }
 }

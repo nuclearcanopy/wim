@@ -67,7 +67,13 @@ fn main() -> anyhow::Result<()> {
                 ResultsList { items: &app.results, selected: app.selected },
                 chunks[0],
             );
-            let status_line = format!("[queue: {}] {status}", app.queue.len());
+            let status_line = format!(
+                "[queue:{} loop:{} shuffle:{} speed:{:.2}x] {status}",
+                app.queue.len(),
+                if app.loop_file { "on" } else { "off" },
+                if app.shuffle { "on" } else { "off" },
+                app.speed,
+            );
             f.render_widget(
                 StatusBar { editing_query: app.editing_query, query: &app.query, message: &status_line },
                 chunks[1],
@@ -88,6 +94,18 @@ fn main() -> anyhow::Result<()> {
                     Action::Quit => break,
                     Action::Play(item) => status = try_play(&player, &item),
                     Action::Queued(item) => status = format!("queued: {}", label(&item)),
+                    Action::SetLoop(on) => {
+                        status = match player.set_loop_file(if on { "inf" } else { "no" }) {
+                            Ok(()) => format!("loop: {}", if on { "on" } else { "off" }),
+                            Err(e) => format!("error setting loop: {e}"),
+                        };
+                    }
+                    Action::SetSpeed(speed) => {
+                        status = match player.set_speed(speed) {
+                            Ok(()) => format!("speed: {speed:.2}x"),
+                            Err(e) => format!("error setting speed: {e}"),
+                        };
+                    }
                     Action::None => {}
                 }
             }
