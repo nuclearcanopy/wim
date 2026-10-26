@@ -67,10 +67,11 @@ playing audio level visualizer, resuming playback state). read
 - [x] play queue: `a` enqueues, auto-advances on mpv end-file. reorder/
       view-the-queue ui still pending (queue currently has no visible
       list of its own, just a count in the status bar).
-- [ ] playback controls: loop / loop-one / shuffle / speed, wired to the
-      existing mpv methods, exposed as keybinds + visible state in ui.
-      shuffle should be "smart" (avoid immediate repeats), not naive
-      full-random — see `docs/features.md`.
+- [x] playback controls: loop-file (`l`), speed (`[`/`]`), shuffle (`s`,
+      reshuffles the queue in place + randomizes future inserts).
+      "avoid immediate repeats" smart-shuffle is more meaningful once
+      there's a "shuffle whole library into queue" feature — not
+      applicable to today's small explicit queue the same way.
 - [ ] gapless playback + optional crossfade (toggle + duration, off by
       default): preload the next queued track before the current one
       ends rather than reactively loading on `end-file`. see
