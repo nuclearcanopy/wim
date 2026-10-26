@@ -3,6 +3,16 @@
 terminal omniplayer. full spec lives in README.md; this file tracks what's
 done and what's next, for both the maintainer and the overnight build loop.
 
+**the standing bar for every feature, not just the ones listed below:**
+is this an incredibly loved feature in top-tier apps? is it modern,
+efficient, and does it make the app better for everyone? if yes, build
+*that* version, not the minimal literal-request version, even unasked.
+see `docs/features.md` for the running rationale behind each feature
+and a list of "loved app" additions layered on top of the original
+spec (eq presets, gapless/crossfade, smart shuffle, a queue, a now-
+playing audio level visualizer, resuming playback state). read
+`docs/architecture.md` before touching the areas it covers.
+
 **rules for anyone (human or loop) working from this file:**
 - small progressive commits, one coherent change each, lowercase subject,
   no ai co-author trailer (this is the maintainer's own repo)
@@ -35,28 +45,46 @@ done and what's next, for both the maintainer and the overnight build loop.
 
 - [x] subsonic client (`src/subsonic.rs`): token auth, ping, search3,
       playlists, stream url. token math unit-tested against the
-      official api docs example; not yet wired into the app, and
-      search3's merge-ranking-with-local-results is still the real
-      "unified search" item below.
-- [ ] local library scanner (`src/library.rs`): walk `config.library_paths`
-      via `walkdir`, classify by extension into music/video, extract
-      basic tags (consider the `lofty` crate for audio metadata) for
-      better search matches than bare filenames.
-- [ ] unified search (`src/search.rs`): one `nucleo-matcher` index over
-      local tracks + local videos + navidrome artists/albums/songs/
-      playlists, merged and ranked together, not per-source silos. this
-      is the most-emphasized requirement — make it actually good, not a
-      token substring filter.
-- [ ] app event loop: replace the smoke-test `main.rs` with a real
-      `App` struct (state machine: library/search view, now-playing
-      view, etc.) driving mpv + search + ui together. vim-like nav
-      (hjkl, gg/G, `/` search, etc. — document exact bindings in
-      README as you settle them).
+      official api docs example.
+- [x] local library scanner (`src/library.rs`): walks `config.library_paths`
+      (defaulting to `~/Music`/`~/Videos` via `default_library_paths()`
+      when unset — most people shouldn't have to configure paths just
+      to get started), classifies by extension, reads audio tags via
+      `lofty`.
+- [x] unified search (`src/search.rs`): one corpus over local tracks +
+      local video + navidrome artists/albums/songs/playlists, merged
+      and ranked together. includes typo tolerance (nucleo subsequence
+      fuzzy + damerau-levenshtein edit-distance fallback) — see
+      `docs/features.md` for why that's not optional.
+- [x] app key-handling state machine (`src/app.rs`): vim-like nav
+      (j/k, gg/G, `/` to edit the query live, enter, q/esc), fully
+      unit-tested, decoupled from rendering.
+- [ ] app event loop in `main.rs`: replace the smoke-test body with a
+      real render loop driving `App` + `mpv::Mpv` + a rendered results
+      list + now-playing status line together. this is the actual
+      integration point everything else below plugs into.
+- [ ] play queue: add-to-queue / play-next / reorder, not just "play
+      the one thing you hit enter on." baseline expected behavior in
+      any serious player — see `docs/features.md`.
 - [ ] playback controls: loop / loop-one / shuffle / speed, wired to the
       existing mpv methods, exposed as keybinds + visible state in ui.
+      shuffle should be "smart" (avoid immediate repeats), not naive
+      full-random — see `docs/features.md`.
+- [ ] gapless playback + optional crossfade (toggle + duration, off by
+      default): preload the next queued track before the current one
+      ends rather than reactively loading on `end-file`. see
+      `docs/features.md`.
 - [ ] 10-band eq via mpv `superequalizer` (or `lavfi-complex` equalizer
       chain) af filter, ISO center frequencies (31/62/125/250/500/1k/2k/
-      4k/8k/16k Hz) unless told otherwise.
+      4k/8k/16k Hz) unless told otherwise, **plus presets** (flat, bass
+      boost, vocal boost, treble boost, rock, classical, custom) — raw
+      sliders alone is the minimal version, not the loved one.
+- [ ] now-playing audio level visualizer: animated unicode-block meter
+      (think `cava`) fitting the monochrome custom-painted aesthetic
+      already established. genuinely loved in the terminal-tool space
+      this app lives in, not a stretch feature.
+- [ ] playback state persistence: resume queue/position/volume across
+      restarts.
 - [ ] replaygain: read replaygain tags (local files) / use subsonic
       `replayGain` fields where the server exposes them, apply via mpv
       `replaygain` property.
