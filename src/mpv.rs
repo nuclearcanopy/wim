@@ -195,6 +195,12 @@ impl Mpv {
         self.set_property("loop-file", json!(mode))
     }
 
+    /// Sets the `af` (audio filter graph) property directly, e.g. for
+    /// the eq filter chain built by `crate::eq::build_af_filter`.
+    pub fn set_af(&self, filter: &str) -> Result<()> {
+        self.set_property("af", json!(filter))
+    }
+
     pub fn seek(&self, seconds: f64, relative: bool) -> Result<()> {
         let flag = if relative { "relative" } else { "absolute" };
         self.command(&[json!("seek"), json!(seconds), json!(flag)])?;

@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod eq;
 mod library;
 mod mpv;
 mod search;
@@ -68,11 +69,12 @@ fn main() -> anyhow::Result<()> {
                 chunks[0],
             );
             let status_line = format!(
-                "[queue:{} loop:{} shuffle:{} speed:{:.2}x] {status}",
+                "[queue:{} loop:{} shuffle:{} speed:{:.2}x eq:{}] {status}",
                 app.queue.len(),
                 if app.loop_file { "on" } else { "off" },
                 if app.shuffle { "on" } else { "off" },
                 app.speed,
+                eq::PRESETS[app.eq_preset].name,
             );
             f.render_widget(
                 StatusBar { editing_query: app.editing_query, query: &app.query, message: &status_line },
@@ -104,6 +106,13 @@ fn main() -> anyhow::Result<()> {
                         status = match player.set_speed(speed) {
                             Ok(()) => format!("speed: {speed:.2}x"),
                             Err(e) => format!("error setting speed: {e}"),
+                        };
+                    }
+                    Action::SetEq(name, gains) => {
+                        let filter = eq::build_af_filter(&gains);
+                        status = match player.set_af(&filter) {
+                            Ok(()) => format!("eq: {name}"),
+                            Err(e) => format!("error setting eq: {e}"),
                         };
                     }
                     Action::None => {}

@@ -5,6 +5,7 @@
 use crossterm::event::KeyCode;
 use rand::Rng;
 
+use crate::eq;
 use crate::search::{Corpus, SearchItem};
 
 const MIN_SPEED: f64 = 0.25;
@@ -18,6 +19,7 @@ pub enum Action {
     Queued(SearchItem),
     SetLoop(bool),
     SetSpeed(f64),
+    SetEq(&'static str, [f64; 10]),
 }
 
 pub struct App {
@@ -35,6 +37,7 @@ pub struct App {
     pub loop_file: bool,
     pub shuffle: bool,
     pub speed: f64,
+    pub eq_preset: usize,
     /// vim-style pending leader key, currently only used for `gg`.
     pending: Option<char>,
 }
@@ -51,6 +54,7 @@ impl App {
             loop_file: false,
             shuffle: false,
             speed: 1.0,
+            eq_preset: 0,
             pending: None,
         }
     }
@@ -164,6 +168,11 @@ impl App {
             KeyCode::Char('[') => {
                 self.speed = (self.speed - SPEED_STEP).max(MIN_SPEED);
                 return Action::SetSpeed(self.speed);
+            }
+            KeyCode::Char('e') => {
+                self.eq_preset = (self.eq_preset + 1) % eq::PRESETS.len();
+                let preset = &eq::PRESETS[self.eq_preset];
+                return Action::SetEq(preset.name, preset.gains);
             }
             KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
             _ => {}
@@ -358,5 +367,24 @@ mod tests {
         assert!(app.queue.iter().any(
             |i| matches!(i, SearchItem::LocalMusic { title, .. } if title == "matchable track 1")
         ));
+    }
+
+    #[test]
+    fn e_cycles_eq_presets_and_wraps() {
+        let mut app = app_with_three_results();
+        assert_eq!(app.eq_preset, 0);
+        for expected_idx in 1..eq::PRESETS.len() {
+            match app.handle_key(KeyCode::Char('e')) {
+                Action::SetEq(name, gains) => {
+                    assert_eq!(name, eq::PRESETS[expected_idx].name);
+                    assert_eq!(gains, eq::PRESETS[expected_idx].gains);
+                }
+                _ => panic!("expected Action::SetEq"),
+            }
+            assert_eq!(app.eq_preset, expected_idx);
+        }
+        // one more press wraps back to the first preset (flat)
+        app.handle_key(KeyCode::Char('e'));
+        assert_eq!(app.eq_preset, 0);
     }
 }
