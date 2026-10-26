@@ -64,9 +64,9 @@ playing audio level visualizer, resuming playback state). read
       music/video items load into mpv on enter; remote items report
       "not playable yet" since live navidrome search isn't merged into
       the loop yet (needs a real server to test against).
-- [ ] play queue: add-to-queue / play-next / reorder, not just "play
-      the one thing you hit enter on." baseline expected behavior in
-      any serious player — see `docs/features.md`.
+- [x] play queue: `a` enqueues, auto-advances on mpv end-file. reorder/
+      view-the-queue ui still pending (queue currently has no visible
+      list of its own, just a count in the status bar).
 - [ ] playback controls: loop / loop-one / shuffle / speed, wired to the
       existing mpv methods, exposed as keybinds + visible state in ui.
       shuffle should be "smart" (avoid immediate repeats), not naive

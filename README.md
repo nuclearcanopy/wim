@@ -31,4 +31,19 @@ cargo build
 on first run, writes a template to `$XDG_CONFIG_HOME/wim/config.toml` (or
 the platform equivalent). fill in your navidrome url/credentials and
 library paths, or manage the same file declaratively via the
-home-manager module instead.
+home-manager module instead. `library_paths` defaults to `~/Music` and
+`~/Videos` (whichever exist) when left empty.
+
+## keybindings
+
+vim-like, settled as the app grows; this list is the source of truth.
+
+- `/` — start/edit the live search query
+- `j` / `k` (or down/up) — move selection
+- `gg` / `G` — jump to first/last result
+- `enter` — play the selected result immediately
+- `a` — add the selected result to the queue (doesn't interrupt playback)
+- `q` / `esc` — quit
+
+the queue auto-advances when the current track ends; nothing plays next
+if the queue is empty.
