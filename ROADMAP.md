@@ -90,9 +90,10 @@ playing audio level visualizer, resuming playback state). read
       this app lives in, not a stretch feature.
 - [ ] playback state persistence: resume queue/position/volume across
       restarts.
-- [ ] replaygain: read replaygain tags (local files) / use subsonic
-      `replayGain` fields where the server exposes them, apply via mpv
-      `replaygain` property.
+- [x] replaygain: mpv reads embedded tags itself once `replaygain=track`
+      is set — enabled by default at startup, no extraction needed on
+      our end for local files. subsonic's replayGain fields for remote
+      tracks deferred along with the rest of live navidrome wiring.
 - [ ] transcoding: let navidrome/subsonic transcode server-side per its
       own configured profile by default (stream request params); only
       add client-side bitrate/format override if asked.
