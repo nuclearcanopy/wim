@@ -76,11 +76,11 @@ playing audio level visualizer, resuming playback state). read
       default): preload the next queued track before the current one
       ends rather than reactively loading on `end-file`. see
       `docs/features.md`.
-- [ ] 10-band eq via mpv `superequalizer` (or `lavfi-complex` equalizer
-      chain) af filter, ISO center frequencies (31/62/125/250/500/1k/2k/
-      4k/8k/16k Hz) unless told otherwise, **plus presets** (flat, bass
-      boost, vocal boost, treble boost, rock, classical, custom) — raw
-      sliders alone is the minimal version, not the loved one.
+- [x] 10-band eq (`src/eq.rs`) with presets (flat/bass boost/vocal
+      boost/treble boost/rock/classical), `e` cycles. applied via
+      chained lavfi `equalizer` filters on mpv's `af` property. preset
+      gain values are heuristic starting points, not acoustically
+      tuned — a "custom" user-editable preset is still open.
 - [ ] now-playing audio level visualizer: animated unicode-block meter
       (think `cava`) fitting the monochrome custom-painted aesthetic
       already established. genuinely loved in the terminal-tool space
