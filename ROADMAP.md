@@ -33,12 +33,11 @@ done and what's next, for both the maintainer and the overnight build loop.
 
 ## next (roughly in order, pick whichever is actually unblocked)
 
-- [ ] subsonic client (`src/subsonic.rs`): token auth (`t = md5(password +
-      salt)`, random `s` salt per request), `ping`, `search3` (artists/
-      albums/songs), playlist listing, `stream` url construction with
-      transcoding params. hand-rolled over `ureq`, no existing subsonic
-      crate (they're unmaintained/incomplete). unit-test the token math
-      and url construction without needing a live server.
+- [x] subsonic client (`src/subsonic.rs`): token auth, ping, search3,
+      playlists, stream url. token math unit-tested against the
+      official api docs example; not yet wired into the app, and
+      search3's merge-ranking-with-local-results is still the real
+      "unified search" item below.
 - [ ] local library scanner (`src/library.rs`): walk `config.library_paths`
       via `walkdir`, classify by extension into music/video, extract
       basic tags (consider the `lofty` crate for audio metadata) for
