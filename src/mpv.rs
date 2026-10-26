@@ -189,6 +189,14 @@ impl Mpv {
         Ok(())
     }
 
+    /// `mode`: "no" | "track" | "album". mpv reads replaygain tags
+    /// embedded in the file itself (via its own demuxer/decoder) and
+    /// applies the matching gain automatically — we don't need to
+    /// extract gain values ourselves for local files.
+    pub fn set_replaygain(&self, mode: &str) -> Result<()> {
+        self.set_property("replaygain", json!(mode))
+    }
+
     pub fn play(&self) -> Result<()> {
         self.set_property("pause", json!(false))
     }
