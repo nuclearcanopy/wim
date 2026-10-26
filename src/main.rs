@@ -30,6 +30,19 @@ fn playable_path(item: &SearchItem) -> Option<String> {
     }
 }
 
+/// Attempts to load `item` into mpv, returning the status line to show
+/// either way. Shared by the manual enter-to-play path and queue
+/// auto-advance on end-of-file, so they can't drift out of sync.
+fn try_play(player: &mpv::Mpv, item: &SearchItem) -> String {
+    match playable_path(item) {
+        Some(path) => match player.load_file(&path) {
+            Ok(()) => format!("playing: {}", label(item)),
+            Err(e) => format!("error loading file: {e}"),
+        },
+        None => "not playable yet — remote items aren't wired into playback this round".to_string(),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cfg = config::load_or_init()?;
 
@@ -40,7 +53,7 @@ fn main() -> anyhow::Result<()> {
     let player = mpv::Mpv::spawn()?;
     let mut app = app::App::new(corpus);
     let mut status = format!(
-        "{} local items indexed — / to search, j/k move, gg/G jump, enter play, q quit",
+        "{} local items indexed — / search, j/k move, gg/G jump, enter play, a queue, q quit",
         app.corpus.len()
     );
 
@@ -54,27 +67,27 @@ fn main() -> anyhow::Result<()> {
                 ResultsList { items: &app.results, selected: app.selected },
                 chunks[0],
             );
+            let status_line = format!("[queue: {}] {status}", app.queue.len());
             f.render_widget(
-                StatusBar { editing_query: app.editing_query, query: &app.query, message: &status },
+                StatusBar { editing_query: app.editing_query, query: &app.query, message: &status_line },
                 chunks[1],
             );
         })?;
+
+        // non-blocking: auto-advance the queue when the current track ends.
+        if let Ok(mpv::Event::EndFile) = player.events().try_recv() {
+            status = match app.pop_queue() {
+                Some(next) => try_play(&player, &next),
+                None => "queue empty — idle".to_string(),
+            };
+        }
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 match app.handle_key(key.code) {
                     Action::Quit => break,
-                    Action::Play(item) => match playable_path(&item) {
-                        Some(path) => match player.load_file(&path) {
-                            Ok(()) => status = format!("playing: {}", label(&item)),
-                            Err(e) => status = format!("error loading file: {e}"),
-                        },
-                        None => {
-                            status =
-                                "not playable yet — remote items aren't wired into playback this round"
-                                    .to_string();
-                        }
-                    },
+                    Action::Play(item) => status = try_play(&player, &item),
+                    Action::Queued(item) => status = format!("queued: {}", label(&item)),
                     Action::None => {}
                 }
             }
