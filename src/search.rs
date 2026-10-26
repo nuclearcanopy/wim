@@ -107,7 +107,9 @@ impl Corpus {
     }
 
     /// Ranked matches for `query` across the whole corpus, best first.
-    pub fn search(&self, query: &str) -> Vec<&SearchItem> {
+    /// Returns owned items (the corpus is small; cloning keeps the caller
+    /// free of borrowing it across an event loop).
+    pub fn search(&self, query: &str) -> Vec<SearchItem> {
         if query.trim().is_empty() {
             return Vec::new();
         }
@@ -126,7 +128,7 @@ impl Corpus {
             .collect();
 
         scored.sort_by(|a, b| b.0.cmp(&a.0));
-        scored.into_iter().map(|(_, item)| item).collect()
+        scored.into_iter().map(|(_, item)| item.clone()).collect()
     }
 }
 
