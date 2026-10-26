@@ -43,6 +43,9 @@ vim-like, settled as the app grows; this list is the source of truth.
 - `gg` / `G` — jump to first/last result
 - `enter` — play the selected result immediately
 - `a` — add the selected result to the queue (doesn't interrupt playback)
+- `l` — toggle loop on the current track
+- `s` — toggle shuffle (reshuffles the current queue immediately)
+- `[` / `]` — speed down/up (0.25x–3x, 0.1x steps)
 - `q` / `esc` — quit
 
 the queue auto-advances when the current track ends; nothing plays next
