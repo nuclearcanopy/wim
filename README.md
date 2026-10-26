@@ -47,6 +47,7 @@ vim-like, settled as the app grows; this list is the source of truth.
 - `s` — toggle shuffle (reshuffles the current queue immediately)
 - `[` / `]` — speed down/up (0.25x–3x, 0.1x steps)
 - `e` — cycle eq preset (flat/bass boost/vocal boost/treble boost/rock/classical)
+- `L` — fetch and show lyrics for what's currently playing (j/k to scroll, L/esc/q to close)
 - `q` / `esc` — quit
 
 the queue auto-advances when the current track ends; nothing plays next
