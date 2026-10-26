@@ -1,6 +1,7 @@
 mod config;
 mod library;
 mod mpv;
+mod search;
 mod subsonic;
 mod term;
 mod theme;
