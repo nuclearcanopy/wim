@@ -22,11 +22,23 @@ const BOTTOM_BAR_MIN: u16 = 2;
 const BOTTOM_BAR_MAX: u16 = 10;
 const STEP: u16 = 2;
 
+/// The defaults a fresh config starts from; also what an out-of-range
+/// persisted value is clamped into.
+pub const SIDEBAR_DEFAULT: u16 = 32;
+pub const BOTTOM_BAR_DEFAULT: u16 = 4;
+
 impl PanelLayout {
     pub fn new() -> Self {
+        Self::from_sizes(SIDEBAR_DEFAULT, BOTTOM_BAR_DEFAULT)
+    }
+
+    /// Restores persisted sizes, clamped to the same bounds resize
+    /// mode itself enforces: a hand-edited config shouldn't be able to
+    /// produce a sidebar wider than the terminal or a zero-row bar.
+    pub fn from_sizes(sidebar_width: u16, bottom_bar_height: u16) -> Self {
         PanelLayout {
-            sidebar_width: 32,
-            bottom_bar_height: 4,
+            sidebar_width: sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX),
+            bottom_bar_height: bottom_bar_height.clamp(BOTTOM_BAR_MIN, BOTTOM_BAR_MAX),
             resize_mode: false,
             resize_selected: ResizePanel::Sidebar,
         }
@@ -119,5 +131,29 @@ mod tests {
             l.bottom_bar_height, original_bottom,
             "sidebar resize must not affect bottom bar height"
         );
+    }
+
+    #[test]
+    fn persisted_sizes_are_restored() {
+        let l = PanelLayout::from_sizes(44, 7);
+        assert_eq!(l.sidebar_width, 44);
+        assert_eq!(l.bottom_bar_height, 7);
+    }
+
+    #[test]
+    fn a_hand_edited_config_cannot_push_sizes_out_of_range() {
+        let huge = PanelLayout::from_sizes(9999, 9999);
+        assert_eq!(huge.sidebar_width, SIDEBAR_MAX);
+        assert_eq!(huge.bottom_bar_height, BOTTOM_BAR_MAX);
+        let tiny = PanelLayout::from_sizes(0, 0);
+        assert_eq!(tiny.sidebar_width, SIDEBAR_MIN);
+        assert_eq!(tiny.bottom_bar_height, BOTTOM_BAR_MIN);
+    }
+
+    #[test]
+    fn new_matches_the_documented_defaults() {
+        let l = PanelLayout::new();
+        assert_eq!(l.sidebar_width, SIDEBAR_DEFAULT);
+        assert_eq!(l.bottom_bar_height, BOTTOM_BAR_DEFAULT);
     }
 }
