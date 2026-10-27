@@ -372,7 +372,12 @@ fn main() -> anyhow::Result<()> {
 
             let sidebar_rows =
                 Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(sidebar);
-            f.render_widget(SearchBox { query: &app.query, editing: app.editing_query }, sidebar_rows[0]);
+            // classic terminal cursor blink: ~530ms per half-phase.
+            let cursor_visible = (start.elapsed().as_millis() / 530) % 2 == 0;
+            f.render_widget(
+                SearchBox { query: &app.query, editing: app.editing_query, cursor_visible },
+                sidebar_rows[0],
+            );
             f.render_widget(
                 ResultsList {
                     items: &app.results,
