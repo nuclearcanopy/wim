@@ -2,7 +2,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
-use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK, WHITE};
+use crate::theme::{lerp, shade, BRIGHT, DIM, NEAR_BLACK, WHITE};
 
 /// Real bold 3D block lettering (figlet's `larry3d` font,
 /// `figlet -f larry3d WIM`), baked in as static art rather than
@@ -79,7 +79,7 @@ impl Widget for Banner {
                 let sweep = ((rel - self.phase).rem_euclid(1.0) - 0.5).abs() * 2.0;
                 // all math stays in plain 0..1 levels until the one
                 // conversion to a Color at the end.
-                let sweep_level = WHITE + (BRIGHT - WHITE) * sweep;
+                let sweep_level = lerp(WHITE, BRIGHT, sweep);
                 let level = (sweep_level * (0.8 + 0.2 * pulse)).clamp(0.0, 1.0);
                 if let Some(cell) = buf.cell_mut((x, y)) {
                     cell.set_char(ch);
@@ -99,7 +99,7 @@ fn draw_rule(buf: &mut Buffer, area: Rect, y: u16, pulse: f32) {
     }
     // deliberately dim and low-contrast against the logo; a divider
     // that competes with the content it's dividing isn't doing its job.
-    let level = NEAR_BLACK + (DIM * 0.5 - NEAR_BLACK) * pulse;
+    let level = lerp(NEAR_BLACK, DIM * 0.5, pulse);
     let color = shade(level);
     for x in area.x..area.x + area.width {
         if let Some(cell) = buf.cell_mut((x, y)) {
