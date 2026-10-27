@@ -38,7 +38,9 @@ impl Notification {
     /// in its box; saturates at 0 rather than going negative in the
     /// one frame between it passing `lifetime` and `expire()` running.
     pub fn remaining_secs(&self) -> u64 {
-        self.lifetime.saturating_sub(self.shown_at.elapsed()).as_secs()
+        self.lifetime
+            .saturating_sub(self.shown_at.elapsed())
+            .as_secs()
     }
 }
 
@@ -66,7 +68,12 @@ impl Notifications {
     pub fn push(&mut self, severity: Severity, message: impl Into<String>) {
         let message = message.into();
         let lifetime = lifetime_for(&message);
-        self.items.push(Notification { severity, message, shown_at: Instant::now(), lifetime });
+        self.items.push(Notification {
+            severity,
+            message,
+            shown_at: Instant::now(),
+            lifetime,
+        });
         if self.items.len() > MAX_STACKED {
             self.items.remove(0);
         }

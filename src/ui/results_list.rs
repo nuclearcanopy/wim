@@ -28,7 +28,10 @@ pub(crate) fn kind_code(item: &SearchItem) -> char {
 pub(crate) fn source_code(item: &SearchItem) -> char {
     match item {
         SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => 'f',
-        SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Song { .. } | SearchItem::Playlist { .. } => 'n',
+        SearchItem::Artist { .. }
+        | SearchItem::Album { .. }
+        | SearchItem::Song { .. }
+        | SearchItem::Playlist { .. } => 'n',
     }
 }
 
@@ -43,7 +46,12 @@ pub(crate) fn label(item: &SearchItem) -> String {
         SearchItem::LocalVideo { title, .. } => title.clone(),
         SearchItem::Artist { name, .. } => name.clone(),
         SearchItem::Album { name, artist, .. } => format!("{name} · {artist}"),
-        SearchItem::Song { title, artist, album, .. } => format!("{title} · {artist} ({album})"),
+        SearchItem::Song {
+            title,
+            artist,
+            album,
+            ..
+        } => format!("{title} · {artist} ({album})"),
         SearchItem::Playlist { name, .. } => name.clone(),
     }
 }
@@ -129,9 +137,17 @@ impl Widget for ResultsList<'_> {
             let is_selected = idx == self.selected;
             let y = area.y + row as u16;
 
-            let fg = if is_selected { shade(BRIGHT) } else { shade(DIM) };
+            let fg = if is_selected {
+                shade(BRIGHT)
+            } else {
+                shade(DIM)
+            };
             let marker = if is_selected { "> " } else { "  " };
-            let star = if is_starred(item, self.favorites, self.remote_starred) { "* " } else { "" };
+            let star = if is_starred(item, self.favorites, self.remote_starred) {
+                "* "
+            } else {
+                ""
+            };
             let full = format!(
                 "{marker}[{}{}] {star}{}",
                 source_code(item),

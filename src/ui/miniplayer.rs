@@ -2,7 +2,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
-use crate::theme::{shade, DIM, NEAR_WHITE};
+use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::progress::{bar, fmt_time};
 use crate::ui::textfit::truncate_with_ellipsis;
 
@@ -16,7 +16,13 @@ pub struct MiniPlayerBar<'a> {
     pub elapsed_secs: Option<f64>,
     pub duration_secs: Option<f64>,
     pub paused: bool,
+    pub loop_label: &'a str,
+    pub shuffle_on: bool,
 }
+
+/// Fixed height this widget always wants; the caller carves out
+/// exactly this many rows above the main bottom bar.
+pub const HEIGHT: u16 = 3;
 
 impl Widget for MiniPlayerBar<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -24,15 +30,53 @@ impl Widget for MiniPlayerBar<'_> {
             return;
         }
         let width = area.width as usize;
-        let state = if self.paused { "⏸" } else { "▶" };
-        let line1 = format!("{state} {} (m: maximize)", self.title);
-        draw_line(buf, area, area.y, &truncate_with_ellipsis(&line1, width), shade(NEAR_WHITE));
 
-        if area.height > 1 {
-            let progress = bar(self.elapsed_secs, self.duration_secs, width.saturating_sub(12));
-            let line2 = format!("{} {progress} {}", fmt_time(self.elapsed_secs), fmt_time(self.duration_secs));
-            draw_line(buf, area, area.y + 1, &truncate_with_ellipsis(&line2, width), shade(DIM));
+        // a rule of its own, not just relying on the text above it
+        // being a different brightness, so the strip reads as its own
+        // separated panel rather than text that happens to float above
+        // the bottom bar.
+        for col in 0..area.width {
+            if let Some(cell) = buf.cell_mut((area.x + col, area.y)) {
+                cell.set_char('─');
+                cell.set_fg(shade(NEAR_BLACK));
+            }
         }
+        if area.height == 1 {
+            return;
+        }
+
+        let state = if self.paused { "⏸" } else { "▶" };
+        let line1 = format!("{state} {} (space: pause, m: maximize)", self.title);
+        draw_line(
+            buf,
+            area,
+            area.y + 1,
+            &truncate_with_ellipsis(&line1, width),
+            shade(NEAR_WHITE),
+        );
+        if area.height == 2 {
+            return;
+        }
+
+        let progress = bar(
+            self.elapsed_secs,
+            self.duration_secs,
+            width.saturating_sub(24),
+        );
+        let line2 = format!(
+            "{} {progress} {}  ↻ {}  shuffle: {}",
+            fmt_time(self.elapsed_secs),
+            fmt_time(self.duration_secs),
+            self.loop_label,
+            if self.shuffle_on { "on" } else { "off" },
+        );
+        draw_line(
+            buf,
+            area,
+            area.y + 2,
+            &truncate_with_ellipsis(&line2, width),
+            shade(DIM),
+        );
     }
 }
 

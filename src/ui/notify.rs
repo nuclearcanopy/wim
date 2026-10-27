@@ -43,7 +43,15 @@ impl Widget for NotificationOverlay<'_> {
     }
 }
 
-fn draw_box(buf: &mut Buffer, x: u16, y: u16, width: u16, text: &str, remaining_secs: u64, color: ratatui::style::Color) {
+fn draw_box(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    text: &str,
+    remaining_secs: u64,
+    color: ratatui::style::Color,
+) {
     put(buf, x, y, '┌', color);
     put(buf, x + width - 1, y, '┐', color);
     for col in 1..width - 1 {
@@ -66,7 +74,11 @@ fn draw_box(buf: &mut Buffer, x: u16, y: u16, width: u16, text: &str, remaining_
     let timer_start = (width - 1).saturating_sub(timer_width);
     for col in 1..width - 1 {
         let in_timer = col >= timer_start && col - timer_start < timer_width;
-        let ch = if in_timer { timer.chars().nth((col - timer_start) as usize).unwrap() } else { '─' };
+        let ch = if in_timer {
+            timer.chars().nth((col - timer_start) as usize).unwrap()
+        } else {
+            '─'
+        };
         put(buf, x + col, y + 2, ch, color);
     }
 }

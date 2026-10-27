@@ -58,7 +58,10 @@ impl Widget for BrowseListView<'_> {
         let (art_rect, list_area) = crate::browse::layout(area, self.view.art.is_some());
         let y = list_area.y;
         if let (Some(rect), ArtMode::Ascii) = (art_rect, self.art_mode) {
-            AsciiArt { image: self.view.art.as_ref() }.render(rect, buf);
+            AsciiArt {
+                image: self.view.art.as_ref(),
+            }
+            .render(rect, buf);
         }
 
         if self.view.tracks.is_empty() {
@@ -77,21 +80,31 @@ impl Widget for BrowseListView<'_> {
 
         for row in 0..visible_rows {
             let idx = scroll_offset + row;
-            let Some(track) = self.view.tracks.get(idx) else { break };
+            let Some(track) = self.view.tracks.get(idx) else {
+                break;
+            };
             let is_selected = idx == self.view.selected;
             let marker = if is_selected { "> " } else { "  " };
             let label = match track {
                 SearchItem::Song { title, artist, .. } => format!("{title} · {artist}"),
                 _ => String::new(),
             };
-            let star = if is_starred(track, self.favorites, self.remote_starred) { "* " } else { "" };
+            let star = if is_starred(track, self.favorites, self.remote_starred) {
+                "* "
+            } else {
+                ""
+            };
             let line = format!("{marker}{:>2}. {star}{label}", idx + 1);
             draw_line(
                 buf,
                 list_area,
                 y + row as u16,
                 &truncate_with_ellipsis(&line, list_area.width as usize),
-                if is_selected { shade(BRIGHT) } else { shade(DIM) },
+                if is_selected {
+                    shade(BRIGHT)
+                } else {
+                    shade(DIM)
+                },
             );
         }
     }

@@ -88,9 +88,10 @@ fn resolve_tracks(item: &SearchItem) -> Result<Vec<SearchItem>, String> {
             .get_playlist_songs(id)
             .map(|songs| browse::songs_to_items(songs, client))
             .map_err(|e| format!("couldn't load playlist tracks: {e}")),
-        SearchItem::Artist { .. } => {
-            Err("artist playback needs the profile view (not built yet); open an album instead".to_string())
-        }
+        SearchItem::Artist { .. } => Err(
+            "artist playback needs the profile view (not built yet); open an album instead"
+                .to_string(),
+        ),
     }
 }
 
@@ -101,8 +102,15 @@ fn resolve_tracks(item: &SearchItem) -> Result<Vec<SearchItem>, String> {
 /// no browsing) is still what the quick-queue key uses.
 fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
     match item {
-        SearchItem::Album { id, name, artist, client } => {
-            let details = client.get_album(id).map_err(|e| format!("couldn't open album: {e}"))?;
+        SearchItem::Album {
+            id,
+            name,
+            artist,
+            client,
+        } => {
+            let details = client
+                .get_album(id)
+                .map_err(|e| format!("couldn't open album: {e}"))?;
             Ok(browse::BrowseView {
                 title: name.clone(),
                 subtitle: artist.clone(),
@@ -113,7 +121,9 @@ fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
             })
         }
         SearchItem::Playlist { id, name, client } => {
-            let songs = client.get_playlist_songs(id).map_err(|e| format!("couldn't open playlist: {e}"))?;
+            let songs = client
+                .get_playlist_songs(id)
+                .map_err(|e| format!("couldn't open playlist: {e}"))?;
             Ok(browse::BrowseView {
                 title: name.clone(),
                 subtitle: String::new(),
@@ -143,7 +153,9 @@ fn toggle_star(
         }
         SearchItem::Song { id, client, .. } => {
             if remote_starred.contains(id) {
-                client.unstar(id).map_err(|e| format!("couldn't unstar: {e}"))?;
+                client
+                    .unstar(id)
+                    .map_err(|e| format!("couldn't unstar: {e}"))?;
                 remote_starred.remove(id);
                 Ok(false)
             } else {
@@ -162,7 +174,10 @@ fn toggle_star(
 /// configured server's own starred list with local favorites into one
 /// `BrowseView`. Fetched fresh on open rather than cached, same as
 /// opening an album, so it can't go stale.
-fn open_starred_view(servers: &[config::NavidromeConfig], favorites: &favorites::Favorites) -> browse::BrowseView {
+fn open_starred_view(
+    servers: &[config::NavidromeConfig],
+    favorites: &favorites::Favorites,
+) -> browse::BrowseView {
     let mut tracks = Vec::new();
     for nav in servers {
         if let Ok(client) = subsonic::Client::new(nav) {
@@ -177,7 +192,14 @@ fn open_starred_view(servers: &[config::NavidromeConfig], favorites: &favorites:
             tracks.push(item);
         }
     }
-    browse::BrowseView { title: "starred songs".to_string(), subtitle: String::new(), year: None, tracks, selected: 0, art: None }
+    browse::BrowseView {
+        title: "starred songs".to_string(),
+        subtitle: String::new(),
+        year: None,
+        tracks,
+        selected: 0,
+        art: None,
+    }
 }
 
 /// Best-effort: a missing/unreadable cover is not worth surfacing as
@@ -193,7 +215,12 @@ fn fetch_cover_art(client: &subsonic::Client, album_id: &str) -> Option<image::D
 /// `/get`. See ROADMAP.md.
 fn lyrics_query(item: &SearchItem) -> Option<(String, String, String)> {
     match item {
-        SearchItem::LocalMusic { title, artist, album, .. } => Some((
+        SearchItem::LocalMusic {
+            title,
+            artist,
+            album,
+            ..
+        } => Some((
             artist.clone().unwrap_or_default(),
             title.clone(),
             album.clone().unwrap_or_default(),
@@ -214,7 +241,10 @@ fn try_play(player: &mpv::Mpv, item: &SearchItem) -> (String, bool) {
             Ok(()) => (format!("playing: {}", label(item)), true),
             Err(e) => (format!("error loading file: {e}"), false),
         },
-        None => ("not directly playable (expand via resolve_tracks first)".to_string(), false),
+        None => (
+            "not directly playable (expand via resolve_tracks first)".to_string(),
+            false,
+        ),
     }
 }
 
@@ -256,19 +286,61 @@ fn save_playback_state(player: &mpv::Mpv, now_playing: &Option<SearchItem>, queu
     let state = persistence::PlaybackState {
         now_playing_path: now_playing.as_ref().and_then(playable_path),
         queue_paths: queue.iter().filter_map(playable_path).collect(),
-        position_secs: player.get_property("time-pos").ok().and_then(|v| v.as_f64()),
+        position_secs: player
+            .get_property("time-pos")
+            .ok()
+            .and_then(|v| v.as_f64()),
         volume: player.get_property("volume").ok().and_then(|v| v.as_f64()),
     };
     let _ = persistence::save(&state);
+}
+
+/// "Back" re-plays whatever was playing before the current track,
+/// putting the interrupted track at the front of the queue so it
+/// picks up right where it would have anyway. Deliberately our own
+/// bookkeeping rather than mpv's `playlist-prev`: that command would
+/// move mpv's playlist-position pointer independently of our own
+/// `app.queue`, desyncing the two; replaying `previous_track` directly
+/// keeps everything flowing through the one path we already control.
+/// Only ever tracks one step back, not a full history.
+fn go_to_previous(
+    player: &mpv::Mpv,
+    now_playing: &mut Option<SearchItem>,
+    previous_track: &mut Option<SearchItem>,
+    queue: &mut Vec<SearchItem>,
+) -> String {
+    let Some(prev) = previous_track.take() else {
+        return "no previous track".to_string();
+    };
+    let (status, played) = try_play(player, &prev);
+    if played {
+        if let Some(interrupted) = now_playing.take() {
+            queue.insert(0, interrupted);
+        }
+        *now_playing = Some(prev);
+    } else {
+        *previous_track = Some(prev);
+    }
+    status
 }
 
 /// `(elapsed, duration, paused)` for whatever's currently loaded;
 /// queried fresh each frame rather than cached, so the mini/full
 /// player's progress bar is always showing mpv's actual position.
 fn playback_info(player: &mpv::Mpv) -> (Option<f64>, Option<f64>, bool) {
-    let elapsed = player.get_property("time-pos").ok().and_then(|v| v.as_f64());
-    let duration = player.get_property("duration").ok().and_then(|v| v.as_f64());
-    let paused = player.get_property("pause").ok().and_then(|v| v.as_bool()).unwrap_or(false);
+    let elapsed = player
+        .get_property("time-pos")
+        .ok()
+        .and_then(|v| v.as_f64());
+    let duration = player
+        .get_property("duration")
+        .ok()
+        .and_then(|v| v.as_f64());
+    let paused = player
+        .get_property("pause")
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     (elapsed, duration, paused)
 }
 
@@ -307,7 +379,13 @@ fn spawn_background_sync(
             }
             for nav in &servers {
                 let result = fetch_navidrome_catalog(nav);
-                if result_tx.send(BackgroundSyncResult { url: nav.url.clone(), result }).is_err() {
+                if result_tx
+                    .send(BackgroundSyncResult {
+                        url: nav.url.clone(),
+                        result,
+                    })
+                    .is_err()
+                {
                     return; // main thread is gone (shutting down)
                 }
             }
@@ -351,7 +429,12 @@ fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatal
     let artists = client.all_artists().unwrap_or_default();
     let albums = client.all_albums().unwrap_or_default();
     let playlists = client.playlists().unwrap_or_default();
-    Ok(FetchedCatalog { client: Arc::new(client), artists, albums, playlists })
+    Ok(FetchedCatalog {
+        client: Arc::new(client),
+        artists,
+        albums,
+        playlists,
+    })
 }
 
 /// Merges a fetched catalog into the corpus and immediately resyncs
@@ -360,7 +443,11 @@ fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatal
 /// it for free instead of having to remember it.
 fn merge_catalog_into_app(app: &mut app::App, catalog: FetchedCatalog) {
     app.corpus.add_subsonic_search_result(
-        subsonic::SearchResult { artists: catalog.artists, albums: catalog.albums, songs: Vec::new() },
+        subsonic::SearchResult {
+            artists: catalog.artists,
+            albums: catalog.albums,
+            songs: Vec::new(),
+        },
         &catalog.client,
     );
     app.corpus.add_playlists(catalog.playlists, &catalog.client);
@@ -371,7 +458,10 @@ fn merge_catalog_into_app(app: &mut app::App, catalog: FetchedCatalog) {
 /// on an existing profile; so none of them can drift out of sync.
 /// Doesn't touch `Config` itself: callers decide whether/how to
 /// persist (append a new profile vs. just refreshing an existing one).
-fn index_navidrome_server(app: &mut app::App, nav: &config::NavidromeConfig) -> Result<String, String> {
+fn index_navidrome_server(
+    app: &mut app::App,
+    nav: &config::NavidromeConfig,
+) -> Result<String, String> {
     let catalog = fetch_navidrome_catalog(nav)?;
     let summary = catalog.summary();
     merge_catalog_into_app(app, catalog);
@@ -543,7 +633,11 @@ fn main() -> anyhow::Result<()> {
     // a missing/corrupt state file just means nothing to resume, not an
     // error; see persistence.rs.
     if let Some(saved) = persistence::load() {
-        if let Some(item) = saved.now_playing_path.as_deref().and_then(persistence::item_from_path) {
+        if let Some(item) = saved
+            .now_playing_path
+            .as_deref()
+            .and_then(persistence::item_from_path)
+        {
             if try_play(&player, &item).1 {
                 if let Some(pos) = saved.position_secs {
                     let _ = player.seek(pos, false);
@@ -585,17 +679,31 @@ fn main() -> anyhow::Result<()> {
                     Step::Welcome => f.render_widget(WelcomeView, area),
                     Step::Controls => f.render_widget(ControlsView, area),
                     Step::Navidrome => {
-                        f.render_widget(LoginView { form: &ob.login, message: &ob.login_message }, area);
+                        f.render_widget(
+                            LoginView {
+                                form: &ob.login,
+                                message: &ob.login_message,
+                            },
+                            area,
+                        );
                     }
                     Step::LibraryPaths => {
                         f.render_widget(
-                            LibraryPathsView { paths: &ob.library_paths, input: &ob.path_input },
+                            LibraryPathsView {
+                                paths: &ob.library_paths,
+                                input: &ob.path_input,
+                            },
                             area,
                         );
                     }
                     Step::Done => f.render_widget(DoneView, area),
                 }
-                f.render_widget(NotificationOverlay { items: notifications.visible() }, area);
+                f.render_widget(
+                    NotificationOverlay {
+                        items: notifications.visible(),
+                    },
+                    area,
+                );
                 return;
             }
 
@@ -616,10 +724,21 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
                     NavManagerStep::Add(form) => {
-                        f.render_widget(LoginView { form, message: &nm.message }, area);
+                        f.render_widget(
+                            LoginView {
+                                form,
+                                message: &nm.message,
+                            },
+                            area,
+                        );
                     }
                 }
-                f.render_widget(NotificationOverlay { items: notifications.visible() }, area);
+                f.render_widget(
+                    NotificationOverlay {
+                        items: notifications.visible(),
+                    },
+                    area,
+                );
                 return;
             }
 
@@ -635,7 +754,11 @@ fn main() -> anyhow::Result<()> {
             // optional mini player strip, over a bottom playback bar
             // (only vertically resizable). resize mode highlights
             // whichever divider borders the selected panel.
-            let mini_bar_height: u16 = if show_mini_bar { 2 } else { 0 };
+            let mini_bar_height: u16 = if show_mini_bar {
+                ui::miniplayer::HEIGHT
+            } else {
+                0
+            };
             let rows = Layout::vertical([
                 Constraint::Min(0),
                 Constraint::Length(mini_bar_height),
@@ -656,8 +779,10 @@ fn main() -> anyhow::Result<()> {
             let vdivider = cols[1];
             let main_content = cols[2];
 
-            let sidebar_selected = panels.resize_mode && panels.resize_selected == ResizePanel::Sidebar;
-            let bottom_selected = panels.resize_mode && panels.resize_selected == ResizePanel::BottomBar;
+            let sidebar_selected =
+                panels.resize_mode && panels.resize_selected == ResizePanel::Sidebar;
+            let bottom_selected =
+                panels.resize_mode && panels.resize_selected == ResizePanel::BottomBar;
 
             // the banner and the browse view's own header both draw
             // internal horizontal rules right at main_content's left
@@ -675,10 +800,22 @@ fn main() -> anyhow::Result<()> {
             } else {
                 Vec::new()
             };
-            f.render_widget(VerticalRule { highlighted: sidebar_selected, junction_rows }, vdivider);
             f.render_widget(
-                HorizontalRule { highlighted: bottom_selected, junction_x: Some(vdivider.x) },
-                Rect { height: 1, ..bottom },
+                VerticalRule {
+                    highlighted: sidebar_selected,
+                    junction_rows,
+                },
+                vdivider,
+            );
+            f.render_widget(
+                HorizontalRule {
+                    highlighted: bottom_selected,
+                    junction_x: Some(vdivider.x),
+                },
+                Rect {
+                    height: 1,
+                    ..bottom
+                },
             );
 
             let sidebar_rows =
@@ -686,7 +823,11 @@ fn main() -> anyhow::Result<()> {
             // classic terminal cursor blink: ~530ms per half-phase.
             let cursor_visible = (start.elapsed().as_millis() / 530) % 2 == 0;
             f.render_widget(
-                SearchBox { query: &app.query, editing: app.editing_query, cursor_visible },
+                SearchBox {
+                    query: &app.query,
+                    editing: app.editing_query,
+                    cursor_visible,
+                },
                 sidebar_rows[0],
             );
             f.render_widget(
@@ -722,7 +863,12 @@ fn main() -> anyhow::Result<()> {
                 );
             } else if let Some(bv) = &browse_view {
                 f.render_widget(
-                    BrowseListView { view: bv, favorites: &favorites, remote_starred: &remote_starred, art_mode },
+                    BrowseListView {
+                        view: bv,
+                        favorites: &favorites,
+                        remote_starred: &remote_starred,
+                        art_mode,
+                    },
                     main_content,
                 );
                 if art_mode == browse::ArtMode::Real {
@@ -735,28 +881,51 @@ fn main() -> anyhow::Result<()> {
                 }
             } else if let Some(lines) = &lyrics_lines {
                 let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
-                f.render_widget(LyricsView { lines: &borrowed, scroll: lyrics_scroll }, main_content);
+                f.render_widget(
+                    LyricsView {
+                        lines: &borrowed,
+                        scroll: lyrics_scroll,
+                    },
+                    main_content,
+                );
             } else {
                 let elapsed_secs = start.elapsed().as_secs_f32();
                 let phase = elapsed_secs * 0.25;
-                f.render_widget(Banner { phase, elapsed_secs }, main_content);
+                f.render_widget(
+                    Banner {
+                        phase,
+                        elapsed_secs,
+                    },
+                    main_content,
+                );
             }
 
             if show_mini_bar {
                 let item = now_playing.as_ref().expect("show_mini_bar implies Some");
                 let (elapsed_secs, duration_secs, paused) = playback_info(&player);
                 f.render_widget(
-                    MiniPlayerBar { title: &label(item), elapsed_secs, duration_secs, paused },
+                    MiniPlayerBar {
+                        title: &label(item),
+                        elapsed_secs,
+                        duration_secs,
+                        paused,
+                        loop_label: app.loop_mode.label(),
+                        shuffle_on: app.shuffle,
+                    },
                     // same y/height as the row carved out above, but
                     // main_content's x/width: the strip must not slide
                     // under the sidebar.
-                    Rect { x: main_content.x, width: main_content.width, ..mini_bar_row },
+                    Rect {
+                        x: main_content.x,
+                        width: main_content.width,
+                        ..mini_bar_row
+                    },
                 );
             }
 
-            let resize_hint = panels.resize_mode.then_some(
-                "resize mode: a=sidebar s=bottom bar, arrows stretch, r/esc exit",
-            );
+            let resize_hint = panels
+                .resize_mode
+                .then_some("resize mode: a=sidebar s=bottom bar, arrows stretch, r/esc exit");
             f.render_widget(
                 ControlsBar {
                     status: &status,
@@ -767,9 +936,18 @@ fn main() -> anyhow::Result<()> {
                     eq_preset: eq::PRESETS[app.eq_preset].name,
                     resize_hint,
                 },
-                Rect { y: bottom.y + 1, height: bottom.height.saturating_sub(1), ..bottom },
+                Rect {
+                    y: bottom.y + 1,
+                    height: bottom.height.saturating_sub(1),
+                    ..bottom
+                },
             );
-            f.render_widget(NotificationOverlay { items: notifications.visible() }, area);
+            f.render_widget(
+                NotificationOverlay {
+                    items: notifications.visible(),
+                },
+                area,
+            );
         })?;
 
         // non-blocking: mpv auto-advances its own playlist on
@@ -821,7 +999,8 @@ fn main() -> anyhow::Result<()> {
                 }
                 Err(msg) => {
                     if server_reachable.insert(sr.url.clone(), false) != Some(false) {
-                        notifications.push(Severity::Alert, format!("{} went offline: {msg}", sr.url));
+                        notifications
+                            .push(Severity::Alert, format!("{} went offline: {msg}", sr.url));
                     }
                 }
             }
@@ -942,7 +1121,10 @@ fn main() -> anyhow::Result<()> {
                                     nm.message = match result {
                                         Ok(msg) => format!("reconnected: {msg}"),
                                         Err(msg) => {
-                                            notifications.push(Severity::Error, format!("{}: {msg}", nav.url));
+                                            notifications.push(
+                                                Severity::Error,
+                                                format!("{}: {msg}", nav.url),
+                                            );
                                             msg
                                         }
                                     };
@@ -971,7 +1153,10 @@ fn main() -> anyhow::Result<()> {
                                 let nav = navidrome_config_from_form(form);
                                 match index_navidrome_server(&mut app, &nav) {
                                     Ok(msg) => {
-                                        notifications.push(Severity::Info, format!("connected: {}", nav.url));
+                                        notifications.push(
+                                            Severity::Info,
+                                            format!("connected: {}", nav.url),
+                                        );
                                         cfg.navidrome_servers.push(nav);
                                         let _ = config::save(&cfg);
                                         nm.connection_status.push(Some(true));
@@ -980,7 +1165,8 @@ fn main() -> anyhow::Result<()> {
                                         nm.message = format!("connected: {msg}");
                                     }
                                     Err(msg) => {
-                                        notifications.push(Severity::Error, format!("{}: {msg}", nav.url));
+                                        notifications
+                                            .push(Severity::Error, format!("{}: {msg}", nav.url));
                                         nm.message = format!("{msg} (esc to go back)");
                                     }
                                 }
@@ -1038,7 +1224,8 @@ fn main() -> anyhow::Result<()> {
                                     for t in &rest {
                                         let _ = try_enqueue(&player, t);
                                     }
-                                    previous_track = std::mem::replace(&mut now_playing, Some(first));
+                                    previous_track =
+                                        std::mem::replace(&mut now_playing, Some(first));
                                     app.queue = rest;
                                     original_queue = session;
                                     // keep the album/playlist listing
@@ -1055,18 +1242,35 @@ fn main() -> anyhow::Result<()> {
                         // with the full player; minimizing again
                         // brings it right back (not cleared, just not
                         // on top while the player's maximized).
-                        KeyCode::Char('m') if now_playing.is_some() => player_minimized = !player_minimized,
+                        KeyCode::Char('m') if now_playing.is_some() => {
+                            player_minimized = !player_minimized
+                        }
                         KeyCode::Char('i') => art_mode = art_mode.toggle(),
+                        KeyCode::Char(' ') if now_playing.is_some() => {
+                            let _ = player.toggle_pause();
+                        }
+                        KeyCode::Char('f') if now_playing.is_some() => {
+                            let _ = player.playlist_next();
+                        }
+                        KeyCode::Char('b') if previous_track.is_some() => {
+                            status = go_to_previous(
+                                &player,
+                                &mut now_playing,
+                                &mut previous_track,
+                                &mut app.queue,
+                            );
+                        }
                         KeyCode::Char('*') => {
                             if let Some(item) = bv.tracks.get(bv.selected).cloned() {
-                                status = match toggle_star(&item, &mut favorites, &mut remote_starred) {
-                                    Ok(true) => "starred".to_string(),
-                                    Ok(false) => "unstarred".to_string(),
-                                    Err(msg) => {
-                                        notifications.push(Severity::Error, msg.clone());
-                                        msg
-                                    }
-                                };
+                                status =
+                                    match toggle_star(&item, &mut favorites, &mut remote_starred) {
+                                        Ok(true) => "starred".to_string(),
+                                        Ok(false) => "unstarred".to_string(),
+                                        Err(msg) => {
+                                            notifications.push(Severity::Error, msg.clone());
+                                            msg
+                                        }
+                                    };
                             }
                         }
                         KeyCode::Esc | KeyCode::Char('q') => browse_view = None,
@@ -1080,8 +1284,12 @@ fn main() -> anyhow::Result<()> {
                 // underlying results selection.
                 if lyrics_lines.is_some() {
                     match key.code {
-                        KeyCode::Char('j') | KeyCode::Down => lyrics_scroll = lyrics_scroll.saturating_add(1),
-                        KeyCode::Char('k') | KeyCode::Up => lyrics_scroll = lyrics_scroll.saturating_sub(1),
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            lyrics_scroll = lyrics_scroll.saturating_add(1)
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            lyrics_scroll = lyrics_scroll.saturating_sub(1)
+                        }
                         KeyCode::Char('L') | KeyCode::Esc | KeyCode::Char('q') => {
                             lyrics_lines = None;
                             lyrics_scroll = 0;
@@ -1096,7 +1304,8 @@ fn main() -> anyhow::Result<()> {
                     nm.connection_status = test_navidrome_connectivity(&cfg.navidrome_servers);
                     for (nav, result) in cfg.navidrome_servers.iter().zip(&nm.connection_status) {
                         if *result == Some(false) {
-                            notifications.push(Severity::Alert, format!("{} is unreachable", nav.url));
+                            notifications
+                                .push(Severity::Alert, format!("{} is unreachable", nav.url));
                         }
                     }
                     nav_manager = Some(nm);
@@ -1105,7 +1314,9 @@ fn main() -> anyhow::Result<()> {
 
                 if key.code == KeyCode::Char('S') {
                     let bv = open_starred_view(&cfg.navidrome_servers, &favorites);
-                    real_art_protocol = picker.as_mut().and_then(|p| bv.art.clone().map(|img| p.new_resize_protocol(img)));
+                    real_art_protocol = picker
+                        .as_mut()
+                        .and_then(|p| bv.art.clone().map(|img| p.new_resize_protocol(img)));
                     browse_view = Some(bv);
                     continue;
                 }
@@ -1115,13 +1326,36 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                // not while typing a query; a space there is a literal
+                // character, not a transport command.
+                if key.code == KeyCode::Char(' ') && now_playing.is_some() && !app.editing_query {
+                    let _ = player.toggle_pause();
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('f') && now_playing.is_some() {
+                    let _ = player.playlist_next();
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('b') && previous_track.is_some() {
+                    status = go_to_previous(
+                        &player,
+                        &mut now_playing,
+                        &mut previous_track,
+                        &mut app.queue,
+                    );
+                    continue;
+                }
+
                 if key.code == KeyCode::Char('*') {
                     // the browse-view case is handled inside its own
                     // intercept above; this only ever runs when
                     // nothing's being browsed, so it's always the
                     // selected search result.
                     status = match app.results.get(app.selected).cloned() {
-                        Some(item) => match toggle_star(&item, &mut favorites, &mut remote_starred) {
+                        Some(item) => match toggle_star(&item, &mut favorites, &mut remote_starred)
+                        {
                             Ok(true) => "starred".to_string(),
                             Ok(false) => "unstarred".to_string(),
                             Err(msg) => {
@@ -1140,10 +1374,9 @@ fn main() -> anyhow::Result<()> {
                             Some((artist, title, album)) => {
                                 match lyrics_client.lookup(&artist, &title, &album, None) {
                                     Ok(Some(l)) => {
-                                        let text = l
-                                            .plain
-                                            .or(l.synced)
-                                            .unwrap_or_else(|| "(instrumental, no lyrics)".to_string());
+                                        let text = l.plain.or(l.synced).unwrap_or_else(|| {
+                                            "(instrumental, no lyrics)".to_string()
+                                        });
                                         lyrics_lines =
                                             Some(text.lines().map(str::to_string).collect());
                                         "lyrics loaded (j/k scroll, L/esc close)".to_string()
@@ -1172,15 +1405,17 @@ fn main() -> anyhow::Result<()> {
                     // instead of playing immediately ("let me scroll
                     // through the songs" first); songs/local files
                     // still play straight away.
-                    Action::Play(item @ SearchItem::Album { .. }) | Action::Play(item @ SearchItem::Playlist { .. }) => {
+                    Action::Play(item @ SearchItem::Album { .. })
+                    | Action::Play(item @ SearchItem::Playlist { .. }) => {
                         // on success, the opened view itself (title +
                         // track count in its header) is the
                         // confirmation; no need to also repeat it on
                         // the status line.
                         match open_browse_view(&item) {
                             Ok(bv) => {
-                                real_art_protocol =
-                                    picker.as_mut().and_then(|p| bv.art.clone().map(|img| p.new_resize_protocol(img)));
+                                real_art_protocol = picker.as_mut().and_then(|p| {
+                                    bv.art.clone().map(|img| p.new_resize_protocol(img))
+                                });
                                 browse_view = Some(bv);
                             }
                             Err(msg) => {
@@ -1202,14 +1437,21 @@ fn main() -> anyhow::Result<()> {
                                         let _ = try_enqueue(&player, t);
                                     }
                                     let rest = tracks.len();
-                                    original_queue = std::iter::once(first.clone()).chain(tracks.iter().cloned()).collect();
-                                    previous_track = std::mem::replace(&mut now_playing, Some(first));
+                                    original_queue = std::iter::once(first.clone())
+                                        .chain(tracks.iter().cloned())
+                                        .collect();
+                                    previous_track =
+                                        std::mem::replace(&mut now_playing, Some(first));
                                     app.queue = tracks;
                                     // a standalone play (not from an
                                     // open album/playlist) takes over
                                     // the full player by default.
                                     player_minimized = false;
-                                    if rest == 0 { s } else { format!("{s} (+{rest} more queued)") }
+                                    if rest == 0 {
+                                        s
+                                    } else {
+                                        format!("{s} (+{rest} more queued)")
+                                    }
                                 } else {
                                     notifications.push(Severity::Error, s.clone());
                                     s
@@ -1230,7 +1472,11 @@ fn main() -> anyhow::Result<()> {
                                 }
                                 let n = tracks.len();
                                 app.queue.extend(tracks);
-                                if n <= 1 { last_status } else { format!("queued {n} tracks") }
+                                if n <= 1 {
+                                    last_status
+                                } else {
+                                    format!("queued {n} tracks")
+                                }
                             }
                             Err(msg) => {
                                 notifications.push(Severity::Error, msg.clone());

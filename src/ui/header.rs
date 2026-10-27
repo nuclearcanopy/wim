@@ -57,7 +57,11 @@ pub fn draw_header(
             // into it. same rule_color as the rest of the line, same
             // as the │ above; one continuous line, one color, the ┴
             // shape alone marks where it meets the rule.
-            let ch = if junction_col == Some(col) { '┴' } else { '─' };
+            let ch = if junction_col == Some(col) {
+                '┴'
+            } else {
+                '─'
+            };
             if let Some(cell) = buf.cell_mut((x, rule_y)) {
                 cell.set_char(ch);
                 cell.set_fg(rule_color);
