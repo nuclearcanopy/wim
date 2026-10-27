@@ -9,6 +9,7 @@ use std::thread;
 use md5::{Digest, Md5};
 use rand::Rng;
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 use crate::config::NavidromeConfig;
 
@@ -35,7 +36,14 @@ const ALBUM_FETCH_CONCURRENCY: usize = 8;
 pub struct Client {
     base_url: String,
     username: String,
-    password: String,
+    /// Wiped on drop. Subsonic auth is `md5(password + salt)` with a
+    /// fresh salt per request, so the cleartext has to stay resident
+    /// for the whole session; zeroizing at least keeps it out of
+    /// freed heap pages, core dumps, and swap afterwards. It is still
+    /// cleartext in config.toml (0600) and passes through the raw
+    /// TOML string on load, so this narrows the window, not the
+    /// storage; see docs/security.md.
+    password: Zeroizing<String>,
     agent: ureq::Agent,
     /// Client-side `stream` overrides; `None` means "let the server's
     /// own configured transcoding profile decide," the default.
@@ -143,7 +151,7 @@ impl Client {
         Ok(Client {
             base_url: normalize_url(&cfg.url),
             username: cfg.username.clone(),
-            password: cfg.resolve_password()?,
+            password: Zeroizing::new(cfg.resolve_password()?),
             agent: ureq::AgentBuilder::new()
                 .max_idle_connections_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
                 .build(),
