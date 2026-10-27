@@ -46,6 +46,14 @@ pub const PRESETS: &[Preset] = &[
     },
 ];
 
+/// Index of the preset named `name`, if any; used to restore a
+/// persisted eq selection by name (see `config::Config::eq_preset`)
+/// rather than a raw index, which could point at a different preset
+/// entirely if `PRESETS` is ever reordered.
+pub fn index_of(name: &str) -> Option<usize> {
+    PRESETS.iter().position(|p| p.name == name)
+}
+
 /// Label on the trailing `astats` analysis stage (see
 /// `build_af_filter`); mpv exposes a labeled lavfi filter's metadata
 /// at `af-metadata/<label>/...`, polled by the now-playing level

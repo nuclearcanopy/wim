@@ -3,6 +3,7 @@ pub mod banner;
 pub mod browse;
 pub mod controlsbar;
 pub mod divider;
+pub mod eq_menu;
 pub mod header;
 pub mod help;
 pub mod helpbox;
