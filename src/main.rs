@@ -918,23 +918,44 @@ fn save_config(cfg: &config::Config, notifications: &mut Notifications) {
 /// `adjust_eq_band`'s job. Deliberately not wired to j/k: this
 /// overwrites all ten gains, which is not something plain navigation
 /// should ever do.
-fn apply_eq_preset_row(app: &mut app::App, player: &mpv::Mpv, row: usize) {
+fn apply_eq_preset_row(
+    app: &mut app::App,
+    player: &mpv::Mpv,
+    notifications: &mut Notifications,
+    row: usize,
+) {
     if row >= eq::PRESETS.len() {
         return;
     }
     app.eq_preset = row;
     app.eq_custom = false;
     app.eq_gains = eq::PRESETS[row].gains;
-    let _ = player.set_af(&eq::build_af_filter(&app.eq_gains));
+    apply_eq_gains(app, player, notifications);
+}
+
+/// Pushes `app.eq_gains` to mpv, reporting a failure: the menu paths
+/// used to discard the error while the global cycle-eq key reported
+/// it, so the same failure was visible from one route and silent from
+/// the other.
+fn apply_eq_gains(app: &app::App, player: &mpv::Mpv, notifications: &mut Notifications) {
+    if let Err(e) = player.set_af(&eq::build_af_filter(&app.eq_gains)) {
+        notifications.push(Severity::Error, format!("error setting eq: {e}"));
+    }
 }
 
 /// One h/l nudge (`dir`: -1.0 or 1.0) on band `band`, 1 dB per step,
 /// clamped to a sane range; touching any band diverges from whatever
 /// named preset was active into a "custom" setting.
-fn adjust_eq_band(app: &mut app::App, player: &mpv::Mpv, band: usize, dir: f64) {
+fn adjust_eq_band(
+    app: &mut app::App,
+    player: &mpv::Mpv,
+    notifications: &mut Notifications,
+    band: usize,
+    dir: f64,
+) {
     app.eq_gains[band] = (app.eq_gains[band] + dir).clamp(-12.0, 12.0);
     app.eq_custom = true;
-    let _ = player.set_af(&eq::build_af_filter(&app.eq_gains));
+    apply_eq_gains(app, player, notifications);
 }
 
 /// A completed background sync attempt for one server, tagged by url
@@ -2868,7 +2889,12 @@ fn main() -> anyhow::Result<()> {
                             eq_menu_selected = eq_menu_selected.saturating_sub(1);
                         }
                         KeyCode::Enter => {
-                            apply_eq_preset_row(&mut app, &player, eq_menu_selected);
+                            apply_eq_preset_row(
+                                &mut app,
+                                &player,
+                                &mut notifications,
+                                eq_menu_selected,
+                            );
                         }
                         KeyCode::Char('h') | KeyCode::Left
                             if eq_menu_selected >= ui::eq_menu::PRESET_COUNT =>
@@ -2876,6 +2902,7 @@ fn main() -> anyhow::Result<()> {
                             adjust_eq_band(
                                 &mut app,
                                 &player,
+                                &mut notifications,
                                 eq_menu_selected - ui::eq_menu::PRESET_COUNT,
                                 -1.0,
                             );
@@ -2886,6 +2913,7 @@ fn main() -> anyhow::Result<()> {
                             adjust_eq_band(
                                 &mut app,
                                 &player,
+                                &mut notifications,
                                 eq_menu_selected - ui::eq_menu::PRESET_COUNT,
                                 1.0,
                             );
@@ -3390,7 +3418,11 @@ fn main() -> anyhow::Result<()> {
                     } else {
                         0.5
                     };
-                    let _ = player.set_property("sub-delay", serde_json::json!(subtitle_delay));
+                    if let Err(e) =
+                        player.set_property("sub-delay", serde_json::json!(subtitle_delay))
+                    {
+                        notifications.push(Severity::Error, format!("subtitle delay: {e}"));
+                    }
                     notifications.push(
                         Severity::Info,
                         format!("subtitle delay: {subtitle_delay:+.1}s"),
