@@ -191,6 +191,26 @@ in
         exactly 10 entries.
       '';
     };
+
+    cacheListensThreshold = mkOption {
+      type = types.int;
+      default = 2;
+      description = ''
+        How many times a remote song must start playing before wim
+        automatically downloads it to the local cache
+        (~/.cache/wim/tracks). Tweakable live in the settings menu ('u').
+      '';
+    };
+
+    cacheEvictionDays = mkOption {
+      type = types.int;
+      default = 7;
+      description = ''
+        How many days a cached track can go unplayed before its
+        downloaded file is evicted to free disk space (play history
+        itself is kept). Also tweakable in the settings menu.
+      '';
+    };
   };
 
   config = mkIf cfg.enable {
@@ -218,6 +238,8 @@ in
         color_level = cfg.subtitles.colorLevel;
       };
       subtitle_language = cfg.subtitleLanguage;
+      cache_listens_threshold = cfg.cacheListensThreshold;
+      cache_eviction_days = cfg.cacheEvictionDays;
       navidrome_servers = map (s: {
         url = s.url;
         username = s.username;
