@@ -2145,6 +2145,7 @@ fn main() -> anyhow::Result<()> {
                         crossfade_on: crossfade_enabled,
                         previous: previous_label.as_deref(),
                         next: next_label.as_deref(),
+                        keymap: &keymap,
                     },
                     main_content,
                 );
@@ -2214,6 +2215,7 @@ fn main() -> anyhow::Result<()> {
                         phase,
                         elapsed_secs,
                         logo_index,
+                        keymap: &keymap,
                     },
                     main_content,
                 );
@@ -2279,6 +2281,7 @@ fn main() -> anyhow::Result<()> {
                             values[7].as_str(),
                         ],
                         selected: settings_menu_selected,
+                        keymap: &keymap,
                     },
                     top,
                 );
@@ -2326,6 +2329,7 @@ fn main() -> anyhow::Result<()> {
                         paused,
                         loop_label: app.loop_mode.label(),
                         shuffle_on: app.shuffle,
+                        keymap: &keymap,
                     },
                     // same y/height as the row carved out above, but
                     // main_content's x/width: the strip must not slide
@@ -2371,7 +2375,12 @@ fn main() -> anyhow::Result<()> {
                 },
             );
             f.render_widget(
-                ui::helpbox::HelpBox { label: "? help" },
+                ui::helpbox::HelpBox {
+                    label: &format!(
+                        "{} help",
+                        keymap::key_label(keymap.get(KeyAction::OpenHelp))
+                    ),
+                },
                 Rect {
                     x: help_box_x,
                     y: bottom.y + 1,
@@ -2408,6 +2417,7 @@ fn main() -> anyhow::Result<()> {
                             values[6].as_str(),
                         ],
                         selected: subtitle_menu_selected,
+                        keymap: &keymap,
                     },
                     area,
                 );

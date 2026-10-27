@@ -2,13 +2,16 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
+use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::theme::{shade, BRIGHT, DIM, NEAR_WHITE};
 use crate::ui::progress::{bar, fmt_time};
 use crate::ui::textfit::truncate_with_ellipsis;
 
 /// The full "maximized" now-playing screen: takes over `main_content`
-/// entirely, same as the banner/browse view it replaces. 'm' minimizes
-/// it back down to `MiniPlayerBar`.
+/// entirely, same as the banner/browse view it replaces. Minimizing it
+/// back down to `MiniPlayerBar` is `KeyAction::ToggleMinimize`; every
+/// key hinted on this screen is remappable, so all of them are
+/// resolved from `keymap` rather than printed as their default.
 pub struct PlayerView<'a> {
     pub title: &'a str,
     pub elapsed_secs: Option<f64>,
@@ -21,6 +24,7 @@ pub struct PlayerView<'a> {
     pub crossfade_on: bool,
     pub previous: Option<&'a str>,
     pub next: Option<&'a str>,
+    pub keymap: &'a Keymap,
 }
 
 impl Widget for PlayerView<'_> {
@@ -61,20 +65,27 @@ impl Widget for PlayerView<'_> {
         // than crammed onto the same line, so it reads as a labeled
         // button rather than a word salad.
         let play_icon = if self.paused { "⏸" } else { "▶" };
+        let key = |action| key_label(self.keymap.get(action));
         draw_transport_row(
             buf,
             area,
             mid_y + 3,
-            &[("b", "⏮"), ("space", play_icon), ("f", "⏭"), ("l", "↻")],
+            &[
+                (key(KeyAction::SkipBack), "⏮"),
+                (key(KeyAction::TogglePause), play_icon),
+                (key(KeyAction::SkipNext), "⏭"),
+                (key(KeyAction::CycleLoop), "↻"),
+            ],
             shade(DIM),
         );
 
         let state_line = format!(
-            "{}  shuffle: {}  speed: {:.2}x  eq: {}  crossfade (c): {}",
+            "{}  shuffle: {}  speed: {:.2}x  eq: {}  crossfade ({}): {}",
             self.loop_label,
             if self.shuffle_on { "on" } else { "off" },
             self.speed,
             self.eq_preset,
+            key(KeyAction::ToggleCrossfade),
             if self.crossfade_on { "on" } else { "off" },
         );
         draw_centered(buf, area, mid_y + 6, &state_line, shade(DIM));
@@ -83,7 +94,13 @@ impl Widget for PlayerView<'_> {
             draw_centered(buf, area, mid_y + 8, &format!("{next} ⏭"), shade(DIM));
         }
 
-        draw_centered(buf, area, mid_y + 10, "m: minimize", shade(DIM));
+        draw_centered(
+            buf,
+            area,
+            mid_y + 10,
+            &format!("{}: minimize", key(KeyAction::ToggleMinimize)),
+            shade(DIM),
+        );
     }
 }
 
@@ -94,7 +111,7 @@ fn draw_transport_row(
     buf: &mut Buffer,
     area: Rect,
     y: u16,
-    items: &[(&str, &str)],
+    items: &[(String, &str)],
     color: ratatui::style::Color,
 ) {
     const COL_WIDTH: u16 = 8;
@@ -128,5 +145,54 @@ fn draw_centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatu
             cell.set_char(ch);
             cell.set_fg(color);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyCode;
+
+    fn render_to_string(keymap: &Keymap) -> String {
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        PlayerView {
+            title: "a song",
+            elapsed_secs: Some(10.0),
+            duration_secs: Some(100.0),
+            paused: false,
+            loop_label: "loop: off",
+            shuffle_on: false,
+            speed: 1.0,
+            eq_preset: "flat",
+            crossfade_on: false,
+            previous: None,
+            next: None,
+            keymap,
+        }
+        .render(area, &mut buf);
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_hint_follows_the_live_keymap() {
+        let mut keymap = Keymap::default();
+        keymap.set(KeyAction::ToggleMinimize, KeyCode::Char('z'));
+        keymap.set(KeyAction::ToggleCrossfade, KeyCode::Char('x'));
+        keymap.set(KeyAction::TogglePause, KeyCode::F(5));
+        let out = render_to_string(&keymap);
+        assert!(out.contains("z: minimize"), "got:\n{out}");
+        assert!(out.contains("crossfade (x):"), "got:\n{out}");
+        assert!(out.contains("f5"), "transport row kept a default:\n{out}");
+        assert!(!out.contains("m: minimize"), "stale default key:\n{out}");
+        assert!(!out.contains("crossfade (c)"), "stale default key:\n{out}");
+        assert!(!out.contains("space"), "stale default key:\n{out}");
     }
 }
