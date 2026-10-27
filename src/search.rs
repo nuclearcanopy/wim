@@ -16,6 +16,48 @@ use crate::subsonic::{
     Album, Artist, Client, Playlist, SearchResult as SubsonicSearchResult, Song,
 };
 
+/// Results-list section a `SearchItem` groups under; see
+/// `SearchItem::category`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Category {
+    Artists,
+    Albums,
+    Songs,
+    Videos,
+    Playlists,
+}
+
+impl Category {
+    pub fn label(self) -> &'static str {
+        match self {
+            Category::Artists => "ARTISTS",
+            Category::Albums => "ALBUMS",
+            Category::Songs => "SONGS",
+            Category::Videos => "VIDEOS",
+            Category::Playlists => "PLAYLISTS",
+        }
+    }
+}
+
+/// `(index, category)` for every point a results list's category
+/// changes, always including index 0 if `items` is non-empty; a
+/// section header goes immediately before each of these. Shared by
+/// `ui::results_list`'s own row layout and main.rs's sidebar-divider
+/// junction marks so the two can never disagree about where a header
+/// actually lands on screen.
+pub fn group_boundaries(items: &[SearchItem]) -> Vec<(usize, Category)> {
+    let mut boundaries = Vec::new();
+    let mut last = None;
+    for (i, item) in items.iter().enumerate() {
+        let cat = item.category();
+        if last != Some(cat) {
+            boundaries.push((i, cat));
+            last = Some(cat);
+        }
+    }
+    boundaries
+}
+
 #[derive(Debug, Clone)]
 pub enum SearchItem {
     LocalMusic {
@@ -98,6 +140,20 @@ impl SearchItem {
             SearchItem::Song { id, .. } => Some((2, id.as_str())),
             SearchItem::Playlist { id, .. } => Some((3, id.as_str())),
             SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => None,
+        }
+    }
+
+    /// The results-list section this item groups under; local music
+    /// and remote songs share one "songs" section rather than
+    /// splitting local-vs-remote further, since that distinction
+    /// already shows up per-row (`results_list::source_code`).
+    pub fn category(&self) -> Category {
+        match self {
+            SearchItem::Artist { .. } => Category::Artists,
+            SearchItem::Album { .. } => Category::Albums,
+            SearchItem::LocalMusic { .. } | SearchItem::Song { .. } => Category::Songs,
+            SearchItem::LocalVideo { .. } => Category::Videos,
+            SearchItem::Playlist { .. } => Category::Playlists,
         }
     }
 
@@ -278,7 +334,32 @@ impl Corpus {
             .collect();
 
         scored.sort_by_key(|a| std::cmp::Reverse(a.0));
-        scored.into_iter().map(|(_, item)| item.clone()).collect()
+
+        // group same-category items together (section headers in the
+        // results list), but order the groups themselves by each
+        // one's single best match rather than a fixed kind ordering:
+        // the first item of a category in this already best-first
+        // list *is* that category's best score, so the order
+        // categories are first seen in is already "best match leads".
+        // searching "bladee" with a 100% artist match still puts
+        // Artists first even though a song titled "Rewind feat.
+        // Bladee" might outscore the rest of that artist's own songs.
+        let mut group_order: Vec<Category> = Vec::new();
+        for (_, item) in &scored {
+            let cat = item.category();
+            if !group_order.contains(&cat) {
+                group_order.push(cat);
+            }
+        }
+        group_order
+            .into_iter()
+            .flat_map(|cat| {
+                scored
+                    .iter()
+                    .filter(move |(_, item)| item.category() == cat)
+                    .map(|(_, item)| (*item).clone())
+            })
+            .collect()
     }
 }
 

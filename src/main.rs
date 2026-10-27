@@ -1093,6 +1093,22 @@ fn main() -> anyhow::Result<()> {
                 // static color matching draw_header's own rule_color.
                 junction_rows.push((main_content.y + 1, '├', shade(NEAR_BLACK)));
             }
+            // each results-list section header is itself a full-width
+            // rule (see ui::results_list::draw_header_row); same
+            // layout() call the list's own render uses, so a header's
+            // row here always matches exactly where one actually is.
+            let (results_rows, results_scroll) = ui::results_list::layout(
+                &app.results,
+                app.selected,
+                sidebar_rows[1].height as usize,
+            );
+            for row in 0..sidebar_rows[1].height as usize {
+                if let Some(ui::results_list::DisplayRow::Header(_)) =
+                    results_rows.get(results_scroll + row)
+                {
+                    junction_rows.push((sidebar_rows[1].y + row as u16, '┤', shade(NEAR_BLACK)));
+                }
+            }
             // the divider used to stop at the bottom of `top`, one row
             // short of the mini player strip below it (a separate row
             // in the outer vertical split, sidebar-width columns

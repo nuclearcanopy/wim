@@ -5,9 +5,53 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
 use crate::favorites::Favorites;
-use crate::search::SearchItem;
-use crate::theme::{shade, BRIGHT, DIM};
+use crate::search::{group_boundaries, Category, SearchItem};
+use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK};
 use crate::ui::textfit::truncate_with_ellipsis;
+
+/// One rendered row: either a section header or an actual result,
+/// carrying its index into the original `items` slice so the caller
+/// can map back to it (`self.selected` stays a plain index into
+/// `items`; headers never get one).
+pub enum DisplayRow {
+    Header(Category),
+    Item(usize),
+}
+
+/// Flattens `items` (already grouped into category runs by
+/// `Corpus::search`) into a display-row sequence with a header before
+/// each run, plus the scroll offset keeping `selected` visible within
+/// `visible_rows`. The one place both this widget's own render and
+/// main.rs's sidebar-divider header-junction marks compute this, so
+/// they can't disagree about where a header actually lands.
+pub fn layout(
+    items: &[SearchItem],
+    selected: usize,
+    visible_rows: usize,
+) -> (Vec<DisplayRow>, usize) {
+    let boundaries = group_boundaries(items);
+    let mut rows = Vec::with_capacity(items.len() + boundaries.len());
+    let mut next_boundary = boundaries.into_iter().peekable();
+    for i in 0..items.len() {
+        if let Some((idx, cat)) = next_boundary.peek() {
+            if *idx == i {
+                rows.push(DisplayRow::Header(*cat));
+                next_boundary.next();
+            }
+        }
+        rows.push(DisplayRow::Item(i));
+    }
+    let selected_row = rows
+        .iter()
+        .position(|r| matches!(r, DisplayRow::Item(i) if *i == selected))
+        .unwrap_or(0);
+    let scroll_offset = if selected_row >= visible_rows {
+        selected_row + 1 - visible_rows
+    } else {
+        0
+    };
+    (rows, scroll_offset)
+}
 
 /// Plain ASCII, not unicode pictographs: even nominally "geometric,
 /// not emoji" symbols (e.g. the bullseye tried earlier for albums)
@@ -123,49 +167,80 @@ impl Widget for ResultsList<'_> {
         }
 
         let visible_rows = area.height as usize;
-        let scroll_offset = if self.selected >= visible_rows {
-            self.selected + 1 - visible_rows
-        } else {
-            0
-        };
+        let (rows, scroll_offset) = layout(self.items, self.selected, visible_rows);
 
         for row in 0..visible_rows {
-            let idx = scroll_offset + row;
-            let Some(item) = self.items.get(idx) else {
+            let Some(display_row) = rows.get(scroll_offset + row) else {
                 break;
             };
-            let is_selected = idx == self.selected;
             let y = area.y + row as u16;
 
-            let fg = if is_selected {
-                shade(BRIGHT)
-            } else {
-                shade(DIM)
-            };
-            let marker = if is_selected { "> " } else { "  " };
-            let star = if is_starred(item, self.favorites, self.remote_starred) {
-                "* "
-            } else {
-                ""
-            };
-            let full = format!(
-                "{marker}[{}{}] {star}{}",
-                source_code(item),
-                kind_code(item),
-                row_label(item, is_selected)
-            );
-            let text = truncate_with_ellipsis(&full, area.width as usize);
+            match display_row {
+                DisplayRow::Header(cat) => draw_header_row(buf, area, y, cat.label()),
+                DisplayRow::Item(idx) => {
+                    let item = &self.items[*idx];
+                    let is_selected = *idx == self.selected;
 
-            for (col, ch) in text.chars().enumerate() {
-                let x = area.x + col as u16;
-                if x >= area.x + area.width {
-                    break;
-                }
-                if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_char(ch);
-                    cell.set_fg(fg);
+                    let fg = if is_selected {
+                        shade(BRIGHT)
+                    } else {
+                        shade(DIM)
+                    };
+                    let marker = if is_selected { "> " } else { "  " };
+                    let star = if is_starred(item, self.favorites, self.remote_starred) {
+                        "* "
+                    } else {
+                        ""
+                    };
+                    let full = format!(
+                        "{marker}[{}{}] {star}{}",
+                        source_code(item),
+                        kind_code(item),
+                        row_label(item, is_selected)
+                    );
+                    let text = truncate_with_ellipsis(&full, area.width as usize);
+
+                    for (col, ch) in text.chars().enumerate() {
+                        let x = area.x + col as u16;
+                        if x >= area.x + area.width {
+                            break;
+                        }
+                        if let Some(cell) = buf.cell_mut((x, y)) {
+                            cell.set_char(ch);
+                            cell.set_fg(fg);
+                        }
+                    }
                 }
             }
+        }
+    }
+}
+
+/// A full-width dim rule with the section name centered, rather than
+/// a plain text line: it's what actually reads as "a divider between
+/// groups" instead of just another row, and fills the whole width so
+/// it visually meets the sidebar's own vertical divider immediately
+/// to its right (see main.rs's matching junction mark at this same
+/// row).
+fn draw_header_row(buf: &mut Buffer, area: Rect, y: u16, label: &str) {
+    let rule_color = shade(NEAR_BLACK);
+    for col in 0..area.width {
+        if let Some(cell) = buf.cell_mut((area.x + col, y)) {
+            cell.set_char('─');
+            cell.set_fg(rule_color);
+        }
+    }
+    let text = format!(" {label} ");
+    let text_width = text.chars().count() as u16;
+    let start_x = area.x + area.width.saturating_sub(text_width) / 2;
+    for (i, ch) in text.chars().enumerate() {
+        let x = start_x + i as u16;
+        if x >= area.x + area.width {
+            break;
+        }
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_char(ch);
+            cell.set_fg(shade(DIM));
         }
     }
 }
