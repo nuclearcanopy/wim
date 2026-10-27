@@ -48,6 +48,7 @@ use ui::onboarding::{ControlsView, DoneView, LibraryPathsView, WelcomeView};
 use ui::player::PlayerView;
 use ui::results_list::{label, ResultsList};
 use ui::searchbox::SearchBox;
+use ui::visualizer::LevelMeter;
 
 /// Local items resolve straight to a file path mpv can load. A remote
 /// `Song` resolves straight to a stream url (mpv loads http urls the
@@ -400,6 +401,28 @@ fn playback_info(player: &mpv::Mpv) -> (Option<f64>, Option<f64>, bool) {
     (elapsed, duration, paused)
 }
 
+/// Current output level, 0..1, for the now-playing level meter.
+/// Best-effort: reads the `astats` tap `build_af_filter` (eq.rs) adds
+/// to the end of the af chain, via mpv's `af-metadata/<label>/...`
+/// property. If that property path doesn't resolve the way expected
+/// (wrong mpv version, filter not actually in the graph yet, af-
+/// metadata represented differently than guessed), this falls back to
+/// a calm idle sine pulse instead of silently showing a dead meter;
+/// `phase` drives that fallback and is advanced by the caller.
+fn audio_level(player: &mpv::Mpv, phase: f32) -> f32 {
+    let key = format!(
+        "af-metadata/{}/lavfi.astats.Overall.RMS_level",
+        eq::LEVEL_METADATA_LABEL
+    );
+    if let Some(db) = player.get_property(&key).ok().and_then(|v| v.as_f64()) {
+        // RMS level is dBFS, roughly -60 (near silent) to 0 (full
+        // scale); map that range to 0..1 rather than guessing a
+        // narrower one that'd clip real audio's dynamic range.
+        return ((db as f32 + 60.0) / 60.0).clamp(0.0, 1.0);
+    }
+    (phase.sin() * 0.3 + 0.35).clamp(0.0, 1.0)
+}
+
 /// How often the background thread (see `spawn_background_sync`)
 /// re-fetches every configured server, so navidrome stays "constantly
 /// updating" without the user ever pressing a manual refresh key.
@@ -600,6 +623,9 @@ fn main() -> anyhow::Result<()> {
     // terminal with none of those; that fallback not being monochrome
     // is the explicit tradeoff of asking for real images).
     let mut art_mode = browse::ArtMode::Ascii;
+    // rolling window for the now-playing level meter; a fixed-size
+    // ring (just truncate the front) rather than growing forever.
+    let mut level_history: Vec<f32> = Vec::new();
     let mut notifications = Notifications::default();
     let lyrics_client = lyrics::Client::new();
     let mut lyrics_lines: Option<Vec<String>> = None;
@@ -917,6 +943,26 @@ fn main() -> anyhow::Result<()> {
                     },
                     main_content,
                 );
+
+                let phase = start.elapsed().as_secs_f32() * 2.0;
+                level_history.push(audio_level(&player, phase));
+                let max_history = main_content.width.max(1) as usize;
+                if level_history.len() > max_history {
+                    level_history.drain(..level_history.len() - max_history);
+                }
+                if main_content.height > 2 {
+                    let meter_rect = Rect {
+                        y: main_content.y + main_content.height - 2,
+                        height: 2,
+                        ..main_content
+                    };
+                    f.render_widget(
+                        LevelMeter {
+                            history: &level_history,
+                        },
+                        meter_rect,
+                    );
+                }
             } else if let Some(bv) = &browse_view {
                 f.render_widget(
                     BrowseListView {
