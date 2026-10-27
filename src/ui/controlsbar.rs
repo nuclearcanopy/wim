@@ -6,6 +6,25 @@ use ratatui::widgets::Widget;
 use crate::theme::{lerp, shade, DIM, NEAR_WHITE, WHITE};
 use crate::ui::textfit::truncate_with_ellipsis;
 
+/// How many of `lengths` (each segment's own character count, in
+/// priority order) fit within `available_width` once a 2-char
+/// separator between every pair is accounted for. Dropping whole
+/// lowest-priority (rightmost) segments once the full line stops
+/// fitting, rather than cutting the last one off mid-word ("cros"
+/// from "crossfade: off", which is what a plain per-character
+/// truncation at `available_width` used to produce).
+fn segments_that_fit(lengths: &[usize], available_width: usize) -> usize {
+    let mut used = 0usize;
+    for (i, &len) in lengths.iter().enumerate() {
+        let needed = len + if i > 0 { 2 } else { 0 };
+        if used + needed > available_width {
+            return i;
+        }
+        used += needed;
+    }
+    lengths.len()
+}
+
 /// Which state-line value last changed, for `ControlsBar::flash`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -118,22 +137,11 @@ fn draw_segments(
     selected: Option<Field>,
 ) {
     let limit = area.x + width.min(area.width as usize) as u16;
-    // a segment that doesn't fully fit used to get cut off mid-word
-    // ("cros" from "crossfade: off") since draw_chars just stops
-    // wherever it runs out of room; drop whole lowest-priority
-    // (rightmost) segments instead once the full line stops fitting,
-    // same "queue first, crossfade last" priority the segment order
-    // already implies.
-    let mut fits = segments.len();
-    let mut used = 0usize;
-    for (i, (_, text)) in segments.iter().enumerate() {
-        let needed = text.chars().count() + if i > 0 { 2 } else { 0 };
-        if used + needed > limit.saturating_sub(area.x) as usize {
-            fits = i;
-            break;
-        }
-        used += needed;
-    }
+    let lengths: Vec<usize> = segments
+        .iter()
+        .map(|(_, text)| text.chars().count())
+        .collect();
+    let fits = segments_that_fit(&lengths, limit.saturating_sub(area.x) as usize);
     let mut x = area.x;
     for (i, (field, text)) in segments.iter().take(fits).enumerate() {
         if x >= limit {
@@ -200,5 +208,43 @@ fn draw_line(
             cell.set_char(ch);
             cell.set_fg(color);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_segment_fits_when_there_is_room() {
+        let lengths = [5, 10, 3]; // + 2*2 separators = 22
+        assert_eq!(segments_that_fit(&lengths, 22), 3);
+        assert_eq!(segments_that_fit(&lengths, 100), 3);
+    }
+
+    #[test]
+    fn drops_whole_trailing_segments_instead_of_cutting_one_mid_word() {
+        // "queue: 0" (8) + "  " + "crossfade: off" (14) = 24; a width
+        // of 20 can't fit the second segment at all, so it should be
+        // dropped entirely rather than showing "crossfade: o".
+        let lengths = [8, 14];
+        assert_eq!(segments_that_fit(&lengths, 20), 1);
+    }
+
+    #[test]
+    fn keeps_the_first_segment_even_if_nothing_else_fits() {
+        let lengths = [8, 14];
+        assert_eq!(segments_that_fit(&lengths, 10), 1);
+    }
+
+    #[test]
+    fn returns_zero_when_not_even_the_first_segment_fits() {
+        let lengths = [8, 14];
+        assert_eq!(segments_that_fit(&lengths, 5), 0);
+    }
+
+    #[test]
+    fn empty_segments_list_fits_trivially() {
+        assert_eq!(segments_that_fit(&[], 0), 0);
     }
 }
