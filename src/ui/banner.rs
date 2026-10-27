@@ -1,7 +1,10 @@
+use std::time::Duration;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
+use crate::anim;
 use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::theme::{lerp, shade, BRIGHT, DIM, NEAR_WHITE, WHITE};
 use crate::ui::logos::LOGOS;
@@ -82,18 +85,13 @@ const MENU: &[(KeyAction, &str)] = &[
 /// dashboard structure). No item count here: it used to sit as a
 /// permanent footer line, which read as the app announcing a number
 /// nobody asked for every time this screen was on; 'I' surfaces it on
-/// demand instead. `phase`/`elapsed` are advanced by the caller each
-/// tick. `logo_index` selects which of `logo_lines`' entries to draw.
+/// demand instead. Both motions come off `elapsed` (time since app
+/// start) via `anim`, so they run at the same speed on any display.
+/// `logo_index` selects which of `logo_lines`' entries to draw.
 pub struct Banner<'a> {
-    pub phase: f32,
-    pub elapsed_secs: f32,
+    pub elapsed: Duration,
     pub logo_index: usize,
     pub keymap: &'a Keymap,
-}
-
-/// 0..1, slow breathing.
-pub fn pulse_level(elapsed_secs: f32) -> f32 {
-    (elapsed_secs * 1.3).sin() * 0.5 + 0.5
 }
 
 impl Widget for Banner<'_> {
@@ -107,7 +105,8 @@ impl Widget for Banner<'_> {
         let frame_height = glyph_height + 2 + MENU.len() as u16;
         let logo_start_y = area.y + area.height.saturating_sub(frame_height) / 2;
 
-        let pulse = pulse_level(self.elapsed_secs);
+        let phase = anim::phase(self.elapsed, anim::BANNER_SWEEP_PERIOD);
+        let pulse = anim::pulse(self.elapsed, anim::BANNER_PULSE_PERIOD);
 
         // a blank column of breathing room on each side; sitting
         // right up against the logo's own edge read as touching it.
@@ -135,7 +134,7 @@ impl Widget for Banner<'_> {
                     continue;
                 }
                 let rel = (x - start_x) as f32 / total_width.max(1) as f32;
-                let sweep = ((rel - self.phase).rem_euclid(1.0) - 0.5).abs() * 2.0;
+                let sweep = ((rel - phase).rem_euclid(1.0) - 0.5).abs() * 2.0;
                 // all math stays in plain 0..1 levels until the one
                 // conversion to a Color at the end.
                 let sweep_level = lerp(WHITE, BRIGHT, sweep);
@@ -220,8 +219,7 @@ mod tests {
         let area = Rect::new(0, 0, 60, 24);
         let mut buf = Buffer::empty(area);
         Banner {
-            phase: 0.0,
-            elapsed_secs: 0.0,
+            elapsed: Duration::ZERO,
             logo_index: 0,
             keymap,
         }
