@@ -1,9 +1,11 @@
 use std::collections::HashSet;
+use std::time::Duration;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
+use crate::anim;
 use crate::favorites::Favorites;
 use crate::search::{group_boundaries, Category, SearchItem};
 use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK};
@@ -158,6 +160,13 @@ pub struct ResultsList<'a> {
     pub empty_message: &'a str,
     pub favorites: &'a Favorites,
     pub remote_starred: &'a HashSet<String>,
+    /// Whether the sidebar itself currently holds focus: the selected
+    /// row's background only breathes in the focused pane, and sits at
+    /// a flat dimmer level otherwise (see `anim::selection_bg`).
+    pub focused: bool,
+    /// Time since app start; the one input to every animation, so the
+    /// pulse runs at the same speed whatever the display's rate is.
+    pub elapsed: Duration,
 }
 
 impl Widget for ResultsList<'_> {
@@ -196,6 +205,13 @@ impl Widget for ResultsList<'_> {
                     let item = &self.items[*idx];
                     let is_selected = *idx == self.selected;
 
+                    // the selection reads off the row's background,
+                    // not its borders; the marker and brightness bump
+                    // below stay on top of it.
+                    if is_selected {
+                        fill_row_bg(buf, area, y, anim::selection_bg(self.elapsed, self.focused));
+                    }
+
                     let fg = if is_selected {
                         shade(BRIGHT)
                     } else {
@@ -231,6 +247,22 @@ impl Widget for ResultsList<'_> {
     }
 }
 
+/// Paints one row of `area` a flat background level across its whole
+/// width, so a selection highlight is a full bar rather than ending
+/// wherever that row's label happens to stop. Shared with
+/// `ui::browse`'s lists, same as `draw_header_row` below.
+pub(crate) fn fill_row_bg(buf: &mut Buffer, area: Rect, y: u16, level: f32) {
+    if y >= area.y + area.height {
+        return;
+    }
+    let bg = shade(level);
+    for col in 0..area.width {
+        if let Some(cell) = buf.cell_mut((area.x + col, y)) {
+            cell.set_bg(bg);
+        }
+    }
+}
+
 /// A full-width dim rule with the section name centered, rather than
 /// a plain text line: it's what actually reads as "a divider between
 /// groups" instead of just another row, and fills the whole width so
@@ -256,6 +288,91 @@ pub(crate) fn draw_header_row(buf: &mut Buffer, area: Rect, y: u16, label: &str)
         if let Some(cell) = buf.cell_mut((x, y)) {
             cell.set_char(ch);
             cell.set_fg(shade(DIM));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::testbuf::buffer;
+    use ratatui::style::Color;
+
+    fn items(n: usize) -> Vec<SearchItem> {
+        (0..n)
+            .map(|i| SearchItem::LocalMusic {
+                path: format!("/m/{i}.flac").into(),
+                title: format!("track {i}"),
+                artist: None,
+                album: None,
+            })
+            .collect()
+    }
+
+    fn render(selected: usize, focused: bool, elapsed: Duration) -> Buffer {
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buf = buffer(20, 5);
+        ResultsList {
+            items: &items(3),
+            selected,
+            empty_message: "",
+            favorites: &Favorites::default(),
+            remote_starred: &HashSet::new(),
+            focused,
+            elapsed,
+        }
+        .render(area, &mut buf);
+        buf
+    }
+
+    fn row_bgs(buf: &Buffer, y: u16) -> Vec<Color> {
+        (0..buf.area.width)
+            .map(|x| buf.cell((x, y)).unwrap().bg)
+            .collect()
+    }
+
+    /// Row 0 is the category header `layout` inserts, so the items
+    /// start at row 1.
+    const FIRST_ITEM_ROW: u16 = 1;
+
+    #[test]
+    fn the_selected_row_carries_a_background_across_its_full_width() {
+        let buf = render(0, true, Duration::ZERO);
+        let expected = shade(anim::selection_bg(Duration::ZERO, true));
+        assert_eq!(row_bgs(&buf, FIRST_ITEM_ROW), vec![expected; 20]);
+    }
+
+    #[test]
+    fn unselected_rows_keep_the_default_background() {
+        let buf = render(0, true, Duration::ZERO);
+        for y in [FIRST_ITEM_ROW + 1, FIRST_ITEM_ROW + 2] {
+            assert_eq!(
+                row_bgs(&buf, y),
+                vec![Color::Reset; 20],
+                "row {y} must not be highlighted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_focused_panes_selection_pulses_over_time() {
+        let trough = render(0, true, Duration::ZERO);
+        let peak = render(0, true, anim::SELECTION_PULSE_PERIOD / 2);
+        assert_ne!(
+            row_bgs(&trough, FIRST_ITEM_ROW),
+            row_bgs(&peak, FIRST_ITEM_ROW),
+            "the background has to move, not sit on one level"
+        );
+    }
+
+    /// A row stays selected in a pane that lost focus; it just holds
+    /// a flat dimmer background instead of competing for attention.
+    #[test]
+    fn an_unfocused_panes_selection_does_not_pulse() {
+        let flat = shade(anim::SELECTION_BG_UNFOCUSED);
+        for t in [Duration::ZERO, anim::SELECTION_PULSE_PERIOD / 2] {
+            let buf = render(0, false, t);
+            assert_eq!(row_bgs(&buf, FIRST_ITEM_ROW), vec![flat; 20]);
         }
     }
 }
