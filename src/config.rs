@@ -139,6 +139,13 @@ pub struct Config {
     /// Tweakable live in the settings menu ('u').
     #[serde(default = "default_cache_listens_threshold")]
     pub cache_listens_threshold: u32,
+    /// Panel sizes from resize mode ('r'), persisted so a layout you
+    /// deliberately set survives a restart; clamped on load by
+    /// `layout::PanelLayout::from_sizes`.
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: u16,
+    #[serde(default = "default_bottom_bar_height")]
+    pub bottom_bar_height: u16,
     /// How many days a cached track can go unplayed before it's
     /// evicted (the file deleted, not its play history) to free disk
     /// space. Also tweakable in the settings menu.
@@ -156,6 +163,14 @@ fn default_eq_preset() -> Option<String> {
 
 fn default_eq_gains() -> [f64; 10] {
     eq::PRESETS[0].gains
+}
+
+fn default_sidebar_width() -> u16 {
+    crate::layout::SIDEBAR_DEFAULT
+}
+
+fn default_bottom_bar_height() -> u16 {
+    crate::layout::BOTTOM_BAR_DEFAULT
 }
 
 fn default_cache_listens_threshold() -> u32 {
@@ -292,6 +307,8 @@ impl Default for Config {
             logo_style: None,
             eq_preset: default_eq_preset(),
             eq_gains: default_eq_gains(),
+            sidebar_width: default_sidebar_width(),
+            bottom_bar_height: default_bottom_bar_height(),
             keybinds: HashMap::new(),
             cache_listens_threshold: default_cache_listens_threshold(),
             cache_eviction_days: default_cache_eviction_days(),
