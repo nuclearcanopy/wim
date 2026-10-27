@@ -149,6 +149,12 @@ fn index_navidrome_server(app: &mut app::App, nav: &config::NavidromeConfig) -> 
                 songs: Vec::new(),
             });
             app.corpus.add_playlists(playlists);
+            // mutating the corpus without this leaves any already-typed
+            // query showing stale results until the user happens to
+            // type or backspace a character — which they may never do
+            // if they already have the query they want. every call
+            // site gets this for free instead of having to remember it.
+            app.resync_results();
 
             Ok(format!("{artist_count} artists, {album_count} albums, {playlist_count} playlists indexed"))
         }
@@ -210,10 +216,28 @@ fn main() -> anyhow::Result<()> {
     // pick between (consistent with search spanning everything). best
     // effort: one server being down shouldn't block startup or hide
     // the others.
-    for nav in &cfg.navidrome_servers {
-        if let Ok(msg) = index_navidrome_server(&mut app, nav) {
-            status = format!("{} local items indexed, navidrome: {msg}", app.corpus.len());
+    if !cfg.navidrome_servers.is_empty() {
+        let mut failures = Vec::new();
+        for nav in &cfg.navidrome_servers {
+            if let Err(msg) = index_navidrome_server(&mut app, nav) {
+                failures.push(format!("{}: {msg}", nav.url));
+            }
         }
+        app.resync_results();
+        status = if failures.is_empty() {
+            format!("{} items indexed (local + navidrome)", app.corpus.len())
+        } else {
+            // a failed reconnect must not be silent — the old behavior
+            // only updated `status` on success, so a down server at
+            // startup looked identical to "nothing configured", with
+            // no hint anything had gone wrong.
+            format!(
+                "{} items indexed; {} navidrome server(s) failed to connect: {}",
+                app.corpus.len(),
+                failures.len(),
+                failures.join("; ")
+            )
+        };
     }
 
     // 'n' opens the profile manager standalone, later.
