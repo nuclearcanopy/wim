@@ -1461,6 +1461,18 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                // every other block below intercepts specific keys and
+                // unconditionally `continue`s even on a non-match
+                // (browse_view/lyrics especially), so a query typed
+                // while either was open got half-swallowed, half
+                // misrouted into playback shortcuts instead of
+                // reaching the text box. One early, unconditional gate
+                // here: editing a query claims every key, full stop.
+                if app.editing_query {
+                    app.handle_key(key.code);
+                    continue;
+                }
+
                 if panels.resize_mode {
                     // each panel only answers to its one valid resize
                     // axis: sidebar is a vertical strip (left/right
@@ -1642,9 +1654,9 @@ fn main() -> anyhow::Result<()> {
                 // subtitle sync is the one styling knob worth
                 // adjusting live (discovered mid-playback); the rest
                 // (size/position/outline/blur/color) are config-only,
-                // set once at startup.
-                if matches!(key.code, KeyCode::Char(',') | KeyCode::Char('.')) && !app.editing_query
-                {
+                // set once at startup. editing_query is already ruled
+                // out above.
+                if matches!(key.code, KeyCode::Char(',') | KeyCode::Char('.')) {
                     subtitle_delay += if key.code == KeyCode::Char(',') {
                         -0.5
                     } else {
