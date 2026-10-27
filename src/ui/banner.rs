@@ -50,6 +50,28 @@ pub fn rule_rows(area: Rect) -> [u16; 2] {
     [block_start_y, rule_y]
 }
 
+/// 0..1, slow breathing; the single source of this animation's phase
+/// so the rule's own color and the junction glow (`junction_level`,
+/// drawn by a different widget entirely) stay in lockstep instead of
+/// drifting out of sync with two independent calculations.
+pub fn pulse_level(elapsed_secs: f32) -> f32 {
+    (elapsed_secs * 1.3).sin() * 0.5 + 0.5
+}
+
+/// The rule's own brightness at a given pulse phase.
+fn rule_level(pulse: f32) -> f32 {
+    lerp(NEAR_BLACK, DIM * 0.5, pulse)
+}
+
+/// Brighter peak for the junction character itself (drawn by
+/// `VerticalRule`, one column to the left of where this widget's own
+/// rule starts) and the couple of rule characters nearest to it, so
+/// the junction doesn't look like the one static, dead spot on an
+/// otherwise animated line.
+pub fn junction_level(pulse: f32) -> f32 {
+    lerp(NEAR_BLACK, BRIGHT, pulse)
+}
+
 impl Widget for Banner {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let total_width = LOGO[0].chars().count() as u16;
@@ -57,7 +79,7 @@ impl Widget for Banner {
         let start_x = area.x + area.width.saturating_sub(total_width) / 2;
         let [block_start_y, rule_y] = rule_rows(area);
 
-        let pulse = (self.elapsed_secs * 1.3).sin() * 0.5 + 0.5; // 0..1, slow breathing
+        let pulse = pulse_level(self.elapsed_secs);
 
         draw_rule(buf, area, block_start_y, pulse);
         let logo_start_y = block_start_y + 1;
@@ -93,18 +115,30 @@ impl Widget for Banner {
     }
 }
 
+/// Tapers the brightness of the first couple of characters toward the
+/// junction's own glow level rather than cutting straight to the
+/// rule's normal (much dimmer) brightness, so the junction reads as
+/// the brightest point of one continuous glow fading outward, not a
+/// single lit pixel next to an otherwise flat line.
+const GLOW_REACH: u16 = 2;
+
 fn draw_rule(buf: &mut Buffer, area: Rect, y: u16, pulse: f32) {
     if y >= area.y + area.height {
         return;
     }
     // deliberately dim and low-contrast against the logo; a divider
     // that competes with the content it's dividing isn't doing its job.
-    let level = lerp(NEAR_BLACK, DIM * 0.5, pulse);
-    let color = shade(level);
-    for x in area.x..area.x + area.width {
+    let base = rule_level(pulse);
+    let peak = junction_level(pulse);
+    for (dist, x) in (area.x..area.x + area.width).enumerate() {
+        let level = if (dist as u16) <= GLOW_REACH {
+            lerp(peak, base, dist as f32 / GLOW_REACH as f32)
+        } else {
+            base
+        };
         if let Some(cell) = buf.cell_mut((x, y)) {
             cell.set_char('─');
-            cell.set_fg(color);
+            cell.set_fg(shade(level));
         }
     }
 }
