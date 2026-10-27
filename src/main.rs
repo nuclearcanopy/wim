@@ -626,6 +626,29 @@ fn adjust_subtitle_field(sub: &mut config::SubtitleConfig, field: usize, dir: f6
     }
 }
 
+/// Landing on a preset row of the eq menu (via j/k) applies it
+/// immediately, same effect as pressing the bare `CycleEq` key would
+/// have for that one preset; a no-op when `row` is a band row
+/// instead, since adjusting those is `adjust_eq_band`'s job.
+fn apply_eq_preset_row(app: &mut app::App, player: &mpv::Mpv, row: usize) {
+    if row >= eq::PRESETS.len() {
+        return;
+    }
+    app.eq_preset = row;
+    app.eq_custom = false;
+    app.eq_gains = eq::PRESETS[row].gains;
+    let _ = player.set_af(&eq::build_af_filter(&app.eq_gains));
+}
+
+/// One h/l nudge (`dir`: -1.0 or 1.0) on band `band`, 1 dB per step,
+/// clamped to a sane range; touching any band diverges from whatever
+/// named preset was active into a "custom" setting.
+fn adjust_eq_band(app: &mut app::App, player: &mpv::Mpv, band: usize, dir: f64) {
+    app.eq_gains[band] = (app.eq_gains[band] + dir).clamp(-12.0, 12.0);
+    app.eq_custom = true;
+    let _ = player.set_af(&eq::build_af_filter(&app.eq_gains));
+}
+
 /// A completed background sync attempt for one server, tagged by url
 /// since several servers' results arrive interleaved on the same
 /// channel with no other way to tell them apart.
@@ -839,6 +862,19 @@ fn rebuild_corpus(cfg: &config::Config) -> search::Corpus {
 enum Focus {
     Sidebar,
     Workspace,
+    BottomBar,
+}
+
+/// "flat"/a preset name, or "custom" once any band's been hand-tuned
+/// away from whatever preset was last applied; shared by the player
+/// view and the bottom bar so neither keeps crediting a preset that
+/// no longer matches `app.eq_gains`.
+fn eq_label(app: &app::App) -> &'static str {
+    if app.eq_custom {
+        "custom"
+    } else {
+        eq::PRESETS[app.eq_preset].name
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -860,6 +896,24 @@ fn main() -> anyhow::Result<()> {
     // everywhere rather than individually named commands).
     let mut keymap = Keymap::from_overrides(&cfg.keybinds);
     let mut app = app::App::new(corpus);
+    // restores whichever eq state was last active (a named preset, or
+    // a hand-tuned custom set) by name rather than a raw index, same
+    // reasoning as `logo_style`; applied to mpv immediately so a
+    // persisted eq (and the level meter's `astats` tap, see
+    // `audio_level`) is live from the first frame, not only after the
+    // first manual 'e' press.
+    match cfg.eq_preset.as_deref().and_then(eq::index_of) {
+        Some(idx) => {
+            app.eq_preset = idx;
+            app.eq_custom = false;
+            app.eq_gains = eq::PRESETS[idx].gains;
+        }
+        None => {
+            app.eq_custom = true;
+            app.eq_gains = cfg.eq_gains;
+        }
+    }
+    let _ = player.set_af(&eq::build_af_filter(&app.eq_gains));
     // the full keybind list moved to the '?' help overlay; nothing
     // worth saying here until something actually happens.
     let mut status = String::new();
@@ -1077,6 +1131,16 @@ fn main() -> anyhow::Result<()> {
     // lights up the value it already shows permanently.
     let mut flash: Option<(Field, Instant)> = None;
     const FLASH_DURATION: Duration = Duration::from_millis(700);
+    // `Focus::BottomBar`'s own selection cursor (see `KeyAction::
+    // FocusBottomBar`); independent of `flash`, a steady cursor
+    // position rather than a transient acknowledgment, but both feed
+    // `ControlsBar`'s rendering.
+    let mut bottombar_selected = Field::Loop;
+    // enter on the bottom bar's Eq field opens this instead of just
+    // cycling presets like the bare 'e' key does; full-workspace, same
+    // treatment as the settings/keybinds menus.
+    let mut eq_menu_open = false;
+    let mut eq_menu_selected: usize = 0;
 
     let mut panels = PanelLayout::new();
     let start = Instant::now();
@@ -1373,7 +1437,7 @@ fn main() -> anyhow::Result<()> {
                         loop_label: app.loop_mode.label(),
                         shuffle_on: app.shuffle,
                         speed: app.speed,
-                        eq_preset: eq::PRESETS[app.eq_preset].name,
+                        eq_preset: eq_label(&app),
                         crossfade_on: crossfade_enabled,
                         previous: previous_label.as_deref(),
                         next: next_label.as_deref(),
@@ -1504,6 +1568,20 @@ fn main() -> anyhow::Result<()> {
                 );
             }
 
+            // enter on the bottom bar's Eq field, same full-workspace
+            // treatment.
+            if eq_menu_open {
+                f.render_widget(
+                    ui::eq_menu::EqMenu {
+                        gains: &app.eq_gains,
+                        custom: app.eq_custom,
+                        active_preset: app.eq_preset,
+                        selected: eq_menu_selected,
+                    },
+                    top,
+                );
+            }
+
             if show_mini_bar {
                 let item = now_playing.as_ref().expect("show_mini_bar implies Some");
                 let (elapsed_secs, duration_secs, paused) = playback_info(&player);
@@ -1541,9 +1619,10 @@ fn main() -> anyhow::Result<()> {
                     loop_label: app.loop_mode.label(),
                     shuffle_on: app.shuffle,
                     speed: app.speed,
-                    eq_preset: eq::PRESETS[app.eq_preset].name,
+                    eq_preset: eq_label(&app),
                     crossfade_on: crossfade_enabled,
                     flash: flash_level,
+                    selected: (focus == Focus::BottomBar).then_some(bottombar_selected),
                     resize_hint,
                 },
                 Rect {
@@ -2023,6 +2102,57 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                // opened via enter on the bottom bar's Eq field (see
+                // the `Focus::BottomBar` block further down), not a
+                // dedicated keymap action of its own; esc is the only
+                // way to close it.
+                if eq_menu_open {
+                    if key.code == KeyCode::Esc {
+                        eq_menu_open = false;
+                        cfg.eq_preset = if app.eq_custom {
+                            None
+                        } else {
+                            Some(eq::PRESETS[app.eq_preset].name.to_string())
+                        };
+                        cfg.eq_gains = app.eq_gains;
+                        let _ = config::save(&cfg);
+                        continue;
+                    }
+                    match key.code {
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            eq_menu_selected = (eq_menu_selected + 1) % ui::eq_menu::ROW_COUNT;
+                            apply_eq_preset_row(&mut app, &player, eq_menu_selected);
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            eq_menu_selected = (eq_menu_selected + ui::eq_menu::ROW_COUNT - 1)
+                                % ui::eq_menu::ROW_COUNT;
+                            apply_eq_preset_row(&mut app, &player, eq_menu_selected);
+                        }
+                        KeyCode::Char('h') | KeyCode::Left
+                            if eq_menu_selected >= ui::eq_menu::PRESET_COUNT =>
+                        {
+                            adjust_eq_band(
+                                &mut app,
+                                &player,
+                                eq_menu_selected - ui::eq_menu::PRESET_COUNT,
+                                -1.0,
+                            );
+                        }
+                        KeyCode::Char('l') | KeyCode::Right
+                            if eq_menu_selected >= ui::eq_menu::PRESET_COUNT =>
+                        {
+                            adjust_eq_band(
+                                &mut app,
+                                &player,
+                                eq_menu_selected - ui::eq_menu::PRESET_COUNT,
+                                1.0,
+                            );
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 if keybinds_menu_open {
                     if capturing_key {
                         // esc cancels the capture without changing
@@ -2091,6 +2221,10 @@ fn main() -> anyhow::Result<()> {
                     focus = Focus::Workspace;
                     continue;
                 }
+                if key.code == keymap.get(KeyAction::FocusBottomBar) {
+                    focus = Focus::BottomBar;
+                    continue;
+                }
 
                 if panels.resize_mode {
                     if key.code == KeyCode::Esc
@@ -2120,6 +2254,71 @@ fn main() -> anyhow::Result<()> {
                 if key.code == keymap.get(KeyAction::ToggleResizeMode) {
                     panels.toggle_resize_mode();
                     continue;
+                }
+
+                // pane-local navigation for the bottom bar, same
+                // "only j/k/arrows/enter care which pane has focus"
+                // rule as the browse view further down: global
+                // playback controls (space/f/b/c/etc.) fall through
+                // untouched below regardless of focus, only these
+                // four keys are intercepted here.
+                if focus == Focus::BottomBar {
+                    match key.code {
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            bottombar_selected = bottombar_selected.next();
+                            continue;
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            bottombar_selected = bottombar_selected.prev();
+                            continue;
+                        }
+                        KeyCode::Enter => {
+                            match bottombar_selected {
+                                Field::Loop => {
+                                    let mode = app.cycle_loop();
+                                    let mpv_loop = if mode == LoopMode::One { "inf" } else { "no" };
+                                    match player.set_loop_file(mpv_loop) {
+                                        Ok(()) => flash = Some((Field::Loop, Instant::now())),
+                                        Err(e) => status = format!("error setting loop: {e}"),
+                                    }
+                                }
+                                Field::Shuffle => {
+                                    let items = app.toggle_shuffle_and_get_queue();
+                                    let msg = resync_queue(&player, &items);
+                                    if msg.starts_with("error") {
+                                        status = msg;
+                                    } else {
+                                        flash = Some((Field::Shuffle, Instant::now()));
+                                    }
+                                }
+                                Field::Speed => {
+                                    let speed = app.bump_speed(1.0);
+                                    match player.set_speed(speed) {
+                                        Ok(()) => flash = Some((Field::Speed, Instant::now())),
+                                        Err(e) => status = format!("error setting speed: {e}"),
+                                    }
+                                }
+                                Field::Eq => {
+                                    eq_menu_open = true;
+                                    eq_menu_selected = if app.eq_custom {
+                                        ui::eq_menu::PRESET_COUNT
+                                    } else {
+                                        app.eq_preset
+                                    };
+                                }
+                                Field::Crossfade => {
+                                    crossfade_enabled = !crossfade_enabled;
+                                    if !crossfade_enabled {
+                                        fade_in_started_at = None;
+                                        let _ = player.set_volume(base_volume);
+                                    }
+                                    flash = Some((Field::Crossfade, Instant::now()));
+                                }
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
                 }
 
                 // same condition the render side uses to decide the
