@@ -18,18 +18,21 @@ use crate::subsonic::Client;
 /// graphics protocol the terminal actually supports (sixel/kitty/
 /// iterm2), falling back to colored halfblocks if none is detected;
 /// that fallback is explicitly not monochrome, which is the tradeoff
-/// of asking for real images at all.
+/// of asking for real images at all. Off skips the art panel
+/// entirely, giving the track list the full width instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtMode {
     Ascii,
     Real,
+    Off,
 }
 
 impl ArtMode {
     pub fn toggle(self) -> Self {
         match self {
             ArtMode::Ascii => ArtMode::Real,
-            ArtMode::Real => ArtMode::Ascii,
+            ArtMode::Real => ArtMode::Off,
+            ArtMode::Off => ArtMode::Ascii,
         }
     }
 }
