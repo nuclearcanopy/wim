@@ -1947,6 +1947,9 @@ fn main() -> anyhow::Result<()> {
     let mut first_frame_drawn = false;
     loop {
         notifications.expire();
+        // sampled once per frame rather than per widget, so everything
+        // on screen animates off the same instant.
+        let frame_elapsed = start.elapsed();
         guard.terminal.draw(|f| {
             let area = f.area();
 
@@ -2196,6 +2199,8 @@ fn main() -> anyhow::Result<()> {
                     empty_message: &empty_results_message(&app),
                     favorites: &favorites,
                     remote_starred: &remote_starred,
+                    focused: focus == Focus::Sidebar,
+                    elapsed: frame_elapsed,
                 },
                 results_rect,
             );
@@ -2266,6 +2271,8 @@ fn main() -> anyhow::Result<()> {
                         art_mode,
                         cell_aspect: aspect,
                         cursor_visible,
+                        focused: focus == Focus::Workspace,
+                        elapsed: frame_elapsed,
                     },
                     main_content,
                 );

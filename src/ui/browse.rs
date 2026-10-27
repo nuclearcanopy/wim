@@ -1,16 +1,18 @@
 use std::collections::HashSet;
+use std::time::Duration;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::Widget;
 
+use crate::anim;
 use crate::browse::{ArtMode, BrowseView};
 use crate::favorites::Favorites;
 use crate::search::SearchItem;
 use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::albumart::AsciiArt;
 use crate::ui::header::draw_header;
-use crate::ui::results_list::draw_header_row;
+use crate::ui::results_list::{draw_header_row, fill_row_bg};
 use crate::ui::scroll;
 use crate::ui::searchbox::SearchBox;
 use crate::ui::textfit::truncate_with_ellipsis;
@@ -35,6 +37,13 @@ pub struct BrowseListView<'a> {
     /// as the sidebar's own `SearchBox`; only matters while
     /// `view.filtering`.
     pub cursor_visible: bool,
+    /// Whether the workspace pane holds focus. A row stays selected in
+    /// a pane that doesn't; its background just holds a flat dimmer
+    /// level instead of breathing (see `anim::selection_bg`).
+    pub focused: bool,
+    /// Time since app start; the one input to every animation, so the
+    /// pulse runs at the same speed whatever the display's rate is.
+    pub elapsed: Duration,
 }
 
 /// Row offsets inside this view's own header block, from `area.y`: a
@@ -153,6 +162,8 @@ impl Widget for BrowseListView<'_> {
             &(0..self.view.tracks.len()).collect::<Vec<_>>(),
             self.view.selected,
             true,
+            self.focused,
+            self.elapsed,
             self.view.show_track_artist,
             self.favorites,
             self.remote_starred,
@@ -182,6 +193,8 @@ impl BrowseListView<'_> {
                 &self.view.albums,
                 self.view.albums_selected,
                 self.view.albums_focused,
+                self.focused,
+                self.elapsed,
             );
         }
 
@@ -225,6 +238,8 @@ impl BrowseListView<'_> {
             &visible,
             self.view.selected,
             !self.view.albums_focused,
+            self.focused,
+            self.elapsed,
             self.view.show_track_artist,
             self.favorites,
             self.remote_starred,
@@ -235,13 +250,16 @@ impl BrowseListView<'_> {
 /// Plain name-only rows (albums have no per-row metadata worth
 /// showing inline the way a song's artist does); `focused` controls
 /// whether the selected row brightens, same "only one column glows
-/// at a time" convention as the sidebar/workspace split.
+/// at a time" convention as the sidebar/workspace split, and
+/// `pane_focused` whether its background breathes or sits flat.
 fn draw_simple_list(
     buf: &mut Buffer,
     area: Rect,
     items: &[SearchItem],
     selected: usize,
     focused: bool,
+    pane_focused: bool,
+    elapsed: Duration,
 ) {
     // same clamp-to-selection scroll as the track list beside it; it
     // had none at all, so past the pane height `j` moved a cursor
@@ -254,6 +272,14 @@ fn draw_simple_list(
         };
         let y = area.y + row as u16;
         let is_selected = scroll_offset + row == selected;
+        if is_selected {
+            fill_row_bg(
+                buf,
+                area,
+                y,
+                anim::selection_bg(elapsed, focused && pane_focused),
+            );
+        }
         let marker = if is_selected { "> " } else { "  " };
         let name = match item {
             SearchItem::Album { name, .. } => name.as_str(),
@@ -277,8 +303,8 @@ fn draw_simple_list(
 /// Shared by the single-list (album/playlist) layout and the artist
 /// profile's SONGS column; `indices` is which positions in `tracks`
 /// to actually show, in order (either every track, or whatever
-/// `visible_track_indices` filtered down to). `focused` is the same
-/// "does this column currently glow" flag `draw_simple_list` uses.
+/// `visible_track_indices` filtered down to). `focused`/`pane_focused`
+/// are the same two flags `draw_simple_list` uses.
 #[allow(clippy::too_many_arguments)]
 fn draw_track_list(
     buf: &mut Buffer,
@@ -287,6 +313,8 @@ fn draw_track_list(
     indices: &[usize],
     selected: usize,
     focused: bool,
+    pane_focused: bool,
+    elapsed: Duration,
     show_artist: bool,
     favorites: &Favorites,
     remote_starred: &HashSet<String>,
@@ -303,6 +331,10 @@ fn draw_track_list(
         };
         let track = &tracks[idx];
         let is_selected = idx == selected;
+        if is_selected {
+            let level = anim::selection_bg(elapsed, focused && pane_focused);
+            fill_row_bg(buf, area, area.y + row as u16, level);
+        }
         let marker = if is_selected { "> " } else { "  " };
         let label = match track {
             SearchItem::Song { title, artist, .. } if show_artist => format!("{title} · {artist}"),
@@ -380,6 +412,8 @@ mod tests {
             art_mode: ArtMode::Off,
             cell_aspect: 2.0,
             cursor_visible: false,
+            focused: true,
+            elapsed: Duration::ZERO,
         }
         .render(area, buf);
     }
@@ -492,6 +526,10 @@ mod tests {
     }
 
     fn render_view(view: &BrowseView, area: Rect) -> Buffer {
+        render_view_at(view, area, true, Duration::ZERO)
+    }
+
+    fn render_view_at(view: &BrowseView, area: Rect, focused: bool, elapsed: Duration) -> Buffer {
         let mut buf = Buffer::empty(area);
         let favorites = Favorites::default();
         let remote_starred = HashSet::new();
@@ -502,6 +540,8 @@ mod tests {
             art_mode: ArtMode::Off,
             cell_aspect: 2.0,
             cursor_visible: false,
+            focused,
+            elapsed,
         }
         .render(area, &mut buf);
         buf
@@ -559,5 +599,91 @@ mod tests {
             "cursor must sit on the selected track: {:?}",
             marked[0]
         );
+    }
+
+    fn row_bgs(buf: &Buffer, y: u16) -> Vec<ratatui::style::Color> {
+        (0..buf.area.width)
+            .map(|x| buf.cell((x, y)).unwrap().bg)
+            .collect()
+    }
+
+    fn cursor_row(buf: &Buffer) -> u16 {
+        (0..buf.area.height)
+            .find(|y| row_text(buf, *y).starts_with('>'))
+            .expect("some row carries the cursor")
+    }
+
+    /// Every cell holding a `>` marker, i.e. one per list on screen.
+    fn cursor_cells(buf: &Buffer) -> Vec<(u16, u16)> {
+        (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| buf.cell((*x, *y)).unwrap().symbol() == ">")
+            .collect()
+    }
+
+    #[test]
+    fn the_selected_track_row_carries_a_background_across_its_full_width() {
+        let view = test_view(test_songs(3));
+        let area = Rect::new(0, 0, 40, 12);
+        let buf = render_view_at(&view, area, true, Duration::ZERO);
+        let y = cursor_row(&buf);
+        let expected = shade(anim::selection_bg(Duration::ZERO, true));
+        assert_eq!(row_bgs(&buf, y), vec![expected; 40]);
+        for other in [y + 1, y + 2] {
+            assert_eq!(
+                row_bgs(&buf, other),
+                vec![ratatui::style::Color::Reset; 40],
+                "row {other} must not be highlighted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_focused_panes_track_selection_pulses_over_time() {
+        let view = test_view(test_songs(3));
+        let area = Rect::new(0, 0, 40, 12);
+        let trough = render_view_at(&view, area, true, Duration::ZERO);
+        let peak = render_view_at(&view, area, true, anim::SELECTION_PULSE_PERIOD / 2);
+        let y = cursor_row(&trough);
+        assert_ne!(
+            row_bgs(&trough, y),
+            row_bgs(&peak, y),
+            "the background has to move, not sit on one level"
+        );
+    }
+
+    /// The track stays selected while the sidebar has focus; its row
+    /// just holds a flat dimmer background instead of breathing.
+    #[test]
+    fn an_unfocused_panes_track_selection_does_not_pulse() {
+        let view = test_view(test_songs(3));
+        let area = Rect::new(0, 0, 40, 12);
+        let flat = shade(anim::SELECTION_BG_UNFOCUSED);
+        for t in [Duration::ZERO, anim::SELECTION_PULSE_PERIOD / 2] {
+            let buf = render_view_at(&view, area, false, t);
+            let y = cursor_row(&buf);
+            assert_eq!(row_bgs(&buf, y), vec![flat; 40]);
+        }
+    }
+
+    /// Both of an artist page's columns keep a selected row, but only
+    /// the one navigation is currently acting on pulses.
+    #[test]
+    fn only_the_focused_column_of_an_artist_page_pulses() {
+        let mut view = test_view(test_songs(3));
+        view.is_artist = true;
+        view.albums = test_albums(3);
+        view.albums_focused = true;
+
+        let area = Rect::new(0, 0, 60, 14);
+        let at = anim::SELECTION_PULSE_PERIOD / 2;
+        let buf = render_view_at(&view, area, true, at);
+        let cells = cursor_cells(&buf);
+        assert_eq!(cells.len(), 2, "one cursor per column: {cells:?}");
+        let bg = |(x, y): (u16, u16)| buf.cell((x, y)).unwrap().bg;
+        // the ALBUMS column's cursor sits four rows above the SONGS
+        // column's, so it comes first in row order.
+        assert_eq!(bg(cells[0]), shade(anim::selection_bg(at, true)));
+        assert_eq!(bg(cells[1]), shade(anim::SELECTION_BG_UNFOCUSED));
     }
 }
