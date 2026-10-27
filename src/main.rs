@@ -1946,6 +1946,11 @@ fn main() -> anyhow::Result<()> {
     let mut first_frame_drawn = false;
     loop {
         notifications.expire();
+        // once per frame, not once per widget that wants it: the
+        // scrubber in the bottom bar, the mini bar and the full player
+        // all read the same position, and each call is three ipc
+        // round-trips.
+        let (elapsed_secs, duration_secs, paused) = playback_info(&player);
         guard.terminal.draw(|f| {
             let area = f.area();
 
@@ -2215,7 +2220,6 @@ fn main() -> anyhow::Result<()> {
                 );
             } else if show_full_player {
                 let item = now_playing.as_ref().expect("show_full_player implies Some");
-                let (elapsed_secs, duration_secs, paused) = playback_info(&player);
                 let previous_label = previous_track.as_ref().map(label);
                 let next_label = app.queue.first().map(label);
                 f.render_widget(
@@ -2406,7 +2410,6 @@ fn main() -> anyhow::Result<()> {
 
             if show_mini_bar {
                 let item = now_playing.as_ref().expect("show_mini_bar implies Some");
-                let (elapsed_secs, duration_secs, paused) = playback_info(&player);
                 f.render_widget(
                     MiniPlayerBar {
                         title: &label(item),
