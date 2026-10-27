@@ -19,12 +19,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// How many distinct play days are kept per track. Only the count
+/// matters, but keeping the days themselves means raising the
+/// threshold later still has history to judge against; 64 is far past
+/// any threshold worth configuring and keeps `index.toml` from growing
+/// without bound for a track played every day for years.
+const MAX_TRACKED_DAYS: usize = 64;
+
 /// Per-track bookkeeping, keyed by the track's stable navidrome id
 /// (`SearchItem::Song::id`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheEntry {
     #[serde(default)]
     pub play_count: u32,
+    /// Distinct calendar days (`YYYY-MM-DD`, see `day_of`) this track
+    /// was played on, oldest first. What the auto-download threshold
+    /// actually counts: playing the same song twice in one sitting
+    /// says nothing about wanting it cached, coming back to it on
+    /// another day does.
+    #[serde(default)]
+    pub play_days: Vec<String>,
     /// Unix seconds; `None` if never played this session or across a
     /// restart before this field existed.
     #[serde(default)]
@@ -50,6 +64,34 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// `YYYY-MM-DD` for a unix timestamp, UTC. UTC rather than local time
+/// keeps this free of a date crate or libc FFI; the only cost is that
+/// two plays within a few hours of UTC midnight can land on different
+/// day labels than the user's own calendar would give them, which for
+/// a "played it again another day" signal is noise, not a defect.
+pub fn day_of(unix_secs: u64) -> String {
+    // days-to-civil, the standard shift-the-epoch-to-March-1st
+    // algorithm; March-based years put the leap day last, which is
+    // what removes every special case from the month arithmetic.
+    let days = (unix_secs / 86_400) as i64 + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let doe = (days - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe as i64 + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Today's `day_of`. The one wall-clock read in the day-threshold
+/// path; everything that decides anything takes the day as an
+/// argument instead, so the policy stays testable against fixed days.
+pub fn today() -> String {
+    day_of(now_secs())
 }
 
 /// `~/.cache/wim`; the actual downloaded audio lives under its own
@@ -96,14 +138,48 @@ impl CacheIndex {
         Ok(())
     }
 
-    /// Bumps play count and last-played for `id`, returning the new
-    /// play count so the caller can tell whether this play just
-    /// crossed the auto-download threshold.
-    pub fn record_play(&mut self, id: &str) -> u32 {
+    /// Records a play that happened on `today` (`YYYY-MM-DD`), bumping
+    /// the play count and the set of distinct play days, and returns
+    /// how many distinct days this track has now been played on so the
+    /// caller can tell whether that just crossed the auto-download
+    /// threshold. `today` is a parameter rather than read off the
+    /// clock here so the policy is testable against fixed days.
+    pub fn record_play(&mut self, id: &str, today: &str) -> u32 {
         let entry = self.entries.entry(id.to_string()).or_default();
         entry.play_count += 1;
+        // migration for an index written before play days existed: the
+        // one earlier day we can still recover is whatever
+        // `last_played_secs` points at, so a track played yesterday
+        // and played again now counts as the two days it really was,
+        // instead of silently restarting from zero.
+        if entry.play_days.is_empty() {
+            if let Some(prev) = entry.last_played_secs {
+                entry.play_days.push(day_of(prev));
+            }
+        }
+        if entry.play_days.last().map(String::as_str) != Some(today) {
+            entry.play_days.retain(|d| d != today);
+            entry.play_days.push(today.to_string());
+        }
+        if entry.play_days.len() > MAX_TRACKED_DAYS {
+            let excess = entry.play_days.len() - MAX_TRACKED_DAYS;
+            entry.play_days.drain(..excess);
+        }
         entry.last_played_secs = Some(now_secs());
-        entry.play_count
+        entry.play_days.len() as u32
+    }
+
+    /// Distinct days `id` has been played on; what the auto-download
+    /// threshold is measured against. The live path reads
+    /// `record_play`'s return value instead of coming back for this,
+    /// so like `play_count` it's here as the public read API for
+    /// whatever UI surface later wants to show it.
+    #[allow(dead_code)]
+    pub fn days_played(&self, id: &str) -> u32 {
+        self.entries
+            .get(id)
+            .map(|e| e.play_days.len() as u32)
+            .unwrap_or(0)
     }
 
     // not read anywhere outside this module's own tests yet; kept as
@@ -165,13 +241,107 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_play_increments_and_returns_running_count() {
+    fn record_play_increments_and_returns_distinct_days() {
         let mut idx = CacheIndex::default();
-        assert_eq!(idx.record_play("t1"), 1);
-        assert_eq!(idx.record_play("t1"), 2);
-        assert_eq!(idx.record_play("t2"), 1);
+        assert_eq!(idx.record_play("t1", "2026-01-01"), 1);
+        assert_eq!(idx.record_play("t1", "2026-01-02"), 2);
+        assert_eq!(idx.record_play("t2", "2026-01-01"), 1);
         assert_eq!(idx.play_count("t1"), 2);
         assert_eq!(idx.play_count("unknown"), 0);
+        assert_eq!(idx.days_played("unknown"), 0);
+    }
+
+    #[test]
+    fn playing_the_same_song_twice_in_one_day_is_still_one_day() {
+        // the actual complaint: pressing enter on a song twice in one
+        // sitting used to be enough to trigger a download.
+        let mut idx = CacheIndex::default();
+        assert_eq!(idx.record_play("t1", "2026-01-01"), 1);
+        assert_eq!(idx.record_play("t1", "2026-01-01"), 1);
+        assert_eq!(idx.record_play("t1", "2026-01-01"), 1);
+        assert_eq!(idx.play_count("t1"), 3, "plays are still counted");
+        assert_eq!(idx.days_played("t1"), 1);
+    }
+
+    #[test]
+    fn two_days_in_a_row_counts_as_two_days() {
+        let mut idx = CacheIndex::default();
+        idx.record_play("t1", "2026-01-01");
+        idx.record_play("t1", "2026-01-01");
+        assert_eq!(idx.record_play("t1", "2026-01-02"), 2);
+        assert_eq!(idx.days_played("t1"), 2);
+    }
+
+    #[test]
+    fn a_day_already_recorded_out_of_order_is_not_counted_twice() {
+        let mut idx = CacheIndex::default();
+        idx.record_play("t1", "2026-01-01");
+        idx.record_play("t1", "2026-01-02");
+        // a clock that stepped back (or a play straddling midnight
+        // reported late) must not inflate the day count.
+        assert_eq!(idx.record_play("t1", "2026-01-01"), 2);
+        assert_eq!(idx.days_played("t1"), 2);
+    }
+
+    #[test]
+    fn tracked_days_stay_bounded_for_a_track_played_every_day() {
+        let mut idx = CacheIndex::default();
+        for day in 0..MAX_TRACKED_DAYS + 20 {
+            idx.record_play("t1", &day_of(day as u64 * 86_400));
+        }
+        assert_eq!(idx.days_played("t1"), MAX_TRACKED_DAYS as u32);
+    }
+
+    #[test]
+    fn an_index_from_before_play_days_recovers_its_last_played_day() {
+        // what loading an older index.toml looks like: a play count and
+        // a last-played timestamp, no day list.
+        let mut idx = CacheIndex::default();
+        idx.entries.insert(
+            "t1".to_string(),
+            CacheEntry {
+                play_count: 9,
+                last_played_secs: Some(0),
+                ..Default::default()
+            },
+        );
+        // played again on a different day: that's two days, not one,
+        // since the old timestamp still tells us about the first.
+        assert_eq!(idx.record_play("t1", "2026-01-01"), 2);
+        assert_eq!(idx.days_played("t1"), 2);
+    }
+
+    #[test]
+    fn an_old_index_last_played_today_is_still_only_one_day() {
+        let mut idx = CacheIndex::default();
+        idx.entries.insert(
+            "t1".to_string(),
+            CacheEntry {
+                play_count: 4,
+                last_played_secs: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(idx.record_play("t1", &day_of(0)), 1);
+    }
+
+    #[test]
+    fn an_old_index_file_still_loads_without_its_new_field() {
+        let raw = "[entries.t1]\nplay_count = 3\nlast_played_secs = 0\n";
+        let idx: CacheIndex = toml::from_str(raw).expect("old index must still parse");
+        assert_eq!(idx.play_count("t1"), 3);
+        assert_eq!(idx.days_played("t1"), 0);
+    }
+
+    #[test]
+    fn day_of_formats_known_unix_timestamps() {
+        assert_eq!(day_of(0), "1970-01-01");
+        assert_eq!(day_of(86_399), "1970-01-01");
+        assert_eq!(day_of(86_400), "1970-01-02");
+        // a leap day, and the day after it.
+        assert_eq!(day_of(1_709_164_800), "2024-02-29");
+        assert_eq!(day_of(1_709_251_200), "2024-03-01");
+        assert_eq!(day_of(1_767_225_600), "2026-01-01");
     }
 
     #[test]
@@ -207,8 +377,8 @@ mod tests {
         let path = std::env::temp_dir().join(format!("wim-cache-sweep-{nanos}.mp3"));
         fs::write(&path, b"fake").unwrap();
 
-        idx.record_play("t1");
-        idx.record_play("t1");
+        idx.record_play("t1", "2026-01-01");
+        idx.record_play("t1", "2026-01-02");
         idx.mark_cached("t1", path.clone());
         // backdate last_played well past any reasonable threshold.
         idx.entries.get_mut("t1").unwrap().last_played_secs = Some(0);
@@ -234,7 +404,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("wim-cache-fresh-{nanos}.mp3"));
         fs::write(&path, b"fake").unwrap();
 
-        idx.record_play("t1");
+        idx.record_play("t1", "2026-01-01");
         idx.mark_cached("t1", path.clone());
 
         let evicted = idx.sweep_stale(7 * 24 * 3600);
