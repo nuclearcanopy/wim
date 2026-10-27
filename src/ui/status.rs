@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
 use crate::theme::{shade, DIM, NEAR_WHITE};
+use crate::ui::textfit::{tail_fit, truncate_with_ellipsis};
 
 /// One-line status bar: the live search query while editing, or a
 /// now-playing/idle message otherwise. Custom-painted, no stock widget.
@@ -17,10 +18,15 @@ impl Widget for StatusBar<'_> {
         if area.height == 0 {
             return;
         }
+        let width = area.width as usize;
+        // actively-typed text keeps its tail visible (the cursor end);
+        // static messages truncate with an ellipsis instead — same
+        // distinction as everywhere else text might overflow the
+        // terminal width. see ui/textfit.rs.
         let text = if self.editing_query {
-            format!("/{}", self.query)
+            tail_fit(&format!("/{}", self.query), width)
         } else {
-            self.message.to_string()
+            truncate_with_ellipsis(self.message, width)
         };
         let color = if self.editing_query { shade(NEAR_WHITE) } else { shade(DIM) };
 
