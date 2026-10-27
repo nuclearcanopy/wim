@@ -4,55 +4,37 @@ use ratatui::widgets::Widget;
 
 use crate::theme::{shade, DIM, NEAR_BLACK};
 
-/// Small bordered box in the bottom-right corner hinting at the key
-/// that opens the full keybind reference, instead of cramming every
-/// keybind permanently into the bottom bar's text. Its top-left
-/// corner is a `┬` junction into the horizontal rule above it (see
-/// `main.rs`), not a floating box with no connection to anything.
+/// Flush column in the bottom-right corner hinting at the key that
+/// opens the full keybind reference, instead of cramming every
+/// keybind permanently into the bottom bar's text. Its own inset
+/// ┌─┐/└─┘ border used to eat the first and last row of an already
+/// tight area, leaving it looking like a small disconnected box
+/// floating inside the bar; just a flush `│` left edge (matching the
+/// `┬` junction in the horizontal rule above it, see `main.rs`) and a
+/// centered label filling the entire given height reads as part of
+/// the bar instead.
 pub struct HelpBox<'a> {
     pub label: &'a str,
 }
 
 impl Widget for HelpBox<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width < 3 {
+        if area.width == 0 || area.height == 0 {
             return;
         }
         let color = shade(NEAR_BLACK);
-        let w = area.width;
-        let h = area.height;
-
-        if h < 2 {
-            // not enough room for any border at all; just the text,
-            // better than nothing.
-            draw_text(buf, area.x, area.y, w, self.label, shade(DIM));
-            return;
+        for y in area.y..area.y + area.height {
+            put(buf, area.x, y, '│', color);
         }
-
-        put(buf, area.x, area.y, '┌', color);
-        put(buf, area.x + w - 1, area.y, '┐', color);
-        put(buf, area.x, area.y + h - 1, '└', color);
-        put(buf, area.x + w - 1, area.y + h - 1, '┘', color);
-        for x in 1..w - 1 {
-            put(buf, area.x + x, area.y, '─', color);
-            put(buf, area.x + x, area.y + h - 1, '─', color);
-        }
-        for y in 1..h - 1 {
-            put(buf, area.x, area.y + y, '│', color);
-            put(buf, area.x + w - 1, area.y + y, '│', color);
-        }
-
-        if h >= 3 {
-            let text_y = area.y + h / 2;
-            draw_text(
-                buf,
-                area.x + 1,
-                text_y,
-                w.saturating_sub(2),
-                self.label,
-                shade(DIM),
-            );
-        }
+        let text_y = area.y + area.height / 2;
+        draw_text(
+            buf,
+            area.x + 1,
+            text_y,
+            area.width.saturating_sub(1),
+            self.label,
+            shade(DIM),
+        );
     }
 }
 
