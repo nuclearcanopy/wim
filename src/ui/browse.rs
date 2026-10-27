@@ -24,6 +24,10 @@ pub struct BrowseListView<'a> {
     /// `browse::layout` gives this widget; this just skips drawing the
     /// ascii fallback there instead of drawing over it.
     pub art_mode: ArtMode,
+    /// The terminal's real cell height:width ratio (see
+    /// `main::cell_aspect`), threaded through to `browse::layout` and
+    /// `AsciiArt` so both agree on what "square" actually means here.
+    pub cell_aspect: f32,
 }
 
 fn is_starred(track: &SearchItem, favorites: &Favorites, remote_starred: &HashSet<String>) -> bool {
@@ -68,11 +72,13 @@ impl Widget for BrowseListView<'_> {
         }
 
         let has_art = self.view.art.is_some() && self.art_mode != ArtMode::Off;
-        let (art_rect, list_area) = crate::browse::layout(area, has_art, self.view.bio.is_some());
+        let (art_rect, list_area) =
+            crate::browse::layout(area, has_art, self.view.bio.is_some(), self.cell_aspect);
         let y = list_area.y;
         if let (Some(rect), ArtMode::Ascii) = (art_rect, self.art_mode) {
             AsciiArt {
                 image: self.view.art.as_ref(),
+                cell_aspect: self.cell_aspect,
             }
             .render(rect, buf);
         }

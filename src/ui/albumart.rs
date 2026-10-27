@@ -13,6 +13,11 @@ use crate::theme::shade;
 /// free, no explicit resize handling needed.
 pub struct AsciiArt<'a> {
     pub image: Option<&'a image::DynamicImage>,
+    /// The terminal's real cell height:width ratio (see
+    /// `main::cell_aspect`); must match whatever `browse::layout` used
+    /// to size the rect this renders into, or the two disagreeing
+    /// assumptions are exactly what makes the art look non-square.
+    pub cell_aspect: f32,
 }
 
 impl Widget for AsciiArt<'_> {
@@ -28,14 +33,17 @@ impl Widget for AsciiArt<'_> {
             return;
         }
 
-        // terminal cells are roughly twice as tall as wide; sampling
-        // one cell as a single square pixel leaves the image looking
-        // vertically squashed. sample two vertical sub-rows per cell
-        // instead and render them as an upper half block (U+2580):
-        // foreground paints the top sub-row, background the bottom,
-        // doubling the effective vertical resolution to match.
+        // terminal cells are taller than wide by `cell_aspect`;
+        // sampling one cell as a single square pixel leaves the image
+        // looking vertically squashed. sample two vertical sub-rows
+        // per cell instead and render them as an upper half block
+        // (U+2580): foreground paints the top sub-row, background the
+        // bottom, doubling the effective vertical resolution so each
+        // pair of sub-rows covers the same physical height as one
+        // sub-row's width, same ratio `browse::layout` sized this
+        // rect with.
         let out_w = area.width as u32;
-        let out_h = area.height as u32 * 2;
+        let out_h = (area.height as f32 * self.cell_aspect).round() as u32;
 
         for row in 0..area.height {
             for col in 0..area.width {
