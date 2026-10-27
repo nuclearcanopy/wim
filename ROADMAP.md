@@ -392,12 +392,42 @@ run that edits these files will collide.
   bar, enter to interact, and enter on the progress bar entering a
   scrub mode.
 
+## maintainer requests in flight (branches, not merged)
+
+- `feat/shellsong-complete`: zsh-style autocomplete for shellsong
+  (inline ghost text, tab cycling that only ever extends what was
+  typed, right-arrow/ctrl+f accept, history-ranked candidates), plus
+  the five consistency fixes and the collapse of every screen-opening
+  verb into one `view(target)` (`view(queue)`, `view(suggestions)`,
+  `view(q, bladee)` for the search-and-open form). `show`/`suggest`/
+  `settings`/`keybinds`/`lyrics`/`starred` all fold into it.
+- `feat/suggestions`: the taste-learning engine (`src/suggest.rs`).
+  candidate generation then scoring then diversification, over the
+  play history already in `cache.rs` (`play_days` gives habit and
+  recency) plus library structure. eight generators covering the
+  maintainer's own examples: album gap, track gap, genre
+  under-exploration, daily rotation, rediscovery, starred-but-unplayed,
+  similar artists (`getArtistInfo2` already returns a `similarArtist`
+  list that is currently discarded), album neighbours. engine only; the
+  menu UI and wiring are a follow-up.
+
 ## open sub-tasks discovered during the review pass
 
-- [ ] **queue has no view of its own.** still only a count in the
-      bottom bar; no way to see, reorder, or remove. for an app whose
-      central design choice is an explicit queue, this is the biggest
-      missing screen.
+- [x] **queue view** (`src/ui/queue.rs`, `Q`): three labelled runs in
+      play order (now playing / up next / played, the last one
+      newest-first), the current track marked structurally with `▌`
+      rather than by brightness alone so selection and now-playing stay
+      readable on the same row, played entries sunk to NEAR_BLACK, an
+      index gutter sized to the widest number actually on screen, and a
+      real empty state instead of a blank pane. enter writes
+      `playlist-pos` to jump (no reload, so `entries` stays aligned with
+      mpv), esc closes. reads `PlayQueue::entries`/`pos`, so it shows
+      mpv's actual playlist rather than a mirror.
+- [ ] **queue view: remove and reorder.** the view is read-plus-jump
+      only. `d` to drop an entry and shift+j/k to move one still need
+      `playlist-remove`/`playlist-move` plus the matching `PlayQueue`
+      mutations; pairs with shellsong's `remove(n)`/`goto(n)` ops,
+      which need the same host plumbing.
 - [ ] **wide characters still overlap their neighbour.** `textfit` is
       `unicode_width`-aware now, but the hand-rolled
       `for (col, ch) in text.chars().enumerate()` draw loops advance one

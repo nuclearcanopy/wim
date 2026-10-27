@@ -154,6 +154,18 @@ impl PlayQueue {
         }
     }
 
+    /// The whole mpv playlist, played prefix included, so a queue view
+    /// can show where you are inside it rather than only what's left.
+    /// Index into this is the same index mpv reports as `playlist-pos`.
+    pub fn entries(&self) -> &[SearchItem] {
+        &self.entries
+    }
+
+    /// Index into `entries` mpv says it's playing, if anything.
+    pub fn pos(&self) -> Option<usize> {
+        self.pos
+    }
+
     pub fn upcoming_len(&self) -> usize {
         self.upcoming().len()
     }

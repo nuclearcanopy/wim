@@ -18,6 +18,7 @@ pub mod notify;
 pub mod onboarding;
 pub mod player;
 pub mod progress;
+pub mod queue;
 pub mod results_list;
 pub mod scroll;
 pub mod searchbox;
