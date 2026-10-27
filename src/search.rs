@@ -4,6 +4,7 @@
 //! should surface matching artists, albums, songs, playlists, and local
 //! files together, ranked by actual relevance, not just substring hits.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -182,11 +183,54 @@ impl SearchItem {
     }
 }
 
+/// A corpus item plus the two haystacks `search` would otherwise
+/// rebuild for every item on every keystroke: the matcher text in its
+/// original case (nucleo's smart-case matching reads it) and a
+/// lowercased copy the edit-distance fallback splits into words.
+#[derive(Debug, Clone)]
+struct Entry {
+    item: SearchItem,
+    haystack: String,
+    haystack_lower: String,
+}
+
+impl Entry {
+    fn new(item: SearchItem) -> Self {
+        let haystack = item.haystack();
+        let haystack_lower = haystack.to_lowercase();
+        Self {
+            item,
+            haystack,
+            haystack_lower,
+        }
+    }
+}
+
+/// Scoring scratch, reused instead of reallocated per item: nucleo's
+/// matcher eagerly allocates ~135kb of dp matrices and is explicitly
+/// meant to be reused across calls, and `buf` is `Utf32Str`'s
+/// codepoint conversion buffer for non-ascii haystacks.
+#[derive(Debug, Clone, Default)]
+struct Scratch {
+    matcher: Matcher,
+    buf: Vec<char>,
+}
+
 /// The merged corpus to search over, built once per library scan /
 /// Navidrome sync and re-searched on every keystroke.
 #[derive(Debug, Clone, Default)]
 pub struct Corpus {
-    items: Vec<SearchItem>,
+    items: Vec<Entry>,
+    /// Remote ids already indexed, split per `SearchItem::remote_key`
+    /// kind tag so a lookup can borrow the id instead of allocating a
+    /// key. Kept for the corpus's whole life rather than recomputed
+    /// per incoming batch, which cloned every indexed id every time.
+    remote_keys: [HashSet<String>; 4],
+    /// `search` takes `&self` (it is called on shared corpus bindings,
+    /// and only ever from the input thread), so the scratch lives
+    /// behind a `RefCell` instead of forcing `&mut` on every caller;
+    /// `search` is not reentrant, so the borrow can't conflict.
+    scratch: RefCell<Scratch>,
 }
 
 impl Corpus {
@@ -194,9 +238,18 @@ impl Corpus {
         Self::default()
     }
 
+    /// Single insertion point: every path that adds an item has to go
+    /// through here so the cached haystacks can't be left unbuilt.
+    fn push(&mut self, item: SearchItem) {
+        if let Some((kind, id)) = item.remote_key() {
+            self.remote_keys[kind as usize].insert(id.to_string());
+        }
+        self.items.push(Entry::new(item));
+    }
+
     pub fn add_local_tracks(&mut self, tracks: impl IntoIterator<Item = LocalTrack>) {
         for t in tracks {
-            self.items.push(match t.kind {
+            self.push(match t.kind {
                 MediaKind::Music => SearchItem::LocalMusic {
                     path: t.path,
                     title: t.title,
@@ -211,19 +264,10 @@ impl Corpus {
         }
     }
 
-    fn existing_remote_keys(&self) -> HashSet<(u8, String)> {
-        self.items
-            .iter()
-            .filter_map(|i| i.remote_key())
-            .map(|(k, id)| (k, id.to_string()))
-            .collect()
-    }
-
     pub fn add_subsonic_search_result(&mut self, r: SubsonicSearchResult, client: &Arc<Client>) {
-        let mut seen = self.existing_remote_keys();
         for Artist { id, name } in r.artists {
-            if seen.insert((0, id.clone())) {
-                self.items.push(SearchItem::Artist {
+            if !self.remote_keys[0].contains(id.as_str()) {
+                self.push(SearchItem::Artist {
                     id,
                     name,
                     client: client.clone(),
@@ -231,8 +275,8 @@ impl Corpus {
             }
         }
         for Album { id, name, artist } in r.albums {
-            if seen.insert((1, id.clone())) {
-                self.items.push(SearchItem::Album {
+            if !self.remote_keys[1].contains(id.as_str()) {
+                self.push(SearchItem::Album {
                     id,
                     name,
                     artist,
@@ -248,8 +292,8 @@ impl Corpus {
             ..
         } in r.songs
         {
-            if seen.insert((2, id.clone())) {
-                self.items.push(SearchItem::Song {
+            if !self.remote_keys[2].contains(id.as_str()) {
+                self.push(SearchItem::Song {
                     id,
                     title,
                     artist,
@@ -265,12 +309,11 @@ impl Corpus {
         playlists: impl IntoIterator<Item = Playlist>,
         client: &Arc<Client>,
     ) {
-        let mut seen = self.existing_remote_keys();
         for Playlist { id, name } in playlists {
-            if !seen.insert((3, id.clone())) {
+            if self.remote_keys[3].contains(id.as_str()) {
                 continue;
             }
-            self.items.push(SearchItem::Playlist {
+            self.push(SearchItem::Playlist {
                 id,
                 name,
                 client: client.clone(),
@@ -291,7 +334,7 @@ impl Corpus {
     pub fn remote_clients(&self) -> Vec<Arc<Client>> {
         let mut seen = HashSet::new();
         let mut clients = Vec::new();
-        for item in &self.items {
+        for item in self.items.iter().map(|e| &e.item) {
             if let Some(client) = item.client() {
                 if seen.insert(client.base_url().to_string()) {
                     clients.push(client.clone());
@@ -307,7 +350,7 @@ impl Corpus {
     pub fn breakdown(&self) -> Vec<(String, usize)> {
         let mut local = 0usize;
         let mut by_server: Vec<(String, usize)> = Vec::new();
-        for item in &self.items {
+        for item in self.items.iter().map(|e| &e.item) {
             match item.source() {
                 None => local += 1,
                 Some(url) => match by_server.iter_mut().find(|(u, _)| u == url) {
@@ -335,34 +378,20 @@ impl Corpus {
         if query.trim().is_empty() {
             return Vec::new();
         }
-        let mut matcher = Matcher::default();
         let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
         let query_lower = query.to_lowercase();
-        let typo_budget = edit_distance_budget(query_lower.chars().count());
+        let query_len = query_lower.chars().count();
+        let typo_budget = edit_distance_budget(query_len);
 
-        let mut scored: Vec<(u32, &SearchItem)> = self
-            .items
-            .iter()
-            .filter_map(|item| {
-                let haystack = item.haystack();
-
-                let mut buf = Vec::new();
-                let utf32 = Utf32Str::new(&haystack, &mut buf);
-                let fuzzy_score = pattern.score(utf32, &mut matcher);
-
-                let typo_score = haystack
-                    .split_whitespace()
-                    .map(|word| strsim::damerau_levenshtein(&query_lower, &word.to_lowercase()))
-                    .filter(|&dist| dist <= typo_budget)
-                    .map(typo_score)
-                    .max();
-
-                match (fuzzy_score, typo_score) {
-                    (None, None) => None,
-                    (a, b) => Some((a.unwrap_or(0).max(b.unwrap_or(0)), item)),
-                }
-            })
-            .collect();
+        let mut scratch = self.scratch.borrow_mut();
+        let mut scored = score_chunk(
+            &self.items,
+            &pattern,
+            &query_lower,
+            query_len,
+            typo_budget,
+            &mut scratch,
+        );
 
         scored.sort_by_key(|a| std::cmp::Reverse(a.0));
 
@@ -412,6 +441,59 @@ impl Corpus {
                     .map(|(_, item)| (*item).clone())
             })
             .collect()
+    }
+}
+
+/// Scores one slice of the corpus against `pattern`, reusing a single
+/// `Scratch` for every item instead of rebuilding one per item. Keeps
+/// corpus order, which the caller's stable sort relies on.
+fn score_chunk<'a>(
+    entries: &'a [Entry],
+    pattern: &Pattern,
+    query_lower: &str,
+    query_len: usize,
+    typo_budget: usize,
+    scratch: &mut Scratch,
+) -> Vec<(u32, &'a SearchItem)> {
+    let Scratch { matcher, buf } = scratch;
+    let mut scored = Vec::new();
+    for entry in entries {
+        let utf32 = Utf32Str::new(&entry.haystack, buf);
+        let fuzzy_score = pattern.score(utf32, matcher);
+
+        // two free skips of the edit-distance pass, both no-ops on the
+        // final score: a typo can never beat `typo_score(0)`, and edit
+        // distance is at least the length difference, so a word that
+        // far off can't come in under budget.
+        let typo_score = if fuzzy_score.is_some_and(|s| s >= typo_score(0)) {
+            None
+        } else {
+            entry
+                .haystack_lower
+                .split_whitespace()
+                .filter(|word| char_count(word).abs_diff(query_len) <= typo_budget)
+                .map(|word| strsim::damerau_levenshtein(query_lower, word))
+                .filter(|&dist| dist <= typo_budget)
+                .map(typo_score)
+                .max()
+        };
+
+        match (fuzzy_score, typo_score) {
+            (None, None) => {}
+            (a, b) => scored.push((a.unwrap_or(0).max(b.unwrap_or(0)), &entry.item)),
+        }
+    }
+    scored
+}
+
+/// `chars().count()` with the ascii fast path spelled out; the typo
+/// prefilter calls this once per word per item, and metadata is mostly
+/// ascii, where the length is already known.
+fn char_count(s: &str) -> usize {
+    if s.is_ascii() {
+        s.len()
+    } else {
+        s.chars().count()
     }
 }
 
