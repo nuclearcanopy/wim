@@ -94,6 +94,12 @@ pub struct SearchResult {
 }
 
 impl Client {
+    /// For grouping corpus items by which server they came from (the
+    /// on-demand index breakdown); not used for any request itself.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub fn new(cfg: &NavidromeConfig) -> anyhow::Result<Self> {
         Ok(Client {
             base_url: normalize_url(&cfg.url),

@@ -637,7 +637,7 @@ fn empty_results_message(app: &app::App) -> String {
     } else if app.editing_query && !app.query.is_empty() {
         format!("no matches for \"{}\"", app.query)
     } else {
-        format!("{} items indexed, press / to search", app.corpus.len())
+        "press / to search".to_string()
     }
 }
 
@@ -714,32 +714,22 @@ fn main() -> anyhow::Result<()> {
     // server stays down.
     let mut server_reachable: HashMap<String, bool> = HashMap::new();
     if !cfg.navidrome_servers.is_empty() {
-        let mut failures = Vec::new();
         for nav in &cfg.navidrome_servers {
             let ok = match index_navidrome_server(&mut app, nav) {
                 Ok(_) => true,
                 Err(msg) => {
-                    // a failed reconnect must not be silent; the old
-                    // behavior only updated `status` on success, so a down
-                    // server at startup looked identical to "nothing
-                    // configured", with no hint anything had gone wrong.
+                    // a failed reconnect must not be silent; push it
+                    // as its own notification rather than folding it
+                    // into a summary status line nobody asked for.
                     notifications.push(Severity::Error, format!("{}: {msg}", nav.url));
-                    failures.push(nav.url.clone());
                     false
                 }
             };
             server_reachable.insert(nav.url.clone(), ok);
         }
         app.resync_results();
-        status = if failures.is_empty() {
-            format!("{} items indexed (local + navidrome)", app.corpus.len())
-        } else {
-            format!(
-                "{} items indexed; {} navidrome server(s) failed to connect",
-                app.corpus.len(),
-                failures.len()
-            )
-        };
+        // 'I' shows a full local/per-server breakdown on demand
+        // instead of announcing a count unprompted on every startup.
     }
 
     // background re-sync so navidrome stays live without a manual
@@ -1124,7 +1114,6 @@ fn main() -> anyhow::Result<()> {
                     Banner {
                         phase,
                         elapsed_secs,
-                        local_items: app.corpus.len(),
                     },
                     main_content,
                 );
@@ -1362,7 +1351,6 @@ fn main() -> anyhow::Result<()> {
                                 cfg.library_paths = ob.library_paths.clone();
                                 let _ = config::save(&cfg);
                                 app.corpus = rebuild_corpus(&cfg);
-                                status = format!("{} local items indexed", app.corpus.len());
                                 ob.advance();
                             }
                             _ => {}
@@ -1599,6 +1587,18 @@ fn main() -> anyhow::Result<()> {
                         }
                         _ => {}
                     }
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('I') {
+                    let text = app
+                        .corpus
+                        .breakdown()
+                        .iter()
+                        .map(|(src, n)| format!("{src}: {n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    notifications.push(Severity::Info, text);
                     continue;
                 }
 
