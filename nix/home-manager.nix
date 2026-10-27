@@ -224,6 +224,25 @@ in
       '';
     };
 
+    sidebarWidth = mkOption {
+      type = types.int;
+      default = 32;
+      description = ''
+        Sidebar width in columns, clamped to 20-60. Also set live by
+        resize mode ('r'), which writes the chosen size back to
+        config.toml; set it here to pin a layout declaratively.
+      '';
+    };
+
+    bottomBarHeight = mkOption {
+      type = types.int;
+      default = 4;
+      description = ''
+        Bottom bar height in rows, clamped to 2-10. Same resize-mode
+        interaction as sidebarWidth.
+      '';
+    };
+
     cacheEvictionDays = mkOption {
       type = types.int;
       default = 7;
@@ -260,6 +279,8 @@ in
         color_level = cfg.subtitles.colorLevel;
       };
       subtitle_language = cfg.subtitleLanguage;
+      sidebar_width = cfg.sidebarWidth;
+      bottom_bar_height = cfg.bottomBarHeight;
       cache_listens_threshold = cfg.cacheListensThreshold;
       cache_eviction_days = cfg.cacheEvictionDays;
       scrobble = {
