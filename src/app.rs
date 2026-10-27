@@ -90,6 +90,13 @@ pub struct App {
     /// once `eq_custom` is true. Always kept in sync with what's
     /// actually audible, so callers never have to re-derive it.
     pub eq_gains: [f64; 10],
+    /// Whether the corpus is still being filled from the background
+    /// library scan / the first navidrome sync; purely so an empty
+    /// results list can say "loading" instead of "nothing found" (see
+    /// `main::loading_message`). Both start false: nothing is pending
+    /// until main.rs has actually spawned the work.
+    pub scanning_library: bool,
+    pub syncing_servers: bool,
     /// vim-style pending leader key, currently only used for `gg`.
     pending: Option<char>,
 }
@@ -109,6 +116,8 @@ impl App {
             eq_preset: 0,
             eq_custom: false,
             eq_gains: eq::PRESETS[0].gains,
+            scanning_library: false,
+            syncing_servers: false,
             pending: None,
         }
     }
