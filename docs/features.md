@@ -1,7 +1,7 @@
 # features
 
 living feature spec with the "why," not just the "what." when adding a
-feature, the standing bar (see `feedback_proactive_feature_quality` —
+feature, the standing bar (see `feedback_proactive_feature_quality`;
 applies to every feature, not just the ones explicitly requested): is
 this an incredibly loved feature in top-tier apps? is it modern,
 efficient, and does it make the app better for everyone? if yes, build
@@ -15,12 +15,12 @@ dead end.
 
 **why typo tolerance isn't optional:** a fuzzy matcher that only does
 subsequence matching (does the query appear as a subsequence of the
-target, in order, possibly with gaps) already catches a lot of typos —
+target, in order, possibly with gaps) already catches a lot of typos;
 dropped letters, extra letters, case differences. but it fundamentally
 cannot catch a transposition (two adjacent letters swapped), because
 the letters are no longer in the right relative order *at all*, not
 just gappy. real people transpose letters constantly. "never have no
-results" means handling both failure modes, not just the easy one —
+results" means handling both failure modes, not just the easy one;
 see `docs/architecture.md`'s search section for how the two signals
 (nucleo subsequence + damerau-levenshtein edit distance) are combined.
 
@@ -57,7 +57,7 @@ account for it explicitly rather than treating track transitions as
 duration setting, off by default so it doesn't surprise anyone who
 just wants gapless.
 
-**smart shuffle:** naive full-random shuffle feels bad in practice —
+**smart shuffle:** naive full-random shuffle feels bad in practice;
 it noticeably repeats recently-played tracks and clusters by chance.
 a shuffle that avoids recent repeats (e.g. weighted against a recency
 window, or a shuffled-bag algorithm) is what every major player
@@ -93,23 +93,25 @@ for the now-playing view once the core player loop exists.
 
 resuming where you left off (queue, position in the current track,
 volume) across restarts is standard in podcast/audiobook apps and most
-modern music players. not yet built; will piggyback on the config file
-once the app loop exists to actually have state worth persisting.
+modern music players. built (`src/persistence.rs`); plain paths under
+`$XDG_STATE_HOME/wim/state.toml`, best-effort both directions.
 
 ## album art
 
-real images (sixel/kitty/iterm2, auto-detected) or a desaturated
-pixelated-block mode for users who want to keep the interface purely
-monochrome. see `docs/architecture.md` for the technical mapping onto
-`ratatui-image`'s protocols. not yet wired in; needs the app loop and
-a real now-playing view to render into first.
+real images (sixel/kitty/iterm2, auto-detected via `ratatui-image`)
+or a grayscale ascii-block rasterization for users who want to keep
+the interface purely monochrome; `i` toggles, `config.album_art` sets
+the starting mode. built (`src/ui/albumart.rs`); see
+`docs/architecture.md` for the technical mapping onto
+`ratatui-image`'s protocols.
 
 ## subtitles (video)
 
-auto-fetch from opensubtitles on local video playback, with full
-manual control: delay, language, size, outline, background opacity/
-blur/radius, position. color stays grayscale per the monochrome rule
-even here; this is ui chrome (subtitle rendering), not image content,
-so the same rule that applies to the rest of the interface applies to
-it. not yet built; needs a real opensubtitles api key to live-test
-(see `QUESTIONS.md`).
+auto-fetch from opensubtitles on local video playback (behind
+`config.opensubtitles_api_key`/`_file`, off by default), plus manual
+control: delay, size, outline, background opacity/blur, position, and
+a single grayscale color level (never a hue, per the monochrome rule
+even here; this is ui chrome, not image content). built
+(`src/opensubtitles.rs`, `mpv::set_subtitle_style`); the opensubtitles
+rest endpoint shapes are an unverified best-effort guess, still needs
+a real api key to actually live-test (see `QUESTIONS.md`).
