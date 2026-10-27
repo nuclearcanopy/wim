@@ -2796,11 +2796,6 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                if key.code == keymap.get(KeyAction::OpenHelp) {
-                    help_open = true;
-                    continue;
-                }
-
                 // every block below intercepts specific keys and
                 // unconditionally `continue`s even on a non-match
                 // (browse_view/lyrics/the subtitle+settings menus
@@ -2813,10 +2808,49 @@ fn main() -> anyhow::Result<()> {
                 // full stop, before anything else gets a chance at it.
                 if app.editing_query {
                     let before = app.query.clone();
-                    app.handle_key(key.code, &keymap);
+                    let action = app.handle_key(key.code, &keymap);
                     if app.query != before {
                         notify_query_changed(&app, &remote_search_tx);
                     }
+                    // enter while typing commits the selection, so the
+                    // action has to run through the same dispatch the
+                    // normal path uses; throwing it away here is what
+                    // made the first enter after a search do nothing
+                    // but close the text box.
+                    let dispatch = dispatch_action(
+                        action,
+                        &mut ActionCtx {
+                            cfg: &cfg,
+                            player: &player,
+                            app: &mut app,
+                            notifications: &mut notifications,
+                            now_playing: &mut now_playing,
+                            previous_track: &mut previous_track,
+                            original_queue: &mut original_queue,
+                            player_minimized: &mut player_minimized,
+                            browse_view: &mut browse_view,
+                            real_art_protocol: &mut real_art_protocol,
+                            picker: &mut picker,
+                            focus: &mut focus,
+                            flash: &mut flash,
+                            cache: &cache_index,
+                            download_tx: &download_tx,
+                            downloading: &mut downloading,
+                            scrobble: &mut scrobble,
+                        },
+                    );
+                    if dispatch == Dispatch::Quit {
+                        break;
+                    }
+                    continue;
+                }
+
+                // after the query box, never before: `?` is an
+                // ordinary character to type into a search, and
+                // claiming it up here meant it could never reach the
+                // text box at all.
+                if key.code == keymap.get(KeyAction::OpenHelp) {
+                    help_open = true;
                     continue;
                 }
 
