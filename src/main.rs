@@ -1264,6 +1264,44 @@ enum Focus {
 /// direction/state combination not listed here has nowhere further
 /// to go that way and is deliberately a no-op (returns `current`
 /// unchanged), not an arbitrary fallback to some other pane.
+/// Whether the keyboard is currently moving focus between panes, or
+/// acting on whatever pane already has it. Two explicit modes rather
+/// than one modifier-key shortcut: a chord that silently moves focus
+/// gives you no way to tell, before pressing anything else, which
+/// pane the next keypress is going to land in. In `Move` nothing
+/// except focus responds at all (no scrolling, no playback, no
+/// keybinds), and both the bottom bar's indicator and the focused
+/// pane's own borders say so the whole time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    Move,
+    Interact,
+}
+
+/// wasd and the arrow keys both mean the same directional move;
+/// normalizes either into the arrow key `focus_in_direction` matches
+/// on, or `None` for a key that isn't a direction at all. wasd
+/// because that's what sway is configured with for exactly this job
+/// (focus the neighboring window), arrows because they're the obvious
+/// guess if you've never read the keybind list. Only consulted in
+/// `InputMode::Move`, so these stay free for their normal meaning
+/// everywhere else.
+fn focus_direction_key(code: KeyCode) -> Option<KeyCode> {
+    match code {
+        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => Some(code),
+        // shift+w arrives as an uppercase char, but match both cases
+        // rather than trusting every terminal to agree on that.
+        KeyCode::Char(c) => match c.to_ascii_lowercase() {
+            'a' => Some(KeyCode::Left),
+            'd' => Some(KeyCode::Right),
+            'w' => Some(KeyCode::Up),
+            's' => Some(KeyCode::Down),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn focus_in_direction(current: Focus, direction: KeyCode) -> Focus {
     match (current, direction) {
         (Focus::Sidebar, KeyCode::Right) => Focus::Workspace,
@@ -1323,22 +1361,19 @@ fn main() -> anyhow::Result<()> {
         }
     }
     let _ = player.set_af(&eq::build_af_filter(&app.eq_gains));
-    // the full keybind list moved to the '?' help overlay; nothing
-    // worth saying here until something actually happens.
-    let mut status = String::new();
     // which pane j/k/arrows/enter navigate: the sidebar's own results
     // list, the workspace (whatever's actually open there), or the
-    // bottom bar's own controls. shift+arrows moves it directionally
-    // (see the input-handling loop below), not three unrelated
-    // absolute "go to X" keys; global playback controls (space/f/b/
-    // c/etc.) don't care about this at all, only pane-local
-    // navigation does.
+    // bottom bar's own controls. only ever changed from
+    // `InputMode::Move` (see the input-handling loop below), never as
+    // a side effect of some other key.
     let mut focus = Focus::Sidebar;
+    let mut input_mode = InputMode::Interact;
     // sidebar_selected/bottom_selected (below) stay bright for this
-    // long right after focus actually changes, then fall back to
-    // their normal dark level; a brief acknowledgement rather than a
-    // permanent highlight, since a boundary that's bright all the
-    // time stopped reading as "something changed" at all.
+    // long right after *leaving* move mode, then fall back to their
+    // normal dark level. during move mode itself they're bright the
+    // whole time, which is the real "where am I" answer; this is just
+    // the tail end of it, so the landing is still visible for a beat
+    // after the mode drops.
     let mut focus_flash_until = Instant::now();
     const FOCUS_FLASH_DURATION: Duration = Duration::from_millis(700);
 
@@ -1739,15 +1774,19 @@ fn main() -> anyhow::Result<()> {
             // it's indistinguishable from the resting state the rest
             // of the time, but still answers "where am I" exactly
             // when that's actually in question.
-            let focus_flashing = Instant::now() < focus_flash_until;
+            // bright for the whole time move mode is active (that's
+            // the point: you can see where the next move starts from
+            // before pressing anything), plus a short decaying tail
+            // after it drops so the landing stays visible for a beat.
+            let focus_lit = input_mode == InputMode::Move || Instant::now() < focus_flash_until;
             let sidebar_selected = (panels.resize_mode
                 && panels.resize_selected == ResizePanel::Sidebar)
                 || (!panels.resize_mode
-                    && focus_flashing
+                    && focus_lit
                     && matches!(focus, Focus::Sidebar | Focus::Workspace));
             let bottom_selected = (panels.resize_mode
                 && panels.resize_selected == ResizePanel::BottomBar)
-                || (!panels.resize_mode && focus_flashing && focus == Focus::BottomBar);
+                || (!panels.resize_mode && focus_lit && focus == Focus::BottomBar);
 
             // search box, a one-row separator rule, then the results
             // list; the separator used to not exist at all, so the
@@ -1858,6 +1897,7 @@ fn main() -> anyhow::Result<()> {
                     query: &app.query,
                     editing: app.editing_query,
                     cursor_visible,
+                    right_border: false,
                 },
                 search_rect,
             );
@@ -2111,7 +2151,7 @@ fn main() -> anyhow::Result<()> {
             });
             f.render_widget(
                 ControlsBar {
-                    status: &status,
+                    move_mode: input_mode == InputMode::Move,
                     queue_len: app.queue.len(),
                     loop_label: app.loop_mode.label(),
                     shuffle_on: app.shuffle,
@@ -2177,9 +2217,8 @@ fn main() -> anyhow::Result<()> {
         // end-of-file (gaplessly); this just keeps our queue *view* in
         // sync with what mpv already moved past, nothing to load here.
         if let Ok(mpv::Event::EndFile) = player.events().try_recv() {
-            status = match app.pop_queue() {
+            match app.pop_queue() {
                 Some(next) => {
-                    let s = format!("now playing: {}", label(&next));
                     set_vid_for_item(&player, &next);
                     maybe_fetch_subtitles(&cfg, &player, &mut notifications, &next);
                     let mut dctx = DownloadCtx {
@@ -2191,7 +2230,6 @@ fn main() -> anyhow::Result<()> {
                     note_playback_started(&next, &mut dctx, &mut notifications);
                     start_tracking_playback(&cfg, &next, &mut scrobble);
                     previous_track = now_playing.replace(next);
-                    s
                 }
                 // mpv has no concept of "the queue we built", only its
                 // own (now-empty) playlist; "loop all" replaying from
@@ -2202,7 +2240,9 @@ fn main() -> anyhow::Result<()> {
                     let mut tracks = original_queue.clone().into_iter();
                     let first = tracks.next().expect("checked non-empty above");
                     let (s, played) = try_play(&player, &first, &cache_index);
-                    if played {
+                    if !played {
+                        notifications.push(Severity::Error, s);
+                    } else {
                         let rest: Vec<SearchItem> = tracks.collect();
                         for t in &rest {
                             let _ = try_enqueue(&player, t, &cache_index);
@@ -2219,13 +2259,9 @@ fn main() -> anyhow::Result<()> {
                         previous_track = now_playing.replace(first);
                         app.queue = rest;
                     }
-                    s
                 }
-                None => {
-                    now_playing = None;
-                    "queue empty, idle".to_string()
-                }
-            };
+                None => now_playing = None,
+            }
             // a track just ended; either start the new one quiet and
             // ramp it up (crossfade on), or make sure it's at full
             // volume regardless of wherever a fade-out left things
@@ -2434,7 +2470,10 @@ fn main() -> anyhow::Result<()> {
                                         cfg.navidrome_servers.push(nav);
                                         let _ = config::save(&cfg);
                                         let _ = servers_tx.send(cfg.navidrome_servers.clone());
-                                        status = format!("navidrome connected: {msg}");
+                                        notifications.push(
+                                            Severity::Info,
+                                            format!("navidrome connected: {msg}"),
+                                        );
                                         ob.advance();
                                     }
                                     Err(msg) => ob.login_message = format!("{msg} (esc to skip)"),
@@ -2453,7 +2492,8 @@ fn main() -> anyhow::Result<()> {
                                 if !token.is_empty() {
                                     cfg.listenbrainz_user_token = Some(token);
                                     let _ = config::save(&cfg);
-                                    status = "listenbrainz scrobbling enabled".to_string();
+                                    notifications
+                                        .push(Severity::Info, "listenbrainz scrobbling enabled");
                                 }
                                 ob.advance();
                             }
@@ -2878,30 +2918,40 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // directional, sway/i3-style, not three separate
-                // absolute "go to X" bindings: shift+right from the
-                // sidebar reaches the workspace, shift+left back;
-                // shift+down from either reaches the bottom bar,
-                // shift+up from there always back to the sidebar.
-                // every other direction/state combination is a no-op
-                // (there's nothing further that way) rather than
-                // picking an arbitrary fallback.
-                if key.modifiers.contains(KeyModifiers::SHIFT)
-                    && matches!(
-                        key.code,
-                        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
-                    )
-                {
-                    let new_focus = focus_in_direction(focus, key.code);
-                    if new_focus != focus {
-                        focus = new_focus;
-                        // a brief brightness pulse on whichever
-                        // boundary just gained focus, decaying back
-                        // to the usual dark level, same idea as the
-                        // bottom bar's own flash-on-change; see
-                        // sidebar_selected/bottom_selected below.
-                        focus_flash_until = Instant::now() + FOCUS_FLASH_DURATION;
+                // move mode owns the keyboard outright while it's
+                // active: the whole point is that wasd/arrows move
+                // focus and *nothing else happens*, so nothing below
+                // this ever sees these keys. directional and
+                // sway/i3-style, not three absolute "go to pane X"
+                // bindings: d/right from the sidebar reaches the
+                // workspace, a/left back, s/down from either reaches
+                // the bottom bar, w/up from there always back to the
+                // sidebar; anything with nowhere further to go that
+                // way is a no-op rather than an arbitrary fallback.
+                // placed after the modal menus (which own tab/enter
+                // themselves while open) but ahead of the
+                // browse/lyrics blocks, so an open album can never
+                // swallow a focus move.
+                if input_mode == InputMode::Move {
+                    match key.code {
+                        KeyCode::Tab | KeyCode::Enter | KeyCode::Esc => {
+                            input_mode = InputMode::Interact;
+                            // one last pulse on the pane just landed
+                            // in, so leaving move mode still answers
+                            // "where am I now" for a moment after the
+                            // permanent move-mode highlight drops.
+                            focus_flash_until = Instant::now() + FOCUS_FLASH_DURATION;
+                        }
+                        code => {
+                            if let Some(dir) = focus_direction_key(code) {
+                                focus = focus_in_direction(focus, dir);
+                            }
+                        }
                     }
+                    continue;
+                }
+                if key.code == KeyCode::Tab {
+                    input_mode = InputMode::Move;
                     continue;
                 }
 
@@ -2958,14 +3008,17 @@ fn main() -> anyhow::Result<()> {
                                     let mpv_loop = if mode == LoopMode::One { "inf" } else { "no" };
                                     match player.set_loop_file(mpv_loop) {
                                         Ok(()) => flash = Some((Field::Loop, Instant::now())),
-                                        Err(e) => status = format!("error setting loop: {e}"),
+                                        Err(e) => notifications.push(
+                                            Severity::Error,
+                                            format!("error setting loop: {e}"),
+                                        ),
                                     }
                                 }
                                 Field::Shuffle => {
                                     let items = app.toggle_shuffle_and_get_queue();
                                     let msg = resync_queue(&player, &items, &cache_index);
                                     if msg.starts_with("error") {
-                                        status = msg;
+                                        notifications.push(Severity::Error, msg);
                                     } else {
                                         flash = Some((Field::Shuffle, Instant::now()));
                                     }
@@ -2974,7 +3027,10 @@ fn main() -> anyhow::Result<()> {
                                     let speed = app.bump_speed(1.0);
                                     match player.set_speed(speed) {
                                         Ok(()) => flash = Some((Field::Speed, Instant::now())),
-                                        Err(e) => status = format!("error setting speed: {e}"),
+                                        Err(e) => notifications.push(
+                                            Severity::Error,
+                                            format!("error setting speed: {e}"),
+                                        ),
                                     }
                                 }
                                 Field::Eq => {
@@ -3121,24 +3177,21 @@ fn main() -> anyhow::Result<()> {
                                     // with the full player.
                                     player_minimized = true;
                                 } else {
-                                    notifications.push(Severity::Error, s.clone());
+                                    notifications.push(Severity::Error, s);
                                 }
-                                status = s;
                             }
                         }
                         _ if key.code == keymap.get(KeyAction::ToggleStar)
                             && !bv.albums_focused =>
                         {
                             if let Some(item) = bv.tracks.get(bv.selected).cloned() {
-                                status =
-                                    match toggle_star(&item, &mut favorites, &mut remote_starred) {
-                                        Ok(true) => "starred".to_string(),
-                                        Ok(false) => "unstarred".to_string(),
-                                        Err(msg) => {
-                                            notifications.push(Severity::Error, msg.clone());
-                                            msg
-                                        }
-                                    };
+                                // the row's own "*" marker is the
+                                // feedback; only a failure needs words.
+                                if let Err(msg) =
+                                    toggle_star(&item, &mut favorites, &mut remote_starred)
+                                {
+                                    notifications.push(Severity::Error, msg);
+                                }
                             }
                         }
                         // whole-album download when the artist view's
@@ -3288,7 +3341,10 @@ fn main() -> anyhow::Result<()> {
                         0.5
                     };
                     let _ = player.set_property("sub-delay", serde_json::json!(subtitle_delay));
-                    status = format!("subtitle delay: {subtitle_delay:+.1}s");
+                    notifications.push(
+                        Severity::Info,
+                        format!("subtitle delay: {subtitle_delay:+.1}s"),
+                    );
                     continue;
                 }
 
@@ -3316,7 +3372,7 @@ fn main() -> anyhow::Result<()> {
                         dctx: &mut dctx,
                         scrobble: &mut scrobble,
                     };
-                    status = go_to_previous(
+                    let _ = go_to_previous(
                         &cfg,
                         &player,
                         &mut notifications,
@@ -3334,18 +3390,11 @@ fn main() -> anyhow::Result<()> {
                     // nothing's being browsed, or something is but the
                     // sidebar has focus, so it's always the sidebar's
                     // own selected search result here.
-                    status = match app.results.get(app.selected).cloned() {
-                        Some(item) => match toggle_star(&item, &mut favorites, &mut remote_starred)
-                        {
-                            Ok(true) => "starred".to_string(),
-                            Ok(false) => "unstarred".to_string(),
-                            Err(msg) => {
-                                notifications.push(Severity::Error, msg.clone());
-                                msg
-                            }
-                        },
-                        None => "nothing selected".to_string(),
-                    };
+                    if let Some(item) = app.results.get(app.selected).cloned() {
+                        if let Err(msg) = toggle_star(&item, &mut favorites, &mut remote_starred) {
+                            notifications.push(Severity::Error, msg);
+                        }
+                    }
                     continue;
                 }
 
@@ -3356,23 +3405,23 @@ fn main() -> anyhow::Result<()> {
                     // is but the sidebar has focus, so it's always
                     // the sidebar's own selected search result here
                     // (same split `ToggleStar` already uses).
-                    status = match app.results.get(app.selected).cloned() {
-                        Some(item) => {
-                            let mut dctx = DownloadCtx {
-                                cache: &cache_index,
-                                download_tx: &download_tx,
-                                downloading: &mut downloading,
-                                listens_threshold: cfg.cache_listens_threshold,
-                            };
-                            trigger_downloads(&item, &mut dctx, &mut notifications)
-                        }
-                        None => "nothing selected".to_string(),
-                    };
+                    if let Some(item) = app.results.get(app.selected).cloned() {
+                        let mut dctx = DownloadCtx {
+                            cache: &cache_index,
+                            download_tx: &download_tx,
+                            downloading: &mut downloading,
+                            listens_threshold: cfg.cache_listens_threshold,
+                        };
+                        let _ = trigger_downloads(&item, &mut dctx, &mut notifications);
+                    }
                     continue;
                 }
 
                 if key.code == keymap.get(KeyAction::OpenLyrics) {
-                    status = match &now_playing {
+                    // only the paths that *don't* put something on
+                    // screen say anything; a successful lookup opens
+                    // the lyrics view, which is its own answer.
+                    match &now_playing {
                         Some(item) => match lyrics_query(item) {
                             Some((artist, title, album)) => {
                                 match lyrics_client.lookup(&artist, &title, &album, None) {
@@ -3392,20 +3441,20 @@ fn main() -> anyhow::Result<()> {
                                         };
                                         lyrics_lines =
                                             Some(text.lines().map(str::to_string).collect());
-                                        "lyrics loaded (j/k scroll, L/esc close)".to_string()
                                     }
-                                    Ok(None) => "no lyrics found".to_string(),
-                                    Err(e) => {
-                                        let msg = format!("lyrics lookup failed: {e}");
-                                        notifications.push(Severity::Error, msg.clone());
-                                        msg
+                                    Ok(None) => {
+                                        notifications.push(Severity::Info, "no lyrics found")
                                     }
+                                    Err(e) => notifications.push(
+                                        Severity::Error,
+                                        format!("lyrics lookup failed: {e}"),
+                                    ),
                                 }
                             }
-                            None => "no lyrics for this item".to_string(),
+                            None => notifications.push(Severity::Info, "no lyrics for this item"),
                         },
-                        None => "nothing playing".to_string(),
-                    };
+                        None => notifications.push(Severity::Info, "nothing playing"),
+                    }
                     continue;
                 }
 
@@ -3442,17 +3491,13 @@ fn main() -> anyhow::Result<()> {
                                 // with it already focused instead.
                                 focus = Focus::Workspace;
                             }
-                            Err(msg) => {
-                                notifications.push(Severity::Error, msg.clone());
-                                status = msg;
-                            }
+                            Err(msg) => notifications.push(Severity::Error, msg),
                         };
                     }
                     Action::Play(item) => {
-                        status = match resolve_tracks(&item) {
-                            Ok(tracks) if tracks.is_empty() => {
-                                "nothing to play (empty album or playlist)".to_string()
-                            }
+                        match resolve_tracks(&item) {
+                            Ok(tracks) if tracks.is_empty() => notifications
+                                .push(Severity::Info, "nothing to play (empty album or playlist)"),
                             Ok(mut tracks) => {
                                 let first = tracks.remove(0);
                                 let (s, played) = try_play(&player, &first, &cache_index);
@@ -3460,7 +3505,6 @@ fn main() -> anyhow::Result<()> {
                                     for t in &tracks {
                                         let _ = try_enqueue(&player, t, &cache_index);
                                     }
-                                    let rest = tracks.len();
                                     original_queue = std::iter::once(first.clone())
                                         .chain(tracks.iter().cloned())
                                         .collect();
@@ -3484,47 +3528,44 @@ fn main() -> anyhow::Result<()> {
                                     // open album/playlist) takes over
                                     // the full player by default.
                                     player_minimized = false;
-                                    if rest == 0 {
-                                        s
-                                    } else {
-                                        format!("{s} (+{rest} more queued)")
-                                    }
                                 } else {
-                                    notifications.push(Severity::Error, s.clone());
-                                    s
+                                    notifications.push(Severity::Error, s);
                                 }
                             }
-                            Err(msg) => {
-                                notifications.push(Severity::Error, msg.clone());
-                                msg
-                            }
-                        };
+                            Err(msg) => notifications.push(Severity::Error, msg),
+                        }
                     }
                     Action::Queued(item) => {
-                        status = match resolve_tracks(&item) {
+                        // queueing has no on-screen consequence of its
+                        // own (the queue count on the bottom bar moves,
+                        // but that's easy to miss), so this is one of
+                        // the few things worth an actual toast.
+                        match resolve_tracks(&item) {
                             Ok(tracks) => {
-                                let mut last_status = String::new();
                                 for t in &tracks {
-                                    last_status = try_enqueue(&player, t, &cache_index);
+                                    let s = try_enqueue(&player, t, &cache_index);
+                                    if s.starts_with("error") {
+                                        notifications.push(Severity::Error, s);
+                                    }
                                 }
                                 let n = tracks.len();
                                 app.queue.extend(tracks);
-                                if n <= 1 {
-                                    last_status
-                                } else {
-                                    format!("queued {n} tracks")
-                                }
+                                notifications.push(
+                                    Severity::Info,
+                                    if n == 1 {
+                                        "queued 1 track".to_string()
+                                    } else {
+                                        format!("queued {n} tracks")
+                                    },
+                                );
                             }
-                            Err(msg) => {
-                                notifications.push(Severity::Error, msg.clone());
-                                msg
-                            }
-                        };
+                            Err(msg) => notifications.push(Severity::Error, msg),
+                        }
                     }
                     Action::QueueReordered(items) => {
                         let msg = resync_queue(&player, &items, &cache_index);
                         if msg.starts_with("error") {
-                            status = msg;
+                            notifications.push(Severity::Error, msg);
                         } else {
                             flash = Some((Field::Shuffle, Instant::now()));
                         }
@@ -3537,18 +3578,22 @@ fn main() -> anyhow::Result<()> {
                         let mpv_loop = if mode == LoopMode::One { "inf" } else { "no" };
                         match player.set_loop_file(mpv_loop) {
                             Ok(()) => flash = Some((Field::Loop, Instant::now())),
-                            Err(e) => status = format!("error setting loop: {e}"),
+                            Err(e) => notifications
+                                .push(Severity::Error, format!("error setting loop: {e}")),
                         }
                     }
                     Action::SetSpeed(speed) => match player.set_speed(speed) {
                         Ok(()) => flash = Some((Field::Speed, Instant::now())),
-                        Err(e) => status = format!("error setting speed: {e}"),
+                        Err(e) => {
+                            notifications.push(Severity::Error, format!("error setting speed: {e}"))
+                        }
                     },
                     Action::SetEq(_name, gains) => {
                         let filter = eq::build_af_filter(&gains);
                         match player.set_af(&filter) {
                             Ok(()) => flash = Some((Field::Eq, Instant::now())),
-                            Err(e) => status = format!("error setting eq: {e}"),
+                            Err(e) => notifications
+                                .push(Severity::Error, format!("error setting eq: {e}")),
                         }
                     }
                     Action::None => {}
@@ -3595,6 +3640,39 @@ mod focus_tests {
             focus_in_direction(Focus::BottomBar, KeyCode::Up),
             Focus::Sidebar
         );
+    }
+
+    #[test]
+    fn wasd_and_arrows_are_the_same_four_directions() {
+        for (letter, arrow) in [
+            ('a', KeyCode::Left),
+            ('d', KeyCode::Right),
+            ('w', KeyCode::Up),
+            ('s', KeyCode::Down),
+        ] {
+            assert_eq!(focus_direction_key(KeyCode::Char(letter)), Some(arrow));
+            // shift+w arrives uppercase on most terminals.
+            assert_eq!(
+                focus_direction_key(KeyCode::Char(letter.to_ascii_uppercase())),
+                Some(arrow)
+            );
+            assert_eq!(focus_direction_key(arrow), Some(arrow));
+        }
+    }
+
+    #[test]
+    fn keys_that_are_not_directions_are_rejected() {
+        // tab/enter/esc in particular: move mode reads those as "leave
+        // move mode", so they must never also register as a move.
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('q'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Tab,
+        ] {
+            assert_eq!(focus_direction_key(code), None);
+        }
     }
 
     #[test]
