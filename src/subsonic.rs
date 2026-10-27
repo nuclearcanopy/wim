@@ -322,6 +322,28 @@ impl Client {
         url
     }
 
+    /// Live, on-demand search via Subsonic's `search3` (ID3-based):
+    /// the counterpart to `getArtists`/`getAlbumList2`'s eager, up-
+    /// front indexing (see `fetch_navidrome_catalog`'s own comment in
+    /// main.rs for why songs specifically are *not* indexed that way).
+    /// Covers whatever an eager index misses, most importantly
+    /// individual song titles, without ever pulling the whole catalog
+    /// of songs up front. Same per-entity shapes as `getArtist`/
+    /// `getAlbum`/`getPlaylist`'s track lists, just all three under one
+    /// `searchResult3` envelope instead of one call per entity type.
+    pub fn search3(&self, query: &str) -> anyhow::Result<SearchResult> {
+        let v = self.get(
+            "search3",
+            &[
+                ("query", query),
+                ("artistCount", "20"),
+                ("albumCount", "20"),
+                ("songCount", "40"),
+            ],
+        )?;
+        Ok(parse_search3_response(&v))
+    }
+
     /// Raw image bytes for an album's (or song's) cover art; navidrome
     /// accepts the album id directly as the `getCoverArt` id in the
     /// common case. Not JSON, so this bypasses `get()` and reads the
@@ -445,12 +467,11 @@ fn parse_artist_albums(v: &serde_json::Value) -> Vec<ArtistAlbum> {
         .unwrap_or_default()
 }
 
-/// Pure parsing for a single `getAlbumList2` page, pulled out of
-/// `all_albums()`'s pagination loop so it's testable in isolation.
-fn parse_album_list2_page(v: &serde_json::Value) -> Vec<Album> {
-    v.get("albumList2")
-        .and_then(|a| a.get("album"))
-        .and_then(|a| a.as_array())
+/// Pure parsing for a flat array of ID3 album objects (`id`/`name`/
+/// `artist`), shared by `getAlbumList2`'s page parsing and `search3`'s
+/// `album` array, which use the identical per-album shape.
+fn parse_album_array(arr: Option<&serde_json::Value>) -> Vec<Album> {
+    arr.and_then(|a| a.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|a| {
@@ -467,6 +488,42 @@ fn parse_album_list2_page(v: &serde_json::Value) -> Vec<Album> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Pure parsing for a single `getAlbumList2` page, pulled out of
+/// `all_albums()`'s pagination loop so it's testable in isolation.
+fn parse_album_list2_page(v: &serde_json::Value) -> Vec<Album> {
+    parse_album_array(v.get("albumList2").and_then(|a| a.get("album")))
+}
+
+/// Pure parsing for a flat array of ID3 artist objects (`id`/`name`),
+/// as returned directly (not grouped by index letter, unlike
+/// `getArtists`) by `search3`'s `artist` array.
+fn parse_artist_array(arr: Option<&serde_json::Value>) -> Vec<Artist> {
+    arr.and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| {
+                    Some(Artist {
+                        id: a.get("id")?.as_str()?.to_string(),
+                        name: a.get("name")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Pure parsing for `search3`'s `searchResult3` envelope, pulled out
+/// of `search3()` so it's testable against a fixture without a live
+/// server, same as every other parse helper in this file.
+fn parse_search3_response(v: &serde_json::Value) -> SearchResult {
+    let r = v.get("searchResult3");
+    SearchResult {
+        artists: parse_artist_array(r.and_then(|r| r.get("artist"))),
+        albums: parse_album_array(r.and_then(|r| r.get("album"))),
+        songs: parse_song_array(r.and_then(|r| r.get("song"))),
+    }
 }
 
 #[cfg(test)]
@@ -620,5 +677,41 @@ mod tests {
         assert!(parse_artists_index(&v).is_empty());
         assert!(parse_album_list2_page(&v).is_empty());
         assert!(parse_song_array(None).is_empty());
+    }
+
+    #[test]
+    fn parses_search3_response_including_a_song_title_match() {
+        // shape per the Subsonic API docs for search3 (ID3-based):
+        // artist/album/song all flat arrays directly under
+        // searchResult3, same per-entity fields as getArtist/
+        // getAlbum/getPlaylist elsewhere in this file.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{
+                "searchResult3": {
+                    "artist": [{"id": "ar-2", "name": "Bladee"}],
+                    "album": [{"id": "al-1", "name": "Icedancer", "artist": "Bladee"}],
+                    "song": [
+                        {"id": "s1", "title": "Flatline", "artist": "Bladee", "album": "Icedancer", "duration": 142}
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        let result = parse_search3_response(&v);
+        assert_eq!(result.artists.len(), 1);
+        assert_eq!(result.artists[0].name, "Bladee");
+        assert_eq!(result.albums.len(), 1);
+        assert_eq!(result.albums[0].name, "Icedancer");
+        assert_eq!(result.songs.len(), 1);
+        assert_eq!(result.songs[0].title, "Flatline");
+    }
+
+    #[test]
+    fn parses_search3_response_with_no_matches_as_empty_not_a_panic() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"searchResult3": {}}"#).unwrap();
+        let result = parse_search3_response(&v);
+        assert!(result.artists.is_empty());
+        assert!(result.albums.is_empty());
+        assert!(result.songs.is_empty());
     }
 }
