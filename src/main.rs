@@ -220,6 +220,7 @@ fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
                 albums_focused: false,
                 filter_query: String::new(),
                 filtering: false,
+                show_track_artist: false,
             })
         }
         SearchItem::Playlist { id, name, client } => {
@@ -240,6 +241,7 @@ fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
                 albums_focused: false,
                 filter_query: String::new(),
                 filtering: false,
+                show_track_artist: true,
             })
         }
         _ => unreachable!("open_browse_view only called for Album/Playlist"),
@@ -271,6 +273,7 @@ fn open_artist_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
         albums_focused: false,
         filter_query: String::new(),
         filtering: false,
+        show_track_artist: false,
     })
 }
 
@@ -350,6 +353,7 @@ fn open_starred_view(
         albums_focused: false,
         filter_query: String::new(),
         filtering: false,
+        show_track_artist: true,
     }
 }
 

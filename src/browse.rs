@@ -177,6 +177,13 @@ pub struct BrowseView {
     /// small catalog", not "search everything"). Empty matches all.
     pub filter_query: String,
     pub filtering: bool,
+    /// Whether track rows repeat the artist name (`"title · artist"`)
+    /// or just show the bare title. Only worth showing when a list can
+    /// genuinely mix artists (a playlist, or the merged-across-everything
+    /// starred-songs view); it's redundant noise on a single album or an
+    /// artist profile's own songs column, where every row is obviously
+    /// the same artist.
+    pub show_track_artist: bool,
 }
 
 /// The bio's own rect, directly below the header and above whatever

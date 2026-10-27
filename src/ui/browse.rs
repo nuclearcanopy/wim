@@ -122,6 +122,7 @@ impl Widget for BrowseListView<'_> {
             &(0..self.view.tracks.len()).collect::<Vec<_>>(),
             self.view.selected,
             true,
+            self.view.show_track_artist,
             self.favorites,
             self.remote_starred,
         );
@@ -185,6 +186,7 @@ impl BrowseListView<'_> {
             &visible,
             self.view.selected,
             !self.view.albums_focused,
+            self.view.show_track_artist,
             self.favorites,
             self.remote_starred,
         );
@@ -241,6 +243,7 @@ fn draw_track_list(
     indices: &[usize],
     selected: usize,
     focused: bool,
+    show_artist: bool,
     favorites: &Favorites,
     remote_starred: &HashSet<String>,
 ) {
@@ -262,7 +265,8 @@ fn draw_track_list(
         let is_selected = idx == selected;
         let marker = if is_selected { "> " } else { "  " };
         let label = match track {
-            SearchItem::Song { title, artist, .. } => format!("{title} · {artist}"),
+            SearchItem::Song { title, artist, .. } if show_artist => format!("{title} · {artist}"),
+            SearchItem::Song { title, .. } => title.clone(),
             _ => String::new(),
         };
         let star = if is_starred(track, favorites, remote_starred) {
