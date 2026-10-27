@@ -126,4 +126,3 @@ fn draw_centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatu
         }
     }
 }
-

@@ -32,7 +32,13 @@ impl Widget for WelcomeView {
             "a terminal omniplayer for your music and video",
             shade(DIM),
         );
-        draw_centered(buf, area, area.y + 4, "press any key to set things up", shade(DIM));
+        draw_centered(
+            buf,
+            area,
+            area.y + 4,
+            "press any key to set things up",
+            shade(DIM),
+        );
     }
 }
 
@@ -65,20 +71,44 @@ impl Widget for LibraryPathsView<'_> {
         draw_line(buf, area, area.y, "where's your media?", shade(NEAR_WHITE));
         let mut y = area.y + 2;
         if self.paths.is_empty() {
-            draw_line(buf, area, y, "(no paths found: type one below, or skip to browse nothing yet)", shade(DIM));
+            draw_line(
+                buf,
+                area,
+                y,
+                "(no paths found: type one below, or skip to browse nothing yet)",
+                shade(DIM),
+            );
             y += 1;
         } else {
             for p in self.paths {
-                draw_line(buf, area, y, &format!("  {}", truncate_with_ellipsis(p, width.saturating_sub(2))), shade(DIM));
+                draw_line(
+                    buf,
+                    area,
+                    y,
+                    &format!("  {}", truncate_with_ellipsis(p, width.saturating_sub(2))),
+                    shade(DIM),
+                );
                 y += 1;
             }
         }
         y += 1;
         let prefix = "add path: ";
         let value_width = width.saturating_sub(prefix.chars().count());
-        draw_line(buf, area, y, &format!("{prefix}{}", tail_fit(self.input, value_width)), shade(NEAR_WHITE));
+        draw_line(
+            buf,
+            area,
+            y,
+            &format!("{prefix}{}", tail_fit(self.input, value_width)),
+            shade(NEAR_WHITE),
+        );
         y += 2;
-        draw_line(buf, area, y, "enter to add, enter on empty to continue", shade(DIM));
+        draw_line(
+            buf,
+            area,
+            y,
+            "enter to add, enter on empty to continue",
+            shade(DIM),
+        );
     }
 }
 

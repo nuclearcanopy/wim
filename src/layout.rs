@@ -60,7 +60,10 @@ impl PanelLayout {
                 self.sidebar_width = self.sidebar_width.saturating_sub(STEP).max(SIDEBAR_MIN);
             }
             ResizePanel::BottomBar => {
-                self.bottom_bar_height = self.bottom_bar_height.saturating_sub(STEP).max(BOTTOM_BAR_MIN);
+                self.bottom_bar_height = self
+                    .bottom_bar_height
+                    .saturating_sub(STEP)
+                    .max(BOTTOM_BAR_MIN);
             }
         }
     }
@@ -112,6 +115,9 @@ mod tests {
         l.grow();
         l.shrink();
         l.shrink();
-        assert_eq!(l.bottom_bar_height, original_bottom, "sidebar resize must not affect bottom bar height");
+        assert_eq!(
+            l.bottom_bar_height, original_bottom,
+            "sidebar resize must not affect bottom bar height"
+        );
     }
 }

@@ -52,10 +52,20 @@ pub fn layout(area: Rect, has_art: bool) -> (Option<Rect>, Rect) {
     } else {
         0
     };
-    let art_rect = (art_width > 0).then(|| Rect { x: area.x, y, width: art_width, height: body_height });
+    let art_rect = (art_width > 0).then(|| Rect {
+        x: area.x,
+        y,
+        width: art_width,
+        height: body_height,
+    });
     let list_x = area.x + art_width + if art_width > 0 { 1 } else { 0 };
     let list_width = (area.x + area.width).saturating_sub(list_x);
-    let list_rect = Rect { x: list_x, y, width: list_width, height: body_height };
+    let list_rect = Rect {
+        x: list_x,
+        y,
+        width: list_width,
+        height: body_height,
+    };
     (art_rect, list_rect)
 }
 
@@ -91,6 +101,12 @@ impl BrowseView {
 pub fn songs_to_items(songs: Vec<crate::subsonic::Song>, client: &Arc<Client>) -> Vec<SearchItem> {
     songs
         .into_iter()
-        .map(|s| SearchItem::Song { id: s.id, title: s.title, artist: s.artist, album: s.album, client: client.clone() })
+        .map(|s| SearchItem::Song {
+            id: s.id,
+            title: s.title,
+            artist: s.artist,
+            album: s.album,
+            client: client.clone(),
+        })
         .collect()
 }

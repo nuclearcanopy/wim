@@ -203,7 +203,10 @@ impl Client {
         let v = self.get("getAlbum", &[("id", album_id)])?;
         let album = v.get("album");
         Ok(AlbumDetails {
-            year: album.and_then(|a| a.get("year")).and_then(|y| y.as_u64()).map(|y| y as u32),
+            year: album
+                .and_then(|a| a.get("year"))
+                .and_then(|y| y.as_u64())
+                .map(|y| y as u32),
             songs: parse_song_array(album.and_then(|a| a.get("song"))),
         })
     }
@@ -213,7 +216,9 @@ impl Client {
     /// Playlists have no release year, so no metadata wrapper needed.
     pub fn get_playlist_songs(&self, playlist_id: &str) -> anyhow::Result<Vec<Song>> {
         let v = self.get("getPlaylist", &[("id", playlist_id)])?;
-        Ok(parse_song_array(v.get("playlist").and_then(|p| p.get("entry"))))
+        Ok(parse_song_array(
+            v.get("playlist").and_then(|p| p.get("entry")),
+        ))
     }
 
     pub fn star(&self, id: &str) -> anyhow::Result<()> {
@@ -232,7 +237,9 @@ impl Client {
     /// listing, just sourced from here instead of one album).
     pub fn get_starred_songs(&self) -> anyhow::Result<Vec<Song>> {
         let v = self.get("getStarred2", &[])?;
-        Ok(parse_song_array(v.get("starred2").and_then(|s| s.get("song"))))
+        Ok(parse_song_array(
+            v.get("starred2").and_then(|s| s.get("song")),
+        ))
     }
 
     pub fn playlists(&self) -> anyhow::Result<Vec<Playlist>> {
@@ -404,8 +411,16 @@ fn parse_song_array(arr: Option<&serde_json::Value>) -> Vec<Song> {
                     Some(Song {
                         id: s.get("id")?.as_str()?.to_string(),
                         title: s.get("title")?.as_str()?.to_string(),
-                        artist: s.get("artist").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                        album: s.get("album").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        artist: s
+                            .get("artist")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        album: s
+                            .get("album")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                         duration: s.get("duration").and_then(|v| v.as_u64()).map(|d| d as u32),
                     })
                 })
@@ -426,7 +441,11 @@ fn parse_album_list2_page(v: &serde_json::Value) -> Vec<Album> {
                     Some(Album {
                         id: a.get("id")?.as_str()?.to_string(),
                         name: a.get("name")?.as_str()?.to_string(),
-                        artist: a.get("artist").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        artist: a
+                            .get("artist")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                     })
                 })
                 .collect()
@@ -450,13 +469,22 @@ mod tests {
 
     #[test]
     fn normalize_url_defaults_to_https_when_scheme_omitted() {
-        assert_eq!(normalize_url("navidrome.example.com"), "https://navidrome.example.com");
+        assert_eq!(
+            normalize_url("navidrome.example.com"),
+            "https://navidrome.example.com"
+        );
     }
 
     #[test]
     fn normalize_url_leaves_an_explicit_scheme_alone() {
-        assert_eq!(normalize_url("http://192.168.1.5:4533"), "http://192.168.1.5:4533");
-        assert_eq!(normalize_url("https://navidrome.example.com/"), "https://navidrome.example.com");
+        assert_eq!(
+            normalize_url("http://192.168.1.5:4533"),
+            "http://192.168.1.5:4533"
+        );
+        assert_eq!(
+            normalize_url("https://navidrome.example.com/"),
+            "https://navidrome.example.com"
+        );
     }
 
     #[test]

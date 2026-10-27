@@ -12,20 +12,49 @@ use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 
 use crate::library::{LocalTrack, MediaKind};
-use crate::subsonic::{Album, Artist, Client, Playlist, SearchResult as SubsonicSearchResult, Song};
+use crate::subsonic::{
+    Album, Artist, Client, Playlist, SearchResult as SubsonicSearchResult, Song,
+};
 
 #[derive(Debug, Clone)]
 pub enum SearchItem {
-    LocalMusic { path: PathBuf, title: String, artist: Option<String>, album: Option<String> },
-    LocalVideo { path: PathBuf, title: String },
+    LocalMusic {
+        path: PathBuf,
+        title: String,
+        artist: Option<String>,
+        album: Option<String>,
+    },
+    LocalVideo {
+        path: PathBuf,
+        title: String,
+    },
     // every remote variant carries the client it came from; with
     // multiple navidrome servers merged into one corpus and no "active
     // server" concept, this is the only way playback later knows which
     // server's credentials to build a stream url with.
-    Artist { id: String, name: String, client: Arc<Client> },
-    Album { id: String, name: String, artist: String, client: Arc<Client> },
-    Song { id: String, title: String, artist: String, album: String, client: Arc<Client> },
-    Playlist { id: String, name: String, client: Arc<Client> },
+    Artist {
+        id: String,
+        name: String,
+        client: Arc<Client>,
+    },
+    Album {
+        id: String,
+        name: String,
+        artist: String,
+        client: Arc<Client>,
+    },
+    Song {
+        id: String,
+        title: String,
+        artist: String,
+        album: String,
+        client: Arc<Client>,
+    },
+    Playlist {
+        id: String,
+        name: String,
+        client: Arc<Client>,
+    },
 }
 
 impl SearchItem {
@@ -33,17 +62,25 @@ impl SearchItem {
     /// joined, so "search bla" matches on title, artist, or album alike.
     fn haystack(&self) -> String {
         match self {
-            SearchItem::LocalMusic { title, artist, album, .. } => {
-                [Some(title.as_str()), artist.as_deref(), album.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            }
+            SearchItem::LocalMusic {
+                title,
+                artist,
+                album,
+                ..
+            } => [Some(title.as_str()), artist.as_deref(), album.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" "),
             SearchItem::LocalVideo { title, .. } => title.clone(),
             SearchItem::Artist { name, .. } => name.clone(),
             SearchItem::Album { name, artist, .. } => format!("{name} {artist}"),
-            SearchItem::Song { title, artist, album, .. } => format!("{title} {artist} {album}"),
+            SearchItem::Song {
+                title,
+                artist,
+                album,
+                ..
+            } => format!("{title} {artist} {album}"),
             SearchItem::Playlist { name, .. } => name.clone(),
         }
     }
@@ -97,7 +134,10 @@ impl Corpus {
                     artist: t.artist,
                     album: t.album,
                 },
-                MediaKind::Video => SearchItem::LocalVideo { path: t.path, title: t.title },
+                MediaKind::Video => SearchItem::LocalVideo {
+                    path: t.path,
+                    title: t.title,
+                },
             });
         }
     }
@@ -114,28 +154,58 @@ impl Corpus {
         let mut seen = self.existing_remote_keys();
         for Artist { id, name } in r.artists {
             if seen.insert((0, id.clone())) {
-                self.items.push(SearchItem::Artist { id, name, client: client.clone() });
+                self.items.push(SearchItem::Artist {
+                    id,
+                    name,
+                    client: client.clone(),
+                });
             }
         }
         for Album { id, name, artist } in r.albums {
             if seen.insert((1, id.clone())) {
-                self.items.push(SearchItem::Album { id, name, artist, client: client.clone() });
+                self.items.push(SearchItem::Album {
+                    id,
+                    name,
+                    artist,
+                    client: client.clone(),
+                });
             }
         }
-        for Song { id, title, artist, album, .. } in r.songs {
+        for Song {
+            id,
+            title,
+            artist,
+            album,
+            ..
+        } in r.songs
+        {
             if seen.insert((2, id.clone())) {
-                self.items.push(SearchItem::Song { id, title, artist, album, client: client.clone() });
+                self.items.push(SearchItem::Song {
+                    id,
+                    title,
+                    artist,
+                    album,
+                    client: client.clone(),
+                });
             }
         }
     }
 
-    pub fn add_playlists(&mut self, playlists: impl IntoIterator<Item = Playlist>, client: &Arc<Client>) {
+    pub fn add_playlists(
+        &mut self,
+        playlists: impl IntoIterator<Item = Playlist>,
+        client: &Arc<Client>,
+    ) {
         let mut seen = self.existing_remote_keys();
         for Playlist { id, name } in playlists {
             if !seen.insert((3, id.clone())) {
                 continue;
             }
-            self.items.push(SearchItem::Playlist { id, name, client: client.clone() });
+            self.items.push(SearchItem::Playlist {
+                id,
+                name,
+                client: client.clone(),
+            });
         }
     }
 
@@ -245,8 +315,15 @@ mod tests {
         }]);
         c.add_subsonic_search_result(
             SubsonicSearchResult {
-                artists: vec![Artist { id: "a1".into(), name: "Black Sabbath".into() }],
-                albums: vec![Album { id: "al1".into(), name: "Blackout".into(), artist: "Scorpions".into() }],
+                artists: vec![Artist {
+                    id: "a1".into(),
+                    name: "Black Sabbath".into(),
+                }],
+                albums: vec![Album {
+                    id: "al1".into(),
+                    name: "Blackout".into(),
+                    artist: "Scorpions".into(),
+                }],
                 songs: vec![Song {
                     id: "s1".into(),
                     title: "Unrelated Track".into(),
@@ -257,7 +334,13 @@ mod tests {
             },
             &client,
         );
-        c.add_playlists([Playlist { id: "p1".into(), name: "black metal essentials".into() }], &client);
+        c.add_playlists(
+            [Playlist {
+                id: "p1".into(),
+                name: "black metal essentials".into(),
+            }],
+            &client,
+        );
         c
     }
 
@@ -266,14 +349,33 @@ mod tests {
         let client = test_client();
         let mut c = Corpus::new();
         let result = || SubsonicSearchResult {
-            artists: vec![Artist { id: "a1".into(), name: "Bladee".into() }],
-            albums: vec![Album { id: "al1".into(), name: "Cold Visions".into(), artist: "Bladee".into() }],
+            artists: vec![Artist {
+                id: "a1".into(),
+                name: "Bladee".into(),
+            }],
+            albums: vec![Album {
+                id: "al1".into(),
+                name: "Cold Visions".into(),
+                artist: "Bladee".into(),
+            }],
             songs: vec![],
         };
         c.add_subsonic_search_result(result(), &client);
         c.add_subsonic_search_result(result(), &client); // simulates a reconnect/periodic resync
-        c.add_playlists([Playlist { id: "p1".into(), name: "Drain Gang".into() }], &client);
-        c.add_playlists([Playlist { id: "p1".into(), name: "Drain Gang".into() }], &client);
+        c.add_playlists(
+            [Playlist {
+                id: "p1".into(),
+                name: "Drain Gang".into(),
+            }],
+            &client,
+        );
+        c.add_playlists(
+            [Playlist {
+                id: "p1".into(),
+                name: "Drain Gang".into(),
+            }],
+            &client,
+        );
 
         assert_eq!(c.len(), 3, "one artist + one album + one playlist, not six");
     }
@@ -292,7 +394,9 @@ mod tests {
         assert!(kinds.contains(&"artist"));
         assert!(kinds.contains(&"album"));
         assert!(kinds.contains(&"playlist"));
-        assert!(!results.iter().any(|i| matches!(i, SearchItem::Song { id, .. } if id == "s1")));
+        assert!(!results
+            .iter()
+            .any(|i| matches!(i, SearchItem::Song { id, .. } if id == "s1")));
     }
 
     #[test]
@@ -307,7 +411,10 @@ mod tests {
         let mut c = Corpus::new();
         c.add_subsonic_search_result(
             SubsonicSearchResult {
-                artists: vec![Artist { id: "a1".into(), name: "Branimir".into() }],
+                artists: vec![Artist {
+                    id: "a1".into(),
+                    name: "Branimir".into(),
+                }],
                 albums: vec![],
                 songs: vec![],
             },
@@ -318,7 +425,9 @@ mod tests {
         // 'a'), so nucleo's own fuzzy matcher already catches this one.
         let dropped_letter = c.search("brnimir");
         assert!(
-            dropped_letter.iter().any(|i| matches!(i, SearchItem::Artist { name, .. } if name == "Branimir")),
+            dropped_letter
+                .iter()
+                .any(|i| matches!(i, SearchItem::Artist { name, .. } if name == "Branimir")),
             "subsequence-fuzzy typo should match"
         );
 
@@ -327,7 +436,9 @@ mod tests {
         // 'i'), so this only matches via the edit-distance fallback.
         let transposed = c.search("brainmir");
         assert!(
-            transposed.iter().any(|i| matches!(i, SearchItem::Artist { name, .. } if name == "Branimir")),
+            transposed
+                .iter()
+                .any(|i| matches!(i, SearchItem::Artist { name, .. } if name == "Branimir")),
             "transposition typo should still match via edit-distance fallback"
         );
     }

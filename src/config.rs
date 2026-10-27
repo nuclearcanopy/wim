@@ -87,7 +87,8 @@ pub fn load_or_init() -> Result<Config> {
         return Ok(Config::default());
     }
     let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let cfg: Config = toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    let cfg: Config =
+        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
     Ok(cfg)
 }
 

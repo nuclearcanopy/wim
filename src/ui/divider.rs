@@ -30,7 +30,11 @@ impl Widget for HorizontalRule {
         }
         let color = shade(if self.highlighted { DIM } else { NEAR_BLACK });
         for x in area.x..area.x + area.width {
-            let ch = if self.junction_x == Some(x) { '┴' } else { '─' };
+            let ch = if self.junction_x == Some(x) {
+                '┴'
+            } else {
+                '─'
+            };
             if let Some(cell) = buf.cell_mut((x, area.y)) {
                 cell.set_char(ch);
                 cell.set_fg(color);
@@ -58,7 +62,11 @@ impl Widget for VerticalRule {
         }
         let color = shade(if self.highlighted { DIM } else { NEAR_BLACK });
         for y in area.y..area.y + area.height {
-            let ch = if self.junction_rows.contains(&y) { '├' } else { '│' };
+            let ch = if self.junction_rows.contains(&y) {
+                '├'
+            } else {
+                '│'
+            };
             if let Some(cell) = buf.cell_mut((area.x, y)) {
                 cell.set_char(ch);
                 cell.set_fg(color);
