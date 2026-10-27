@@ -162,6 +162,13 @@ in
       default = null;
       description = "Name of a home-screen logo style from the generated figlet/toilet batch (cycle with left/right in-app to find one, then set its exact name here). Null keeps the default ANSI Shadow logo.";
     };
+
+    keybinds = mkOption {
+      type = types.attrsOf types.str;
+      default = { };
+      example = { skip_next = "f5"; toggle_shuffle = "x"; };
+      description = "Overrides for the remappable keybinds (action name -> key name, same as 'K' in-app writes to config.toml; see keymap::KeyAction::name/key_label in the wim source for the exact strings). Only needs entries for actions actually remapped away from their default.";
+    };
   };
 
   config = mkIf cfg.enable {
@@ -193,6 +200,8 @@ in
       opensubtitles_api_key_file = toString cfg.opensubtitlesApiKeyFile;
     } // lib.optionalAttrs (cfg.logoStyle != null) {
       logo_style = cfg.logoStyle;
+    } // lib.optionalAttrs (cfg.keybinds != { }) {
+      keybinds = cfg.keybinds;
     });
   };
 }
