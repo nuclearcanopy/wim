@@ -51,7 +51,15 @@ at it — don't mark it done on build+test passing alone.
       event demuxing), play/pause/seek/volume/speed/loop-file wired
       but unused
 - [x] ui: custom-painted `Banner` widget proving the no-stock-widgets,
-      monochrome-gradient, animated approach
+      monochrome-gradient, animated approach (later replaced with real
+      figlet isometric1 3d lettering — see below)
+- [x] onboarding (`src/onboarding.rs`, `src/ui/onboarding.rs`): real
+      guided first-run sequence (welcome/controls/navidrome/library
+      paths/done), not a disconnected login popup. config.rs no longer
+      bails with a cli error on first run. text-overflow handling
+      (`src/ui/textfit.rs`) so typed text doesn't silently run off a
+      narrow terminal. contrast hierarchy fixed (dividers much dimmer
+      than text, not the same brightness).
 
 ## next (roughly in order, pick whichever is actually unblocked)
 
