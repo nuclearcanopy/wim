@@ -110,6 +110,51 @@ impl PlayQueue {
         self.rebuild(next);
     }
 
+    /// Drops the entry at `index`, keeping `pos` pointing at the same
+    /// *track* rather than the same number. Removing the playing entry
+    /// leaves `pos` where it is, which is correct: mpv moves on to the
+    /// next file, and that file has just shifted into this slot. The
+    /// observed `playlist-pos` corrects anything this gets wrong on
+    /// the next notification either way.
+    pub fn remove(&mut self, index: usize) -> bool {
+        if index >= self.entries.len() {
+            return false;
+        }
+        self.entries.remove(index);
+        if let Some(p) = self.pos {
+            if index < p {
+                self.pos = Some(p - 1);
+            } else if self.entries.is_empty() {
+                self.pos = None;
+            }
+        }
+        true
+    }
+
+    /// Moves the entry at `from` to land at index `to`, carrying `pos`
+    /// with it so the same track stays current. Mirrors what the caller
+    /// must ask mpv for via `Mpv::playlist_move`.
+    pub fn move_entry(&mut self, from: usize, to: usize) -> bool {
+        let len = self.entries.len();
+        if from >= len || to >= len || from == to {
+            return false;
+        }
+        let item = self.entries.remove(from);
+        self.entries.insert(to, item);
+        if let Some(p) = self.pos {
+            self.pos = Some(if p == from {
+                to
+            } else if from < p && to >= p {
+                p - 1
+            } else if from > p && to <= p {
+                p + 1
+            } else {
+                p
+            });
+        }
+        true
+    }
+
     /// The upcoming tracks in a fresh random order, for the caller to
     /// hand straight back to `replace_upcoming` (Fisher-Yates, same as
     /// the old in-place queue shuffle).
@@ -403,5 +448,106 @@ mod tests {
         assert!(q.current().is_none());
         assert_eq!(q.upcoming_len(), 0);
         assert_eq!(q.set_pos(0), PosChange::Unresolved);
+    }
+
+    #[test]
+    fn removing_before_the_current_track_keeps_the_same_track_current() {
+        let mut q = PlayQueue::default();
+        q.reset(vec![song("a"), song("b"), song("c")]);
+        q.set_pos(2);
+        assert!(q.remove(0));
+        assert_eq!(titles(q.entries()), vec!["b", "c"]);
+        assert_eq!(title_of(q.current()).as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn removing_after_the_current_track_leaves_pos_alone() {
+        let mut q = PlayQueue::default();
+        q.reset(vec![song("a"), song("b"), song("c")]);
+        q.set_pos(0);
+        assert!(q.remove(2));
+        assert_eq!(title_of(q.current()).as_deref(), Some("a"));
+        assert_eq!(q.upcoming_len(), 1);
+    }
+
+    #[test]
+    fn removing_the_current_track_lands_on_whatever_shifted_into_it() {
+        let mut q = PlayQueue::default();
+        q.reset(vec![song("a"), song("b"), song("c")]);
+        q.set_pos(1);
+        assert!(q.remove(1));
+        // mpv moves on to the next file, which is now at this index.
+        assert_eq!(title_of(q.current()).as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn removing_the_last_entry_clears_the_position() {
+        let mut q = PlayQueue::default();
+        q.reset(vec![song("a")]);
+        q.set_pos(0);
+        assert!(q.remove(0));
+        assert!(q.entries().is_empty());
+        assert_eq!(q.pos(), None);
+    }
+
+    #[test]
+    fn remove_out_of_range_is_refused_not_a_panic() {
+        let mut q = PlayQueue::default();
+        q.reset(vec![song("a")]);
+        assert!(!q.remove(9));
+        assert_eq!(q.entries().len(), 1);
+    }
+
+    #[test]
+    fn moving_an_upcoming_entry_reorders_without_moving_playback() {
+        let mut q = PlayQueue::default();
+        q.reset(vec![song("a"), song("b"), song("c"), song("d")]);
+        q.set_pos(0);
+        // pull "d" up to sit right after the current track
+        assert!(q.move_entry(3, 1));
+        assert_eq!(titles(q.entries()), vec!["a", "d", "b", "c"]);
+        assert_eq!(title_of(q.current()).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn moving_the_current_entry_carries_the_position_with_it() {
+        let mut q = PlayQueue::default();
+        q.reset(vec![song("a"), song("b"), song("c")]);
+        q.set_pos(0);
+        assert!(q.move_entry(0, 2));
+        assert_eq!(titles(q.entries()), vec!["b", "c", "a"]);
+        assert_eq!(title_of(q.current()).as_deref(), Some("a"));
+        assert_eq!(q.pos(), Some(2));
+    }
+
+    #[test]
+    fn moving_across_the_current_track_shifts_pos_by_one() {
+        let mut q = PlayQueue::default();
+        q.reset(vec![song("a"), song("b"), song("c")]);
+        q.set_pos(1);
+        // "a" moves below the current track, so current slides up
+        assert!(q.move_entry(0, 2));
+        assert_eq!(titles(q.entries()), vec!["b", "c", "a"]);
+        assert_eq!(title_of(q.current()).as_deref(), Some("b"));
+        assert_eq!(q.pos(), Some(0));
+
+        let mut q = PlayQueue::default();
+        q.reset(vec![song("a"), song("b"), song("c")]);
+        q.set_pos(1);
+        // and the other direction: "c" moves above it
+        assert!(q.move_entry(2, 0));
+        assert_eq!(titles(q.entries()), vec!["c", "a", "b"]);
+        assert_eq!(title_of(q.current()).as_deref(), Some("b"));
+        assert_eq!(q.pos(), Some(2));
+    }
+
+    #[test]
+    fn a_no_op_or_out_of_range_move_is_refused() {
+        let mut q = PlayQueue::default();
+        q.reset(vec![song("a"), song("b")]);
+        assert!(!q.move_entry(0, 0));
+        assert!(!q.move_entry(0, 5));
+        assert!(!q.move_entry(5, 0));
+        assert_eq!(titles(q.entries()), vec!["a", "b"]);
     }
 }

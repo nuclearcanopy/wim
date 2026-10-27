@@ -237,17 +237,31 @@ impl Mpv {
     /// Clears mpv's playlist except the currently-playing file (mpv's
     /// own semantics for `playlist-clear`), so the upcoming queue can be
     /// rebuilt (e.g. after a shuffle) without interrupting playback.
-    pub fn playlist_clear(&self) -> Result<()> {
-        self.command(&[json!("playlist-clear")])?;
+    /// Drops one entry from mpv's own playlist. Removing the entry
+    /// that's playing makes mpv move on to the next one, which is the
+    /// sensible reading of "remove this".
+    pub fn playlist_remove(&self, index: usize) -> Result<()> {
+        self.command(&[json!("playlist-remove"), json!(index)])?;
         Ok(())
     }
 
-    /// Moves the entry at `from` so it takes the place of the entry at
-    /// `to`. Only ever called with `from > to` here (a just-appended
-    /// track being dropped back into a shuffled queue), which is the
-    /// case where the moved entry really does end up at index `to`.
+    /// Moves the entry at `from` so it ends up at index `to`.
+    ///
+    /// mpv's own `playlist-move` takes the *target entry* to displace,
+    /// not the destination index, and the two differ when moving
+    /// downwards: moving 2 to sit at 3 means displacing entry 4. That
+    /// off-by-one is mpv's documented behaviour, converted here so
+    /// callers can just say where they want it to land. The shuffled
+    /// re-insert in `main.rs` only ever moves upwards, where the two
+    /// readings coincide, so it is unaffected by the conversion.
     pub fn playlist_move(&self, from: usize, to: usize) -> Result<()> {
-        self.command(&[json!("playlist-move"), json!(from), json!(to)])?;
+        let displaced = if to > from { to + 1 } else { to };
+        self.command(&[json!("playlist-move"), json!(from), json!(displaced)])?;
+        Ok(())
+    }
+
+    pub fn playlist_clear(&self) -> Result<()> {
+        self.command(&[json!("playlist-clear")])?;
         Ok(())
     }
 

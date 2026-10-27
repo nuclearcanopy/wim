@@ -423,11 +423,23 @@ run that edits these files will collide.
       `playlist-pos` to jump (no reload, so `entries` stays aligned with
       mpv), esc closes. reads `PlayQueue::entries`/`pos`, so it shows
       mpv's actual playlist rather than a mirror.
-- [ ] **queue view: remove and reorder.** the view is read-plus-jump
-      only. `d` to drop an entry and shift+j/k to move one still need
-      `playlist-remove`/`playlist-move` plus the matching `PlayQueue`
-      mutations; pairs with shellsong's `remove(n)`/`goto(n)` ops,
-      which need the same host plumbing.
+- [x] **queue view: remove and reorder.** `d` drops an entry, `J`/`K`
+      move one. `PlayQueue::remove`/`move_entry` carry `pos` with the
+      *track* rather than the index, so the entry list stays aligned
+      with mpv's playlist through every edit; the observed
+      `playlist-pos` still corrects anything that drifts. reorder is
+      deliberately upcoming-only: moving a played entry does nothing
+      useful, and in the played run the display is reversed so `J`
+      would visibly move a row the wrong way. found and fixed a latent
+      bug while here: `Mpv::playlist_move` passed the destination
+      straight through as mpv's displaced-entry index, which is only
+      correct when moving upwards (its doc admitted as much); it now
+      converts, so downward moves land where asked. the old single
+      caller only moved upwards, so it is unaffected.
+- [ ] **queue view: the ops shellsong will need.** `remove(n)`/
+      `goto(n)`/`shuffle_queue()` from the shellsong branch can now
+      reuse `PlayQueue::remove`/`move_entry` plus the mpv commands
+      added here, but still need the `Op` -> host wiring.
 - [ ] **wide characters still overlap their neighbour.** `textfit` is
       `unicode_width`-aware now, but the hand-rolled
       `for (col, ch) in text.chars().enumerate()` draw loops advance one
