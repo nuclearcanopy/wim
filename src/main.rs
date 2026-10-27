@@ -1896,6 +1896,7 @@ fn main() -> anyhow::Result<()> {
                 SearchBox {
                     query: &app.query,
                     editing: app.editing_query,
+                    label: "search",
                     cursor_visible,
                     right_border: false,
                 },
