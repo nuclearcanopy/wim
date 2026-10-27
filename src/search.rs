@@ -100,17 +100,6 @@ impl SearchItem {
             SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => None,
         }
     }
-
-    pub fn kind_label(&self) -> &'static str {
-        match self {
-            SearchItem::LocalMusic { .. } => "local",
-            SearchItem::LocalVideo { .. } => "video",
-            SearchItem::Artist { .. } => "artist",
-            SearchItem::Album { .. } => "album",
-            SearchItem::Song { .. } => "song",
-            SearchItem::Playlist { .. } => "playlist",
-        }
-    }
 }
 
 /// The merged corpus to search over, built once per library scan /
@@ -384,16 +373,23 @@ mod tests {
     fn search_merges_every_source_for_a_matching_keyword() {
         let c = corpus();
         let results = c.search("bla");
-        let kinds: Vec<&str> = results.iter().map(|i| i.kind_label()).collect();
 
         // "bla" should hit the local track (via title/artist/album text),
         // the artist, the album, and the playlist; but not the unrelated
         // song, proving this is one merged ranked list, not per-source
         // silos that happen to sit next to each other.
-        assert!(kinds.contains(&"local"));
-        assert!(kinds.contains(&"artist"));
-        assert!(kinds.contains(&"album"));
-        assert!(kinds.contains(&"playlist"));
+        assert!(results
+            .iter()
+            .any(|i| matches!(i, SearchItem::LocalMusic { .. })));
+        assert!(results
+            .iter()
+            .any(|i| matches!(i, SearchItem::Artist { .. })));
+        assert!(results
+            .iter()
+            .any(|i| matches!(i, SearchItem::Album { .. })));
+        assert!(results
+            .iter()
+            .any(|i| matches!(i, SearchItem::Playlist { .. })));
         assert!(!results
             .iter()
             .any(|i| matches!(i, SearchItem::Song { id, .. } if id == "s1")));

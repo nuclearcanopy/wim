@@ -14,5 +14,4 @@ pub mod player;
 pub mod progress;
 pub mod results_list;
 pub mod searchbox;
-pub mod status;
 pub mod textfit;

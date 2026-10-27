@@ -11,13 +11,15 @@ pub fn shade(level: f32) -> Color {
     Color::Rgb(v, v, v)
 }
 
-/// Linearly interpolates a shade between `from` and `to` at position `t`
-/// (`0.0..=1.0`), for gradient text/banners.
-pub fn lerp_shade(from: f32, to: f32, t: f32) -> Color {
-    shade(from + (to - from) * t.clamp(0.0, 1.0))
+/// Linearly interpolates a level between `from` and `to` at position
+/// `t` (`0.0..=1.0`), for gradient text/banners; stays a plain level
+/// rather than converting straight to a `Color` since callers (e.g.
+/// the banner's sweep) usually need to combine it with another factor
+/// (a pulse, a fade) before the one conversion to `Color` at the end.
+pub fn lerp(from: f32, to: f32, t: f32) -> f32 {
+    from + (to - from) * t.clamp(0.0, 1.0)
 }
 
-pub const BLACK: f32 = 0.0;
 pub const NEAR_BLACK: f32 = 0.08;
 pub const DIM: f32 = 0.35;
 pub const MID: f32 = 0.55;

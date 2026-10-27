@@ -24,6 +24,11 @@ pub struct LocalTrack {
     pub title: String,
     pub artist: Option<String>,
     pub album: Option<String>,
+    // captured from the tags but not read anywhere yet: SearchItem
+    // doesn't carry duration (see lyrics.rs), so local lookups always
+    // fall through to lrclib's fuzzy /search rather than the exact
+    // /get endpoint. documented, deliberate gap, not blocking.
+    #[allow(dead_code)]
     pub duration_secs: Option<u32>,
     pub kind: MediaKind,
 }

@@ -14,8 +14,16 @@ use serde_json::{json, Value};
 /// Property-change and other async events pushed by mpv over the IPC socket.
 #[derive(Debug, Clone)]
 pub enum Event {
-    PropertyChange { name: String, value: Value },
+    // reserved for the audio-level visualizer (astats/showvolume
+    // af-metadata polling): nothing calls `observe_property` yet, so
+    // this never actually fires today.
+    #[allow(dead_code)]
+    PropertyChange {
+        name: String,
+        value: Value,
+    },
     EndFile,
+    #[allow(dead_code)]
     Other(Value),
 }
 
@@ -164,6 +172,8 @@ impl Mpv {
         Ok(())
     }
 
+    // reserved for the audio-level visualizer; see `Event::PropertyChange`.
+    #[allow(dead_code)]
     pub fn observe_property(&self, id: u64, name: &str) -> Result<()> {
         self.command(&[json!("observe_property"), json!(id), json!(name)])?;
         Ok(())
@@ -200,14 +210,6 @@ impl Mpv {
     /// extract gain values ourselves for local files.
     pub fn set_replaygain(&self, mode: &str) -> Result<()> {
         self.set_property("replaygain", json!(mode))
-    }
-
-    pub fn play(&self) -> Result<()> {
-        self.set_property("pause", json!(false))
-    }
-
-    pub fn pause(&self) -> Result<()> {
-        self.set_property("pause", json!(true))
     }
 
     pub fn toggle_pause(&self) -> Result<()> {
