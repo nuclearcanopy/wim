@@ -25,6 +25,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::StatefulImage;
 
 use app::{Action, LoopMode};
 use layout::{PanelLayout, ResizePanel};
@@ -106,6 +109,7 @@ fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
                 year: details.year,
                 tracks: browse::songs_to_items(details.songs, client),
                 selected: 0,
+                art: fetch_cover_art(client, id),
             })
         }
         SearchItem::Playlist { id, name, client } => {
@@ -116,6 +120,7 @@ fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
                 year: None,
                 tracks: browse::songs_to_items(songs, client),
                 selected: 0,
+                art: None,
             })
         }
         _ => unreachable!("open_browse_view only called for Album/Playlist"),
@@ -172,7 +177,14 @@ fn open_starred_view(servers: &[config::NavidromeConfig], favorites: &favorites:
             tracks.push(item);
         }
     }
-    browse::BrowseView { title: "starred songs".to_string(), subtitle: String::new(), year: None, tracks, selected: 0 }
+    browse::BrowseView { title: "starred songs".to_string(), subtitle: String::new(), year: None, tracks, selected: 0, art: None }
+}
+
+/// Best-effort: a missing/unreadable cover is not worth surfacing as
+/// an error, the album view just shows no art for it.
+fn fetch_cover_art(client: &subsonic::Client, album_id: &str) -> Option<image::DynamicImage> {
+    let bytes = client.get_cover_art_bytes(album_id).ok()?;
+    image::load_from_memory(&bytes).ok()
 }
 
 /// (artist, title, album) for a lyrics lookup; only meaningful for
@@ -436,6 +448,12 @@ fn main() -> anyhow::Result<()> {
     // the track listing stays visible rather than getting replaced.
     // 'm' toggles it by hand either way.
     let mut player_minimized = false;
+    // 'i' toggles between ascii rasterization (default, strictly
+    // monochrome) and ratatui-image's real terminal-graphics display
+    // (sixel/kitty/iterm2, falling back to colored halfblocks on a
+    // terminal with none of those; that fallback not being monochrome
+    // is the explicit tradeoff of asking for real images).
+    let mut art_mode = browse::ArtMode::Ascii;
     let mut notifications = Notifications::default();
     let lyrics_client = lyrics::Client::new();
     let mut lyrics_lines: Option<Vec<String>> = None;
@@ -547,6 +565,14 @@ fn main() -> anyhow::Result<()> {
     let mut panels = PanelLayout::new();
     let start = Instant::now();
     let mut guard = term::TerminalGuard::new()?;
+    // queries the terminal over stdio for font-cell size and graphics
+    // protocol support; best-effort, 'i' (real image mode) just stays
+    // unavailable if this fails rather than erroring the whole app.
+    let mut picker = Picker::from_query_stdio().ok();
+    // rebuilt (not re-encoded every frame) whenever a newly-opened
+    // album's art changes; `ratatui-image` owns the actual resize/
+    // encode caching per protocol instance.
+    let mut real_art_protocol: Option<StatefulProtocol> = None;
     loop {
         notifications.expire();
         guard.terminal.draw(|f| {
@@ -696,9 +722,17 @@ fn main() -> anyhow::Result<()> {
                 );
             } else if let Some(bv) = &browse_view {
                 f.render_widget(
-                    BrowseListView { view: bv, favorites: &favorites, remote_starred: &remote_starred },
+                    BrowseListView { view: bv, favorites: &favorites, remote_starred: &remote_starred, art_mode },
                     main_content,
                 );
+                if art_mode == browse::ArtMode::Real {
+                    if let Some(protocol) = &mut real_art_protocol {
+                        let (art_rect, _) = browse::layout(main_content, bv.art.is_some());
+                        if let Some(rect) = art_rect {
+                            f.render_stateful_widget(StatefulImage::default(), rect, protocol);
+                        }
+                    }
+                }
             } else if let Some(lines) = &lyrics_lines {
                 let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
                 f.render_widget(LyricsView { lines: &borrowed, scroll: lyrics_scroll }, main_content);
@@ -1022,6 +1056,7 @@ fn main() -> anyhow::Result<()> {
                         // brings it right back (not cleared, just not
                         // on top while the player's maximized).
                         KeyCode::Char('m') if now_playing.is_some() => player_minimized = !player_minimized,
+                        KeyCode::Char('i') => art_mode = art_mode.toggle(),
                         KeyCode::Char('*') => {
                             if let Some(item) = bv.tracks.get(bv.selected).cloned() {
                                 status = match toggle_star(&item, &mut favorites, &mut remote_starred) {
@@ -1069,7 +1104,9 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if key.code == KeyCode::Char('S') {
-                    browse_view = Some(open_starred_view(&cfg.navidrome_servers, &favorites));
+                    let bv = open_starred_view(&cfg.navidrome_servers, &favorites);
+                    real_art_protocol = picker.as_mut().and_then(|p| bv.art.clone().map(|img| p.new_resize_protocol(img)));
+                    browse_view = Some(bv);
                     continue;
                 }
 
@@ -1141,7 +1178,11 @@ fn main() -> anyhow::Result<()> {
                         // confirmation; no need to also repeat it on
                         // the status line.
                         match open_browse_view(&item) {
-                            Ok(bv) => browse_view = Some(bv),
+                            Ok(bv) => {
+                                real_art_protocol =
+                                    picker.as_mut().and_then(|p| bv.art.clone().map(|img| p.new_resize_protocol(img)));
+                                browse_view = Some(bv);
+                            }
                             Err(msg) => {
                                 notifications.push(Severity::Error, msg.clone());
                                 status = msg;

@@ -4,10 +4,11 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
-use crate::browse::BrowseView;
+use crate::browse::{ArtMode, BrowseView};
 use crate::favorites::Favorites;
 use crate::search::SearchItem;
 use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK};
+use crate::ui::albumart::AsciiArt;
 use crate::ui::header::draw_header;
 use crate::ui::textfit::truncate_with_ellipsis;
 
@@ -18,6 +19,11 @@ pub struct BrowseListView<'a> {
     pub view: &'a BrowseView,
     pub favorites: &'a Favorites,
     pub remote_starred: &'a HashSet<String>,
+    /// In `Real` mode the art panel is left to main.rs, which overlays
+    /// a `ratatui-image` stateful widget on the exact same rect
+    /// `browse::layout` gives this widget; this just skips drawing the
+    /// ascii fallback there instead of drawing over it.
+    pub art_mode: ArtMode,
 }
 
 fn is_starred(track: &SearchItem, favorites: &Favorites, remote_starred: &HashSet<String>) -> bool {
@@ -32,8 +38,6 @@ fn is_starred(track: &SearchItem, favorites: &Favorites, remote_starred: &HashSe
 
 impl Widget for BrowseListView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let width = area.width as usize;
-
         let subtitle = match (self.view.subtitle.is_empty(), self.view.year) {
             (false, Some(y)) => format!(" · {} · {y}", self.view.subtitle),
             (false, None) => format!(" · {}", self.view.subtitle),
@@ -41,7 +45,7 @@ impl Widget for BrowseListView<'_> {
             (true, None) => String::new(),
         };
         let title_line = format!("{}{subtitle}", self.view.title);
-        let mut y = draw_header(
+        draw_header(
             buf,
             area,
             area.y,
@@ -50,16 +54,21 @@ impl Widget for BrowseListView<'_> {
             shade(DIM),
             shade(NEAR_BLACK),
         );
-        y += 1;
+
+        let (art_rect, list_area) = crate::browse::layout(area, self.view.art.is_some());
+        let y = list_area.y;
+        if let (Some(rect), ArtMode::Ascii) = (art_rect, self.art_mode) {
+            AsciiArt { image: self.view.art.as_ref() }.render(rect, buf);
+        }
 
         if self.view.tracks.is_empty() {
-            draw_line(buf, area, y, "(no tracks)", shade(DIM));
+            draw_line(buf, list_area, y, "(no tracks)", shade(DIM));
             return;
         }
 
         // same clamp-to-selection scroll as ResultsList: a long album
         // shouldn't be unreachable past the bottom of the pane.
-        let visible_rows = (area.y + area.height).saturating_sub(y) as usize;
+        let visible_rows = list_area.height as usize;
         let scroll_offset = if self.view.selected >= visible_rows {
             self.view.selected + 1 - visible_rows
         } else {
@@ -79,9 +88,9 @@ impl Widget for BrowseListView<'_> {
             let line = format!("{marker}{:>2}. {star}{label}", idx + 1);
             draw_line(
                 buf,
-                area,
+                list_area,
                 y + row as u16,
-                &truncate_with_ellipsis(&line, width),
+                &truncate_with_ellipsis(&line, list_area.width as usize),
                 if is_selected { shade(BRIGHT) } else { shade(DIM) },
             );
         }

@@ -1,3 +1,4 @@
+pub mod albumart;
 pub mod banner;
 pub mod browse;
 pub mod controlsbar;
