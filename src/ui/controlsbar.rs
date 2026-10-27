@@ -77,6 +77,10 @@ pub struct ControlsBar<'a> {
     /// `true` while wasd/arrows move focus between panes and nothing
     /// else responds to the keyboard; see `InputMode` in main.rs.
     pub move_mode: bool,
+    /// Which pane currently has focus, named so the mode line answers
+    /// "where will the next keypress land" outright instead of leaving
+    /// it to be inferred from a highlighted border somewhere else.
+    pub focus_label: &'a str,
     pub queue_len: usize,
     pub loop_label: &'a str,
     pub shuffle_on: bool,
@@ -117,9 +121,9 @@ impl Widget for ControlsBar<'_> {
         // dropped, since that's the one thing here you can't infer
         // from the rest of the screen.
         let mode_label = if self.move_mode {
-            "-- MOVE --"
+            format!("-- MOVE: {} --", self.focus_label)
         } else {
-            "-- INTERACT --"
+            format!("-- INTERACT: {} --", self.focus_label)
         };
         let rows_left = (area.y + area.height).saturating_sub(y);
         let mode_on_its_own_row = rows_left >= 2;
@@ -134,7 +138,7 @@ impl Widget for ControlsBar<'_> {
                 area.x,
                 area.x + area.width,
                 y,
-                mode_label,
+                &mode_label,
                 // bright in move mode: it's the transient one, and
                 // the one where every other key is inert.
                 if self.move_mode {

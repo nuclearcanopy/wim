@@ -2153,6 +2153,11 @@ fn main() -> anyhow::Result<()> {
             f.render_widget(
                 ControlsBar {
                     move_mode: input_mode == InputMode::Move,
+                    focus_label: match focus {
+                        Focus::Sidebar => "sidebar",
+                        Focus::Workspace => "workspace",
+                        Focus::BottomBar => "bottom bar",
+                    },
                     queue_len: app.queue.len(),
                     loop_label: app.loop_mode.label(),
                     shuffle_on: app.shuffle,
