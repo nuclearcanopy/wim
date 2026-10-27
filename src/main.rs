@@ -162,6 +162,17 @@ fn index_navidrome_server(app: &mut app::App, nav: &config::NavidromeConfig) -> 
     }
 }
 
+/// Plain connectivity check (ping only, no catalog fetch) for every
+/// configured server at once, so opening the profile manager shows
+/// where each one stands immediately rather than making you select
+/// each one individually to find out.
+fn test_navidrome_connectivity(servers: &[config::NavidromeConfig]) -> Vec<Option<bool>> {
+    servers
+        .iter()
+        .map(|nav| Some(subsonic::Client::new(nav).and_then(|c| c.ping()).is_ok()))
+        .collect()
+}
+
 fn navidrome_config_from_form(form: &LoginForm) -> config::NavidromeConfig {
     config::NavidromeConfig {
         url: form.url.clone(),
@@ -319,6 +330,7 @@ fn main() -> anyhow::Result<()> {
                                 servers: &cfg.navidrome_servers,
                                 selected: nm.selected,
                                 message: &nm.message,
+                                connection_status: &nm.connection_status,
                             },
                             area,
                         );
@@ -513,6 +525,9 @@ fn main() -> anyhow::Result<()> {
                                 }
                                 KeyCode::Char('d') if nm.selected < cfg.navidrome_servers.len() => {
                                     cfg.navidrome_servers.remove(nm.selected);
+                                    if nm.selected < nm.connection_status.len() {
+                                        nm.connection_status.remove(nm.selected);
+                                    }
                                     let _ = config::save(&cfg);
                                     nm.selected = nm.selected.min(cfg.navidrome_servers.len());
                                     nm.message = "profile removed (already-indexed items stay until restart)".to_string();
@@ -522,7 +537,12 @@ fn main() -> anyhow::Result<()> {
                                 }
                                 KeyCode::Enter => {
                                     let nav = cfg.navidrome_servers[nm.selected].clone();
-                                    nm.message = match index_navidrome_server(&mut app, &nav) {
+                                    let result = index_navidrome_server(&mut app, &nav);
+                                    if nm.selected >= nm.connection_status.len() {
+                                        nm.connection_status.resize(nm.selected + 1, None);
+                                    }
+                                    nm.connection_status[nm.selected] = Some(result.is_ok());
+                                    nm.message = match result {
                                         Ok(msg) => format!("reconnected: {msg}"),
                                         Err(msg) => msg,
                                     };
@@ -553,6 +573,7 @@ fn main() -> anyhow::Result<()> {
                                     Ok(msg) => {
                                         cfg.navidrome_servers.push(nav);
                                         let _ = config::save(&cfg);
+                                        nm.connection_status.push(Some(true));
                                         nm.selected = cfg.navidrome_servers.len() - 1;
                                         nm.step = NavManagerStep::List;
                                         nm.message = format!("connected: {msg}");
@@ -606,7 +627,9 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if key.code == KeyCode::Char('n') {
-                    nav_manager = Some(NavManager::new());
+                    let mut nm = NavManager::new();
+                    nm.connection_status = test_navidrome_connectivity(&cfg.navidrome_servers);
+                    nav_manager = Some(nm);
                     continue;
                 }
 
