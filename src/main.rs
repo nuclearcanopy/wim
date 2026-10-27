@@ -2572,6 +2572,12 @@ fn main() -> anyhow::Result<()> {
                     match &mut nm.step {
                         NavManagerStep::List => {
                             let entry_count = cfg.navidrome_servers.len() + 1; // +1 for "add new"
+                                                                               // any key other than a second 'd' cancels
+                                                                               // a pending removal, including moving off
+                                                                               // the row it was armed on.
+                            if key.code != KeyCode::Char('d') {
+                                nm.pending_delete = None;
+                            }
                             match key.code {
                                 KeyCode::Esc => nav_manager = None,
                                 KeyCode::Char('j') | KeyCode::Down => {
@@ -2581,13 +2587,23 @@ fn main() -> anyhow::Result<()> {
                                     nm.selected = nm.selected.saturating_sub(1);
                                 }
                                 KeyCode::Char('d') if nm.selected < cfg.navidrome_servers.len() => {
-                                    cfg.navidrome_servers.remove(nm.selected);
-                                    if nm.selected < nm.connection_status.len() {
-                                        nm.connection_status.remove(nm.selected);
+                                    // first press arms, second on the
+                                    // same row commits; this rewrites
+                                    // config.toml and can't be undone.
+                                    if nm.pending_delete == Some(nm.selected) {
+                                        cfg.navidrome_servers.remove(nm.selected);
+                                        nm.forget_status_at(nm.selected);
+                                        save_config(&cfg, &mut notifications);
+                                        nm.selected = nm.selected.min(cfg.navidrome_servers.len());
+                                        nm.pending_delete = None;
+                                        nm.message = "profile removed (already-indexed items stay until restart)".to_string();
+                                    } else {
+                                        nm.pending_delete = Some(nm.selected);
+                                        nm.message = format!(
+                                            "press d again to remove {}",
+                                            cfg.navidrome_servers[nm.selected].url
+                                        );
                                     }
-                                    save_config(&cfg, &mut notifications);
-                                    nm.selected = nm.selected.min(cfg.navidrome_servers.len());
-                                    nm.message = "profile removed (already-indexed items stay until restart)".to_string();
                                 }
                                 KeyCode::Enter if nm.selected == cfg.navidrome_servers.len() => {
                                     nm.step = NavManagerStep::Add(LoginForm::new());
