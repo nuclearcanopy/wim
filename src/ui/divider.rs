@@ -13,14 +13,15 @@ use crate::theme::{shade, DIM, NEAR_BLACK};
 /// selection cue for whichever panel this divider borders.
 pub struct HorizontalRule {
     pub highlighted: bool,
-    /// Absolute buffer x-coordinate of a vertical divider ending right
-    /// above this rule (e.g. the sidebar/main-content split meeting the
-    /// bottom bar), if any; drawn as `┴` there instead of `─` so the
-    /// two lines actually join instead of crossing with a gap. This is
-    /// not optional polish: two dividers that are structurally meant to
-    /// meet but are drawn by two widgets with zero knowledge of each
-    /// other will visibly not connect unless something tells them to.
-    pub junction_x: Option<u16>,
+    /// `(x, glyph)` pairs where some other vertical divider meets this
+    /// rule, so the two lines actually join instead of crossing with a
+    /// gap: `┴` where one ends from above (e.g. the sidebar/main-
+    /// content split), `┬` where one starts below (e.g. a boxed hint
+    /// carved out of the bottom bar's own row). This is not optional
+    /// polish: two dividers that are structurally meant to meet but are
+    /// drawn by two widgets with zero knowledge of each other will
+    /// visibly not connect unless something tells them to.
+    pub junctions: Vec<(u16, char)>,
 }
 
 impl Widget for HorizontalRule {
@@ -30,11 +31,11 @@ impl Widget for HorizontalRule {
         }
         let color = shade(if self.highlighted { DIM } else { NEAR_BLACK });
         for x in area.x..area.x + area.width {
-            let ch = if self.junction_x == Some(x) {
-                '┴'
-            } else {
-                '─'
-            };
+            let ch = self
+                .junctions
+                .iter()
+                .find(|(jx, _)| *jx == x)
+                .map_or('─', |(_, ch)| *ch);
             if let Some(cell) = buf.cell_mut((x, area.y)) {
                 cell.set_char(ch);
                 cell.set_fg(color);
@@ -46,13 +47,18 @@ impl Widget for HorizontalRule {
 /// Vertical counterpart (`│`), same highlight convention.
 pub struct VerticalRule {
     pub highlighted: bool,
-    /// Absolute buffer y-coordinates where something on the other side
-    /// (main content, e.g. the banner's own internal rules) draws a
+    /// `(y, color)` pairs where something on the other side (main
+    /// content, e.g. the banner's own internal rules) draws a
     /// horizontal line that starts right at this divider; drawn as `├`
-    /// there instead of a plain `│`, same reasoning as `HorizontalRule`'s
-    /// `junction_x`: two lines meeting from different widgets don't
-    /// connect on their own.
-    pub junction_rows: Vec<u16>,
+    /// there instead of a plain `│`, in the given color rather than
+    /// the rule's own, same reasoning as `HorizontalRule`'s
+    /// `junctions`: two lines meeting from different widgets don't
+    /// connect (or animate in sync) on their own. A static color is
+    /// just `shade(level)` with a fixed level; the banner's junction
+    /// passes its current pulse level instead, so the junction glows
+    /// in lockstep with the animated rule it's joining rather than
+    /// sitting there as the one dead pixel on an otherwise alive line.
+    pub junction_rows: Vec<(u16, ratatui::style::Color)>,
 }
 
 impl Widget for VerticalRule {
@@ -60,12 +66,12 @@ impl Widget for VerticalRule {
         if area.width == 0 {
             return;
         }
-        let color = shade(if self.highlighted { DIM } else { NEAR_BLACK });
+        let default_color = shade(if self.highlighted { DIM } else { NEAR_BLACK });
         for y in area.y..area.y + area.height {
-            let ch = if self.junction_rows.contains(&y) {
-                '├'
-            } else {
-                '│'
+            let junction = self.junction_rows.iter().find(|(jy, _)| *jy == y);
+            let (ch, color) = match junction {
+                Some((_, color)) => ('├', *color),
+                None => ('│', default_color),
             };
             if let Some(cell) = buf.cell_mut((area.x, y)) {
                 cell.set_char(ch);

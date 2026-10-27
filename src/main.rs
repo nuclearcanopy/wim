@@ -36,6 +36,7 @@ use navmanager::{NavManager, NavManagerStep};
 use notify::{Notifications, Severity};
 use onboarding::{Onboarding, Step};
 use search::SearchItem;
+use theme::{shade, NEAR_BLACK};
 use ui::banner::Banner;
 use ui::browse::BrowseListView;
 use ui::controlsbar::ControlsBar;
@@ -660,10 +661,9 @@ fn main() -> anyhow::Result<()> {
     player.set_subtitle_style(&cfg.subtitles);
     let mut subtitle_delay = cfg.subtitles.delay_secs;
     let mut app = app::App::new(corpus);
-    let mut status = format!(
-        "{} local items indexed | / search, j/k move, gg/G jump, enter play, a queue, * star, S starred, L lyrics, n navidrome, q quit",
-        app.corpus.len()
-    );
+    // the full keybind list moved to the '?' help overlay; nothing
+    // worth saying here until something actually happens.
+    let mut status = String::new();
 
     let mut favorites = favorites::load();
     // song ids this session knows are starred, across every configured
@@ -683,6 +683,9 @@ fn main() -> anyhow::Result<()> {
     // 'i' cycles ascii -> real -> off from here; this is just the
     // config-driven starting point.
     let mut art_mode = initial_art_mode(cfg.album_art);
+    // full keybind reference, opened with '?'; takes over the whole
+    // screen the same way onboarding/the nav manager do.
+    let mut help_open = false;
     // rolling window for the now-playing level meter; a fixed-size
     // ring (just truncate the front) rather than growing forever.
     let mut level_history: Vec<f32> = Vec::new();
@@ -899,6 +902,11 @@ fn main() -> anyhow::Result<()> {
                 return;
             }
 
+            if help_open {
+                f.render_widget(ui::help::HelpOverlay, area);
+                return;
+            }
+
             // the full player replaces whatever else main_content was
             // showing; minimized just means "let the album view (if
             // any) or the banner show instead", with a thin ipod-style
@@ -941,6 +949,12 @@ fn main() -> anyhow::Result<()> {
             let bottom_selected =
                 panels.resize_mode && panels.resize_selected == ResizePanel::BottomBar;
 
+            // shared with the banner's own render below, so the
+            // junction's glow and the rule it's joining are always
+            // computed from the exact same instant, never drifting
+            // out of sync by even a frame.
+            let elapsed_secs = start.elapsed().as_secs_f32();
+
             // the banner and the browse view's own header both draw
             // internal horizontal rules right at main_content's left
             // edge; the player/lyrics don't. same join as the bottom
@@ -950,10 +964,19 @@ fn main() -> anyhow::Result<()> {
                 Vec::new()
             } else if browse_view.is_some() {
                 // draw_header's rule sits one row below where it's
-                // asked to start, which is always main_content.y here.
-                vec![main_content.y + 1]
+                // asked to start, which is always main_content.y here;
+                // static color matching draw_header's own rule_color,
+                // this one doesn't animate.
+                vec![(main_content.y + 1, shade(NEAR_BLACK))]
             } else if lyrics_lines.is_none() {
-                ui::banner::rule_rows(main_content).to_vec()
+                // the banner's rules pulse; the junction glows in the
+                // same phase instead of sitting there as a dead pixel.
+                let pulse = ui::banner::pulse_level(elapsed_secs);
+                let glow = shade(ui::banner::junction_level(pulse));
+                ui::banner::rule_rows(main_content)
+                    .into_iter()
+                    .map(|y| (y, glow))
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -964,10 +987,19 @@ fn main() -> anyhow::Result<()> {
                 },
                 vdivider,
             );
+            // a small bordered hint carved out of the bottom-right
+            // corner, pointing at '?' for the full keybind reference,
+            // instead of permanently cramming every keybind into the
+            // bottom bar's own text. its left edge needs a ┬ in the
+            // rule above it, same reasoning as every other junction
+            // this session: two lines meant to meet don't, unless
+            // something tells them to.
+            const HELP_BOX_WIDTH: u16 = 10;
+            let help_box_x = bottom.x + bottom.width.saturating_sub(HELP_BOX_WIDTH);
             f.render_widget(
                 HorizontalRule {
                     highlighted: bottom_selected,
-                    junction_x: Some(vdivider.x),
+                    junctions: vec![(vdivider.x, '┴'), (help_box_x, '┬')],
                 },
                 Rect {
                     height: 1,
@@ -1117,8 +1149,18 @@ fn main() -> anyhow::Result<()> {
                 },
                 Rect {
                     y: bottom.y + 1,
+                    width: bottom.width.saturating_sub(HELP_BOX_WIDTH),
                     height: bottom.height.saturating_sub(1),
                     ..bottom
+                },
+            );
+            f.render_widget(
+                ui::helpbox::HelpBox { label: "? help" },
+                Rect {
+                    x: help_box_x,
+                    y: bottom.y + 1,
+                    width: HELP_BOX_WIDTH,
+                    height: bottom.height.saturating_sub(1),
                 },
             );
             f.render_widget(
@@ -1244,7 +1286,7 @@ fn main() -> anyhow::Result<()> {
                     if let NavManagerStep::Add(form) = &mut nm.step {
                         form.current_mut().push_str(text);
                     }
-                } else {
+                } else if !help_open {
                     app.paste_into_query(text);
                 }
             }
@@ -1392,6 +1434,17 @@ fn main() -> anyhow::Result<()> {
                             _ => {}
                         },
                     }
+                    continue;
+                }
+
+                if help_open {
+                    if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
+                        help_open = false;
+                    }
+                    continue;
+                }
+                if key.code == KeyCode::Char('?') {
+                    help_open = true;
                     continue;
                 }
 

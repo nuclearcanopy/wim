@@ -4,6 +4,8 @@ pub mod browse;
 pub mod controlsbar;
 pub mod divider;
 pub mod header;
+pub mod help;
+pub mod helpbox;
 pub mod login;
 pub mod lyrics_view;
 pub mod miniplayer;
