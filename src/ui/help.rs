@@ -37,6 +37,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("e", "cycle eq preset"),
             ("c", "toggle crossfade"),
             (", / .", "subtitle delay -/+ 0.5s"),
+            ("t", "subtitle settings menu"),
         ],
     ),
     (
