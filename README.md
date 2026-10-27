@@ -26,6 +26,34 @@ nix develop
 cargo build
 ```
 
+or build the packaged binary directly: `nix build .#wim` (mpv is
+wrapped onto its `PATH` automatically, no system-wide install needed).
+
+## nix
+
+packaged as `packages.<system>.wim` (and `.default`). a home-manager
+module is exposed as `homeManagerModules.default`:
+
+```nix
+{
+  imports = [ wim.homeManagerModules.default ];
+  programs.wim = {
+    enable = true;
+    navidrome = {
+      url = "https://navidrome.example.com";
+      username = "me";
+      passwordFile = config.age.secrets.navidrome-password.path; # or any path
+    };
+    albumArt = "auto"; # auto | blocks | sixel | kitty | iterm2 | off
+    libraryPaths = [ ]; # defaults to ~/Music, ~/Videos when empty
+  };
+}
+```
+
+there's deliberately no plaintext `navidrome.password` option — nix
+store paths are world-readable, so `passwordFile` (composes with
+agenix/sops-nix) is the only way to set credentials declaratively.
+
 ## config
 
 on first run, writes a template to `$XDG_CONFIG_HOME/wim/config.toml` (or
