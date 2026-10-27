@@ -46,14 +46,22 @@ pub const PRESETS: &[Preset] = &[
     },
 ];
 
-/// Builds an mpv `af` filter-graph string applying `gains` (dB per band,
-/// `BAND_HZ` order) as a chain of lavfi `equalizer` filters.
+/// Label on the trailing `astats` analysis stage (see
+/// `build_af_filter`); mpv exposes a labeled lavfi filter's metadata
+/// at `af-metadata/<label>/...`, polled by the now-playing level
+/// meter. Doesn't touch the audio itself, purely an analysis tap.
+pub const LEVEL_METADATA_LABEL: &str = "wimlevel";
+
+/// Builds an mpv `af` filter-graph string applying `gains` (dB per
+/// band, `BAND_HZ` order) as a chain of lavfi `equalizer` filters,
+/// plus a labeled `astats` tap at the end for the level meter.
 pub fn build_af_filter(gains: &[f64; 10]) -> String {
-    let stages: Vec<String> = BAND_HZ
+    let mut stages: Vec<String> = BAND_HZ
         .iter()
         .zip(gains.iter())
         .map(|(hz, g)| format!("equalizer=f={hz}:width_type=o:width=1:g={g}"))
         .collect();
+    stages.push(format!("astats@{LEVEL_METADATA_LABEL}=metadata=1:reset=1"));
     format!("lavfi=[{}]", stages.join(","))
 }
 
