@@ -268,3 +268,160 @@ layout. the actual design:
       opensubtitles). verified via a standalone `lib.evalModules`
       instantiation against fake home-manager options, not the full
       home-manager flake (much faster, same actual module code path).
+
+## maintainer review pass (first real human look at the rendered app)
+
+the UX self-check above was vindicated: the maintainer ran the app and
+found a lot that build+test had happily called done. recorded here
+because the root causes are the useful part, not the fix list.
+
+- [x] **enter did nothing.** the loudest complaint, and two separate
+      bugs wearing one costume. `app::handle_key` returned an `Action`
+      that the `editing_query` call site dropped on the floor before
+      `continue`ing past the only code that acts on it, so the first
+      enter after typing silently closed the box and cleared the queue
+      and a second was needed. separately, enter on an album inside the
+      artist profile set `open_album` and then `continue`d past the
+      block that reads it. the dispatch is now one `dispatch_action`
+      function both key paths route through, and `Action` is
+      `#[must_use]` so a dropped action is a compile error.
+- [x] **nothing showed which pane had focus.** replaced the three
+      absolute focus keybinds with explicit move/interact modes (`tab`
+      enters move mode; wasd/arrows move focus and nothing else
+      responds), the focused pane named outright in the bottom bar, and
+      each search box labelled in its own border (`┤ search ├` vs
+      `┤ filter songs ├`) since the two rendered identically and a
+      blinking cursor was the only focus signal, absent half of every
+      blink cycle.
+- [x] **borders that did not meet.** junction glyphs were hardcoded in
+      main.rs; two were simply wrong and one was dead code, because
+      `VerticalRule` resolves junctions with `.find()` and an earlier
+      hardcoded row shadowed the later push. now derived from which
+      arms actually carry a line (`src/ui/junctions.rs`), with buffer
+      snapshot tests per app state.
+- [x] **the bottom bar narrated at you.** the status line is deleted
+      outright, not filtered: ~21 sites that wrote transient sentences
+      ("now playing: x", "error loading file") now either raise a
+      notification or say nothing. a mode indicator took its place.
+- [x] **destructive menus.** the eq menu applied a preset on every j/k
+      and wrapped, so scrolling past the last band silently overwrote
+      all ten hand-tuned gains and esc saved it; presets now need
+      enter and the list clamps. `d` in the profile manager deleted and
+      rewrote config.toml on one keypress; now two.
+- [x] **help was unreachable.** ~50 rows in one column, so on a 24-row
+      terminal the last sections (including how to quit) fell off the
+      bottom silently. now column-packed, first-fit, never splitting a
+      section, with tests asserting every heading is on screen at 80x24.
+- [x] **every key hint lied after a remap.** `src/ui/help.rs` was the
+      only surface reading the live keymap; the dashboard, player,
+      miniplayer and menus hardcoded defaults. all resolve through
+      `key_label(keymap.get(..))` now, with the genuinely-fixed keys
+      (j/k, enter, esc, tab) kept literal and `reserved_key_purpose`
+      refusing a binding onto them rather than silently shadowing it.
+- [x] **perf.** artist pages took ~5s: not the N+1 fan-out (already
+      threaded) but `ureq` pooling exactly one idle connection per
+      host, so 15 parallel requests each paid a fresh TLS handshake
+      (1.94s to 375ms). search was 8-27x slowed by per-keystroke
+      haystack allocation and a fresh nucleo matcher per call, with
+      ranking verified byte-identical across 30 query/corpus combos.
+      startup no longer blocks on the catalog fetch, the library scan,
+      the restored queue's ipc appends, or the terminal graphics probe.
+- [x] **security.** config.toml was mode 0644 with the navidrome
+      password in cleartext; now 0600, zeroized on drop, and the app
+      warns when it is about to persist a plaintext password. subsonic
+      auth needs the cleartext for every request (`md5(password+salt)`)
+      so it cannot be hashed away; `password_file` plus agenix remains
+      the real answer and is already supported.
+
+### the "horrible bass" investigation (resolved, not wim's fault)
+
+worth writing down because three plausible theories were wrong and the
+measurements are what settled it.
+
+- the eq was innocent: flat chain measured -89.8 dB RMS residual vs dry
+  (ffmpeg), -95.9 dB through mpv's json ipc, and flat within 0.02 dB
+  per octave band through the real binary. no resample or downmix stage
+  inserted; `astats reset=1` is bit-transparent. see
+  `docs/audio-quality.md`.
+- `format=raw` was a dead end: the source file is already opus 246k and
+  both the old (no `format` param) and new paths return byte-identical
+  `audio/ogg`, so navidrome was never transcoding for wim. the change
+  is kept as a correctness guarantee, not a fix.
+- replaygain was a dead end: the server reports `replayGain: {}`.
+- actual cause, found by reading the live pipewire graph: wireplumber
+  had a persisted per-application volume for mpv of
+  `channelVolumes: [3.548, 3.548]`, i.e. **+11.0 dB**, restored into
+  every mpv stream. the browser was unaffected because that state is
+  keyed per application. +11 dB on modern masters hard-clips and bass
+  carries the energy, hence "clipping from how much bass there is".
+  reset to unity, and wireplumber persisted the correction.
+- real defect found while in there: ten 1-octave peaking bands spaced
+  an octave apart sum, so "bass boost" declared +6/+5/+3/+1 dB and
+  measured +7.05/+6.70/+4.31/+1.77. `compensated_gains` now inverts the
+  measured spill matrix; a flat eq emits no biquads at all and null
+  tests bit-identical.
+
+## in flight (branches, NOT merged; do not start work that touches these)
+
+five branches exist with uncommitted-to-master work. check
+`git worktree list` and `git branch` before picking anything up; a loop
+run that edits these files will collide.
+
+- `feat/shellsong` + `wim-wt-shellsong`: "shellsong", a music command
+  language on `:` (`src/shellsong.rs`, `src/ui/shellsong.rs`,
+  `docs/shellsong.md`). call-only grammar, `play(crest)`,
+  `queue([hex, 4 star crest])`, `queue_aa(...)`, `favorite(...)`,
+  `add_to_queue(front, ...)`, `moveto(10%)`, `seek(+30s)`. deliberately
+  scoped to pure modules with zero main.rs edits; **host wiring is
+  still to do** and is the one remaining step.
+- `feat/pulse-animations` + `wim-wt-pulse`: selection shown by a
+  pulsing row background instead of border colour, plus one `src/anim.rs`
+  driving every animation off wall-clock time scaled to the display's
+  refresh rate (the loop currently polls a flat 100ms, so everything
+  animates at ~10fps).
+- `fix/nowplaying-queue` + `wim-wt-queue`: "now playing" shows the
+  wrong track because the app mirrors mpv's playlist position by
+  counting end-file events instead of observing `playlist-pos`; any
+  missed event desyncs it permanently. also moves the download trigger
+  from "played twice" to "played on two distinct days".
+- `feat/controls-bar-icons` + `wim-wt-controls`: bottom controls bar to
+  glyphs instead of `loop: off` text, arrow-key selection within the
+  bar, enter to interact, and enter on the progress bar entering a
+  scrub mode.
+
+## open sub-tasks discovered during the review pass
+
+- [ ] **queue has no view of its own.** still only a count in the
+      bottom bar; no way to see, reorder, or remove. for an app whose
+      central design choice is an explicit queue, this is the biggest
+      missing screen.
+- [ ] **wide characters still overlap their neighbour.** `textfit` is
+      `unicode_width`-aware now, but the hand-rolled
+      `for (col, ch) in text.chars().enumerate()` draw loops advance one
+      cell per char regardless of width, so CJK/emoji still overdraw.
+      the measurement is fixed; the drawing is not.
+- [ ] **migrate the remaining width-measurement call sites to textfit**:
+      banner.rs, helpbox.rs, login.rs, eq_menu.rs, onboarding.rs,
+      subtitle_menu.rs, notify.rs, player.rs, results_list.rs header
+      centering, controlsbar.rs, searchbox.rs, settings_menu.rs,
+      keybinds_menu.rs.
+- [ ] **`help.rs` still mislabels four remappable actions as fixed**:
+      `Key::Fixed("[ / ]")` and `Key::Fixed(", / .")` cover SpeedUp/
+      SpeedDown and SubtitleDelayUp/Down, which are rebindable, so
+      those two rows go stale after a remap.
+- [ ] **`HELP_BOX_WIDTH` is 10**, so a help key rebound to `space`
+      renders clipped ("space hel"). widen it or shorten the label.
+- [ ] **mpv survives an unclean wim exit.** `PR_SET_PDEATHSIG` would
+      close it with the parent; `Mpv::spawn` also passes no
+      `--no-config`, so a user mpv.conf silently alters playback.
+- [ ] **custom user-editable eq preset** (noted long ago, still open).
+- [ ] **decompose main.rs** (~3.9k lines). a reviewed, ordered plan
+      exists: extract focus/InputMode, then the playback free functions,
+      then the sync/channel plumbing, then a `struct Ui` for the ~35
+      loose locals, then the draw closure, and only then the input
+      tiers (their ordering is load-bearing and heavily commented).
+- [ ] **~10 blocking mpv ipc round-trips per frame**: `playback_info` is
+      called 2-3x per loop iteration plus `audio_level` and
+      `cell_aspect`'s ioctl; `observe_property` exists and is now used
+      for playlist-pos, so the rest should follow and the per-frame
+      polling should go.
