@@ -4,6 +4,7 @@ mod eq;
 mod library;
 mod lyrics;
 mod mpv;
+mod persistence;
 mod search;
 mod subsonic;
 mod term;
@@ -95,6 +96,19 @@ fn resync_queue(player: &mpv::Mpv, items: &[SearchItem]) -> String {
     "shuffled".to_string()
 }
 
+/// Snapshots now-playing/queue/position/volume for next launch to
+/// resume. Best-effort: a failed save just means nothing to resume
+/// next time, not worth surfacing since we're already quitting.
+fn save_playback_state(player: &mpv::Mpv, now_playing: &Option<SearchItem>, queue: &[SearchItem]) {
+    let state = persistence::PlaybackState {
+        now_playing_path: now_playing.as_ref().and_then(playable_path),
+        queue_paths: queue.iter().filter_map(playable_path).collect(),
+        position_secs: player.get_property("time-pos").ok().and_then(|v| v.as_f64()),
+        volume: player.get_property("volume").ok().and_then(|v| v.as_f64()),
+    };
+    let _ = persistence::save(&state);
+}
+
 fn main() -> anyhow::Result<()> {
     let cfg = config::load_or_init()?;
 
@@ -116,6 +130,29 @@ fn main() -> anyhow::Result<()> {
     let lyrics_client = lyrics::Client::new();
     let mut lyrics_lines: Option<Vec<String>> = None;
     let mut lyrics_scroll: usize = 0;
+
+    // resuming across restarts is standard in any serious media player;
+    // a missing/corrupt state file just means nothing to resume, not an
+    // error — see persistence.rs.
+    if let Some(saved) = persistence::load() {
+        if let Some(item) = saved.now_playing_path.as_deref().and_then(persistence::item_from_path) {
+            if try_play(&player, &item).1 {
+                if let Some(pos) = saved.position_secs {
+                    let _ = player.seek(pos, false);
+                }
+                now_playing = Some(item);
+            }
+        }
+        for queued_path in &saved.queue_paths {
+            if let Some(item) = persistence::item_from_path(queued_path) {
+                let _ = try_enqueue(&player, &item);
+                app.queue.push(item);
+            }
+        }
+        if let Some(vol) = saved.volume {
+            let _ = player.set_volume(vol);
+        }
+    }
 
     let mut guard = term::TerminalGuard::new()?;
     loop {
@@ -212,7 +249,10 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 match app.handle_key(key.code) {
-                    Action::Quit => break,
+                    Action::Quit => {
+                        save_playback_state(&player, &now_playing, &app.queue);
+                        break;
+                    }
                     Action::Play(item) => {
                         let (s, played) = try_play(&player, &item);
                         if played {
