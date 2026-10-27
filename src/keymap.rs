@@ -19,6 +19,7 @@ pub enum KeyAction {
     StartSearch,
     FocusSidebar,
     FocusWorkspace,
+    FocusBottomBar,
     Enqueue,
     CycleLoop,
     ToggleShuffle,
@@ -52,6 +53,7 @@ pub const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::StartSearch,
     KeyAction::FocusSidebar,
     KeyAction::FocusWorkspace,
+    KeyAction::FocusBottomBar,
     KeyAction::Enqueue,
     KeyAction::CycleLoop,
     KeyAction::ToggleShuffle,
@@ -88,6 +90,7 @@ impl KeyAction {
             KeyAction::StartSearch => "start_search",
             KeyAction::FocusSidebar => "focus_sidebar",
             KeyAction::FocusWorkspace => "focus_workspace",
+            KeyAction::FocusBottomBar => "focus_bottom_bar",
             KeyAction::Enqueue => "enqueue",
             KeyAction::CycleLoop => "cycle_loop",
             KeyAction::ToggleShuffle => "toggle_shuffle",
@@ -122,6 +125,7 @@ impl KeyAction {
             KeyAction::StartSearch => "search",
             KeyAction::FocusSidebar => "focus sidebar",
             KeyAction::FocusWorkspace => "focus workspace",
+            KeyAction::FocusBottomBar => "focus bottom bar",
             KeyAction::Enqueue => "enqueue selected",
             KeyAction::CycleLoop => "cycle loop mode",
             KeyAction::ToggleShuffle => "toggle shuffle",
@@ -155,6 +159,12 @@ impl KeyAction {
             KeyAction::StartSearch => KeyCode::Char('/'),
             KeyAction::FocusSidebar => KeyCode::Char('A'),
             KeyAction::FocusWorkspace => KeyCode::Char('D'),
+            // 'W' pairs with 'A' the same way resize mode's own a/w
+            // both select the sidebar panel; free in both the
+            // remappable table and every fixed literal (grepped
+            // every `KeyCode::Char(...)` in main.rs before picking
+            // it), unlike 'S' (already `OpenStarredView`).
+            KeyAction::FocusBottomBar => KeyCode::Char('W'),
             KeyAction::Enqueue => KeyCode::Char('a'),
             KeyAction::CycleLoop => KeyCode::Char('l'),
             KeyAction::ToggleShuffle => KeyCode::Char('s'),
