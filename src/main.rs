@@ -3515,6 +3515,10 @@ fn main() -> anyhow::Result<()> {
                         .as_mut()
                         .and_then(|p| bv.art.clone().map(|img| p.new_resize_protocol(img)));
                     browse_view = Some(bv);
+                    // same as opening an album: the starred list draws
+                    // a selection cursor, so j/k have to move *it*
+                    // rather than the hidden sidebar behind it.
+                    focus = Focus::Workspace;
                     continue;
                 }
 
