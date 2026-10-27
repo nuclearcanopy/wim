@@ -339,11 +339,11 @@ fn open_starred_view(
             tracks.push(item);
         }
     }
-    browse::BrowseView {
+    let mut view = browse::BrowseView {
         title: "starred songs".to_string(),
         subtitle: String::new(),
         year: None,
-        tracks,
+        tracks: Vec::new(),
         selected: 0,
         art: None,
         bio: None,
@@ -354,7 +354,11 @@ fn open_starred_view(
         filter_query: String::new(),
         filtering: false,
         show_track_artist: true,
-    }
+    };
+    // through `set_tracks`, not a bare assignment: it re-clamps
+    // `selected` with the list it's an index into.
+    view.set_tracks(tracks);
+    view
 }
 
 /// Best-effort: a missing/unreadable cover is not worth surfacing as
@@ -2650,11 +2654,11 @@ fn main() -> anyhow::Result<()> {
                         match key.code {
                             KeyCode::Char(c) => {
                                 bv.filter_query.push(c);
-                                bv.clamp_selection_to_filter();
+                                bv.clamp_selection();
                             }
                             KeyCode::Backspace => {
                                 bv.filter_query.pop();
-                                bv.clamp_selection_to_filter();
+                                bv.clamp_selection();
                             }
                             KeyCode::Esc | KeyCode::Enter => bv.filtering = false,
                             _ => {}
