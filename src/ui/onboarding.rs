@@ -60,6 +60,56 @@ impl Widget for ControlsView {
     }
 }
 
+pub struct ListenBrainzView<'a> {
+    pub input: &'a str,
+}
+
+impl Widget for ListenBrainzView<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        draw_line(
+            buf,
+            area,
+            area.y,
+            "scrobble to listenbrainz? (optional)",
+            shade(NEAR_WHITE),
+        );
+        draw_line(
+            buf,
+            area,
+            area.y + 2,
+            "paste a user token from listenbrainz.org -> profile -> settings",
+            shade(DIM),
+        );
+        draw_line(
+            buf,
+            area,
+            area.y + 3,
+            "(a token, not your account password)",
+            shade(DIM),
+        );
+
+        let width = area.width as usize;
+        let masked: String = "*".repeat(self.input.chars().count());
+        let prefix = "token: ";
+        let value_width = width.saturating_sub(prefix.chars().count());
+        draw_line(
+            buf,
+            area,
+            area.y + 5,
+            &format!("{prefix}{}", tail_fit(&masked, value_width)),
+            shade(NEAR_WHITE),
+        );
+
+        draw_line(
+            buf,
+            area,
+            area.y + 7,
+            "enter to save and continue, esc to skip (scrobbling just won't happen)",
+            shade(DIM),
+        );
+    }
+}
+
 pub struct LibraryPathsView<'a> {
     pub paths: &'a [String],
     pub input: &'a str,
