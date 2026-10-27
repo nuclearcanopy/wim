@@ -4,6 +4,7 @@
 //! owning it directly is simpler than fighting someone else's types.
 
 use std::io::Read;
+use std::thread;
 
 use md5::{Digest, Md5};
 use rand::Rng;
@@ -13,6 +14,18 @@ use crate::config::NavidromeConfig;
 
 const API_VERSION: &str = "1.16.1";
 const CLIENT_NAME: &str = "wim";
+
+/// ureq's own default is 1 idle connection per host, so a fan-out of
+/// concurrent requests pools exactly one of them and every later call
+/// pays a fresh tcp+tls handshake; this keeps the whole artist-page
+/// fan-out (plus cover art and search) on warm, reused connections.
+const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 16;
+
+/// How many `getAlbum` requests an artist fetch runs at once. Subsonic
+/// has no single call for every song by an artist (see
+/// `artist_albums_with_tracks`), so it is one request per album; 8
+/// hides nearly all the latency without opening a socket per album.
+const ALBUM_FETCH_CONCURRENCY: usize = 8;
 
 /// Cheap to clone (ureq's `Agent` is `Arc`-backed internally); every
 /// remote `SearchItem` carries an `Arc<Client>` so playback can later
@@ -92,6 +105,26 @@ pub struct ArtistAlbum {
     pub year: Option<u32>,
 }
 
+/// One album's tracks from an artist fetch. `index` is the album's
+/// slot in the chronological album list it came from, because parallel
+/// fetches complete out of order.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // consumed by the artist view; ui wiring lands separately
+pub struct ArtistAlbumTracks {
+    pub index: usize,
+    pub album: ArtistAlbum,
+    pub songs: Vec<Song>,
+}
+
+/// Progress events from `stream_artist_tracks`, in arrival order.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // same as ArtistAlbumTracks
+pub enum ArtistLoad {
+    /// Best-effort, `None` when the server has no biography.
+    Bio(Option<String>),
+    Album(ArtistAlbumTracks),
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SearchResult {
     pub artists: Vec<Artist>,
@@ -111,7 +144,9 @@ impl Client {
             base_url: normalize_url(&cfg.url),
             username: cfg.username.clone(),
             password: cfg.resolve_password()?,
-            agent: ureq::AgentBuilder::new().build(),
+            agent: ureq::AgentBuilder::new()
+                .max_idle_connections_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
+                .build(),
             max_bitrate_kbps: cfg.max_bitrate_kbps,
             transcode_format: cfg.transcode_format.clone(),
         })
@@ -367,6 +402,124 @@ impl Client {
     }
 }
 
+/// The artist-page data path. Separate impl block (and one blanket
+/// `dead_code` allow) because the ui wiring that calls these lands
+/// separately; drop the allow once it does.
+#[allow(dead_code)]
+impl Client {
+    /// Every song on every album credited to this artist, grouped by
+    /// album, chronological. Subsonic has no single call for this:
+    /// `getArtist` returns albums without songs, `getAlbumList2` can't
+    /// filter by artist, and `getTopSongs` is a last.fm-ranked subset,
+    /// so it stays one `getAlbum` per album; those are independent, so
+    /// they run `ALBUM_FETCH_CONCURRENCY` at a time rather than
+    /// serially. Callers wanting only the artist's own tracks filter on
+    /// each `Song::artist` (a compilation's other credits land here
+    /// too, same as before).
+    pub fn artist_albums_with_tracks(
+        &self,
+        artist_id: &str,
+    ) -> anyhow::Result<Vec<ArtistAlbumTracks>> {
+        let albums = self.artist_albums_chronological(artist_id)?;
+        let workers = ALBUM_FETCH_CONCURRENCY.min(albums.len());
+        if workers == 0 {
+            return Ok(Vec::new());
+        }
+        let albums = &albums;
+        let batches: Vec<Vec<ArtistAlbumTracks>> = thread::scope(|scope| {
+            (0..workers)
+                .map(|worker| {
+                    scope.spawn(move || {
+                        albums
+                            .iter()
+                            .enumerate()
+                            .skip(worker)
+                            .step_by(workers)
+                            .filter_map(|(index, album)| self.album_tracks(index, album))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap_or_default())
+                .collect()
+        });
+        let mut tracks: Vec<ArtistAlbumTracks> = batches.into_iter().flatten().collect();
+        tracks.sort_by_key(|t| t.index);
+        Ok(tracks)
+    }
+
+    /// Non-blocking counterpart for the artist view: one `getArtist`
+    /// round trip, then the album list comes straight back so the page
+    /// can render immediately while everything else streams over `tx`.
+    ///
+    /// Drive it with `try_recv` from the event loop. Each
+    /// `ArtistLoad::Album` carries one album's tracks and its `index`
+    /// into the returned list (completions arrive out of order);
+    /// `ArtistLoad::Bio` arrives at most once. `Disconnected` means
+    /// every fetch finished. Dropping the receiver (closing the view)
+    /// stops the workers at their next send, so a navigate-away costs
+    /// at most one more in-flight request per worker.
+    pub fn stream_artist_tracks(
+        &self,
+        artist_id: &str,
+        tx: std::sync::mpsc::Sender<ArtistLoad>,
+    ) -> anyhow::Result<Vec<ArtistAlbum>> {
+        let albums = self.artist_albums_chronological(artist_id)?;
+        let workers = ALBUM_FETCH_CONCURRENCY.min(albums.len());
+        for worker in 0..workers {
+            let client = self.clone();
+            let tx = tx.clone();
+            let stripe: Vec<(usize, ArtistAlbum)> = albums
+                .iter()
+                .cloned()
+                .enumerate()
+                .skip(worker)
+                .step_by(workers)
+                .collect();
+            thread::spawn(move || {
+                for (index, album) in stripe {
+                    let Some(tracks) = client.album_tracks(index, &album) else {
+                        continue;
+                    };
+                    if tx.send(ArtistLoad::Album(tracks)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        // navidrome proxies the bio from last.fm, which is slow enough
+        // on its own to be worth taking off the open path; it rides the
+        // same channel so the caller has one thing to poll.
+        let client = self.clone();
+        let bio_artist = artist_id.to_string();
+        thread::spawn(move || {
+            let bio = client.get_artist_bio(&bio_artist).ok().flatten();
+            let _ = tx.send(ArtistLoad::Bio(bio));
+        });
+        Ok(albums)
+    }
+
+    /// Chronological, not whatever order `getArtist` returned
+    /// (alphabetical); unknown-year albums sort last rather than first.
+    fn artist_albums_chronological(&self, artist_id: &str) -> anyhow::Result<Vec<ArtistAlbum>> {
+        let mut albums = self.get_artist(artist_id)?;
+        albums.sort_by_key(|a| a.year.unwrap_or(u32::MAX));
+        Ok(albums)
+    }
+
+    /// `None` on any per-album failure: one unreadable album shouldn't
+    /// take down a whole artist page.
+    fn album_tracks(&self, index: usize, album: &ArtistAlbum) -> Option<ArtistAlbumTracks> {
+        let details = self.get_album(&album.id).ok()?;
+        Some(ArtistAlbumTracks {
+            index,
+            album: album.clone(),
+            songs: details.songs,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SubsonicEnvelope {
     #[serde(rename = "subsonic-response")]
@@ -540,6 +693,147 @@ fn parse_search3_response(v: &serde_json::Value) -> SearchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+
+    /// Minimal http/1.1 server for the fetch-path tests: canned
+    /// subsonic json, an optional per-request delay standing in for
+    /// network latency, and counters for requests and accepted
+    /// connections (the latter is how keep-alive reuse is asserted).
+    struct MockServer {
+        url: String,
+        requests: Arc<AtomicUsize>,
+        connections: Arc<AtomicUsize>,
+    }
+
+    impl MockServer {
+        fn start(albums: usize, songs_per_album: usize, latency: Duration) -> MockServer {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(AtomicUsize::new(0));
+            let connections = Arc::new(AtomicUsize::new(0));
+            let (req, conn) = (requests.clone(), connections.clone());
+            // detached: the test binary exits without waiting on it
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    conn.fetch_add(1, Ordering::Relaxed);
+                    let req = req.clone();
+                    thread::spawn(move || {
+                        serve(stream, albums, songs_per_album, latency, &req);
+                    });
+                }
+            });
+            MockServer {
+                url,
+                requests,
+                connections,
+            }
+        }
+
+        fn client(&self) -> Client {
+            Client::new(&NavidromeConfig {
+                url: self.url.clone(),
+                username: "test".into(),
+                password: Some("pw".into()),
+                password_file: None,
+                max_bitrate_kbps: None,
+                transcode_format: None,
+            })
+            .unwrap()
+        }
+
+        fn requests(&self) -> usize {
+            self.requests.load(Ordering::Relaxed)
+        }
+
+        fn connections(&self) -> usize {
+            self.connections.load(Ordering::Relaxed)
+        }
+    }
+
+    /// One keep-alive connection: requests until the client hangs up.
+    fn serve(
+        stream: TcpStream,
+        albums: usize,
+        songs_per_album: usize,
+        latency: Duration,
+        requests: &AtomicUsize,
+    ) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        loop {
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                return;
+            }
+            loop {
+                let mut header = String::new();
+                match reader.read_line(&mut header) {
+                    Ok(0) => return,
+                    Ok(_) if header.trim().is_empty() => break,
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+            requests.fetch_add(1, Ordering::Relaxed);
+            thread::sleep(latency);
+            let body = mock_body(&request_line, albums, songs_per_album);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            if writer.write_all(response.as_bytes()).is_err() {
+                return;
+            }
+            let _ = writer.flush();
+        }
+    }
+
+    /// Years descend with album position, so the returned order is the
+    /// reverse of the chronological one every caller sorts into.
+    fn mock_body(request_line: &str, albums: usize, songs_per_album: usize) -> String {
+        if request_line.contains("/rest/getArtistInfo2") {
+            return r#"{"subsonic-response":{"status":"ok","artistInfo2":{"biography":"mock bio"}}}"#
+                .to_string();
+        }
+        if request_line.contains("/rest/getArtist?") {
+            let album_json: Vec<String> = (0..albums)
+                .map(|i| {
+                    format!(
+                        r#"{{"id":"al-{i}","name":"album {i}","year":{}}}"#,
+                        2030 - i
+                    )
+                })
+                .collect();
+            return format!(
+                r#"{{"subsonic-response":{{"status":"ok","artist":{{"id":"ar-1","name":"Bladee","album":[{}]}}}}}}"#,
+                album_json.join(",")
+            );
+        }
+        if request_line.contains("/rest/getAlbum?") {
+            let album = request_line
+                .split("id=")
+                .nth(1)
+                .and_then(|rest| rest.split(['&', ' ']).next())
+                .unwrap_or("al-0")
+                .to_string();
+            let song_json: Vec<String> = (0..songs_per_album)
+                .map(|i| {
+                    format!(
+                        r#"{{"id":"{album}-s{i}","title":"track {i}","artist":"Bladee","album":"{album}","duration":100}}"#
+                    )
+                })
+                .collect();
+            return format!(
+                r#"{{"subsonic-response":{{"status":"ok","album":{{"id":"{album}","name":"{album}","year":2024,"song":[{}]}}}}}}"#,
+                song_json.join(",")
+            );
+        }
+        r#"{"subsonic-response":{"status":"ok"}}"#.to_string()
+    }
 
     #[test]
     fn stream_url_omits_overrides_by_default_and_includes_them_when_set() {
@@ -726,5 +1020,144 @@ mod tests {
         assert!(result.artists.is_empty());
         assert!(result.albums.is_empty());
         assert!(result.songs.is_empty());
+    }
+
+    #[test]
+    fn artist_fetch_returns_every_album_chronologically_with_its_tracks() {
+        let server = MockServer::start(5, 4, Duration::ZERO);
+        let tracks = server.client().artist_albums_with_tracks("ar-1").unwrap();
+        assert_eq!(tracks.len(), 5);
+        // mock years descend with album position, so chronological
+        // order is the reverse of what getArtist returned
+        let names: Vec<&str> = tracks.iter().map(|t| t.album.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["album 4", "album 3", "album 2", "album 1", "album 0"]
+        );
+        let indexes: Vec<usize> = tracks.iter().map(|t| t.index).collect();
+        assert_eq!(indexes, vec![0, 1, 2, 3, 4]);
+        assert_eq!(tracks.iter().map(|t| t.songs.len()).sum::<usize>(), 20);
+        assert_eq!(tracks[0].songs[0].album, "al-4");
+        assert_eq!(server.requests(), 6); // one getArtist + one getAlbum per album
+    }
+
+    #[test]
+    fn artist_fetch_reuses_connections_instead_of_one_per_album() {
+        let server = MockServer::start(15, 2, Duration::ZERO);
+        let tracks = server.client().artist_albums_with_tracks("ar-1").unwrap();
+        assert_eq!(tracks.len(), 15);
+        assert_eq!(server.requests(), 16);
+        // 16 requests over at most one connection per worker; with
+        // ureq's default idle-per-host of 1 this was ~16 handshakes.
+        assert!(
+            server.connections() <= ALBUM_FETCH_CONCURRENCY + 1,
+            "opened {} connections for 16 requests",
+            server.connections()
+        );
+    }
+
+    #[test]
+    fn artist_fetch_with_no_albums_is_empty_not_an_error() {
+        let server = MockServer::start(0, 0, Duration::ZERO);
+        assert!(server
+            .client()
+            .artist_albums_with_tracks("ar-1")
+            .unwrap()
+            .is_empty());
+        assert_eq!(server.requests(), 1);
+    }
+
+    #[test]
+    fn streaming_artist_fetch_returns_the_album_list_then_streams_tracks_and_bio() {
+        let server = MockServer::start(6, 3, Duration::from_millis(20));
+        let client = server.client();
+        let (tx, rx) = mpsc::channel();
+        let albums = client.stream_artist_tracks("ar-1", tx).unwrap();
+        // the album list (names included) is back after one round
+        // trip, before any getAlbum has been issued
+        assert_eq!(albums.len(), 6);
+        assert_eq!(albums[0].name, "album 5");
+        assert_eq!(albums[0].year, Some(2025));
+
+        let mut streamed = vec![None; albums.len()];
+        let mut bio = None;
+        for event in rx {
+            match event {
+                ArtistLoad::Album(tracks) => {
+                    let index = tracks.index;
+                    streamed[index] = Some(tracks);
+                }
+                ArtistLoad::Bio(b) => bio = b,
+            }
+        }
+        assert!(streamed.iter().all(|slot| slot.is_some()));
+        let songs: usize = streamed
+            .iter()
+            .map(|slot| slot.as_ref().unwrap().songs.len())
+            .sum();
+        assert_eq!(songs, 18);
+        assert_eq!(bio.as_deref(), Some("mock bio"));
+        // getArtist + 6 getAlbum + getArtistInfo2, nothing refetched
+        assert_eq!(server.requests(), 8);
+    }
+
+    #[test]
+    fn streaming_artist_fetch_stops_when_the_receiver_is_dropped() {
+        let server = MockServer::start(60, 1, Duration::from_millis(20));
+        let client = server.client();
+        let (tx, rx) = mpsc::channel();
+        client.stream_artist_tracks("ar-1", tx).unwrap();
+        drop(rx);
+        thread::sleep(Duration::from_millis(600));
+        // each worker notices on its first failed send, so a closed
+        // view costs at most one in-flight request per worker
+        assert!(
+            server.requests() <= 2 + ALBUM_FETCH_CONCURRENCY * 2,
+            "kept fetching after the receiver was dropped: {} requests",
+            server.requests()
+        );
+    }
+
+    /// Serial-vs-parallel numbers for the artist page against the mock
+    /// server's simulated latency; a timing assertion, so it's opt-in
+    /// (`cargo test -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn artist_fetch_timing_serial_vs_parallel() {
+        const LATENCY: Duration = Duration::from_millis(120);
+        let server = MockServer::start(15, 10, LATENCY);
+        let client = server.client();
+
+        let started = Instant::now();
+        let albums = client.get_artist("ar-1").unwrap();
+        let serial: usize = albums
+            .iter()
+            .map(|a| client.get_album(&a.id).unwrap().songs.len())
+            .sum();
+        let serial_elapsed = started.elapsed();
+        let serial_requests = server.requests();
+        let serial_connections = server.connections();
+
+        let server = MockServer::start(15, 10, LATENCY);
+        let client = server.client();
+        let started = Instant::now();
+        let parallel: usize = client
+            .artist_albums_with_tracks("ar-1")
+            .unwrap()
+            .iter()
+            .map(|t| t.songs.len())
+            .sum();
+        let parallel_elapsed = started.elapsed();
+
+        eprintln!(
+            "serial:   {serial} songs, {serial_requests} requests, {serial_connections} connections, {serial_elapsed:?}"
+        );
+        eprintln!(
+            "parallel: {parallel} songs, {} requests, {} connections, {parallel_elapsed:?}",
+            server.requests(),
+            server.connections()
+        );
+        assert_eq!(serial, parallel);
+        assert!(parallel_elapsed * 2 < serial_elapsed);
     }
 }
