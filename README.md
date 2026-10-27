@@ -39,11 +39,16 @@ module is exposed as `homeManagerModules.default`:
   imports = [ wim.homeManagerModules.default ];
   programs.wim = {
     enable = true;
-    navidrome = {
-      url = "https://navidrome.example.com";
-      username = "me";
-      passwordFile = config.age.secrets.navidrome-password.path; # or any path
-    };
+    # a list — every configured server feeds the same unified search,
+    # no "active server" to switch between. the in-app 'n' profile
+    # manager can add more on top of whatever's declared here.
+    navidromeServers = [
+      {
+        url = "https://navidrome.example.com";
+        username = "me";
+        passwordFile = config.age.secrets.navidrome-password.path; # or any path
+      }
+    ];
     albumArt = "auto"; # auto | blocks | sixel | kitty | iterm2 | off
     libraryPaths = [ ]; # defaults to ~/Music, ~/Videos when empty
   };
@@ -76,6 +81,7 @@ vim-like, settled as the app grows; this list is the source of truth.
 - `[` / `]` — speed down/up (0.25x–3x, 0.1x steps)
 - `e` — cycle eq preset (flat/bass boost/vocal boost/treble boost/rock/classical)
 - `L` — fetch and show lyrics for what's currently playing (j/k to scroll, L/esc/q to close)
+- `n` — manage navidrome profiles (list/add/remove; j/k select, enter reconnect/add, d remove)
 - `q` / `esc` — quit
 
 the queue auto-advances when the current track ends; nothing plays next

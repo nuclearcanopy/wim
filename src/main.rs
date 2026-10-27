@@ -4,6 +4,7 @@ mod eq;
 mod library;
 mod lyrics;
 mod mpv;
+mod navmanager;
 mod onboarding;
 mod persistence;
 mod search;
@@ -18,11 +19,13 @@ use crossterm::event::{self, Event, KeyCode};
 use ratatui::layout::{Constraint, Layout};
 
 use app::Action;
+use navmanager::{NavManager, NavManagerStep};
 use onboarding::{Onboarding, Step};
 use search::SearchItem;
 use ui::banner::Banner;
 use ui::login::{LoginForm, LoginView};
 use ui::lyrics_view::LyricsView;
+use ui::nav_manager::NavManagerListView;
 use ui::onboarding::{ControlsView, DoneView, LibraryPathsView, WelcomeView};
 use ui::results_list::{label, ResultsList};
 use ui::status::StatusBar;
@@ -114,26 +117,15 @@ fn save_playback_state(player: &mpv::Mpv, now_playing: &Option<SearchItem>, queu
     let _ = persistence::save(&state);
 }
 
-/// Shared by the standalone `n` reopen and the onboarding Navidrome
-/// step, so the two paths can't drift out of sync. Pings before saving
-/// — a typo'd url/password shows an error and keeps the form open
-/// instead of silently saving garbage credentials.
-fn try_connect_navidrome(
-    cfg: &mut config::Config,
-    app: &mut app::App,
-    form: &LoginForm,
-) -> Result<String, String> {
-    let nav = config::NavidromeConfig {
-        url: form.url.clone(),
-        username: form.username.clone(),
-        password: Some(form.password.clone()),
-        password_file: None,
-    };
-    match subsonic::Client::new(&nav).and_then(|c| c.ping().map(|_| c)) {
+/// Shared by onboarding, the profile manager's add flow, and reconnect
+/// on an existing profile — so none of them can drift out of sync.
+/// Pings before the caller saves anything — a typo'd url/password
+/// shows an error rather than silently persisting garbage credentials.
+/// Doesn't touch `Config` itself: callers decide whether/how to
+/// persist (append a new profile vs. just refreshing an existing one).
+fn index_navidrome_server(app: &mut app::App, nav: &config::NavidromeConfig) -> Result<String, String> {
+    match subsonic::Client::new(nav).and_then(|c| c.ping().map(|_| c)) {
         Ok(client) => {
-            cfg.navidrome = Some(nav);
-            let _ = config::save(cfg);
-
             // index the real catalog, not just playlists — getArtists
             // returns everything in one call, getAlbumList2 is paginated
             // (see subsonic.rs). songs stay search-on-demand via
@@ -153,11 +145,18 @@ fn try_connect_navidrome(
             });
             app.corpus.add_playlists(playlists);
 
-            Ok(format!(
-                "navidrome connected: {artist_count} artists, {album_count} albums, {playlist_count} playlists indexed"
-            ))
+            Ok(format!("{artist_count} artists, {album_count} albums, {playlist_count} playlists indexed"))
         }
-        Err(e) => Err(format!("login failed: {e} — esc to skip")),
+        Err(e) => Err(format!("connection failed: {e}")),
+    }
+}
+
+fn navidrome_config_from_form(form: &LoginForm) -> config::NavidromeConfig {
+    config::NavidromeConfig {
+        url: form.url.clone(),
+        username: form.username.clone(),
+        password: Some(form.password.clone()),
+        password_file: None,
     }
 }
 
@@ -201,9 +200,19 @@ fn main() -> anyhow::Result<()> {
     let mut lyrics_lines: Option<Vec<String>> = None;
     let mut lyrics_scroll: usize = 0;
 
-    // `n` reopens just the navidrome step standalone, later.
-    let mut login_form: Option<LoginForm> = None;
-    let mut login_message = String::new();
+    // connect every configured server on startup — all of them feed
+    // the same unified corpus, there's no "active server" concept to
+    // pick between (consistent with search spanning everything). best
+    // effort: one server being down shouldn't block startup or hide
+    // the others.
+    for nav in &cfg.navidrome_servers {
+        if let Ok(msg) = index_navidrome_server(&mut app, nav) {
+            status = format!("{} local items indexed, navidrome: {msg}", app.corpus.len());
+        }
+    }
+
+    // 'n' opens the profile manager standalone, later.
+    let mut nav_manager: Option<NavManager> = None;
 
     // first run gets the full guided sequence (welcome, controls,
     // navidrome, library paths) instead of a disconnected popup with
@@ -277,8 +286,22 @@ fn main() -> anyhow::Result<()> {
             .split(area);
             f.render_widget(ui::divider::HorizontalRule, chunks[1]);
 
-            if let Some(form) = &login_form {
-                f.render_widget(LoginView { form, message: &login_message }, chunks[0]);
+            if let Some(nm) = &nav_manager {
+                match &nm.step {
+                    NavManagerStep::List => {
+                        f.render_widget(
+                            NavManagerListView {
+                                servers: &cfg.navidrome_servers,
+                                selected: nm.selected,
+                                message: &nm.message,
+                            },
+                            chunks[0],
+                        );
+                    }
+                    NavManagerStep::Add(form) => {
+                        f.render_widget(LoginView { form, message: &nm.message }, chunks[0]);
+                    }
+                }
             } else {
                 match &lyrics_lines {
                     Some(lines) => {
@@ -363,12 +386,15 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Tab => ob.login.next_field(),
                             KeyCode::Enter if !ob.login.is_last_field() => ob.login.next_field(),
                             KeyCode::Enter => {
-                                match try_connect_navidrome(&mut cfg, &mut app, &ob.login) {
+                                let nav = navidrome_config_from_form(&ob.login);
+                                match index_navidrome_server(&mut app, &nav) {
                                     Ok(msg) => {
-                                        status = msg;
+                                        cfg.navidrome_servers.push(nav);
+                                        let _ = config::save(&cfg);
+                                        status = format!("navidrome connected: {msg}");
                                         ob.advance();
                                     }
-                                    Err(msg) => ob.login_message = msg,
+                                    Err(msg) => ob.login_message = format!("{msg} — esc to skip"),
                                 }
                             }
                             _ => {}
@@ -396,26 +422,63 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                if let Some(form) = &mut login_form {
-                    match key.code {
-                        KeyCode::Esc => {
-                            login_form = None;
-                            status = "navidrome setup skipped — local files only".to_string();
-                        }
-                        KeyCode::Char(c) => form.current_mut().push(c),
-                        KeyCode::Backspace => {
-                            form.current_mut().pop();
-                        }
-                        KeyCode::Tab => form.next_field(),
-                        KeyCode::Enter if !form.is_last_field() => form.next_field(),
-                        KeyCode::Enter => match try_connect_navidrome(&mut cfg, &mut app, form) {
-                            Ok(msg) => {
-                                status = msg;
-                                login_form = None;
+                if let Some(nm) = &mut nav_manager {
+                    match &mut nm.step {
+                        NavManagerStep::List => {
+                            let entry_count = cfg.navidrome_servers.len() + 1; // +1 for "add new"
+                            match key.code {
+                                KeyCode::Esc => nav_manager = None,
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    nm.selected = (nm.selected + 1).min(entry_count - 1);
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    nm.selected = nm.selected.saturating_sub(1);
+                                }
+                                KeyCode::Char('d') if nm.selected < cfg.navidrome_servers.len() => {
+                                    cfg.navidrome_servers.remove(nm.selected);
+                                    let _ = config::save(&cfg);
+                                    nm.selected = nm.selected.min(cfg.navidrome_servers.len());
+                                    nm.message = "profile removed (already-indexed items stay until restart)".to_string();
+                                }
+                                KeyCode::Enter if nm.selected == cfg.navidrome_servers.len() => {
+                                    nm.step = NavManagerStep::Add(LoginForm::new());
+                                }
+                                KeyCode::Enter => {
+                                    let nav = cfg.navidrome_servers[nm.selected].clone();
+                                    nm.message = match index_navidrome_server(&mut app, &nav) {
+                                        Ok(msg) => format!("reconnected: {msg}"),
+                                        Err(msg) => msg,
+                                    };
+                                }
+                                _ => {}
                             }
-                            Err(msg) => login_message = msg,
+                        }
+                        NavManagerStep::Add(form) => match key.code {
+                            KeyCode::Esc => {
+                                nm.step = NavManagerStep::List;
+                                nm.message.clear();
+                            }
+                            KeyCode::Char(c) => form.current_mut().push(c),
+                            KeyCode::Backspace => {
+                                form.current_mut().pop();
+                            }
+                            KeyCode::Tab => form.next_field(),
+                            KeyCode::Enter if !form.is_last_field() => form.next_field(),
+                            KeyCode::Enter => {
+                                let nav = navidrome_config_from_form(form);
+                                match index_navidrome_server(&mut app, &nav) {
+                                    Ok(msg) => {
+                                        cfg.navidrome_servers.push(nav);
+                                        let _ = config::save(&cfg);
+                                        nm.selected = cfg.navidrome_servers.len() - 1;
+                                        nm.step = NavManagerStep::List;
+                                        nm.message = format!("connected: {msg}");
+                                    }
+                                    Err(msg) => nm.message = format!("{msg} — esc to go back"),
+                                }
+                            }
+                            _ => {}
                         },
-                        _ => {}
                     }
                     continue;
                 }
@@ -437,8 +500,7 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if key.code == KeyCode::Char('n') {
-                    login_form = Some(LoginForm::new());
-                    login_message.clear();
+                    nav_manager = Some(NavManager::new());
                     continue;
                 }
 
