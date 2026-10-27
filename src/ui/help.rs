@@ -71,6 +71,14 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Bound(KeyAction::IndexBreakdown), "index breakdown"),
             (Key::Bound(KeyAction::ToggleStar), "star / unstar"),
             (Key::Bound(KeyAction::OpenLyrics), "lyrics"),
+            (
+                Key::Fixed("left/right"),
+                "artist profile: switch albums/songs column",
+            ),
+            (
+                Key::Bound(KeyAction::StartSearch),
+                "artist profile: filter songs",
+            ),
         ],
     ),
     (
