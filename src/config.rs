@@ -58,6 +58,19 @@ pub struct Config {
     /// Directories to scan for local music and video.
     #[serde(default)]
     pub library_paths: Vec<String>,
+    /// Off by default: fades the end of one track into the start of
+    /// the next rather than a hard cut. Separate from (and layered on
+    /// top of) gapless playback, which stays on regardless. Not a
+    /// true overlapping crossfade (one mpv instance, one file loaded
+    /// at a time); a fade-out/fade-in volume ramp at the boundary.
+    #[serde(default)]
+    pub crossfade_enabled: bool,
+    #[serde(default = "default_crossfade_seconds")]
+    pub crossfade_seconds: f64,
+}
+
+fn default_crossfade_seconds() -> f64 {
+    3.0
 }
 
 impl Default for Config {
@@ -66,6 +79,8 @@ impl Default for Config {
             navidrome_servers: Vec::new(),
             album_art: AlbumArtMode::Auto,
             library_paths: Vec::new(),
+            crossfade_enabled: false,
+            crossfade_seconds: default_crossfade_seconds(),
         }
     }
 }

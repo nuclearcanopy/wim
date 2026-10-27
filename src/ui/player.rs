@@ -18,6 +18,7 @@ pub struct PlayerView<'a> {
     pub shuffle_on: bool,
     pub speed: f64,
     pub eq_preset: &'a str,
+    pub crossfade_on: bool,
     pub previous: Option<&'a str>,
     pub next: Option<&'a str>,
 }
@@ -69,11 +70,12 @@ impl Widget for PlayerView<'_> {
         );
 
         let state_line = format!(
-            "{}  shuffle: {}  speed: {:.2}x  eq: {}",
+            "{}  shuffle: {}  speed: {:.2}x  eq: {}  crossfade (c): {}",
             self.loop_label,
             if self.shuffle_on { "on" } else { "off" },
             self.speed,
             self.eq_preset,
+            if self.crossfade_on { "on" } else { "off" },
         );
         draw_centered(buf, area, mid_y + 6, &state_line, shade(DIM));
 

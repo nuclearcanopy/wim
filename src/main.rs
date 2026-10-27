@@ -266,6 +266,20 @@ fn fetch_cover_art(client: &subsonic::Client, album_id: &str) -> Option<image::D
     image::load_from_memory(&bytes).ok()
 }
 
+/// `Auto`/`Blocks` both start in ascii (the strictly-monochrome
+/// default); `Sixel`/`Kitty`/`Iterm2` start in real-image mode since
+/// configuring one specifically is an explicit ask for it. `i` still
+/// cycles through all three regardless of where it started.
+fn initial_art_mode(mode: config::AlbumArtMode) -> browse::ArtMode {
+    match mode {
+        config::AlbumArtMode::Auto | config::AlbumArtMode::Blocks => browse::ArtMode::Ascii,
+        config::AlbumArtMode::Sixel
+        | config::AlbumArtMode::Kitty
+        | config::AlbumArtMode::Iterm2 => browse::ArtMode::Real,
+        config::AlbumArtMode::Off => browse::ArtMode::Off,
+    }
+}
+
 /// (artist, title, album) for a lyrics lookup; only meaningful for
 /// local music; `SearchItem` doesn't carry duration, so lookups always
 /// fall through to lrclib's fuzzy `/search` rather than its exact
@@ -617,12 +631,9 @@ fn main() -> anyhow::Result<()> {
     // the track listing stays visible rather than getting replaced.
     // 'm' toggles it by hand either way.
     let mut player_minimized = false;
-    // 'i' toggles between ascii rasterization (default, strictly
-    // monochrome) and ratatui-image's real terminal-graphics display
-    // (sixel/kitty/iterm2, falling back to colored halfblocks on a
-    // terminal with none of those; that fallback not being monochrome
-    // is the explicit tradeoff of asking for real images).
-    let mut art_mode = browse::ArtMode::Ascii;
+    // 'i' cycles ascii -> real -> off from here; this is just the
+    // config-driven starting point.
+    let mut art_mode = initial_art_mode(cfg.album_art);
     // rolling window for the now-playing level meter; a fixed-size
     // ring (just truncate the front) rather than growing forever.
     let mut level_history: Vec<f32> = Vec::new();
@@ -737,6 +748,20 @@ fn main() -> anyhow::Result<()> {
             let _ = player.set_volume(vol);
         }
     }
+
+    // the ceiling crossfade's fade-out/fade-in ramps scale against;
+    // read back rather than assuming 100, since persistence may have
+    // just restored something else above.
+    let base_volume = player
+        .get_property("volume")
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(100.0);
+    let mut crossfade_enabled = cfg.crossfade_enabled;
+    // Some(when the current track started) while fading in; mpv has
+    // no notion of this, so it's tracked entirely on our side and
+    // cleared once the fade finishes.
+    let mut fade_in_started_at: Option<Instant> = None;
 
     let mut panels = PanelLayout::new();
     let start = Instant::now();
@@ -938,6 +963,7 @@ fn main() -> anyhow::Result<()> {
                         shuffle_on: app.shuffle,
                         speed: app.speed,
                         eq_preset: eq::PRESETS[app.eq_preset].name,
+                        crossfade_on: crossfade_enabled,
                         previous: previous_label.as_deref(),
                         next: next_label.as_deref(),
                     },
@@ -1087,6 +1113,43 @@ fn main() -> anyhow::Result<()> {
                     "queue empty, idle".to_string()
                 }
             };
+            // a track just ended; either start the new one quiet and
+            // ramp it up (crossfade on), or make sure it's at full
+            // volume regardless of wherever a fade-out left things
+            // (crossfade just got disabled mid-fade, say).
+            if now_playing.is_some() {
+                if crossfade_enabled {
+                    let _ = player.set_volume(0.0);
+                    fade_in_started_at = Some(Instant::now());
+                } else {
+                    let _ = player.set_volume(base_volume);
+                }
+            }
+        }
+
+        // the fade-out approaching a track's end and the fade-in right
+        // after a new one starts are mutually exclusive in time (one
+        // happens near end-of-file, the other right after), so this
+        // is safe to check unconditionally every frame rather than
+        // only while a particular view is showing; volume should fade
+        // whether or not the player view is on screen.
+        if crossfade_enabled && now_playing.is_some() {
+            if let Some(started) = fade_in_started_at {
+                let t = (started.elapsed().as_secs_f64() / cfg.crossfade_seconds).clamp(0.0, 1.0);
+                let _ = player.set_volume(base_volume * t);
+                if t >= 1.0 {
+                    fade_in_started_at = None;
+                }
+            } else {
+                let (elapsed, duration, _) = playback_info(&player);
+                if let (Some(elapsed), Some(duration)) = (elapsed, duration) {
+                    let remaining = duration - elapsed;
+                    if remaining <= cfg.crossfade_seconds {
+                        let t = (remaining / cfg.crossfade_seconds).clamp(0.0, 1.0);
+                        let _ = player.set_volume(base_volume * t);
+                    }
+                }
+            }
         }
 
         // drain whatever the background sync thread finished since the
@@ -1425,6 +1488,19 @@ fn main() -> anyhow::Result<()> {
 
                 if key.code == KeyCode::Char('m') && now_playing.is_some() {
                     player_minimized = !player_minimized;
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('c') {
+                    crossfade_enabled = !crossfade_enabled;
+                    if !crossfade_enabled {
+                        fade_in_started_at = None;
+                        let _ = player.set_volume(base_volume);
+                    }
+                    status = format!(
+                        "crossfade: {}",
+                        if crossfade_enabled { "on" } else { "off" }
+                    );
                     continue;
                 }
 
