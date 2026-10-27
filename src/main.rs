@@ -2097,6 +2097,7 @@ fn main() -> anyhow::Result<()> {
                             values[7].as_str(),
                         ],
                         selected: settings_menu_selected,
+                        keymap: &keymap,
                     },
                     top,
                 );
