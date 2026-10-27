@@ -112,23 +112,39 @@ fn artist_tracks(
     // chronological, not whatever order getArtist happened to return
     // (alphabetical); unknown-year albums sort last rather than first.
     albums.sort_by_key(|a| a.year.unwrap_or(u32::MAX));
+
+    // one getAlbum round-trip per album, done one at a time, was the
+    // whole reason opening a prolific artist's profile felt so slow
+    // (dozens of sequential network calls, each paying its own
+    // latency); they're entirely independent requests, so fetch them
+    // all in parallel instead. `Client` wraps a `ureq::Agent`, which
+    // is explicitly safe to share and use concurrently across
+    // threads for exactly this.
+    let details: Vec<Option<subsonic::AlbumDetails>> = thread::scope(|scope| {
+        albums
+            .iter()
+            .map(|album| scope.spawn(|| client.get_album(&album.id).ok()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or(None))
+            .collect()
+    });
+
     let mut tracks = Vec::new();
-    for album in albums {
-        if let Ok(details) = client.get_album(&album.id) {
-            tracks.extend(
-                details
-                    .songs
-                    .into_iter()
-                    .filter(|s| s.artist == artist_name)
-                    .map(|s| SearchItem::Song {
-                        id: s.id,
-                        title: s.title,
-                        artist: s.artist,
-                        album: s.album,
-                        client: client.clone(),
-                    }),
-            );
-        }
+    for album in details.into_iter().flatten() {
+        tracks.extend(
+            album
+                .songs
+                .into_iter()
+                .filter(|s| s.artist == artist_name)
+                .map(|s| SearchItem::Song {
+                    id: s.id,
+                    title: s.title,
+                    artist: s.artist,
+                    album: s.album,
+                    client: client.clone(),
+                }),
+        );
     }
     Ok(tracks)
 }
