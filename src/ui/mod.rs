@@ -16,5 +16,6 @@ pub mod player;
 pub mod progress;
 pub mod results_list;
 pub mod searchbox;
+pub mod subtitle_menu;
 pub mod textfit;
 pub mod visualizer;

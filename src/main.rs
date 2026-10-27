@@ -535,6 +535,27 @@ fn now_playing_is_video(now_playing: &Option<SearchItem>) -> bool {
     matches!(now_playing, Some(SearchItem::LocalVideo { .. }))
 }
 
+/// `dir`: -1.0 or 1.0. One step per field, matching `ui::subtitle_menu`'s
+/// field order; kept as a plain index match rather than a generic
+/// field-descriptor table since there are only seven of these and
+/// their underlying types (f64/u32/f32) don't share one anyway.
+fn adjust_subtitle_field(sub: &mut config::SubtitleConfig, field: usize, dir: f64) {
+    match field {
+        0 => sub.delay_secs = (sub.delay_secs + dir * 0.5).clamp(-30.0, 30.0),
+        1 => {
+            sub.font_size = (sub.font_size as i64 + (dir * 2.0) as i64).clamp(10, 100) as u32;
+        }
+        2 => {
+            sub.position = (sub.position as i64 + (dir * 5.0) as i64).clamp(0, 150) as u32;
+        }
+        3 => sub.outline_size = (sub.outline_size + dir * 0.5).clamp(0.0, 5.0),
+        4 => sub.background_opacity = (sub.background_opacity + dir * 0.1).clamp(0.0, 1.0),
+        5 => sub.blur = (sub.blur + dir * 0.5).clamp(0.0, 10.0),
+        6 => sub.color_level = (sub.color_level + dir as f32 * 0.05).clamp(0.0, 1.0),
+        _ => {}
+    }
+}
+
 /// A completed background sync attempt for one server, tagged by url
 /// since several servers' results arrive interleaved on the same
 /// channel with no other way to tell them apart.
@@ -765,6 +786,11 @@ fn main() -> anyhow::Result<()> {
     // full keybind reference, opened with '?'; takes over the whole
     // screen the same way onboarding/the nav manager do.
     let mut help_open = false;
+    // 't': a small centered box over whatever's already on screen
+    // (not a full takeover like help_open), for live subtitle style
+    // tweaks instead of only the ,/. delay-only adjustment.
+    let mut subtitle_menu_open = false;
+    let mut subtitle_menu_selected: usize = 0;
     // rolling window for the now-playing level meter; a fixed-size
     // ring (just truncate the front) rather than growing forever.
     let mut level_history: Vec<f32> = Vec::new();
@@ -1304,6 +1330,33 @@ fn main() -> anyhow::Result<()> {
                 },
                 area,
             );
+
+            if subtitle_menu_open {
+                let values = [
+                    format!("{:+.1}s", cfg.subtitles.delay_secs),
+                    format!("{}", cfg.subtitles.font_size),
+                    format!("{}", cfg.subtitles.position),
+                    format!("{:.1}", cfg.subtitles.outline_size),
+                    format!("{:.1}", cfg.subtitles.background_opacity),
+                    format!("{:.1}", cfg.subtitles.blur),
+                    format!("{:.2}", cfg.subtitles.color_level),
+                ];
+                f.render_widget(
+                    ui::subtitle_menu::SubtitleMenu {
+                        values: [
+                            values[0].as_str(),
+                            values[1].as_str(),
+                            values[2].as_str(),
+                            values[3].as_str(),
+                            values[4].as_str(),
+                            values[5].as_str(),
+                            values[6].as_str(),
+                        ],
+                        selected: subtitle_menu_selected,
+                    },
+                    area,
+                );
+            }
         })?;
 
         // non-blocking: mpv auto-advances its own playlist on
@@ -1598,6 +1651,40 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                if subtitle_menu_open {
+                    match key.code {
+                        KeyCode::Char('t') | KeyCode::Esc => {
+                            subtitle_menu_open = false;
+                            let _ = config::save(&cfg);
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            subtitle_menu_selected =
+                                (subtitle_menu_selected + 1) % ui::subtitle_menu::FIELD_COUNT;
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            subtitle_menu_selected =
+                                (subtitle_menu_selected + ui::subtitle_menu::FIELD_COUNT - 1)
+                                    % ui::subtitle_menu::FIELD_COUNT;
+                        }
+                        KeyCode::Char('h') | KeyCode::Left => {
+                            adjust_subtitle_field(&mut cfg.subtitles, subtitle_menu_selected, -1.0);
+                            player.set_subtitle_style(&cfg.subtitles);
+                            subtitle_delay = cfg.subtitles.delay_secs;
+                        }
+                        KeyCode::Char('l') | KeyCode::Right => {
+                            adjust_subtitle_field(&mut cfg.subtitles, subtitle_menu_selected, 1.0);
+                            player.set_subtitle_style(&cfg.subtitles);
+                            subtitle_delay = cfg.subtitles.delay_secs;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                if key.code == KeyCode::Char('t') {
+                    subtitle_menu_open = true;
+                    continue;
+                }
+
                 // every other block below intercepts specific keys and
                 // unconditionally `continue`s even on a non-match
                 // (browse_view/lyrics especially), so a query typed
@@ -1793,11 +1880,11 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // subtitle sync is the one styling knob worth
-                // adjusting live (discovered mid-playback); the rest
-                // (size/position/outline/blur/color) are config-only,
-                // set once at startup. editing_query is already ruled
-                // out above.
+                // quick delay-only nudge, kept alongside the full 't'
+                // menu since this is the one knob worth a dedicated
+                // half-second-step shortcut while actually watching
+                // something out of sync. editing_query is already
+                // ruled out above.
                 if matches!(key.code, KeyCode::Char(',') | KeyCode::Char('.')) {
                     subtitle_delay += if key.code == KeyCode::Char(',') {
                         -0.5
