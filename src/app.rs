@@ -71,7 +71,20 @@ pub struct App {
     pub loop_mode: LoopMode,
     pub shuffle: bool,
     pub speed: f64,
+    /// index into `eq::PRESETS`; meaningful only while `eq_custom` is
+    /// false (see `eq_custom`'s own doc).
     pub eq_preset: usize,
+    /// True once any individual band has been hand-adjusted (via the
+    /// eq menu) away from whatever named preset was active; the
+    /// bottom bar/player view show "custom" instead of a preset name
+    /// while this is set, rather than keeping credit on a preset that
+    /// no longer matches `eq_gains`.
+    pub eq_custom: bool,
+    /// The actual gains currently applied to mpv's `af` filter: either
+    /// a copy of `eq::PRESETS[eq_preset].gains`, or a hand-tuned set
+    /// once `eq_custom` is true. Always kept in sync with what's
+    /// actually audible, so callers never have to re-derive it.
+    pub eq_gains: [f64; 10],
     /// vim-style pending leader key, currently only used for `gg`.
     pending: Option<char>,
 }
@@ -89,8 +102,34 @@ impl App {
             shuffle: false,
             speed: 1.0,
             eq_preset: 0,
+            eq_custom: false,
+            eq_gains: eq::PRESETS[0].gains,
             pending: None,
         }
+    }
+
+    /// Cycles loop mode (off -> one -> all -> off); shared by the
+    /// `CycleLoop` keymap path and `Focus::BottomBar`'s enter-to-tweak
+    /// on the Loop field, so both apply the exact same mutation.
+    pub fn cycle_loop(&mut self) -> LoopMode {
+        self.loop_mode = self.loop_mode.next();
+        self.loop_mode
+    }
+
+    /// Toggles shuffle (see `toggle_shuffle` for the reshuffle-in-place
+    /// behavior) and hands back the queue's new order, same payload
+    /// `Action::QueueReordered` already carries, for the caller to
+    /// resync mpv's own playlist to.
+    pub fn toggle_shuffle_and_get_queue(&mut self) -> Vec<SearchItem> {
+        self.toggle_shuffle();
+        self.queue.clone()
+    }
+
+    /// One speed step, `dir` positive (`SpeedUp`) or negative
+    /// (`SpeedDown`); shared the same way `cycle_loop` is.
+    pub fn bump_speed(&mut self, dir: f64) -> f64 {
+        self.speed = (self.speed + dir * SPEED_STEP).clamp(MIN_SPEED, MAX_SPEED);
+        self.speed
     }
 
     /// Pops and returns the next queued item, for the caller to actually
@@ -206,20 +245,18 @@ impl App {
                 return Action::Queued(item);
             }
         } else if key == keymap.get(KeyAction::CycleLoop) {
-            self.loop_mode = self.loop_mode.next();
-            return Action::SetLoop(self.loop_mode);
+            return Action::SetLoop(self.cycle_loop());
         } else if key == keymap.get(KeyAction::ToggleShuffle) {
-            self.toggle_shuffle();
-            return Action::QueueReordered(self.queue.clone());
+            return Action::QueueReordered(self.toggle_shuffle_and_get_queue());
         } else if key == keymap.get(KeyAction::SpeedUp) {
-            self.speed = (self.speed + SPEED_STEP).min(MAX_SPEED);
-            return Action::SetSpeed(self.speed);
+            return Action::SetSpeed(self.bump_speed(1.0));
         } else if key == keymap.get(KeyAction::SpeedDown) {
-            self.speed = (self.speed - SPEED_STEP).max(MIN_SPEED);
-            return Action::SetSpeed(self.speed);
+            return Action::SetSpeed(self.bump_speed(-1.0));
         } else if key == keymap.get(KeyAction::CycleEq) {
             self.eq_preset = (self.eq_preset + 1) % eq::PRESETS.len();
+            self.eq_custom = false;
             let preset = &eq::PRESETS[self.eq_preset];
+            self.eq_gains = preset.gains;
             return Action::SetEq(preset.name, preset.gains);
         } else if key == keymap.get(KeyAction::Quit) {
             // not Esc: it's overloaded everywhere as "back/close" for

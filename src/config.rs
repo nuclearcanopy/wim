@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::eq;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NavidromeConfig {
     pub url: String,
@@ -101,6 +103,17 @@ pub struct Config {
     /// happens to be first".
     #[serde(default)]
     pub logo_style: Option<String>,
+    /// Name of the active `eq::PRESETS` entry (restored by name, same
+    /// reasoning as `logo_style`), or `None` while a hand-tuned
+    /// `eq_gains` is active instead (see `app::App::eq_custom`).
+    #[serde(default = "default_eq_preset")]
+    pub eq_preset: Option<String>,
+    /// Always kept in sync with whatever's actually applied (the
+    /// active preset's gains, or a hand-tuned set); read back on
+    /// startup regardless of `eq_preset`, so a custom eq survives a
+    /// restart even though it has no name of its own.
+    #[serde(default = "default_eq_gains")]
+    pub eq_gains: [f64; 10],
     /// Action name (`keymap::KeyAction::name`) -> key name
     /// (`keymap::key_label`'s inverse); only non-default bindings
     /// need to appear here (see `Keymap::overrides`), so most users
@@ -113,6 +126,14 @@ pub struct Config {
 
 fn default_subtitle_language() -> String {
     "en".to_string()
+}
+
+fn default_eq_preset() -> Option<String> {
+    Some(eq::PRESETS[0].name.to_string())
+}
+
+fn default_eq_gains() -> [f64; 10] {
+    eq::PRESETS[0].gains
 }
 
 impl Config {
@@ -199,6 +220,8 @@ impl Default for Config {
             opensubtitles_api_key_file: None,
             subtitle_language: default_subtitle_language(),
             logo_style: None,
+            eq_preset: default_eq_preset(),
+            eq_gains: default_eq_gains(),
             keybinds: HashMap::new(),
         }
     }
