@@ -95,8 +95,9 @@ at it; don't mark it done on build+test passing alone.
 - [x] three-state loop (`app::LoopMode`, off/one/all) instead of a
       binary toggle; "one" maps to mpv's own loop-file, "all" has no
       mpv equivalent (it only sees its own playlist) so it's tracked as
-      our own queue snapshot (`original_queue`) and replayed from the
-      top once the queue empties with that mode active.
+      our own session snapshot (`playqueue::PlayQueue::session`) and
+      replayed from the top once mpv's playlist drains with that mode
+      active.
 - [x] starring (`src/favorites.rs`, `subsonic::Client::star`/`unstar`/
       `get_starred_songs`): `*` stars/unstars whatever's hovered,
       remote songs call navidrome's own star api (stays in sync with
@@ -191,9 +192,11 @@ layout. the actual design:
       music/video items load into mpv on enter; remote items report
       "not playable yet" since live navidrome search isn't merged into
       the loop yet (needs a real server to test against).
-- [x] play queue: `a` enqueues, auto-advances on mpv end-file. reorder/
-      view-the-queue ui still pending (queue currently has no visible
-      list of its own, just a count in the status bar).
+- [x] play queue: `a` enqueues into mpv's own playlist, which is the
+      only queue there is; the current track is resolved from mpv's
+      `playlist-pos` (`src/playqueue.rs`). reorder/view-the-queue ui
+      still pending (queue currently has no visible list of its own,
+      just a count in the status bar).
 - [x] playback controls: loop-file (`l`), speed (`[`/`]`), shuffle (`s`,
       reshuffles the queue in place + randomizes future inserts).
       "avoid immediate repeats" smart-shuffle is more meaningful once

@@ -134,11 +134,18 @@ pub struct Config {
     /// leniency as every other best-effort field.
     #[serde(default)]
     pub keybinds: HashMap<String, String>,
-    /// How many times a remote song must start playing before it's
-    /// automatically downloaded to the local cache (see `cache.rs`).
-    /// Tweakable live in the settings menu ('u').
-    #[serde(default = "default_cache_listens_threshold")]
-    pub cache_listens_threshold: u32,
+    /// On how many *distinct calendar days* a remote song must have
+    /// been played before it's automatically downloaded to the local
+    /// cache (see `cache.rs`); playing it twice in one sitting is not
+    /// a signal, coming back to it another day is. Tweakable live in
+    /// the settings menu ('u'). The `alias` carries the value over
+    /// from the old play-count field of the same default, so an
+    /// existing config keeps working instead of erroring.
+    #[serde(
+        default = "default_cache_days_threshold",
+        alias = "cache_listens_threshold"
+    )]
+    pub cache_days_threshold: u32,
     /// Panel sizes from resize mode ('r'), persisted so a layout you
     /// deliberately set survives a restart; clamped on load by
     /// `layout::PanelLayout::from_sizes`.
@@ -173,7 +180,7 @@ fn default_bottom_bar_height() -> u16 {
     crate::layout::BOTTOM_BAR_DEFAULT
 }
 
-fn default_cache_listens_threshold() -> u32 {
+fn default_cache_days_threshold() -> u32 {
     2
 }
 
@@ -310,7 +317,7 @@ impl Default for Config {
             sidebar_width: default_sidebar_width(),
             bottom_bar_height: default_bottom_bar_height(),
             keybinds: HashMap::new(),
-            cache_listens_threshold: default_cache_listens_threshold(),
+            cache_days_threshold: default_cache_days_threshold(),
             cache_eviction_days: default_cache_eviction_days(),
         }
     }

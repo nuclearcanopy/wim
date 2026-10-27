@@ -11,7 +11,7 @@ pub const FIELD_LABELS: [&str; FIELD_COUNT] = [
     "album art",
     "crossfade",
     "crossfade seconds",
-    "cache after plays",
+    "cache after days played",
     "cache eviction days",
     "scrobble % threshold",
     "scrobble seconds threshold",
