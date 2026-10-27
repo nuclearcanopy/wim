@@ -24,7 +24,7 @@ callers awaiting a specific command's reply never see event noise.
 ## strictly monochrome ui
 
 every color anywhere in the ui is `Color::Rgb(v, v, v)` via
-`src/theme.rs`'s `shade()`/`lerp_shade()` helpers. no hues, ever —
+`src/theme.rs`'s `shade()`/`lerp_shade()` helpers. no hues, ever,
 including album art in `blocks` mode (see below). this is an explicit,
 non-negotiable aesthetic choice, not a limitation of the tooling; state
 (errors, selection, emphasis) is conveyed via brightness, weight, and
@@ -50,7 +50,7 @@ graphics protocol, iterm2 protocol, and a `Halfblocks` unicode fallback)
 with terminal auto-detection. the `album_art` config option
 (`auto | blocks | sixel | kitty | iterm2 | off`) exposes this directly:
 
-- `auto`/`sixel`/`kitty`/`iterm2`: real raster album art, true color —
+- `auto`/`sixel`/`kitty`/`iterm2`: real raster album art, true color;
   this is actual image data, not ui chrome, so the monochrome rule
   doesn't apply to it.
 - `blocks`: forces the halfblock protocol even on terminals that support
@@ -79,7 +79,7 @@ an occasional over-eager match. see `docs/features.md` for the product
 reasoning (why typo tolerance isn't optional here).
 
 the corpus is a flat `Vec<SearchItem>` spanning local music, local
-video, and every navidrome entity type (artist/album/song/playlist) —
+video, and every navidrome entity type (artist/album/song/playlist):
 one index, one ranked list, not per-source silos rendered next to each
 other.
 
