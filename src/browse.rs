@@ -11,6 +11,7 @@ use ratatui::layout::Rect;
 
 use crate::search::SearchItem;
 use crate::subsonic::Client;
+use crate::ui::textfit;
 
 /// Ascii is the "pure-TUI purity" default: a grayscale block
 /// rasterization that stays strictly monochrome and needs nothing
@@ -202,6 +203,9 @@ pub fn bio_rect(area: Rect, has_bio: bool) -> Option<Rect> {
 /// Naive greedy word-wrap, no hyphenation; the last line gets an
 /// ellipsis if there was more text than `max_lines` could hold, same
 /// "truncate rather than overflow" rule as everywhere else in the ui.
+/// Measured in display cells throughout (`textfit`), not bytes: a
+/// cyrillic/CJK bio measured by `str::len` wraps at a third to a half
+/// of the width it was given.
 pub fn wrap_bio(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines: Vec<String> = Vec::new();
@@ -214,9 +218,9 @@ pub fn wrap_bio(text: &str, width: usize, max_lines: usize) -> Vec<String> {
             break;
         }
         let would_be = if current.is_empty() {
-            word.len()
+            textfit::width(word)
         } else {
-            current.len() + 1 + word.len()
+            textfit::width(&current) + 1 + textfit::width(word)
         };
         if would_be > width && !current.is_empty() {
             lines.push(std::mem::take(&mut current));
@@ -236,10 +240,9 @@ pub fn wrap_bio(text: &str, width: usize, max_lines: usize) -> Vec<String> {
 
     if truncated {
         if let Some(last) = lines.last_mut() {
-            let max_chars = width.saturating_sub(1);
-            if last.chars().count() > max_chars {
-                *last = last.chars().take(max_chars).collect();
-            }
+            // always re-fit, not only when it overflows: the '…' has
+            // to fit inside `width` alongside whatever's kept.
+            *last = textfit::truncate_to_width(last, width.saturating_sub(1));
             last.push('…');
         }
     }
@@ -449,5 +452,41 @@ pub(crate) mod tests {
     #[test]
     fn wrap_bio_handles_empty_text() {
         assert!(wrap_bio("", 40, 3).is_empty());
+    }
+
+    #[test]
+    fn wrap_bio_measures_cells_not_bytes() {
+        // five cyrillic words, 2 bytes per char: by `str::len` this
+        // would wrap after the first word, by display width all five
+        // fit on one 30-cell line.
+        let lines = wrap_bio("гнев это дар судьбы наш", 30, 3);
+        assert_eq!(lines, vec!["гнев это дар судьбы наш".to_string()]);
+    }
+
+    #[test]
+    fn wrap_bio_keeps_wide_characters_inside_the_width() {
+        // each cjk char is two cells, so three words of three chars
+        // can't share an 8-cell line.
+        let lines = wrap_bio("日本語 音楽家 東京都", 8, 3);
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            assert!(
+                textfit::width(line) <= 8,
+                "line wider than the pane: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_bio_truncation_fits_the_ellipsis_in_cells() {
+        let text = "日本語 音楽家 東京都 作曲家 演奏者";
+        let lines = wrap_bio(text, 8, 2);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].ends_with('…'));
+        assert!(
+            textfit::width(&lines[1]) <= 8,
+            "truncated line wider than the pane: {:?}",
+            lines[1]
+        );
     }
 }
