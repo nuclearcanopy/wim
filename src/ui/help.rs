@@ -2,6 +2,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
+use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
 
@@ -9,70 +10,103 @@ use crate::ui::header::draw_header;
 /// bottom-right corner); takes over the whole screen the same way
 /// onboarding/the nav manager do, since it's a brief reference lookup
 /// rather than something you'd want to see alongside anything else.
-pub struct HelpOverlay;
+/// Looks up every remappable entry's *current* key from `keymap`
+/// live, rather than a hardcoded default string that would silently
+/// go stale the moment anything got rebound via 'K'.
+pub struct HelpOverlay<'a> {
+    pub keymap: &'a Keymap,
+}
 
-const SECTIONS: &[(&str, &[(&str, &str)])] = &[
+/// `Fixed` for universal navigation primitives and modal-internal
+/// conventions that deliberately aren't part of the remappable
+/// keymap (see keymap.rs); `Bound` for anything that is, so its
+/// label always reflects whatever it's actually currently bound to.
+enum Key {
+    Fixed(&'static str),
+    Bound(KeyAction),
+}
+
+const SECTIONS: &[(&str, &[(Key, &str)])] = &[
     (
         "navigation",
         &[
-            ("/", "search"),
-            ("j / k", "move selection"),
-            ("gg / G", "jump to top / bottom"),
-            ("enter", "play / open"),
-            ("esc", "back / close"),
-            ("shift+a/w", "focus sidebar"),
-            ("shift+d", "focus workspace"),
-            ("left/right", "cycle home screen logo"),
-            ("0", "reset logo to default"),
+            (Key::Bound(KeyAction::StartSearch), "search"),
+            (Key::Fixed("j / k"), "move selection"),
+            (Key::Fixed("gg / G"), "jump to top / bottom"),
+            (Key::Fixed("enter"), "play / open"),
+            (Key::Fixed("esc"), "back / close"),
+            (Key::Bound(KeyAction::FocusSidebar), "focus sidebar"),
+            (Key::Bound(KeyAction::FocusWorkspace), "focus workspace"),
+            (Key::Fixed("left/right"), "cycle home screen logo"),
+            (Key::Fixed("0"), "reset logo to default"),
         ],
     ),
     (
         "playback",
         &[
-            ("space", "pause / resume"),
-            ("a", "queue"),
-            ("f", "skip to next"),
-            ("b", "back to previous"),
-            ("l", "cycle loop: off / one / all"),
-            ("s", "shuffle"),
-            ("[ / ]", "speed"),
-            ("e", "cycle eq preset"),
-            ("c", "toggle crossfade"),
-            (", / .", "subtitle delay -/+ 0.5s"),
-            ("t", "subtitle settings menu"),
+            (Key::Bound(KeyAction::TogglePause), "pause / resume"),
+            (Key::Bound(KeyAction::Enqueue), "queue"),
+            (Key::Bound(KeyAction::SkipNext), "skip to next"),
+            (Key::Bound(KeyAction::SkipBack), "back to previous"),
+            (
+                Key::Bound(KeyAction::CycleLoop),
+                "cycle loop: off / one / all",
+            ),
+            (Key::Bound(KeyAction::ToggleShuffle), "shuffle"),
+            (Key::Fixed("[ / ]"), "speed"),
+            (Key::Bound(KeyAction::CycleEq), "cycle eq preset"),
+            (Key::Bound(KeyAction::ToggleCrossfade), "toggle crossfade"),
+            (Key::Fixed(", / ."), "subtitle delay -/+ 0.5s"),
+            (
+                Key::Bound(KeyAction::OpenSubtitleMenu),
+                "subtitle settings menu",
+            ),
         ],
     ),
     (
         "library",
         &[
-            ("n", "navidrome profiles"),
-            ("S", "starred songs"),
-            ("I", "index breakdown"),
-            ("*", "star / unstar"),
-            ("L", "lyrics"),
+            (Key::Bound(KeyAction::OpenNavManager), "navidrome profiles"),
+            (Key::Bound(KeyAction::OpenStarredView), "starred songs"),
+            (Key::Bound(KeyAction::IndexBreakdown), "index breakdown"),
+            (Key::Bound(KeyAction::ToggleStar), "star / unstar"),
+            (Key::Bound(KeyAction::OpenLyrics), "lyrics"),
         ],
     ),
     (
         "view",
         &[
-            ("m", "minimize / maximize player"),
-            ("v", "fullscreen video (covers the sidebar too)"),
-            ("i", "cycle album art: ascii / real / off"),
-            ("r", "resize mode (a/w/s/d select, arrows stretch)"),
+            (
+                Key::Bound(KeyAction::ToggleMinimize),
+                "minimize / maximize player",
+            ),
+            (
+                Key::Bound(KeyAction::ToggleFullscreenVideo),
+                "fullscreen video (covers the sidebar too)",
+            ),
+            (
+                Key::Bound(KeyAction::CycleArtMode),
+                "cycle album art: ascii / real / off",
+            ),
+            (
+                Key::Bound(KeyAction::ToggleResizeMode),
+                "resize mode (a/w/s/d select, arrows stretch)",
+            ),
         ],
     ),
     (
         "other",
         &[
-            ("u", "settings"),
-            ("q", "quit"),
-            ("ctrl+c", "quit, always, from anywhere"),
-            ("?", "close this"),
+            (Key::Bound(KeyAction::OpenSettingsMenu), "settings"),
+            (Key::Fixed("K"), "remap keybinds"),
+            (Key::Bound(KeyAction::Quit), "quit"),
+            (Key::Fixed("ctrl+c"), "quit, always, from anywhere"),
+            (Key::Bound(KeyAction::OpenHelp), "close this"),
         ],
     ),
 ];
 
-impl Widget for HelpOverlay {
+impl Widget for HelpOverlay<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let mut y = draw_header(
             buf,
@@ -95,7 +129,17 @@ impl Widget for HelpOverlay {
                 if y >= area.y + area.height {
                     break;
                 }
-                draw_line(buf, area, y, &format!("  {key:<10} {desc}"), shade(DIM));
+                let key_text = match key {
+                    Key::Fixed(s) => s.to_string(),
+                    Key::Bound(action) => key_label(self.keymap.get(*action)),
+                };
+                draw_line(
+                    buf,
+                    area,
+                    y,
+                    &format!("  {key_text:<10} {desc}"),
+                    shade(DIM),
+                );
                 y += 1;
             }
             y += 1;

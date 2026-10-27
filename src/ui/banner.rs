@@ -105,11 +105,14 @@ impl Widget for Banner {
 
         let pulse = pulse_level(self.elapsed_secs);
 
+        // a blank column of breathing room on each side; sitting
+        // right up against the logo's own edge read as touching it.
+        const ARROW_GAP: u16 = 2;
         let arrow_y = logo_start_y + glyph_height / 2;
-        if start_x > area.x {
-            put(buf, start_x - 1, arrow_y, '<', shade(NEAR_WHITE));
+        if start_x >= area.x + ARROW_GAP {
+            put(buf, start_x - ARROW_GAP, arrow_y, '<', shade(NEAR_WHITE));
         }
-        let right_x = start_x + total_width;
+        let right_x = start_x + total_width + ARROW_GAP - 1;
         if right_x < area.x + area.width {
             put(buf, right_x, arrow_y, '>', shade(NEAR_WHITE));
         }
