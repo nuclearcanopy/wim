@@ -6,6 +6,7 @@ mod favorites;
 mod keymap;
 mod layout;
 mod library;
+mod listenbrainz;
 mod lyrics;
 mod mpv;
 mod navmanager;
@@ -49,7 +50,7 @@ use ui::lyrics_view::LyricsView;
 use ui::miniplayer::MiniPlayerBar;
 use ui::nav_manager::NavManagerListView;
 use ui::notify::NotificationOverlay;
-use ui::onboarding::{ControlsView, DoneView, LibraryPathsView, WelcomeView};
+use ui::onboarding::{ControlsView, DoneView, LibraryPathsView, ListenBrainzView, WelcomeView};
 use ui::player::PlayerView;
 use ui::results_list::{label, ResultsList};
 use ui::searchbox::SearchBox;
@@ -431,6 +432,100 @@ fn lyrics_query(item: &SearchItem) -> Option<(String, String, String)> {
     }
 }
 
+/// `None` for anything that isn't a single track with a known artist:
+/// local video has no artist field at all, and remote browse entries
+/// (artist/album/playlist) never reach `now_playing` directly, they're
+/// always expanded into `Song`s first via `resolve_tracks`.
+fn scrobble_metadata(item: &SearchItem) -> Option<listenbrainz::TrackMetadata> {
+    match item {
+        SearchItem::LocalMusic {
+            title,
+            artist,
+            album,
+            ..
+        } => Some(listenbrainz::TrackMetadata {
+            artist_name: artist.clone()?,
+            track_name: title.clone(),
+            release_name: album.clone(),
+        }),
+        SearchItem::Song {
+            title,
+            artist,
+            album,
+            ..
+        } => Some(listenbrainz::TrackMetadata {
+            artist_name: artist.clone(),
+            track_name: title.clone(),
+            release_name: if album.is_empty() {
+                None
+            } else {
+                Some(album.clone())
+            },
+        }),
+        SearchItem::LocalVideo { .. }
+        | SearchItem::Artist { .. }
+        | SearchItem::Album { .. }
+        | SearchItem::Playlist { .. } => None,
+    }
+}
+
+/// Fires a "playing_now" listen on a background thread; fire-and-
+/// forget, a slow/failed ListenBrainz request must never block
+/// playback or the ui. A no-op if listenbrainz isn't configured (no
+/// token) or `item` has no scrobbleable metadata.
+fn fire_playing_now(cfg: &config::Config, item: &SearchItem) {
+    let Some(meta) = scrobble_metadata(item) else {
+        return;
+    };
+    let Some(client) = listenbrainz::Client::from_config(cfg) else {
+        return;
+    };
+    thread::spawn(move || {
+        let _ = client.submit_playing_now(&meta);
+    });
+}
+
+/// Fires a "single" (scrobble) listen on a background thread; same
+/// fire-and-forget contract as `fire_playing_now`.
+fn fire_scrobble(cfg: &config::Config, item: &SearchItem, listened_at: i64) {
+    let Some(meta) = scrobble_metadata(item) else {
+        return;
+    };
+    let Some(client) = listenbrainz::Client::from_config(cfg) else {
+        return;
+    };
+    thread::spawn(move || {
+        let _ = client.submit_single(&meta, listened_at);
+    });
+}
+
+/// Per-track scrobble bookkeeping, bundled into one struct (rather than
+/// two loose locals threaded through every playback function) so
+/// `go_to_previous` doesn't trip clippy's argument-count limit.
+/// `start_tracking_playback` resets this every time `now_playing`
+/// changes to a new track.
+#[derive(Default)]
+struct ScrobbleState {
+    /// Set once the "single" listen has fired for the current track,
+    /// so the per-tick threshold check (main loop) only ever fires it
+    /// once, not every tick after the threshold is crossed.
+    scrobbled: bool,
+    /// The current track's own start time, not whenever a scrobble
+    /// happens to fire; used as the `single` submission's
+    /// `listened_at`.
+    started_unix: Option<i64>,
+}
+
+/// Called from every site that sets `now_playing` to a new `Some(..)`:
+/// resets the per-track scrobble bookkeeping and fires "playing_now".
+/// Centralized here so each call site is one line instead of
+/// repeating all three steps (easy to silently miss one otherwise).
+fn start_tracking_playback(cfg: &config::Config, item: &SearchItem, scrobble: &mut ScrobbleState) {
+    scrobble.scrobbled = false;
+    scrobble.started_unix = Some(listenbrainz::now_unix());
+    fire_playing_now(cfg, item);
+}
+
 /// Replaces mpv's whole playlist and plays `item` immediately. Returns
 /// the status line and whether it actually started playing, so the
 /// caller can update `now_playing` only on success. Callers are
@@ -531,6 +626,7 @@ fn go_to_previous(
     now_playing: &mut Option<SearchItem>,
     previous_track: &mut Option<SearchItem>,
     queue: &mut Vec<SearchItem>,
+    scrobble: &mut ScrobbleState,
 ) -> String {
     let Some(prev) = previous_track.take() else {
         return "no previous track".to_string();
@@ -541,6 +637,7 @@ fn go_to_previous(
             queue.insert(0, interrupted);
         }
         maybe_fetch_subtitles(cfg, player, notifications, &prev);
+        start_tracking_playback(cfg, &prev, scrobble);
         *now_playing = Some(prev);
     } else {
         *previous_track = Some(prev);
@@ -885,6 +982,7 @@ fn main() -> anyhow::Result<()> {
     // whatever was playing right before `now_playing` last changed;
     // purely for the player view's "previous: ..." line.
     let mut previous_track: Option<SearchItem> = None;
+    let mut scrobble = ScrobbleState::default();
     // false (full player) by default for a standalone play; starting
     // playback from an open album/playlist sets this true instead, so
     // the track listing stays visible rather than getting replaced.
@@ -917,6 +1015,12 @@ fn main() -> anyhow::Result<()> {
     // mode does, never the bottom bar.
     let mut settings_menu_open = false;
     let mut settings_menu_selected: usize = 0;
+    // text-entry sub-mode for the settings menu's "listenbrainz
+    // token" row (the one field there that isn't h/l-adjustable
+    // numeric); enter on that row starts it, enter commits, esc
+    // cancels without changing anything.
+    let mut settings_token_editing = false;
+    let mut settings_token_input = String::new();
     // 'K': not itself remappable, deliberately (remapping the key
     // that opens the remap menu away and forgetting the new one
     // would be a real way to lock yourself out of it; '?' help
@@ -1044,6 +1148,7 @@ fn main() -> anyhow::Result<()> {
                     let _ = player.seek(pos, false);
                 }
                 maybe_fetch_subtitles(&cfg, &player, &mut notifications, &item);
+                start_tracking_playback(&cfg, &item, &mut scrobble);
                 now_playing = Some(item);
             }
         }
@@ -1105,6 +1210,14 @@ fn main() -> anyhow::Result<()> {
                             LoginView {
                                 form: &ob.login,
                                 message: &ob.login_message,
+                            },
+                            area,
+                        );
+                    }
+                    Step::ListenBrainz => {
+                        f.render_widget(
+                            ListenBrainzView {
+                                input: &ob.listenbrainz_token_input,
                             },
                             area,
                         );
@@ -1473,14 +1586,36 @@ fn main() -> anyhow::Result<()> {
                     browse::ArtMode::Real => "real",
                     browse::ArtMode::Off => "off",
                 };
+                let token_value = if settings_token_editing {
+                    format!(
+                        "{} (enter to save, esc to cancel)",
+                        "*".repeat(settings_token_input.chars().count())
+                    )
+                } else if cfg.listenbrainz_user_token.is_some()
+                    || cfg.listenbrainz_user_token_file.is_some()
+                {
+                    "set (enter to change)".to_string()
+                } else {
+                    "not set (enter to add)".to_string()
+                };
                 let values = [
                     format!("{art_mode_label} ('i' also cycles this)"),
                     if crossfade_enabled { "on" } else { "off" }.to_string(),
                     format!("{:.1}s", cfg.crossfade_seconds),
+                    format!("{:.0}%", cfg.scrobble.threshold_percent),
+                    format!("{:.0}s", cfg.scrobble.threshold_seconds),
+                    token_value,
                 ];
                 f.render_widget(
                     ui::settings_menu::SettingsMenu {
-                        values: [values[0].as_str(), values[1].as_str(), values[2].as_str()],
+                        values: [
+                            values[0].as_str(),
+                            values[1].as_str(),
+                            values[2].as_str(),
+                            values[3].as_str(),
+                            values[4].as_str(),
+                            values[5].as_str(),
+                        ],
                         selected: settings_menu_selected,
                     },
                     top,
@@ -1606,6 +1741,7 @@ fn main() -> anyhow::Result<()> {
                     let s = format!("now playing: {}", label(&next));
                     set_vid_for_item(&player, &next);
                     maybe_fetch_subtitles(&cfg, &player, &mut notifications, &next);
+                    start_tracking_playback(&cfg, &next, &mut scrobble);
                     previous_track = now_playing.replace(next);
                     s
                 }
@@ -1624,6 +1760,7 @@ fn main() -> anyhow::Result<()> {
                             let _ = try_enqueue(&player, t);
                         }
                         maybe_fetch_subtitles(&cfg, &player, &mut notifications, &first);
+                        start_tracking_playback(&cfg, &first, &mut scrobble);
                         previous_track = now_playing.replace(first);
                         app.queue = rest;
                     }
@@ -1668,6 +1805,26 @@ fn main() -> anyhow::Result<()> {
                     if remaining <= cfg.crossfade_seconds {
                         let t = (remaining / cfg.crossfade_seconds).clamp(0.0, 1.0);
                         let _ = player.set_volume(base_volume * t);
+                    }
+                }
+            }
+        }
+
+        // scrobbling: fires the "single" listen exactly once per
+        // track, the moment the configured threshold is crossed;
+        // checked every tick regardless of which view is on screen,
+        // same unconditional treatment as the crossfade ramp above.
+        // a no-op (see `fire_scrobble`) if listenbrainz isn't
+        // configured at all.
+        if !scrobble.scrobbled {
+            if let Some(item) = &now_playing {
+                let (elapsed, duration, _) = playback_info(&player);
+                if let (Some(elapsed), Some(duration)) = (elapsed, duration) {
+                    if listenbrainz::should_scrobble(&cfg.scrobble, elapsed, duration) {
+                        let listened_at =
+                            scrobble.started_unix.unwrap_or_else(listenbrainz::now_unix);
+                        fire_scrobble(&cfg, item, listened_at);
+                        scrobble.scrobbled = true;
                     }
                 }
             }
@@ -1721,6 +1878,7 @@ fn main() -> anyhow::Result<()> {
                 if let Some(ob) = &mut onboarding {
                     match ob.step {
                         Step::Navidrome => ob.login.current_mut().push_str(text),
+                        Step::ListenBrainz => ob.listenbrainz_token_input.push_str(text),
                         Step::LibraryPaths => ob.path_input.push_str(text),
                         _ => {}
                     }
@@ -1728,6 +1886,10 @@ fn main() -> anyhow::Result<()> {
                     if let NavManagerStep::Add(form) = &mut nm.step {
                         form.current_mut().push_str(text);
                     }
+                } else if settings_menu_open && settings_token_editing {
+                    // long random tokens are exactly the kind of thing
+                    // worth pasting rather than typing by hand.
+                    settings_token_input.push_str(text);
                 } else if !help_open {
                     app.paste_into_query(text);
                 }
@@ -1772,6 +1934,23 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     Err(msg) => ob.login_message = format!("{msg} (esc to skip)"),
                                 }
+                            }
+                            _ => {}
+                        },
+                        Step::ListenBrainz => match key.code {
+                            KeyCode::Esc => ob.advance(),
+                            KeyCode::Char(c) => ob.listenbrainz_token_input.push(c),
+                            KeyCode::Backspace => {
+                                ob.listenbrainz_token_input.pop();
+                            }
+                            KeyCode::Enter => {
+                                let token = ob.listenbrainz_token_input.trim().to_string();
+                                if !token.is_empty() {
+                                    cfg.listenbrainz_user_token = Some(token);
+                                    let _ = config::save(&cfg);
+                                    status = "listenbrainz scrobbling enabled".to_string();
+                                }
+                                ob.advance();
                             }
                             _ => {}
                         },
@@ -1973,6 +2152,32 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if settings_menu_open {
+                    // the token field's own text-entry sub-mode takes
+                    // every key while active, same "claim everything"
+                    // priority as editing_query/the filter box above;
+                    // esc here only cancels the edit, not the whole menu.
+                    if settings_token_editing {
+                        match key.code {
+                            KeyCode::Char(c) => settings_token_input.push(c),
+                            KeyCode::Backspace => {
+                                settings_token_input.pop();
+                            }
+                            KeyCode::Esc => {
+                                settings_token_editing = false;
+                                settings_token_input.clear();
+                            }
+                            KeyCode::Enter => {
+                                let token = settings_token_input.trim().to_string();
+                                cfg.listenbrainz_user_token =
+                                    if token.is_empty() { None } else { Some(token) };
+                                let _ = config::save(&cfg);
+                                settings_token_editing = false;
+                                settings_token_input.clear();
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     if key.code == KeyCode::Esc
                         || key.code == keymap.get(KeyAction::OpenSettingsMenu)
                     {
@@ -2013,6 +2218,26 @@ fn main() -> anyhow::Result<()> {
                         }
                         KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 2 => {
                             cfg.crossfade_seconds = (cfg.crossfade_seconds + 0.5).clamp(1.0, 15.0);
+                        }
+                        KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 3 => {
+                            cfg.scrobble.threshold_percent =
+                                (cfg.scrobble.threshold_percent - 5.0).clamp(5.0, 100.0);
+                        }
+                        KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 3 => {
+                            cfg.scrobble.threshold_percent =
+                                (cfg.scrobble.threshold_percent + 5.0).clamp(5.0, 100.0);
+                        }
+                        KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 4 => {
+                            cfg.scrobble.threshold_seconds =
+                                (cfg.scrobble.threshold_seconds - 15.0).clamp(15.0, 600.0);
+                        }
+                        KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 4 => {
+                            cfg.scrobble.threshold_seconds =
+                                (cfg.scrobble.threshold_seconds + 15.0).clamp(15.0, 600.0);
+                        }
+                        KeyCode::Enter if settings_menu_selected == 5 => {
+                            settings_token_editing = true;
+                            settings_token_input.clear();
                         }
                         _ => {}
                     }
@@ -2217,6 +2442,7 @@ fn main() -> anyhow::Result<()> {
                                         &mut notifications,
                                         &first,
                                     );
+                                    start_tracking_playback(&cfg, &first, &mut scrobble);
                                     previous_track = now_playing.replace(first);
                                     app.queue = rest;
                                     original_queue = session;
@@ -2383,6 +2609,7 @@ fn main() -> anyhow::Result<()> {
                         &mut now_playing,
                         &mut previous_track,
                         &mut app.queue,
+                        &mut scrobble,
                     );
                     continue;
                 }
@@ -2501,6 +2728,7 @@ fn main() -> anyhow::Result<()> {
                                         &mut notifications,
                                         &first,
                                     );
+                                    start_tracking_playback(&cfg, &first, &mut scrobble);
                                     previous_track = now_playing.replace(first);
                                     app.queue = tracks;
                                     // a standalone play (not from an
