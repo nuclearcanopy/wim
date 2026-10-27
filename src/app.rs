@@ -21,9 +21,38 @@ pub enum Action {
     /// should resync mpv's own playlist to match this new order,
     /// without disturbing whatever's currently playing.
     QueueReordered(Vec<SearchItem>),
-    SetLoop(bool),
+    SetLoop(LoopMode),
     SetSpeed(f64),
     SetEq(&'static str, [f64; 10]),
+}
+
+/// `One` loops just the current track forever (maps to mpv's own
+/// `loop-file`); `All` replays the whole queue/album from the top once
+/// it empties, a separate concept main.rs tracks itself (mpv has no
+/// built-in notion of "the queue we built", only its own playlist).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopMode {
+    Off,
+    One,
+    All,
+}
+
+impl LoopMode {
+    pub fn next(self) -> Self {
+        match self {
+            LoopMode::Off => LoopMode::One,
+            LoopMode::One => LoopMode::All,
+            LoopMode::All => LoopMode::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LoopMode::Off => "off",
+            LoopMode::One => "one",
+            LoopMode::All => "all",
+        }
+    }
 }
 
 pub struct App {
@@ -38,7 +67,7 @@ pub struct App {
     /// track, so implicitly bulk-queuing them would be surprising. `a`
     /// enqueues explicitly instead. See docs/features.md.
     pub queue: Vec<SearchItem>,
-    pub loop_file: bool,
+    pub loop_mode: LoopMode,
     pub shuffle: bool,
     pub speed: f64,
     pub eq_preset: usize,
@@ -55,7 +84,7 @@ impl App {
             selected: 0,
             editing_query: false,
             queue: Vec::new(),
-            loop_file: false,
+            loop_mode: LoopMode::Off,
             shuffle: false,
             speed: 1.0,
             eq_preset: 0,
@@ -164,8 +193,8 @@ impl App {
                 }
             }
             KeyCode::Char('l') => {
-                self.loop_file = !self.loop_file;
-                return Action::SetLoop(self.loop_file);
+                self.loop_mode = self.loop_mode.next();
+                return Action::SetLoop(self.loop_mode);
             }
             KeyCode::Char('s') => {
                 self.toggle_shuffle();
@@ -378,12 +407,14 @@ mod tests {
     }
 
     #[test]
-    fn l_toggles_loop_and_reports_the_new_state() {
+    fn l_cycles_through_off_one_all_and_back_to_off() {
         let mut app = app_with_three_results();
-        assert!(matches!(app.handle_key(KeyCode::Char('l')), Action::SetLoop(true)));
-        assert!(app.loop_file);
-        assert!(matches!(app.handle_key(KeyCode::Char('l')), Action::SetLoop(false)));
-        assert!(!app.loop_file);
+        assert!(matches!(app.handle_key(KeyCode::Char('l')), Action::SetLoop(LoopMode::One)));
+        assert_eq!(app.loop_mode, LoopMode::One);
+        assert!(matches!(app.handle_key(KeyCode::Char('l')), Action::SetLoop(LoopMode::All)));
+        assert_eq!(app.loop_mode, LoopMode::All);
+        assert!(matches!(app.handle_key(KeyCode::Char('l')), Action::SetLoop(LoopMode::Off)));
+        assert_eq!(app.loop_mode, LoopMode::Off);
     }
 
     #[test]
