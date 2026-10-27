@@ -22,6 +22,7 @@ pub mod results_list;
 pub mod scroll;
 pub mod searchbox;
 pub mod settings_menu;
+pub mod shellsong;
 pub mod subtitle_menu;
 #[cfg(test)]
 pub mod testbuf;
