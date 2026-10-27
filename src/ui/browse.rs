@@ -165,6 +165,7 @@ impl BrowseListView<'_> {
             query: &self.view.filter_query,
             editing: self.view.filtering,
             cursor_visible: self.cursor_visible,
+            right_border: true,
         }
         .render(song_rows[1], buf);
 
