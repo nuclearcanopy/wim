@@ -114,8 +114,13 @@ playing audio level visualizer, resuming playback state). read
 - [ ] subtitle styling: delay, language, size, outline, background
       opacity/blur/radius, position — all via mpv `sub-*` properties;
       color stays grayscale per the monochrome rule.
-- [ ] nix packaging: `packages.<system>.wim` derivation
-      (`rustPlatform.buildRustPackage`) in flake.nix.
+- [x] nix packaging: `packages.<system>.wim` (and `.default`) via
+      `rustPlatform.buildRustPackage`. mpv is a runtime subprocess dep
+      (not linked), so the binary is wrapped with `makeWrapper` to put
+      it on `PATH` rather than requiring it installed system-wide.
+      verified with `nix build` + `nix flake check` and manually ran
+      the wrapped binary with an emptied inherited `PATH` to confirm
+      mpv really comes from the wrapper, not the ambient environment.
 - [ ] home-manager module (`nix/home-manager.nix` + flake
       `homeManagerModules.default`): declarative options mirroring
       config.toml 1:1 (navidrome url/username/passwordFile, album_art,
