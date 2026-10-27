@@ -32,6 +32,7 @@ pub enum KeyAction {
     SkipNext,
     SkipBack,
     ToggleStar,
+    DownloadSelected,
     OpenLyrics,
     CycleArtMode,
     ToggleMinimize,
@@ -65,6 +66,7 @@ pub const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::SkipNext,
     KeyAction::SkipBack,
     KeyAction::ToggleStar,
+    KeyAction::DownloadSelected,
     KeyAction::OpenLyrics,
     KeyAction::CycleArtMode,
     KeyAction::ToggleMinimize,
@@ -101,6 +103,7 @@ impl KeyAction {
             KeyAction::SkipNext => "skip_next",
             KeyAction::SkipBack => "skip_back",
             KeyAction::ToggleStar => "toggle_star",
+            KeyAction::DownloadSelected => "download_selected",
             KeyAction::OpenLyrics => "open_lyrics",
             KeyAction::CycleArtMode => "cycle_art_mode",
             KeyAction::ToggleMinimize => "toggle_minimize",
@@ -135,6 +138,7 @@ impl KeyAction {
             KeyAction::SkipNext => "skip to next",
             KeyAction::SkipBack => "back to previous",
             KeyAction::ToggleStar => "star / unstar",
+            KeyAction::DownloadSelected => "download selected (for offline)",
             KeyAction::OpenLyrics => "lyrics",
             KeyAction::CycleArtMode => "cycle album art mode",
             KeyAction::ToggleMinimize => "minimize / maximize player",
@@ -168,6 +172,10 @@ impl KeyAction {
             KeyAction::SkipNext => KeyCode::Char('f'),
             KeyAction::SkipBack => KeyCode::Char('b'),
             KeyAction::ToggleStar => KeyCode::Char('*'),
+            // 'o' ("offline"): every other free-standing letter with a
+            // plausible mnemonic (d/g/s/...) was already taken by an
+            // existing action (see this file's own default_key list).
+            KeyAction::DownloadSelected => KeyCode::Char('o'),
             KeyAction::OpenLyrics => KeyCode::Char('L'),
             KeyAction::CycleArtMode => KeyCode::Char('i'),
             KeyAction::ToggleMinimize => KeyCode::Char('m'),
