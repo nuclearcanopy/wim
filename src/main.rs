@@ -1138,6 +1138,21 @@ enum Focus {
     BottomBar,
 }
 
+/// shift+<direction>'s sway/i3-style transition: which neighboring
+/// pane (if any) lies in that direction from `current`. Every
+/// direction/state combination not listed here has nowhere further
+/// to go that way and is deliberately a no-op (returns `current`
+/// unchanged), not an arbitrary fallback to some other pane.
+fn focus_in_direction(current: Focus, direction: KeyCode) -> Focus {
+    match (current, direction) {
+        (Focus::Sidebar, KeyCode::Right) => Focus::Workspace,
+        (Focus::Workspace, KeyCode::Left) => Focus::Sidebar,
+        (Focus::Sidebar | Focus::Workspace, KeyCode::Down) => Focus::BottomBar,
+        (Focus::BottomBar, KeyCode::Up) => Focus::Sidebar,
+        _ => current,
+    }
+}
+
 /// "flat"/a preset name, or "custom" once any band's been hand-tuned
 /// away from whatever preset was last applied; shared by the player
 /// view and the bottom bar so neither keeps crediting a preset that
@@ -2729,13 +2744,7 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
                     )
                 {
-                    let new_focus = match (focus, key.code) {
-                        (Focus::Sidebar, KeyCode::Right) => Focus::Workspace,
-                        (Focus::Workspace, KeyCode::Left) => Focus::Sidebar,
-                        (Focus::Sidebar | Focus::Workspace, KeyCode::Down) => Focus::BottomBar,
-                        (Focus::BottomBar, KeyCode::Up) => Focus::Sidebar,
-                        (current, _) => current,
-                    };
+                    let new_focus = focus_in_direction(focus, key.code);
                     if new_focus != focus {
                         focus = new_focus;
                         // a brief brightness pulse on whichever
@@ -3395,4 +3404,75 @@ fn main() -> anyhow::Result<()> {
     drop(guard);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::*;
+
+    #[test]
+    fn sidebar_right_reaches_workspace_and_back_left() {
+        assert_eq!(
+            focus_in_direction(Focus::Sidebar, KeyCode::Right),
+            Focus::Workspace
+        );
+        assert_eq!(
+            focus_in_direction(Focus::Workspace, KeyCode::Left),
+            Focus::Sidebar
+        );
+    }
+
+    #[test]
+    fn down_from_sidebar_or_workspace_reaches_the_bottom_bar() {
+        assert_eq!(
+            focus_in_direction(Focus::Sidebar, KeyCode::Down),
+            Focus::BottomBar
+        );
+        assert_eq!(
+            focus_in_direction(Focus::Workspace, KeyCode::Down),
+            Focus::BottomBar
+        );
+    }
+
+    #[test]
+    fn up_from_the_bottom_bar_always_reaches_the_sidebar() {
+        assert_eq!(
+            focus_in_direction(Focus::BottomBar, KeyCode::Up),
+            Focus::Sidebar
+        );
+    }
+
+    #[test]
+    fn directions_with_nowhere_to_go_are_a_no_op() {
+        // nothing is further left than the sidebar, further right
+        // than the workspace, or further down than the bottom bar.
+        assert_eq!(
+            focus_in_direction(Focus::Sidebar, KeyCode::Left),
+            Focus::Sidebar
+        );
+        assert_eq!(
+            focus_in_direction(Focus::Sidebar, KeyCode::Up),
+            Focus::Sidebar
+        );
+        assert_eq!(
+            focus_in_direction(Focus::Workspace, KeyCode::Right),
+            Focus::Workspace
+        );
+        assert_eq!(
+            focus_in_direction(Focus::Workspace, KeyCode::Up),
+            Focus::Workspace
+        );
+        assert_eq!(
+            focus_in_direction(Focus::BottomBar, KeyCode::Down),
+            Focus::BottomBar
+        );
+        assert_eq!(
+            focus_in_direction(Focus::BottomBar, KeyCode::Left),
+            Focus::BottomBar
+        );
+        assert_eq!(
+            focus_in_direction(Focus::BottomBar, KeyCode::Right),
+            Focus::BottomBar
+        );
+    }
 }
