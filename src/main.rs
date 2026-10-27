@@ -4,6 +4,7 @@ mod eq;
 mod library;
 mod lyrics;
 mod mpv;
+mod onboarding;
 mod persistence;
 mod search;
 mod subsonic;
@@ -17,10 +18,12 @@ use crossterm::event::{self, Event, KeyCode};
 use ratatui::layout::{Constraint, Layout};
 
 use app::Action;
+use onboarding::{Onboarding, Step};
 use search::SearchItem;
 use ui::banner::Banner;
 use ui::login::{LoginForm, LoginView};
 use ui::lyrics_view::LyricsView;
+use ui::onboarding::{ControlsView, DoneView, LibraryPathsView, WelcomeView};
 use ui::results_list::{label, ResultsList};
 use ui::status::StatusBar;
 
@@ -111,6 +114,34 @@ fn save_playback_state(player: &mpv::Mpv, now_playing: &Option<SearchItem>, queu
     let _ = persistence::save(&state);
 }
 
+/// Shared by the standalone `n` reopen and the onboarding Navidrome
+/// step, so the two paths can't drift out of sync. Pings before saving
+/// — a typo'd url/password shows an error and keeps the form open
+/// instead of silently saving garbage credentials.
+fn try_connect_navidrome(
+    cfg: &mut config::Config,
+    app: &mut app::App,
+    form: &LoginForm,
+) -> Result<String, String> {
+    let nav = config::NavidromeConfig {
+        url: form.url.clone(),
+        username: form.username.clone(),
+        password: Some(form.password.clone()),
+        password_file: None,
+    };
+    match subsonic::Client::new(&nav).and_then(|c| c.ping().map(|_| c)) {
+        Ok(client) => {
+            cfg.navidrome = Some(nav);
+            let _ = config::save(cfg);
+            if let Ok(playlists) = client.playlists() {
+                app.corpus.add_playlists(playlists);
+            }
+            Ok("navidrome connected and saved".to_string())
+        }
+        Err(e) => Err(format!("login failed: {e} — esc to skip")),
+    }
+}
+
 /// What the results list should say instead of rendering nothing when
 /// there's nothing to show — a blank screen with no explanation is a
 /// dead end, never the right default.
@@ -125,12 +156,16 @@ fn empty_results_message(app: &app::App) -> String {
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    let mut cfg = config::load_or_init()?;
-
-    let tracks = library::scan(&cfg.library_paths);
+fn rebuild_corpus(cfg: &config::Config) -> search::Corpus {
     let mut corpus = search::Corpus::new();
-    corpus.add_local_tracks(tracks);
+    corpus.add_local_tracks(library::scan(&cfg.library_paths));
+    corpus
+}
+
+fn main() -> anyhow::Result<()> {
+    let is_first_run = !config::config_path()?.exists();
+    let mut cfg = config::load_or_init()?;
+    let corpus = rebuild_corpus(&cfg);
 
     let player = mpv::Mpv::spawn()?;
     // per-track normalization is the sensible default; mpv reads the
@@ -147,11 +182,24 @@ fn main() -> anyhow::Result<()> {
     let mut lyrics_lines: Option<Vec<String>> = None;
     let mut lyrics_scroll: usize = 0;
 
-    // shown automatically on first run instead of requiring a
-    // hand-edited config.toml before the app is even usable; `n`
-    // reopens it later too.
-    let mut login_form: Option<LoginForm> = if cfg.navidrome.is_none() { Some(LoginForm::new()) } else { None };
+    // `n` reopens just the navidrome step standalone, later.
+    let mut login_form: Option<LoginForm> = None;
     let mut login_message = String::new();
+
+    // first run gets the full guided sequence (welcome, controls,
+    // navidrome, library paths) instead of a disconnected popup with
+    // no context — a hand-edited config.toml before the app is even
+    // usable once was a bad first impression.
+    let mut onboarding: Option<Onboarding> = if is_first_run {
+        let defaults = if cfg.library_paths.is_empty() {
+            library::default_library_paths()
+        } else {
+            cfg.library_paths.clone()
+        };
+        Some(Onboarding::new(defaults))
+    } else {
+        None
+    };
 
     // resuming across restarts is standard in any serious media player;
     // a missing/corrupt state file just means nothing to resume, not an
@@ -181,6 +229,27 @@ fn main() -> anyhow::Result<()> {
     loop {
         guard.terminal.draw(|f| {
             let area = f.area();
+
+            // onboarding takes the whole screen — no divider/status bar
+            // competing with a guided first-run sequence.
+            if let Some(ob) = &onboarding {
+                match ob.step {
+                    Step::Welcome => f.render_widget(WelcomeView, area),
+                    Step::Controls => f.render_widget(ControlsView, area),
+                    Step::Navidrome => {
+                        f.render_widget(LoginView { form: &ob.login, message: &ob.login_message }, area);
+                    }
+                    Step::LibraryPaths => {
+                        f.render_widget(
+                            LibraryPathsView { paths: &ob.library_paths, input: &ob.path_input },
+                            area,
+                        );
+                    }
+                    Step::Done => f.render_widget(DoneView, area),
+                }
+                return;
+            }
+
             let chunks = Layout::vertical([
                 Constraint::Min(0),
                 Constraint::Length(1),
@@ -263,6 +332,51 @@ fn main() -> anyhow::Result<()> {
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                if let Some(ob) = &mut onboarding {
+                    match ob.step {
+                        Step::Welcome | Step::Controls => ob.advance(),
+                        Step::Navidrome => match key.code {
+                            KeyCode::Esc => ob.advance(),
+                            KeyCode::Char(c) => ob.login.current_mut().push(c),
+                            KeyCode::Backspace => {
+                                ob.login.current_mut().pop();
+                            }
+                            KeyCode::Tab => ob.login.next_field(),
+                            KeyCode::Enter if !ob.login.is_last_field() => ob.login.next_field(),
+                            KeyCode::Enter => {
+                                match try_connect_navidrome(&mut cfg, &mut app, &ob.login) {
+                                    Ok(msg) => {
+                                        status = msg;
+                                        ob.advance();
+                                    }
+                                    Err(msg) => ob.login_message = msg,
+                                }
+                            }
+                            _ => {}
+                        },
+                        Step::LibraryPaths => match key.code {
+                            KeyCode::Char(c) => ob.path_input.push(c),
+                            KeyCode::Backspace => {
+                                ob.path_input.pop();
+                            }
+                            KeyCode::Enter if !ob.path_input.trim().is_empty() => {
+                                ob.library_paths.push(ob.path_input.trim().to_string());
+                                ob.path_input.clear();
+                            }
+                            KeyCode::Enter | KeyCode::Esc => {
+                                cfg.library_paths = ob.library_paths.clone();
+                                let _ = config::save(&cfg);
+                                app.corpus = rebuild_corpus(&cfg);
+                                status = format!("{} local items indexed", app.corpus.len());
+                                ob.advance();
+                            }
+                            _ => {}
+                        },
+                        Step::Done => onboarding = None,
+                    }
+                    continue;
+                }
+
                 if let Some(form) = &mut login_form {
                     match key.code {
                         KeyCode::Esc => {
@@ -275,28 +389,13 @@ fn main() -> anyhow::Result<()> {
                         }
                         KeyCode::Tab => form.next_field(),
                         KeyCode::Enter if !form.is_last_field() => form.next_field(),
-                        KeyCode::Enter => {
-                            let nav = config::NavidromeConfig {
-                                url: form.url.clone(),
-                                username: form.username.clone(),
-                                password: Some(form.password.clone()),
-                                password_file: None,
-                            };
-                            match subsonic::Client::new(&nav).and_then(|c| c.ping().map(|_| c)) {
-                                Ok(client) => {
-                                    cfg.navidrome = Some(nav);
-                                    let _ = config::save(&cfg);
-                                    if let Ok(playlists) = client.playlists() {
-                                        app.corpus.add_playlists(playlists);
-                                    }
-                                    status = "navidrome connected and saved".to_string();
-                                    login_form = None;
-                                }
-                                Err(e) => {
-                                    login_message = format!("login failed: {e} — esc to skip");
-                                }
+                        KeyCode::Enter => match try_connect_navidrome(&mut cfg, &mut app, form) {
+                            Ok(msg) => {
+                                status = msg;
+                                login_form = None;
                             }
-                        }
+                            Err(msg) => login_message = msg,
+                        },
                         _ => {}
                     }
                     continue;
