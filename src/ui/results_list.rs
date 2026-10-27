@@ -6,31 +6,26 @@ use crate::search::SearchItem;
 use crate::theme::{shade, BRIGHT, DIM};
 use crate::ui::textfit::truncate_with_ellipsis;
 
-/// One glyph per kind. Deliberately plain geometric/text-presentation
-/// unicode symbols, not the literal emoji pictographs (🌐📁💿🎵🎬) the
-/// spec described; those render as fixed-color bitmaps on most
-/// systems regardless of the terminal's foreground color, which would
-/// silently break the strict-monochrome rule. These stay plain glyphs
-/// in whatever shade we set.
-pub(crate) fn kind_icon(item: &SearchItem) -> char {
+/// Plain ASCII, not unicode pictographs: even nominally "geometric,
+/// not emoji" symbols (e.g. the bullseye tried earlier for albums)
+/// can still be flagged emoji-presentation in some fonts/terminals, or
+/// render at ambiguous width and throw off alignment. A letter in
+/// brackets can't do either.
+pub(crate) fn kind_code(item: &SearchItem) -> char {
     match item {
-        SearchItem::LocalMusic { .. } | SearchItem::Song { .. } => '♪',
-        SearchItem::LocalVideo { .. } => '▶',
-        SearchItem::Artist { .. } => '◆',
-        // outer rim + inner label circle reads as a vinyl record, not
-        // the eye/target look of a plain dotted circle.
-        SearchItem::Album { .. } => '◎',
-        SearchItem::Playlist { .. } => '≡',
+        SearchItem::LocalMusic { .. } | SearchItem::Song { .. } => 's',
+        SearchItem::LocalVideo { .. } => 'v',
+        SearchItem::Artist { .. } => 'a',
+        SearchItem::Album { .. } => 'l',
+        SearchItem::Playlist { .. } => 'p',
     }
 }
 
-/// ○ for remote (navidrome) items, ● for local files: just two plain
-/// circles, hollow vs. filled, not a literal globe/folder glyph, for
-/// the same monochrome-safety reason as `kind_icon`.
-pub(crate) fn source_icon(item: &SearchItem) -> char {
+/// 'n' for navidrome (remote), 'f' for file (local).
+pub(crate) fn source_code(item: &SearchItem) -> char {
     match item {
-        SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => '●',
-        SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Song { .. } | SearchItem::Playlist { .. } => '○',
+        SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => 'f',
+        SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Song { .. } | SearchItem::Playlist { .. } => 'n',
     }
 }
 
@@ -102,7 +97,7 @@ impl Widget for ResultsList<'_> {
             let fg = if is_selected { shade(BRIGHT) } else { shade(DIM) };
             let marker = if is_selected { "> " } else { "  " };
             let full =
-                format!("{marker}{}{} {}", source_icon(item), kind_icon(item), label(item));
+                format!("{marker}[{}{}] {}", source_code(item), kind_code(item), label(item));
             let text = truncate_with_ellipsis(&full, area.width as usize);
 
             for (col, ch) in text.chars().enumerate() {
