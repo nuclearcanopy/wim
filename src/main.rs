@@ -1961,6 +1961,7 @@ fn main() -> anyhow::Result<()> {
                         crossfade_on: crossfade_enabled,
                         previous: previous_label.as_deref(),
                         next: next_label.as_deref(),
+                        keymap: &keymap,
                     },
                     main_content,
                 );
