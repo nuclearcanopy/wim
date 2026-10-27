@@ -60,6 +60,16 @@ at it — don't mark it done on build+test passing alone.
       (`src/ui/textfit.rs`) so typed text doesn't silently run off a
       narrow terminal. contrast hierarchy fixed (dividers much dimmer
       than text, not the same brightness).
+- [x] real navidrome catalog indexing + multi-profile management:
+      login now fetches the actual artist/album catalog
+      (getArtists/getAlbumList2, checked against Feishin's real
+      implementation first) instead of only playlists. config schema
+      is `navidrome_servers: Vec<..>` — multiple servers, all merged
+      into one corpus, no "active server" concept. 'n' opens a profile
+      manager (list/add/remove), replacing a single always-blank login
+      form that looked destructive even though it wasn't. banner swap
+      to larry3d (non-isometric, no diagonal letter drift), bracketed
+      paste support, url ghost-prefix input all landed alongside this.
 
 ## layout overhaul + artist/album browsing (explicit spec, do these in order — each depends on the one before)
 
