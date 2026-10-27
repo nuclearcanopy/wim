@@ -356,6 +356,52 @@ mod tests {
         app
     }
 
+    /// Same corpus and query as `app_with_three_results`, but left
+    /// mid-typing (`editing_query` still true), which is the state the
+    /// enter/esc tests below are actually about.
+    fn app_still_typing() -> App {
+        let mut app = app_with_three_results();
+        let keymap = Keymap::default();
+        let _ = app.handle_key(KeyCode::Char('/'), &keymap);
+        assert!(app.editing_query);
+        app
+    }
+
+    #[test]
+    fn enter_while_typing_plays_the_highlighted_result() {
+        // the "i search bladee, press enter, nothing happens" bug: this
+        // action exists, it just used to get discarded at the call site.
+        let mut app = app_still_typing();
+        let keymap = Keymap::default();
+        match app.handle_key(KeyCode::Enter, &keymap) {
+            Action::Play(SearchItem::LocalMusic { title, .. }) => {
+                assert_eq!(title, "matchable track 0");
+            }
+            _ => panic!("expected Action::Play"),
+        }
+        assert!(!app.editing_query, "enter also commits the text box");
+    }
+
+    #[test]
+    fn esc_while_typing_cancels_without_touching_the_queue() {
+        let mut app = app_with_three_results();
+        let keymap = Keymap::default();
+        let _ = app.handle_key(KeyCode::Char('a'), &keymap);
+        assert_eq!(app.queue.len(), 1);
+
+        let _ = app.handle_key(KeyCode::Char('/'), &keymap);
+        assert!(matches!(
+            app.handle_key(KeyCode::Esc, &keymap),
+            Action::None
+        ));
+        assert!(!app.editing_query);
+        assert_eq!(
+            app.queue.len(),
+            1,
+            "esc cancels; only enter replaces the playlist, so only enter clears the queue"
+        );
+    }
+
     #[test]
     fn typing_a_query_populates_and_resets_selection() {
         let app = app_with_three_results();
