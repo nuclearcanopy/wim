@@ -62,6 +62,12 @@ pub struct Playlist {
     pub name: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AlbumDetails {
+    pub year: Option<u32>,
+    pub songs: Vec<Song>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SearchResult {
     pub artists: Vec<Artist>,
@@ -186,16 +192,23 @@ impl Client {
         })
     }
 
-    /// Every track on an album, in album order; used to expand a
-    /// playable album into its actual tracks (playing/queuing an album
-    /// means playing every song on it, not the album entity itself).
-    pub fn get_album_songs(&self, album_id: &str) -> anyhow::Result<Vec<Song>> {
+    /// Every track on an album, in album order, plus the album's own
+    /// release year (shown in the album view; `getAlbumList2` doesn't
+    /// carry it, only `getAlbum` does); used both to expand a playable
+    /// album into its actual tracks and to populate the track-listing
+    /// view when you open one.
+    pub fn get_album(&self, album_id: &str) -> anyhow::Result<AlbumDetails> {
         let v = self.get("getAlbum", &[("id", album_id)])?;
-        Ok(parse_song_array(v.get("album").and_then(|a| a.get("song"))))
+        let album = v.get("album");
+        Ok(AlbumDetails {
+            year: album.and_then(|a| a.get("year")).and_then(|y| y.as_u64()).map(|y| y as u32),
+            songs: parse_song_array(album.and_then(|a| a.get("song"))),
+        })
     }
 
     /// Same idea for playlists: `getPlaylist`'s tracks live under
     /// `entry`, not `song`, but the per-track shape is identical.
+    /// Playlists have no release year, so no metadata wrapper needed.
     pub fn get_playlist_songs(&self, playlist_id: &str) -> anyhow::Result<Vec<Song>> {
         let v = self.get("getPlaylist", &[("id", playlist_id)])?;
         Ok(parse_song_array(v.get("playlist").and_then(|p| p.get("entry"))))
