@@ -18,6 +18,7 @@ mod opensubtitles;
 mod persistence;
 mod playqueue;
 mod search;
+mod shellsong;
 mod subsonic;
 mod term;
 mod theme;
