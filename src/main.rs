@@ -949,34 +949,17 @@ fn main() -> anyhow::Result<()> {
             let bottom_selected =
                 panels.resize_mode && panels.resize_selected == ResizePanel::BottomBar;
 
-            // shared with the banner's own render below, so the
-            // junction's glow and the rule it's joining are always
-            // computed from the exact same instant, never drifting
-            // out of sync by even a frame.
-            let elapsed_secs = start.elapsed().as_secs_f32();
-
-            // the banner and the browse view's own header both draw
-            // internal horizontal rules right at main_content's left
-            // edge; the player/lyrics don't. same join as the bottom
+            // the browse view's own header draws an internal
+            // horizontal rule right at main_content's left edge; the
+            // banner (now a LazyVim-style logo+menu, no framing rules)
+            // and the player/lyrics don't. same join as the bottom
             // bar: whichever one's actually showing needs its rule row
             // marked, or the vertical divider crosses it with a gap.
-            let junction_rows = if show_full_player {
-                Vec::new()
-            } else if browse_view.is_some() {
+            let junction_rows = if browse_view.is_some() {
                 // draw_header's rule sits one row below where it's
                 // asked to start, which is always main_content.y here;
-                // static color matching draw_header's own rule_color,
-                // this one doesn't animate.
+                // static color matching draw_header's own rule_color.
                 vec![(main_content.y + 1, shade(NEAR_BLACK))]
-            } else if lyrics_lines.is_none() {
-                // the banner's rules pulse; the junction glows in the
-                // same phase instead of sitting there as a dead pixel.
-                let pulse = ui::banner::pulse_level(elapsed_secs);
-                let glow = shade(ui::banner::junction_level(pulse));
-                ui::banner::rule_rows(main_content)
-                    .into_iter()
-                    .map(|y| (y, glow))
-                    .collect()
             } else {
                 Vec::new()
             };
@@ -1106,6 +1089,7 @@ fn main() -> anyhow::Result<()> {
                     Banner {
                         phase,
                         elapsed_secs,
+                        local_items: app.corpus.len(),
                     },
                     main_content,
                 );
