@@ -6,6 +6,7 @@ pub mod header;
 pub mod login;
 pub mod lyrics_view;
 pub mod nav_manager;
+pub mod notify;
 pub mod nowplaying;
 pub mod onboarding;
 pub mod results_list;
