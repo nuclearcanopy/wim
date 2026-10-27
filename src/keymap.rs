@@ -54,6 +54,7 @@ pub enum KeyAction {
     ToggleResizeMode,
     OpenNavManager,
     OpenStarredView,
+    OpenQueueView,
     OpenSubtitleMenu,
     OpenSettingsMenu,
     OpenHelp,
@@ -86,6 +87,7 @@ pub const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ToggleResizeMode,
     KeyAction::OpenNavManager,
     KeyAction::OpenStarredView,
+    KeyAction::OpenQueueView,
     KeyAction::OpenSubtitleMenu,
     KeyAction::OpenSettingsMenu,
     KeyAction::OpenHelp,
@@ -121,6 +123,7 @@ impl KeyAction {
             KeyAction::ToggleResizeMode => "toggle_resize_mode",
             KeyAction::OpenNavManager => "open_navidrome_profiles",
             KeyAction::OpenStarredView => "open_starred_songs",
+            KeyAction::OpenQueueView => "open_queue_view",
             KeyAction::OpenSubtitleMenu => "open_subtitle_menu",
             KeyAction::OpenSettingsMenu => "open_settings_menu",
             KeyAction::OpenHelp => "open_help",
@@ -154,6 +157,7 @@ impl KeyAction {
             KeyAction::ToggleResizeMode => "resize mode",
             KeyAction::OpenNavManager => "navidrome profiles",
             KeyAction::OpenStarredView => "starred songs",
+            KeyAction::OpenQueueView => "the queue",
             KeyAction::OpenSubtitleMenu => "subtitle settings menu",
             KeyAction::OpenSettingsMenu => "settings menu",
             KeyAction::OpenHelp => "help",
@@ -189,6 +193,10 @@ impl KeyAction {
             KeyAction::ToggleResizeMode => KeyCode::Char('r'),
             KeyAction::OpenNavManager => KeyCode::Char('n'),
             KeyAction::OpenStarredView => KeyCode::Char('S'),
+            // 'Q' for queue; the shift-letter convention S/L/I/K
+            // already uses, and esc closes it so a mis-shift to 'q'
+            // is the only risk, same as every other one of those.
+            KeyAction::OpenQueueView => KeyCode::Char('Q'),
             KeyAction::OpenSubtitleMenu => KeyCode::Char('t'),
             KeyAction::OpenSettingsMenu => KeyCode::Char('u'),
             KeyAction::OpenHelp => KeyCode::Char('?'),
