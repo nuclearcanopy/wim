@@ -55,17 +55,24 @@ pub fn layout(area: Rect, has_art: bool, has_bio: bool) -> (Option<Rect>, Rect) 
     let bio_height = if has_bio { BIO_HEIGHT } else { 0 };
     let y = area.y + HEADER_HEIGHT + bio_height;
     let body_height = (area.y + area.height).saturating_sub(y);
-    // roughly square given ~2:1 terminal cell aspect.
+    // roughly square given ~2:1 terminal cell aspect: width wants to
+    // be ~2x height in cells. Capping width against `area.width / 3`
+    // without also shrinking height the same way left the art rect
+    // itself non-square (full body_height, clipped width), which is
+    // what actually stretched the art tall regardless of what
+    // AsciiArt's own sampling did; the rect handed to it has to be
+    // square first.
     let art_width = if has_art && body_height > 0 {
         (body_height * 2).min(area.width / 3).max(1)
     } else {
         0
     };
+    let art_height = (art_width / 2).max(1).min(body_height);
     let art_rect = (art_width > 0).then_some(Rect {
         x: area.x,
         y,
         width: art_width,
-        height: body_height,
+        height: art_height,
     });
     let list_x = area.x + art_width + if art_width > 0 { 1 } else { 0 };
     let list_width = (area.x + area.width).saturating_sub(list_x);
