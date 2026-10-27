@@ -8,8 +8,9 @@
 //! built-in `superequalizer` (which exposes a fixed 18-band layout that
 //! doesn't line up with the 10 bands asked for here).
 
-pub const BAND_HZ: [f64; 10] =
-    [31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0];
+pub const BAND_HZ: [f64; 10] = [
+    31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+];
 
 pub struct Preset {
     pub name: &'static str,
@@ -19,12 +20,30 @@ pub struct Preset {
 }
 
 pub const PRESETS: &[Preset] = &[
-    Preset { name: "flat", gains: [0.0; 10] },
-    Preset { name: "bass boost", gains: [6.0, 5.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] },
-    Preset { name: "vocal boost", gains: [-1.0, -1.0, 0.0, 1.0, 2.0, 3.0, 2.0, 1.0, 0.0, -1.0] },
-    Preset { name: "treble boost", gains: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 4.0, 5.0] },
-    Preset { name: "rock", gains: [4.0, 3.0, 1.0, 0.0, -1.0, -1.0, 0.0, 2.0, 3.0, 4.0] },
-    Preset { name: "classical", gains: [3.0, 2.0, 1.0, 0.0, 0.0, -1.0, 0.0, 1.0, 2.0, 3.0] },
+    Preset {
+        name: "flat",
+        gains: [0.0; 10],
+    },
+    Preset {
+        name: "bass boost",
+        gains: [6.0, 5.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    },
+    Preset {
+        name: "vocal boost",
+        gains: [-1.0, -1.0, 0.0, 1.0, 2.0, 3.0, 2.0, 1.0, 0.0, -1.0],
+    },
+    Preset {
+        name: "treble boost",
+        gains: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 4.0, 5.0],
+    },
+    Preset {
+        name: "rock",
+        gains: [4.0, 3.0, 1.0, 0.0, -1.0, -1.0, 0.0, 2.0, 3.0, 4.0],
+    },
+    Preset {
+        name: "classical",
+        gains: [3.0, 2.0, 1.0, 0.0, 0.0, -1.0, 0.0, 1.0, 2.0, 3.0],
+    },
 ];
 
 /// Builds an mpv `af` filter-graph string applying `gains` (dB per band,

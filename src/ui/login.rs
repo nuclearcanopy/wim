@@ -18,7 +18,12 @@ pub struct LoginForm {
 
 impl LoginForm {
     pub fn new() -> Self {
-        LoginForm { url: String::new(), username: String::new(), password: String::new(), field: 0 }
+        LoginForm {
+            url: String::new(),
+            username: String::new(),
+            password: String::new(),
+            field: 0,
+        }
     }
 
     pub fn current_mut(&mut self) -> &mut String {
@@ -65,8 +70,11 @@ pub struct LoginView<'a> {
 impl Widget for LoginView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let masked_password: String = "*".repeat(self.form.password.chars().count());
-        let rows: [(&str, &str); 3] =
-            [("server", &self.form.url), ("username", &self.form.username), ("password", &masked_password)];
+        let rows: [(&str, &str); 3] = [
+            ("server", &self.form.url),
+            ("username", &self.form.username),
+            ("password", &masked_password),
+        ];
 
         let width = area.width as usize;
         let mut y = draw_header(
@@ -84,7 +92,11 @@ impl Widget for LoginView<'_> {
             let active = i == self.form.field;
             let marker = if active { "> " } else { "  " };
             let prefix = format!("{marker}{label}: ");
-            let active_color = if active { shade(NEAR_WHITE) } else { shade(DIM) };
+            let active_color = if active {
+                shade(NEAR_WHITE)
+            } else {
+                shade(DIM)
+            };
 
             if i == 0 {
                 // url field: "https://" renders as a ghost prefix baked
@@ -99,7 +111,14 @@ impl Widget for LoginView<'_> {
                 let fitted_value = tail_fit(value, value_width);
 
                 draw_line(buf, area, y, &prefix, active_color);
-                draw_line_at(buf, area, prefix.chars().count() as u16, y, ghost, shade(DIM));
+                draw_line_at(
+                    buf,
+                    area,
+                    prefix.chars().count() as u16,
+                    y,
+                    ghost,
+                    shade(DIM),
+                );
                 draw_line_at(
                     buf,
                     area,
@@ -124,9 +143,21 @@ impl Widget for LoginView<'_> {
         // emulator binds (often ctrl+shift+v, sometimes middle-click).
         // bracketed paste is enabled on our end either way, so if your
         // terminal supports it, it'll just work.
-        draw_line(buf, area, y, "paste with your terminal's shortcut (often ctrl+shift+v)", shade(DIM));
+        draw_line(
+            buf,
+            area,
+            y,
+            "paste with your terminal's shortcut (often ctrl+shift+v)",
+            shade(DIM),
+        );
         y += 1;
-        draw_line(buf, area, y, &truncate_with_ellipsis(self.message, width), shade(DIM));
+        draw_line(
+            buf,
+            area,
+            y,
+            &truncate_with_ellipsis(self.message, width),
+            shade(DIM),
+        );
     }
 }
 
@@ -134,7 +165,14 @@ fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::s
     draw_line_at(buf, area, 0, y, text, color);
 }
 
-fn draw_line_at(buf: &mut Buffer, area: Rect, x_offset: u16, y: u16, text: &str, color: ratatui::style::Color) {
+fn draw_line_at(
+    buf: &mut Buffer,
+    area: Rect,
+    x_offset: u16,
+    y: u16,
+    text: &str,
+    color: ratatui::style::Color,
+) {
     if y >= area.y + area.height {
         return;
     }

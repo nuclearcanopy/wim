@@ -58,7 +58,13 @@ impl Widget for SearchBox<'_> {
 
         if self.editing && self.cursor_visible {
             let cursor_col = text.chars().count().min(inner_width.saturating_sub(1));
-            put(buf, area.x + 1 + cursor_col as u16, area.y + 1, '█', shade(NEAR_WHITE));
+            put(
+                buf,
+                area.x + 1 + cursor_col as u16,
+                area.y + 1,
+                '█',
+                shade(NEAR_WHITE),
+            );
         }
     }
 }

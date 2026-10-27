@@ -30,32 +30,83 @@ impl Widget for PlayerView<'_> {
         let mid_y = area.y + area.height / 2;
 
         if let Some(prev) = self.previous {
-            draw_centered(buf, area, mid_y.saturating_sub(4), &format!("⏮ {prev}"), shade(DIM));
+            draw_centered(
+                buf,
+                area,
+                mid_y.saturating_sub(4),
+                &format!("⏮ {prev}"),
+                shade(DIM),
+            );
         }
 
-        let state_icon = if self.paused { "⏸" } else { "▶" };
-        draw_centered(buf, area, mid_y.saturating_sub(2), state_icon, shade(DIM));
-        draw_centered(buf, area, mid_y.saturating_sub(1), self.title, shade(NEAR_WHITE));
+        draw_centered(
+            buf,
+            area,
+            mid_y.saturating_sub(1),
+            self.title,
+            shade(NEAR_WHITE),
+        );
 
         let bar_width = (area.width as usize).saturating_sub(14).min(40);
         let progress = bar(self.elapsed_secs, self.duration_secs, bar_width);
-        let time_line = format!("{} {progress} {}", fmt_time(self.elapsed_secs), fmt_time(self.duration_secs));
+        let time_line = format!(
+            "{} {progress} {}",
+            fmt_time(self.elapsed_secs),
+            fmt_time(self.duration_secs)
+        );
         draw_centered(buf, area, mid_y + 1, &time_line, shade(BRIGHT));
 
+        // each control's keybind sits right above its icon rather
+        // than crammed onto the same line, so it reads as a labeled
+        // button rather than a word salad.
+        let play_icon = if self.paused { "⏸" } else { "▶" };
+        draw_transport_row(
+            buf,
+            area,
+            mid_y + 3,
+            &[("b", "⏮"), ("space", play_icon), ("f", "⏭"), ("l", "↻")],
+            shade(DIM),
+        );
+
         let state_line = format!(
-            "↻ {}  shuffle: {}  speed: {:.2}x  eq: {}",
+            "{}  shuffle: {}  speed: {:.2}x  eq: {}",
             self.loop_label,
             if self.shuffle_on { "on" } else { "off" },
             self.speed,
             self.eq_preset,
         );
-        draw_centered(buf, area, mid_y + 3, &state_line, shade(DIM));
+        draw_centered(buf, area, mid_y + 6, &state_line, shade(DIM));
 
         if let Some(next) = self.next {
-            draw_centered(buf, area, mid_y + 5, &format!("{next} ⏭"), shade(DIM));
+            draw_centered(buf, area, mid_y + 8, &format!("{next} ⏭"), shade(DIM));
         }
 
-        draw_centered(buf, area, mid_y + 7, "m: minimize", shade(DIM));
+        draw_centered(buf, area, mid_y + 10, "m: minimize", shade(DIM));
+    }
+}
+
+/// Two rows (keybind label, then its icon), each pair centered in its
+/// own fixed-width column so a one-char icon and a five-char label
+/// ("space") still line up over each other.
+fn draw_transport_row(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    items: &[(&str, &str)],
+    color: ratatui::style::Color,
+) {
+    const COL_WIDTH: u16 = 8;
+    let total_width = COL_WIDTH * items.len() as u16;
+    let start_x = area.x + area.width.saturating_sub(total_width) / 2;
+    for (i, (label, icon)) in items.iter().enumerate() {
+        let col = Rect {
+            x: start_x + i as u16 * COL_WIDTH,
+            y,
+            width: COL_WIDTH,
+            height: 2,
+        };
+        draw_centered(buf, col, col.y, label, color);
+        draw_centered(buf, col, col.y + 1, icon, color);
     }
 }
 

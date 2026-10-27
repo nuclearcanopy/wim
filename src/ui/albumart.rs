@@ -28,34 +28,63 @@ impl Widget for AsciiArt<'_> {
             return;
         }
 
-        for row in 0..area.height {
-            let sy0 = (row as u32 * ih) / area.height as u32;
-            let sy1 = (((row + 1) as u32 * ih) / area.height as u32).clamp(sy0 + 1, ih);
-            for col in 0..area.width {
-                let sx0 = (col as u32 * iw) / area.width as u32;
-                let sx1 = (((col + 1) as u32 * iw) / area.width as u32).clamp(sx0 + 1, iw);
+        // terminal cells are roughly twice as tall as wide; sampling
+        // one cell as a single square pixel leaves the image looking
+        // vertically squashed. sample two vertical sub-rows per cell
+        // instead and render them as an upper half block (U+2580):
+        // foreground paints the top sub-row, background the bottom,
+        // doubling the effective vertical resolution to match.
+        let out_w = area.width as u32;
+        let out_h = area.height as u32 * 2;
 
-                let mut sum = 0u64;
-                let mut count = 0u64;
-                for y in sy0..sy1 {
-                    for x in sx0..sx1 {
-                        let p = img.get_pixel(x, y);
-                        // standard luma weights; alpha isn't factored
-                        // in since cover art is opaque in practice.
-                        let luma = 0.2126 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.0722 * p[2] as f64;
-                        sum += luma as u64;
-                        count += 1;
-                    }
-                }
-                let level = if count > 0 { (sum as f32 / count as f32) / 255.0 } else { 0.0 };
+        for row in 0..area.height {
+            for col in 0..area.width {
+                let top = sample_luma(img, iw, ih, out_w, out_h, col as u32, row as u32 * 2);
+                let bottom = sample_luma(img, iw, ih, out_w, out_h, col as u32, row as u32 * 2 + 1);
 
                 let x = area.x + col;
                 let y = area.y + row;
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_char('█');
-                    cell.set_fg(shade(level));
+                    cell.set_char('▀');
+                    cell.set_fg(shade(top));
+                    cell.set_bg(shade(bottom));
                 }
             }
         }
+    }
+}
+
+/// Average luma (0..1) of the source-image region corresponding to
+/// one cell of an `out_w` x `out_h` virtual sampling grid.
+fn sample_luma(
+    img: &image::DynamicImage,
+    iw: u32,
+    ih: u32,
+    out_w: u32,
+    out_h: u32,
+    col: u32,
+    row: u32,
+) -> f32 {
+    let sx0 = (col * iw) / out_w;
+    let sx1 = (((col + 1) * iw) / out_w).clamp(sx0 + 1, iw);
+    let sy0 = (row * ih) / out_h;
+    let sy1 = (((row + 1) * ih) / out_h).clamp(sy0 + 1, ih);
+
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    for y in sy0..sy1 {
+        for x in sx0..sx1 {
+            let p = img.get_pixel(x, y);
+            // standard luma weights; alpha isn't factored in since
+            // cover art is opaque in practice.
+            let luma = 0.2126 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.0722 * p[2] as f64;
+            sum += luma as u64;
+            count += 1;
+        }
+    }
+    if count > 0 {
+        (sum as f32 / count as f32) / 255.0
+    } else {
+        0.0
     }
 }

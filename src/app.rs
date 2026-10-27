@@ -304,7 +304,11 @@ mod tests {
         app.handle_key(KeyCode::Char('/'));
         app.paste_into_query(" more");
         assert_eq!(app.query, format!("{before} more"));
-        assert_eq!(app.results.len(), 3, "pasted text must refresh results same as typing");
+        assert_eq!(
+            app.results.len(),
+            3,
+            "pasted text must refresh results same as typing"
+        );
     }
 
     #[test]
@@ -313,7 +317,10 @@ mod tests {
         let before = app.query.clone();
         assert!(!app.editing_query);
         app.paste_into_query("should not append");
-        assert_eq!(app.query, before, "paste while not editing must not change the query");
+        assert_eq!(
+            app.query, before,
+            "paste while not editing must not change the query"
+        );
     }
 
     #[test]
@@ -323,7 +330,10 @@ mod tests {
         assert_eq!(app.selected, 1);
         app.handle_key(KeyCode::Char('j'));
         app.handle_key(KeyCode::Char('j'));
-        assert_eq!(app.selected, 2, "clamps at the last result, doesn't wrap/overflow");
+        assert_eq!(
+            app.selected, 2,
+            "clamps at the last result, doesn't wrap/overflow"
+        );
         app.handle_key(KeyCode::Char('k'));
         assert_eq!(app.selected, 1);
     }
@@ -344,7 +354,10 @@ mod tests {
         app.handle_key(KeyCode::Char('G')); // selected = 2
         app.handle_key(KeyCode::Char('g'));
         app.handle_key(KeyCode::Char('j')); // cancels pending g, moves down instead
-        assert_eq!(app.selected, 2, "already at bottom; j is clamped, not a stray top-jump");
+        assert_eq!(
+            app.selected, 2,
+            "already at bottom; j is clamped, not a stray top-jump"
+        );
     }
 
     #[test]
@@ -400,27 +413,42 @@ mod tests {
         app.handle_key(KeyCode::Char('a')); // queues track 1
 
         let first = app.pop_queue();
-        assert!(matches!(first, Some(SearchItem::LocalMusic { ref title, .. }) if title == "matchable track 0"));
+        assert!(
+            matches!(first, Some(SearchItem::LocalMusic { ref title, .. }) if title == "matchable track 0")
+        );
         let second = app.pop_queue();
-        assert!(matches!(second, Some(SearchItem::LocalMusic { ref title, .. }) if title == "matchable track 1"));
+        assert!(
+            matches!(second, Some(SearchItem::LocalMusic { ref title, .. }) if title == "matchable track 1")
+        );
         assert!(app.pop_queue().is_none());
     }
 
     #[test]
     fn l_cycles_through_off_one_all_and_back_to_off() {
         let mut app = app_with_three_results();
-        assert!(matches!(app.handle_key(KeyCode::Char('l')), Action::SetLoop(LoopMode::One)));
+        assert!(matches!(
+            app.handle_key(KeyCode::Char('l')),
+            Action::SetLoop(LoopMode::One)
+        ));
         assert_eq!(app.loop_mode, LoopMode::One);
-        assert!(matches!(app.handle_key(KeyCode::Char('l')), Action::SetLoop(LoopMode::All)));
+        assert!(matches!(
+            app.handle_key(KeyCode::Char('l')),
+            Action::SetLoop(LoopMode::All)
+        ));
         assert_eq!(app.loop_mode, LoopMode::All);
-        assert!(matches!(app.handle_key(KeyCode::Char('l')), Action::SetLoop(LoopMode::Off)));
+        assert!(matches!(
+            app.handle_key(KeyCode::Char('l')),
+            Action::SetLoop(LoopMode::Off)
+        ));
         assert_eq!(app.loop_mode, LoopMode::Off);
     }
 
     #[test]
     fn speed_adjusts_and_clamps_at_bounds() {
         let mut app = app_with_three_results();
-        assert!(matches!(app.handle_key(KeyCode::Char(']')), Action::SetSpeed(s) if (s - 1.1).abs() < 1e-9));
+        assert!(
+            matches!(app.handle_key(KeyCode::Char(']')), Action::SetSpeed(s) if (s - 1.1).abs() < 1e-9)
+        );
         for _ in 0..50 {
             app.handle_key(KeyCode::Char(']'));
         }
@@ -443,7 +471,11 @@ mod tests {
 
         app.handle_key(KeyCode::Char('s')); // shuffle on, reshuffles in place
         assert!(app.shuffle);
-        assert_eq!(app.queue.len(), 3, "shuffle must not drop or duplicate items");
+        assert_eq!(
+            app.queue.len(),
+            3,
+            "shuffle must not drop or duplicate items"
+        );
 
         let mut titles: Vec<String> = app
             .queue
@@ -454,7 +486,14 @@ mod tests {
             })
             .collect();
         titles.sort();
-        assert_eq!(titles, vec!["matchable track 0", "matchable track 1", "matchable track 2"]);
+        assert_eq!(
+            titles,
+            vec![
+                "matchable track 0",
+                "matchable track 1",
+                "matchable track 2"
+            ]
+        );
     }
 
     #[test]

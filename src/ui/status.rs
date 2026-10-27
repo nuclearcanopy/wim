@@ -28,7 +28,11 @@ impl Widget for StatusBar<'_> {
         } else {
             truncate_with_ellipsis(self.message, width)
         };
-        let color = if self.editing_query { shade(NEAR_WHITE) } else { shade(DIM) };
+        let color = if self.editing_query {
+            shade(NEAR_WHITE)
+        } else {
+            shade(DIM)
+        };
 
         for (col, ch) in text.chars().enumerate() {
             let x = area.x + col as u16;

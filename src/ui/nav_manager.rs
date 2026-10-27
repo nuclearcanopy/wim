@@ -53,7 +53,11 @@ impl Widget for NavManagerListView<'_> {
                 area,
                 y,
                 &truncate_with_ellipsis(&line, width),
-                if active { shade(NEAR_WHITE) } else { shade(DIM) },
+                if active {
+                    shade(NEAR_WHITE)
+                } else {
+                    shade(DIM)
+                },
             );
             y += 1;
         }
@@ -65,11 +69,21 @@ impl Widget for NavManagerListView<'_> {
             area,
             y,
             &format!("{marker}[ add new profile ]"),
-            if add_active { shade(NEAR_WHITE) } else { shade(DIM) },
+            if add_active {
+                shade(NEAR_WHITE)
+            } else {
+                shade(DIM)
+            },
         );
         y += 2;
 
-        draw_line(buf, area, y, &truncate_with_ellipsis(self.message, width), shade(DIM));
+        draw_line(
+            buf,
+            area,
+            y,
+            &truncate_with_ellipsis(self.message, width),
+            shade(DIM),
+        );
     }
 }
 

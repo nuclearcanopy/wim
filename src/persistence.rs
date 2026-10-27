@@ -61,9 +61,12 @@ pub fn item_from_path(path_str: &str) -> Option<SearchItem> {
     let ext = path.extension()?.to_str()?;
     let title = library::filename_title(&path);
     match library::classify(ext)? {
-        MediaKind::Music => {
-            Some(SearchItem::LocalMusic { path, title, artist: None, album: None })
-        }
+        MediaKind::Music => Some(SearchItem::LocalMusic {
+            path,
+            title,
+            artist: None,
+            album: None,
+        }),
         MediaKind::Video => Some(SearchItem::LocalVideo { path, title }),
     }
 }
@@ -80,7 +83,10 @@ mod tests {
 
     #[test]
     fn item_from_path_rebuilds_a_minimal_local_music_item() {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!("wim-test-{nanos}.mp3"));
         fs::write(&path, "not real audio, just needs to exist").unwrap();
 

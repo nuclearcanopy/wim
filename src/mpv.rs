@@ -82,7 +82,9 @@ impl Mpv {
                 if let Some(id) = v.get("request_id").and_then(Value::as_u64) {
                     if let Some(p) = reader_pending.lock().unwrap().remove(&id) {
                         let result = match v.get("error").and_then(Value::as_str) {
-                            Some("success") | None => Ok(v.get("data").cloned().unwrap_or(Value::Null)),
+                            Some("success") | None => {
+                                Ok(v.get("data").cloned().unwrap_or(Value::Null))
+                            }
                             Some(err) => Err(err.to_string()),
                         };
                         let _ = p.reply_tx.send(result);
@@ -129,7 +131,10 @@ impl Mpv {
     pub fn command(&self, args: &[Value]) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap().insert(id, Pending { reply_tx: tx });
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(id, Pending { reply_tx: tx });
 
         let payload = json!({ "command": args, "request_id": id });
         let mut line = serde_json::to_vec(&payload)?;
@@ -208,6 +213,15 @@ impl Mpv {
     pub fn toggle_pause(&self) -> Result<()> {
         let paused = self.get_property("pause")?.as_bool().unwrap_or(false);
         self.set_property("pause", json!(!paused))
+    }
+
+    /// `"weak"`: a no-op (not an error) if there's nothing further
+    /// along mpv's own playlist, since it already holds every queued
+    /// track (see `playlist_append`) and knows better than we do
+    /// whether there's anywhere to skip to.
+    pub fn playlist_next(&self) -> Result<()> {
+        self.command(&[json!("playlist-next"), json!("weak")])
+            .map(|_| ())
     }
 
     pub fn set_volume(&self, vol: f64) -> Result<()> {

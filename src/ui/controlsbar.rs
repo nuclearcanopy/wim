@@ -47,7 +47,14 @@ impl Widget for ControlsBar<'_> {
     }
 }
 
-fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, width: usize, color: ratatui::style::Color) {
+fn draw_line(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    text: &str,
+    width: usize,
+    color: ratatui::style::Color,
+) {
     if y >= area.y + area.height {
         return;
     }
