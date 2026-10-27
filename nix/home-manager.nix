@@ -141,12 +141,27 @@ in
         '';
       };
     };
+
+    # same plaintext-vs-file split as navidromeServers.passwordFile,
+    # same reason (world-readable nix store paths); neither set means
+    # the opensubtitles auto-fetch feature never runs.
+    opensubtitlesApiKeyFile = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      description = "Path to a file containing an opensubtitles.com api key. Null disables auto-fetch (manually-placed subtitle files alongside a video still work regardless).";
+    };
+
+    subtitleLanguage = mkOption {
+      type = types.str;
+      default = "en";
+      description = "Preferred language code for opensubtitles auto-fetch.";
+    };
   };
 
   config = mkIf cfg.enable {
     home.packages = [ cfg.package ];
 
-    xdg.configFile."wim/config.toml".source = tomlFormat.generate "wim-config.toml" {
+    xdg.configFile."wim/config.toml".source = tomlFormat.generate "wim-config.toml" ({
       album_art = cfg.albumArt;
       library_paths = cfg.libraryPaths;
       crossfade_enabled = cfg.crossfadeEnabled;
@@ -160,6 +175,7 @@ in
         blur = cfg.subtitles.blur;
         color_level = cfg.subtitles.colorLevel;
       };
+      subtitle_language = cfg.subtitleLanguage;
       navidrome_servers = map (s: {
         url = s.url;
         username = s.username;
@@ -167,6 +183,8 @@ in
       }
       // lib.optionalAttrs (s.maxBitrateKbps != null) { max_bitrate_kbps = s.maxBitrateKbps; }
       // lib.optionalAttrs (s.transcodeFormat != null) { transcode_format = s.transcodeFormat; }) cfg.navidromeServers;
-    };
+    } // lib.optionalAttrs (cfg.opensubtitlesApiKeyFile != null) {
+      opensubtitles_api_key_file = toString cfg.opensubtitlesApiKeyFile;
+    });
   };
 }

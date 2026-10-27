@@ -78,6 +78,36 @@ pub struct Config {
     pub crossfade_seconds: f64,
     #[serde(default)]
     pub subtitles: SubtitleConfig,
+    /// Neither set (the default): opensubtitles auto-fetch never runs.
+    /// Manually-placed subtitle files alongside a video still work
+    /// regardless (that's just mpv's own default behavior), this is
+    /// purely the "go find one automatically" feature. Same
+    /// plaintext-vs-file split as `NavidromeConfig::password`/
+    /// `password_file`, same reason: Nix store paths are world-
+    /// readable, so a literal key in config.toml via home-manager
+    /// would leak to every local user.
+    #[serde(default)]
+    pub opensubtitles_api_key: Option<String>,
+    #[serde(default)]
+    pub opensubtitles_api_key_file: Option<String>,
+    #[serde(default = "default_subtitle_language")]
+    pub subtitle_language: String,
+}
+
+fn default_subtitle_language() -> String {
+    "en".to_string()
+}
+
+impl Config {
+    pub fn resolve_opensubtitles_api_key(&self) -> Option<String> {
+        if let Some(k) = &self.opensubtitles_api_key {
+            return Some(k.clone());
+        }
+        let path = self.opensubtitles_api_key_file.as_ref()?;
+        fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim_end_matches('\n').to_string())
+    }
 }
 
 fn default_crossfade_seconds() -> f64 {
@@ -148,6 +178,9 @@ impl Default for Config {
             crossfade_enabled: false,
             crossfade_seconds: default_crossfade_seconds(),
             subtitles: SubtitleConfig::default(),
+            opensubtitles_api_key: None,
+            opensubtitles_api_key_file: None,
+            subtitle_language: default_subtitle_language(),
         }
     }
 }
