@@ -68,6 +68,7 @@ const MENU: &[(&str, &str)] = &[
     ("n", "navidrome profiles"),
     ("S", "starred songs"),
     ("I", "index breakdown"),
+    ("u", "settings"),
     ("?", "help"),
     ("q", "quit"),
 ];
