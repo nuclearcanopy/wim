@@ -88,13 +88,28 @@ impl Widget for Banner {
             }
         }
 
+        // LazyVim's own menu is a left-aligned column (key, two
+        // spaces, description) centered as one block; centering each
+        // row independently (by that row's own text length) is what
+        // produced the jagged, staircase-looking menu seen before this
+        // fix, since "n  navidrome profiles" and "q  quit" don't share
+        // a length. Pad every key to the longest key's width first so
+        // the description column itself lines up too.
         let menu_start_y = logo_start_y + GLYPH_HEIGHT as u16 + 2;
-        for (i, (key, desc)) in MENU.iter().enumerate() {
-            draw_centered(
+        let key_width = MENU.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
+        let lines: Vec<String> = MENU
+            .iter()
+            .map(|(key, desc)| format!("{key:<key_width$}  {desc}"))
+            .collect();
+        let block_width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+        let block_start_x = area.x + area.width.saturating_sub(block_width) / 2;
+        for (i, line) in lines.iter().enumerate() {
+            draw_left(
                 buf,
                 area,
+                block_start_x,
                 menu_start_y + i as u16,
-                &format!("{key}  {desc}"),
+                line,
                 shade(DIM),
             );
         }
@@ -102,6 +117,29 @@ impl Widget for Banner {
         let footer_y = menu_start_y + MENU.len() as u16 + 1;
         let footer = format!("{} local items indexed", self.local_items);
         draw_centered(buf, area, footer_y, &footer, shade(NEAR_BLACK));
+    }
+}
+
+fn draw_left(
+    buf: &mut Buffer,
+    area: Rect,
+    start_x: u16,
+    y: u16,
+    text: &str,
+    color: ratatui::style::Color,
+) {
+    if y >= area.y + area.height {
+        return;
+    }
+    for (i, ch) in text.chars().enumerate() {
+        let x = start_x + i as u16;
+        if x >= area.x + area.width {
+            break;
+        }
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_char(ch);
+            cell.set_fg(color);
+        }
     }
 }
 
