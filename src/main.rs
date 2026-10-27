@@ -1665,7 +1665,7 @@ fn main() -> anyhow::Result<()> {
     let mut eq_menu_open = false;
     let mut eq_menu_selected: usize = 0;
 
-    let mut panels = PanelLayout::new();
+    let mut panels = PanelLayout::from_sizes(cfg.sidebar_width, cfg.bottom_bar_height);
     let start = Instant::now();
     let mut guard = term::TerminalGuard::new()?;
     // queries the terminal over stdio for font-cell size and graphics
@@ -3021,6 +3021,17 @@ fn main() -> anyhow::Result<()> {
                         || key.code == keymap.get(KeyAction::ToggleResizeMode)
                     {
                         panels.toggle_resize_mode();
+                        // persist on leaving the mode rather than on
+                        // every arrow press: a resize is a handful of
+                        // keystrokes, and the sizes used to reset to
+                        // the defaults on every restart.
+                        if cfg.sidebar_width != panels.sidebar_width
+                            || cfg.bottom_bar_height != panels.bottom_bar_height
+                        {
+                            cfg.sidebar_width = panels.sidebar_width;
+                            cfg.bottom_bar_height = panels.bottom_bar_height;
+                            save_config(&cfg, &mut notifications);
+                        }
                         continue;
                     }
                     // each panel only answers to its one valid resize
