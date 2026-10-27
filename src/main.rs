@@ -364,7 +364,15 @@ fn main() -> anyhow::Result<()> {
             let sidebar_selected = panels.resize_mode && panels.resize_selected == ResizePanel::Sidebar;
             let bottom_selected = panels.resize_mode && panels.resize_selected == ResizePanel::BottomBar;
 
-            f.render_widget(VerticalRule { highlighted: sidebar_selected }, vdivider);
+            // only the banner draws its own internal horizontal rules in
+            // main_content; lyrics/now-playing don't, so there's nothing
+            // to join against in those cases.
+            let junction_rows = if lyrics_lines.is_none() && now_playing.is_none() {
+                ui::banner::rule_rows(main_content).to_vec()
+            } else {
+                Vec::new()
+            };
+            f.render_widget(VerticalRule { highlighted: sidebar_selected, junction_rows }, vdivider);
             f.render_widget(
                 HorizontalRule { highlighted: bottom_selected, junction_x: Some(vdivider.x) },
                 Rect { height: 1, ..bottom },
