@@ -1,4 +1,5 @@
 mod app;
+mod browse;
 mod config;
 mod eq;
 mod layout;
@@ -26,6 +27,7 @@ use navmanager::{NavManager, NavManagerStep};
 use onboarding::{Onboarding, Step};
 use search::SearchItem;
 use ui::banner::Banner;
+use ui::browse::BrowseListView;
 use ui::controlsbar::ControlsBar;
 use ui::divider::{HorizontalRule, VerticalRule};
 use ui::login::{LoginForm, LoginView};
@@ -68,12 +70,12 @@ fn resolve_tracks(item: &SearchItem) -> Result<Vec<SearchItem>, String> {
             Ok(vec![item.clone()])
         }
         SearchItem::Album { id, client, .. } => client
-            .get_album_songs(id)
-            .map(|songs| songs_to_items(songs, client))
+            .get_album(id)
+            .map(|details| browse::songs_to_items(details.songs, client))
             .map_err(|e| format!("couldn't load album tracks: {e}")),
         SearchItem::Playlist { id, client, .. } => client
             .get_playlist_songs(id)
-            .map(|songs| songs_to_items(songs, client))
+            .map(|songs| browse::songs_to_items(songs, client))
             .map_err(|e| format!("couldn't load playlist tracks: {e}")),
         SearchItem::Artist { .. } => {
             Err("artist playback needs the profile view (not built yet); open an album instead".to_string())
@@ -81,11 +83,35 @@ fn resolve_tracks(item: &SearchItem) -> Result<Vec<SearchItem>, String> {
     }
 }
 
-fn songs_to_items(songs: Vec<subsonic::Song>, client: &Arc<subsonic::Client>) -> Vec<SearchItem> {
-    songs
-        .into_iter()
-        .map(|s| SearchItem::Song { id: s.id, title: s.title, artist: s.artist, album: s.album, client: client.clone() })
-        .collect()
+/// Opens the track-listing view on an album or playlist; the Enter-key
+/// response for those two kinds instead of `resolve_tracks`+immediate
+/// play, so picking one from search shows its tracks first rather than
+/// jumping straight into playback. `resolve_tracks` (full expand+queue,
+/// no browsing) is still what the quick-queue key uses.
+fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
+    match item {
+        SearchItem::Album { id, name, artist, client } => {
+            let details = client.get_album(id).map_err(|e| format!("couldn't open album: {e}"))?;
+            Ok(browse::BrowseView {
+                title: name.clone(),
+                subtitle: artist.clone(),
+                year: details.year,
+                tracks: browse::songs_to_items(details.songs, client),
+                selected: 0,
+            })
+        }
+        SearchItem::Playlist { id, name, client } => {
+            let songs = client.get_playlist_songs(id).map_err(|e| format!("couldn't open playlist: {e}"))?;
+            Ok(browse::BrowseView {
+                title: name.clone(),
+                subtitle: String::new(),
+                year: None,
+                tracks: browse::songs_to_items(songs, client),
+                selected: 0,
+            })
+        }
+        _ => unreachable!("open_browse_view only called for Album/Playlist"),
+    }
 }
 
 /// (artist, title, album) for a lyrics lookup; only meaningful for
@@ -285,6 +311,10 @@ fn main() -> anyhow::Result<()> {
     let lyrics_client = lyrics::Client::new();
     let mut lyrics_lines: Option<Vec<String>> = None;
     let mut lyrics_scroll: usize = 0;
+    // opened via enter on an album/playlist; takes over main_content
+    // until esc, same modal-ish precedence as lyrics but independent
+    // of it (browsing doesn't require anything to already be playing).
+    let mut browse_view: Option<browse::BrowseView> = None;
 
     // connect every configured server on startup; all of them feed
     // the same unified corpus, there's no "active server" concept to
@@ -429,9 +459,9 @@ fn main() -> anyhow::Result<()> {
             let bottom_selected = panels.resize_mode && panels.resize_selected == ResizePanel::BottomBar;
 
             // only the banner draws its own internal horizontal rules in
-            // main_content; lyrics/now-playing don't, so there's nothing
-            // to join against in those cases.
-            let junction_rows = if lyrics_lines.is_none() && now_playing.is_none() {
+            // main_content; lyrics/now-playing/browse don't, so there's
+            // nothing to join against in those cases.
+            let junction_rows = if browse_view.is_none() && lyrics_lines.is_none() && now_playing.is_none() {
                 ui::banner::rule_rows(main_content).to_vec()
             } else {
                 Vec::new()
@@ -459,18 +489,21 @@ fn main() -> anyhow::Result<()> {
                 sidebar_rows[1],
             );
 
-            match &lyrics_lines {
-                Some(lines) => {
-                    let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
-                    f.render_widget(LyricsView { lines: &borrowed, scroll: lyrics_scroll }, main_content);
-                }
-                None => match &now_playing {
-                    Some(item) => f.render_widget(NowPlayingView { label: &label(item) }, main_content),
-                    None => {
-                        let elapsed_secs = start.elapsed().as_secs_f32();
-                        let phase = elapsed_secs * 0.25;
-                        f.render_widget(Banner { phase, elapsed_secs }, main_content);
+            match &browse_view {
+                Some(bv) => f.render_widget(BrowseListView { view: bv }, main_content),
+                None => match &lyrics_lines {
+                    Some(lines) => {
+                        let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+                        f.render_widget(LyricsView { lines: &borrowed, scroll: lyrics_scroll }, main_content);
                     }
+                    None => match &now_playing {
+                        Some(item) => f.render_widget(NowPlayingView { label: &label(item) }, main_content),
+                        None => {
+                            let elapsed_secs = start.elapsed().as_secs_f32();
+                            let phase = elapsed_secs * 0.25;
+                            f.render_widget(Banner { phase, elapsed_secs }, main_content);
+                        }
+                    },
                 },
             }
 
@@ -687,6 +720,37 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                // browse view intercepts input the same way lyrics does
+                // (below): scrolling/picking a track shouldn't move the
+                // underlying results selection. enter plays from the
+                // selected track to the end of the album/playlist; esc
+                // closes it, handing main_content back to whatever it'd
+                // otherwise show (now-playing, lyrics, or the banner).
+                if let Some(bv) = &mut browse_view {
+                    match key.code {
+                        KeyCode::Char('j') | KeyCode::Down => bv.next(),
+                        KeyCode::Char('k') | KeyCode::Up => bv.prev(),
+                        KeyCode::Enter => {
+                            let mut tracks = bv.tracks[bv.selected..].to_vec().into_iter();
+                            if let Some(first) = tracks.next() {
+                                let (s, played) = try_play(&player, &first);
+                                status = s;
+                                if played {
+                                    let rest: Vec<SearchItem> = tracks.collect();
+                                    for t in &rest {
+                                        let _ = try_enqueue(&player, t);
+                                    }
+                                    now_playing = Some(first);
+                                    app.queue = rest;
+                                }
+                            }
+                        }
+                        KeyCode::Esc | KeyCode::Char('q') => browse_view = None,
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // lyrics view intercepts input directly rather than going
                 // through App, since scrolling it shouldn't move the
                 // underlying results selection.
@@ -739,6 +803,20 @@ fn main() -> anyhow::Result<()> {
                     Action::Quit => {
                         save_playback_state(&player, &now_playing, &app.queue);
                         break;
+                    }
+                    // albums/playlists open the track-listing view
+                    // instead of playing immediately ("let me scroll
+                    // through the songs" first); songs/local files
+                    // still play straight away.
+                    Action::Play(item @ SearchItem::Album { .. }) | Action::Play(item @ SearchItem::Playlist { .. }) => {
+                        status = match open_browse_view(&item) {
+                            Ok(bv) => {
+                                let msg = format!("opened: {} ({} tracks)", bv.title, bv.tracks.len());
+                                browse_view = Some(bv);
+                                msg
+                            }
+                            Err(msg) => msg,
+                        };
                     }
                     Action::Play(item) => {
                         status = match resolve_tracks(&item) {
