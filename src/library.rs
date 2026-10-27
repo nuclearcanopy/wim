@@ -28,7 +28,7 @@ pub struct LocalTrack {
     pub kind: MediaKind,
 }
 
-fn classify(ext: &str) -> Option<MediaKind> {
+pub(crate) fn classify(ext: &str) -> Option<MediaKind> {
     let ext = ext.to_ascii_lowercase();
     if MUSIC_EXTENSIONS.contains(&ext.as_str()) {
         Some(MediaKind::Music)
@@ -39,7 +39,7 @@ fn classify(ext: &str) -> Option<MediaKind> {
     }
 }
 
-fn filename_title(path: &Path) -> String {
+pub(crate) fn filename_title(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
@@ -92,10 +92,32 @@ fn video_track(path: &Path) -> LocalTrack {
     }
 }
 
+/// Standard XDG user dirs (`~/Music`, `~/Videos`), used when the config
+/// doesn't list any explicit `library_paths` — most people keep their
+/// media in the usual home-folder layout and shouldn't have to configure
+/// paths just to get started.
+pub fn default_library_paths() -> Vec<String> {
+    [dirs::audio_dir(), dirs::video_dir()]
+        .into_iter()
+        .flatten()
+        .filter(|p| p.is_dir())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
 /// Recursively scans each configured library path, returning every music
 /// and video file found. Unreadable tags are not fatal — the file still
-/// gets indexed with a filename-derived title.
+/// gets indexed with a filename-derived title. Falls back to
+/// `default_library_paths()` when `paths` is empty.
 pub fn scan(paths: &[String]) -> Vec<LocalTrack> {
+    let owned_defaults;
+    let paths = if paths.is_empty() {
+        owned_defaults = default_library_paths();
+        &owned_defaults
+    } else {
+        paths
+    };
+
     let mut tracks = Vec::new();
     for root in paths {
         for entry in WalkDir::new(root)
