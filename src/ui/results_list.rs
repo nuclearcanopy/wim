@@ -45,12 +45,10 @@ pub fn layout(
         .iter()
         .position(|r| matches!(r, DisplayRow::Item(i) if *i == selected))
         .unwrap_or(0);
-    let scroll_offset = if selected_row >= visible_rows {
-        selected_row + 1 - visible_rows
-    } else {
-        0
-    };
-    (rows, scroll_offset)
+    (
+        rows,
+        crate::ui::scroll::offset_for(selected_row, visible_rows),
+    )
 }
 
 /// Plain ASCII, not unicode pictographs: even nominally "geometric,
