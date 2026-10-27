@@ -2,7 +2,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
-use crate::theme::{lerp, shade, BRIGHT, DIM, NEAR_BLACK, WHITE};
+use crate::theme::{lerp, shade, BRIGHT, DIM, WHITE};
 
 /// `figlet -f "ANSI Shadow" WIM`; the same font LazyVim's own
 /// snacks.nvim dashboard header uses (confirmed against LazyVim's
@@ -28,22 +28,22 @@ const MENU: &[(&str, &str)] = &[
     ("/", "search"),
     ("n", "navidrome profiles"),
     ("S", "starred songs"),
+    ("I", "index breakdown"),
     ("?", "help"),
     ("q", "quit"),
 ];
 
 /// Logo with a brightness sweep plus a slower overall pulse layered on
 /// top (two independent motions read as more "alive" than a single
-/// linear sweep), a key/description menu below it (LazyVim's own
-/// dashboard structure), and the local-library count as a footer line
-/// (this is specifically where that count belongs: once, on the idle
-/// home screen, not permanently crammed into the status line every
-/// time it's on screen). `phase`/`elapsed` are advanced by the caller
-/// each tick.
+/// linear sweep) and a key/description menu below it (LazyVim's own
+/// dashboard structure). No item count here: it used to sit as a
+/// permanent footer line, which read as the app announcing a number
+/// nobody asked for every time this screen was on; 'I' surfaces it on
+/// demand instead. `phase`/`elapsed` are advanced by the caller each
+/// tick.
 pub struct Banner {
     pub phase: f32,
     pub elapsed_secs: f32,
-    pub local_items: usize,
 }
 
 /// 0..1, slow breathing.
@@ -56,8 +56,8 @@ impl Widget for Banner {
         let total_width = LOGO[0].chars().count() as u16;
         let start_x = area.x + area.width.saturating_sub(total_width) / 2;
 
-        // logo, one gap row, the menu, one gap row, the footer line.
-        let frame_height = GLYPH_HEIGHT as u16 + 2 + MENU.len() as u16 + 2;
+        // logo, one gap row, the menu.
+        let frame_height = GLYPH_HEIGHT as u16 + 2 + MENU.len() as u16;
         let logo_start_y = area.y + area.height.saturating_sub(frame_height) / 2;
 
         let pulse = pulse_level(self.elapsed_secs);
@@ -113,10 +113,6 @@ impl Widget for Banner {
                 shade(DIM),
             );
         }
-
-        let footer_y = menu_start_y + MENU.len() as u16 + 1;
-        let footer = format!("{} local items indexed", self.local_items);
-        draw_centered(buf, area, footer_y, &footer, shade(NEAR_BLACK));
     }
 }
 
@@ -131,24 +127,6 @@ fn draw_left(
     if y >= area.y + area.height {
         return;
     }
-    for (i, ch) in text.chars().enumerate() {
-        let x = start_x + i as u16;
-        if x >= area.x + area.width {
-            break;
-        }
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_fg(color);
-        }
-    }
-}
-
-fn draw_centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
-    if y >= area.y + area.height {
-        return;
-    }
-    let text_width = text.chars().count() as u16;
-    let start_x = area.x + area.width.saturating_sub(text_width) / 2;
     for (i, ch) in text.chars().enumerate() {
         let x = start_x + i as u16;
         if x >= area.x + area.width {
