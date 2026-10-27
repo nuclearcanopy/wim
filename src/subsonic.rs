@@ -1,6 +1,6 @@
 //! Hand-rolled Subsonic API client (targets Navidrome). The handful of
 //! existing subsonic crates are unmaintained/incomplete, and the surface
-//! we need (ping, search3, playlists, stream urls) is small enough that
+//! we need (ping, catalog browsing, playlists, stream urls) is small enough that
 //! owning it directly is simpler than fighting someone else's types.
 
 use std::io::Read;
@@ -55,6 +55,10 @@ pub struct Song {
     pub title: String,
     pub artist: String,
     pub album: String,
+    // parsed for fidelity to the api response but not read anywhere
+    // yet; same documented gap as LocalTrack::duration_secs (see
+    // library.rs) — SearchItem::Song doesn't carry duration either.
+    #[allow(dead_code)]
     pub duration: Option<u32>,
 }
 
@@ -68,6 +72,14 @@ pub struct Playlist {
 pub struct AlbumDetails {
     pub year: Option<u32>,
     pub songs: Vec<Song>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArtistAlbum {
+    pub id: String,
+    /// `None` sorts last rather than first; an unknown release date
+    /// shouldn't jump to the front of a chronological listing.
+    pub year: Option<u32>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -138,62 +150,6 @@ impl Client {
         Ok(())
     }
 
-    pub fn search3(&self, query: &str) -> anyhow::Result<SearchResult> {
-        let v = self.get(
-            "search3",
-            &[
-                ("query", query),
-                ("artistCount", "20"),
-                ("albumCount", "20"),
-                ("songCount", "40"),
-            ],
-        )?;
-        let r = v.get("searchResult3").cloned().unwrap_or_default();
-
-        let artists = r
-            .get("artist")
-            .and_then(|a| a.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|a| {
-                        Some(Artist {
-                            id: a.get("id")?.as_str()?.to_string(),
-                            name: a.get("name")?.as_str()?.to_string(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let albums = r
-            .get("album")
-            .and_then(|a| a.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|a| {
-                        Some(Album {
-                            id: a.get("id")?.as_str()?.to_string(),
-                            name: a.get("name")?.as_str()?.to_string(),
-                            artist: a
-                                .get("artist")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let songs = parse_song_array(r.get("song"));
-
-        Ok(SearchResult {
-            artists,
-            albums,
-            songs,
-        })
-    }
-
     /// Every track on an album, in album order, plus the album's own
     /// release year (shown in the album view; `getAlbumList2` doesn't
     /// carry it, only `getAlbum` does); used both to expand a playable
@@ -209,6 +165,28 @@ impl Client {
                 .map(|y| y as u32),
             songs: parse_song_array(album.and_then(|a| a.get("song"))),
         })
+    }
+
+    /// Every album credited to this artist (ID3 browsing), for the
+    /// artist profile view's chronological album list. Doesn't include
+    /// songs; see `get_album` per-album for those (and the Global/
+    /// Various-Artists filtering that requires).
+    pub fn get_artist(&self, artist_id: &str) -> anyhow::Result<Vec<ArtistAlbum>> {
+        let v = self.get("getArtist", &[("id", artist_id)])?;
+        Ok(parse_artist_albums(&v))
+    }
+
+    /// Navidrome's own `getArtistInfo2` already proxies a biography
+    /// from last.fm, no separate api key needed; `None` if the server
+    /// has nothing (unknown artist, no internet metadata lookup
+    /// configured, etc.), not an error.
+    pub fn get_artist_bio(&self, artist_id: &str) -> anyhow::Result<Option<String>> {
+        let v = self.get("getArtistInfo2", &[("id", artist_id)])?;
+        Ok(v.get("artistInfo2")
+            .and_then(|a| a.get("biography"))
+            .and_then(|b| b.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty()))
     }
 
     /// Same idea for playlists: `getPlaylist`'s tracks live under
@@ -429,6 +407,25 @@ fn parse_song_array(arr: Option<&serde_json::Value>) -> Vec<Song> {
         .unwrap_or_default()
 }
 
+/// Pure parsing for `getArtist`'s nested album list, pulled out of
+/// `get_artist()` so it's testable in isolation.
+fn parse_artist_albums(v: &serde_json::Value) -> Vec<ArtistAlbum> {
+    v.get("artist")
+        .and_then(|a| a.get("album"))
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| {
+                    Some(ArtistAlbum {
+                        id: a.get("id")?.as_str()?.to_string(),
+                        year: a.get("year").and_then(|y| y.as_u64()).map(|y| y as u32),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Pure parsing for a single `getAlbumList2` page, pulled out of
 /// `all_albums()`'s pagination loop so it's testable in isolation.
 fn parse_album_list2_page(v: &serde_json::Value) -> Vec<Album> {
@@ -527,6 +524,21 @@ mod tests {
         assert_eq!(albums[0].name, "Cold Visions");
         assert_eq!(albums[0].artist, "Bladee");
         assert_eq!(albums[1].artist, "Various Artists");
+    }
+
+    #[test]
+    fn parses_artist_albums_including_a_missing_year() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"artist": {"id": "ar-2", "name": "Bladee", "album": [
+                {"id": "al-1", "name": "Cold Visions", "year": 2024},
+                {"id": "al-2", "name": "Global"}
+            ]}}"#,
+        )
+        .unwrap();
+        let albums = parse_artist_albums(&v);
+        assert_eq!(albums.len(), 2);
+        assert_eq!(albums[0].year, Some(2024));
+        assert_eq!(albums[1].year, None);
     }
 
     #[test]
