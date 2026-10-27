@@ -13,6 +13,14 @@ use crate::theme::{shade, DIM, NEAR_BLACK};
 /// selection cue for whichever panel this divider borders.
 pub struct HorizontalRule {
     pub highlighted: bool,
+    /// Absolute buffer x-coordinate of a vertical divider ending right
+    /// above this rule (e.g. the sidebar/main-content split meeting the
+    /// bottom bar), if any — drawn as `┴` there instead of `─` so the
+    /// two lines actually join instead of crossing with a gap. This is
+    /// not optional polish: two dividers that are structurally meant to
+    /// meet but are drawn by two widgets with zero knowledge of each
+    /// other will visibly not connect unless something tells them to.
+    pub junction_x: Option<u16>,
 }
 
 impl Widget for HorizontalRule {
@@ -22,8 +30,9 @@ impl Widget for HorizontalRule {
         }
         let color = shade(if self.highlighted { DIM } else { NEAR_BLACK });
         for x in area.x..area.x + area.width {
+            let ch = if self.junction_x == Some(x) { '┴' } else { '─' };
             if let Some(cell) = buf.cell_mut((x, area.y)) {
-                cell.set_char('─');
+                cell.set_char(ch);
                 cell.set_fg(color);
             }
         }
