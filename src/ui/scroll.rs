@@ -14,6 +14,13 @@ pub fn offset_for(selected_row: usize, visible_rows: usize) -> usize {
     }
 }
 
+/// Clamps a content scroll offset to the last line of `len` lines, so
+/// holding `j` parks on the end of the text instead of walking off
+/// into blank space.
+pub fn clamp_to_content(scroll: usize, len: usize) -> usize {
+    scroll.min(len.saturating_sub(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -33,5 +40,17 @@ mod tests {
     #[test]
     fn a_zero_height_pane_has_no_offset() {
         assert_eq!(offset_for(7, 0), 0);
+    }
+
+    #[test]
+    fn content_scroll_stops_on_the_last_line() {
+        assert_eq!(clamp_to_content(3, 10), 3);
+        assert_eq!(clamp_to_content(9, 10), 9);
+        assert_eq!(clamp_to_content(50, 10), 9);
+    }
+
+    #[test]
+    fn content_scroll_of_nothing_stays_at_zero() {
+        assert_eq!(clamp_to_content(7, 0), 0);
     }
 }

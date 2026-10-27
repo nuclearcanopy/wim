@@ -3254,8 +3254,11 @@ fn main() -> anyhow::Result<()> {
                     // being open silently ate every other keybind.
                     let mut handled = true;
                     match key.code {
+                        // clamped to the content: scrolling past the
+                        // last line just parks the view on blank space.
                         KeyCode::Char('j') | KeyCode::Down => {
-                            lyrics_scroll = lyrics_scroll.saturating_add(1)
+                            let lines = lyrics_lines.as_ref().map_or(0, Vec::len);
+                            lyrics_scroll = ui::scroll::clamp_to_content(lyrics_scroll + 1, lines)
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             lyrics_scroll = lyrics_scroll.saturating_sub(1)
