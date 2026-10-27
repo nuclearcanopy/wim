@@ -2030,6 +2030,7 @@ fn main() -> anyhow::Result<()> {
                         phase,
                         elapsed_secs,
                         logo_index,
+                        keymap: &keymap,
                     },
                     main_content,
                 );

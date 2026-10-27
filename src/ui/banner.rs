@@ -2,6 +2,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
+use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::theme::{lerp, shade, BRIGHT, DIM, NEAR_WHITE, WHITE};
 use crate::ui::logos::LOGOS;
 
@@ -58,19 +59,21 @@ pub fn logo_index_for_name(name: Option<&str>) -> usize {
     }
 }
 
-/// Key, description; same `snacks.dashboard.Item` idea LazyVim's own
+/// Action, description; same `snacks.dashboard.Item` idea LazyVim's own
 /// dashboard menu uses below its header, minus the nerd-font icons
 /// (same monochrome/plain-ascii reasoning as the result-row `[sk]`
 /// codes: a patched-font glyph the user's terminal doesn't have would
-/// just show as a broken box, not a silent icon).
-const MENU: &[(&str, &str)] = &[
-    ("/", "search"),
-    ("n", "navidrome profiles"),
-    ("S", "starred songs"),
-    ("I", "index breakdown"),
-    ("u", "settings"),
-    ("?", "help"),
-    ("q", "quit"),
+/// just show as a broken box, not a silent icon). Actions rather than
+/// key literals: every one of these is remappable, so the key column
+/// is resolved from the live keymap at render time.
+const MENU: &[(KeyAction, &str)] = &[
+    (KeyAction::StartSearch, "search"),
+    (KeyAction::OpenNavManager, "navidrome profiles"),
+    (KeyAction::OpenStarredView, "starred songs"),
+    (KeyAction::IndexBreakdown, "index breakdown"),
+    (KeyAction::OpenSettingsMenu, "settings"),
+    (KeyAction::OpenHelp, "help"),
+    (KeyAction::Quit, "quit"),
 ];
 
 /// Logo with a brightness sweep plus a slower overall pulse layered on
@@ -81,10 +84,11 @@ const MENU: &[(&str, &str)] = &[
 /// nobody asked for every time this screen was on; 'I' surfaces it on
 /// demand instead. `phase`/`elapsed` are advanced by the caller each
 /// tick. `logo_index` selects which of `logo_lines`' entries to draw.
-pub struct Banner {
+pub struct Banner<'a> {
     pub phase: f32,
     pub elapsed_secs: f32,
     pub logo_index: usize,
+    pub keymap: &'a Keymap,
 }
 
 /// 0..1, slow breathing.
@@ -92,7 +96,7 @@ pub fn pulse_level(elapsed_secs: f32) -> f32 {
     (elapsed_secs * 1.3).sin() * 0.5 + 0.5
 }
 
-impl Widget for Banner {
+impl Widget for Banner<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let lines = logo_lines(self.logo_index);
         let glyph_height = lines.len() as u16;
@@ -149,10 +153,16 @@ impl Widget for Banner {
         // produced the jagged, staircase-looking menu seen before this
         // fix, since "n  navidrome profiles" and "q  quit" don't share
         // a length. Pad every key to the longest key's width first so
-        // the description column itself lines up too.
+        // the description column itself lines up too; that width comes
+        // from the resolved labels, since a rebound key ("f5") is a
+        // different length than the default it replaced.
         let menu_start_y = logo_start_y + glyph_height + 2;
-        let key_width = MENU.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
-        let lines: Vec<String> = MENU
+        let menu: Vec<(String, &str)> = MENU
+            .iter()
+            .map(|(action, desc)| (key_label(self.keymap.get(*action)), *desc))
+            .collect();
+        let key_width = menu.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
+        let lines: Vec<String> = menu
             .iter()
             .map(|(key, desc)| format!("{key:<key_width$}  {desc}"))
             .collect();
@@ -198,5 +208,54 @@ fn draw_left(
             cell.set_char(ch);
             cell.set_fg(color);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyCode;
+
+    fn render_to_string(keymap: &Keymap) -> String {
+        let area = Rect::new(0, 0, 60, 24);
+        let mut buf = Buffer::empty(area);
+        Banner {
+            phase: 0.0,
+            elapsed_secs: 0.0,
+            logo_index: 0,
+            keymap,
+        }
+        .render(area, &mut buf);
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_menu_shows_rebound_keys_not_the_defaults() {
+        let mut keymap = Keymap::default();
+        keymap.set(KeyAction::StartSearch, KeyCode::Char('x'));
+        keymap.set(KeyAction::OpenHelp, KeyCode::Char('y'));
+        let out = render_to_string(&keymap);
+        assert!(out.contains("x  search"), "got:\n{out}");
+        assert!(out.contains("y  help"), "got:\n{out}");
+        assert!(!out.contains("/  search"), "stale default key:\n{out}");
+        assert!(!out.contains("?  help"), "stale default key:\n{out}");
+    }
+
+    #[test]
+    fn the_key_column_is_padded_from_the_resolved_labels() {
+        // "f5" is wider than every default, so every other row has to
+        // widen with it or the description column goes jagged again.
+        let mut keymap = Keymap::default();
+        keymap.set(KeyAction::Quit, KeyCode::F(5));
+        let out = render_to_string(&keymap);
+        assert!(out.contains("f5  quit"), "got:\n{out}");
+        assert!(out.contains("/   search"), "got:\n{out}");
     }
 }
