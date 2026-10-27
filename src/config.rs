@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -100,6 +101,14 @@ pub struct Config {
     /// happens to be first".
     #[serde(default)]
     pub logo_style: Option<String>,
+    /// Action name (`keymap::KeyAction::name`) -> key name
+    /// (`keymap::key_label`'s inverse); only non-default bindings
+    /// need to appear here (see `Keymap::overrides`), so most users
+    /// remapping one or two keys never see a giant table. Unknown
+    /// action/key names are ignored rather than rejected, same
+    /// leniency as every other best-effort field.
+    #[serde(default)]
+    pub keybinds: HashMap<String, String>,
 }
 
 fn default_subtitle_language() -> String {
@@ -190,6 +199,7 @@ impl Default for Config {
             opensubtitles_api_key_file: None,
             subtitle_language: default_subtitle_language(),
             logo_style: None,
+            keybinds: HashMap::new(),
         }
     }
 }

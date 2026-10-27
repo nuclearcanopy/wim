@@ -3,6 +3,7 @@ mod browse;
 mod config;
 mod eq;
 mod favorites;
+mod keymap;
 mod layout;
 mod library;
 mod lyrics;
@@ -31,6 +32,7 @@ use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 
 use app::{Action, LoopMode};
+use keymap::{KeyAction, Keymap};
 use layout::{PanelLayout, ResizePanel};
 use navmanager::{NavManager, NavManagerStep};
 use notify::{Notifications, Severity};
@@ -738,6 +740,11 @@ fn main() -> anyhow::Result<()> {
     // just holds onto it for whenever one shows up.
     player.set_subtitle_style(&cfg.subtitles);
     let mut subtitle_delay = cfg.subtitles.delay_secs;
+    // every global, single-purpose command key, remappable via 'K';
+    // see keymap.rs for which keys deliberately aren't covered
+    // (universal navigation primitives, applied the same way
+    // everywhere rather than individually named commands).
+    let mut keymap = Keymap::from_overrides(&cfg.keybinds);
     let mut app = app::App::new(corpus);
     // the full keybind list moved to the '?' help overlay; nothing
     // worth saying here until something actually happens.
@@ -796,6 +803,15 @@ fn main() -> anyhow::Result<()> {
     // mode does, never the bottom bar.
     let mut settings_menu_open = false;
     let mut settings_menu_selected: usize = 0;
+    // 'K': not itself remappable, deliberately (remapping the key
+    // that opens the remap menu away and forgetting the new one
+    // would be a real way to lock yourself out of it; '?' help
+    // always shows it regardless). `capturing_key` is Some while
+    // waiting for the next keypress to bind to the selected action.
+    let mut keybinds_menu_open = false;
+    let mut keybinds_menu_selected: usize = 0;
+    let mut capturing_key = false;
+    let mut keybind_conflict: Option<KeyAction> = None;
     // left/right cycles through ui::banner::LOGOS while the workspace
     // has focus and the banner is what's showing; '0' resets to the
     // default (index 0, ANSI Shadow). Restored from config by name,
@@ -1014,7 +1030,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             if help_open {
-                f.render_widget(ui::help::HelpOverlay, area);
+                f.render_widget(ui::help::HelpOverlay { keymap: &keymap }, area);
                 return;
             }
 
@@ -1330,6 +1346,23 @@ fn main() -> anyhow::Result<()> {
                     ui::settings_menu::SettingsMenu {
                         values: [values[0].as_str(), values[1].as_str(), values[2].as_str()],
                         selected: settings_menu_selected,
+                    },
+                    top,
+                );
+            }
+
+            // 'K': same full-workspace treatment.
+            if keybinds_menu_open {
+                let keys: Vec<String> = keymap::ALL_ACTIONS
+                    .iter()
+                    .map(|a| keymap::key_label(keymap.get(*a)))
+                    .collect();
+                f.render_widget(
+                    ui::keybinds_menu::KeybindsMenu {
+                        keys: &keys,
+                        selected: keybinds_menu_selected,
+                        capturing: capturing_key,
+                        conflict: keybind_conflict.map(|a| a.label()),
                     },
                     top,
                 );
@@ -1719,12 +1752,12 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if help_open {
-                    if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
+                    if key.code == KeyCode::Esc || key.code == keymap.get(KeyAction::OpenHelp) {
                         help_open = false;
                     }
                     continue;
                 }
-                if key.code == KeyCode::Char('?') {
+                if key.code == keymap.get(KeyAction::OpenHelp) {
                     help_open = true;
                     continue;
                 }
@@ -1740,16 +1773,19 @@ fn main() -> anyhow::Result<()> {
                 // in the text box): editing a query claims every key,
                 // full stop, before anything else gets a chance at it.
                 if app.editing_query {
-                    app.handle_key(key.code);
+                    app.handle_key(key.code, &keymap);
                     continue;
                 }
 
                 if subtitle_menu_open {
+                    if key.code == KeyCode::Esc
+                        || key.code == keymap.get(KeyAction::OpenSubtitleMenu)
+                    {
+                        subtitle_menu_open = false;
+                        let _ = config::save(&cfg);
+                        continue;
+                    }
                     match key.code {
-                        KeyCode::Char('t') | KeyCode::Esc => {
-                            subtitle_menu_open = false;
-                            let _ = config::save(&cfg);
-                        }
                         KeyCode::Char('j') | KeyCode::Down => {
                             subtitle_menu_selected =
                                 (subtitle_menu_selected + 1) % ui::subtitle_menu::FIELD_COUNT;
@@ -1773,18 +1809,21 @@ fn main() -> anyhow::Result<()> {
                     }
                     continue;
                 }
-                if key.code == KeyCode::Char('t') {
+                if key.code == keymap.get(KeyAction::OpenSubtitleMenu) {
                     subtitle_menu_open = true;
                     continue;
                 }
 
                 if settings_menu_open {
+                    if key.code == KeyCode::Esc
+                        || key.code == keymap.get(KeyAction::OpenSettingsMenu)
+                    {
+                        settings_menu_open = false;
+                        cfg.crossfade_enabled = crossfade_enabled;
+                        let _ = config::save(&cfg);
+                        continue;
+                    }
                     match key.code {
-                        KeyCode::Char('u') | KeyCode::Esc => {
-                            settings_menu_open = false;
-                            cfg.crossfade_enabled = crossfade_enabled;
-                            let _ = config::save(&cfg);
-                        }
                         KeyCode::Char('j') | KeyCode::Down => {
                             settings_menu_selected =
                                 (settings_menu_selected + 1) % ui::settings_menu::FIELD_COUNT;
@@ -1821,12 +1860,68 @@ fn main() -> anyhow::Result<()> {
                     }
                     continue;
                 }
-                if key.code == KeyCode::Char('u') {
+                if key.code == keymap.get(KeyAction::OpenSettingsMenu) {
                     settings_menu_open = true;
                     continue;
                 }
 
-                if matches!(key.code, KeyCode::Char('A' | 'W')) {
+                if keybinds_menu_open {
+                    if capturing_key {
+                        // esc cancels the capture without changing
+                        // anything, same "back out" meaning it has
+                        // everywhere else; it's also the one key that
+                        // can never itself be captured, since it's
+                        // the only way out of a capture gone wrong.
+                        if key.code != KeyCode::Esc {
+                            let action = keymap::ALL_ACTIONS[keybinds_menu_selected];
+                            keybind_conflict = keymap
+                                .action_bound_to(key.code)
+                                .filter(|owner| *owner != action);
+                            keymap.set(action, key.code);
+                            cfg.keybinds = keymap.overrides();
+                            let _ = config::save(&cfg);
+                        }
+                        capturing_key = false;
+                        continue;
+                    }
+                    match key.code {
+                        KeyCode::Char('K') | KeyCode::Esc => keybinds_menu_open = false,
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            keybinds_menu_selected =
+                                (keybinds_menu_selected + 1) % keymap::ALL_ACTIONS.len();
+                            keybind_conflict = None;
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            keybinds_menu_selected =
+                                (keybinds_menu_selected + keymap::ALL_ACTIONS.len() - 1)
+                                    % keymap::ALL_ACTIONS.len();
+                            keybind_conflict = None;
+                        }
+                        KeyCode::Char('r') => {
+                            capturing_key = true;
+                            keybind_conflict = None;
+                        }
+                        KeyCode::Char('0') => {
+                            keymap.reset(keymap::ALL_ACTIONS[keybinds_menu_selected]);
+                            cfg.keybinds = keymap.overrides();
+                            let _ = config::save(&cfg);
+                        }
+                        KeyCode::Char('R') => {
+                            keymap.reset_all();
+                            cfg.keybinds = keymap.overrides();
+                            let _ = config::save(&cfg);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                if key.code == KeyCode::Char('K') {
+                    keybinds_menu_open = true;
+                    keybinds_menu_selected = 0;
+                    continue;
+                }
+
+                if key.code == keymap.get(KeyAction::FocusSidebar) {
                     focus = Focus::Sidebar;
                     continue;
                 }
@@ -1834,23 +1929,26 @@ fn main() -> anyhow::Result<()> {
                 // below) before this feature existed, and this check
                 // runs first and unconditionally continues, which
                 // made that handler dead code until this fix.
-                if key.code == KeyCode::Char('D') {
+                if key.code == keymap.get(KeyAction::FocusWorkspace) {
                     focus = Focus::Workspace;
                     continue;
                 }
 
                 if panels.resize_mode {
+                    if key.code == KeyCode::Esc
+                        || key.code == keymap.get(KeyAction::ToggleResizeMode)
+                    {
+                        panels.toggle_resize_mode();
+                        continue;
+                    }
                     // each panel only answers to its one valid resize
                     // axis: sidebar is a vertical strip (left/right
                     // only), bottom bar is a horizontal strip (up/down
                     // only); the other axis is a no-op, not a no-op
-                    // that happens to also work the "wrong" way.
+                    // that happens to also work the "wrong" way. wasd
+                    // here is fixed, not remapped: a transient mode's
+                    // own panel-pick, not a named command.
                     match (panels.resize_selected, key.code) {
-                        (_, KeyCode::Char('r') | KeyCode::Esc) => panels.toggle_resize_mode(),
-                        // wasd selects between panels (w/a -> sidebar,
-                        // s/d -> bottom bar); only two panels exist
-                        // today so this is a 2-way split of a 4-way
-                        // scheme, ready for whenever a third shows up.
                         (_, KeyCode::Char('a' | 'w')) => panels.select(ResizePanel::Sidebar),
                         (_, KeyCode::Char('s' | 'd')) => panels.select(ResizePanel::BottomBar),
                         (ResizePanel::Sidebar, KeyCode::Left) => panels.shrink(),
@@ -1861,7 +1959,7 @@ fn main() -> anyhow::Result<()> {
                     }
                     continue;
                 }
-                if key.code == KeyCode::Char('r') {
+                if key.code == keymap.get(KeyAction::ToggleResizeMode) {
                     panels.toggle_resize_mode();
                     continue;
                 }
@@ -1912,7 +2010,7 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                if key.code == KeyCode::Char('i') {
+                if key.code == keymap.get(KeyAction::CycleArtMode) {
                     art_mode = art_mode.toggle();
                     continue;
                 }
@@ -1958,7 +2056,7 @@ fn main() -> anyhow::Result<()> {
                                 status = s;
                             }
                         }
-                        KeyCode::Char('*') => {
+                        _ if key.code == keymap.get(KeyAction::ToggleStar) => {
                             if let Some(item) = bv.tracks.get(bv.selected).cloned() {
                                 status =
                                     match toggle_star(&item, &mut favorites, &mut remote_starred) {
@@ -1987,7 +2085,11 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Char('k') | KeyCode::Up => {
                             lyrics_scroll = lyrics_scroll.saturating_sub(1)
                         }
-                        KeyCode::Char('L') | KeyCode::Esc | KeyCode::Char('q') => {
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            lyrics_lines = None;
+                            lyrics_scroll = 0;
+                        }
+                        _ if key.code == keymap.get(KeyAction::OpenLyrics) => {
                             lyrics_lines = None;
                             lyrics_scroll = 0;
                         }
@@ -1996,7 +2098,7 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                if key.code == KeyCode::Char('I') {
+                if key.code == keymap.get(KeyAction::IndexBreakdown) {
                     let text = app
                         .corpus
                         .breakdown()
@@ -2008,7 +2110,7 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                if key.code == KeyCode::Char('n') {
+                if key.code == keymap.get(KeyAction::OpenNavManager) {
                     let mut nm = NavManager::new();
                     nm.connection_status = test_navidrome_connectivity(&cfg.navidrome_servers);
                     for (nav, result) in cfg.navidrome_servers.iter().zip(&nm.connection_status) {
@@ -2021,7 +2123,7 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                if key.code == KeyCode::Char('S') {
+                if key.code == keymap.get(KeyAction::OpenStarredView) {
                     let bv = open_starred_view(&cfg.navidrome_servers, &favorites);
                     real_art_protocol = picker
                         .as_mut()
@@ -2030,17 +2132,19 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                if key.code == KeyCode::Char('m') && now_playing.is_some() {
+                if key.code == keymap.get(KeyAction::ToggleMinimize) && now_playing.is_some() {
                     player_minimized = !player_minimized;
                     continue;
                 }
 
-                if key.code == KeyCode::Char('v') && now_playing_is_video(&now_playing) {
+                if key.code == keymap.get(KeyAction::ToggleFullscreenVideo)
+                    && now_playing_is_video(&now_playing)
+                {
                     video_fullscreen = !video_fullscreen;
                     continue;
                 }
 
-                if key.code == KeyCode::Char('c') {
+                if key.code == keymap.get(KeyAction::ToggleCrossfade) {
                     crossfade_enabled = !crossfade_enabled;
                     if !crossfade_enabled {
                         fade_in_started_at = None;
@@ -2055,8 +2159,10 @@ fn main() -> anyhow::Result<()> {
                 // half-second-step shortcut while actually watching
                 // something out of sync. editing_query is already
                 // ruled out above.
-                if matches!(key.code, KeyCode::Char(',') | KeyCode::Char('.')) {
-                    subtitle_delay += if key.code == KeyCode::Char(',') {
+                if key.code == keymap.get(KeyAction::SubtitleDelayDown)
+                    || key.code == keymap.get(KeyAction::SubtitleDelayUp)
+                {
+                    subtitle_delay += if key.code == keymap.get(KeyAction::SubtitleDelayDown) {
                         -0.5
                     } else {
                         0.5
@@ -2066,19 +2172,20 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // not while typing a query; a space there is a literal
-                // character, not a transport command.
-                if key.code == KeyCode::Char(' ') && now_playing.is_some() && !app.editing_query {
+                // not while typing a query; editing_query is already
+                // ruled out above, so this only ever sees it as a
+                // transport command.
+                if key.code == keymap.get(KeyAction::TogglePause) && now_playing.is_some() {
                     let _ = player.toggle_pause();
                     continue;
                 }
 
-                if key.code == KeyCode::Char('f') && now_playing.is_some() {
+                if key.code == keymap.get(KeyAction::SkipNext) && now_playing.is_some() {
                     let _ = player.playlist_next();
                     continue;
                 }
 
-                if key.code == KeyCode::Char('b') && previous_track.is_some() {
+                if key.code == keymap.get(KeyAction::SkipBack) && previous_track.is_some() {
                     status = go_to_previous(
                         &cfg,
                         &player,
@@ -2090,7 +2197,7 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                if key.code == KeyCode::Char('*') {
+                if key.code == keymap.get(KeyAction::ToggleStar) {
                     // the browse-view-focused case is handled inside
                     // its own intercept above; this runs whenever
                     // nothing's being browsed, or something is but the
@@ -2111,7 +2218,7 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                if key.code == KeyCode::Char('L') {
+                if key.code == keymap.get(KeyAction::OpenLyrics) {
                     status = match &now_playing {
                         Some(item) => match lyrics_query(item) {
                             Some((artist, title, album)) => {
@@ -2149,7 +2256,7 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                match app.handle_key(key.code) {
+                match app.handle_key(key.code, &keymap) {
                     Action::Quit => {
                         save_playback_state(&player, &now_playing, &app.queue);
                         break;
