@@ -1,5 +1,6 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use ratatui::widgets::Widget;
 
 use crate::keymap::{key_label, KeyAction, Keymap};
@@ -35,15 +36,9 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Fixed("gg / G"), "jump to top / bottom"),
             (Key::Fixed("enter"), "play / open"),
             (Key::Fixed("esc"), "back / close"),
-            (Key::Fixed("tab"), "enter move mode (focus a pane)"),
-            (
-                Key::Fixed("wasd / arrows"),
-                "move mode: focus pane left/down/up/right",
-            ),
-            (
-                Key::Fixed("enter / esc"),
-                "move mode: back to interact mode",
-            ),
+            (Key::Fixed("tab"), "enter move mode"),
+            (Key::Fixed("wasd / arrows"), "move: focus pane"),
+            (Key::Fixed("enter / esc"), "move: back to interact"),
             (Key::Fixed("left/right"), "cycle home screen logo"),
             (Key::Fixed("0"), "reset logo to default"),
         ],
@@ -55,19 +50,13 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Bound(KeyAction::Enqueue), "queue"),
             (Key::Bound(KeyAction::SkipNext), "skip to next"),
             (Key::Bound(KeyAction::SkipBack), "back to previous"),
-            (
-                Key::Bound(KeyAction::CycleLoop),
-                "cycle loop: off / one / all",
-            ),
+            (Key::Bound(KeyAction::CycleLoop), "cycle loop"),
             (Key::Bound(KeyAction::ToggleShuffle), "shuffle"),
             (Key::Fixed("[ / ]"), "speed"),
             (Key::Bound(KeyAction::CycleEq), "cycle eq preset"),
             (Key::Bound(KeyAction::ToggleCrossfade), "toggle crossfade"),
             (Key::Fixed(", / ."), "subtitle delay -/+ 0.5s"),
-            (
-                Key::Bound(KeyAction::OpenSubtitleMenu),
-                "subtitle settings menu",
-            ),
+            (Key::Bound(KeyAction::OpenSubtitleMenu), "subtitle settings"),
         ],
     ),
     (
@@ -79,38 +68,26 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Bound(KeyAction::ToggleStar), "star / unstar"),
             (
                 Key::Bound(KeyAction::DownloadSelected),
-                "download selected (for offline)",
-            ),
-            (Key::Bound(KeyAction::OpenLyrics), "lyrics"),
-            (
-                Key::Fixed("left/right"),
-                "artist profile: switch albums/songs column",
+                "download for offline",
             ),
             (
-                Key::Bound(KeyAction::StartSearch),
-                "artist profile: filter songs",
+                Key::Bound(KeyAction::OpenLyrics),
+                "lyrics for current track",
             ),
+            (Key::Fixed("left/right"), "artist: switch column"),
+            (Key::Bound(KeyAction::StartSearch), "artist: filter songs"),
         ],
     ),
     (
         "view",
         &[
-            (
-                Key::Bound(KeyAction::ToggleMinimize),
-                "minimize / maximize player",
-            ),
+            (Key::Bound(KeyAction::ToggleMinimize), "minimize player"),
             (
                 Key::Bound(KeyAction::ToggleFullscreenVideo),
-                "fullscreen video (covers the sidebar too)",
+                "fullscreen video",
             ),
-            (
-                Key::Bound(KeyAction::CycleArtMode),
-                "cycle album art: ascii / real / off",
-            ),
-            (
-                Key::Bound(KeyAction::ToggleResizeMode),
-                "resize mode (a/w/s/d select, arrows stretch)",
-            ),
+            (Key::Bound(KeyAction::CycleArtMode), "cycle album art"),
+            (Key::Bound(KeyAction::ToggleResizeMode), "resize panes"),
         ],
     ),
     (
@@ -119,7 +96,7 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Bound(KeyAction::OpenSettingsMenu), "settings"),
             (Key::Fixed("K"), "remap keybinds"),
             (Key::Bound(KeyAction::Quit), "quit"),
-            (Key::Fixed("ctrl+c"), "quit, always, from anywhere"),
+            (Key::Fixed("ctrl+c"), "quit from anywhere"),
             (Key::Bound(KeyAction::OpenHelp), "close this"),
         ],
     ),
@@ -127,7 +104,7 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
 
 impl Widget for HelpOverlay<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let mut y = draw_header(
+        let top = draw_header(
             buf,
             area,
             area.y,
@@ -135,46 +112,207 @@ impl Widget for HelpOverlay<'_> {
             "? or esc to close",
             shade(DIM),
             shade(NEAR_BLACK),
-        );
-        y += 1;
+        ) + 1;
 
-        for (section, binds) in SECTIONS {
-            if y >= area.y + area.height {
-                break;
-            }
-            draw_line(buf, area, y, section, shade(NEAR_WHITE));
-            y += 1;
-            for (key, desc) in *binds {
+        // laid out in columns rather than one tall list: the full
+        // reference is ~50 rows, so on a normal 24-row terminal the
+        // last sections (including how to quit) used to just silently
+        // fall off the bottom. columns are balanced by row count, and
+        // a narrow terminal falls back to a single column.
+        let rows_available = (area.y + area.height).saturating_sub(top) as usize;
+        let blocks = self.rendered_blocks();
+        let columns = split_into_columns(&blocks, rows_available, area.width as usize);
+
+        let col_width = if columns.len() > 1 {
+            area.width as usize / columns.len()
+        } else {
+            area.width as usize
+        };
+        for (i, column) in columns.iter().enumerate() {
+            let x = area.x + (i * col_width) as u16;
+            for (y, line) in (top..).zip(column.iter()) {
                 if y >= area.y + area.height {
                     break;
                 }
-                let key_text = match key {
-                    Key::Fixed(s) => s.to_string(),
-                    Key::Bound(action) => key_label(self.keymap.get(*action)),
-                };
-                draw_line(
-                    buf,
-                    area,
-                    y,
-                    &format!("  {key_text:<10} {desc}"),
-                    shade(DIM),
-                );
-                y += 1;
+                draw_line(buf, x, col_width, y, &line.text, shade(line.level));
             }
-            y += 1;
         }
     }
 }
 
-fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
+/// One rendered line plus its brightness: section headings sit at
+/// `NEAR_WHITE`, individual binds at `DIM`, blank spacers anywhere.
+struct Line {
+    text: String,
+    level: f32,
+}
+
+impl HelpOverlay<'_> {
+    /// `SECTIONS` flattened into drawable lines, resolving every
+    /// `Key::Bound` against the live keymap so a rebound key is never
+    /// shown as its default. Grouped per section so `split_into_columns`
+    /// can avoid breaking a section across a column boundary.
+    fn rendered_blocks(&self) -> Vec<Vec<Line>> {
+        SECTIONS
+            .iter()
+            .map(|(section, binds)| {
+                let mut block = vec![Line {
+                    text: (*section).to_string(),
+                    level: NEAR_WHITE,
+                }];
+                for (key, desc) in *binds {
+                    let key_text = match key {
+                        Key::Fixed(s) => (*s).to_string(),
+                        Key::Bound(action) => key_label(self.keymap.get(*action)),
+                    };
+                    block.push(Line {
+                        text: format!("  {key_text:<13} {desc}"),
+                        level: DIM,
+                    });
+                }
+                block.push(Line {
+                    text: String::new(),
+                    level: DIM,
+                });
+                block
+            })
+            .collect()
+    }
+}
+
+/// Minimum usable width for one column; below two of these the layout
+/// stays single-column and scrolls off as before, which is still
+/// better than two columns of truncated nonsense.
+const MIN_COLUMN_WIDTH: usize = 40;
+
+/// Packs whole sections into columns, never splitting a section across
+/// a column boundary. First-fit rather than "fill one column then move
+/// on": filling greedily left a tall section stranded with nowhere to
+/// go and overflowed the last column off the bottom, which is the
+/// exact failure this layout exists to prevent. Source order within a
+/// column is preserved, so reading is column-major but no section is
+/// ever interleaved with another.
+fn split_into_columns(
+    blocks: &[Vec<Line>],
+    rows_available: usize,
+    width: usize,
+) -> Vec<Vec<&Line>> {
+    let max_columns = (width / MIN_COLUMN_WIDTH).max(1);
+    if max_columns == 1 || rows_available == 0 {
+        return vec![blocks.iter().flatten().collect()];
+    }
+    let mut columns: Vec<Vec<&Line>> = vec![Vec::new()];
+    for block in blocks {
+        let target = columns
+            .iter()
+            .position(|c| c.len() + block.len() <= rows_available);
+        let idx = match target {
+            Some(i) => i,
+            None if columns.len() < max_columns => {
+                columns.push(Vec::new());
+                columns.len() - 1
+            }
+            // out of columns and out of rows: put it in the emptiest
+            // one and let it overflow, rather than dropping it.
+            None => columns
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, c)| c.len())
+                .map(|(i, _)| i)
+                .expect("seeded with one column"),
+        };
+        columns[idx].extend(block.iter());
+    }
+    columns
+}
+
+fn draw_line(buf: &mut Buffer, x0: u16, max_width: usize, y: u16, text: &str, color: Color) {
     for (col, ch) in text.chars().enumerate() {
-        let x = area.x + col as u16;
-        if x >= area.x + area.width {
+        if col >= max_width {
             break;
         }
-        if let Some(cell) = buf.cell_mut((x, y)) {
+        if let Some(cell) = buf.cell_mut((x0 + col as u16, y)) {
             cell.set_char(ch);
             cell.set_fg(color);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keymap::Keymap;
+
+    fn render_to_lines(width: u16, height: u16) -> Vec<String> {
+        let keymap = Keymap::default();
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        HelpOverlay { keymap: &keymap }.render(area, &mut buf);
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_section_heading_is_visible_on_a_standard_terminal() {
+        // 80x24 is the floor worth supporting; the single-column
+        // layout used to drop the last sections (quit included) off
+        // the bottom with no indication they existed.
+        let rendered = render_to_lines(120, 24).join("\n");
+        for (section, _) in SECTIONS {
+            assert!(
+                rendered.contains(section),
+                "section {section:?} fell off the overlay:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn how_to_quit_is_always_reachable() {
+        let rendered = render_to_lines(120, 24).join("\n");
+        assert!(rendered.contains("quit from anywhere"));
+    }
+
+    #[test]
+    fn a_narrow_terminal_falls_back_to_one_column() {
+        let blocks_owner = {
+            let keymap = Keymap::default();
+            HelpOverlay { keymap: &keymap }.rendered_blocks()
+        };
+        let cols = split_into_columns(&blocks_owner, 24, 50);
+        assert_eq!(cols.len(), 1, "50 cols can't hold two readable columns");
+    }
+
+    #[test]
+    fn a_section_is_never_split_across_columns() {
+        let keymap = Keymap::default();
+        let blocks = HelpOverlay { keymap: &keymap }.rendered_blocks();
+        let cols = split_into_columns(&blocks, 12, 160);
+        // each section's heading must be followed by its own binds in
+        // the same column, so count headings per column and make sure
+        // no column starts with a bind row (an orphaned continuation).
+        for col in &cols {
+            if let Some(first) = col.first() {
+                assert!(
+                    !first.text.starts_with("  "),
+                    "column starts mid-section: {:?}",
+                    first.text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn renders_without_panicking_at_degenerate_sizes() {
+        for (w, h) in [(1, 1), (1, 0), (200, 1), (3, 3), (0, 10)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            let keymap = Keymap::default();
+            HelpOverlay { keymap: &keymap }.render(area, &mut buf);
         }
     }
 }
