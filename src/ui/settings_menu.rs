@@ -5,8 +5,14 @@ use ratatui::widgets::Widget;
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
 
-pub const FIELD_COUNT: usize = 3;
-pub const FIELD_LABELS: [&str; FIELD_COUNT] = ["album art", "crossfade", "crossfade seconds"];
+pub const FIELD_COUNT: usize = 5;
+pub const FIELD_LABELS: [&str; FIELD_COUNT] = [
+    "album art",
+    "crossfade",
+    "crossfade seconds",
+    "cache after plays",
+    "cache eviction days",
+];
 
 /// Takes over the whole workspace (sidebar included, never the
 /// bottom bar) the same way the help overlay takes over the whole

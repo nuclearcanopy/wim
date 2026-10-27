@@ -1,6 +1,8 @@
 mod app;
 mod browse;
+mod cache;
 mod config;
+mod download;
 mod eq;
 mod favorites;
 mod keymap;
@@ -21,7 +23,7 @@ mod ui;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,6 +34,8 @@ use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 
 use app::{Action, LoopMode};
+use cache::CacheIndex;
+use download::DownloadEvent;
 use keymap::{KeyAction, Keymap};
 use layout::{PanelLayout, ResizePanel};
 use navmanager::{NavManager, NavManagerStep};
@@ -70,6 +74,22 @@ fn playable_path(item: &SearchItem) -> Option<String> {
         SearchItem::Song { id, client, .. } => Some(client.stream_url(id)),
         SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => None,
     }
+}
+
+/// Same as `playable_path`, but checks the local cache (see `cache.rs`)
+/// for a remote `Song` first: a valid cached file plays back instantly
+/// with no network round-trip at all, which is the entire payoff of
+/// caching in the first place. Falls through to `playable_path` (a
+/// stream url) whenever nothing's cached, or for anything that was
+/// never a candidate for caching to begin with.
+fn resolve_playable(item: &SearchItem, cache: &Arc<Mutex<CacheIndex>>) -> Option<String> {
+    if let SearchItem::Song { id, client, .. } = item {
+        if let Some(path) = cache.lock().ok().and_then(|idx| idx.cached_path(id)) {
+            return Some(path.to_string_lossy().into_owned());
+        }
+        return Some(client.stream_url(id));
+    }
+    playable_path(item)
 }
 
 /// Expands anything that represents more than one track into its
@@ -437,8 +457,12 @@ fn lyrics_query(item: &SearchItem) -> Option<(String, String, String)> {
 /// expected to have already run `item` through `resolve_tracks`, so in
 /// practice `playable_path` never actually returns `None` here; that
 /// arm only exists because `playable_path` is total over `SearchItem`.
-fn try_play(player: &mpv::Mpv, item: &SearchItem) -> (String, bool) {
-    match playable_path(item) {
+fn try_play(
+    player: &mpv::Mpv,
+    item: &SearchItem,
+    cache: &Arc<Mutex<CacheIndex>>,
+) -> (String, bool) {
+    match resolve_playable(item, cache) {
         Some(path) => match player.load_file(&path) {
             Ok(()) => {
                 set_vid_for_item(player, item);
@@ -473,8 +497,8 @@ fn set_vid_for_item(player: &mpv::Mpv, item: &SearchItem) {
 /// was already loaded, otherwise queues gaplessly; mpv auto-advances
 /// its own playlist on end-of-file with none of the round-trip gap that
 /// reactively reloading on our end would introduce).
-fn try_enqueue(player: &mpv::Mpv, item: &SearchItem) -> String {
-    match playable_path(item) {
+fn try_enqueue(player: &mpv::Mpv, item: &SearchItem, cache: &Arc<Mutex<CacheIndex>>) -> String {
+    match resolve_playable(item, cache) {
         Some(path) => match player.playlist_append(&path) {
             Ok(()) => format!("queued: {}", label(item)),
             Err(e) => format!("error queuing file: {e}"),
@@ -486,12 +510,12 @@ fn try_enqueue(player: &mpv::Mpv, item: &SearchItem) -> String {
 /// Resyncs mpv's upcoming playlist to `items` (e.g. after a shuffle)
 /// without disturbing whatever's currently playing; mpv's own
 /// `playlist-clear` semantics already preserve the current file.
-fn resync_queue(player: &mpv::Mpv, items: &[SearchItem]) -> String {
+fn resync_queue(player: &mpv::Mpv, items: &[SearchItem], cache: &Arc<Mutex<CacheIndex>>) -> String {
     if let Err(e) = player.playlist_clear() {
         return format!("error resyncing queue: {e}");
     }
     for item in items {
-        if let Some(path) = playable_path(item) {
+        if let Some(path) = resolve_playable(item, cache) {
             if let Err(e) = player.playlist_append(&path) {
                 return format!("error resyncing queue: {e}");
             }
@@ -524,6 +548,20 @@ fn save_playback_state(player: &mpv::Mpv, now_playing: &Option<SearchItem>, queu
 /// `app.queue`, desyncing the two; replaying `previous_track` directly
 /// keeps everything flowing through the one path we already control.
 /// Only ever tracks one step back, not a full history.
+/// Bundles everything the auto/manual download paths need to touch:
+/// the shared cache index, the channel to report progress back on,
+/// and the set of track ids currently mid-transfer. One struct instead
+/// of four separate parameters, mostly so `go_to_previous` (which
+/// already takes half a dozen other params) doesn't trip clippy's
+/// too-many-arguments lint; see `note_playback_started`/
+/// `trigger_downloads`, which take the same bundle.
+struct DownloadCtx<'a> {
+    cache: &'a Arc<Mutex<CacheIndex>>,
+    download_tx: &'a mpsc::Sender<DownloadEvent>,
+    downloading: &'a mut HashSet<String>,
+    listens_threshold: u32,
+}
+
 fn go_to_previous(
     cfg: &config::Config,
     player: &mpv::Mpv,
@@ -531,21 +569,133 @@ fn go_to_previous(
     now_playing: &mut Option<SearchItem>,
     previous_track: &mut Option<SearchItem>,
     queue: &mut Vec<SearchItem>,
+    dctx: &mut DownloadCtx,
 ) -> String {
     let Some(prev) = previous_track.take() else {
         return "no previous track".to_string();
     };
-    let (status, played) = try_play(player, &prev);
+    let (status, played) = try_play(player, &prev, dctx.cache);
     if played {
         if let Some(interrupted) = now_playing.take() {
             queue.insert(0, interrupted);
         }
         maybe_fetch_subtitles(cfg, player, notifications, &prev);
+        note_playback_started(&prev, dctx, notifications);
         *now_playing = Some(prev);
     } else {
         *previous_track = Some(prev);
     }
     status
+}
+
+/// Called every time a remote song actually starts playing (every
+/// `now_playing`-replacing call site threads this through): bumps its
+/// play count and, once that crosses `dctx.listens_threshold`, kicks
+/// off a background download so the track is cached for next time
+/// (see `cache.rs`/`download.rs`). A no-op for local items (never
+/// cached at all) and for anything already cached or already
+/// mid-download.
+///
+/// This is also the one call site a future scrobble submission
+/// (ListenBrainz, separate work happening elsewhere) would hook into:
+/// by the time this runs, the track has definitely started playing.
+fn note_playback_started(
+    item: &SearchItem,
+    dctx: &mut DownloadCtx,
+    notifications: &mut Notifications,
+) {
+    let SearchItem::Song {
+        id,
+        title,
+        artist,
+        client,
+        ..
+    } = item
+    else {
+        return;
+    };
+    let (count, already_cached) = match dctx.cache.lock() {
+        Ok(mut idx) => {
+            let count = idx.record_play(id);
+            let _ = idx.save();
+            (count, idx.cached_path(id).is_some())
+        }
+        Err(_) => return,
+    };
+    if count < dctx.listens_threshold || already_cached || dctx.downloading.contains(id) {
+        return;
+    }
+    dctx.downloading.insert(id.clone());
+    let track_label = format!("{title} · {artist}");
+    notifications.push_progress(id.clone(), track_label.clone());
+    download::spawn_tracks(
+        vec![(id.clone(), track_label, client.stream_url(id))],
+        dctx.cache.clone(),
+        dctx.download_tx.clone(),
+    );
+}
+
+/// Backs the manual download keybind (`KeyAction::DownloadSelected`):
+/// expands `item` the same way playing it would (`resolve_tracks`, so
+/// an album/playlist/artist downloads every song in it), downloads
+/// every remote song in the result concurrently (one thread each, see
+/// `download::spawn_tracks`), and skips anything already cached,
+/// already downloading, or not actually a remote track (local files
+/// are already local, nothing to cache).
+fn trigger_downloads(
+    item: &SearchItem,
+    dctx: &mut DownloadCtx,
+    notifications: &mut Notifications,
+) -> String {
+    let tracks = match resolve_tracks(item) {
+        Ok(t) => t,
+        Err(msg) => return msg,
+    };
+    let mut batch = Vec::new();
+    let mut already_cached = 0;
+    let mut in_flight = 0;
+    for t in &tracks {
+        let SearchItem::Song {
+            id,
+            title,
+            artist,
+            client,
+            ..
+        } = t
+        else {
+            continue;
+        };
+        let cached = dctx
+            .cache
+            .lock()
+            .ok()
+            .is_some_and(|idx| idx.cached_path(id).is_some());
+        if cached {
+            already_cached += 1;
+            continue;
+        }
+        if dctx.downloading.contains(id) {
+            in_flight += 1;
+            continue;
+        }
+        dctx.downloading.insert(id.clone());
+        let track_label = format!("{title} · {artist}");
+        notifications.push_progress(id.clone(), track_label.clone());
+        batch.push((id.clone(), track_label, client.stream_url(id)));
+    }
+    let queued = batch.len();
+    if queued > 0 {
+        download::spawn_tracks(batch, dctx.cache.clone(), dctx.download_tx.clone());
+    }
+    if queued > 0 {
+        format!("downloading {queued} track(s)")
+    } else if already_cached > 0 {
+        "already cached".to_string()
+    } else if in_flight > 0 {
+        "already downloading".to_string()
+    } else {
+        "nothing to download (local files are already local)".to_string()
+    }
 }
 
 /// `(elapsed, duration, paused)` for whatever's currently loaded;
@@ -594,6 +744,23 @@ fn audio_level(player: &mpv::Mpv, phase: f32) -> f32 {
 /// re-fetches every configured server, so navidrome stays "constantly
 /// updating" without the user ever pressing a manual refresh key.
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(45);
+
+/// How often the main loop re-sweeps the download cache for stale
+/// (unplayed past `cfg.cache_eviction_days`) files, on top of the
+/// sweep that always runs once at startup; cheap local filesystem
+/// work, not worth its own background thread the way network sync is.
+const CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Deletes every cached file past `cfg.cache_eviction_days` unplayed;
+/// best-effort, same as every other cache operation (a failed save
+/// just means the eviction is re-attempted next sweep).
+fn sweep_cache(cache: &Arc<Mutex<CacheIndex>>, eviction_days: u64) {
+    if let Ok(mut idx) = cache.lock() {
+        if idx.sweep_stale(eviction_days.saturating_mul(24 * 3600)) > 0 {
+            let _ = idx.save();
+        }
+    }
+}
 
 /// How often the embedded video pane pulls a fresh frame from mpv;
 /// each pull is an IPC round-trip plus a base64 decode, not free, and
@@ -989,6 +1156,21 @@ fn main() -> anyhow::Result<()> {
     // ring (just truncate the front) rather than growing forever.
     let mut level_history: Vec<f32> = Vec::new();
     let mut notifications = Notifications::default();
+    // track play counts/last-played/on-disk cache state (cache.rs);
+    // shared with background download threads, so it's behind a
+    // mutex rather than owned outright the way `app`/`player` are.
+    let cache_index = Arc::new(Mutex::new(cache::CacheIndex::load()));
+    sweep_cache(&cache_index, cfg.cache_eviction_days);
+    let mut last_cache_sweep = Instant::now();
+    // per-track download progress, reported back from whichever
+    // thread `download::spawn_tracks` spawned (see
+    // `spawn_background_sync` for the same pattern applied to
+    // navidrome sync instead); polled every frame, same as `sync_rx`.
+    let (download_tx, download_rx) = mpsc::channel::<DownloadEvent>();
+    // track ids with a download already in flight, so a second play
+    // crossing the threshold (or a second manual download press)
+    // doesn't kick off a duplicate transfer of the same file.
+    let mut downloading: HashSet<String> = HashSet::new();
     let lyrics_client = lyrics::Client::new();
     let mut lyrics_lines: Option<Vec<String>> = None;
     let mut lyrics_scroll: usize = 0;
@@ -1093,17 +1275,24 @@ fn main() -> anyhow::Result<()> {
             .as_deref()
             .and_then(persistence::item_from_path)
         {
-            if try_play(&player, &item).1 {
+            if try_play(&player, &item, &cache_index).1 {
                 if let Some(pos) = saved.position_secs {
                     let _ = player.seek(pos, false);
                 }
                 maybe_fetch_subtitles(&cfg, &player, &mut notifications, &item);
+                let mut dctx = DownloadCtx {
+                    cache: &cache_index,
+                    download_tx: &download_tx,
+                    downloading: &mut downloading,
+                    listens_threshold: cfg.cache_listens_threshold,
+                };
+                note_playback_started(&item, &mut dctx, &mut notifications);
                 now_playing = Some(item);
             }
         }
         for queued_path in &saved.queue_paths {
             if let Some(item) = persistence::item_from_path(queued_path) {
-                let _ = try_enqueue(&player, &item);
+                let _ = try_enqueue(&player, &item, &cache_index);
                 app.queue.push(item);
             }
         }
@@ -1541,10 +1730,18 @@ fn main() -> anyhow::Result<()> {
                     format!("{art_mode_label} ('i' also cycles this)"),
                     if crossfade_enabled { "on" } else { "off" }.to_string(),
                     format!("{:.1}s", cfg.crossfade_seconds),
+                    format!("{} plays", cfg.cache_listens_threshold),
+                    format!("{} days", cfg.cache_eviction_days),
                 ];
                 f.render_widget(
                     ui::settings_menu::SettingsMenu {
-                        values: [values[0].as_str(), values[1].as_str(), values[2].as_str()],
+                        values: [
+                            values[0].as_str(),
+                            values[1].as_str(),
+                            values[2].as_str(),
+                            values[3].as_str(),
+                            values[4].as_str(),
+                        ],
                         selected: settings_menu_selected,
                     },
                     top,
@@ -1685,6 +1882,13 @@ fn main() -> anyhow::Result<()> {
                     let s = format!("now playing: {}", label(&next));
                     set_vid_for_item(&player, &next);
                     maybe_fetch_subtitles(&cfg, &player, &mut notifications, &next);
+                    let mut dctx = DownloadCtx {
+                        cache: &cache_index,
+                        download_tx: &download_tx,
+                        downloading: &mut downloading,
+                        listens_threshold: cfg.cache_listens_threshold,
+                    };
+                    note_playback_started(&next, &mut dctx, &mut notifications);
                     previous_track = now_playing.replace(next);
                     s
                 }
@@ -1696,13 +1900,20 @@ fn main() -> anyhow::Result<()> {
                 None if app.loop_mode == LoopMode::All && !original_queue.is_empty() => {
                     let mut tracks = original_queue.clone().into_iter();
                     let first = tracks.next().expect("checked non-empty above");
-                    let (s, played) = try_play(&player, &first);
+                    let (s, played) = try_play(&player, &first, &cache_index);
                     if played {
                         let rest: Vec<SearchItem> = tracks.collect();
                         for t in &rest {
-                            let _ = try_enqueue(&player, t);
+                            let _ = try_enqueue(&player, t, &cache_index);
                         }
                         maybe_fetch_subtitles(&cfg, &player, &mut notifications, &first);
+                        let mut dctx = DownloadCtx {
+                            cache: &cache_index,
+                            download_tx: &download_tx,
+                            downloading: &mut downloading,
+                            listens_threshold: cfg.cache_listens_threshold,
+                        };
+                        note_playback_started(&first, &mut dctx, &mut notifications);
                         previous_track = now_playing.replace(first);
                         app.queue = rest;
                     }
@@ -1783,6 +1994,41 @@ fn main() -> anyhow::Result<()> {
                         notifications
                             .push(Severity::Alert, format!("{} went offline: {msg}", sr.url));
                     }
+                }
+            }
+        }
+
+        if last_cache_sweep.elapsed() >= CACHE_SWEEP_INTERVAL {
+            sweep_cache(&cache_index, cfg.cache_eviction_days);
+            last_cache_sweep = Instant::now();
+        }
+
+        // drain whatever any in-flight download (auto or manual) has
+        // reported since the last frame; `downloading` only ever
+        // tracks ids currently mid-transfer, so both terminal variants
+        // remove the id regardless of success/failure.
+        while let Ok(event) = download_rx.try_recv() {
+            match event {
+                DownloadEvent::Progress {
+                    id,
+                    downloaded,
+                    total,
+                } => notifications.update_progress(&id, downloaded, total),
+                DownloadEvent::Done { id, label } => {
+                    downloading.remove(&id);
+                    notifications.finish_progress(
+                        &id,
+                        Severity::Info,
+                        format!("downloaded: {label}"),
+                    );
+                }
+                DownloadEvent::Failed { id, label, error } => {
+                    downloading.remove(&id);
+                    notifications.finish_progress(
+                        &id,
+                        Severity::Error,
+                        format!("download failed: {label}: {error}"),
+                    );
                 }
             }
         }
@@ -2093,6 +2339,20 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 2 => {
                             cfg.crossfade_seconds = (cfg.crossfade_seconds + 0.5).clamp(1.0, 15.0);
                         }
+                        KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 3 => {
+                            cfg.cache_listens_threshold =
+                                cfg.cache_listens_threshold.saturating_sub(1).max(1);
+                        }
+                        KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 3 => {
+                            cfg.cache_listens_threshold = (cfg.cache_listens_threshold + 1).min(20);
+                        }
+                        KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 4 => {
+                            cfg.cache_eviction_days =
+                                cfg.cache_eviction_days.saturating_sub(1).max(1);
+                        }
+                        KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 4 => {
+                            cfg.cache_eviction_days = (cfg.cache_eviction_days + 1).min(90);
+                        }
                         _ => {}
                     }
                     continue;
@@ -2284,7 +2544,7 @@ fn main() -> anyhow::Result<()> {
                                 }
                                 Field::Shuffle => {
                                     let items = app.toggle_shuffle_and_get_queue();
-                                    let msg = resync_queue(&player, &items);
+                                    let msg = resync_queue(&player, &items, &cache_index);
                                     if msg.starts_with("error") {
                                         status = msg;
                                     } else {
@@ -2404,11 +2664,11 @@ fn main() -> anyhow::Result<()> {
                             let session: Vec<SearchItem> = bv.tracks[bv.selected..].to_vec();
                             let mut tracks = session.clone().into_iter();
                             if let Some(first) = tracks.next() {
-                                let (s, played) = try_play(&player, &first);
+                                let (s, played) = try_play(&player, &first, &cache_index);
                                 if played {
                                     let rest: Vec<SearchItem> = tracks.collect();
                                     for t in &rest {
-                                        let _ = try_enqueue(&player, t);
+                                        let _ = try_enqueue(&player, t, &cache_index);
                                     }
                                     maybe_fetch_subtitles(
                                         &cfg,
@@ -2416,6 +2676,13 @@ fn main() -> anyhow::Result<()> {
                                         &mut notifications,
                                         &first,
                                     );
+                                    let mut dctx = DownloadCtx {
+                                        cache: &cache_index,
+                                        download_tx: &download_tx,
+                                        downloading: &mut downloading,
+                                        listens_threshold: cfg.cache_listens_threshold,
+                                    };
+                                    note_playback_started(&first, &mut dctx, &mut notifications);
                                     previous_track = now_playing.replace(first);
                                     app.queue = rest;
                                     original_queue = session;
@@ -2442,6 +2709,27 @@ fn main() -> anyhow::Result<()> {
                                             msg
                                         }
                                     };
+                            }
+                        }
+                        // whole-album download when the artist view's
+                        // ALBUMS column has focus (every song on that
+                        // album), the single selected track otherwise;
+                        // same albums_focused/song-list split `enter`
+                        // already uses just above.
+                        _ if key.code == keymap.get(KeyAction::DownloadSelected) => {
+                            let target = if bv.albums_focused {
+                                bv.albums.get(bv.albums_selected).cloned()
+                            } else {
+                                bv.tracks.get(bv.selected).cloned()
+                            };
+                            if let Some(item) = target {
+                                let mut dctx = DownloadCtx {
+                                    cache: &cache_index,
+                                    download_tx: &download_tx,
+                                    downloading: &mut downloading,
+                                    listens_threshold: cfg.cache_listens_threshold,
+                                };
+                                status = trigger_downloads(&item, &mut dctx, &mut notifications);
                             }
                         }
                         _ => {}
@@ -2575,6 +2863,12 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if key.code == keymap.get(KeyAction::SkipBack) && previous_track.is_some() {
+                    let mut dctx = DownloadCtx {
+                        cache: &cache_index,
+                        download_tx: &download_tx,
+                        downloading: &mut downloading,
+                        listens_threshold: cfg.cache_listens_threshold,
+                    };
                     status = go_to_previous(
                         &cfg,
                         &player,
@@ -2582,6 +2876,7 @@ fn main() -> anyhow::Result<()> {
                         &mut now_playing,
                         &mut previous_track,
                         &mut app.queue,
+                        &mut dctx,
                     );
                     continue;
                 }
@@ -2602,6 +2897,28 @@ fn main() -> anyhow::Result<()> {
                                 msg
                             }
                         },
+                        None => "nothing selected".to_string(),
+                    };
+                    continue;
+                }
+
+                if key.code == keymap.get(KeyAction::DownloadSelected) {
+                    // the browse-view-and-focused case is handled
+                    // inside its own intercept above; this runs
+                    // whenever nothing's being browsed, or something
+                    // is but the sidebar has focus, so it's always
+                    // the sidebar's own selected search result here
+                    // (same split `ToggleStar` already uses).
+                    status = match app.results.get(app.selected).cloned() {
+                        Some(item) => {
+                            let mut dctx = DownloadCtx {
+                                cache: &cache_index,
+                                download_tx: &download_tx,
+                                downloading: &mut downloading,
+                                listens_threshold: cfg.cache_listens_threshold,
+                            };
+                            trigger_downloads(&item, &mut dctx, &mut notifications)
+                        }
                         None => "nothing selected".to_string(),
                     };
                     continue;
@@ -2685,10 +3002,10 @@ fn main() -> anyhow::Result<()> {
                             }
                             Ok(mut tracks) => {
                                 let first = tracks.remove(0);
-                                let (s, played) = try_play(&player, &first);
+                                let (s, played) = try_play(&player, &first, &cache_index);
                                 if played {
                                     for t in &tracks {
-                                        let _ = try_enqueue(&player, t);
+                                        let _ = try_enqueue(&player, t, &cache_index);
                                     }
                                     let rest = tracks.len();
                                     original_queue = std::iter::once(first.clone())
@@ -2700,6 +3017,13 @@ fn main() -> anyhow::Result<()> {
                                         &mut notifications,
                                         &first,
                                     );
+                                    let mut dctx = DownloadCtx {
+                                        cache: &cache_index,
+                                        download_tx: &download_tx,
+                                        downloading: &mut downloading,
+                                        listens_threshold: cfg.cache_listens_threshold,
+                                    };
+                                    note_playback_started(&first, &mut dctx, &mut notifications);
                                     previous_track = now_playing.replace(first);
                                     app.queue = tracks;
                                     // a standalone play (not from an
@@ -2727,7 +3051,7 @@ fn main() -> anyhow::Result<()> {
                             Ok(tracks) => {
                                 let mut last_status = String::new();
                                 for t in &tracks {
-                                    last_status = try_enqueue(&player, t);
+                                    last_status = try_enqueue(&player, t, &cache_index);
                                 }
                                 let n = tracks.len();
                                 app.queue.extend(tracks);
@@ -2744,7 +3068,7 @@ fn main() -> anyhow::Result<()> {
                         };
                     }
                     Action::QueueReordered(items) => {
-                        let msg = resync_queue(&player, &items);
+                        let msg = resync_queue(&player, &items, &cache_index);
                         if msg.starts_with("error") {
                             status = msg;
                         } else {
