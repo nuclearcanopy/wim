@@ -965,9 +965,9 @@ struct RemoteSearchOutcome {
 /// song titles are deliberately never indexed up front (a library's
 /// songs could be enormous; see that function's own comment), so
 /// without this, searching a song by title only ever worked by
-/// coincidence. Same shape as `spawn_background_sync` — pure network
+/// coincidence. Same shape as `spawn_background_sync`: pure network
 /// I/O on its own thread, result handed back over a channel, main
-/// thread owns all the `!Send` state — just triggered by query changes
+/// thread owns all the `!Send` state; just triggered by query changes
 /// instead of a fixed timer.
 ///
 /// Results aren't tagged with the query they answer and are merged
