@@ -80,14 +80,11 @@ const MENU: &[(&str, &str)] = &[
 /// permanent footer line, which read as the app announcing a number
 /// nobody asked for every time this screen was on; 'I' surfaces it on
 /// demand instead. `phase`/`elapsed` are advanced by the caller each
-/// tick. `logo_index` selects which of `logo_lines`' entries to draw;
-/// `focused` shows the `<`/`>` cycle hint, only meaningful while the
-/// workspace actually has navigation focus (see `main::Focus`).
+/// tick. `logo_index` selects which of `logo_lines`' entries to draw.
 pub struct Banner {
     pub phase: f32,
     pub elapsed_secs: f32,
     pub logo_index: usize,
-    pub focused: bool,
 }
 
 /// 0..1, slow breathing.
@@ -108,15 +105,13 @@ impl Widget for Banner {
 
         let pulse = pulse_level(self.elapsed_secs);
 
-        if self.focused {
-            let arrow_y = logo_start_y + glyph_height / 2;
-            if start_x > area.x {
-                put(buf, start_x - 1, arrow_y, '<', shade(NEAR_WHITE));
-            }
-            let right_x = start_x + total_width;
-            if right_x < area.x + area.width {
-                put(buf, right_x, arrow_y, '>', shade(NEAR_WHITE));
-            }
+        let arrow_y = logo_start_y + glyph_height / 2;
+        if start_x > area.x {
+            put(buf, start_x - 1, arrow_y, '<', shade(NEAR_WHITE));
+        }
+        let right_x = start_x + total_width;
+        if right_x < area.x + area.width {
+            put(buf, right_x, arrow_y, '>', shade(NEAR_WHITE));
         }
 
         for (row_idx, row) in lines.iter().enumerate() {
