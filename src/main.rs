@@ -20,6 +20,7 @@ mod search;
 mod subsonic;
 mod term;
 mod theme;
+mod trace;
 mod ui;
 
 use std::collections::{HashMap, HashSet};
@@ -1325,11 +1326,13 @@ fn eq_label(app: &app::App) -> &'static str {
 }
 
 fn main() -> anyhow::Result<()> {
+    trace::init();
     let is_first_run = !config::config_path()?.exists();
     let mut cfg = config::load_or_init()?;
     let corpus = rebuild_corpus(&cfg);
 
     let player = mpv::Mpv::spawn()?;
+    trace::mark("mpv spawned");
     // per-track normalization is the sensible default; mpv reads the
     // gain from each file's own embedded tags as it plays.
     player.set_replaygain("track")?;
