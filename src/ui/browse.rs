@@ -10,6 +10,7 @@ use crate::search::SearchItem;
 use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::albumart::AsciiArt;
 use crate::ui::header::draw_header;
+use crate::ui::results_list::draw_header_row;
 use crate::ui::searchbox::SearchBox;
 use crate::ui::textfit::truncate_with_ellipsis;
 
@@ -89,8 +90,13 @@ impl Widget for BrowseListView<'_> {
         }
 
         let has_art = self.view.art.is_some() && self.art_mode != ArtMode::Off;
-        let (art_rect, list_area) =
-            crate::browse::layout(area, has_art, self.view.bio.is_some(), self.cell_aspect);
+        let (art_rect, list_area) = crate::browse::layout(
+            area,
+            has_art,
+            self.view.bio.is_some(),
+            self.view.is_artist,
+            self.cell_aspect,
+        );
         let y = list_area.y;
         if let (Some(rect), ArtMode::Ascii) = (art_rect, self.art_mode) {
             AsciiArt {
@@ -116,6 +122,7 @@ impl Widget for BrowseListView<'_> {
             &(0..self.view.tracks.len()).collect::<Vec<_>>(),
             self.view.selected,
             true,
+            self.view.show_track_artist,
             self.favorites,
             self.remote_starred,
         );
@@ -129,7 +136,10 @@ impl BrowseListView<'_> {
     /// (`view.albums_focused`, see main.rs).
     fn render_artist_columns(&self, area: Rect, buf: &mut Buffer) {
         let cols = Layout::horizontal([Constraint::Percentage(35), Constraint::Min(0)]).split(area);
-        let albums_rect = cols[0];
+        let album_rows =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(cols[0]);
+        draw_header_row(buf, album_rows[0], album_rows[0].y, "ALBUMS");
+        let albums_rect = album_rows[1];
         let songs_col = cols[1];
 
         if self.view.albums.is_empty() {
@@ -144,16 +154,21 @@ impl BrowseListView<'_> {
             );
         }
 
-        let song_rows =
-            Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(songs_col);
+        let song_rows = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(songs_col);
+        draw_header_row(buf, song_rows[0], song_rows[0].y, "SONGS");
         SearchBox {
             query: &self.view.filter_query,
             editing: self.view.filtering,
             cursor_visible: self.cursor_visible,
         }
-        .render(song_rows[0], buf);
+        .render(song_rows[1], buf);
 
-        let songs_rect = song_rows[1];
+        let songs_rect = song_rows[2];
         let visible = self.view.visible_track_indices();
         if visible.is_empty() {
             let msg = if self.view.filter_query.is_empty() {
@@ -171,6 +186,7 @@ impl BrowseListView<'_> {
             &visible,
             self.view.selected,
             !self.view.albums_focused,
+            self.view.show_track_artist,
             self.favorites,
             self.remote_starred,
         );
@@ -227,6 +243,7 @@ fn draw_track_list(
     indices: &[usize],
     selected: usize,
     focused: bool,
+    show_artist: bool,
     favorites: &Favorites,
     remote_starred: &HashSet<String>,
 ) {
@@ -248,7 +265,8 @@ fn draw_track_list(
         let is_selected = idx == selected;
         let marker = if is_selected { "> " } else { "  " };
         let label = match track {
-            SearchItem::Song { title, artist, .. } => format!("{title} · {artist}"),
+            SearchItem::Song { title, artist, .. } if show_artist => format!("{title} · {artist}"),
+            SearchItem::Song { title, .. } => title.clone(),
             _ => String::new(),
         };
         let star = if is_starred(track, favorites, remote_starred) {

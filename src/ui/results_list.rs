@@ -222,7 +222,7 @@ impl Widget for ResultsList<'_> {
 /// it visually meets the sidebar's own vertical divider immediately
 /// to its right (see main.rs's matching junction mark at this same
 /// row).
-fn draw_header_row(buf: &mut Buffer, area: Rect, y: u16, label: &str) {
+pub(crate) fn draw_header_row(buf: &mut Buffer, area: Rect, y: u16, label: &str) {
     let rule_color = shade(NEAR_BLACK);
     for col in 0..area.width {
         if let Some(cell) = buf.cell_mut((area.x + col, y)) {
