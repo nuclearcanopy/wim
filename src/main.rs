@@ -1272,7 +1272,6 @@ fn main() -> anyhow::Result<()> {
                         phase,
                         elapsed_secs,
                         logo_index,
-                        focused: focus == Focus::Workspace,
                     },
                     main_content,
                 );
@@ -1702,6 +1701,21 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                // every block below intercepts specific keys and
+                // unconditionally `continue`s even on a non-match
+                // (browse_view/lyrics/the subtitle+settings menus
+                // especially), so this has to be the very next check
+                // after the modal-overlay ones above, not somewhere
+                // later where new handlers keep getting inserted
+                // ahead of it (which is exactly how 't'/'u' ended up
+                // leaking into a query being typed instead of landing
+                // in the text box): editing a query claims every key,
+                // full stop, before anything else gets a chance at it.
+                if app.editing_query {
+                    app.handle_key(key.code);
+                    continue;
+                }
+
                 if subtitle_menu_open {
                     match key.code {
                         KeyCode::Char('t') | KeyCode::Esc => {
@@ -1784,23 +1798,15 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // every other block below intercepts specific keys and
-                // unconditionally `continue`s even on a non-match
-                // (browse_view/lyrics especially), so a query typed
-                // while either was open got half-swallowed, half
-                // misrouted into playback shortcuts instead of
-                // reaching the text box. One early, unconditional gate
-                // here: editing a query claims every key, full stop.
-                if app.editing_query {
-                    app.handle_key(key.code);
-                    continue;
-                }
-
                 if matches!(key.code, KeyCode::Char('A' | 'W')) {
                     focus = Focus::Sidebar;
                     continue;
                 }
-                if matches!(key.code, KeyCode::Char('S' | 'D')) {
+                // not 'S' here: it was already taken (starred songs,
+                // below) before this feature existed, and this check
+                // runs first and unconditionally continues, which
+                // made that handler dead code until this fix.
+                if key.code == KeyCode::Char('D') {
                     focus = Focus::Workspace;
                     continue;
                 }
@@ -1834,13 +1840,17 @@ fn main() -> anyhow::Result<()> {
 
                 // same condition the render side uses to decide the
                 // banner is what's actually on screen (not the full
-                // player, a browse view, or lyrics); cycling the logo
-                // only makes sense while it's visible and the
-                // workspace actually has navigation focus.
+                // player, a browse view, or lyrics). Not gated on
+                // workspace focus: left/right have no other binding
+                // while the banner's showing regardless of which pane
+                // has focus (sidebar navigation uses j/k/up/down, not
+                // left/right), and gating it on a focus state that
+                // defaults to Sidebar meant the feature did nothing
+                // and showed no `<`/`>` hint at all out of the box.
                 let banner_showing = (now_playing.is_none() || player_minimized)
                     && browse_view.is_none()
                     && lyrics_lines.is_none();
-                if banner_showing && focus == Focus::Workspace {
+                if banner_showing {
                     match key.code {
                         KeyCode::Left => {
                             logo_index = (logo_index + ui::banner::logo_count() - 1)
