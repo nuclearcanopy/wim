@@ -10,7 +10,7 @@ use ratatui::Terminal;
 /// construction, restores all three on drop (including on panic, via a
 /// hook installed here) so a crash never leaves the user's shell in a
 /// broken state. Bracketed paste matters specifically for the
-/// navidrome password field — without it, a terminal's native paste
+/// navidrome password field; without it, a terminal's native paste
 /// (e.g. from a password manager) isn't reliably delivered as a single
 /// `Event::Paste`, and raw keystroke synthesis isn't guaranteed either.
 pub struct TerminalGuard {

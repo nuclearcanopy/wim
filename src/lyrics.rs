@@ -1,4 +1,4 @@
-//! Auto lyrics lookup via lrclib.net — free, no api key required, so
+//! Auto lyrics lookup via lrclib.net; free, no api key required, so
 //! there's no reason to ship without this by default. See
 //! docs/features.md.
 
@@ -62,7 +62,7 @@ impl Client {
 
     /// Fuzzy fallback for when we don't have an exact duration (e.g. a
     /// local file lofty couldn't read duration from) or `get` found
-    /// nothing — never dead-end on a missing duration tag the way an
+    /// nothing; never dead-end on a missing duration tag the way an
     /// exact-match-only lookup would. Returns the first match, if any.
     pub fn search(&self, artist: &str, track: &str) -> anyhow::Result<Option<Lyrics>> {
         let results: Vec<Lyrics> = self

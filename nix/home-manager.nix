@@ -27,7 +27,7 @@ let
         description = ''
           Path to a file containing the Navidrome password (e.g. an
           agenix secret), trailing newline trimmed. Required to
-          actually authenticate — there is no plaintext-password option
+          actually authenticate; there is no plaintext-password option
           by design.
         '';
       };
@@ -46,7 +46,7 @@ in
 
     # a list, not a single server: wim merges every configured server
     # into one unified search corpus rather than picking an "active"
-    # one — see ROADMAP.md. the in-app 'n' profile manager can add more
+    # one; see ROADMAP.md. the in-app 'n' profile manager can add more
     # on top of whatever's declared here.
     navidromeServers = mkOption {
       type = types.listOf (types.submodule navidromeServerModule);
