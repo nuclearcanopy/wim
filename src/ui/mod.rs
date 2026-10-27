@@ -7,6 +7,7 @@ pub mod header;
 pub mod help;
 pub mod helpbox;
 pub mod login;
+pub mod logos;
 pub mod lyrics_view;
 pub mod miniplayer;
 pub mod nav_manager;
