@@ -17,6 +17,15 @@ pub struct NavidromeConfig {
     /// Path to a file containing the password (trailing newline trimmed).
     #[serde(default)]
     pub password_file: Option<String>,
+    /// Server-side transcoding already happens by default per
+    /// navidrome's own configured profile; these are optional
+    /// client-side overrides (e.g. a bandwidth-constrained connection
+    /// to this specific server) sent as `stream` request params.
+    /// `None` means "don't override, use the server's default."
+    #[serde(default)]
+    pub max_bitrate_kbps: Option<u32>,
+    #[serde(default)]
+    pub transcode_format: Option<String>,
 }
 
 impl NavidromeConfig {

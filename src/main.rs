@@ -578,6 +578,8 @@ fn navidrome_config_from_form(form: &LoginForm) -> config::NavidromeConfig {
         username: form.username.clone(),
         password: Some(form.password.clone()),
         password_file: None,
+        max_bitrate_kbps: None,
+        transcode_format: None,
     }
 }
 
