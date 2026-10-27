@@ -34,7 +34,7 @@ impl Widget for EqMenu<'_> {
             area,
             area.y,
             "eq",
-            "esc to close",
+            "enter: apply preset, h/l: nudge band, esc: close",
             shade(DIM),
             shade(NEAR_BLACK),
         );

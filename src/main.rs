@@ -903,10 +903,12 @@ fn adjust_subtitle_field(sub: &mut config::SubtitleConfig, field: usize, dir: f6
     }
 }
 
-/// Landing on a preset row of the eq menu (via j/k) applies it
-/// immediately, same effect as pressing the bare `CycleEq` key would
-/// have for that one preset; a no-op when `row` is a band row
-/// instead, since adjusting those is `adjust_eq_band`'s job.
+/// Enter on a preset row of the eq menu applies it, same effect as
+/// pressing the bare `CycleEq` key would have for that one preset; a
+/// no-op when `row` is a band row instead, since adjusting those is
+/// `adjust_eq_band`'s job. Deliberately not wired to j/k: this
+/// overwrites all ten gains, which is not something plain navigation
+/// should ever do.
 fn apply_eq_preset_row(app: &mut app::App, player: &mpv::Mpv, row: usize) {
     if row >= eq::PRESETS.len() {
         return;
@@ -2834,13 +2836,20 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     match key.code {
+                        // clamped, not wrapped, and a preset is only
+                        // applied on enter: landing on one with j/k
+                        // used to apply it instantly, so scrolling off
+                        // the last band wrapped around to "flat" and
+                        // silently overwrote all ten hand-tuned gains,
+                        // which esc then saved.
                         KeyCode::Char('j') | KeyCode::Down => {
-                            eq_menu_selected = (eq_menu_selected + 1) % ui::eq_menu::ROW_COUNT;
-                            apply_eq_preset_row(&mut app, &player, eq_menu_selected);
+                            eq_menu_selected =
+                                (eq_menu_selected + 1).min(ui::eq_menu::ROW_COUNT - 1);
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
-                            eq_menu_selected = (eq_menu_selected + ui::eq_menu::ROW_COUNT - 1)
-                                % ui::eq_menu::ROW_COUNT;
+                            eq_menu_selected = eq_menu_selected.saturating_sub(1);
+                        }
+                        KeyCode::Enter => {
                             apply_eq_preset_row(&mut app, &player, eq_menu_selected);
                         }
                         KeyCode::Char('h') | KeyCode::Left
