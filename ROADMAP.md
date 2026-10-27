@@ -88,8 +88,11 @@ playing audio level visualizer, resuming playback state). read
       (think `cava`) fitting the monochrome custom-painted aesthetic
       already established. genuinely loved in the terminal-tool space
       this app lives in, not a stretch feature.
-- [ ] playback state persistence: resume queue/position/volume across
-      restarts.
+- [x] playback state persistence (`src/persistence.rs`): resumes
+      queue/now-playing/position/volume across restarts via plain
+      paths under `$XDG_STATE_HOME/wim/state.toml`, best-effort both
+      directions (missing file, gone path, or a failed save are all
+      silently fine, not errors).
 - [x] replaygain: mpv reads embedded tags itself once `replaygain=track`
       is set — enabled by default at startup, no extraction needed on
       our end for local files. subsonic's replayGain fields for remote
