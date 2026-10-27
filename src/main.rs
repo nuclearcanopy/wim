@@ -24,7 +24,7 @@ mod trace;
 mod ui;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -929,10 +929,13 @@ fn adjust_eq_band(app: &mut app::App, player: &mpv::Mpv, band: usize, dir: f64) 
 
 /// A completed background sync attempt for one server, tagged by url
 /// since several servers' results arrive interleaved on the same
-/// channel with no other way to tell them apart.
+/// channel with no other way to tell them apart. Carries the starred
+/// song ids too: they used to be fetched synchronously before the
+/// first frame, and they ride the connection this thread is already
+/// making rather than needing one of their own.
 struct BackgroundSyncResult {
     url: String,
-    result: Result<FetchedCatalog, String>,
+    result: NavidromeEverything,
 }
 
 /// How long to let rapid keystrokes settle before actually firing a
@@ -1038,7 +1041,10 @@ fn spawn_background_search(
 /// across this boundary, so this only ever does pure network I/O and
 /// hands the result back rather than touching app state directly.
 /// `servers_rx` lets the main thread push an updated server list (add/
-/// remove a profile) without restarting the thread.
+/// remove a profile) without restarting the thread. This is also the
+/// initial connect: it fetches first and waits afterwards, so a
+/// configured server is reached as fast as the network allows without
+/// anything on the main thread blocking on it.
 fn spawn_background_sync(
     initial_servers: Vec<config::NavidromeConfig>,
     result_tx: mpsc::Sender<BackgroundSyncResult>,
@@ -1046,22 +1052,18 @@ fn spawn_background_sync(
 ) {
     thread::spawn(move || {
         let mut servers = initial_servers;
+        let mut first_pass = true;
         loop {
-            match servers_rx.recv_timeout(AUTO_SYNC_INTERVAL) {
-                Ok(updated) => servers = updated,
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-            // same reasoning as the startup fetch: independent
-            // per-server requests, so run them concurrently rather
-            // than making every server wait for the one before it.
+            // independent per-server requests, so run them
+            // concurrently rather than making every server wait for
+            // the one before it.
             let results: Vec<BackgroundSyncResult> = thread::scope(|scope| {
                 servers
                     .iter()
                     .map(|nav| {
                         (
                             nav.url.clone(),
-                            scope.spawn(|| fetch_navidrome_catalog(nav)),
+                            scope.spawn(|| fetch_navidrome_everything(nav)),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1074,10 +1076,19 @@ fn spawn_background_sync(
                     })
                     .collect()
             });
+            if first_pass && !servers.is_empty() {
+                trace::mark("navidrome: first sync landed");
+                first_pass = false;
+            }
             for result in results {
                 if result_tx.send(result).is_err() {
                     return; // main thread is gone (shutting down)
                 }
+            }
+            match servers_rx.recv_timeout(AUTO_SYNC_INTERVAL) {
+                Ok(updated) => servers = updated,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
             }
         }
     });
@@ -1231,12 +1242,30 @@ fn navidrome_config_from_form(form: &LoginForm) -> config::NavidromeConfig {
     }
 }
 
+/// What an empty corpus is still waiting on, or `None` once both the
+/// local scan and the first server sync have reported in. Startup fills
+/// the corpus from two background threads, so "nothing found" is only
+/// honest after both have answered; until then this says which. Kept
+/// short enough to fit the sidebar's width without being truncated
+/// (see `ui::results_list`).
+fn loading_message(scanning_library: bool, syncing_servers: bool) -> Option<&'static str> {
+    match (scanning_library, syncing_servers) {
+        (true, true) => Some("loading library..."),
+        (true, false) => Some("scanning local library..."),
+        (false, true) => Some("connecting to navidrome..."),
+        (false, false) => None,
+    }
+}
+
 /// What the results list should say instead of rendering nothing when
 /// there's nothing to show; a blank screen with no explanation is a
 /// dead end, never the right default.
 fn empty_results_message(app: &app::App) -> String {
     if app.corpus.is_empty() {
-        "no local music/video found: check library_paths in config, or set up navidrome (n)"
+        loading_message(app.scanning_library, app.syncing_servers)
+            .unwrap_or(
+                "no local music/video found: check library_paths in config, or set up navidrome (n)",
+            )
             .to_string()
     } else if app.editing_query && !app.query.is_empty() {
         format!("no matches for \"{}\"", app.query)
@@ -1329,7 +1358,14 @@ fn main() -> anyhow::Result<()> {
     trace::init();
     let is_first_run = !config::config_path()?.exists();
     let mut cfg = config::load_or_init()?;
-    let corpus = rebuild_corpus(&cfg);
+    trace::mark("config loaded");
+    // the local scan is the biggest single startup cost (a blocking tag
+    // read per music file); it streams into the corpus from its own
+    // thread while the ui is already up, drained next to `sync_rx` in
+    // the main loop. nothing between here and the first frame waits on
+    // it. see docs/architecture.md.
+    let (scan_tx, scan_rx) = mpsc::channel::<library::ScanBatch>();
+    library::spawn_scan(cfg.library_paths.clone(), scan_tx);
 
     let player = mpv::Mpv::spawn()?;
     trace::mark("mpv spawned");
@@ -1345,7 +1381,11 @@ fn main() -> anyhow::Result<()> {
     // (universal navigation primitives, applied the same way
     // everywhere rather than individually named commands).
     let mut keymap = Keymap::from_overrides(&cfg.keybinds);
-    let mut app = app::App::new(corpus);
+    let mut app = app::App::new(search::Corpus::new());
+    // so the first frame says "scanning" rather than "no local music
+    // found"; cleared when the scan thread drops its sender. the
+    // server equivalent is set below.
+    app.scanning_library = true;
     // restores whichever eq state was last active (a named preset, or
     // a hand-tuned custom set) by name rather than a raw index, same
     // reasoning as `logo_style`; applied to mpv immediately so a
@@ -1382,8 +1422,10 @@ fn main() -> anyhow::Result<()> {
 
     let mut favorites = favorites::load();
     // song ids this session knows are starred, across every configured
-    // server; populated at startup and kept current on every manual
-    // toggle (not re-fetched constantly, starring is low-frequency).
+    // server; arrives with each background sync result and is kept
+    // current on every manual toggle. unioned rather than replaced, so
+    // a toggle can't be clobbered by a fetch that was already in
+    // flight when it happened.
     let mut remote_starred: HashSet<String> = HashSet::new();
 
     let mut now_playing: Option<SearchItem> = None;
@@ -1475,66 +1517,25 @@ fn main() -> anyhow::Result<()> {
     // `app.queue` itself is a live, shrinking FIFO, not a fixed list.
     let mut original_queue: Vec<SearchItem> = Vec::new();
 
-    // connect every configured server on startup; all of them feed
-    // the same unified corpus, there's no "active server" concept to
-    // pick between (consistent with search spanning everything). best
-    // effort: one server being down shouldn't block startup or hide
-    // the others.
     // tracks the last known reachability per server url, so the
     // background sync below only notifies on an actual transition
     // (going offline, coming back), not every single retry while a
     // server stays down.
     let mut server_reachable: HashMap<String, bool> = HashMap::new();
-    if !cfg.navidrome_servers.is_empty() {
-        // every configured server connects (catalog + starred songs)
-        // in parallel rather than one after another; applying each
-        // result to `app`/`remote_starred` still happens here on the
-        // main thread, sequentially, but that's pure in-memory work,
-        // not the network latency that actually made startup slow.
-        let results: Vec<(String, NavidromeEverything)> = thread::scope(|scope| {
-            cfg.navidrome_servers
-                .iter()
-                .map(|nav| {
-                    (
-                        nav.url.clone(),
-                        scope.spawn(|| fetch_navidrome_everything(nav)),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|(url, handle)| {
-                    let result = handle
-                        .join()
-                        .unwrap_or_else(|_| Err("panicked while connecting".to_string()));
-                    (url, result)
-                })
-                .collect()
-        });
+    // every configured server is connected by the background sync
+    // thread, never here: a round-trip per server before the first
+    // frame meant a stalled server could hold the whole ui at a black
+    // screen indefinitely. all of them feed the same unified corpus,
+    // there's no "active server" concept to pick between (consistent
+    // with search spanning everything), and each one's reachability is
+    // reported as it lands (see the `sync_rx` drain). 'I' shows a full
+    // local/per-server breakdown on demand instead of announcing a
+    // count unprompted on every startup.
+    app.syncing_servers = !cfg.navidrome_servers.is_empty();
 
-        for (url, result) in results {
-            let ok = match result {
-                Ok((catalog, starred)) => {
-                    merge_catalog_into_app(&mut app, catalog);
-                    remote_starred.extend(starred);
-                    true
-                }
-                Err(msg) => {
-                    // a failed reconnect must not be silent; push it
-                    // as its own notification rather than folding it
-                    // into a summary status line nobody asked for.
-                    notifications.push(Severity::Error, format!("{url}: {msg}"));
-                    false
-                }
-            };
-            server_reachable.insert(url, ok);
-        }
-        app.resync_results();
-        // 'I' shows a full local/per-server breakdown on demand
-        // instead of announcing a count unprompted on every startup.
-    }
-
-    // background re-sync so navidrome stays live without a manual
-    // refresh key ("constantly updating" per the spec).
+    // background re-sync, which also does the initial connect; keeps
+    // navidrome live without a manual refresh key ("constantly
+    // updating" per the spec).
     let (sync_tx, sync_rx) = mpsc::channel::<BackgroundSyncResult>();
     let (servers_tx, servers_rx) = mpsc::channel::<Vec<config::NavidromeConfig>>();
     spawn_background_sync(cfg.navidrome_servers.clone(), sync_tx, servers_rx);
@@ -2339,23 +2340,53 @@ fn main() -> anyhow::Result<()> {
             video_frame = None;
         }
 
+        // drain whatever the library scan thread read since the last
+        // frame, in batches rather than per file; the channel
+        // disconnecting is the scan thread signing off (it drops its
+        // sender), which is what clears the "scanning" message.
+        let mut scanned_batches = 0;
+        loop {
+            match scan_rx.try_recv() {
+                Ok(batch) => {
+                    app.corpus.add_local_tracks(batch);
+                    scanned_batches += 1;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    app.scanning_library = false;
+                    break;
+                }
+            }
+        }
+        if scanned_batches > 0 {
+            app.resync_results();
+        }
+
         // drain whatever the background sync thread finished since the
         // last frame; only notify on an actual offline/online
         // transition, not every retry while a server stays down.
         while let Ok(sr) = sync_rx.try_recv() {
+            // reported either way: a server that answered with an
+            // error has still answered, so nothing is left "connecting"
+            // forever.
+            app.syncing_servers = false;
             match sr.result {
-                Ok(catalog) => {
+                Ok((catalog, starred)) => {
                     merge_catalog_into_app(&mut app, catalog);
+                    remote_starred.extend(starred);
                     if server_reachable.insert(sr.url.clone(), true) == Some(false) {
                         notifications.push(Severity::Info, format!("{} is back online", sr.url));
                     }
                 }
-                Err(msg) => {
-                    if server_reachable.insert(sr.url.clone(), false) != Some(false) {
-                        notifications
-                            .push(Severity::Alert, format!("{} went offline: {msg}", sr.url));
-                    }
-                }
+                Err(msg) => match server_reachable.insert(sr.url.clone(), false) {
+                    // a server that's been unreachable since launch was
+                    // never online to go offline from; failing the
+                    // first connect is its own (never silent) message.
+                    None => notifications.push(Severity::Error, format!("{}: {msg}", sr.url)),
+                    Some(true) => notifications
+                        .push(Severity::Alert, format!("{} went offline: {msg}", sr.url)),
+                    Some(false) => {}
+                },
             }
         }
 
@@ -3710,5 +3741,40 @@ mod focus_tests {
             focus_in_direction(Focus::BottomBar, KeyCode::Right),
             Focus::BottomBar
         );
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn loading_message_names_whatever_is_still_in_flight() {
+        assert_eq!(loading_message(true, true), Some("loading library..."));
+        assert_eq!(
+            loading_message(true, false),
+            Some("scanning local library...")
+        );
+        assert_eq!(
+            loading_message(false, true),
+            Some("connecting to navidrome...")
+        );
+    }
+
+    #[test]
+    fn loading_message_is_none_once_both_sources_have_reported() {
+        assert_eq!(
+            loading_message(false, false),
+            None,
+            "with nothing pending, an empty corpus really is empty"
+        );
+    }
+
+    #[test]
+    fn loading_messages_fit_a_narrow_sidebar() {
+        for (scanning, syncing) in [(true, true), (true, false), (false, true)] {
+            let msg = loading_message(scanning, syncing).unwrap();
+            assert!(msg.len() <= 30, "{msg:?} would be truncated in the sidebar");
+        }
     }
 }
