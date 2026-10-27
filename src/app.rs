@@ -352,10 +352,15 @@ mod tests {
         // existing text, same as a real "type some, then paste more".
         let mut app = app_with_three_results();
         let keymap = Keymap::default();
+        // appends a word that's genuinely present in every fixture
+        // title ("matchable track N"), so the assertion exercises
+        // paste-triggers-a-real-refresh rather than leaning on the
+        // typo fallback's edit-distance slack (which got intentionally
+        // tightened; see search.rs's `edit_distance_budget`).
         let before = app.query.clone();
         app.handle_key(KeyCode::Char('/'), &keymap);
-        app.paste_into_query(" more");
-        assert_eq!(app.query, format!("{before} more"));
+        app.paste_into_query(" track");
+        assert_eq!(app.query, format!("{before} track"));
         assert_eq!(
             app.results.len(),
             3,
