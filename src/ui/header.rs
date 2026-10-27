@@ -35,10 +35,20 @@ pub fn draw_header(
     if rule_y < area.y + area.height {
         for col in 0..width {
             let x = area.x + col as u16;
-            let ch = if junction_col == Some(col) { '┬' } else { '─' };
+            // ┴ (stem up), not ┬ (stem down): the │ this connects to is
+            // in the row *above* the rule, so the joint must point up
+            // into it, not down into nothing. the junction cell also
+            // takes text_color, matching the │ above it, rather than
+            // the rule's dimmer color — it's visually a continuation of
+            // that vertical bar, not of the horizontal rule.
+            let (ch, color) = if junction_col == Some(col) {
+                ('┴', text_color)
+            } else {
+                ('─', rule_color)
+            };
             if let Some(cell) = buf.cell_mut((x, rule_y)) {
                 cell.set_char(ch);
-                cell.set_fg(rule_color);
+                cell.set_fg(color);
             }
         }
     }

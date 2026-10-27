@@ -284,7 +284,7 @@ fn main() -> anyhow::Result<()> {
                 Constraint::Length(1),
             ])
             .split(area);
-            f.render_widget(ui::divider::HorizontalRule, chunks[1]);
+            f.render_widget(ui::divider::HorizontalRule { highlighted: false }, chunks[1]);
 
             if let Some(nm) = &nav_manager {
                 match &nm.step {
@@ -466,8 +466,14 @@ fn main() -> anyhow::Result<()> {
                             }
                             KeyCode::Char(c) => form.current_mut().push(c),
                             KeyCode::Backspace => {
-                                form.current_mut().pop();
+                                if form.current_mut().is_empty() {
+                                    form.prev_field();
+                                } else {
+                                    form.current_mut().pop();
+                                }
                             }
+                            KeyCode::Up => form.prev_field(),
+                            KeyCode::Down => form.next_field_clamped(),
                             KeyCode::Tab => form.next_field(),
                             KeyCode::Enter if !form.is_last_field() => form.next_field(),
                             KeyCode::Enter => {
