@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -328,5 +328,45 @@ pub fn save(cfg: &Config) -> Result<()> {
     }
     let toml = toml::to_string_pretty(cfg)?;
     fs::write(&path, toml).with_context(|| format!("writing {}", path.display()))?;
+    restrict_to_owner(&path)?;
     Ok(())
+}
+
+/// 0600 on the config file: it holds navidrome passwords and a
+/// listenbrainz token in cleartext, and the default 0644 left those
+/// readable by every account on the machine. Applied on every save,
+/// not just creation, so an already-loose file gets tightened too.
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restricting permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn restrict_to_owner_drops_group_and_other_access() {
+        let dir = std::env::temp_dir().join(format!("wim-cfgtest-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        fs::write(&path, "x = 1\n").unwrap();
+        // start deliberately world-readable, the way a plain
+        // fs::write leaves it under the usual 022 umask.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        restrict_to_owner(&path).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config holds cleartext credentials");
+        fs::remove_dir_all(&dir).ok();
+    }
 }
