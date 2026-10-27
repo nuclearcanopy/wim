@@ -61,6 +61,48 @@ at it — don't mark it done on build+test passing alone.
       narrow terminal. contrast hierarchy fixed (dividers much dimmer
       than text, not the same brightness).
 
+## layout overhaul + artist/album browsing (explicit spec, do these in order — each depends on the one before)
+
+the current single-pane results list is a placeholder, not the real
+layout. the actual design:
+
+1. **sidebar + bottom bar layout.** left column: a boxed "search ..."
+   input (text replaced once typing starts) with results below it.
+   bottom: playback controls (not a one-line status string). the
+   sidebar is a vertical strip — only horizontally resizable. the
+   bottom bar is a horizontal strip — only vertically resizable. this
+   has to exist before anything else below makes sense.
+2. **resize mode.** a keybind enters it; wasd selects which panel
+   (sidebar/bottom bar/main content), arrow keys stretch the selected
+   panel along its one valid axis only (sidebar: left/right arrows
+   only; bottom bar: up/down only). esc or the same keybind exits.
+3. **result row icons**, one per kind, monochrome (unicode glyphs, not
+   color-coded — color is reserved per the monochrome rule): disc for
+   albums, musical note for songs, a "reel" glyph for video, plus a
+   *source* glyph layered on top — globe for navidrome/remote, folder
+   for local. e.g. an album row reads like
+   `( albumart? ) COLD VISIONS` with a disc glyph and a globe glyph.
+4. **artist profile view**: press enter (or a dedicated key) on an
+   artist to open a dedicated view, not just play/search. shows: a
+   bio (navidrome's own `getArtistInfo2` already proxies one from
+   last.fm, no separate api key needed — use that by default; true
+   genius-sourced bios would need a separate integration, logged in
+   QUESTIONS.md as a possible upgrade, not blocking this), albums in
+   chronological order, and **every song by that artist across every
+   album including compilations** — see the Global-album problem below.
+5. **album view**: spotify-style track listing when you open an album
+   from search or from an artist profile.
+6. **the "Global/Various Artists" compilation problem**: the
+   maintainer's real navidrome setup keeps every non-album single in
+   one giant compilation album ("Global") credited to "Various
+   Artists" per navidrome convention. an artist's profile must still
+   surface their songs out of that album. the fix: Subsonic's
+   `getAlbum(id)` returns each song with its own *track-level* `artist`
+   field, distinct from the album-level artist — when building an
+   artist's song list, don't filter by album artist, filter by each
+   song's own artist field. this works for any compilation album, not
+   just a hardcoded "Global" special case.
+
 ## next (roughly in order, pick whichever is actually unblocked)
 
 - [x] subsonic client (`src/subsonic.rs`): token auth, ping, search3,
