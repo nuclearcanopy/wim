@@ -55,7 +55,20 @@ impl Widget for BrowseListView<'_> {
             shade(NEAR_BLACK),
         );
 
-        let (art_rect, list_area) = crate::browse::layout(area, self.view.art.is_some());
+        if let (Some(bio), Some(rect)) = (
+            &self.view.bio,
+            crate::browse::bio_rect(area, self.view.bio.is_some()),
+        ) {
+            for (i, line) in crate::browse::wrap_bio(bio, rect.width as usize, rect.height as usize)
+                .into_iter()
+                .enumerate()
+            {
+                draw_line(buf, rect, rect.y + i as u16, &line, shade(DIM));
+            }
+        }
+
+        let (art_rect, list_area) =
+            crate::browse::layout(area, self.view.art.is_some(), self.view.bio.is_some());
         let y = list_area.y;
         if let (Some(rect), ArtMode::Ascii) = (art_rect, self.art_mode) {
             AsciiArt {
