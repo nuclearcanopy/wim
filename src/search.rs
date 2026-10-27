@@ -702,6 +702,91 @@ mod tests {
         );
     }
 
+    /// Deterministic (no rng) synthetic corpus for `bench_search`,
+    /// with realistic multi-word artist/album/title haystacks so the
+    /// whitespace-split typo pass sees a realistic word count per item.
+    fn synthetic_corpus(n: usize) -> Corpus {
+        const ARTISTS: [&str; 12] = [
+            "Bladee",
+            "Vangelis",
+            "Black Sabbath",
+            "Scorpions",
+            "Cigarettes After Sex",
+            "Metallica",
+            "Kanye West",
+            "Branimir Stulic",
+            "Selena Gomez",
+            "Aphex Twin",
+            "Boards of Canada",
+            "Godspeed You! Black Emperor",
+        ];
+        const ALBUMS: [&str; 12] = [
+            "Cold Visions",
+            "Blade Runner",
+            "Paranoid",
+            "Blackout",
+            "Crest",
+            "...And Justice for All",
+            "The College Dropout",
+            "Selected Ambient Works",
+            "Music Has the Right to Children",
+            "Lift Your Skinny Fists",
+            "Eversince",
+            "Icedancer",
+        ];
+        const TITLES: [&str; 12] = [
+            "Blade Runner Blues",
+            "Be Nice 2 Me",
+            "Who Goes There",
+            "Rewind",
+            "Tears of Joy",
+            "Obedient",
+            "Hotel Breakfast",
+            "Into Dust",
+            "Sunset Mall",
+            "Western Union",
+            "Decay",
+            "Drownin",
+        ];
+        let mut c = Corpus::new();
+        c.add_local_tracks((0..n).map(|i| LocalTrack {
+            path: PathBuf::from(format!("/music/{i:06}.flac")),
+            title: format!("{} {i}", TITLES[i % TITLES.len()]),
+            artist: Some(ARTISTS[(i / 7) % ARTISTS.len()].to_string()),
+            album: Some(ALBUMS[(i / 13) % ALBUMS.len()].to_string()),
+            duration_secs: None,
+            kind: MediaKind::Music,
+        }));
+        c
+    }
+
+    /// Not an assertion: prints per-query wall time, since absolute
+    /// numbers are machine-dependent. Run with
+    /// `cargo test --release -- --ignored --nocapture bench_search`.
+    /// "b" is the worst case for match count, "brainmir" for the
+    /// edit-distance fallback.
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_search() {
+        for size in [10_000usize, 100_000] {
+            let c = synthetic_corpus(size);
+            for query in ["b", "bla", "blade", "blade runner", "brainmir"] {
+                let iters: u32 = if size >= 100_000 { 5 } else { 20 };
+                let mut hits = 0usize;
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    hits += c.search(query).len();
+                }
+                let per = start.elapsed() / iters;
+                println!(
+                    "{size:>7} items  {:<14} {per:>12.3?}  ({} hits)",
+                    query,
+                    hits / iters as usize
+                );
+            }
+        }
+    }
+
     /// Mirror of the above: when nothing in the corpus is a strong
     /// match, the relative cutoff must not prune the list down to
     /// nothing/near-nothing; weak guesses are exactly what should show
