@@ -252,6 +252,7 @@ pub fn reserved_key_purpose(key: KeyCode) -> Option<&'static str> {
         KeyCode::Char('j') | KeyCode::Char('k') => "move selection",
         KeyCode::Char('g') | KeyCode::Char('G') => "jump to top / bottom",
         KeyCode::Char('K') => "the remap menu itself",
+        KeyCode::Char(':') => "the shellsong console",
         KeyCode::Enter => "play / open",
         KeyCode::Esc => "back / close",
         KeyCode::Tab => "move mode",
