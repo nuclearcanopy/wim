@@ -206,7 +206,7 @@ impl App {
     }
 
     /// Bracketed paste delivers the whole pasted string as one event,
-    /// not synthesized keystrokes — this is the paste-equivalent of
+    /// not synthesized keystrokes; this is the paste-equivalent of
     /// `handle_key_editing`'s char-push path, including the same
     /// results refresh. No-ops if the query isn't actually being
     /// edited (paste while browsing results does nothing, same as
@@ -218,7 +218,7 @@ impl App {
         }
     }
 
-    /// Re-filters `results` against the current query — call this
+    /// Re-filters `results` against the current query; call this
     /// after anything that mutates `corpus` out from under an already-
     /// typed query (e.g. navidrome connecting mid-session), or the
     /// displayed results silently go stale: they'd keep showing

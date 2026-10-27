@@ -97,7 +97,7 @@ impl Client {
 mod tests {
     use super::*;
 
-    // captured from a real lrclib.net /api/get response, trimmed —
+    // captured from a real lrclib.net /api/get response, trimmed;
     // exercises the real field names/shape without hitting the network
     // in tests.
     const SAMPLE_RESPONSE: &str = r#"{

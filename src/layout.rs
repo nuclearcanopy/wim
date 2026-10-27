@@ -1,6 +1,6 @@
 //! Panel sizing state: the sidebar is a vertical strip (only
 //! horizontally resizable), the bottom bar is a horizontal strip (only
-//! vertically resizable) — resize mode lets you select one with wasd
+//! vertically resizable); resize mode lets you select one with wasd
 //! and stretch it along its one valid axis with the arrow keys.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -47,7 +47,7 @@ pub enum AlbumArtMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Multiple servers, all merged into one unified search corpus —
+    /// Multiple servers, all merged into one unified search corpus;
     /// consistent with "search spans everything" rather than requiring
     /// an "active server" concept to switch between. Add via the 'n'
     /// profile manager; adding never replaces an existing one.
