@@ -365,17 +365,28 @@ fn fetch_cover_art(client: &subsonic::Client, album_id: &str) -> Option<image::D
     image::load_from_memory(&bytes).ok()
 }
 
+/// Whether the config names a graphics protocol outright, which is an
+/// explicit ask for real raster art; `auto` isn't one of those (it
+/// documents ascii as its starting point, with 'i' to switch).
+fn wants_real_art(mode: config::AlbumArtMode) -> bool {
+    matches!(
+        mode,
+        config::AlbumArtMode::Sixel | config::AlbumArtMode::Kitty | config::AlbumArtMode::Iterm2
+    )
+}
+
 /// `Auto`/`Blocks` both start in ascii (the strictly-monochrome
-/// default); `Sixel`/`Kitty`/`Iterm2` start in real-image mode since
-/// configuring one specifically is an explicit ask for it. `i` still
-/// cycles through all three regardless of where it started.
-fn initial_art_mode(mode: config::AlbumArtMode) -> browse::ArtMode {
+/// default); a named protocol starts in real-image mode, but only once
+/// the terminal has actually answered the graphics probe (see the
+/// `picker_rx` drain). Real mode with no `Picker` renders no art at
+/// all, so claiming it before the answer is in would mean an empty
+/// pane rather than the ascii fallback. `i` still cycles through all
+/// three regardless of where it started.
+fn art_mode_for_picker(mode: config::AlbumArtMode, protocol_detected: bool) -> browse::ArtMode {
     match mode {
-        config::AlbumArtMode::Auto | config::AlbumArtMode::Blocks => browse::ArtMode::Ascii,
-        config::AlbumArtMode::Sixel
-        | config::AlbumArtMode::Kitty
-        | config::AlbumArtMode::Iterm2 => browse::ArtMode::Real,
         config::AlbumArtMode::Off => browse::ArtMode::Off,
+        _ if wants_real_art(mode) && protocol_detected => browse::ArtMode::Real,
+        _ => browse::ArtMode::Ascii,
     }
 }
 
@@ -1457,8 +1468,12 @@ fn main() -> anyhow::Result<()> {
     // 'm' toggles it by hand either way.
     let mut player_minimized = false;
     // 'i' cycles ascii -> real -> off from here; this is just the
-    // config-driven starting point.
-    let mut art_mode = initial_art_mode(cfg.album_art);
+    // config-driven starting point, with the graphics probe still out
+    // (so never Real yet, see `art_mode_for_picker`). kept around so
+    // the probe landing can only upgrade a mode the user hasn't since
+    // cycled by hand.
+    let art_mode_pending = art_mode_for_picker(cfg.album_art, false);
+    let mut art_mode = art_mode_pending;
     // latest captured frame while playing a local video, rendered
     // through the same ascii pipeline as album art instead of mpv
     // opening its own window; `None` whenever nothing video is
@@ -1666,7 +1681,19 @@ fn main() -> anyhow::Result<()> {
     // queries the terminal over stdio for font-cell size and graphics
     // protocol support; best-effort, 'i' (real image mode) just stays
     // unavailable if this fails rather than erroring the whole app.
-    let mut picker = Picker::from_query_stdio().ok();
+    // on its own thread because the terminal may simply never answer,
+    // in which case ratatui-image waits out a full second: the single
+    // largest thing the first frame used to sit behind. spawned after
+    // raw mode is already on, since the probe saves and restores
+    // whatever termios state it finds.
+    let (picker_tx, picker_rx) = mpsc::channel::<Option<Picker>>();
+    thread::spawn(move || {
+        let _ = picker_tx.send(Picker::from_query_stdio().ok());
+        trace::mark("graphics probe answered");
+    });
+    let mut picker: Option<Picker> = None;
+    let mut picker_probed = false;
+    trace::mark("terminal ready");
     // rebuilt (not re-encoded every frame) whenever a newly-opened
     // album's art changes; `ratatui-image` owns the actual resize/
     // encode caching per protocol instance.
@@ -2385,6 +2412,31 @@ fn main() -> anyhow::Result<()> {
             }
         } else {
             video_frame = None;
+        }
+
+        // the terminal's answer to the graphics probe, or `None` if it
+        // never gave one. a config that named a protocol only gets
+        // real art from here on; until (or unless) this lands it stays
+        // ascii, and a terminal that stayed silent is said so out loud
+        // rather than leaving an art pane that never fills.
+        if !picker_probed {
+            match picker_rx.try_recv() {
+                Ok(probed) => {
+                    picker_probed = true;
+                    picker = probed;
+                    if art_mode == art_mode_pending {
+                        art_mode = art_mode_for_picker(cfg.album_art, picker.is_some());
+                    }
+                    if picker.is_none() && wants_real_art(cfg.album_art) {
+                        notifications.push(
+                            Severity::Alert,
+                            "album art: terminal reported no graphics protocol, using ascii",
+                        );
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => picker_probed = true,
+            }
         }
 
         // drain whatever the library scan thread read since the last
@@ -3817,6 +3869,51 @@ mod startup_tests {
             None,
             "with nothing pending, an empty corpus really is empty"
         );
+    }
+
+    #[test]
+    fn a_named_protocol_only_claims_real_art_once_the_probe_answers() {
+        assert_eq!(
+            art_mode_for_picker(config::AlbumArtMode::Kitty, true),
+            browse::ArtMode::Real
+        );
+        assert_eq!(
+            art_mode_for_picker(config::AlbumArtMode::Kitty, false),
+            browse::ArtMode::Ascii,
+            "real mode without a picker renders nothing at all"
+        );
+        assert_eq!(
+            art_mode_for_picker(config::AlbumArtMode::Sixel, false),
+            browse::ArtMode::Ascii
+        );
+    }
+
+    #[test]
+    fn auto_and_blocks_stay_ascii_whatever_the_probe_says() {
+        for detected in [true, false] {
+            assert_eq!(
+                art_mode_for_picker(config::AlbumArtMode::Auto, detected),
+                browse::ArtMode::Ascii
+            );
+            assert_eq!(
+                art_mode_for_picker(config::AlbumArtMode::Blocks, detected),
+                browse::ArtMode::Ascii
+            );
+            assert_eq!(
+                art_mode_for_picker(config::AlbumArtMode::Off, detected),
+                browse::ArtMode::Off
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_named_protocol_counts_as_asking_for_real_art() {
+        assert!(wants_real_art(config::AlbumArtMode::Kitty));
+        assert!(wants_real_art(config::AlbumArtMode::Sixel));
+        assert!(wants_real_art(config::AlbumArtMode::Iterm2));
+        assert!(!wants_real_art(config::AlbumArtMode::Auto));
+        assert!(!wants_real_art(config::AlbumArtMode::Blocks));
+        assert!(!wants_real_art(config::AlbumArtMode::Off));
     }
 
     #[test]
