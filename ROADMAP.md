@@ -80,10 +80,53 @@ at it; don't mark it done on build+test passing alone.
 - [x] blinking cursor block in the search box while editing
       (`src/ui/searchbox.rs`), classic terminal-style ~530ms blink.
 - [x] popup notification stack (`src/notify.rs`, `src/ui/notify.rs`):
-      top-right overlay, auto-dismissed after 5s, severity-coded by
-      brightness (not color) with i/⚠/✗ icons. wired into every
-      connectivity check, and playback/lyrics failures; routine
-      success feedback stays on the ambient status line.
+      bordered boxes stacked top-right, newest on top, each with its
+      own countdown baked into the bottom border (lifetime scales 3-10s
+      with message length); i/!/x ascii severity codes, brightness-
+      coded (not color). wired into every connectivity check, and
+      playback/lyrics failures; routine success feedback stays on the
+      ambient status line.
+- [x] background navidrome resync (`spawn_background_sync` in
+      `main.rs`): a dedicated thread re-fetches every configured
+      server every 45s so the catalog stays live without a manual
+      refresh key; tracks last-known reachability per server and only
+      notifies on an actual offline/online transition, not every retry
+      while one stays down.
+- [x] three-state loop (`app::LoopMode`, off/one/all) instead of a
+      binary toggle; "one" maps to mpv's own loop-file, "all" has no
+      mpv equivalent (it only sees its own playlist) so it's tracked as
+      our own queue snapshot (`original_queue`) and replayed from the
+      top once the queue empties with that mode active.
+- [x] starring (`src/favorites.rs`, `subsonic::Client::star`/`unstar`/
+      `get_starred_songs`): `*` stars/unstars whatever's hovered,
+      remote songs call navidrome's own star api (stays in sync with
+      any other subsonic client), local files fall back to a
+      persisted `favorites.toml`. `S` opens a "starred songs" view that
+      behaves like any other track listing, merging every server's
+      starred list with local favorites.
+- [x] real player screen (`src/ui/player.rs`, `src/ui/miniplayer.rs`):
+      title, elapsed/duration progress bar, loop/shuffle/speed/eq, and
+      previous/next in queue, polled fresh from mpv each frame.
+      maximized (default for a standalone play) takes over
+      `main_content`; minimized (default when playing from an open
+      album/playlist, or by hand via `m`) drops to a thin ipod-style
+      strip above the main bottom bar, spanning only `main_content`'s
+      width so it never slides under the sidebar. transport uses real
+      unicode media-control glyphs (⏮ ⏯ ⏭), not ascii stand-ins.
+- [x] album art (`src/ui/albumart.rs`, `ratatui-image`): fetched via
+      `getCoverArt` when an album opens. `i` toggles ascii (default;
+      grayscale block rasterization resampled fresh from the source
+      image at the panel's current size every render, so resizing the
+      terminal re-rasterizes at the new resolution for free, strictly
+      monochrome) vs. real (`ratatui-image`'s actual sixel/kitty/iterm2
+      protocols, auto-detected once at startup, falling back to
+      colored halfblocks if none is supported; that fallback isn't
+      monochrome, the explicit tradeoff of asking for real images).
+- [x] result row icons switched twice this round: unicode glyphs (◉/○
+      etc.) risked emoji-presentation fallback or ambiguous terminal
+      width depending on font, so both the row icons and the
+      notification severity icons settled on plain ascii (`[sk]`
+      bracket codes, `i`/`!`/`x`) instead.
 
 ## layout overhaul + artist/album browsing (explicit spec, do these in order; each depends on the one before)
 
@@ -92,20 +135,19 @@ layout. the actual design:
 
 1. [x] **sidebar + bottom bar layout.** boxed search box + results on
    the left (`src/ui/searchbox.rs`), multi-line playback bar on the
-   bottom (`src/ui/controlsbar.rs`), main content area for now-playing/
-   lyrics (`src/ui/nowplaying.rs`). sidebar only horizontally
-   resizable, bottom bar only vertically; nav manager/login stay
-   full-screen modals (setup flows, not core browsing).
-2. [x] **resize mode** (`src/layout.rs`, tested): `r` toggles it, `a`/`s`
-   select sidebar/bottom bar, arrow keys stretch along that panel's
-   one valid axis only (the other axis is a genuine no-op per panel).
-3. [x] **result row icons**, one per kind, monochrome (plain
-   text-presentation unicode glyphs, not emoji pictographs, since
-   those render as fixed-color bitmaps regardless of terminal fg
-   color; not color-coded either, per the monochrome rule): source
-   glyph first (○ remote, ● local), then kind glyph: ♪ songs/local
-   music, ▶ video, ◆ artist, ◎ album (vinyl rim+label, not the eye/
-   target look of a plain dotted circle), ≡ playlist.
+   bottom (`src/ui/controlsbar.rs`), main content area for the player/
+   album view/lyrics (`src/ui/player.rs`, `src/ui/browse.rs`,
+   `src/ui/lyrics_view.rs`). sidebar only horizontally resizable,
+   bottom bar only vertically (plus the mini player strip, vertically
+   fixed); nav manager/login stay full-screen modals (setup flows, not
+   core browsing).
+2. [x] **resize mode** (`src/layout.rs`, tested): `r` toggles it,
+   `a`/`w` and `s`/`d` select sidebar/bottom bar, arrow keys stretch
+   along that panel's one valid axis only (the other axis is a genuine
+   no-op per panel).
+3. [x] **result row icons**: `[sk]` plain-ascii bracket codes (source
+   letter + kind letter), not unicode glyphs; see the ascii-switch note
+   further up for why.
 4. **artist profile view**: press enter (or a dedicated key) on an
    artist to open a dedicated view, not just play/search. shows: a
    bio (navidrome's own `getArtistInfo2` already proxies one from
@@ -199,10 +241,9 @@ layout. the actual design:
       doesn't carry duration so local lookups always use the fuzzy
       /search endpoint rather than the exact /get one; both noted
       inline, not blocking, fine to revisit.
-- [ ] album art (`ratatui-image`): wire the `album_art` config mode
-      (auto/blocks/sixel/kitty/iterm2/off). `blocks` must desaturate to
-      grayscale to match the monochrome ui; other modes show true color
-      since that's real image data, not ui chrome.
+- [x] album art (`ratatui-image`): see the album art entry further up.
+      still open: no config-level default mode yet (always starts in
+      ascii; `i` toggles per-session, not persisted to config.toml).
 - [ ] video playback + opensubtitles: auto-fetch subs for local video.
       needs an opensubtitles api key from the maintainer; build the
       integration behind a config field, note in QUESTIONS.md that it
