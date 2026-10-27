@@ -79,6 +79,11 @@ at it; don't mark it done on build+test passing alone.
       server up front showing ✓/✗ per row.
 - [x] blinking cursor block in the search box while editing
       (`src/ui/searchbox.rs`), classic terminal-style ~530ms blink.
+- [x] popup notification stack (`src/notify.rs`, `src/ui/notify.rs`):
+      top-right overlay, auto-dismissed after 5s, severity-coded by
+      brightness (not color) with i/⚠/✗ icons. wired into every
+      connectivity check, and playback/lyrics failures; routine
+      success feedback stays on the ambient status line.
 
 ## layout overhaul + artist/album browsing (explicit spec, do these in order; each depends on the one before)
 
@@ -97,9 +102,10 @@ layout. the actual design:
 3. [x] **result row icons**, one per kind, monochrome (plain
    text-presentation unicode glyphs, not emoji pictographs, since
    those render as fixed-color bitmaps regardless of terminal fg
-   color; not color-coded either, per the monochrome rule): ♪ songs/
-   local music, ▶ video, ◆ artist, ◉ album, ≡ playlist, plus a hollow/
-   filled source glyph (○ remote, ● local) layered alongside.
+   color; not color-coded either, per the monochrome rule): source
+   glyph first (○ remote, ● local), then kind glyph: ♪ songs/local
+   music, ▶ video, ◆ artist, ◎ album (vinyl rim+label, not the eye/
+   target look of a plain dotted circle), ≡ playlist.
 4. **artist profile view**: press enter (or a dedicated key) on an
    artist to open a dedicated view, not just play/search. shows: a
    bio (navidrome's own `getArtistInfo2` already proxies one from
@@ -108,8 +114,15 @@ layout. the actual design:
    QUESTIONS.md as a possible upgrade, not blocking this), albums in
    chronological order, and **every song by that artist across every
    album including compilations**; see the Global-album problem below.
-5. **album view**: spotify-style track listing when you open an album
-   from search or from an artist profile.
+5. [x] **album/playlist view**: enter on an album or playlist opens a
+   scrollable track listing in `main_content` (`src/browse.rs`,
+   `src/ui/browse.rs`); title/artist/year for albums, title only for
+   playlists (no single artist). enter on a track plays from there to
+   the end of the list; esc returns `main_content` to whatever it'd
+   otherwise show (now-playing/lyrics/the idle banner). the quick-queue
+   key (`a`) still expands+queues the whole thing directly, no
+   browsing step. remote playback itself (stream urls, multi-server
+   client attribution per `SearchItem`) landed alongside this.
 6. **the "Global/Various Artists" compilation problem**: the
    maintainer's real navidrome setup keeps every non-album single in
    one giant compilation album ("Global") credited to "Various
