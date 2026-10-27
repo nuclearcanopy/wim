@@ -72,16 +72,22 @@ impl Mpv {
             .spawn()
             .context("spawning mpv; is it installed and on PATH?")?;
 
-        // mpv creates the socket asynchronously after startup.
+        // mpv creates the socket asynchronously after startup, usually
+        // 30-80ms in. a flat 20ms sleep per attempt spent most of that
+        // asleep past the socket actually being ready, so back off
+        // instead: 1ms doubling to 20ms, same ~1s total budget.
+        const CONNECT_BUDGET: Duration = Duration::from_secs(1);
+        const MAX_BACKOFF: Duration = Duration::from_millis(20);
         let sock = {
-            let mut attempt = 0;
+            let mut waited = Duration::ZERO;
+            let mut backoff = Duration::from_millis(1);
             loop {
                 match UnixStream::connect(&sock_path) {
                     Ok(s) => break s,
-                    Err(e) if attempt < 50 => {
-                        attempt += 1;
-                        thread::sleep(Duration::from_millis(20));
-                        let _ = e;
+                    Err(_) if waited < CONNECT_BUDGET => {
+                        thread::sleep(backoff);
+                        waited += backoff;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
                     }
                     Err(e) => return Err(e).context("connecting to mpv ipc socket"),
                 }
