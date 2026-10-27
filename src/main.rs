@@ -7,6 +7,7 @@ mod library;
 mod lyrics;
 mod mpv;
 mod navmanager;
+mod notify;
 mod onboarding;
 mod persistence;
 mod search;
@@ -24,6 +25,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use app::Action;
 use layout::{PanelLayout, ResizePanel};
 use navmanager::{NavManager, NavManagerStep};
+use notify::{Notifications, Severity};
 use onboarding::{Onboarding, Step};
 use search::SearchItem;
 use ui::banner::Banner;
@@ -33,6 +35,7 @@ use ui::divider::{HorizontalRule, VerticalRule};
 use ui::login::{LoginForm, LoginView};
 use ui::lyrics_view::LyricsView;
 use ui::nav_manager::NavManagerListView;
+use ui::notify::NotificationOverlay;
 use ui::nowplaying::NowPlayingView;
 use ui::onboarding::{ControlsView, DoneView, LibraryPathsView, WelcomeView};
 use ui::results_list::{label, ResultsList};
@@ -308,6 +311,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     let mut now_playing: Option<SearchItem> = None;
+    let mut notifications = Notifications::default();
     let lyrics_client = lyrics::Client::new();
     let mut lyrics_lines: Option<Vec<String>> = None;
     let mut lyrics_scroll: usize = 0;
@@ -325,22 +329,22 @@ fn main() -> anyhow::Result<()> {
         let mut failures = Vec::new();
         for nav in &cfg.navidrome_servers {
             if let Err(msg) = index_navidrome_server(&mut app, nav) {
-                failures.push(format!("{}: {msg}", nav.url));
+                // a failed reconnect must not be silent; the old
+                // behavior only updated `status` on success, so a down
+                // server at startup looked identical to "nothing
+                // configured", with no hint anything had gone wrong.
+                notifications.push(Severity::Error, format!("{}: {msg}", nav.url));
+                failures.push(nav.url.clone());
             }
         }
         app.resync_results();
         status = if failures.is_empty() {
             format!("{} items indexed (local + navidrome)", app.corpus.len())
         } else {
-            // a failed reconnect must not be silent; the old behavior
-            // only updated `status` on success, so a down server at
-            // startup looked identical to "nothing configured", with
-            // no hint anything had gone wrong.
             format!(
-                "{} items indexed; {} navidrome server(s) failed to connect: {}",
+                "{} items indexed; {} navidrome server(s) failed to connect",
                 app.corpus.len(),
-                failures.len(),
-                failures.join("; ")
+                failures.len()
             )
         };
     }
@@ -390,6 +394,7 @@ fn main() -> anyhow::Result<()> {
     let start = Instant::now();
     let mut guard = term::TerminalGuard::new()?;
     loop {
+        notifications.expire();
         guard.terminal.draw(|f| {
             let area = f.area();
 
@@ -410,6 +415,7 @@ fn main() -> anyhow::Result<()> {
                     }
                     Step::Done => f.render_widget(DoneView, area),
                 }
+                f.render_widget(NotificationOverlay { items: notifications.visible() }, area);
                 return;
             }
 
@@ -433,6 +439,7 @@ fn main() -> anyhow::Result<()> {
                         f.render_widget(LoginView { form, message: &nm.message }, area);
                     }
                 }
+                f.render_widget(NotificationOverlay { items: notifications.visible() }, area);
                 return;
             }
 
@@ -522,6 +529,7 @@ fn main() -> anyhow::Result<()> {
                 },
                 Rect { y: bottom.y + 1, height: bottom.height.saturating_sub(1), ..bottom },
             );
+            f.render_widget(NotificationOverlay { items: notifications.visible() }, area);
         })?;
 
         // non-blocking: mpv auto-advances its own playlist on
@@ -654,7 +662,10 @@ fn main() -> anyhow::Result<()> {
                                     nm.connection_status[nm.selected] = Some(result.is_ok());
                                     nm.message = match result {
                                         Ok(msg) => format!("reconnected: {msg}"),
-                                        Err(msg) => msg,
+                                        Err(msg) => {
+                                            notifications.push(Severity::Error, format!("{}: {msg}", nav.url));
+                                            msg
+                                        }
                                     };
                                 }
                                 _ => {}
@@ -681,6 +692,7 @@ fn main() -> anyhow::Result<()> {
                                 let nav = navidrome_config_from_form(form);
                                 match index_navidrome_server(&mut app, &nav) {
                                     Ok(msg) => {
+                                        notifications.push(Severity::Info, format!("connected: {}", nav.url));
                                         cfg.navidrome_servers.push(nav);
                                         let _ = config::save(&cfg);
                                         nm.connection_status.push(Some(true));
@@ -688,7 +700,10 @@ fn main() -> anyhow::Result<()> {
                                         nm.step = NavManagerStep::List;
                                         nm.message = format!("connected: {msg}");
                                     }
-                                    Err(msg) => nm.message = format!("{msg} (esc to go back)"),
+                                    Err(msg) => {
+                                        notifications.push(Severity::Error, format!("{}: {msg}", nav.url));
+                                        nm.message = format!("{msg} (esc to go back)");
+                                    }
                                 }
                             }
                             _ => {}
@@ -734,7 +749,6 @@ fn main() -> anyhow::Result<()> {
                             let mut tracks = bv.tracks[bv.selected..].to_vec().into_iter();
                             if let Some(first) = tracks.next() {
                                 let (s, played) = try_play(&player, &first);
-                                status = s;
                                 if played {
                                     let rest: Vec<SearchItem> = tracks.collect();
                                     for t in &rest {
@@ -742,7 +756,10 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     now_playing = Some(first);
                                     app.queue = rest;
+                                } else {
+                                    notifications.push(Severity::Error, s.clone());
                                 }
+                                status = s;
                             }
                         }
                         KeyCode::Esc | KeyCode::Char('q') => browse_view = None,
@@ -770,6 +787,11 @@ fn main() -> anyhow::Result<()> {
                 if key.code == KeyCode::Char('n') {
                     let mut nm = NavManager::new();
                     nm.connection_status = test_navidrome_connectivity(&cfg.navidrome_servers);
+                    for (nav, result) in cfg.navidrome_servers.iter().zip(&nm.connection_status) {
+                        if *result == Some(false) {
+                            notifications.push(Severity::Alert, format!("{} is unreachable", nav.url));
+                        }
+                    }
                     nav_manager = Some(nm);
                     continue;
                 }
@@ -789,7 +811,11 @@ fn main() -> anyhow::Result<()> {
                                         "lyrics loaded (j/k scroll, L/esc close)".to_string()
                                     }
                                     Ok(None) => "no lyrics found".to_string(),
-                                    Err(e) => format!("lyrics lookup failed: {e}"),
+                                    Err(e) => {
+                                        let msg = format!("lyrics lookup failed: {e}");
+                                        notifications.push(Severity::Error, msg.clone());
+                                        msg
+                                    }
                                 }
                             }
                             None => "no lyrics for this item".to_string(),
@@ -815,7 +841,10 @@ fn main() -> anyhow::Result<()> {
                                 browse_view = Some(bv);
                                 msg
                             }
-                            Err(msg) => msg,
+                            Err(msg) => {
+                                notifications.push(Severity::Error, msg.clone());
+                                msg
+                            }
                         };
                     }
                     Action::Play(item) => {
@@ -835,10 +864,14 @@ fn main() -> anyhow::Result<()> {
                                     app.queue = tracks;
                                     if rest == 0 { s } else { format!("{s} (+{rest} more queued)") }
                                 } else {
+                                    notifications.push(Severity::Error, s.clone());
                                     s
                                 }
                             }
-                            Err(msg) => msg,
+                            Err(msg) => {
+                                notifications.push(Severity::Error, msg.clone());
+                                msg
+                            }
                         };
                     }
                     Action::Queued(item) => {
@@ -852,7 +885,10 @@ fn main() -> anyhow::Result<()> {
                                 app.queue.extend(tracks);
                                 if n <= 1 { last_status } else { format!("queued {n} tracks") }
                             }
-                            Err(msg) => msg,
+                            Err(msg) => {
+                                notifications.push(Severity::Error, msg.clone());
+                                msg
+                            }
                         };
                     }
                     Action::QueueReordered(items) => status = resync_queue(&player, &items),
