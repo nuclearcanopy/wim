@@ -204,6 +204,19 @@ impl App {
         self.results = self.corpus.search(&self.query);
         self.selected = 0;
     }
+
+    /// Bracketed paste delivers the whole pasted string as one event,
+    /// not synthesized keystrokes — this is the paste-equivalent of
+    /// `handle_key_editing`'s char-push path, including the same
+    /// results refresh. No-ops if the query isn't actually being
+    /// edited (paste while browsing results does nothing, same as
+    /// typing a bare character would).
+    pub fn paste_into_query(&mut self, text: &str) {
+        if self.editing_query {
+            self.query.push_str(text);
+            self.refresh_results();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +252,28 @@ mod tests {
         assert_eq!(app.results.len(), 3);
         assert_eq!(app.selected, 0);
         assert!(!app.editing_query);
+    }
+
+    #[test]
+    fn paste_into_query_appends_and_refreshes_results() {
+        // fixture already types "matchable" into the query, then exits
+        // editing mode; re-enter it to test paste appending to the
+        // existing text, same as a real "type some, then paste more".
+        let mut app = app_with_three_results();
+        let before = app.query.clone();
+        app.handle_key(KeyCode::Char('/'));
+        app.paste_into_query(" more");
+        assert_eq!(app.query, format!("{before} more"));
+        assert_eq!(app.results.len(), 3, "pasted text must refresh results same as typing");
+    }
+
+    #[test]
+    fn paste_into_query_is_a_noop_when_not_editing() {
+        let mut app = app_with_three_results();
+        let before = app.query.clone();
+        assert!(!app.editing_query);
+        app.paste_into_query("should not append");
+        assert_eq!(app.query, before, "paste while not editing must not change the query");
     }
 
     #[test]

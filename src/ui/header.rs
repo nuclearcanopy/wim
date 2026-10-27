@@ -41,14 +41,13 @@ pub fn draw_header(
             // takes text_color, matching the │ above it, rather than
             // the rule's dimmer color — it's visually a continuation of
             // that vertical bar, not of the horizontal rule.
-            let (ch, color) = if junction_col == Some(col) {
-                ('┴', text_color)
-            } else {
-                ('─', rule_color)
-            };
+            // same color as the rest of the rule — the ┴ shape alone
+            // conveys the connection; a brightness jump just for one
+            // character reads as a stray artifact, not a joint.
+            let ch = if junction_col == Some(col) { '┴' } else { '─' };
             if let Some(cell) = buf.cell_mut((x, rule_y)) {
                 cell.set_char(ch);
-                cell.set_fg(color);
+                cell.set_fg(rule_color);
             }
         }
     }
