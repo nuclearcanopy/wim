@@ -1798,6 +1798,7 @@ fn main() -> anyhow::Result<()> {
                             main_content,
                             bv.art.is_some(),
                             bv.bio.is_some(),
+                            bv.is_artist,
                             aspect,
                         );
                         if let Some(rect) = art_rect {
