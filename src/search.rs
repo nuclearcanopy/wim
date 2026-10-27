@@ -6,21 +6,26 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 
 use crate::library::{LocalTrack, MediaKind};
-use crate::subsonic::{Album, Artist, Playlist, SearchResult as SubsonicSearchResult, Song};
+use crate::subsonic::{Album, Artist, Client, Playlist, SearchResult as SubsonicSearchResult, Song};
 
 #[derive(Debug, Clone)]
 pub enum SearchItem {
     LocalMusic { path: PathBuf, title: String, artist: Option<String>, album: Option<String> },
     LocalVideo { path: PathBuf, title: String },
-    Artist { id: String, name: String },
-    Album { id: String, name: String, artist: String },
-    Song { id: String, title: String, artist: String, album: String },
-    Playlist { id: String, name: String },
+    // every remote variant carries the client it came from; with
+    // multiple navidrome servers merged into one corpus and no "active
+    // server" concept, this is the only way playback later knows which
+    // server's credentials to build a stream url with.
+    Artist { id: String, name: String, client: Arc<Client> },
+    Album { id: String, name: String, artist: String, client: Arc<Client> },
+    Song { id: String, title: String, artist: String, album: String, client: Arc<Client> },
+    Playlist { id: String, name: String, client: Arc<Client> },
 }
 
 impl SearchItem {
@@ -44,7 +49,7 @@ impl SearchItem {
     }
 
     /// `Some((kind_tag, id))` for remote items, used to dedup against
-    /// what's already in the corpus — reconnecting the same server
+    /// what's already in the corpus; reconnecting the same server
     /// (manually, or via periodic auto-resync) must not just keep
     /// appending duplicates of every artist/album/playlist every time.
     /// `None` for local items, which aren't added repeatedly the same
@@ -105,32 +110,32 @@ impl Corpus {
             .collect()
     }
 
-    pub fn add_subsonic_search_result(&mut self, r: SubsonicSearchResult) {
+    pub fn add_subsonic_search_result(&mut self, r: SubsonicSearchResult, client: &Arc<Client>) {
         let mut seen = self.existing_remote_keys();
         for Artist { id, name } in r.artists {
             if seen.insert((0, id.clone())) {
-                self.items.push(SearchItem::Artist { id, name });
+                self.items.push(SearchItem::Artist { id, name, client: client.clone() });
             }
         }
         for Album { id, name, artist } in r.albums {
             if seen.insert((1, id.clone())) {
-                self.items.push(SearchItem::Album { id, name, artist });
+                self.items.push(SearchItem::Album { id, name, artist, client: client.clone() });
             }
         }
         for Song { id, title, artist, album, .. } in r.songs {
             if seen.insert((2, id.clone())) {
-                self.items.push(SearchItem::Song { id, title, artist, album });
+                self.items.push(SearchItem::Song { id, title, artist, album, client: client.clone() });
             }
         }
     }
 
-    pub fn add_playlists(&mut self, playlists: impl IntoIterator<Item = Playlist>) {
+    pub fn add_playlists(&mut self, playlists: impl IntoIterator<Item = Playlist>, client: &Arc<Client>) {
         let mut seen = self.existing_remote_keys();
         for Playlist { id, name } in playlists {
             if !seen.insert((3, id.clone())) {
                 continue;
             }
-            self.items.push(SearchItem::Playlist { id, name });
+            self.items.push(SearchItem::Playlist { id, name, client: client.clone() });
         }
     }
 
@@ -210,8 +215,25 @@ fn typo_score(distance: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::NavidromeConfig;
+
+    /// Never dialed; `Client::new` just builds the struct (ping/fetch
+    /// calls are separate), so this is safe to construct in tests with
+    /// no server and no network access.
+    fn test_client() -> Arc<Client> {
+        Arc::new(
+            Client::new(&NavidromeConfig {
+                url: "https://example.invalid".into(),
+                username: "test".into(),
+                password: Some("test".into()),
+                password_file: None,
+            })
+            .unwrap(),
+        )
+    }
 
     fn corpus() -> Corpus {
+        let client = test_client();
         let mut c = Corpus::new();
         c.add_local_tracks([LocalTrack {
             path: PathBuf::from("/music/blade runner ost.flac"),
@@ -221,33 +243,37 @@ mod tests {
             duration_secs: None,
             kind: MediaKind::Music,
         }]);
-        c.add_subsonic_search_result(SubsonicSearchResult {
-            artists: vec![Artist { id: "a1".into(), name: "Black Sabbath".into() }],
-            albums: vec![Album { id: "al1".into(), name: "Blackout".into(), artist: "Scorpions".into() }],
-            songs: vec![Song {
-                id: "s1".into(),
-                title: "Unrelated Track".into(),
-                artist: "Someone Else".into(),
-                album: "Other Album".into(),
-                duration: None,
-            }],
-        });
-        c.add_playlists([Playlist { id: "p1".into(), name: "black metal essentials".into() }]);
+        c.add_subsonic_search_result(
+            SubsonicSearchResult {
+                artists: vec![Artist { id: "a1".into(), name: "Black Sabbath".into() }],
+                albums: vec![Album { id: "al1".into(), name: "Blackout".into(), artist: "Scorpions".into() }],
+                songs: vec![Song {
+                    id: "s1".into(),
+                    title: "Unrelated Track".into(),
+                    artist: "Someone Else".into(),
+                    album: "Other Album".into(),
+                    duration: None,
+                }],
+            },
+            &client,
+        );
+        c.add_playlists([Playlist { id: "p1".into(), name: "black metal essentials".into() }], &client);
         c
     }
 
     #[test]
     fn reconnecting_the_same_server_does_not_duplicate_entries() {
+        let client = test_client();
         let mut c = Corpus::new();
         let result = || SubsonicSearchResult {
             artists: vec![Artist { id: "a1".into(), name: "Bladee".into() }],
             albums: vec![Album { id: "al1".into(), name: "Cold Visions".into(), artist: "Bladee".into() }],
             songs: vec![],
         };
-        c.add_subsonic_search_result(result());
-        c.add_subsonic_search_result(result()); // simulates a reconnect/periodic resync
-        c.add_playlists([Playlist { id: "p1".into(), name: "Drain Gang".into() }]);
-        c.add_playlists([Playlist { id: "p1".into(), name: "Drain Gang".into() }]);
+        c.add_subsonic_search_result(result(), &client);
+        c.add_subsonic_search_result(result(), &client); // simulates a reconnect/periodic resync
+        c.add_playlists([Playlist { id: "p1".into(), name: "Drain Gang".into() }], &client);
+        c.add_playlists([Playlist { id: "p1".into(), name: "Drain Gang".into() }], &client);
 
         assert_eq!(c.len(), 3, "one artist + one album + one playlist, not six");
     }
@@ -279,11 +305,14 @@ mod tests {
     #[test]
     fn typos_still_find_the_artist() {
         let mut c = Corpus::new();
-        c.add_subsonic_search_result(SubsonicSearchResult {
-            artists: vec![Artist { id: "a1".into(), name: "Branimir".into() }],
-            albums: vec![],
-            songs: vec![],
-        });
+        c.add_subsonic_search_result(
+            SubsonicSearchResult {
+                artists: vec![Artist { id: "a1".into(), name: "Branimir".into() }],
+                albums: vec![],
+                songs: vec![],
+            },
+            &test_client(),
+        );
 
         // "brnimir": valid letter subsequence of "branimir" (drop the
         // 'a'), so nucleo's own fuzzy matcher already catches this one.
