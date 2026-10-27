@@ -286,6 +286,8 @@ mod tests {
                 username: "test".into(),
                 password: Some("test".into()),
                 password_file: None,
+                max_bitrate_kbps: None,
+                transcode_format: None,
             })
             .unwrap(),
         )
