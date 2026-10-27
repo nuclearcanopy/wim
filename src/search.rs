@@ -100,6 +100,18 @@ impl SearchItem {
             SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => None,
         }
     }
+
+    /// `None` for local items; the originating server's base url for
+    /// everything else, for the on-demand index breakdown.
+    fn source(&self) -> Option<&str> {
+        match self {
+            SearchItem::Artist { client, .. }
+            | SearchItem::Album { client, .. }
+            | SearchItem::Song { client, .. }
+            | SearchItem::Playlist { client, .. } => Some(client.base_url()),
+            SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => None,
+        }
+    }
 }
 
 /// The merged corpus to search over, built once per library scan /
@@ -198,12 +210,28 @@ impl Corpus {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+
+    /// Local count plus a per-navidrome-server count, in first-seen
+    /// order; computed on demand ('I') rather than announced on every
+    /// startup/rescan.
+    pub fn breakdown(&self) -> Vec<(String, usize)> {
+        let mut local = 0usize;
+        let mut by_server: Vec<(String, usize)> = Vec::new();
+        for item in &self.items {
+            match item.source() {
+                None => local += 1,
+                Some(url) => match by_server.iter_mut().find(|(u, _)| u == url) {
+                    Some((_, count)) => *count += 1,
+                    None => by_server.push((url.to_string(), 1)),
+                },
+            }
+        }
+        let mut result = vec![("local".to_string(), local)];
+        result.extend(by_server);
+        result
     }
 
     /// Ranked matches for `query` across the whole corpus, best first.
@@ -368,7 +396,8 @@ mod tests {
             &client,
         );
 
-        assert_eq!(c.len(), 3, "one artist + one album + one playlist, not six");
+        let total: usize = c.breakdown().iter().map(|(_, n)| n).sum();
+        assert_eq!(total, 3, "one artist + one album + one playlist, not six");
     }
 
     #[test]

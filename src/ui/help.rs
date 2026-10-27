@@ -42,6 +42,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("n", "navidrome profiles"),
             ("S", "starred songs"),
+            ("I", "index breakdown"),
             ("*", "star / unstar"),
             ("L", "lyrics"),
         ],
