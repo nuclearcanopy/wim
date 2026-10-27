@@ -186,8 +186,22 @@ impl App {
                 self.query.pop();
                 self.refresh_results();
             }
-            KeyCode::Esc | KeyCode::Enter => {
+            KeyCode::Esc => {
                 self.editing_query = false;
+            }
+            // esc cancels (stop typing, do nothing); enter commits
+            // (stop typing AND act on whatever's selected), same as
+            // every other search box anywhere. Treating them the
+            // same here meant the first enter right after typing
+            // silently did nothing but close the text box, and only
+            // a *second* enter actually played/opened anything,
+            // which just read as "enter doesn't work."
+            KeyCode::Enter => {
+                self.editing_query = false;
+                if let Some(item) = self.results.get(self.selected) {
+                    self.queue.clear();
+                    return Action::Play(item.clone());
+                }
             }
             _ => {}
         }

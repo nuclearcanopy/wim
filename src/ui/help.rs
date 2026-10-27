@@ -35,11 +35,13 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Fixed("gg / G"), "jump to top / bottom"),
             (Key::Fixed("enter"), "play / open"),
             (Key::Fixed("esc"), "back / close"),
-            (Key::Bound(KeyAction::FocusSidebar), "focus sidebar"),
-            (Key::Bound(KeyAction::FocusWorkspace), "focus workspace"),
             (
-                Key::Bound(KeyAction::FocusBottomBar),
-                "focus bottom bar: j/k select, enter tweaks",
+                Key::Fixed("shift+left/right"),
+                "focus sidebar <-> workspace",
+            ),
+            (
+                Key::Fixed("shift+down/up"),
+                "focus bottom bar (j/k select, enter tweaks) / back",
             ),
             (Key::Fixed("left/right"), "cycle home screen logo"),
             (Key::Fixed("0"), "reset logo to default"),

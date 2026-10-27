@@ -1191,16 +1191,20 @@ fn main() -> anyhow::Result<()> {
     // worth saying here until something actually happens.
     let mut status = String::new();
     // which pane j/k/arrows/enter navigate: the sidebar's own results
-    // list, or whatever's open in the workspace (currently only a
-    // browse view has anything to navigate within). Shift+W/A (or
-    // Shift+S/D) switches it, same w+a / s+d pairing convention as
-    // resize mode's panel-select, deliberately capitalized so it
-    // never collides with that mode's own lowercase wasd, or with
-    // plain 'a' (enqueue) / 's' (shuffle), both of which keep meaning
-    // exactly what they already do. Global playback controls
-    // (space/f/b/m/i/etc.) don't care about this at all; only
-    // pane-local navigation does.
+    // list, the workspace (whatever's actually open there), or the
+    // bottom bar's own controls. shift+arrows moves it directionally
+    // (see the input-handling loop below), not three unrelated
+    // absolute "go to X" keys; global playback controls (space/f/b/
+    // c/etc.) don't care about this at all, only pane-local
+    // navigation does.
     let mut focus = Focus::Sidebar;
+    // sidebar_selected/bottom_selected (below) stay bright for this
+    // long right after focus actually changes, then fall back to
+    // their normal dark level; a brief acknowledgement rather than a
+    // permanent highlight, since a boundary that's bright all the
+    // time stopped reading as "something changed" at all.
+    let mut focus_flash_until = Instant::now();
+    const FOCUS_FLASH_DURATION: Duration = Duration::from_millis(700);
 
     let mut favorites = favorites::load();
     // song ids this session knows are starred, across every configured
@@ -1434,10 +1438,9 @@ fn main() -> anyhow::Result<()> {
     // lights up the value it already shows permanently.
     let mut flash: Option<(Field, Instant)> = None;
     const FLASH_DURATION: Duration = Duration::from_millis(700);
-    // `Focus::BottomBar`'s own selection cursor (see `KeyAction::
-    // FocusBottomBar`); independent of `flash`, a steady cursor
-    // position rather than a transient acknowledgment, but both feed
-    // `ControlsBar`'s rendering.
+    // `Focus::BottomBar`'s own selection cursor; independent of
+    // `flash`, a steady cursor position rather than a transient
+    // acknowledgment, but both feed `ControlsBar`'s rendering.
     let mut bottombar_selected = Field::Loop;
     // enter on the bottom bar's Eq field opens this instead of just
     // cycling presets like the bare 'e' key does; full-workspace, same
@@ -1581,18 +1584,27 @@ fn main() -> anyhow::Result<()> {
             let vdivider = cols[1];
             let main_content = cols[2];
 
-            // resize-mode's own panel pick is the only thing that
-            // highlights this divider; it used to also brighten
-            // whenever the sidebar had navigation focus, but that
-            // made the plain '│' segments a visibly different (DIM)
-            // shade from the section-header junctions right next to
-            // them, which always stayed NEAR_BLACK. one consistent
-            // dark shade everywhere beats a focus cue that only half
-            // the divider actually followed.
-            let sidebar_selected =
-                panels.resize_mode && panels.resize_selected == ResizePanel::Sidebar;
-            let bottom_selected =
-                panels.resize_mode && panels.resize_selected == ResizePanel::BottomBar;
+            // resize mode's own panel pick highlights these the same
+            // way it always has; a *permanent* highlight tied to
+            // plain navigation focus was tried and reverted earlier
+            // this session (it made the plain '│' segments a visibly
+            // different, permanently-DIM shade from the section-
+            // header junctions right next to them, which always
+            // stayed NEAR_BLACK). A brief pulse right when focus
+            // actually changes, decaying back to that same dark level
+            // within FOCUS_FLASH_DURATION, doesn't have that problem:
+            // it's indistinguishable from the resting state the rest
+            // of the time, but still answers "where am I" exactly
+            // when that's actually in question.
+            let focus_flashing = Instant::now() < focus_flash_until;
+            let sidebar_selected = (panels.resize_mode
+                && panels.resize_selected == ResizePanel::Sidebar)
+                || (!panels.resize_mode
+                    && focus_flashing
+                    && matches!(focus, Focus::Sidebar | Focus::Workspace));
+            let bottom_selected = (panels.resize_mode
+                && panels.resize_selected == ResizePanel::BottomBar)
+                || (!panels.resize_mode && focus_flashing && focus == Focus::BottomBar);
 
             // search box, a one-row separator rule, then the results
             // list; the separator used to not exist at all, so the
@@ -2703,20 +2715,36 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                if key.code == keymap.get(KeyAction::FocusSidebar) {
-                    focus = Focus::Sidebar;
-                    continue;
-                }
-                // not 'S' here: it was already taken (starred songs,
-                // below) before this feature existed, and this check
-                // runs first and unconditionally continues, which
-                // made that handler dead code until this fix.
-                if key.code == keymap.get(KeyAction::FocusWorkspace) {
-                    focus = Focus::Workspace;
-                    continue;
-                }
-                if key.code == keymap.get(KeyAction::FocusBottomBar) {
-                    focus = Focus::BottomBar;
+                // directional, sway/i3-style, not three separate
+                // absolute "go to X" bindings: shift+right from the
+                // sidebar reaches the workspace, shift+left back;
+                // shift+down from either reaches the bottom bar,
+                // shift+up from there always back to the sidebar.
+                // every other direction/state combination is a no-op
+                // (there's nothing further that way) rather than
+                // picking an arbitrary fallback.
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && matches!(
+                        key.code,
+                        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                    )
+                {
+                    let new_focus = match (focus, key.code) {
+                        (Focus::Sidebar, KeyCode::Right) => Focus::Workspace,
+                        (Focus::Workspace, KeyCode::Left) => Focus::Sidebar,
+                        (Focus::Sidebar | Focus::Workspace, KeyCode::Down) => Focus::BottomBar,
+                        (Focus::BottomBar, KeyCode::Up) => Focus::Sidebar,
+                        (current, _) => current,
+                    };
+                    if new_focus != focus {
+                        focus = new_focus;
+                        // a brief brightness pulse on whichever
+                        // boundary just gained focus, decaying back
+                        // to the usual dark level, same idea as the
+                        // bottom bar's own flash-on-change; see
+                        // sidebar_selected/bottom_selected below.
+                        focus_flash_until = Instant::now() + FOCUS_FLASH_DURATION;
+                    }
                     continue;
                 }
 
@@ -2888,6 +2916,16 @@ fn main() -> anyhow::Result<()> {
                         bv.albums_focused = !bv.albums_focused;
                         continue;
                     }
+                    // only `continue` for keys this block actually
+                    // does something with; everything else has to
+                    // fall through to the global handlers further
+                    // down, or a focused browse view silently ate
+                    // every other keybind in the app (navidrome
+                    // profiles, starred songs, crossfade, skip/back,
+                    // all of it) the moment an album was open, which
+                    // is exactly the "pressing shift+s and nothing
+                    // happens" bug this fixes.
+                    let mut handled = true;
                     match key.code {
                         KeyCode::Char('j') | KeyCode::Down => bv.next(),
                         KeyCode::Char('k') | KeyCode::Up => bv.prev(),
@@ -2967,9 +3005,9 @@ fn main() -> anyhow::Result<()> {
                                 status = trigger_downloads(&item, &mut dctx, &mut notifications);
                             }
                         }
-                        _ => {}
+                        _ => handled = false,
                     }
-                    if open_album.is_none() {
+                    if handled || open_album.is_some() {
                         continue;
                     }
                 }
@@ -2990,6 +3028,10 @@ fn main() -> anyhow::Result<()> {
                 // through App, since scrolling it shouldn't move the
                 // underlying results selection.
                 if lyrics_lines.is_some() {
+                    // same fix as the browse-view block above: only
+                    // swallow keys actually handled here, or lyrics
+                    // being open silently ate every other keybind.
+                    let mut handled = true;
                     match key.code {
                         KeyCode::Char('j') | KeyCode::Down => {
                             lyrics_scroll = lyrics_scroll.saturating_add(1)
@@ -3005,9 +3047,11 @@ fn main() -> anyhow::Result<()> {
                             lyrics_lines = None;
                             lyrics_scroll = 0;
                         }
-                        _ => {}
+                        _ => handled = false,
                     }
-                    continue;
+                    if handled {
+                        continue;
+                    }
                 }
 
                 if key.code == keymap.get(KeyAction::IndexBreakdown) {
@@ -3227,6 +3271,12 @@ fn main() -> anyhow::Result<()> {
                                     bv.art.clone().map(|img| p.new_resize_protocol(img))
                                 });
                                 browse_view = Some(bv);
+                                // opening something to browse and then
+                                // still needing a separate keypress
+                                // just to be able to scroll it read as
+                                // "enter doesn't do anything"; land
+                                // with it already focused instead.
+                                focus = Focus::Workspace;
                             }
                             Err(msg) => {
                                 notifications.push(Severity::Error, msg.clone());
