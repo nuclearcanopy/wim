@@ -70,6 +70,10 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Bound(KeyAction::OpenStarredView), "starred songs"),
             (Key::Bound(KeyAction::IndexBreakdown), "index breakdown"),
             (Key::Bound(KeyAction::ToggleStar), "star / unstar"),
+            (
+                Key::Bound(KeyAction::DownloadSelected),
+                "download selected (for offline)",
+            ),
             (Key::Bound(KeyAction::OpenLyrics), "lyrics"),
             (
                 Key::Fixed("left/right"),
