@@ -1,9 +1,20 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use ratatui::widgets::Widget;
 
-use crate::theme::{shade, DIM, NEAR_WHITE};
+use crate::theme::{lerp, shade, DIM, NEAR_WHITE, WHITE};
 use crate::ui::textfit::truncate_with_ellipsis;
+
+/// Which state-line value last changed, for `ControlsBar::flash`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    Loop,
+    Shuffle,
+    Speed,
+    Eq,
+    Crossfade,
+}
 
 /// Bottom playback bar: as many lines as `area.height` allows, most
 /// important first, rather than cramming everything onto one status
@@ -16,6 +27,15 @@ pub struct ControlsBar<'a> {
     pub shuffle_on: bool,
     pub speed: f64,
     pub eq_preset: &'a str,
+    pub crossfade_on: bool,
+    /// Field that changed most recently and how "hot" it still is:
+    /// `1.0` right after the toggle, decaying to `0.0` back at the
+    /// line's normal DIM. Acknowledges a toggle by briefly
+    /// brightening the value that already has a permanent spot on
+    /// this line, instead of writing a one-off sentence to the status
+    /// row above (which reads as the app typing a message at you for
+    /// something the state line already shows).
+    pub flash: Option<(Field, f32)>,
     pub resize_hint: Option<&'a str>,
 }
 
@@ -35,16 +55,67 @@ impl Widget for ControlsBar<'_> {
             return;
         }
 
-        let state_line = format!(
-            "queue: {}  loop: {}  shuffle: {}  speed: {:.2}x  eq: {}",
-            self.queue_len,
-            self.loop_label,
-            if self.shuffle_on { "on" } else { "off" },
-            self.speed,
-            self.eq_preset,
-        );
-        draw_line(buf, area, y, &state_line, width, shade(DIM));
+        let segments: [(Option<Field>, String); 6] = [
+            (None, format!("queue: {}", self.queue_len)),
+            (Some(Field::Loop), format!("loop: {}", self.loop_label)),
+            (
+                Some(Field::Shuffle),
+                format!("shuffle: {}", if self.shuffle_on { "on" } else { "off" }),
+            ),
+            (Some(Field::Speed), format!("speed: {:.2}x", self.speed)),
+            (Some(Field::Eq), format!("eq: {}", self.eq_preset)),
+            (
+                Some(Field::Crossfade),
+                format!(
+                    "crossfade: {}",
+                    if self.crossfade_on { "on" } else { "off" }
+                ),
+            ),
+        ];
+        draw_segments(buf, area, y, width, &segments, self.flash);
     }
+}
+
+fn draw_segments(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    width: usize,
+    segments: &[(Option<Field>, String)],
+    flash: Option<(Field, f32)>,
+) {
+    let limit = area.x + width.min(area.width as usize) as u16;
+    let mut x = area.x;
+    for (i, (field, text)) in segments.iter().enumerate() {
+        if x >= limit {
+            break;
+        }
+        if i > 0 {
+            x = draw_chars(buf, x, limit, y, "  ", shade(DIM));
+        }
+        let color = match (field, flash) {
+            (Some(f), Some((hot_field, level))) if *f == hot_field => {
+                shade(lerp(DIM, WHITE, level))
+            }
+            _ => shade(DIM),
+        };
+        x = draw_chars(buf, x, limit, y, text, color);
+    }
+}
+
+fn draw_chars(buf: &mut Buffer, start_x: u16, limit: u16, y: u16, text: &str, color: Color) -> u16 {
+    let mut x = start_x;
+    for ch in text.chars() {
+        if x >= limit {
+            break;
+        }
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_char(ch);
+            cell.set_fg(color);
+        }
+        x += 1;
+    }
+    x
 }
 
 fn draw_line(

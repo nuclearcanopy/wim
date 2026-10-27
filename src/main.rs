@@ -39,7 +39,7 @@ use search::SearchItem;
 use theme::{shade, NEAR_BLACK};
 use ui::banner::Banner;
 use ui::browse::BrowseListView;
-use ui::controlsbar::ControlsBar;
+use ui::controlsbar::{ControlsBar, Field};
 use ui::divider::{HorizontalRule, VerticalRule};
 use ui::login::{LoginForm, LoginView};
 use ui::lyrics_view::LyricsView;
@@ -815,6 +815,12 @@ fn main() -> anyhow::Result<()> {
     // no notion of this, so it's tracked entirely on our side and
     // cleared once the fade finishes.
     let mut fade_in_started_at: Option<Instant> = None;
+    // Which ControlsBar state-line field most recently changed, and
+    // when; render computes a decaying brightness from the elapsed
+    // time rather than a one-off status sentence, so a toggle just
+    // lights up the value it already shows permanently.
+    let mut flash: Option<(Field, Instant)> = None;
+    const FLASH_DURATION: Duration = Duration::from_millis(700);
 
     let mut panels = PanelLayout::new();
     let start = Instant::now();
@@ -1121,6 +1127,10 @@ fn main() -> anyhow::Result<()> {
             let resize_hint = panels
                 .resize_mode
                 .then_some("resize mode: a=sidebar s=bottom bar, arrows stretch, r/esc exit");
+            let flash_level = flash.map(|(field, at)| {
+                let t = at.elapsed().as_secs_f32() / FLASH_DURATION.as_secs_f32();
+                (field, (1.0 - t).clamp(0.0, 1.0))
+            });
             f.render_widget(
                 ControlsBar {
                     status: &status,
@@ -1129,6 +1139,8 @@ fn main() -> anyhow::Result<()> {
                     shuffle_on: app.shuffle,
                     speed: app.speed,
                     eq_preset: eq::PRESETS[app.eq_preset].name,
+                    crossfade_on: crossfade_enabled,
+                    flash: flash_level,
                     resize_hint,
                 },
                 Rect {
@@ -1594,10 +1606,7 @@ fn main() -> anyhow::Result<()> {
                         fade_in_started_at = None;
                         let _ = player.set_volume(base_volume);
                     }
-                    status = format!(
-                        "crossfade: {}",
-                        if crossfade_enabled { "on" } else { "off" }
-                    );
+                    flash = Some((Field::Crossfade, Instant::now()));
                     continue;
                 }
 
@@ -1797,30 +1806,35 @@ fn main() -> anyhow::Result<()> {
                             }
                         };
                     }
-                    Action::QueueReordered(items) => status = resync_queue(&player, &items),
+                    Action::QueueReordered(items) => {
+                        let msg = resync_queue(&player, &items);
+                        if msg.starts_with("error") {
+                            status = msg;
+                        } else {
+                            flash = Some((Field::Shuffle, Instant::now()));
+                        }
+                    }
                     Action::SetLoop(mode) => {
                         // "loop all" isn't an mpv concept; it's tracked
                         // ourselves (see `original_queue`) and acted on
                         // when the queue empties, not here. mpv only
                         // ever needs to know about single-file loop.
                         let mpv_loop = if mode == LoopMode::One { "inf" } else { "no" };
-                        status = match player.set_loop_file(mpv_loop) {
-                            Ok(()) => format!("loop: {}", mode.label()),
-                            Err(e) => format!("error setting loop: {e}"),
-                        };
+                        match player.set_loop_file(mpv_loop) {
+                            Ok(()) => flash = Some((Field::Loop, Instant::now())),
+                            Err(e) => status = format!("error setting loop: {e}"),
+                        }
                     }
-                    Action::SetSpeed(speed) => {
-                        status = match player.set_speed(speed) {
-                            Ok(()) => format!("speed: {speed:.2}x"),
-                            Err(e) => format!("error setting speed: {e}"),
-                        };
-                    }
-                    Action::SetEq(name, gains) => {
+                    Action::SetSpeed(speed) => match player.set_speed(speed) {
+                        Ok(()) => flash = Some((Field::Speed, Instant::now())),
+                        Err(e) => status = format!("error setting speed: {e}"),
+                    },
+                    Action::SetEq(_name, gains) => {
                         let filter = eq::build_af_filter(&gains);
-                        status = match player.set_af(&filter) {
-                            Ok(()) => format!("eq: {name}"),
-                            Err(e) => format!("error setting eq: {e}"),
-                        };
+                        match player.set_af(&filter) {
+                            Ok(()) => flash = Some((Field::Eq, Instant::now())),
+                            Err(e) => status = format!("error setting eq: {e}"),
+                        }
                     }
                     Action::None => {}
                 }
