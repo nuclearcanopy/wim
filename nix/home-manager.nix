@@ -156,6 +156,12 @@ in
       default = "en";
       description = "Preferred language code for opensubtitles auto-fetch.";
     };
+
+    logoStyle = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Name of a home-screen logo style from the generated figlet/toilet batch (cycle with left/right in-app to find one, then set its exact name here). Null keeps the default ANSI Shadow logo.";
+    };
   };
 
   config = mkIf cfg.enable {
@@ -185,6 +191,8 @@ in
       // lib.optionalAttrs (s.transcodeFormat != null) { transcode_format = s.transcodeFormat; }) cfg.navidromeServers;
     } // lib.optionalAttrs (cfg.opensubtitlesApiKeyFile != null) {
       opensubtitles_api_key_file = toString cfg.opensubtitlesApiKeyFile;
+    } // lib.optionalAttrs (cfg.logoStyle != null) {
+      logo_style = cfg.logoStyle;
     });
   };
 }

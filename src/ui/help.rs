@@ -22,6 +22,8 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("esc", "back / close"),
             ("shift+a/w", "focus sidebar"),
             ("shift+s/d", "focus workspace"),
+            ("left/right", "cycle home screen logo (workspace focus)"),
+            ("0", "reset logo to default"),
         ],
     ),
     (

@@ -791,6 +791,11 @@ fn main() -> anyhow::Result<()> {
     // tweaks instead of only the ,/. delay-only adjustment.
     let mut subtitle_menu_open = false;
     let mut subtitle_menu_selected: usize = 0;
+    // left/right cycles through ui::banner::LOGOS while the workspace
+    // has focus and the banner is what's showing; '0' resets to the
+    // default (index 0, ANSI Shadow). Restored from config by name,
+    // not a raw index (see `Config::logo_style`'s own reasoning).
+    let mut logo_index = ui::banner::logo_index_for_name(cfg.logo_style.as_deref());
     // rolling window for the now-playing level meter; a fixed-size
     // ring (just truncate the front) rather than growing forever.
     let mut level_history: Vec<f32> = Vec::new();
@@ -1245,6 +1250,8 @@ fn main() -> anyhow::Result<()> {
                     Banner {
                         phase,
                         elapsed_secs,
+                        logo_index,
+                        focused: focus == Focus::Workspace,
                     },
                     main_content,
                 );
@@ -1731,6 +1738,39 @@ fn main() -> anyhow::Result<()> {
                 if key.code == KeyCode::Char('r') {
                     panels.toggle_resize_mode();
                     continue;
+                }
+
+                // same condition the render side uses to decide the
+                // banner is what's actually on screen (not the full
+                // player, a browse view, or lyrics); cycling the logo
+                // only makes sense while it's visible and the
+                // workspace actually has navigation focus.
+                let banner_showing = (now_playing.is_none() || player_minimized)
+                    && browse_view.is_none()
+                    && lyrics_lines.is_none();
+                if banner_showing && focus == Focus::Workspace {
+                    match key.code {
+                        KeyCode::Left => {
+                            logo_index = (logo_index + ui::banner::logo_count() - 1)
+                                % ui::banner::logo_count();
+                            cfg.logo_style = ui::banner::logo_name(logo_index).map(String::from);
+                            let _ = config::save(&cfg);
+                            continue;
+                        }
+                        KeyCode::Right => {
+                            logo_index = (logo_index + 1) % ui::banner::logo_count();
+                            cfg.logo_style = ui::banner::logo_name(logo_index).map(String::from);
+                            let _ = config::save(&cfg);
+                            continue;
+                        }
+                        KeyCode::Char('0') => {
+                            logo_index = 0;
+                            cfg.logo_style = None;
+                            let _ = config::save(&cfg);
+                            continue;
+                        }
+                        _ => {}
+                    }
                 }
 
                 // closing what's open doesn't depend on which pane has

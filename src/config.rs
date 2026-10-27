@@ -92,6 +92,14 @@ pub struct Config {
     pub opensubtitles_api_key_file: Option<String>,
     #[serde(default = "default_subtitle_language")]
     pub subtitle_language: String,
+    /// Which of the generated `ui::logos::LOGOS` entries the home
+    /// screen's banner shows, by name rather than index (an index
+    /// would silently point at a different font if that generated
+    /// list is ever regenerated in a different order). `None` is the
+    /// permanent default (ANSI Shadow, `banner::LOGO`), not "whatever
+    /// happens to be first".
+    #[serde(default)]
+    pub logo_style: Option<String>,
 }
 
 fn default_subtitle_language() -> String {
@@ -181,6 +189,7 @@ impl Default for Config {
             opensubtitles_api_key: None,
             opensubtitles_api_key_file: None,
             subtitle_language: default_subtitle_language(),
+            logo_style: None,
         }
     }
 }

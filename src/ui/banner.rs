@@ -2,13 +2,19 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
-use crate::theme::{lerp, shade, BRIGHT, DIM, WHITE};
+use crate::theme::{lerp, shade, BRIGHT, DIM, NEAR_WHITE, WHITE};
+use crate::ui::logos::LOGOS;
 
 /// `figlet -f "ANSI Shadow" WIM`; the same font LazyVim's own
 /// snacks.nvim dashboard header uses (confirmed against LazyVim's
 /// actual `lua/lazyvim/plugins/ui.lua` source, not just recalled from
 /// memory), baked in as static art rather than a runtime figlet call.
-/// No figlet dependency at runtime; "WIM" never changes.
+/// No figlet dependency at runtime; "WIM" never changes. This is
+/// specifically index 0 of the logo picker (`<`/`>` while the
+/// workspace has focus, see `logo_lines`/`logo_name`); kept as its
+/// own const rather than folded into `logos::LOGOS` since it's the
+/// permanent default a 'reset' always returns to, not just another
+/// item in that generated list.
 const LOGO: &[&str] = &[
     r"██╗    ██╗██╗███╗   ███╗",
     r"██║    ██║██║████╗ ████║",
@@ -17,7 +23,40 @@ const LOGO: &[&str] = &[
     r"╚███╔███╔╝██║██║ ╚═╝ ██║",
     r" ╚══╝╚══╝ ╚═╝╚═╝     ╚═╝",
 ];
-pub const GLYPH_HEIGHT: usize = 6;
+
+/// 1 (the default) plus every alternative; `logo_index` cycles
+/// `0..logo_count()`.
+pub fn logo_count() -> usize {
+    1 + LOGOS.len()
+}
+
+pub fn logo_lines(index: usize) -> &'static [&'static str] {
+    if index == 0 {
+        LOGO
+    } else {
+        LOGOS[index - 1].1
+    }
+}
+
+/// `None` for the default (nothing to save, config just omits it);
+/// `Some(name)` otherwise, the stable key persisted to config.toml
+/// instead of the index itself (which would shift if this generated
+/// list is ever regenerated with different fonts in a different
+/// order).
+pub fn logo_name(index: usize) -> Option<&'static str> {
+    (index != 0).then(|| LOGOS[index - 1].0)
+}
+
+pub fn logo_index_for_name(name: Option<&str>) -> usize {
+    match name {
+        None => 0,
+        Some(name) => LOGOS
+            .iter()
+            .position(|(n, _)| *n == name)
+            .map(|i| i + 1)
+            .unwrap_or(0),
+    }
+}
 
 /// Key, description; same `snacks.dashboard.Item` idea LazyVim's own
 /// dashboard menu uses below its header, minus the nerd-font icons
@@ -40,10 +79,14 @@ const MENU: &[(&str, &str)] = &[
 /// permanent footer line, which read as the app announcing a number
 /// nobody asked for every time this screen was on; 'I' surfaces it on
 /// demand instead. `phase`/`elapsed` are advanced by the caller each
-/// tick.
+/// tick. `logo_index` selects which of `logo_lines`' entries to draw;
+/// `focused` shows the `<`/`>` cycle hint, only meaningful while the
+/// workspace actually has navigation focus (see `main::Focus`).
 pub struct Banner {
     pub phase: f32,
     pub elapsed_secs: f32,
+    pub logo_index: usize,
+    pub focused: bool,
 }
 
 /// 0..1, slow breathing.
@@ -53,16 +96,29 @@ pub fn pulse_level(elapsed_secs: f32) -> f32 {
 
 impl Widget for Banner {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let total_width = LOGO[0].chars().count() as u16;
+        let lines = logo_lines(self.logo_index);
+        let glyph_height = lines.len() as u16;
+        let total_width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
         let start_x = area.x + area.width.saturating_sub(total_width) / 2;
 
         // logo, one gap row, the menu.
-        let frame_height = GLYPH_HEIGHT as u16 + 2 + MENU.len() as u16;
+        let frame_height = glyph_height + 2 + MENU.len() as u16;
         let logo_start_y = area.y + area.height.saturating_sub(frame_height) / 2;
 
         let pulse = pulse_level(self.elapsed_secs);
 
-        for (row_idx, row) in LOGO.iter().enumerate() {
+        if self.focused {
+            let arrow_y = logo_start_y + glyph_height / 2;
+            if start_x > area.x {
+                put(buf, start_x - 1, arrow_y, '<', shade(NEAR_WHITE));
+            }
+            let right_x = start_x + total_width;
+            if right_x < area.x + area.width {
+                put(buf, right_x, arrow_y, '>', shade(NEAR_WHITE));
+            }
+        }
+
+        for (row_idx, row) in lines.iter().enumerate() {
             let y = logo_start_y + row_idx as u16;
             if y >= area.y + area.height {
                 continue;
@@ -95,7 +151,7 @@ impl Widget for Banner {
         // fix, since "n  navidrome profiles" and "q  quit" don't share
         // a length. Pad every key to the longest key's width first so
         // the description column itself lines up too.
-        let menu_start_y = logo_start_y + GLYPH_HEIGHT as u16 + 2;
+        let menu_start_y = logo_start_y + glyph_height + 2;
         let key_width = MENU.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
         let lines: Vec<String> = MENU
             .iter()
@@ -113,6 +169,13 @@ impl Widget for Banner {
                 shade(DIM),
             );
         }
+    }
+}
+
+fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: ratatui::style::Color) {
+    if let Some(cell) = buf.cell_mut((x, y)) {
+        cell.set_char(ch);
+        cell.set_fg(color);
     }
 }
 
