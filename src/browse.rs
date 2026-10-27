@@ -113,6 +113,23 @@ pub struct BrowseView {
     /// last.fm); only ever set when this view was opened on an artist,
     /// `None` for albums/playlists.
     pub bio: Option<String>,
+    /// Only set for artist views: every album credited to them,
+    /// shown as its own column alongside the (filterable) song list
+    /// rather than mixed into one flat list. Empty for album/playlist
+    /// views, which keep the single-list layout they always had.
+    pub is_artist: bool,
+    pub albums: Vec<SearchItem>,
+    pub albums_selected: usize,
+    /// left/right switches which column navigation (j/k/enter/*)
+    /// applies to; meaningless for album/playlist views (`is_artist`
+    /// is false, there's only ever one column).
+    pub albums_focused: bool,
+    /// Narrows `tracks` down to whatever matches (plain case-
+    /// insensitive substring on the row label, not the sidebar's full
+    /// fuzzy search: this is "find a song in one artist's already-
+    /// small catalog", not "search everything"). Empty matches all.
+    pub filter_query: String,
+    pub filtering: bool,
 }
 
 /// The bio's own rect, directly below the header and above whatever
@@ -176,14 +193,66 @@ pub fn wrap_bio(text: &str, width: usize, max_lines: usize) -> Vec<String> {
 }
 
 impl BrowseView {
+    /// Indices into `tracks` that match `filter_query`: a plain
+    /// case-insensitive substring match on the same label the row
+    /// itself shows. Empty query matches everything, so this is
+    /// always safe to use as "the currently visible tracks."
+    pub fn visible_track_indices(&self) -> Vec<usize> {
+        if self.filter_query.is_empty() {
+            return (0..self.tracks.len()).collect();
+        }
+        let needle = self.filter_query.to_lowercase();
+        self.tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                crate::ui::results_list::label(item)
+                    .to_lowercase()
+                    .contains(&needle)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Snaps `selected` onto the nearest still-visible track after
+    /// the filter changes, rather than leaving it pointed at a row
+    /// that's no longer shown at all.
+    pub fn clamp_selection_to_filter(&mut self) {
+        let visible = self.visible_track_indices();
+        if !visible.contains(&self.selected) {
+            self.selected = visible.first().copied().unwrap_or(0);
+        }
+    }
+
     pub fn next(&mut self) {
-        if self.selected + 1 < self.tracks.len() {
-            self.selected += 1;
+        if self.albums_focused {
+            if self.albums_selected + 1 < self.albums.len() {
+                self.albums_selected += 1;
+            }
+            return;
+        }
+        let visible = self.visible_track_indices();
+        match visible.iter().position(|&i| i == self.selected) {
+            Some(pos) => {
+                if let Some(&next_idx) = visible.get(pos + 1) {
+                    self.selected = next_idx;
+                }
+            }
+            None => self.selected = visible.first().copied().unwrap_or(0),
         }
     }
 
     pub fn prev(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        if self.albums_focused {
+            self.albums_selected = self.albums_selected.saturating_sub(1);
+            return;
+        }
+        let visible = self.visible_track_indices();
+        match visible.iter().position(|&i| i == self.selected) {
+            Some(pos) if pos > 0 => self.selected = visible[pos - 1],
+            Some(_) => {}
+            None => self.selected = visible.first().copied().unwrap_or(0),
+        }
     }
 }
 

@@ -1,15 +1,16 @@
 use std::collections::HashSet;
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::Widget;
 
 use crate::browse::{ArtMode, BrowseView};
 use crate::favorites::Favorites;
 use crate::search::SearchItem;
-use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK};
+use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::albumart::AsciiArt;
 use crate::ui::header::draw_header;
+use crate::ui::searchbox::SearchBox;
 use crate::ui::textfit::truncate_with_ellipsis;
 
 /// Track listing for an opened album/playlist, in `main_content`
@@ -28,6 +29,10 @@ pub struct BrowseListView<'a> {
     /// `main::cell_aspect`), threaded through to `browse::layout` and
     /// `AsciiArt` so both agree on what "square" actually means here.
     pub cell_aspect: f32,
+    /// Blink phase for the song-filter box's cursor, same convention
+    /// as the sidebar's own `SearchBox`; only matters while
+    /// `view.filtering`.
+    pub cursor_visible: bool,
 }
 
 fn is_starred(track: &SearchItem, favorites: &Favorites, remote_starred: &HashSet<String>) -> bool {
@@ -83,49 +88,174 @@ impl Widget for BrowseListView<'_> {
             .render(rect, buf);
         }
 
+        if self.view.is_artist {
+            self.render_artist_columns(list_area, buf);
+            return;
+        }
+
         if self.view.tracks.is_empty() {
             draw_line(buf, list_area, y, "(no tracks)", shade(DIM));
             return;
         }
+        draw_track_list(
+            buf,
+            list_area,
+            &self.view.tracks,
+            &(0..self.view.tracks.len()).collect::<Vec<_>>(),
+            self.view.selected,
+            true,
+            self.favorites,
+            self.remote_starred,
+        );
+    }
+}
 
-        // same clamp-to-selection scroll as ResultsList: a long album
-        // shouldn't be unreachable past the bottom of the pane.
-        let visible_rows = list_area.height as usize;
-        let scroll_offset = if self.view.selected >= visible_rows {
-            self.view.selected + 1 - visible_rows
+impl BrowseListView<'_> {
+    /// ALBUMS (left) and a filterable SONGS column (right, its own
+    /// search box above the list) side by side, instead of one flat
+    /// list; left/right switches which column navigation applies to
+    /// (`view.albums_focused`, see main.rs).
+    fn render_artist_columns(&self, area: Rect, buf: &mut Buffer) {
+        let cols = Layout::horizontal([Constraint::Percentage(35), Constraint::Min(0)]).split(area);
+        let albums_rect = cols[0];
+        let songs_col = cols[1];
+
+        if self.view.albums.is_empty() {
+            draw_line(buf, albums_rect, albums_rect.y, "(no albums)", shade(DIM));
         } else {
-            0
-        };
-
-        for row in 0..visible_rows {
-            let idx = scroll_offset + row;
-            let Some(track) = self.view.tracks.get(idx) else {
-                break;
-            };
-            let is_selected = idx == self.view.selected;
-            let marker = if is_selected { "> " } else { "  " };
-            let label = match track {
-                SearchItem::Song { title, artist, .. } => format!("{title} · {artist}"),
-                _ => String::new(),
-            };
-            let star = if is_starred(track, self.favorites, self.remote_starred) {
-                "* "
-            } else {
-                ""
-            };
-            let line = format!("{marker}{:>2}. {star}{label}", idx + 1);
-            draw_line(
+            draw_simple_list(
                 buf,
-                list_area,
-                y + row as u16,
-                &truncate_with_ellipsis(&line, list_area.width as usize),
-                if is_selected {
-                    shade(BRIGHT)
-                } else {
-                    shade(DIM)
-                },
+                albums_rect,
+                &self.view.albums,
+                self.view.albums_selected,
+                self.view.albums_focused,
             );
         }
+
+        let song_rows =
+            Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(songs_col);
+        SearchBox {
+            query: &self.view.filter_query,
+            editing: self.view.filtering,
+            cursor_visible: self.cursor_visible,
+        }
+        .render(song_rows[0], buf);
+
+        let songs_rect = song_rows[1];
+        let visible = self.view.visible_track_indices();
+        if visible.is_empty() {
+            let msg = if self.view.filter_query.is_empty() {
+                "(no tracks)"
+            } else {
+                "(no matches)"
+            };
+            draw_line(buf, songs_rect, songs_rect.y, msg, shade(DIM));
+            return;
+        }
+        draw_track_list(
+            buf,
+            songs_rect,
+            &self.view.tracks,
+            &visible,
+            self.view.selected,
+            !self.view.albums_focused,
+            self.favorites,
+            self.remote_starred,
+        );
+    }
+}
+
+/// Plain name-only rows (albums have no per-row metadata worth
+/// showing inline the way a song's artist does); `focused` controls
+/// whether the selected row brightens, same "only one column glows
+/// at a time" convention as the sidebar/workspace split.
+fn draw_simple_list(
+    buf: &mut Buffer,
+    area: Rect,
+    items: &[SearchItem],
+    selected: usize,
+    focused: bool,
+) {
+    for (row, item) in items.iter().enumerate() {
+        let y = area.y + row as u16;
+        if y >= area.y + area.height {
+            break;
+        }
+        let is_selected = row == selected;
+        let marker = if is_selected { "> " } else { "  " };
+        let name = match item {
+            SearchItem::Album { name, .. } => name.as_str(),
+            _ => "",
+        };
+        let color = if is_selected && focused {
+            shade(NEAR_WHITE)
+        } else {
+            shade(DIM)
+        };
+        draw_line(
+            buf,
+            area,
+            y,
+            &truncate_with_ellipsis(&format!("{marker}{name}"), area.width as usize),
+            color,
+        );
+    }
+}
+
+/// Shared by the single-list (album/playlist) layout and the artist
+/// profile's SONGS column; `indices` is which positions in `tracks`
+/// to actually show, in order (either every track, or whatever
+/// `visible_track_indices` filtered down to). `focused` is the same
+/// "does this column currently glow" flag `draw_simple_list` uses.
+#[allow(clippy::too_many_arguments)]
+fn draw_track_list(
+    buf: &mut Buffer,
+    area: Rect,
+    tracks: &[SearchItem],
+    indices: &[usize],
+    selected: usize,
+    focused: bool,
+    favorites: &Favorites,
+    remote_starred: &HashSet<String>,
+) {
+    // same clamp-to-selection scroll as ResultsList: a long album
+    // shouldn't be unreachable past the bottom of the pane.
+    let selected_row = indices.iter().position(|&i| i == selected).unwrap_or(0);
+    let visible_rows = area.height as usize;
+    let scroll_offset = if selected_row >= visible_rows {
+        selected_row + 1 - visible_rows
+    } else {
+        0
+    };
+
+    for row in 0..visible_rows {
+        let Some(&idx) = indices.get(scroll_offset + row) else {
+            break;
+        };
+        let track = &tracks[idx];
+        let is_selected = idx == selected;
+        let marker = if is_selected { "> " } else { "  " };
+        let label = match track {
+            SearchItem::Song { title, artist, .. } => format!("{title} · {artist}"),
+            _ => String::new(),
+        };
+        let star = if is_starred(track, favorites, remote_starred) {
+            "* "
+        } else {
+            ""
+        };
+        let line = format!("{marker}{:>2}. {star}{label}", idx + 1);
+        draw_line(
+            buf,
+            area,
+            area.y + row as u16,
+            &truncate_with_ellipsis(&line, area.width as usize),
+            if is_selected && focused {
+                shade(BRIGHT)
+            } else {
+                shade(DIM)
+            },
+        );
     }
 }
 

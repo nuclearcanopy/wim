@@ -90,7 +90,9 @@ fn resolve_tracks(item: &SearchItem) -> Result<Vec<SearchItem>, String> {
             .get_playlist_songs(id)
             .map(|songs| browse::songs_to_items(songs, client))
             .map_err(|e| format!("couldn't load playlist tracks: {e}")),
-        SearchItem::Artist { id, name, client } => artist_tracks(client, id, name),
+        SearchItem::Artist { id, name, client } => {
+            artist_tracks(client, id, name).map(|(tracks, _albums)| tracks)
+        }
     }
 }
 
@@ -101,17 +103,20 @@ fn resolve_tracks(item: &SearchItem) -> Result<Vec<SearchItem>, String> {
 /// "Global"/"Various Artists" convention would otherwise hide every
 /// song on it from here); filtering by the song's own field instead of
 /// the album's works for any compilation, not a hardcoded special case.
+/// Every song actually credited to this artist (see the module doc
+/// above for the Global/Various-Artists filtering), plus the
+/// album list itself for the artist profile's own ALBUMS column.
 fn artist_tracks(
     client: &Arc<subsonic::Client>,
     artist_id: &str,
     artist_name: &str,
-) -> Result<Vec<SearchItem>, String> {
-    let mut albums = client
+) -> Result<(Vec<SearchItem>, Vec<SearchItem>), String> {
+    let mut artist_albums = client
         .get_artist(artist_id)
         .map_err(|e| format!("couldn't load artist: {e}"))?;
     // chronological, not whatever order getArtist happened to return
     // (alphabetical); unknown-year albums sort last rather than first.
-    albums.sort_by_key(|a| a.year.unwrap_or(u32::MAX));
+    artist_albums.sort_by_key(|a| a.year.unwrap_or(u32::MAX));
 
     // one getAlbum round-trip per album, done one at a time, was the
     // whole reason opening a prolific artist's profile felt so slow
@@ -121,7 +126,7 @@ fn artist_tracks(
     // is explicitly safe to share and use concurrently across
     // threads for exactly this.
     let details: Vec<Option<subsonic::AlbumDetails>> = thread::scope(|scope| {
-        albums
+        artist_albums
             .iter()
             .map(|album| scope.spawn(|| client.get_album(&album.id).ok()))
             .collect::<Vec<_>>()
@@ -131,9 +136,24 @@ fn artist_tracks(
     });
 
     let mut tracks = Vec::new();
-    for album in details.into_iter().flatten() {
+    let mut albums = Vec::new();
+    for (artist_album, details) in artist_albums.into_iter().zip(details) {
+        let Some(details) = details else { continue };
+        // AlbumDetails itself carries no name (see subsonic.rs); each
+        // of its own songs does, and they all share one.
+        let album_name = details
+            .songs
+            .first()
+            .map(|s| s.album.clone())
+            .unwrap_or_default();
+        albums.push(SearchItem::Album {
+            id: artist_album.id,
+            name: album_name,
+            artist: artist_name.to_string(),
+            client: client.clone(),
+        });
         tracks.extend(
-            album
+            details
                 .songs
                 .into_iter()
                 .filter(|s| s.artist == artist_name)
@@ -146,7 +166,7 @@ fn artist_tracks(
                 }),
         );
     }
-    Ok(tracks)
+    Ok((tracks, albums))
 }
 
 /// Opens the track-listing view on an album or playlist; the Enter-key
@@ -173,6 +193,12 @@ fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
                 selected: 0,
                 art: fetch_cover_art(client, id),
                 bio: None,
+                is_artist: false,
+                albums: Vec::new(),
+                albums_selected: 0,
+                albums_focused: false,
+                filter_query: String::new(),
+                filtering: false,
             })
         }
         SearchItem::Playlist { id, name, client } => {
@@ -187,6 +213,12 @@ fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
                 selected: 0,
                 art: None,
                 bio: None,
+                is_artist: false,
+                albums: Vec::new(),
+                albums_selected: 0,
+                albums_focused: false,
+                filter_query: String::new(),
+                filtering: false,
             })
         }
         _ => unreachable!("open_browse_view only called for Album/Playlist"),
@@ -194,15 +226,16 @@ fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
 }
 
 /// The artist profile view: a bio (best-effort, `None` if navidrome
-/// has nothing for this artist) and every song actually credited to
-/// them across every album, chronologically. See `artist_tracks` for
-/// the Global/Various-Artists filtering this relies on.
+/// has nothing for this artist), an ALBUMS column, and a filterable
+/// SONGS column (every song actually credited to them across every
+/// album, chronologically). See `artist_tracks` for the Global/
+/// Various-Artists filtering this relies on.
 fn open_artist_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
     let SearchItem::Artist { id, name, client } = item else {
         unreachable!("open_artist_view only called for Artist");
     };
     let bio = client.get_artist_bio(id).ok().flatten();
-    let tracks = artist_tracks(client, id, name)?;
+    let (tracks, albums) = artist_tracks(client, id, name)?;
     Ok(browse::BrowseView {
         title: name.clone(),
         subtitle: format!("{} songs", tracks.len()),
@@ -211,6 +244,12 @@ fn open_artist_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
         selected: 0,
         art: None,
         bio,
+        is_artist: true,
+        albums,
+        albums_selected: 0,
+        albums_focused: false,
+        filter_query: String::new(),
+        filtering: false,
     })
 }
 
@@ -284,6 +323,12 @@ fn open_starred_view(
         selected: 0,
         art: None,
         bio: None,
+        is_artist: false,
+        albums: Vec::new(),
+        albums_selected: 0,
+        albums_focused: false,
+        filter_query: String::new(),
+        filtering: false,
     }
 }
 
@@ -1364,6 +1409,7 @@ fn main() -> anyhow::Result<()> {
                         remote_starred: &remote_starred,
                         art_mode,
                         cell_aspect: aspect,
+                        cursor_visible,
                     },
                     main_content,
                 );
@@ -1867,6 +1913,28 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                // same reasoning, same tier: typing into the artist
+                // profile's own song filter has to claim every key
+                // too, or it's the exact same leak all over again for
+                // a second text box.
+                if let Some(bv) = &mut browse_view {
+                    if bv.filtering {
+                        match key.code {
+                            KeyCode::Char(c) => {
+                                bv.filter_query.push(c);
+                                bv.clamp_selection_to_filter();
+                            }
+                            KeyCode::Backspace => {
+                                bv.filter_query.pop();
+                                bv.clamp_selection_to_filter();
+                            }
+                            KeyCode::Esc | KeyCode::Enter => bv.filtering = false,
+                            _ => {}
+                        }
+                        continue;
+                    }
+                }
+
                 if subtitle_menu_open {
                     if key.code == KeyCode::Esc
                         || key.code == keymap.get(KeyAction::OpenSubtitleMenu)
@@ -2112,11 +2180,27 @@ fn main() -> anyhow::Result<()> {
                 // with focus on the sidebar, j/k/enter fall through
                 // to `app.handle_key` instead, moving/acting on the
                 // search results behind this view. enter plays from
-                // the selected track to the end of the album/playlist.
+                // the selected track to the end of the album/playlist
+                // (or, with the artist profile's ALBUMS column
+                // focused, opens that album instead; see `open_album`
+                // below, computed here but applied after this borrow
+                // of `browse_view` ends).
+                let mut open_album: Option<SearchItem> = None;
                 if let (Some(bv), Focus::Workspace) = (&mut browse_view, focus) {
+                    if bv.is_artist && key.code == keymap.get(KeyAction::StartSearch) {
+                        bv.filtering = true;
+                        continue;
+                    }
+                    if bv.is_artist && matches!(key.code, KeyCode::Left | KeyCode::Right) {
+                        bv.albums_focused = !bv.albums_focused;
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('j') | KeyCode::Down => bv.next(),
                         KeyCode::Char('k') | KeyCode::Up => bv.prev(),
+                        KeyCode::Enter if bv.albums_focused => {
+                            open_album = bv.albums.get(bv.albums_selected).cloned();
+                        }
                         KeyCode::Enter => {
                             let session: Vec<SearchItem> = bv.tracks[bv.selected..].to_vec();
                             let mut tracks = session.clone().into_iter();
@@ -2146,7 +2230,9 @@ fn main() -> anyhow::Result<()> {
                                 status = s;
                             }
                         }
-                        _ if key.code == keymap.get(KeyAction::ToggleStar) => {
+                        _ if key.code == keymap.get(KeyAction::ToggleStar)
+                            && !bv.albums_focused =>
+                        {
                             if let Some(item) = bv.tracks.get(bv.selected).cloned() {
                                 status =
                                     match toggle_star(&item, &mut favorites, &mut remote_starred) {
@@ -2160,6 +2246,20 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                         _ => {}
+                    }
+                    if open_album.is_none() {
+                        continue;
+                    }
+                }
+                if let Some(album) = open_album {
+                    match open_browse_view(&album) {
+                        Ok(new_bv) => {
+                            real_art_protocol = picker.as_mut().and_then(|p| {
+                                new_bv.art.clone().map(|img| p.new_resize_protocol(img))
+                            });
+                            browse_view = Some(new_bv);
+                        }
+                        Err(msg) => notifications.push(Severity::Error, msg),
                     }
                     continue;
                 }
