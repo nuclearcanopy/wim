@@ -75,7 +75,7 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(dir.join("wim").join("config.toml"))
 }
 
-/// Loads config.toml, or starts with defaults on first run — never
+/// Loads config.toml, or starts with defaults on first run; never
 /// bails out to a cli error. A missing navidrome section just means
 /// the in-app login prompt (main.rs) offers to set one up; forcing
 /// people to hand-edit a toml file before they can even see the app

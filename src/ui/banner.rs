@@ -8,10 +8,10 @@ use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK, WHITE};
 /// `figlet -f larry3d WIM`), baked in as static art rather than
 /// hand-rolled. Tried `isometric1` first, but that font simulates true
 /// isometric perspective, which shifts each letter diagonally relative
-/// to the ones before it — reads as "stacked behind each other" rather
+/// to the ones before it; reads as "stacked behind each other" rather
 /// than clean 3D weight. `larry3d` gives bold slanted depth per letter
 /// without that progressive diagonal drift across the whole word. No
-/// figlet dependency at runtime — "WIM" never changes, so this is just
+/// figlet dependency at runtime; "WIM" never changes, so this is just
 /// baked-in text.
 const LOGO: &[&str] = &[
     r" __      __  ______               ",
@@ -31,7 +31,7 @@ pub const GLYPH_HEIGHT: usize = 7;
 ///
 /// Contrast matters as much as the animation: the frame rules and
 /// tagline deliberately sit much dimmer than the logo itself (NEAR_BLACK
-/// vs. the logo's WHITE/BRIGHT range) — everything rendered at similar
+/// vs. the logo's WHITE/BRIGHT range); everything rendered at similar
 /// brightness reads as flat no matter how much is animated.
 pub struct Banner {
     pub phase: f32,
@@ -87,7 +87,7 @@ fn draw_rule(buf: &mut Buffer, area: Rect, y: u16, pulse: f32) {
     if y >= area.y + area.height {
         return;
     }
-    // deliberately dim and low-contrast against the logo — a divider
+    // deliberately dim and low-contrast against the logo; a divider
     // that competes with the content it's dividing isn't doing its job.
     let level = NEAR_BLACK + (DIM * 0.5 - NEAR_BLACK) * pulse;
     let color = shade(level);

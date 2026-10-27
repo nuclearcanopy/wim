@@ -65,7 +65,7 @@ impl Widget for LibraryPathsView<'_> {
         draw_line(buf, area, area.y, "where's your media?", shade(NEAR_WHITE));
         let mut y = area.y + 2;
         if self.paths.is_empty() {
-            draw_line(buf, area, y, "(no paths found — type one below, or skip to browse nothing yet)", shade(DIM));
+            draw_line(buf, area, y, "(no paths found: type one below, or skip to browse nothing yet)", shade(DIM));
             y += 1;
         } else {
             for p in self.paths {

@@ -4,7 +4,7 @@
 //! reconstructs minimal `SearchItem`s from them (filename-derived title,
 //! no artist/album) rather than depending on a prior library scan still
 //! matching, so a moved/renamed library doesn't make resume fail outright
-//! — paths that no longer exist are just silently skipped.
+//!; paths that no longer exist are just silently skipped.
 
 use std::fs;
 use std::path::PathBuf;
@@ -43,7 +43,7 @@ pub fn save(state: &PlaybackState) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort load — a missing or corrupt state file just means
+/// Best-effort load; a missing or corrupt state file just means
 /// nothing to resume, not an error worth surfacing to the user.
 pub fn load() -> Option<PlaybackState> {
     let path = state_path().ok()?;

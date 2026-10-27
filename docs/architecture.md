@@ -13,7 +13,7 @@ FFI (the `libmpv`/`libmpv2` crates).
 why: no pkg-config/C headers needed at build time, which keeps the nix
 packaging story simple (just `mpv` as a runtime dep, nothing to find at
 build time). it's also exactly how most external mpv controllers
-(mpv-mpris, various mpv remotes) are built — a well-trodden path, not a
+(mpv-mpris, various mpv remotes) are built; a well-trodden path, not a
 workaround.
 
 the reader thread demuxes two kinds of messages on the same socket:
@@ -33,7 +33,7 @@ modifiers instead of color.
 ## no stock ratatui widgets
 
 `Block`/`Paragraph`/`List` with default borders produce the generic
-"boxes everywhere" tui look. ratatui itself doesn't force that — it's
+"boxes everywhere" tui look. ratatui itself doesn't force that; it's
 just a cell buffer (`Buffer`) you can paint however you want, with full
 rgb/truecolor per cell and no forced borders. every widget in `src/ui/`
 implements `Widget::render` by writing cells directly
@@ -63,18 +63,18 @@ with terminal auto-detection. the `album_art` config option
 `src/search.rs` merges two independent matching passes into one ranked
 list, because they catch different failure modes:
 
-1. **nucleo-matcher subsequence fuzzy score** — fast, handles
+1. **nucleo-matcher subsequence fuzzy score**; fast, handles
    substrings/skips/case well. catches typos where the letters are still
    in the right relative order (e.g. a dropped letter).
 2. **damerau-levenshtein edit-distance fallback** (`strsim` crate),
-   computed per word in the haystack — catches genuine transposition
+   computed per word in the haystack; catches genuine transposition
    typos where the letters are *not* in subsequence order (e.g. two
    adjacent letters swapped), which a pure subsequence matcher cannot
    match at all no matter how fuzzy its scoring is.
 
 an item matches if *either* signal fires. the budget for the
 edit-distance fallback (`edit_distance_budget()`) scales with query
-length — deliberately generous, because a missed result is worse than
+length; deliberately generous, because a missed result is worse than
 an occasional over-eager match. see `docs/features.md` for the product
 reasoning (why typo tolerance isn't optional here).
 
@@ -86,7 +86,7 @@ other.
 ## subsonic: hand-rolled client
 
 `src/subsonic.rs` talks to navidrome's subsonic-compatible api directly
-over `ureq`, rather than using an existing subsonic crate — the
+over `ureq`, rather than using an existing subsonic crate; the
 available ones are unmaintained or incomplete, and the actual surface
 needed (ping, search3, playlists, stream urls) is small. token auth
 follows the spec exactly: `t = md5(password + salt)` with a fresh random
@@ -97,7 +97,7 @@ wire (independent of tls).
 
 `src/config.rs` always reads a single toml file
 (`$XDG_CONFIG_HOME/wim/config.toml`). the planned home-manager module
-(see roadmap) doesn't introduce a second config path — it just *writes
+(see roadmap) doesn't introduce a second config path; it just *writes
 that same file* declaratively from nix options, so hand-edited and
 nix-managed config are indistinguishable to the app. credentials use a
 `password_file` option (a path, compatible with agenix) rather than an
@@ -108,9 +108,9 @@ user.
 ## app state is decoupled from rendering
 
 `src/app.rs`'s `App` struct and its `handle_key()` state machine have no
-dependency on an actual terminal — `crossterm::event::KeyCode` is just a
+dependency on an actual terminal; `crossterm::event::KeyCode` is just a
 plain enum, constructible in tests without a tty. this matters
 practically: raw-mode rendering can't be exercised headlessly (no real
-tty in this build/test/loop context), but all the *logic* — selection
+tty in this build/test/loop context), but all the *logic*; selection
 movement and clamping, the `gg`/`G` vim-style pending-key handling,
-query editing, what "enter" does — is fully unit-tested without one.
+query editing, what "enter" does; is fully unit-tested without one.

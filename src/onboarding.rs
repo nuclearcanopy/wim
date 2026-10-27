@@ -1,5 +1,5 @@
 //! First-run onboarding: welcome, controls, navidrome setup, library
-//! paths — a proper guided sequence rather than a disconnected login
+//! paths; a proper guided sequence rather than a disconnected login
 //! popup appearing with no context. Pure state only; main.rs owns the
 //! network/filesystem orchestration (pinging navidrome, saving config),
 //! same split as the rest of the app.

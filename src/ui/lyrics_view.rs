@@ -5,7 +5,7 @@ use ratatui::widgets::Widget;
 use crate::theme::{shade, DIM};
 
 /// Simple scrollable plain-text view, no stock `Paragraph`/wrapping
-/// widget — lines are pre-split by the caller and indexed directly.
+/// widget; lines are pre-split by the caller and indexed directly.
 pub struct LyricsView<'a> {
     pub lines: &'a [&'a str],
     pub scroll: usize,

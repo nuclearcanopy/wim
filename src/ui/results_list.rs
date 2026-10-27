@@ -7,15 +7,17 @@ use crate::theme::{shade, BRIGHT, DIM};
 use crate::ui::textfit::truncate_with_ellipsis;
 
 pub(crate) fn label(item: &SearchItem) -> String {
+    // "·" (middle dot), not an em dash, for title/artist metadata
+    // separators; same convention most music apps use.
     match item {
         SearchItem::LocalMusic { title, artist, .. } => match artist {
-            Some(a) => format!("{title} — {a}"),
+            Some(a) => format!("{title} · {a}"),
             None => title.clone(),
         },
         SearchItem::LocalVideo { title, .. } => title.clone(),
         SearchItem::Artist { name, .. } => name.clone(),
-        SearchItem::Album { name, artist, .. } => format!("{name} — {artist}"),
-        SearchItem::Song { title, artist, album, .. } => format!("{title} — {artist} ({album})"),
+        SearchItem::Album { name, artist, .. } => format!("{name} · {artist}"),
+        SearchItem::Song { title, artist, album, .. } => format!("{title} · {artist} ({album})"),
         SearchItem::Playlist { name, .. } => name.clone(),
     }
 }
@@ -23,7 +25,7 @@ pub(crate) fn label(item: &SearchItem) -> String {
 /// Custom-painted results list: no stock `List` widget. Each row is
 /// `[kind] label`, the selected row rendered near-white, others dim, and
 /// the window scrolls to keep the selection visible without wrapping.
-/// An empty `items` isn't a no-op render — a blank screen with no
+/// An empty `items` isn't a no-op render; a blank screen with no
 /// explanation is a dead end, not a loved-app experience; `empty_message`
 /// is shown instead so there's always *something* telling the user why
 /// nothing's there and what to do about it.

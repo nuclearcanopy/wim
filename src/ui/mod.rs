@@ -1,5 +1,6 @@
 pub mod banner;
 pub mod divider;
+pub mod header;
 pub mod login;
 pub mod lyrics_view;
 pub mod nav_manager;

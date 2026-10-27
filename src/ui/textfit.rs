@@ -1,14 +1,14 @@
-//! Terminal width is unpredictable and resizable — text that silently
+//! Terminal width is unpredictable and resizable; text that silently
 //! runs off the edge with no indication is a real bug, not a cosmetic
 //! nitpick: it hides what you're actively typing. Two strategies,
 //! chosen per use case:
 //!
 //! - `tail_fit`: for text being actively typed (search query, login
-//!   fields) — shows the *end* of the string so the cursor position
+//!   fields); shows the *end* of the string so the cursor position
 //!   stays visible as you type past the visible width, the way any
 //!   real text input does.
 //! - `truncate_with_ellipsis`: for static/display text (status
-//!   messages, result rows) — shows the start and marks the cut with
+//!   messages, result rows); shows the start and marks the cut with
 //!   `…` so it's visually obvious there's more, rather than an
 //!   unexplained hard stop.
 
@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn handles_multibyte_characters_by_count_not_bytes() {
-        // "─" is 3 bytes in utf-8 but 1 char — must not panic/mis-slice.
+        // "─" is 3 bytes in utf-8 but 1 char; must not panic/mis-slice.
         let s = "──────────"; // 10 chars, 30 bytes
         assert_eq!(tail_fit(s, 5).chars().count(), 5);
         assert_eq!(truncate_with_ellipsis(s, 5).chars().count(), 5);

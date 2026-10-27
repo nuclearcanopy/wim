@@ -4,9 +4,10 @@ use ratatui::widgets::Widget;
 
 use crate::config::NavidromeConfig;
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
+use crate::ui::header::draw_header;
 use crate::ui::textfit::truncate_with_ellipsis;
 
-/// The profile list — not shown when adding a new one (that reuses
+/// The profile list; not shown when adding a new one (that reuses
 /// `LoginView` directly). Selecting an existing profile reconnects/
 /// refreshes it; `d` removes it; the last row is always "add new".
 pub struct NavManagerListView<'a> {
@@ -18,17 +19,16 @@ pub struct NavManagerListView<'a> {
 impl Widget for NavManagerListView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let width = area.width as usize;
-        let mut y = area.y;
-        draw_line(
+        let mut y = draw_header(
             buf,
             area,
-            y,
-            "navidrome profiles — enter: reconnect/add, d: remove, esc: close",
+            area.y,
+            "navidrome profiles",
+            "enter: reconnect/add, d: remove, esc: close",
             shade(DIM),
+            shade(NEAR_BLACK),
         );
         y += 1;
-        draw_line(buf, area, y, &"─".repeat(width), shade(NEAR_BLACK));
-        y += 2;
 
         if self.servers.is_empty() {
             draw_line(buf, area, y, "(no profiles yet)", shade(DIM));

@@ -20,7 +20,7 @@ impl Widget for StatusBar<'_> {
         }
         let width = area.width as usize;
         // actively-typed text keeps its tail visible (the cursor end);
-        // static messages truncate with an ellipsis instead — same
+        // static messages truncate with an ellipsis instead; same
         // distinction as everywhere else text might overflow the
         // terminal width. see ui/textfit.rs.
         let text = if self.editing_query {

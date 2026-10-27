@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
+use crate::ui::header::draw_header;
 use crate::ui::textfit::{tail_fit, truncate_with_ellipsis};
 
 /// Interactive Navidrome setup, shown on first run instead of requiring
@@ -28,8 +29,21 @@ impl LoginForm {
         }
     }
 
+    /// Tab cycles with wraparound (standard tab-navigation convention).
     pub fn next_field(&mut self) {
         self.field = (self.field + 1) % 3;
+    }
+
+    /// Arrow-key navigation is non-wrapping; stops at the first/last
+    /// field rather than cycling, the more expected behavior for
+    /// up/down specifically (and for backspace-on-empty going back to
+    /// fix a typo without having to tab all the way around).
+    pub fn prev_field(&mut self) {
+        self.field = self.field.saturating_sub(1);
+    }
+
+    pub fn next_field_clamped(&mut self) {
+        self.field = (self.field + 1).min(2);
     }
 
     pub fn is_last_field(&self) -> bool {
@@ -55,17 +69,16 @@ impl Widget for LoginView<'_> {
             [("server", &self.form.url), ("username", &self.form.username), ("password", &masked_password)];
 
         let width = area.width as usize;
-        let mut y = area.y;
-        draw_line(
+        let mut y = draw_header(
             buf,
             area,
-            y,
-            &truncate_with_ellipsis("navidrome setup — enter to advance, esc to skip (local files only)", width),
+            area.y,
+            "navidrome setup",
+            "enter to advance, esc to skip (local files only)",
             shade(DIM),
+            shade(NEAR_BLACK),
         );
         y += 1;
-        draw_line(buf, area, y, &"─".repeat(width), shade(NEAR_BLACK));
-        y += 2;
 
         for (i, (label, value)) in rows.iter().enumerate() {
             let active = i == self.form.field;
@@ -75,7 +88,7 @@ impl Widget for LoginView<'_> {
 
             if i == 0 {
                 // url field: "https://" renders as a ghost prefix baked
-                // into the box itself, like it's already typed — not a
+                // into the box itself, like it's already typed; not a
                 // separate label note. skipped if the user typed a
                 // scheme themselves, so it never doubles up.
                 let has_own_scheme = value.to_ascii_lowercase().starts_with("http://")
@@ -96,7 +109,7 @@ impl Widget for LoginView<'_> {
                     active_color,
                 );
             } else {
-                // the value is what's actively being typed — keep its
+                // the value is what's actively being typed; keep its
                 // tail (cursor end) visible rather than truncating it
                 // away, same as the search query in the status bar.
                 let value_width = width.saturating_sub(prefix.chars().count());

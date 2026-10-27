@@ -1,6 +1,6 @@
 //! Unified fuzzy search: one ranked list across local music, local video,
 //! and every Navidrome entity type, rather than per-source silos. This is
-//! the single most-emphasized requirement in the spec — searching "bla"
+//! the single most-emphasized requirement in the spec; searching "bla"
 //! should surface matching artists, albums, songs, playlists, and local
 //! files together, ranked by actual relevance, not just substring hits.
 
@@ -23,7 +23,7 @@ pub enum SearchItem {
 }
 
 impl SearchItem {
-    /// The text the fuzzy matcher scores against — every relevant field
+    /// The text the fuzzy matcher scores against; every relevant field
     /// joined, so "search bla" matches on title, artist, or album alike.
     fn haystack(&self) -> String {
         match self {
@@ -207,7 +207,7 @@ mod tests {
         let kinds: Vec<&str> = results.iter().map(|i| i.kind_label()).collect();
 
         // "bla" should hit the local track (via title/artist/album text),
-        // the artist, the album, and the playlist — but not the unrelated
+        // the artist, the album, and the playlist; but not the unrelated
         // song, proving this is one merged ranked list, not per-source
         // silos that happen to sit next to each other.
         assert!(kinds.contains(&"local"));

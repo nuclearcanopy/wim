@@ -1,5 +1,5 @@
 //! 10-band graphic eq. Raw per-band gains are the mechanism, but presets
-//! are the actual feature most people use — every well-regarded player
+//! are the actual feature most people use; every well-regarded player
 //! ships them so users don't have to hand-tune ten sliders. See
 //! docs/features.md.
 //!
@@ -14,7 +14,7 @@ pub const BAND_HZ: [f64; 10] =
 pub struct Preset {
     pub name: &'static str,
     /// dB gain per band, same order as `BAND_HZ`. Starting-point values,
-    /// not acoustically measured — refinable by ear later.
+    /// not acoustically measured; refinable by ear later.
     pub gains: [f64; 10],
 }
 

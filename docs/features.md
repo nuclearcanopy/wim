@@ -10,7 +10,7 @@ that version, not the minimal one, even if not explicitly asked.
 ## search
 
 **requirement:** one keyword should surface matching artists, albums,
-songs, playlists, local tracks, and local video together — never a
+songs, playlists, local tracks, and local video together; never a
 dead end.
 
 **why typo tolerance isn't optional:** a fuzzy matcher that only does
@@ -26,7 +26,7 @@ see `docs/architecture.md`'s search section for how the two signals
 
 **status:** implemented (`src/search.rs`). not yet wired into the app
 loop against a live navidrome server (needs real credentials to
-exercise end to end — see `QUESTIONS.md`).
+exercise end to end; see `QUESTIONS.md`).
 
 **candidate future improvements** (not yet built, listed so they don't
 get lost): weight recently-played / frequently-played items higher in
@@ -67,7 +67,7 @@ literal naive one.
 
 **status:** mpv control layer exists (`src/mpv.rs`), methods for
 play/pause/seek/volume/speed/loop-file are wired but nothing calls them
-yet — the app event loop (`src/app.rs` + the `main.rs` integration) is
+yet; the app event loop (`src/app.rs` + the `main.rs` integration) is
 the next piece. eq/gapless/crossfade/smart-shuffle are not yet built;
 tracked here and in `ROADMAP.md` so they don't get forgotten once the
 literal spec items are done.
@@ -75,7 +75,7 @@ literal spec items are done.
 ## queue
 
 a persistent play queue (not just "play one thing at a time") is
-expected baseline behavior in any serious media player — add to queue,
+expected baseline behavior in any serious media player; add to queue,
 play next, reorder, see what's coming up. without it the app would feel
 primitive regardless of how good search or eq are. not yet built.
 
@@ -85,7 +85,7 @@ given the strictly-monochrome, custom-painted, omarchy-homepage-inspired
 aesthetic already established (see `docs/architecture.md`), a live audio
 level meter (think `cava`, the hugely popular terminal audio visualizer)
 rendered as animated unicode blocks fits the project's own identity
-directly — modern, efficient (mpv already exposes audio level data), and
+directly; modern, efficient (mpv already exposes audio level data), and
 genuinely loved in the terminal-tool space this app lives in. candidate
 for the now-playing view once the core player loop exists.
 
@@ -101,7 +101,7 @@ once the app loop exists to actually have state worth persisting.
 real images (sixel/kitty/iterm2, auto-detected) or a desaturated
 pixelated-block mode for users who want to keep the interface purely
 monochrome. see `docs/architecture.md` for the technical mapping onto
-`ratatui-image`'s protocols. not yet wired in — needs the app loop and
+`ratatui-image`'s protocols. not yet wired in; needs the app loop and
 a real now-playing view to render into first.
 
 ## subtitles (video)
@@ -109,7 +109,7 @@ a real now-playing view to render into first.
 auto-fetch from opensubtitles on local video playback, with full
 manual control: delay, language, size, outline, background opacity/
 blur/radius, position. color stays grayscale per the monochrome rule
-even here — this is ui chrome (subtitle rendering), not image content,
+even here; this is ui chrome (subtitle rendering), not image content,
 so the same rule that applies to the rest of the interface applies to
 it. not yet built; needs a real opensubtitles api key to live-test
 (see `QUESTIONS.md`).
