@@ -955,26 +955,57 @@ fn main() -> anyhow::Result<()> {
             let bottom_selected =
                 panels.resize_mode && panels.resize_selected == ResizePanel::BottomBar;
 
-            // the browse view's own header draws an internal
-            // horizontal rule right at main_content's left edge; the
-            // banner (now a LazyVim-style logo+menu, no framing rules)
-            // and the player/lyrics don't. same join as the bottom
-            // bar: whichever one's actually showing needs its rule row
-            // marked, or the vertical divider crosses it with a gap.
-            let junction_rows = if browse_view.is_some() {
+            let sidebar_rows =
+                Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(sidebar);
+            // the search box is open on its own right edge (see
+            // ui/searchbox.rs) and relies on this divider for its
+            // closing line instead: ┬ where its top border meets the
+            // divider (nothing above that row, the divider only
+            // continues down from there), ┤ where its bottom border
+            // does (the divider continues both up and down through
+            // that row). the browse view's own header draws a second,
+            // separate internal horizontal rule right at
+            // main_content's left edge; the banner (now a
+            // LazyVim-style logo+menu, no framing rules) and the
+            // player/lyrics don't, so that one only applies sometimes.
+            let mut junction_rows = vec![
+                (sidebar_rows[0].y, '┬', shade(NEAR_BLACK)),
+                (
+                    sidebar_rows[0].y + sidebar_rows[0].height - 1,
+                    '┤',
+                    shade(NEAR_BLACK),
+                ),
+            ];
+            if browse_view.is_some() {
                 // draw_header's rule sits one row below where it's
                 // asked to start, which is always main_content.y here;
                 // static color matching draw_header's own rule_color.
-                vec![(main_content.y + 1, shade(NEAR_BLACK))]
+                junction_rows.push((main_content.y + 1, '├', shade(NEAR_BLACK)));
+            }
+            // the divider used to stop at the bottom of `top`, one row
+            // short of the mini player strip below it (a separate row
+            // in the outer vertical split, sidebar-width columns
+            // included); the real bottom bar's rule still drew a ┴
+            // junction expecting a line to feed into it from above,
+            // so with the mini bar showing, that line had already
+            // stopped 3 rows earlier. Stretch the divider down through
+            // the mini bar's own height too in that case, with a ┼
+            // where its own internal rule (its first row) crosses.
+            let vdivider_rect = if show_mini_bar {
+                junction_rows.push((mini_bar_row.y, '┼', shade(NEAR_BLACK)));
+                Rect {
+                    height: vdivider.height + mini_bar_row.height,
+                    ..vdivider
+                }
             } else {
-                Vec::new()
+                vdivider
             };
             f.render_widget(
                 VerticalRule {
                     highlighted: sidebar_selected,
                     junction_rows,
                 },
-                vdivider,
+                vdivider_rect,
             );
             // a small bordered hint carved out of the bottom-right
             // corner, pointing at '?' for the full keybind reference,
@@ -996,8 +1027,6 @@ fn main() -> anyhow::Result<()> {
                 },
             );
 
-            let sidebar_rows =
-                Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(sidebar);
             // classic terminal cursor blink: ~530ms per half-phase.
             let cursor_visible = (start.elapsed().as_millis() / 530).is_multiple_of(2);
             f.render_widget(
