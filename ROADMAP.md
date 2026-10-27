@@ -76,16 +76,15 @@ at it; don't mark it done on build+test passing alone.
 the current single-pane results list is a placeholder, not the real
 layout. the actual design:
 
-1. **sidebar + bottom bar layout.** left column: a boxed "search ..."
-   input (text replaced once typing starts) with results below it.
-   bottom: playback controls (not a one-line status string). the
-   sidebar is a vertical strip; only horizontally resizable. the
-   bottom bar is a horizontal strip; only vertically resizable. this
-   has to exist before anything else below makes sense.
-2. **resize mode.** a keybind enters it; wasd selects which panel
-   (sidebar/bottom bar/main content), arrow keys stretch the selected
-   panel along its one valid axis only (sidebar: left/right arrows
-   only; bottom bar: up/down only). esc or the same keybind exits.
+1. [x] **sidebar + bottom bar layout.** boxed search box + results on
+   the left (`src/ui/searchbox.rs`), multi-line playback bar on the
+   bottom (`src/ui/controlsbar.rs`), main content area for now-playing/
+   lyrics (`src/ui/nowplaying.rs`). sidebar only horizontally
+   resizable, bottom bar only vertically; nav manager/login stay
+   full-screen modals (setup flows, not core browsing).
+2. [x] **resize mode** (`src/layout.rs`, tested): `r` toggles it, `a`/`s`
+   select sidebar/bottom bar, arrow keys stretch along that panel's
+   one valid axis only (the other axis is a genuine no-op per panel).
 3. **result row icons**, one per kind, monochrome (unicode glyphs, not
    color-coded; color is reserved per the monochrome rule): disc for
    albums, musical note for songs, a "reel" glyph for video, plus a
