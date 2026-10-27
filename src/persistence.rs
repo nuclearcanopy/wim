@@ -1,5 +1,5 @@
 //! Resuming playback (queue, position, volume) across restarts is
-//! standard in podcast/audiobook apps and most modern music players —
+//! standard in podcast/audiobook apps and most modern music players;
 //! not optional polish. State is saved as plain paths; resuming
 //! reconstructs minimal `SearchItem`s from them (filename-derived title,
 //! no artist/album) rather than depending on a prior library scan still
