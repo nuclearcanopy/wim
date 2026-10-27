@@ -12,7 +12,7 @@ use crate::ui::textfit::truncate_with_ellipsis;
 pub struct ControlsBar<'a> {
     pub status: &'a str,
     pub queue_len: usize,
-    pub loop_on: bool,
+    pub loop_label: &'a str,
     pub shuffle_on: bool,
     pub speed: f64,
     pub eq_preset: &'a str,
@@ -38,7 +38,7 @@ impl Widget for ControlsBar<'_> {
         let state_line = format!(
             "queue: {}  loop: {}  shuffle: {}  speed: {:.2}x  eq: {}",
             self.queue_len,
-            if self.loop_on { "on" } else { "off" },
+            self.loop_label,
             if self.shuffle_on { "on" } else { "off" },
             self.speed,
             self.eq_preset,
