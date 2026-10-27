@@ -2191,7 +2191,12 @@ fn main() -> anyhow::Result<()> {
                 },
             );
             f.render_widget(
-                ui::helpbox::HelpBox { label: "? help" },
+                ui::helpbox::HelpBox {
+                    label: &format!(
+                        "{} help",
+                        keymap::key_label(keymap.get(KeyAction::OpenHelp))
+                    ),
+                },
                 Rect {
                     x: help_box_x,
                     y: bottom.y + 1,
