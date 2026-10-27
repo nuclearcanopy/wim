@@ -5,9 +5,15 @@ use ratatui::widgets::Widget;
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::textfit::tail_fit;
 
-/// A hand-drawn box (┌─┐│└┘, not a stock `Block`) around the search
-/// input: "search..." as a dim placeholder when empty, replaced by the
-/// live query once typing starts.
+/// A hand-drawn box around the search input: "search..." as a dim
+/// placeholder when empty, replaced by the live query once typing
+/// starts. Deliberately open on the right: the sidebar's own vertical
+/// divider sits one column past `area`'s right edge already, so a
+/// second parallel line right next to it just looked like a
+/// disconnected box bolted onto the layout rather than part of it.
+/// Closing this side is main.rs's job, via the vdivider's own
+/// `junction_rows` at this box's top/bottom rows (┬ and ┤), the same
+/// way every other junction this session got wired up.
 pub struct SearchBox<'a> {
     pub query: &'a str,
     pub editing: bool,
@@ -27,19 +33,18 @@ impl Widget for SearchBox<'_> {
         let h = area.height;
 
         put(buf, area.x, area.y, '┌', border_color);
-        put(buf, area.x + w - 1, area.y, '┐', border_color);
         put(buf, area.x, area.y + h - 1, '└', border_color);
-        put(buf, area.x + w - 1, area.y + h - 1, '┘', border_color);
-        for x in 1..w - 1 {
+        for x in 1..w {
             put(buf, area.x + x, area.y, '─', border_color);
             put(buf, area.x + x, area.y + h - 1, '─', border_color);
         }
         for y in 1..h - 1 {
             put(buf, area.x, area.y + y, '│', border_color);
-            put(buf, area.x + w - 1, area.y + y, '│', border_color);
         }
 
-        let inner_width = w.saturating_sub(2) as usize;
+        // one border column on the left only now; no right border to
+        // reserve a second column for.
+        let inner_width = w.saturating_sub(1) as usize;
         // the placeholder only makes sense when there's nothing typed
         // *and* nothing being typed; once editing starts on an empty
         // query, the blinking cursor alone is the "you're in here" signal,
