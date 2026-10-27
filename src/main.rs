@@ -666,6 +666,14 @@ fn rebuild_corpus(cfg: &config::Config) -> search::Corpus {
     corpus
 }
 
+/// Which pane plain navigation (j/k/arrows/enter) currently targets.
+/// See where `focus` is declared in `main` for the full reasoning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Sidebar,
+    Workspace,
+}
+
 fn main() -> anyhow::Result<()> {
     let is_first_run = !config::config_path()?.exists();
     let mut cfg = config::load_or_init()?;
@@ -683,6 +691,17 @@ fn main() -> anyhow::Result<()> {
     // the full keybind list moved to the '?' help overlay; nothing
     // worth saying here until something actually happens.
     let mut status = String::new();
+    // which pane j/k/arrows/enter navigate: the sidebar's own results
+    // list, or whatever's open in the workspace (currently only a
+    // browse view has anything to navigate within). Shift+W/A (or
+    // Shift+S/D) switches it, same w+a / s+d pairing convention as
+    // resize mode's panel-select, deliberately capitalized so it
+    // never collides with that mode's own lowercase wasd, or with
+    // plain 'a' (enqueue) / 's' (shuffle), both of which keep meaning
+    // exactly what they already do. Global playback controls
+    // (space/f/b/m/i/etc.) don't care about this at all; only
+    // pane-local navigation does.
+    let mut focus = Focus::Sidebar;
 
     let mut favorites = favorites::load();
     // song ids this session knows are starred, across every configured
@@ -959,8 +978,14 @@ fn main() -> anyhow::Result<()> {
             let vdivider = cols[1];
             let main_content = cols[2];
 
-            let sidebar_selected =
-                panels.resize_mode && panels.resize_selected == ResizePanel::Sidebar;
+            // resize-mode's panel pick doubles as the divider
+            // highlight outside resize mode too: it's the same visual
+            // (brighter divider), and reusing it means which pane has
+            // navigation focus is actually visible, not just a fact
+            // main.rs tracks silently.
+            let sidebar_selected = (panels.resize_mode
+                && panels.resize_selected == ResizePanel::Sidebar)
+                || (!panels.resize_mode && focus == Focus::Sidebar);
             let bottom_selected =
                 panels.resize_mode && panels.resize_selected == ResizePanel::BottomBar;
 
@@ -1498,6 +1523,15 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                if matches!(key.code, KeyCode::Char('A' | 'W')) {
+                    focus = Focus::Sidebar;
+                    continue;
+                }
+                if matches!(key.code, KeyCode::Char('S' | 'D')) {
+                    focus = Focus::Workspace;
+                    continue;
+                }
+
                 if panels.resize_mode {
                     // each panel only answers to its one valid resize
                     // axis: sidebar is a vertical strip (left/right
@@ -1525,13 +1559,29 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // browse view intercepts input the same way lyrics does
-                // (below): scrolling/picking a track shouldn't move the
-                // underlying results selection. enter plays from the
-                // selected track to the end of the album/playlist; esc
-                // closes it, handing main_content back to whatever it'd
-                // otherwise show (now-playing, lyrics, or the banner).
-                if let Some(bv) = &mut browse_view {
+                // closing what's open doesn't depend on which pane has
+                // focus; the global playback controls below (space/f/
+                // b/m/i) don't either, only pane-local navigation
+                // does (see the Focus match further down).
+                if browse_view.is_some() && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    browse_view = None;
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('i') {
+                    art_mode = art_mode.toggle();
+                    continue;
+                }
+
+                // browse view intercepts navigation the same way
+                // lyrics does (below): scrolling/picking a track
+                // shouldn't move the underlying sidebar selection,
+                // but only while the workspace actually has focus;
+                // with focus on the sidebar, j/k/enter fall through
+                // to `app.handle_key` instead, moving/acting on the
+                // search results behind this view. enter plays from
+                // the selected track to the end of the album/playlist.
+                if let (Some(bv), Focus::Workspace) = (&mut browse_view, focus) {
                     match key.code {
                         KeyCode::Char('j') | KeyCode::Down => bv.next(),
                         KeyCode::Char('k') | KeyCode::Up => bv.prev(),
@@ -1564,30 +1614,6 @@ fn main() -> anyhow::Result<()> {
                                 status = s;
                             }
                         }
-                        // maximizing replaces this album/playlist view
-                        // with the full player; minimizing again
-                        // brings it right back (not cleared, just not
-                        // on top while the player's maximized).
-                        KeyCode::Char('m') if now_playing.is_some() => {
-                            player_minimized = !player_minimized
-                        }
-                        KeyCode::Char('i') => art_mode = art_mode.toggle(),
-                        KeyCode::Char(' ') if now_playing.is_some() => {
-                            let _ = player.toggle_pause();
-                        }
-                        KeyCode::Char('f') if now_playing.is_some() => {
-                            let _ = player.playlist_next();
-                        }
-                        KeyCode::Char('b') if previous_track.is_some() => {
-                            status = go_to_previous(
-                                &cfg,
-                                &player,
-                                &mut notifications,
-                                &mut now_playing,
-                                &mut previous_track,
-                                &mut app.queue,
-                            );
-                        }
                         KeyCode::Char('*') => {
                             if let Some(item) = bv.tracks.get(bv.selected).cloned() {
                                 status =
@@ -1601,7 +1627,6 @@ fn main() -> anyhow::Result<()> {
                                     };
                             }
                         }
-                        KeyCode::Esc | KeyCode::Char('q') => browse_view = None,
                         _ => {}
                     }
                     continue;
@@ -1717,10 +1742,11 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if key.code == KeyCode::Char('*') {
-                    // the browse-view case is handled inside its own
-                    // intercept above; this only ever runs when
-                    // nothing's being browsed, so it's always the
-                    // selected search result.
+                    // the browse-view-focused case is handled inside
+                    // its own intercept above; this runs whenever
+                    // nothing's being browsed, or something is but the
+                    // sidebar has focus, so it's always the sidebar's
+                    // own selected search result here.
                     status = match app.results.get(app.selected).cloned() {
                         Some(item) => match toggle_star(&item, &mut favorites, &mut remote_starred)
                         {
