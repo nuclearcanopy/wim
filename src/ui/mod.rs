@@ -1,10 +1,13 @@
 pub mod banner;
+pub mod controlsbar;
 pub mod divider;
 pub mod header;
 pub mod login;
 pub mod lyrics_view;
 pub mod nav_manager;
+pub mod nowplaying;
 pub mod onboarding;
 pub mod results_list;
+pub mod searchbox;
 pub mod status;
 pub mod textfit;

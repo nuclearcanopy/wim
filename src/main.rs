@@ -373,7 +373,31 @@ fn main() -> anyhow::Result<()> {
         }
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
+            let ev = event::read()?;
+
+            // bracketed paste delivers the whole pasted string as one
+            // event, not synthesized keystrokes — enabling bracketed
+            // paste mode (term.rs) without handling this event meant
+            // paste did literally nothing. route it to whichever text
+            // input is actually active, same priority order as key
+            // handling below.
+            if let Event::Paste(text) = &ev {
+                if let Some(ob) = &mut onboarding {
+                    match ob.step {
+                        Step::Navidrome => ob.login.current_mut().push_str(text),
+                        Step::LibraryPaths => ob.path_input.push_str(text),
+                        _ => {}
+                    }
+                } else if let Some(nm) = &mut nav_manager {
+                    if let NavManagerStep::Add(form) = &mut nm.step {
+                        form.current_mut().push_str(text);
+                    }
+                } else {
+                    app.paste_into_query(text);
+                }
+            }
+
+            if let Event::Key(key) = ev {
                 if let Some(ob) = &mut onboarding {
                     match ob.step {
                         Step::Welcome | Step::Controls => ob.advance(),
