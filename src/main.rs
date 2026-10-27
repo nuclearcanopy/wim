@@ -2228,6 +2228,7 @@ fn main() -> anyhow::Result<()> {
                             values[6].as_str(),
                         ],
                         selected: subtitle_menu_selected,
+                        keymap: &keymap,
                     },
                     area,
                 );
