@@ -11,6 +11,10 @@ use crate::ui::textfit::tail_fit;
 pub struct SearchBox<'a> {
     pub query: &'a str,
     pub editing: bool,
+    /// Blink phase for the terminal-style cursor block; only matters
+    /// while `editing`. The caller toggles this on a timer so the
+    /// widget itself stays a pure render of whatever state it's given.
+    pub cursor_visible: bool,
 }
 
 impl Widget for SearchBox<'_> {
@@ -36,7 +40,11 @@ impl Widget for SearchBox<'_> {
         }
 
         let inner_width = w.saturating_sub(2) as usize;
-        let (text, color) = if self.query.is_empty() {
+        // the placeholder only makes sense when there's nothing typed
+        // *and* nothing being typed; once editing starts on an empty
+        // query, the blinking cursor alone is the "you're in here" signal,
+        // not placeholder text fighting it for the same cell.
+        let (text, color) = if self.query.is_empty() && !self.editing {
             ("search...".to_string(), shade(DIM))
         } else {
             (tail_fit(self.query, inner_width), shade(NEAR_WHITE))
@@ -46,6 +54,11 @@ impl Widget for SearchBox<'_> {
                 break;
             }
             put(buf, area.x + 1 + col as u16, area.y + 1, ch, color);
+        }
+
+        if self.editing && self.cursor_visible {
+            let cursor_col = text.chars().count().min(inner_width.saturating_sub(1));
+            put(buf, area.x + 1 + cursor_col as u16, area.y + 1, '█', shade(NEAR_WHITE));
         }
     }
 }
