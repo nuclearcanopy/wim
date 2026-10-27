@@ -255,15 +255,22 @@ fn open_starred_view(
     servers: &[config::NavidromeConfig],
     favorites: &favorites::Favorites,
 ) -> browse::BrowseView {
-    let mut tracks = Vec::new();
-    for nav in servers {
-        if let Ok(client) = subsonic::Client::new(nav) {
-            if let Ok(songs) = client.get_starred_songs() {
-                let client = Arc::new(client);
-                tracks.extend(browse::songs_to_items(songs, &client));
-            }
-        }
-    }
+    let per_server: Vec<Vec<SearchItem>> = thread::scope(|scope| {
+        servers
+            .iter()
+            .map(|nav| {
+                scope.spawn(|| {
+                    let client = Arc::new(subsonic::Client::new(nav).ok()?);
+                    let songs = client.get_starred_songs().ok()?;
+                    Some(browse::songs_to_items(songs, &client))
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or(None).unwrap_or_default())
+            .collect()
+    });
+    let mut tracks: Vec<SearchItem> = per_server.into_iter().flatten().collect();
     for path in favorites.paths() {
         if let Some(item) = persistence::item_from_path(path) {
             tracks.push(item);
@@ -602,15 +609,30 @@ fn spawn_background_sync(
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
             }
-            for nav in &servers {
-                let result = fetch_navidrome_catalog(nav);
-                if result_tx
-                    .send(BackgroundSyncResult {
-                        url: nav.url.clone(),
-                        result,
+            // same reasoning as the startup fetch: independent
+            // per-server requests, so run them concurrently rather
+            // than making every server wait for the one before it.
+            let results: Vec<BackgroundSyncResult> = thread::scope(|scope| {
+                servers
+                    .iter()
+                    .map(|nav| {
+                        (
+                            nav.url.clone(),
+                            scope.spawn(|| fetch_navidrome_catalog(nav)),
+                        )
                     })
-                    .is_err()
-                {
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|(url, handle)| BackgroundSyncResult {
+                        url,
+                        result: handle
+                            .join()
+                            .unwrap_or_else(|_| Err("panicked while syncing".to_string())),
+                    })
+                    .collect()
+            });
+            for result in results {
+                if result_tx.send(result).is_err() {
                     return; // main thread is gone (shutting down)
                 }
             }
@@ -650,10 +672,20 @@ fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatal
     // paginated (see subsonic.rs). songs stay fetched on demand (per
     // album/playlist/artist opened) rather than indexed eagerly; a
     // library this size could be enormous and isn't needed up front
-    // for search to work on artists/albums.
-    let artists = client.all_artists().unwrap_or_default();
-    let albums = client.all_albums().unwrap_or_default();
-    let playlists = client.playlists().unwrap_or_default();
+    // for search to work on artists/albums. these three are
+    // independent requests; fetching them concurrently instead of one
+    // after another is most of the difference between this feeling
+    // instant and feeling like three round-trips stacked up.
+    let (artists, albums, playlists) = thread::scope(|scope| {
+        let artists = scope.spawn(|| client.all_artists().unwrap_or_default());
+        let albums = scope.spawn(|| client.all_albums().unwrap_or_default());
+        let playlists = scope.spawn(|| client.playlists().unwrap_or_default());
+        (
+            artists.join().unwrap_or_default(),
+            albums.join().unwrap_or_default(),
+            playlists.join().unwrap_or_default(),
+        )
+    });
     Ok(FetchedCatalog {
         client: Arc::new(client),
         artists,
@@ -679,6 +711,22 @@ fn merge_catalog_into_app(app: &mut app::App, catalog: FetchedCatalog) {
     app.resync_results();
 }
 
+type NavidromeEverything = Result<(FetchedCatalog, Vec<String>), String>;
+
+/// Catalog + starred-song-ids for one server, fetched together so
+/// the startup multi-server pass (see `main`) only connects once per
+/// server rather than once for the catalog and again for starred
+/// songs. Pure network I/O, safe to call from any thread.
+fn fetch_navidrome_everything(nav: &config::NavidromeConfig) -> NavidromeEverything {
+    let catalog = fetch_navidrome_catalog(nav)?;
+    let starred = catalog
+        .client
+        .get_starred_songs()
+        .map(|songs| songs.into_iter().map(|s| s.id).collect())
+        .unwrap_or_default();
+    Ok((catalog, starred))
+}
+
 /// Shared by onboarding, the profile manager's add flow, and reconnect
 /// on an existing profile; so none of them can drift out of sync.
 /// Doesn't touch `Config` itself: callers decide whether/how to
@@ -698,10 +746,15 @@ fn index_navidrome_server(
 /// where each one stands immediately rather than making you select
 /// each one individually to find out.
 fn test_navidrome_connectivity(servers: &[config::NavidromeConfig]) -> Vec<Option<bool>> {
-    servers
-        .iter()
-        .map(|nav| Some(subsonic::Client::new(nav).and_then(|c| c.ping()).is_ok()))
-        .collect()
+    thread::scope(|scope| {
+        servers
+            .iter()
+            .map(|nav| scope.spawn(|| subsonic::Client::new(nav).and_then(|c| c.ping()).is_ok()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| Some(handle.join().unwrap_or(false)))
+            .collect()
+    })
 }
 
 fn navidrome_config_from_form(form: &LoginForm) -> config::NavidromeConfig {
@@ -861,18 +914,47 @@ fn main() -> anyhow::Result<()> {
     // server stays down.
     let mut server_reachable: HashMap<String, bool> = HashMap::new();
     if !cfg.navidrome_servers.is_empty() {
-        for nav in &cfg.navidrome_servers {
-            let ok = match index_navidrome_server(&mut app, nav) {
-                Ok(_) => true,
+        // every configured server connects (catalog + starred songs)
+        // in parallel rather than one after another; applying each
+        // result to `app`/`remote_starred` still happens here on the
+        // main thread, sequentially, but that's pure in-memory work,
+        // not the network latency that actually made startup slow.
+        let results: Vec<(String, NavidromeEverything)> = thread::scope(|scope| {
+            cfg.navidrome_servers
+                .iter()
+                .map(|nav| {
+                    (
+                        nav.url.clone(),
+                        scope.spawn(|| fetch_navidrome_everything(nav)),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|(url, handle)| {
+                    let result = handle
+                        .join()
+                        .unwrap_or_else(|_| Err("panicked while connecting".to_string()));
+                    (url, result)
+                })
+                .collect()
+        });
+
+        for (url, result) in results {
+            let ok = match result {
+                Ok((catalog, starred)) => {
+                    merge_catalog_into_app(&mut app, catalog);
+                    remote_starred.extend(starred);
+                    true
+                }
                 Err(msg) => {
                     // a failed reconnect must not be silent; push it
                     // as its own notification rather than folding it
                     // into a summary status line nobody asked for.
-                    notifications.push(Severity::Error, format!("{}: {msg}", nav.url));
+                    notifications.push(Severity::Error, format!("{url}: {msg}"));
                     false
                 }
             };
-            server_reachable.insert(nav.url.clone(), ok);
+            server_reachable.insert(url, ok);
         }
         app.resync_results();
         // 'I' shows a full local/per-server breakdown on demand
@@ -884,14 +966,6 @@ fn main() -> anyhow::Result<()> {
     let (sync_tx, sync_rx) = mpsc::channel::<BackgroundSyncResult>();
     let (servers_tx, servers_rx) = mpsc::channel::<Vec<config::NavidromeConfig>>();
     spawn_background_sync(cfg.navidrome_servers.clone(), sync_tx, servers_rx);
-
-    for nav in &cfg.navidrome_servers {
-        if let Ok(client) = subsonic::Client::new(nav) {
-            if let Ok(songs) = client.get_starred_songs() {
-                remote_starred.extend(songs.into_iter().map(|s| s.id));
-            }
-        }
-    }
 
     // 'n' opens the profile manager standalone, later.
     let mut nav_manager: Option<NavManager> = None;
