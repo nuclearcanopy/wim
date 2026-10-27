@@ -10,6 +10,7 @@ mod mpv;
 mod navmanager;
 mod notify;
 mod onboarding;
+mod opensubtitles;
 mod persistence;
 mod search;
 mod subsonic;
@@ -280,6 +281,45 @@ fn initial_art_mode(mode: config::AlbumArtMode) -> browse::ArtMode {
     }
 }
 
+/// Best-effort, fire-and-forget from the caller's point of view: a
+/// no-op whenever `item` isn't a local video, no api key is
+/// configured, or the search/download fails for any reason (no
+/// matches, network error, quota exhausted). Blocking on the render
+/// thread, same documented tradeoff as the lyrics lookup; a brief
+/// hitch right when a video starts, not a background thread.
+fn maybe_fetch_subtitles(
+    cfg: &config::Config,
+    player: &mpv::Mpv,
+    notifications: &mut Notifications,
+    item: &SearchItem,
+) {
+    let SearchItem::LocalVideo { path, title } = item else {
+        return;
+    };
+    let Some(api_key) = cfg.resolve_opensubtitles_api_key() else {
+        return;
+    };
+    let client = opensubtitles::Client::new(api_key);
+    let Ok(results) = client.search(title, &cfg.subtitle_language) else {
+        return;
+    };
+    let Some(best) = results.first() else {
+        return;
+    };
+    let Ok(bytes) = client.download(best.file_id) else {
+        return;
+    };
+    let sub_path = path.with_extension("wim-auto.srt");
+    if std::fs::write(&sub_path, bytes).is_ok()
+        && player.sub_add(&sub_path.to_string_lossy()).is_ok()
+    {
+        notifications.push(
+            Severity::Info,
+            format!("subtitle: {} ({})", best.release, best.language),
+        );
+    }
+}
+
 /// (artist, title, album) for a lyrics lookup; only meaningful for
 /// local music; `SearchItem` doesn't carry duration, so lookups always
 /// fall through to lrclib's fuzzy `/search` rather than its exact
@@ -375,7 +415,9 @@ fn save_playback_state(player: &mpv::Mpv, now_playing: &Option<SearchItem>, queu
 /// keeps everything flowing through the one path we already control.
 /// Only ever tracks one step back, not a full history.
 fn go_to_previous(
+    cfg: &config::Config,
     player: &mpv::Mpv,
+    notifications: &mut Notifications,
     now_playing: &mut Option<SearchItem>,
     previous_track: &mut Option<SearchItem>,
     queue: &mut Vec<SearchItem>,
@@ -388,6 +430,7 @@ fn go_to_previous(
         if let Some(interrupted) = now_playing.take() {
             queue.insert(0, interrupted);
         }
+        maybe_fetch_subtitles(cfg, player, notifications, &prev);
         *now_playing = Some(prev);
     } else {
         *previous_track = Some(prev);
@@ -741,6 +784,7 @@ fn main() -> anyhow::Result<()> {
                 if let Some(pos) = saved.position_secs {
                     let _ = player.seek(pos, false);
                 }
+                maybe_fetch_subtitles(&cfg, &player, &mut notifications, &item);
                 now_playing = Some(item);
             }
         }
@@ -1092,6 +1136,7 @@ fn main() -> anyhow::Result<()> {
             status = match app.pop_queue() {
                 Some(next) => {
                     let s = format!("now playing: {}", label(&next));
+                    maybe_fetch_subtitles(&cfg, &player, &mut notifications, &next);
                     previous_track = now_playing.replace(next);
                     s
                 }
@@ -1109,6 +1154,7 @@ fn main() -> anyhow::Result<()> {
                         for t in &rest {
                             let _ = try_enqueue(&player, t);
                         }
+                        maybe_fetch_subtitles(&cfg, &player, &mut notifications, &first);
                         previous_track = now_playing.replace(first);
                         app.queue = rest;
                     }
@@ -1396,6 +1442,12 @@ fn main() -> anyhow::Result<()> {
                                     for t in &rest {
                                         let _ = try_enqueue(&player, t);
                                     }
+                                    maybe_fetch_subtitles(
+                                        &cfg,
+                                        &player,
+                                        &mut notifications,
+                                        &first,
+                                    );
                                     previous_track = now_playing.replace(first);
                                     app.queue = rest;
                                     original_queue = session;
@@ -1425,7 +1477,9 @@ fn main() -> anyhow::Result<()> {
                         }
                         KeyCode::Char('b') if previous_track.is_some() => {
                             status = go_to_previous(
+                                &cfg,
                                 &player,
+                                &mut notifications,
                                 &mut now_playing,
                                 &mut previous_track,
                                 &mut app.queue,
@@ -1540,7 +1594,9 @@ fn main() -> anyhow::Result<()> {
 
                 if key.code == KeyCode::Char('b') && previous_track.is_some() {
                     status = go_to_previous(
+                        &cfg,
                         &player,
+                        &mut notifications,
                         &mut now_playing,
                         &mut previous_track,
                         &mut app.queue,
@@ -1655,6 +1711,12 @@ fn main() -> anyhow::Result<()> {
                                     original_queue = std::iter::once(first.clone())
                                         .chain(tracks.iter().cloned())
                                         .collect();
+                                    maybe_fetch_subtitles(
+                                        &cfg,
+                                        &player,
+                                        &mut notifications,
+                                        &first,
+                                    );
                                     previous_track = now_playing.replace(first);
                                     app.queue = tracks;
                                     // a standalone play (not from an
