@@ -49,15 +49,13 @@ use ui::player::PlayerView;
 use ui::results_list::{label, ResultsList};
 use ui::searchbox::SearchBox;
 
-/// Local items resolve straight to a file path mpv can load. Remote
-/// (subsonic) items aren't wired into playback yet; the live loop only
-/// has a local corpus this round; see ROADMAP.md.
-///
-/// A remote `Song` resolves straight to a stream url (mpv loads http
-/// urls the same as local paths, nothing special needed). Remote
-/// `Album`/`Playlist`/`Artist` do NOT resolve here: they represent many
+/// Local items resolve straight to a file path mpv can load. A remote
+/// `Song` resolves straight to a stream url (mpv loads http urls the
+/// same as local paths, nothing special needed). Remote `Album`/
+/// `Playlist`/`Artist` do NOT resolve here: they represent many
 /// tracks, not one, and get expanded into individual `Song` items by
-/// `resolve_tracks` before anything ever calls this function on them.
+/// `resolve_tracks`/`artist_tracks` before anything ever calls this
+/// function on them.
 fn playable_path(item: &SearchItem) -> Option<String> {
     match item {
         SearchItem::LocalMusic { path, .. } | SearchItem::LocalVideo { path, .. } => {
@@ -69,12 +67,10 @@ fn playable_path(item: &SearchItem) -> Option<String> {
 }
 
 /// Expands anything that represents more than one track into its
-/// actual tracks, so playing/queuing an album or playlist means
-/// playing/queuing every song on it, not the (unplayable) album entity
-/// itself. Local items and remote songs are already exactly one track,
-/// so they pass through unchanged. Artist playback isn't wired up yet
-/// (would mean fetching every album by that artist); see ROADMAP.md's
-/// artist profile view.
+/// actual tracks, so playing/queuing an album, playlist, or artist
+/// means playing/queuing every (actual, see `artist_tracks`) song,
+/// not the entity itself. Local items and remote songs are already
+/// exactly one track, so they pass through unchanged.
 fn resolve_tracks(item: &SearchItem) -> Result<Vec<SearchItem>, String> {
     match item {
         SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } | SearchItem::Song { .. } => {
@@ -88,11 +84,47 @@ fn resolve_tracks(item: &SearchItem) -> Result<Vec<SearchItem>, String> {
             .get_playlist_songs(id)
             .map(|songs| browse::songs_to_items(songs, client))
             .map_err(|e| format!("couldn't load playlist tracks: {e}")),
-        SearchItem::Artist { .. } => Err(
-            "artist playback needs the profile view (not built yet); open an album instead"
-                .to_string(),
-        ),
+        SearchItem::Artist { id, name, client } => artist_tracks(client, id, name),
     }
+}
+
+/// Every song actually credited to this artist, across every album
+/// including compilations. The Global/Various-Artists fix: `getAlbum`
+/// returns each song with its own track-level `artist` field, distinct
+/// from the album's credited artist (a compilation like navidrome's
+/// "Global"/"Various Artists" convention would otherwise hide every
+/// song on it from here); filtering by the song's own field instead of
+/// the album's works for any compilation, not a hardcoded special case.
+fn artist_tracks(
+    client: &Arc<subsonic::Client>,
+    artist_id: &str,
+    artist_name: &str,
+) -> Result<Vec<SearchItem>, String> {
+    let mut albums = client
+        .get_artist(artist_id)
+        .map_err(|e| format!("couldn't load artist: {e}"))?;
+    // chronological, not whatever order getArtist happened to return
+    // (alphabetical); unknown-year albums sort last rather than first.
+    albums.sort_by_key(|a| a.year.unwrap_or(u32::MAX));
+    let mut tracks = Vec::new();
+    for album in albums {
+        if let Ok(details) = client.get_album(&album.id) {
+            tracks.extend(
+                details
+                    .songs
+                    .into_iter()
+                    .filter(|s| s.artist == artist_name)
+                    .map(|s| SearchItem::Song {
+                        id: s.id,
+                        title: s.title,
+                        artist: s.artist,
+                        album: s.album,
+                        client: client.clone(),
+                    }),
+            );
+        }
+    }
+    Ok(tracks)
 }
 
 /// Opens the track-listing view on an album or playlist; the Enter-key
@@ -118,6 +150,7 @@ fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
                 tracks: browse::songs_to_items(details.songs, client),
                 selected: 0,
                 art: fetch_cover_art(client, id),
+                bio: None,
             })
         }
         SearchItem::Playlist { id, name, client } => {
@@ -131,10 +164,32 @@ fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
                 tracks: browse::songs_to_items(songs, client),
                 selected: 0,
                 art: None,
+                bio: None,
             })
         }
         _ => unreachable!("open_browse_view only called for Album/Playlist"),
     }
+}
+
+/// The artist profile view: a bio (best-effort, `None` if navidrome
+/// has nothing for this artist) and every song actually credited to
+/// them across every album, chronologically. See `artist_tracks` for
+/// the Global/Various-Artists filtering this relies on.
+fn open_artist_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
+    let SearchItem::Artist { id, name, client } = item else {
+        unreachable!("open_artist_view only called for Artist");
+    };
+    let bio = client.get_artist_bio(id).ok().flatten();
+    let tracks = artist_tracks(client, id, name)?;
+    Ok(browse::BrowseView {
+        title: name.clone(),
+        subtitle: format!("{} songs", tracks.len()),
+        year: None,
+        tracks,
+        selected: 0,
+        art: None,
+        bio,
+    })
 }
 
 /// Local files flip the persisted favorites set; remote songs call
@@ -199,6 +254,7 @@ fn open_starred_view(
         tracks,
         selected: 0,
         art: None,
+        bio: None,
     }
 }
 
@@ -422,10 +478,10 @@ fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatal
         .and_then(|c| c.ping().map(|_| c))
         .map_err(|e| format!("connection failed: {e}"))?;
     // getArtists returns everything in one call, getAlbumList2 is
-    // paginated (see subsonic.rs). songs stay search-on-demand via
-    // search3 rather than eagerly fetched; a library this size could be
-    // enormous and isn't needed up front for search to work on
-    // artists/albums.
+    // paginated (see subsonic.rs). songs stay fetched on demand (per
+    // album/playlist/artist opened) rather than indexed eagerly; a
+    // library this size could be enormous and isn't needed up front
+    // for search to work on artists/albums.
     let artists = client.all_artists().unwrap_or_default();
     let albums = client.all_albums().unwrap_or_default();
     let playlists = client.playlists().unwrap_or_default();
@@ -821,7 +877,7 @@ fn main() -> anyhow::Result<()> {
             let sidebar_rows =
                 Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(sidebar);
             // classic terminal cursor blink: ~530ms per half-phase.
-            let cursor_visible = (start.elapsed().as_millis() / 530) % 2 == 0;
+            let cursor_visible = (start.elapsed().as_millis() / 530).is_multiple_of(2);
             f.render_widget(
                 SearchBox {
                     query: &app.query,
@@ -873,7 +929,8 @@ fn main() -> anyhow::Result<()> {
                 );
                 if art_mode == browse::ArtMode::Real {
                     if let Some(protocol) = &mut real_art_protocol {
-                        let (art_rect, _) = browse::layout(main_content, bv.art.is_some());
+                        let (art_rect, _) =
+                            browse::layout(main_content, bv.art.is_some(), bv.bio.is_some());
                         if let Some(rect) = art_rect {
                             f.render_stateful_widget(StatefulImage::default(), rect, protocol);
                         }
@@ -957,7 +1014,7 @@ fn main() -> anyhow::Result<()> {
             status = match app.pop_queue() {
                 Some(next) => {
                     let s = format!("now playing: {}", label(&next));
-                    previous_track = std::mem::replace(&mut now_playing, Some(next));
+                    previous_track = now_playing.replace(next);
                     s
                 }
                 // mpv has no concept of "the queue we built", only its
@@ -974,7 +1031,7 @@ fn main() -> anyhow::Result<()> {
                         for t in &rest {
                             let _ = try_enqueue(&player, t);
                         }
-                        previous_track = std::mem::replace(&mut now_playing, Some(first));
+                        previous_track = now_playing.replace(first);
                         app.queue = rest;
                     }
                     s
@@ -1224,8 +1281,7 @@ fn main() -> anyhow::Result<()> {
                                     for t in &rest {
                                         let _ = try_enqueue(&player, t);
                                     }
-                                    previous_track =
-                                        std::mem::replace(&mut now_playing, Some(first));
+                                    previous_track = now_playing.replace(first);
                                     app.queue = rest;
                                     original_queue = session;
                                     // keep the album/playlist listing
@@ -1374,9 +1430,19 @@ fn main() -> anyhow::Result<()> {
                             Some((artist, title, album)) => {
                                 match lyrics_client.lookup(&artist, &title, &album, None) {
                                     Ok(Some(l)) => {
-                                        let text = l.plain.or(l.synced).unwrap_or_else(|| {
+                                        // the api's own `instrumental`
+                                        // flag, not just "plain/synced
+                                        // both happened to be empty";
+                                        // a real track with genuinely
+                                        // missing lyrics data shouldn't
+                                        // be mislabeled instrumental.
+                                        let text = if l.instrumental {
                                             "(instrumental, no lyrics)".to_string()
-                                        });
+                                        } else {
+                                            l.plain.or(l.synced).unwrap_or_else(|| {
+                                                "(no lyrics text available)".to_string()
+                                            })
+                                        };
                                         lyrics_lines =
                                             Some(text.lines().map(str::to_string).collect());
                                         "lyrics loaded (j/k scroll, L/esc close)".to_string()
@@ -1401,17 +1467,22 @@ fn main() -> anyhow::Result<()> {
                         save_playback_state(&player, &now_playing, &app.queue);
                         break;
                     }
-                    // albums/playlists open the track-listing view
-                    // instead of playing immediately ("let me scroll
-                    // through the songs" first); songs/local files
-                    // still play straight away.
+                    // albums/playlists/artists open a track-listing
+                    // view instead of playing immediately ("let me
+                    // scroll through the songs" first); songs/local
+                    // files still play straight away.
                     Action::Play(item @ SearchItem::Album { .. })
-                    | Action::Play(item @ SearchItem::Playlist { .. }) => {
+                    | Action::Play(item @ SearchItem::Playlist { .. })
+                    | Action::Play(item @ SearchItem::Artist { .. }) => {
                         // on success, the opened view itself (title +
                         // track count in its header) is the
                         // confirmation; no need to also repeat it on
                         // the status line.
-                        match open_browse_view(&item) {
+                        let opened = match &item {
+                            SearchItem::Artist { .. } => open_artist_view(&item),
+                            _ => open_browse_view(&item),
+                        };
+                        match opened {
                             Ok(bv) => {
                                 real_art_protocol = picker.as_mut().and_then(|p| {
                                     bv.art.clone().map(|img| p.new_resize_protocol(img))
@@ -1440,8 +1511,7 @@ fn main() -> anyhow::Result<()> {
                                     original_queue = std::iter::once(first.clone())
                                         .chain(tracks.iter().cloned())
                                         .collect();
-                                    previous_track =
-                                        std::mem::replace(&mut now_playing, Some(first));
+                                    previous_track = now_playing.replace(first);
                                     app.queue = tracks;
                                     // a standalone play (not from an
                                     // open album/playlist) takes over
