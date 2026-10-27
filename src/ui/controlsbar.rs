@@ -118,8 +118,24 @@ fn draw_segments(
     selected: Option<Field>,
 ) {
     let limit = area.x + width.min(area.width as usize) as u16;
+    // a segment that doesn't fully fit used to get cut off mid-word
+    // ("cros" from "crossfade: off") since draw_chars just stops
+    // wherever it runs out of room; drop whole lowest-priority
+    // (rightmost) segments instead once the full line stops fitting,
+    // same "queue first, crossfade last" priority the segment order
+    // already implies.
+    let mut fits = segments.len();
+    let mut used = 0usize;
+    for (i, (_, text)) in segments.iter().enumerate() {
+        let needed = text.chars().count() + if i > 0 { 2 } else { 0 };
+        if used + needed > limit.saturating_sub(area.x) as usize {
+            fits = i;
+            break;
+        }
+        used += needed;
+    }
     let mut x = area.x;
-    for (i, (field, text)) in segments.iter().enumerate() {
+    for (i, (field, text)) in segments.iter().take(fits).enumerate() {
         if x >= limit {
             break;
         }

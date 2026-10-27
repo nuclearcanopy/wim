@@ -9,6 +9,19 @@
 //! named commands, and letting them drift out of their own
 //! convention per-action would make the rest of the app harder to
 //! learn, not easier.
+//!
+//! Switching focus between the sidebar/workspace/bottom bar is the
+//! same kind of fixed convention, not a named command either: it's
+//! shift+arrows, directional (which neighboring pane a direction
+//! leads to, sway/i3-style, not three unrelated "go to X" bindings
+//! that are easy to mix up and give no sense of layout), handled
+//! directly in `main.rs` rather than through this keymap. A first
+//! attempt at three separate absolute `KeyAction`s for this
+//! (focus_sidebar/focus_workspace/focus_bottom_bar, each its own
+//! unrelated letter) was hard to actually learn: nothing about
+//! "focus_bottom_bar is shift+w" tells you anything about where the
+//! bottom bar *is* relative to wherever you already are, which is
+//! the whole point of a directional scheme.
 
 use std::collections::HashMap;
 
@@ -17,9 +30,6 @@ use crossterm::event::KeyCode;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyAction {
     StartSearch,
-    FocusSidebar,
-    FocusWorkspace,
-    FocusBottomBar,
     Enqueue,
     CycleLoop,
     ToggleShuffle,
@@ -52,9 +62,6 @@ pub enum KeyAction {
 /// `Keymap::default` and `reset_all` iterate to rebuild from scratch.
 pub const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::StartSearch,
-    KeyAction::FocusSidebar,
-    KeyAction::FocusWorkspace,
-    KeyAction::FocusBottomBar,
     KeyAction::Enqueue,
     KeyAction::CycleLoop,
     KeyAction::ToggleShuffle,
@@ -90,9 +97,6 @@ impl KeyAction {
     pub fn name(self) -> &'static str {
         match self {
             KeyAction::StartSearch => "start_search",
-            KeyAction::FocusSidebar => "focus_sidebar",
-            KeyAction::FocusWorkspace => "focus_workspace",
-            KeyAction::FocusBottomBar => "focus_bottom_bar",
             KeyAction::Enqueue => "enqueue",
             KeyAction::CycleLoop => "cycle_loop",
             KeyAction::ToggleShuffle => "toggle_shuffle",
@@ -126,9 +130,6 @@ impl KeyAction {
     pub fn label(self) -> &'static str {
         match self {
             KeyAction::StartSearch => "search",
-            KeyAction::FocusSidebar => "focus sidebar",
-            KeyAction::FocusWorkspace => "focus workspace",
-            KeyAction::FocusBottomBar => "focus bottom bar",
             KeyAction::Enqueue => "enqueue selected",
             KeyAction::CycleLoop => "cycle loop mode",
             KeyAction::ToggleShuffle => "toggle shuffle",
@@ -161,14 +162,6 @@ impl KeyAction {
     fn default_key(self) -> KeyCode {
         match self {
             KeyAction::StartSearch => KeyCode::Char('/'),
-            KeyAction::FocusSidebar => KeyCode::Char('A'),
-            KeyAction::FocusWorkspace => KeyCode::Char('D'),
-            // 'W' pairs with 'A' the same way resize mode's own a/w
-            // both select the sidebar panel; free in both the
-            // remappable table and every fixed literal (grepped
-            // every `KeyCode::Char(...)` in main.rs before picking
-            // it), unlike 'S' (already `OpenStarredView`).
-            KeyAction::FocusBottomBar => KeyCode::Char('W'),
             KeyAction::Enqueue => KeyCode::Char('a'),
             KeyAction::CycleLoop => KeyCode::Char('l'),
             KeyAction::ToggleShuffle => KeyCode::Char('s'),
