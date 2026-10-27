@@ -63,7 +63,12 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
     ),
     (
         "other",
-        &[("u", "settings"), ("q", "quit"), ("?", "close this")],
+        &[
+            ("u", "settings"),
+            ("q", "quit"),
+            ("ctrl+c", "quit, always, from anywhere"),
+            ("?", "close this"),
+        ],
     ),
 ];
 

@@ -213,7 +213,12 @@ impl App {
                 let preset = &eq::PRESETS[self.eq_preset];
                 return Action::SetEq(preset.name, preset.gains);
             }
-            KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
+            // not Esc: it's overloaded everywhere as "back/close" for
+            // every modal/menu (help, subtitle/settings menus, nav
+            // manager, onboarding, browse view, lyrics), so it has to
+            // mean that consistently rather than quitting the whole
+            // app the one time nothing else is open to close.
+            KeyCode::Char('q') => return Action::Quit,
             _ => {}
         }
         Action::None
