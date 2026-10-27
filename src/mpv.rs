@@ -245,6 +245,27 @@ impl Mpv {
         self.set_property("af", json!(filter))
     }
 
+    /// Applies every `sub-*` style property from config/runtime state
+    /// at once; best-effort per property (one unsupported/malformed
+    /// value on an older mpv shouldn't block the rest from applying).
+    pub fn set_subtitle_style(&self, cfg: &crate::config::SubtitleConfig) {
+        let _ = self.set_property("sub-delay", json!(cfg.delay_secs));
+        let _ = self.set_property("sub-font-size", json!(cfg.font_size));
+        let _ = self.set_property("sub-pos", json!(cfg.position));
+        let _ = self.set_property("sub-border-size", json!(cfg.outline_size));
+        let _ = self.set_property("sub-blur", json!(cfg.blur));
+        let _ = self.set_property("sub-color", json!(gray_color(cfg.color_level, 1.0)));
+        // the background box itself always renders near-black
+        // regardless of the text's own level; a box that matched a
+        // bright text color would defeat its own purpose (readability
+        // contrast), and there's no separate background-color config
+        // field to let it drift from that.
+        let _ = self.set_property(
+            "sub-back-color",
+            json!(gray_color(0.0, cfg.background_opacity as f32)),
+        );
+    }
+
     pub fn seek(&self, seconds: f64, relative: bool) -> Result<()> {
         let flag = if relative { "relative" } else { "absolute" };
         self.command(&[json!("seek"), json!(seconds), json!(flag)])?;
@@ -252,9 +273,35 @@ impl Mpv {
     }
 }
 
+/// `#AARRGGBB`, mpv's own color option format; `level` (0..1) sets R,
+/// G, and B identically so this can never produce a hue, only a shade
+/// of gray, per the monochrome rule, no matter what caller passes in.
+fn gray_color(level: f32, alpha: f32) -> String {
+    let v = (level.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{a:02X}{v:02X}{v:02X}{v:02X}")
+}
+
 impl Drop for Mpv {
     fn drop(&mut self) {
         let _ = self.command(&[json!("quit")]);
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gray_color_keeps_r_g_b_identical_regardless_of_input() {
+        assert_eq!(gray_color(1.0, 1.0), "#FFFFFFFF");
+        assert_eq!(gray_color(0.0, 0.0), "#00000000");
+        assert_eq!(gray_color(0.5, 1.0), "#FF808080");
+    }
+
+    #[test]
+    fn gray_color_clamps_out_of_range_input() {
+        assert_eq!(gray_color(-1.0, 2.0), "#FF000000");
     }
 }

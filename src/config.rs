@@ -76,10 +76,67 @@ pub struct Config {
     pub crossfade_enabled: bool,
     #[serde(default = "default_crossfade_seconds")]
     pub crossfade_seconds: f64,
+    #[serde(default)]
+    pub subtitles: SubtitleConfig,
 }
 
 fn default_crossfade_seconds() -> f64 {
     3.0
+}
+
+/// Applied to mpv's own `sub-*` properties on startup (see
+/// `main.rs::apply_subtitle_style`); color stays a single grayscale
+/// level per the monochrome rule, not an arbitrary hue, for both the
+/// text and its background box.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubtitleConfig {
+    /// Seconds; positive delays subtitles later. Also adjustable live
+    /// with `,`/`.` while something's playing.
+    #[serde(default)]
+    pub delay_secs: f64,
+    #[serde(default = "default_sub_font_size")]
+    pub font_size: u32,
+    /// 0 (bottom) to 150 (top), mpv's own `sub-pos` range.
+    #[serde(default = "default_sub_position")]
+    pub position: u32,
+    #[serde(default = "default_sub_outline_size")]
+    pub outline_size: f64,
+    /// 0.0 (fully transparent) to 1.0 (opaque).
+    #[serde(default)]
+    pub background_opacity: f64,
+    #[serde(default)]
+    pub blur: f64,
+    /// 0.0 (black) to 1.0 (white) text color; same scale as
+    /// `theme::shade` in the ui, applied here to mpv's own renderer.
+    #[serde(default = "default_sub_color_level")]
+    pub color_level: f32,
+}
+
+fn default_sub_font_size() -> u32 {
+    42
+}
+fn default_sub_position() -> u32 {
+    10
+}
+fn default_sub_outline_size() -> f64 {
+    2.0
+}
+fn default_sub_color_level() -> f32 {
+    1.0
+}
+
+impl Default for SubtitleConfig {
+    fn default() -> Self {
+        SubtitleConfig {
+            delay_secs: 0.0,
+            font_size: default_sub_font_size(),
+            position: default_sub_position(),
+            outline_size: default_sub_outline_size(),
+            background_opacity: 0.0,
+            blur: 0.0,
+            color_level: default_sub_color_level(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -90,6 +147,7 @@ impl Default for Config {
             library_paths: Vec::new(),
             crossfade_enabled: false,
             crossfade_seconds: default_crossfade_seconds(),
+            subtitles: SubtitleConfig::default(),
         }
     }
 }

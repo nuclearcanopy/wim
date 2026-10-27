@@ -103,6 +103,44 @@ in
       default = 3.0;
       description = "Length of the crossfade fade-out/fade-in ramp, in seconds.";
     };
+
+    subtitles = {
+      delaySeconds = mkOption {
+        type = types.float;
+        default = 0.0;
+        description = "Positive delays subtitles later. Also adjustable live with ','/'.' while something's playing.";
+      };
+      fontSize = mkOption {
+        type = types.int;
+        default = 42;
+      };
+      position = mkOption {
+        type = types.int;
+        default = 10;
+        description = "0 (bottom) to 150 (top), mpv's own sub-pos range.";
+      };
+      outlineSize = mkOption {
+        type = types.float;
+        default = 2.0;
+      };
+      backgroundOpacity = mkOption {
+        type = types.float;
+        default = 0.0;
+        description = "0.0 (fully transparent) to 1.0 (opaque).";
+      };
+      blur = mkOption {
+        type = types.float;
+        default = 0.0;
+      };
+      colorLevel = mkOption {
+        type = types.float;
+        default = 1.0;
+        description = ''
+          0.0 (black) to 1.0 (white) text color; always a single
+          grayscale level, never a hue, per the monochrome rule.
+        '';
+      };
+    };
   };
 
   config = mkIf cfg.enable {
@@ -113,6 +151,15 @@ in
       library_paths = cfg.libraryPaths;
       crossfade_enabled = cfg.crossfadeEnabled;
       crossfade_seconds = cfg.crossfadeSeconds;
+      subtitles = {
+        delay_secs = cfg.subtitles.delaySeconds;
+        font_size = cfg.subtitles.fontSize;
+        position = cfg.subtitles.position;
+        outline_size = cfg.subtitles.outlineSize;
+        background_opacity = cfg.subtitles.backgroundOpacity;
+        blur = cfg.subtitles.blur;
+        color_level = cfg.subtitles.colorLevel;
+      };
       navidrome_servers = map (s: {
         url = s.url;
         username = s.username;

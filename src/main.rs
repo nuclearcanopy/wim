@@ -612,6 +612,10 @@ fn main() -> anyhow::Result<()> {
     // per-track normalization is the sensible default; mpv reads the
     // gain from each file's own embedded tags as it plays.
     player.set_replaygain("track")?;
+    // harmless to set before any video/subtitle is even loaded; mpv
+    // just holds onto it for whenever one shows up.
+    player.set_subtitle_style(&cfg.subtitles);
+    let mut subtitle_delay = cfg.subtitles.delay_secs;
     let mut app = app::App::new(corpus);
     let mut status = format!(
         "{} local items indexed | / search, j/k move, gg/G jump, enter play, a queue, * star, S starred, L lyrics, n navidrome, q quit",
@@ -1503,6 +1507,22 @@ fn main() -> anyhow::Result<()> {
                         "crossfade: {}",
                         if crossfade_enabled { "on" } else { "off" }
                     );
+                    continue;
+                }
+
+                // subtitle sync is the one styling knob worth
+                // adjusting live (discovered mid-playback); the rest
+                // (size/position/outline/blur/color) are config-only,
+                // set once at startup.
+                if matches!(key.code, KeyCode::Char(',') | KeyCode::Char('.')) && !app.editing_query
+                {
+                    subtitle_delay += if key.code == KeyCode::Char(',') {
+                        -0.5
+                    } else {
+                        0.5
+                    };
+                    let _ = player.set_property("sub-delay", serde_json::json!(subtitle_delay));
+                    status = format!("subtitle delay: {subtitle_delay:+.1}s");
                     continue;
                 }
 
