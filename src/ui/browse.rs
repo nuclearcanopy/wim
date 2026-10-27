@@ -305,3 +305,56 @@ fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::s
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::browse::tests::{test_songs, test_view};
+
+    fn row_text(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| {
+                buf.cell((x, y))
+                    .map_or(' ', |c| c.symbol().chars().next().unwrap_or(' '))
+            })
+            .collect()
+    }
+
+    fn render(view: &BrowseView, area: Rect) -> Buffer {
+        let mut buf = Buffer::empty(area);
+        let favorites = Favorites::default();
+        let remote_starred = HashSet::new();
+        BrowseListView {
+            view,
+            favorites: &favorites,
+            remote_starred: &remote_starred,
+            art_mode: ArtMode::Off,
+            cell_aspect: 2.0,
+            cursor_visible: false,
+        }
+        .render(area, &mut buf);
+        buf
+    }
+
+    #[test]
+    fn the_track_cursor_lands_on_the_row_enter_would_act_on() {
+        let mut view = test_view(test_songs(5));
+        view.selected = 4;
+        // what a reloaded/shortened listing does; the cursor has to
+        // follow `selected`, not stay on a row that no longer exists.
+        view.set_tracks(test_songs(3));
+
+        let area = Rect::new(0, 0, 40, 12);
+        let buf = render(&view, area);
+        let marked: Vec<String> = (0..area.height)
+            .map(|y| row_text(&buf, y))
+            .filter(|row| row.starts_with('>'))
+            .collect();
+        assert_eq!(marked.len(), 1, "exactly one row carries the cursor");
+        assert!(
+            marked[0].contains("song 2"),
+            "cursor must sit on the selected track: {:?}",
+            marked[0]
+        );
+    }
+}

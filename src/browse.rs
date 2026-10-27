@@ -268,14 +268,30 @@ impl BrowseView {
             .collect()
     }
 
-    /// Snaps `selected` onto the nearest still-visible track after
-    /// the filter changes, rather than leaving it pointed at a row
-    /// that's no longer shown at all.
-    pub fn clamp_selection_to_filter(&mut self) {
+    /// Forces `selected` back inside `tracks` *and* onto a row the
+    /// filter actually shows. Call after anything that mutates either
+    /// one: a stale `selected` isn't visible as a stale cursor (the
+    /// draw path falls back to row 0 when it can't find the selected
+    /// index), so enter silently acts on a different track than the
+    /// `>` marker points at.
+    pub fn clamp_selection(&mut self) {
+        if self.tracks.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        self.selected = self.selected.min(self.tracks.len() - 1);
         let visible = self.visible_track_indices();
         if !visible.contains(&self.selected) {
             self.selected = visible.first().copied().unwrap_or(0);
         }
+    }
+
+    /// The one way to replace the track list after construction, so
+    /// the `selected`-stays-in-`tracks` invariant can't be dropped by
+    /// whoever assigns it next.
+    pub fn set_tracks(&mut self, tracks: Vec<SearchItem>) {
+        self.tracks = tracks;
+        self.clamp_selection();
     }
 
     pub fn next(&mut self) {
@@ -323,9 +339,94 @@ pub fn songs_to_items(songs: Vec<crate::subsonic::Song>, client: &Arc<Client>) -
         .collect()
 }
 
+// `pub(crate)` purely so `ui::browse`'s own render tests can reuse
+// these fixtures instead of keeping a second copy of them.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A client that never talks to anything; remote `SearchItem`s all
+    /// carry one, and building it is offline (no ping on construct).
+    pub(crate) fn test_client() -> Arc<Client> {
+        Arc::new(
+            Client::new(&crate::config::NavidromeConfig {
+                url: "https://example.invalid".into(),
+                username: "test".into(),
+                password: Some("pw".into()),
+                password_file: None,
+                max_bitrate_kbps: None,
+                transcode_format: None,
+            })
+            .unwrap(),
+        )
+    }
+
+    pub(crate) fn test_songs(n: usize) -> Vec<SearchItem> {
+        let client = test_client();
+        (0..n)
+            .map(|i| SearchItem::Song {
+                id: format!("song-{i}"),
+                title: format!("song {i}"),
+                artist: "artist".to_string(),
+                album: "album".to_string(),
+                client: client.clone(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn test_view(tracks: Vec<SearchItem>) -> BrowseView {
+        BrowseView {
+            title: "album".to_string(),
+            subtitle: String::new(),
+            year: None,
+            tracks,
+            selected: 0,
+            art: None,
+            bio: None,
+            is_artist: false,
+            albums: Vec::new(),
+            albums_selected: 0,
+            albums_focused: false,
+            filter_query: String::new(),
+            filtering: false,
+            show_track_artist: false,
+        }
+    }
+
+    #[test]
+    fn set_tracks_clamps_selection_into_the_shorter_list() {
+        let mut view = test_view(test_songs(5));
+        view.selected = 4;
+        view.set_tracks(test_songs(3));
+        assert_eq!(
+            view.selected, 2,
+            "selected must stay a valid index into tracks"
+        );
+    }
+
+    #[test]
+    fn set_tracks_resets_selection_when_the_list_empties() {
+        let mut view = test_view(test_songs(5));
+        view.selected = 3;
+        view.set_tracks(Vec::new());
+        assert_eq!(view.selected, 0);
+    }
+
+    #[test]
+    fn clamp_selection_snaps_onto_a_still_visible_filtered_row() {
+        let mut view = test_view(test_songs(5));
+        view.filter_query = "song 3".to_string();
+        view.clamp_selection();
+        assert_eq!(view.selected, 3);
+    }
+
+    #[test]
+    fn clamp_selection_fixes_an_out_of_bounds_index() {
+        let mut view = test_view(test_songs(2));
+        view.selected = 99;
+        view.clamp_selection();
+        assert_eq!(view.selected, 1);
+    }
 
     #[test]
     fn wrap_bio_fits_short_text_on_one_line() {
