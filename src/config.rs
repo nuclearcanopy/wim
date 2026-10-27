@@ -95,6 +95,18 @@ pub struct Config {
     pub opensubtitles_api_key_file: Option<String>,
     #[serde(default = "default_subtitle_language")]
     pub subtitle_language: String,
+    /// Same plaintext-vs-file split as `NavidromeConfig::password`/
+    /// `password_file`, same reason (world-readable nix store paths).
+    /// Neither set (the default) means scrobbling never runs; the
+    /// token comes from listenbrainz.org -> profile -> settings, not
+    /// an account password. Settable via onboarding (first run) or
+    /// the settings menu's "listenbrainz token" row.
+    #[serde(default)]
+    pub listenbrainz_user_token: Option<String>,
+    #[serde(default)]
+    pub listenbrainz_user_token_file: Option<String>,
+    #[serde(default)]
+    pub scrobble: ScrobbleConfig,
     /// Which of the generated `ui::logos::LOGOS` entries the home
     /// screen's banner shows, by name rather than index (an index
     /// would silently point at a different font if that generated
@@ -163,6 +175,43 @@ impl Config {
         fs::read_to_string(path)
             .ok()
             .map(|s| s.trim_end_matches('\n').to_string())
+    }
+
+    pub fn resolve_listenbrainz_user_token(&self) -> Option<String> {
+        if let Some(t) = &self.listenbrainz_user_token {
+            return Some(t.clone());
+        }
+        let path = self.listenbrainz_user_token_file.as_ref()?;
+        fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim_end_matches('\n').to_string())
+    }
+}
+
+/// Tunable scrobble thresholds; defaults match ListenBrainz's own
+/// convention (half the track, or 4 minutes, whichever comes first).
+/// See `listenbrainz::should_scrobble` for exactly how these combine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScrobbleConfig {
+    #[serde(default = "default_scrobble_threshold_percent")]
+    pub threshold_percent: f64,
+    #[serde(default = "default_scrobble_threshold_seconds")]
+    pub threshold_seconds: f64,
+}
+
+fn default_scrobble_threshold_percent() -> f64 {
+    50.0
+}
+fn default_scrobble_threshold_seconds() -> f64 {
+    240.0
+}
+
+impl Default for ScrobbleConfig {
+    fn default() -> Self {
+        ScrobbleConfig {
+            threshold_percent: default_scrobble_threshold_percent(),
+            threshold_seconds: default_scrobble_threshold_seconds(),
+        }
     }
 }
 
@@ -237,6 +286,9 @@ impl Default for Config {
             opensubtitles_api_key: None,
             opensubtitles_api_key_file: None,
             subtitle_language: default_subtitle_language(),
+            listenbrainz_user_token: None,
+            listenbrainz_user_token_file: None,
+            scrobble: ScrobbleConfig::default(),
             logo_style: None,
             eq_preset: default_eq_preset(),
             eq_gains: default_eq_gains(),
