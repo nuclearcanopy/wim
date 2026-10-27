@@ -38,13 +38,24 @@ pub struct Banner {
     pub elapsed_secs: f32,
 }
 
+/// The two rows `draw_rule` paints on, in absolute buffer coordinates;
+/// exposed so the caller can tell the main/sidebar `VerticalRule` where
+/// to switch from `│` to `├` (see `src/ui/divider.rs`), since those two
+/// lines meet at this widget's left edge with zero awareness of each
+/// other otherwise.
+pub fn rule_rows(area: Rect) -> [u16; 2] {
+    let frame_height = GLYPH_HEIGHT as u16 + 4; // rule, gap, logo, gap, rule+tagline
+    let block_start_y = area.y + area.height.saturating_sub(frame_height) / 2;
+    let rule_y = block_start_y + 1 + GLYPH_HEIGHT as u16;
+    [block_start_y, rule_y]
+}
+
 impl Widget for Banner {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let total_width = LOGO[0].chars().count() as u16;
         let tagline = "terminal omniplayer";
-        let frame_height = GLYPH_HEIGHT as u16 + 4; // rule, gap, logo, gap, rule+tagline
         let start_x = area.x + area.width.saturating_sub(total_width) / 2;
-        let block_start_y = area.y + area.height.saturating_sub(frame_height) / 2;
+        let [block_start_y, rule_y] = rule_rows(area);
 
         let pulse = (self.elapsed_secs * 1.3).sin() * 0.5 + 0.5; // 0..1, slow breathing
 
@@ -77,7 +88,6 @@ impl Widget for Banner {
             }
         }
 
-        let rule_y = logo_start_y + GLYPH_HEIGHT as u16;
         draw_rule(buf, area, rule_y, pulse);
         draw_centered(buf, area, rule_y + 1, tagline, shade(DIM));
     }
