@@ -53,6 +53,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "view",
         &[
             ("m", "minimize / maximize player"),
+            ("v", "fullscreen video (covers the sidebar too)"),
             ("i", "cycle album art: ascii / real / off"),
             ("r", "resize mode (a/w/s/d select, arrows stretch)"),
         ],

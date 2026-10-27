@@ -280,6 +280,66 @@ impl Mpv {
         self.command(&[json!("seek"), json!(seconds), json!(flag)])?;
         Ok(())
     }
+
+    /// One video frame as raw `bgr0` pixels, for embedding video in
+    /// the workspace (see `main::VideoPane`/`main::capture_video_frame`)
+    /// instead of leaving it to mpv's own native window. Round-trips
+    /// over the same IPC socket as every other command, so calling
+    /// this on every render tick would stall the UI on each reply;
+    /// callers are expected to throttle.
+    pub fn screenshot_raw(&self) -> Result<RawFrame> {
+        let v = self.command(&[json!("screenshot-raw")])?;
+        let width = v.get("w").and_then(Value::as_u64).context("missing w")? as u32;
+        let height = v.get("h").and_then(Value::as_u64).context("missing h")? as u32;
+        let stride = v
+            .get("stride")
+            .and_then(Value::as_u64)
+            .context("missing stride")? as u32;
+        let data_b64 = v
+            .get("data")
+            .and_then(Value::as_str)
+            .context("missing data")?;
+        let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_b64)
+            .context("decoding screenshot-raw's base64 data")?;
+        Ok(RawFrame {
+            width,
+            height,
+            stride,
+            data,
+        })
+    }
+}
+
+/// `bgr0` (4 bytes/pixel, blue/green/red/unused) raw frame as returned
+/// by mpv's `screenshot-raw` command; `stride` is the byte width of
+/// one row and may exceed `width * 4` (row padding), so it has to be
+/// used to find each row's start rather than assuming a tight pack.
+pub struct RawFrame {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub data: Vec<u8>,
+}
+
+impl RawFrame {
+    /// `bgr0` -> `image::RgbImage`, dropping the padding byte and
+    /// swapping channel order; `None` if the dimensions mpv reported
+    /// don't actually fit the data it sent (never expected, but a
+    /// malformed frame should just get skipped, not panic the UI).
+    pub fn into_image(self) -> Option<image::RgbImage> {
+        let mut rgb = Vec::with_capacity((self.width * self.height * 3) as usize);
+        for row in 0..self.height {
+            let row_start = (row * self.stride) as usize;
+            for col in 0..self.width {
+                let px = row_start + (col * 4) as usize;
+                let pixel = self.data.get(px..px + 3)?;
+                rgb.push(pixel[2]); // r
+                rgb.push(pixel[1]); // g
+                rgb.push(pixel[0]); // b
+            }
+        }
+        image::RgbImage::from_raw(self.width, self.height, rgb)
+    }
 }
 
 /// `#AARRGGBB`, mpv's own color option format; `level` (0..1) sets R,
@@ -312,5 +372,34 @@ mod tests {
     #[test]
     fn gray_color_clamps_out_of_range_input() {
         assert_eq!(gray_color(-1.0, 2.0), "#FF000000");
+    }
+
+    #[test]
+    fn raw_frame_swaps_bgr_to_rgb_and_drops_padding() {
+        // 2x1 bgr0, stride padded by 4 extra bytes past width*4.
+        let frame = RawFrame {
+            width: 2,
+            height: 1,
+            stride: 12,
+            data: vec![
+                10, 20, 30, 0, // pixel 0: b=10 g=20 r=30
+                40, 50, 60, 0, // pixel 1: b=40 g=50 r=60
+                0, 0, 0, 0, // row padding, must be ignored
+            ],
+        };
+        let img = frame.into_image().expect("valid frame");
+        assert_eq!(img.get_pixel(0, 0).0, [30, 20, 10]);
+        assert_eq!(img.get_pixel(1, 0).0, [60, 50, 40]);
+    }
+
+    #[test]
+    fn raw_frame_rejects_data_too_short_for_its_own_dimensions() {
+        let frame = RawFrame {
+            width: 4,
+            height: 4,
+            stride: 16,
+            data: vec![0; 4],
+        };
+        assert!(frame.into_image().is_none());
     }
 }

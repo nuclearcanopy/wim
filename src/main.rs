@@ -37,6 +37,7 @@ use notify::{Notifications, Severity};
 use onboarding::{Onboarding, Step};
 use search::SearchItem;
 use theme::{shade, NEAR_BLACK};
+use ui::albumart::AsciiArt;
 use ui::banner::Banner;
 use ui::browse::BrowseListView;
 use ui::controlsbar::{ControlsBar, Field};
@@ -524,6 +525,16 @@ fn audio_level(player: &mpv::Mpv, phase: f32) -> f32 {
 /// updating" without the user ever pressing a manual refresh key.
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(45);
 
+/// How often the embedded video pane pulls a fresh frame from mpv;
+/// each pull is an IPC round-trip plus a base64 decode, not free, and
+/// the ascii/halfblock rendering it feeds was never going to look
+/// smooth at real video frame rates anyway.
+const VIDEO_FRAME_INTERVAL: Duration = Duration::from_millis(150);
+
+fn now_playing_is_video(now_playing: &Option<SearchItem>) -> bool {
+    matches!(now_playing, Some(SearchItem::LocalVideo { .. }))
+}
+
 /// A completed background sync attempt for one server, tagged by url
 /// since several servers' results arrive interleaved on the same
 /// channel with no other way to tell them apart.
@@ -740,6 +751,17 @@ fn main() -> anyhow::Result<()> {
     // 'i' cycles ascii -> real -> off from here; this is just the
     // config-driven starting point.
     let mut art_mode = initial_art_mode(cfg.album_art);
+    // latest captured frame while playing a local video, rendered
+    // through the same ascii pipeline as album art instead of mpv
+    // opening its own window; `None` whenever nothing video is
+    // playing or a capture hasn't landed yet. 'v' expands its pane
+    // from main_content to the whole workspace (sidebar included),
+    // never the bottom bar.
+    let mut video_frame: Option<image::DynamicImage> = None;
+    let mut video_fullscreen = false;
+    // throttles screenshot-raw calls (an IPC round-trip each time) to
+    // a modest rate rather than once per render tick.
+    let mut last_video_frame_at = Instant::now() - VIDEO_FRAME_INTERVAL;
     // full keybind reference, opened with '?'; takes over the whole
     // screen the same way onboarding/the nav manager do.
     let mut help_open = false;
@@ -1101,7 +1123,21 @@ fn main() -> anyhow::Result<()> {
                 sidebar_rows[1],
             );
 
-            if show_full_player {
+            if show_full_player && now_playing_is_video(&now_playing) {
+                // the video pane itself: rendered through the same
+                // ascii/halfblock pipeline as album art rather than
+                // leaving it to mpv's own window (see
+                // `mpv::screenshot_raw`/`VIDEO_FRAME_INTERVAL` above).
+                // no level meter here; it'd just be noise over a
+                // picture that's already moving.
+                f.render_widget(
+                    AsciiArt {
+                        image: video_frame.as_ref(),
+                        cell_aspect: cell_aspect(),
+                    },
+                    main_content,
+                );
+            } else if show_full_player {
                 let item = now_playing.as_ref().expect("show_full_player implies Some");
                 let (elapsed_secs, duration_secs, paused) = playback_info(&player);
                 let previous_label = previous_track.as_ref().map(label);
@@ -1185,6 +1221,22 @@ fn main() -> anyhow::Result<()> {
                         elapsed_secs,
                     },
                     main_content,
+                );
+            }
+
+            // 'v': expands the video pane from main_content to cover
+            // the whole workspace (sidebar included), painted last so
+            // it simply overwrites whatever the sidebar/divider/
+            // results list already drew in `top` rather than needing
+            // to skip rendering them in the first place. never covers
+            // `bottom`, which sits outside `top` entirely.
+            if video_fullscreen && show_full_player && now_playing_is_video(&now_playing) {
+                f.render_widget(
+                    AsciiArt {
+                        image: video_frame.as_ref(),
+                        cell_aspect: cell_aspect(),
+                    },
+                    top,
                 );
             }
 
@@ -1328,6 +1380,21 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+
+        // pulling a frame regardless of whether the video pane is
+        // actually on screen right now would be wasted IPC/decode
+        // work the moment it's covered by the browse view or help
+        // overlay; only bother while it'd actually be visible.
+        if now_playing_is_video(&now_playing) && !help_open {
+            if last_video_frame_at.elapsed() >= VIDEO_FRAME_INTERVAL {
+                if let Ok(frame) = player.screenshot_raw() {
+                    video_frame = frame.into_image().map(image::DynamicImage::ImageRgb8);
+                }
+                last_video_frame_at = Instant::now();
+            }
+        } else {
+            video_frame = None;
         }
 
         // drain whatever the background sync thread finished since the
@@ -1708,6 +1775,11 @@ fn main() -> anyhow::Result<()> {
 
                 if key.code == KeyCode::Char('m') && now_playing.is_some() {
                     player_minimized = !player_minimized;
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('v') && now_playing_is_video(&now_playing) {
+                    video_fullscreen = !video_fullscreen;
                     continue;
                 }
 
