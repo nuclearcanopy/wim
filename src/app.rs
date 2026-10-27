@@ -217,6 +217,17 @@ impl App {
             self.refresh_results();
         }
     }
+
+    /// Re-filters `results` against the current query — call this
+    /// after anything that mutates `corpus` out from under an already-
+    /// typed query (e.g. navidrome connecting mid-session), or the
+    /// displayed results silently go stale: they'd keep showing
+    /// whatever matched the *old*, smaller corpus until the user
+    /// happens to type or backspace a character, which they may never
+    /// do if they already have the query they want.
+    pub fn resync_results(&mut self) {
+        self.refresh_results();
+    }
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@
 //! should surface matching artists, albums, songs, playlists, and local
 //! files together, ranked by actual relevance, not just substring hits.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -39,6 +40,22 @@ impl SearchItem {
             SearchItem::Album { name, artist, .. } => format!("{name} {artist}"),
             SearchItem::Song { title, artist, album, .. } => format!("{title} {artist} {album}"),
             SearchItem::Playlist { name, .. } => name.clone(),
+        }
+    }
+
+    /// `Some((kind_tag, id))` for remote items, used to dedup against
+    /// what's already in the corpus — reconnecting the same server
+    /// (manually, or via periodic auto-resync) must not just keep
+    /// appending duplicates of every artist/album/playlist every time.
+    /// `None` for local items, which aren't added repeatedly the same
+    /// way (the whole corpus is rebuilt fresh on a library rescan).
+    fn remote_key(&self) -> Option<(u8, &str)> {
+        match self {
+            SearchItem::Artist { id, .. } => Some((0, id.as_str())),
+            SearchItem::Album { id, .. } => Some((1, id.as_str())),
+            SearchItem::Song { id, .. } => Some((2, id.as_str())),
+            SearchItem::Playlist { id, .. } => Some((3, id.as_str())),
+            SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => None,
         }
     }
 
@@ -80,20 +97,39 @@ impl Corpus {
         }
     }
 
+    fn existing_remote_keys(&self) -> HashSet<(u8, String)> {
+        self.items
+            .iter()
+            .filter_map(|i| i.remote_key())
+            .map(|(k, id)| (k, id.to_string()))
+            .collect()
+    }
+
     pub fn add_subsonic_search_result(&mut self, r: SubsonicSearchResult) {
+        let mut seen = self.existing_remote_keys();
         for Artist { id, name } in r.artists {
-            self.items.push(SearchItem::Artist { id, name });
+            if seen.insert((0, id.clone())) {
+                self.items.push(SearchItem::Artist { id, name });
+            }
         }
         for Album { id, name, artist } in r.albums {
-            self.items.push(SearchItem::Album { id, name, artist });
+            if seen.insert((1, id.clone())) {
+                self.items.push(SearchItem::Album { id, name, artist });
+            }
         }
         for Song { id, title, artist, album, .. } in r.songs {
-            self.items.push(SearchItem::Song { id, title, artist, album });
+            if seen.insert((2, id.clone())) {
+                self.items.push(SearchItem::Song { id, title, artist, album });
+            }
         }
     }
 
     pub fn add_playlists(&mut self, playlists: impl IntoIterator<Item = Playlist>) {
+        let mut seen = self.existing_remote_keys();
         for Playlist { id, name } in playlists {
+            if !seen.insert((3, id.clone())) {
+                continue;
+            }
             self.items.push(SearchItem::Playlist { id, name });
         }
     }
@@ -198,6 +234,22 @@ mod tests {
         });
         c.add_playlists([Playlist { id: "p1".into(), name: "black metal essentials".into() }]);
         c
+    }
+
+    #[test]
+    fn reconnecting_the_same_server_does_not_duplicate_entries() {
+        let mut c = Corpus::new();
+        let result = || SubsonicSearchResult {
+            artists: vec![Artist { id: "a1".into(), name: "Bladee".into() }],
+            albums: vec![Album { id: "al1".into(), name: "Cold Visions".into(), artist: "Bladee".into() }],
+            songs: vec![],
+        };
+        c.add_subsonic_search_result(result());
+        c.add_subsonic_search_result(result()); // simulates a reconnect/periodic resync
+        c.add_playlists([Playlist { id: "p1".into(), name: "Drain Gang".into() }]);
+        c.add_playlists([Playlist { id: "p1".into(), name: "Drain Gang".into() }]);
+
+        assert_eq!(c.len(), 3, "one artist + one album + one playlist, not six");
     }
 
     #[test]
