@@ -148,14 +148,12 @@ layout. the actual design:
 3. [x] **result row icons**: `[sk]` plain-ascii bracket codes (source
    letter + kind letter), not unicode glyphs; see the ascii-switch note
    further up for why.
-4. **artist profile view**: press enter (or a dedicated key) on an
-   artist to open a dedicated view, not just play/search. shows: a
-   bio (navidrome's own `getArtistInfo2` already proxies one from
-   last.fm, no separate api key needed; use that by default; true
-   genius-sourced bios would need a separate integration, logged in
-   QUESTIONS.md as a possible upgrade, not blocking this), albums in
-   chronological order, and **every song by that artist across every
-   album including compilations**; see the Global-album problem below.
+4. [x] **artist profile view**: enter on an artist opens the same
+   `BrowseView`/`BrowseListView` as albums/playlists, with a bio
+   (navidrome's own `getArtistInfo2`, proxied from last.fm, best-
+   effort) and every song actually credited to them across every
+   album, chronologically. true genius-sourced bios would need a
+   separate integration; not built, not blocking.
 5. [x] **album/playlist view**: enter on an album or playlist opens a
    scrollable track listing in `main_content` (`src/browse.rs`,
    `src/ui/browse.rs`); title/artist/year for albums, title only for
@@ -165,16 +163,10 @@ layout. the actual design:
    key (`a`) still expands+queues the whole thing directly, no
    browsing step. remote playback itself (stream urls, multi-server
    client attribution per `SearchItem`) landed alongside this.
-6. **the "Global/Various Artists" compilation problem**: the
-   maintainer's real navidrome setup keeps every non-album single in
-   one giant compilation album ("Global") credited to "Various
-   Artists" per navidrome convention. an artist's profile must still
-   surface their songs out of that album. the fix: Subsonic's
-   `getAlbum(id)` returns each song with its own *track-level* `artist`
-   field, distinct from the album-level artist; when building an
-   artist's song list, don't filter by album artist, filter by each
-   song's own artist field. this works for any compilation album, not
-   just a hardcoded "Global" special case.
+6. [x] **the "Global/Various Artists" compilation problem**: fixed via
+   `artist_tracks` in `main.rs`, filtering each album's songs by their
+   own track-level `artist` field rather than the album's credited
+   artist. works for any compilation, not a hardcoded "Global" case.
 
 ## next (roughly in order, pick whichever is actually unblocked)
 
@@ -210,19 +202,25 @@ layout. the actual design:
 - [x] gapless playback: queue (`a`) now appends to mpv's own native
       playlist instead of us reactively reloading on `end-file`, so mpv
       auto-advances internally with no ipc round-trip gap.
-- [ ] optional crossfade (toggle + duration, off by default); separate
-      from gapless; mpv doesn't do this natively the way it handles
-      playlist auto-advance, needs its own mechanism (likely dual
-      mpv instances or a scripted volume ramp). see `docs/features.md`.
+- [x] crossfade (toggle `c`, duration via `config.crossfade_seconds`,
+      off by default); separate from gapless, which stays on
+      regardless. not a true overlapping crossfade (one mpv instance,
+      one file loaded at a time, can't play two simultaneously); a
+      fade-out/fade-in volume ramp at the track boundary instead.
 - [x] 10-band eq (`src/eq.rs`) with presets (flat/bass boost/vocal
       boost/treble boost/rock/classical), `e` cycles. applied via
       chained lavfi `equalizer` filters on mpv's `af` property. preset
       gain values are heuristic starting points, not acoustically
       tuned; a "custom" user-editable preset is still open.
-- [ ] now-playing audio level visualizer: animated unicode-block meter
-      (think `cava`) fitting the monochrome custom-painted aesthetic
-      already established. genuinely loved in the terminal-tool space
-      this app lives in, not a stretch feature.
+- [x] now-playing audio level meter (`src/ui/visualizer.rs`): a
+      labeled `astats` lavfi tap on the af chain exposes RMS level via
+      mpv's `af-metadata` property, rendered as a scrolling unicode-
+      block history. honest caveat: one overall level, not a true
+      per-band spectrum (a real `cava`-style meter needs a parallel
+      bandpass/astats/amix filter graph); falls back to a calm idle
+      sine pulse if the af-metadata property doesn't resolve the way
+      expected (unverified against real mpv audio decode in this
+      sandbox, no audio device available to test against).
 - [x] playback state persistence (`src/persistence.rs`): resumes
       queue/now-playing/position/volume across restarts via plain
       paths under `$XDG_STATE_HOME/wim/state.toml`, best-effort both
@@ -232,25 +230,30 @@ layout. the actual design:
       is set; enabled by default at startup, no extraction needed on
       our end for local files. subsonic's replayGain fields for remote
       tracks deferred along with the rest of live navidrome wiring.
-- [ ] transcoding: let navidrome/subsonic transcode server-side per its
-      own configured profile by default (stream request params); only
-      add client-side bitrate/format override if asked.
+- [x] transcoding: server-side by default (navidrome's own configured
+      profile); `max_bitrate_kbps`/`transcode_format` per navidrome
+      server add an optional client-side override on top.
 - [x] lyrics (`src/lyrics.rs`): lrclib.net (free, no api key), `L` to
       view/close, j/k to scroll. known gap: blocking fetch on the
       render thread (visible hitch during lookup), and SearchItem
       doesn't carry duration so local lookups always use the fuzzy
       /search endpoint rather than the exact /get one; both noted
       inline, not blocking, fine to revisit.
-- [x] album art (`ratatui-image`): see the album art entry further up.
-      still open: no config-level default mode yet (always starts in
-      ascii; `i` toggles per-session, not persisted to config.toml).
-- [ ] video playback + opensubtitles: auto-fetch subs for local video.
-      needs an opensubtitles api key from the maintainer; build the
-      integration behind a config field, note in QUESTIONS.md that it
-      needs a real key to live-test, keep building everything else.
-- [ ] subtitle styling: delay, language, size, outline, background
-      opacity/blur/radius, position; all via mpv `sub-*` properties;
-      color stays grayscale per the monochrome rule.
+- [x] album art (`ratatui-image`): see the album art entry further up;
+      `config.album_art` now sets the starting mode (closed the gap
+      noted here previously).
+- [x] video playback + opensubtitles (`src/opensubtitles.rs`):
+      auto-fetch behind `config.opensubtitles_api_key`/`_file` (same
+      plaintext-vs-file split as navidrome's password). the actual
+      rest endpoint shapes are an unverified best-effort guess, see
+      QUESTIONS.md; needs a real key from the maintainer to live-test.
+- [x] subtitle styling: delay, size, position, outline, background
+      opacity, blur, color (grayscale level only, per the monochrome
+      rule) all via mpv `sub-*` properties, set from `config.subtitles`
+      at startup. sync (`,`/`.`) is the one knob adjustable live, the
+      rest are config-only. language selection is the preferred
+      opensubtitles search language, not yet a multi-track switcher
+      (no embedded-track scenario tested).
 - [x] nix packaging: `packages.<system>.wim` (and `.default`) via
       `rustPlatform.buildRustPackage`. mpv is a runtime subprocess dep
       (not linked), so the binary is wrapped with `makeWrapper` to put
@@ -258,8 +261,10 @@ layout. the actual design:
       verified with `nix build` + `nix flake check` and manually ran
       the wrapped binary with an emptied inherited `PATH` to confirm
       mpv really comes from the wrapper, not the ambient environment.
-- [ ] home-manager module (`nix/home-manager.nix` + flake
+- [x] home-manager module (`nix/home-manager.nix` + flake
       `homeManagerModules.default`): declarative options mirroring
-      config.toml 1:1 (navidrome url/username/passwordFile, album_art,
-      library_paths, etc.), generates the same toml file home-manager
-      already understands how to write.
+      config.toml 1:1, including every field added this session
+      (crossfade, per-server transcoding overrides, subtitles,
+      opensubtitles). verified via a standalone `lib.evalModules`
+      instantiation against fake home-manager options, not the full
+      home-manager flake (much faster, same actual module code path).
