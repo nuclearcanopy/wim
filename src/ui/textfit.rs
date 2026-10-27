@@ -24,6 +24,14 @@ pub fn width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
+/// Terminal cells one char occupies; a control or zero-width char
+/// counts as 0. For drawing loops that advance a cursor per char: a
+/// `x += 1` there is only correct for ascii, and runs a cell behind
+/// the terminal for every wide glyph in the string.
+pub fn char_cells(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
 /// Longest prefix of `s` that fits in `max_width` cells. A
 /// double-width char that would straddle the right edge is dropped
 /// rather than half-drawn, so the result is never *wider* than asked
@@ -32,7 +40,7 @@ pub fn truncate_to_width(s: &str, max_width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
     for ch in s.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let cw = char_cells(ch);
         if used + cw > max_width {
             break;
         }
@@ -51,7 +59,7 @@ pub fn tail_fit(s: &str, max_width: usize) -> String {
     let mut kept: Vec<char> = Vec::new();
     let mut used = 0;
     for ch in s.chars().rev() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let cw = char_cells(ch);
         if used + cw > max_width {
             break;
         }
