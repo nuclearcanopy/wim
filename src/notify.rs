@@ -70,10 +70,14 @@ pub struct Notification {
     /// used both to find the right one to update/finish and to decide
     /// whether `expire()` is even allowed to drop it on a timer.
     id: Option<String>,
-    /// The label a progress notification was created with, kept
-    /// separately from `message` so `update_progress` can rebuild the
-    /// bar/percentage each tick without the caller re-passing it.
+    /// The text `message` gets rebuilt from, kept separately so it can
+    /// be re-derived without the caller re-passing it: the track label
+    /// for a progress notification (percentage appended each tick), the
+    /// bare message for an ordinary one (repeat count appended).
     label: String,
+    /// How many times this exact message has been pushed; `1` for
+    /// anything that's only happened once. See `push`.
+    repeats: u32,
     pub progress: Option<Progress>,
     shown_at: Instant,
     lifetime: Duration,
@@ -131,12 +135,29 @@ pub struct Notifications {
 impl Notifications {
     pub fn push(&mut self, severity: Severity, message: impl Into<String>) {
         let message = message.into();
+        // a failure that re-fires every frame (a dead mpv ipc socket
+        // being the one that actually happened) would otherwise stack
+        // five identical boxes and then keep shoving the rest of the
+        // screen aside forever; collapse repeats onto the existing one
+        // with a count and a fresh timer instead.
+        if let Some(existing) = self
+            .items
+            .iter_mut()
+            .find(|n| n.progress.is_none() && n.severity == severity && n.label == message)
+        {
+            existing.repeats += 1;
+            existing.message = format!("{message} (x{})", existing.repeats);
+            existing.shown_at = Instant::now();
+            existing.lifetime = lifetime_for(&existing.message);
+            return;
+        }
         let lifetime = lifetime_for(&message);
         self.items.push(Notification {
             severity,
+            label: message.clone(),
             message,
             id: None,
-            label: String::new(),
+            repeats: 1,
             progress: None,
             shown_at: Instant::now(),
             lifetime,
@@ -157,6 +178,7 @@ impl Notifications {
             message: format!("downloading: {label}"),
             id: Some(id),
             label,
+            repeats: 1,
             progress: Some(Progress {
                 downloaded: 0,
                 total: None,
@@ -189,8 +211,10 @@ impl Notifications {
         let message = message.into();
         if let Some(n) = self.items.iter_mut().find(|n| n.id.as_deref() == Some(id)) {
             n.severity = severity;
+            n.label = message.clone();
             n.message = message;
             n.id = None;
+            n.repeats = 1;
             n.progress = None;
             n.shown_at = Instant::now();
             n.lifetime = lifetime_for(&n.message);
@@ -255,6 +279,60 @@ mod tests {
         assert!(
             n.visible().is_empty(),
             "once finished, it should expire normally like any other notification"
+        );
+    }
+
+    #[test]
+    fn the_same_message_collapses_into_one_box_with_a_count() {
+        let mut n = Notifications::default();
+        for _ in 0..4 {
+            n.push(Severity::Error, "writing to mpv ipc socket");
+        }
+        assert_eq!(n.visible().len(), 1, "repeats must not stack up");
+        assert_eq!(n.visible()[0].message, "writing to mpv ipc socket (x4)");
+    }
+
+    #[test]
+    fn a_repeat_refreshes_the_timer_rather_than_expiring_mid_burst() {
+        let mut n = Notifications::default();
+        n.push(Severity::Error, "server unreachable");
+        n.items[0].shown_at = Instant::now() - Duration::from_secs(9999);
+        n.push(Severity::Error, "server unreachable");
+        n.expire();
+        assert_eq!(n.visible().len(), 1);
+    }
+
+    #[test]
+    fn different_messages_and_severities_stay_separate() {
+        let mut n = Notifications::default();
+        n.push(Severity::Error, "one");
+        n.push(Severity::Error, "two");
+        // same text, different severity: still its own notification,
+        // since the icon and meaning differ.
+        n.push(Severity::Info, "one");
+        assert_eq!(n.visible().len(), 3);
+    }
+
+    #[test]
+    fn a_burst_of_distinct_failures_is_still_capped() {
+        let mut n = Notifications::default();
+        for i in 0..MAX_STACKED + 3 {
+            n.push(Severity::Error, format!("server {i} down"));
+        }
+        assert_eq!(n.visible().len(), MAX_STACKED);
+        // the oldest dropped off, so the newest must have survived.
+        assert!(n.visible().last().unwrap().message.contains("server 7"));
+    }
+
+    #[test]
+    fn a_progress_box_is_never_coalesced_into() {
+        let mut n = Notifications::default();
+        n.push_progress("t1", "Some Song");
+        n.push(Severity::Info, "downloading: Some Song");
+        assert_eq!(
+            n.visible().len(),
+            2,
+            "an in-flight download must keep its own live box"
         );
     }
 
