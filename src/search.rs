@@ -4,6 +4,7 @@
 //! should surface matching artists, albums, songs, playlists, and local
 //! files together, ranked by actual relevance, not just substring hits.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -140,6 +141,23 @@ impl SearchItem {
             SearchItem::Song { id, .. } => Some((2, id.as_str())),
             SearchItem::Playlist { id, .. } => Some((3, id.as_str())),
             SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => None,
+        }
+    }
+
+    /// Stable "is this the same row as before" identity: remote items
+    /// key on their server-side id, local ones on their path, with a
+    /// kind tag so ids of different entity types can't collide. Used
+    /// to restore a selection after the results list is re-filtered
+    /// underneath the user (see `App::resync_results`); `SearchItem`
+    /// can't just be `PartialEq`, it carries an `Arc<Client>`.
+    pub fn identity(&self) -> (u8, Cow<'_, str>) {
+        match self {
+            SearchItem::Artist { id, .. } => (0, Cow::Borrowed(id)),
+            SearchItem::Album { id, .. } => (1, Cow::Borrowed(id)),
+            SearchItem::Song { id, .. } => (2, Cow::Borrowed(id)),
+            SearchItem::Playlist { id, .. } => (3, Cow::Borrowed(id)),
+            SearchItem::LocalMusic { path, .. } => (4, path.to_string_lossy()),
+            SearchItem::LocalVideo { path, .. } => (5, path.to_string_lossy()),
         }
     }
 
