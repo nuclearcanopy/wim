@@ -20,6 +20,8 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("gg / G", "jump to top / bottom"),
             ("enter", "play / open"),
             ("esc", "back / close"),
+            ("shift+a/w", "focus sidebar"),
+            ("shift+s/d", "focus workspace"),
         ],
     ),
     (
