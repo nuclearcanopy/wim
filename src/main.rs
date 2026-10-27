@@ -3359,7 +3359,16 @@ fn main() -> anyhow::Result<()> {
                             open_album = bv.albums.get(bv.albums_selected).cloned();
                         }
                         KeyCode::Enter => {
-                            let session: Vec<SearchItem> = bv.tracks[bv.selected..].to_vec();
+                            // the selected row through the end of
+                            // what's actually visible, not of the
+                            // whole list: a filtered artist page used
+                            // to play the unfiltered tail instead.
+                            let visible = bv.visible_track_indices();
+                            let from = visible.iter().position(|&i| i == bv.selected).unwrap_or(0);
+                            let session: Vec<SearchItem> = visible[from..]
+                                .iter()
+                                .map(|&i| bv.tracks[i].clone())
+                                .collect();
                             let mut tracks = session.clone().into_iter();
                             if let Some(first) = tracks.next() {
                                 let (s, played) = try_play(&player, &first, &cache_index);
