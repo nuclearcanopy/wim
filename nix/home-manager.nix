@@ -20,7 +20,7 @@ let
       };
       # Deliberately no plaintext `password` option: Nix store paths are
       # world-readable, so a literal password value here would leak to
-      # every local user. passwordFile composes with agenix/sops-nix —
+      # every local user. passwordFile composes with agenix/sops-nix;
       # point it at a decrypted secret path. See docs/architecture.md.
       passwordFile = mkOption {
         type = types.path;
@@ -30,6 +30,21 @@ let
           actually authenticate; there is no plaintext-password option
           by design.
         '';
+      };
+
+      # server-side transcoding already happens by default per
+      # navidrome's own configured profile; these are optional
+      # client-side overrides for this specific server.
+      maxBitrateKbps = mkOption {
+        type = types.nullOr types.int;
+        default = null;
+        description = "Client-side max bitrate override (kbps) sent on stream requests to this server. Null leaves it up to the server.";
+      };
+
+      transcodeFormat = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Client-side transcode format override (e.g. \"opus\", \"mp3\") sent on stream requests to this server. Null leaves it up to the server.";
       };
     };
   };
@@ -72,6 +87,22 @@ in
         defaults to `~/Music` and `~/Videos` on its own.
       '';
     };
+
+    crossfadeEnabled = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Fades the end of one track into the start of the next rather
+        than a hard cut, separate from (and on top of) gapless
+        playback, which is always on. Toggleable at runtime with 'c'.
+      '';
+    };
+
+    crossfadeSeconds = mkOption {
+      type = types.float;
+      default = 3.0;
+      description = "Length of the crossfade fade-out/fade-in ramp, in seconds.";
+    };
   };
 
   config = mkIf cfg.enable {
@@ -80,11 +111,15 @@ in
     xdg.configFile."wim/config.toml".source = tomlFormat.generate "wim-config.toml" {
       album_art = cfg.albumArt;
       library_paths = cfg.libraryPaths;
+      crossfade_enabled = cfg.crossfadeEnabled;
+      crossfade_seconds = cfg.crossfadeSeconds;
       navidrome_servers = map (s: {
         url = s.url;
         username = s.username;
         password_file = toString s.passwordFile;
-      }) cfg.navidromeServers;
+      }
+      // lib.optionalAttrs (s.maxBitrateKbps != null) { max_bitrate_kbps = s.maxBitrateKbps; }
+      // lib.optionalAttrs (s.transcodeFormat != null) { transcode_format = s.transcodeFormat; }) cfg.navidromeServers;
     };
   };
 }
