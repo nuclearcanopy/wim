@@ -174,7 +174,7 @@ impl Mpv {
     /// Appends to mpv's own playlist (playing immediately if nothing is
     /// currently loaded, otherwise queued). mpv auto-advances through
     /// its playlist natively on end-of-file, with none of the IPC
-    /// round-trip gap that reactively reloading on our end introduces —
+    /// round-trip gap that reactively reloading on our end introduces;
     /// this is what actually makes queue playback gapless.
     pub fn playlist_append(&self, path_or_url: &str) -> Result<()> {
         self.command(&[json!("loadfile"), json!(path_or_url), json!("append-play")])?;
