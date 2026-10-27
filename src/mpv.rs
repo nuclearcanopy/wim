@@ -266,6 +266,15 @@ impl Mpv {
         );
     }
 
+    /// Loads an external subtitle file onto the currently playing
+    /// video (e.g. one just downloaded from opensubtitles) and
+    /// switches to it immediately ("select" flag), rather than just
+    /// adding it to the track list unselected.
+    pub fn sub_add(&self, path: &str) -> Result<()> {
+        self.command(&[json!("sub-add"), json!(path), json!("select")])?;
+        Ok(())
+    }
+
     pub fn seek(&self, seconds: f64, relative: bool) -> Result<()> {
         let flag = if relative { "relative" } else { "absolute" };
         self.command(&[json!("seek"), json!(seconds), json!(flag)])?;
