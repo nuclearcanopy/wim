@@ -52,7 +52,7 @@ impl Widget for LoginView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let masked_password: String = "*".repeat(self.form.password.chars().count());
         let rows: [(&str, &str); 3] =
-            [("server (https:// assumed)", &self.form.url), ("username", &self.form.username), ("password", &masked_password)];
+            [("server", &self.form.url), ("username", &self.form.username), ("password", &masked_password)];
 
         let width = area.width as usize;
         let mut y = area.y;
@@ -71,12 +71,38 @@ impl Widget for LoginView<'_> {
             let active = i == self.form.field;
             let marker = if active { "> " } else { "  " };
             let prefix = format!("{marker}{label}: ");
-            // the value is what's actively being typed — keep its tail
-            // (cursor end) visible rather than truncating it away, same
-            // as the search query in the status bar.
-            let value_width = width.saturating_sub(prefix.chars().count());
-            let line = format!("{prefix}{}", tail_fit(value, value_width));
-            draw_line(buf, area, y, &line, if active { shade(NEAR_WHITE) } else { shade(DIM) });
+            let active_color = if active { shade(NEAR_WHITE) } else { shade(DIM) };
+
+            if i == 0 {
+                // url field: "https://" renders as a ghost prefix baked
+                // into the box itself, like it's already typed — not a
+                // separate label note. skipped if the user typed a
+                // scheme themselves, so it never doubles up.
+                let has_own_scheme = value.to_ascii_lowercase().starts_with("http://")
+                    || value.to_ascii_lowercase().starts_with("https://");
+                let ghost = if has_own_scheme { "" } else { "https://" };
+                let prefix_width = prefix.chars().count() + ghost.chars().count();
+                let value_width = width.saturating_sub(prefix_width);
+                let fitted_value = tail_fit(value, value_width);
+
+                draw_line(buf, area, y, &prefix, active_color);
+                draw_line_at(buf, area, prefix.chars().count() as u16, y, ghost, shade(DIM));
+                draw_line_at(
+                    buf,
+                    area,
+                    (prefix.chars().count() + ghost.chars().count()) as u16,
+                    y,
+                    &fitted_value,
+                    active_color,
+                );
+            } else {
+                // the value is what's actively being typed — keep its
+                // tail (cursor end) visible rather than truncating it
+                // away, same as the search query in the status bar.
+                let value_width = width.saturating_sub(prefix.chars().count());
+                let line = format!("{prefix}{}", tail_fit(value, value_width));
+                draw_line(buf, area, y, &line, active_color);
+            }
             y += 1;
         }
 
@@ -86,11 +112,15 @@ impl Widget for LoginView<'_> {
 }
 
 fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
+    draw_line_at(buf, area, 0, y, text, color);
+}
+
+fn draw_line_at(buf: &mut Buffer, area: Rect, x_offset: u16, y: u16, text: &str, color: ratatui::style::Color) {
     if y >= area.y + area.height {
         return;
     }
     for (col, ch) in text.chars().enumerate() {
-        let x = area.x + col as u16;
+        let x = area.x + x_offset + col as u16;
         if x >= area.x + area.width {
             break;
         }

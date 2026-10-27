@@ -133,10 +133,29 @@ fn try_connect_navidrome(
         Ok(client) => {
             cfg.navidrome = Some(nav);
             let _ = config::save(cfg);
-            if let Ok(playlists) = client.playlists() {
-                app.corpus.add_playlists(playlists);
-            }
-            Ok("navidrome connected and saved".to_string())
+
+            // index the real catalog, not just playlists — getArtists
+            // returns everything in one call, getAlbumList2 is paginated
+            // (see subsonic.rs). songs stay search-on-demand via
+            // search3 rather than eagerly fetched; a library this size
+            // could be enormous and isn't needed up front for search
+            // to work on artists/albums.
+            let artists = client.all_artists().unwrap_or_default();
+            let albums = client.all_albums().unwrap_or_default();
+            let playlists = client.playlists().unwrap_or_default();
+            let (artist_count, album_count, playlist_count) =
+                (artists.len(), albums.len(), playlists.len());
+
+            app.corpus.add_subsonic_search_result(subsonic::SearchResult {
+                artists,
+                albums,
+                songs: Vec::new(),
+            });
+            app.corpus.add_playlists(playlists);
+
+            Ok(format!(
+                "navidrome connected: {artist_count} artists, {album_count} albums, {playlist_count} playlists indexed"
+            ))
         }
         Err(e) => Err(format!("login failed: {e} — esc to skip")),
     }
