@@ -698,6 +698,184 @@ fn go_to_previous(
     status
 }
 
+/// What the main loop should do once an action has been handled.
+/// `Action::Quit` has to break that loop, which a called function
+/// can't do for its caller, so it reports back instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dispatch {
+    Continue,
+    Quit,
+}
+
+/// Every bit of main-loop state an `Action` can touch, bundled into
+/// one argument to stay under clippy's too-many-arguments limit (same
+/// reasoning as `TrackChangeCtx`). `DownloadCtx` is rebuilt from
+/// these fields per use rather than held, so `notifications` stays
+/// borrowable alongside it.
+struct ActionCtx<'a> {
+    cfg: &'a config::Config,
+    player: &'a mpv::Mpv,
+    app: &'a mut app::App,
+    notifications: &'a mut Notifications,
+    now_playing: &'a mut Option<SearchItem>,
+    previous_track: &'a mut Option<SearchItem>,
+    original_queue: &'a mut Vec<SearchItem>,
+    player_minimized: &'a mut bool,
+    browse_view: &'a mut Option<browse::BrowseView>,
+    real_art_protocol: &'a mut Option<StatefulProtocol>,
+    picker: &'a mut Option<Picker>,
+    focus: &'a mut Focus,
+    flash: &'a mut Option<(Field, Instant)>,
+    cache: &'a Arc<Mutex<CacheIndex>>,
+    download_tx: &'a mpsc::Sender<DownloadEvent>,
+    downloading: &'a mut HashSet<String>,
+    scrobble: &'a mut ScrobbleState,
+}
+
+/// The one place an `Action` from `app.handle_key` is acted on. Both
+/// key paths route through here (ordinary keys, and a query being
+/// typed); the typing path used to discard its action, which is why
+/// the first enter after a search only closed the text box.
+fn dispatch_action(action: Action, ctx: &mut ActionCtx) -> Dispatch {
+    match action {
+        Action::Quit => {
+            save_playback_state(ctx.player, ctx.now_playing, &ctx.app.queue);
+            return Dispatch::Quit;
+        }
+        // albums/playlists/artists open a track-listing view instead
+        // of playing immediately ("let me scroll through the songs"
+        // first); songs/local files still play straight away.
+        Action::Play(item @ SearchItem::Album { .. })
+        | Action::Play(item @ SearchItem::Playlist { .. })
+        | Action::Play(item @ SearchItem::Artist { .. }) => {
+            // on success, the opened view itself (title + track count
+            // in its header) is the confirmation; no need to also
+            // repeat it on the status line.
+            let opened = match &item {
+                SearchItem::Artist { .. } => open_artist_view(&item),
+                _ => open_browse_view(&item),
+            };
+            match opened {
+                Ok(bv) => {
+                    *ctx.real_art_protocol = ctx
+                        .picker
+                        .as_mut()
+                        .and_then(|p| bv.art.clone().map(|img| p.new_resize_protocol(img)));
+                    *ctx.browse_view = Some(bv);
+                    // opening something to browse and then still
+                    // needing a separate keypress just to be able to
+                    // scroll it read as "enter doesn't do anything";
+                    // land with it already focused instead.
+                    *ctx.focus = Focus::Workspace;
+                }
+                Err(msg) => ctx.notifications.push(Severity::Error, msg),
+            };
+        }
+        Action::Play(item) => {
+            match resolve_tracks(&item) {
+                Ok(tracks) if tracks.is_empty() => ctx
+                    .notifications
+                    .push(Severity::Info, "nothing to play (empty album or playlist)"),
+                Ok(mut tracks) => {
+                    let first = tracks.remove(0);
+                    let (s, played) = try_play(ctx.player, &first, ctx.cache);
+                    if played {
+                        for t in &tracks {
+                            let _ = try_enqueue(ctx.player, t, ctx.cache);
+                        }
+                        *ctx.original_queue = std::iter::once(first.clone())
+                            .chain(tracks.iter().cloned())
+                            .collect();
+                        maybe_fetch_subtitles(ctx.cfg, ctx.player, ctx.notifications, &first);
+                        let mut dctx = DownloadCtx {
+                            cache: ctx.cache,
+                            download_tx: ctx.download_tx,
+                            downloading: ctx.downloading,
+                            listens_threshold: ctx.cfg.cache_listens_threshold,
+                        };
+                        note_playback_started(&first, &mut dctx, ctx.notifications);
+                        start_tracking_playback(ctx.cfg, &first, ctx.scrobble);
+                        *ctx.previous_track = ctx.now_playing.replace(first);
+                        ctx.app.queue = tracks;
+                        // a standalone play (not from an open
+                        // album/playlist) takes over the full player
+                        // by default.
+                        *ctx.player_minimized = false;
+                    } else {
+                        ctx.notifications.push(Severity::Error, s);
+                    }
+                }
+                Err(msg) => ctx.notifications.push(Severity::Error, msg),
+            }
+        }
+        Action::Queued(item) => {
+            // queueing has no on-screen consequence of its own (the
+            // queue count on the bottom bar moves, but that's easy to
+            // miss), so this is one of the few things worth an actual
+            // toast.
+            match resolve_tracks(&item) {
+                Ok(tracks) => {
+                    for t in &tracks {
+                        let s = try_enqueue(ctx.player, t, ctx.cache);
+                        if s.starts_with("error") {
+                            ctx.notifications.push(Severity::Error, s);
+                        }
+                    }
+                    let n = tracks.len();
+                    ctx.app.queue.extend(tracks);
+                    ctx.notifications.push(
+                        Severity::Info,
+                        if n == 1 {
+                            "queued 1 track".to_string()
+                        } else {
+                            format!("queued {n} tracks")
+                        },
+                    );
+                }
+                Err(msg) => ctx.notifications.push(Severity::Error, msg),
+            }
+        }
+        Action::QueueReordered(items) => {
+            let msg = resync_queue(ctx.player, &items, ctx.cache);
+            if msg.starts_with("error") {
+                ctx.notifications.push(Severity::Error, msg);
+            } else {
+                *ctx.flash = Some((Field::Shuffle, Instant::now()));
+            }
+        }
+        Action::SetLoop(mode) => {
+            // "loop all" isn't an mpv concept; it's tracked ourselves
+            // (see `original_queue`) and acted on when the queue
+            // empties, not here. mpv only ever needs to know about
+            // single-file loop.
+            let mpv_loop = if mode == LoopMode::One { "inf" } else { "no" };
+            match ctx.player.set_loop_file(mpv_loop) {
+                Ok(()) => *ctx.flash = Some((Field::Loop, Instant::now())),
+                Err(e) => ctx
+                    .notifications
+                    .push(Severity::Error, format!("error setting loop: {e}")),
+            }
+        }
+        Action::SetSpeed(speed) => match ctx.player.set_speed(speed) {
+            Ok(()) => *ctx.flash = Some((Field::Speed, Instant::now())),
+            Err(e) => ctx
+                .notifications
+                .push(Severity::Error, format!("error setting speed: {e}")),
+        },
+        Action::SetEq(_name, gains) => {
+            let filter = eq::build_af_filter(&gains);
+            match ctx.player.set_af(&filter) {
+                Ok(()) => *ctx.flash = Some((Field::Eq, Instant::now())),
+                Err(e) => ctx
+                    .notifications
+                    .push(Severity::Error, format!("error setting eq: {e}")),
+            }
+        }
+        Action::None => {}
+    }
+    Dispatch::Continue
+}
+
 /// Called every time a remote song actually starts playing (every
 /// `now_playing`-replacing call site threads this through): bumps its
 /// play count and, once that crosses `dctx.listens_threshold`, kicks
@@ -2652,10 +2830,6 @@ fn main() -> anyhow::Result<()> {
                     }
                     continue;
                 }
-                if key.code == keymap.get(KeyAction::OpenHelp) {
-                    help_open = true;
-                    continue;
-                }
 
                 // every block below intercepts specific keys and
                 // unconditionally `continue`s even on a non-match
@@ -2669,10 +2843,49 @@ fn main() -> anyhow::Result<()> {
                 // full stop, before anything else gets a chance at it.
                 if app.editing_query {
                     let before = app.query.clone();
-                    app.handle_key(key.code, &keymap);
+                    let action = app.handle_key(key.code, &keymap);
                     if app.query != before {
                         notify_query_changed(&app, &remote_search_tx);
                     }
+                    // enter while typing commits the selection, so the
+                    // action has to run through the same dispatch the
+                    // normal path uses; throwing it away here is what
+                    // made the first enter after a search do nothing
+                    // but close the text box.
+                    let dispatch = dispatch_action(
+                        action,
+                        &mut ActionCtx {
+                            cfg: &cfg,
+                            player: &player,
+                            app: &mut app,
+                            notifications: &mut notifications,
+                            now_playing: &mut now_playing,
+                            previous_track: &mut previous_track,
+                            original_queue: &mut original_queue,
+                            player_minimized: &mut player_minimized,
+                            browse_view: &mut browse_view,
+                            real_art_protocol: &mut real_art_protocol,
+                            picker: &mut picker,
+                            focus: &mut focus,
+                            flash: &mut flash,
+                            cache: &cache_index,
+                            download_tx: &download_tx,
+                            downloading: &mut downloading,
+                            scrobble: &mut scrobble,
+                        },
+                    );
+                    if dispatch == Dispatch::Quit {
+                        break;
+                    }
+                    continue;
+                }
+
+                // after the query box, never before: `?` is an
+                // ordinary character to type into a search, and
+                // claiming it up here meant it could never reach the
+                // text box at all.
+                if key.code == keymap.get(KeyAction::OpenHelp) {
+                    help_open = true;
                     continue;
                 }
 
@@ -3206,7 +3419,16 @@ fn main() -> anyhow::Result<()> {
                             open_album = bv.albums.get(bv.albums_selected).cloned();
                         }
                         KeyCode::Enter => {
-                            let session: Vec<SearchItem> = bv.tracks[bv.selected..].to_vec();
+                            // the selected row through the end of
+                            // what's actually visible, not of the
+                            // whole list: a filtered artist page used
+                            // to play the unfiltered tail instead.
+                            let visible = bv.visible_track_indices();
+                            let from = visible.iter().position(|&i| i == bv.selected).unwrap_or(0);
+                            let session: Vec<SearchItem> = visible[from..]
+                                .iter()
+                                .map(|&i| bv.tracks[i].clone())
+                                .collect();
                             let mut tracks = session.clone().into_iter();
                             if let Some(first) = tracks.next() {
                                 let (s, played) = try_play(&player, &first, &cache_index);
@@ -3379,6 +3601,10 @@ fn main() -> anyhow::Result<()> {
                         .as_mut()
                         .and_then(|p| bv.art.clone().map(|img| p.new_resize_protocol(img)));
                     browse_view = Some(bv);
+                    // same as opening an album: the starred list draws
+                    // a selection cursor, so j/k have to move *it*
+                    // rather than the hidden sidebar behind it.
+                    focus = Focus::Workspace;
                     continue;
                 }
 
@@ -3541,145 +3767,31 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                match app.handle_key(key.code, &keymap) {
-                    Action::Quit => {
-                        save_playback_state(&player, &now_playing, &app.queue);
-                        break;
-                    }
-                    // albums/playlists/artists open a track-listing
-                    // view instead of playing immediately ("let me
-                    // scroll through the songs" first); songs/local
-                    // files still play straight away.
-                    Action::Play(item @ SearchItem::Album { .. })
-                    | Action::Play(item @ SearchItem::Playlist { .. })
-                    | Action::Play(item @ SearchItem::Artist { .. }) => {
-                        // on success, the opened view itself (title +
-                        // track count in its header) is the
-                        // confirmation; no need to also repeat it on
-                        // the status line.
-                        let opened = match &item {
-                            SearchItem::Artist { .. } => open_artist_view(&item),
-                            _ => open_browse_view(&item),
-                        };
-                        match opened {
-                            Ok(bv) => {
-                                real_art_protocol = picker.as_mut().and_then(|p| {
-                                    bv.art.clone().map(|img| p.new_resize_protocol(img))
-                                });
-                                browse_view = Some(bv);
-                                // opening something to browse and then
-                                // still needing a separate keypress
-                                // just to be able to scroll it read as
-                                // "enter doesn't do anything"; land
-                                // with it already focused instead.
-                                focus = Focus::Workspace;
-                            }
-                            Err(msg) => notifications.push(Severity::Error, msg),
-                        };
-                    }
-                    Action::Play(item) => {
-                        match resolve_tracks(&item) {
-                            Ok(tracks) if tracks.is_empty() => notifications
-                                .push(Severity::Info, "nothing to play (empty album or playlist)"),
-                            Ok(mut tracks) => {
-                                let first = tracks.remove(0);
-                                let (s, played) = try_play(&player, &first, &cache_index);
-                                if played {
-                                    for t in &tracks {
-                                        let _ = try_enqueue(&player, t, &cache_index);
-                                    }
-                                    original_queue = std::iter::once(first.clone())
-                                        .chain(tracks.iter().cloned())
-                                        .collect();
-                                    maybe_fetch_subtitles(
-                                        &cfg,
-                                        &player,
-                                        &mut notifications,
-                                        &first,
-                                    );
-                                    let mut dctx = DownloadCtx {
-                                        cache: &cache_index,
-                                        download_tx: &download_tx,
-                                        downloading: &mut downloading,
-                                        listens_threshold: cfg.cache_listens_threshold,
-                                    };
-                                    note_playback_started(&first, &mut dctx, &mut notifications);
-                                    start_tracking_playback(&cfg, &first, &mut scrobble);
-                                    previous_track = now_playing.replace(first);
-                                    app.queue = tracks;
-                                    // a standalone play (not from an
-                                    // open album/playlist) takes over
-                                    // the full player by default.
-                                    player_minimized = false;
-                                } else {
-                                    notifications.push(Severity::Error, s);
-                                }
-                            }
-                            Err(msg) => notifications.push(Severity::Error, msg),
-                        }
-                    }
-                    Action::Queued(item) => {
-                        // queueing has no on-screen consequence of its
-                        // own (the queue count on the bottom bar moves,
-                        // but that's easy to miss), so this is one of
-                        // the few things worth an actual toast.
-                        match resolve_tracks(&item) {
-                            Ok(tracks) => {
-                                for t in &tracks {
-                                    let s = try_enqueue(&player, t, &cache_index);
-                                    if s.starts_with("error") {
-                                        notifications.push(Severity::Error, s);
-                                    }
-                                }
-                                let n = tracks.len();
-                                app.queue.extend(tracks);
-                                notifications.push(
-                                    Severity::Info,
-                                    if n == 1 {
-                                        "queued 1 track".to_string()
-                                    } else {
-                                        format!("queued {n} tracks")
-                                    },
-                                );
-                            }
-                            Err(msg) => notifications.push(Severity::Error, msg),
-                        }
-                    }
-                    Action::QueueReordered(items) => {
-                        let msg = resync_queue(&player, &items, &cache_index);
-                        if msg.starts_with("error") {
-                            notifications.push(Severity::Error, msg);
-                        } else {
-                            flash = Some((Field::Shuffle, Instant::now()));
-                        }
-                    }
-                    Action::SetLoop(mode) => {
-                        // "loop all" isn't an mpv concept; it's tracked
-                        // ourselves (see `original_queue`) and acted on
-                        // when the queue empties, not here. mpv only
-                        // ever needs to know about single-file loop.
-                        let mpv_loop = if mode == LoopMode::One { "inf" } else { "no" };
-                        match player.set_loop_file(mpv_loop) {
-                            Ok(()) => flash = Some((Field::Loop, Instant::now())),
-                            Err(e) => notifications
-                                .push(Severity::Error, format!("error setting loop: {e}")),
-                        }
-                    }
-                    Action::SetSpeed(speed) => match player.set_speed(speed) {
-                        Ok(()) => flash = Some((Field::Speed, Instant::now())),
-                        Err(e) => {
-                            notifications.push(Severity::Error, format!("error setting speed: {e}"))
-                        }
+                let action = app.handle_key(key.code, &keymap);
+                let dispatch = dispatch_action(
+                    action,
+                    &mut ActionCtx {
+                        cfg: &cfg,
+                        player: &player,
+                        app: &mut app,
+                        notifications: &mut notifications,
+                        now_playing: &mut now_playing,
+                        previous_track: &mut previous_track,
+                        original_queue: &mut original_queue,
+                        player_minimized: &mut player_minimized,
+                        browse_view: &mut browse_view,
+                        real_art_protocol: &mut real_art_protocol,
+                        picker: &mut picker,
+                        focus: &mut focus,
+                        flash: &mut flash,
+                        cache: &cache_index,
+                        download_tx: &download_tx,
+                        downloading: &mut downloading,
+                        scrobble: &mut scrobble,
                     },
-                    Action::SetEq(_name, gains) => {
-                        let filter = eq::build_af_filter(&gains);
-                        match player.set_af(&filter) {
-                            Ok(()) => flash = Some((Field::Eq, Instant::now())),
-                            Err(e) => notifications
-                                .push(Severity::Error, format!("error setting eq: {e}")),
-                        }
-                    }
-                    Action::None => {}
+                );
+                if dispatch == Dispatch::Quit {
+                    break;
                 }
             }
         }
