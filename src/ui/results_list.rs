@@ -22,14 +22,33 @@ pub(crate) fn label(item: &SearchItem) -> String {
 /// Custom-painted results list: no stock `List` widget. Each row is
 /// `[kind] label`, the selected row rendered near-white, others dim, and
 /// the window scrolls to keep the selection visible without wrapping.
+/// An empty `items` isn't a no-op render — a blank screen with no
+/// explanation is a dead end, not a loved-app experience; `empty_message`
+/// is shown instead so there's always *something* telling the user why
+/// nothing's there and what to do about it.
 pub struct ResultsList<'a> {
     pub items: &'a [SearchItem],
     pub selected: usize,
+    pub empty_message: &'a str,
 }
 
 impl Widget for ResultsList<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 || self.items.is_empty() {
+        if area.height == 0 {
+            return;
+        }
+
+        if self.items.is_empty() {
+            for (col, ch) in self.empty_message.chars().enumerate() {
+                let x = area.x + col as u16;
+                if x >= area.x + area.width {
+                    break;
+                }
+                if let Some(cell) = buf.cell_mut((x, area.y)) {
+                    cell.set_char(ch);
+                    cell.set_fg(shade(DIM));
+                }
+            }
             return;
         }
 
