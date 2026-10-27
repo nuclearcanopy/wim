@@ -3,7 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::widgets::Widget;
 
-use crate::theme::{lerp, shade, DIM, NEAR_WHITE, WHITE};
+use crate::theme::{lerp, shade, DIM, NEAR_BLACK, NEAR_WHITE, WHITE};
 use crate::ui::textfit::truncate_with_ellipsis;
 
 /// How many of `lengths` (each segment's own character count, in
@@ -62,12 +62,21 @@ impl Field {
     }
 }
 
-/// Bottom playback bar: as many lines as `area.height` allows, most
-/// important first, rather than cramming everything onto one status
-/// line. Resizable (bottom bar, vertical axis only); more rows reveal
-/// more lines gracefully.
+/// Bottom playback bar: controls and current input mode, nothing
+/// else. It deliberately has no status/message line: transient
+/// messages ("now playing: x", "error loading file", "starred") used
+/// to land here, which meant the one permanently-visible strip of the
+/// UI was mostly occupied by stale sentences about things that had
+/// already happened. Anything genuinely worth surfacing goes to the
+/// notification overlay instead; this bar only ever shows state that
+/// is still true.
+/// Resizable (bottom bar, vertical axis only); more rows reveal more
+/// lines gracefully, fewer rows collapse the mode indicator into the
+/// control line rather than dropping it.
 pub struct ControlsBar<'a> {
-    pub status: &'a str,
+    /// `true` while wasd/arrows move focus between panes and nothing
+    /// else responds to the keyboard; see `InputMode` in main.rs.
+    pub move_mode: bool,
     pub queue_len: usize,
     pub loop_label: &'a str,
     pub shuffle_on: bool,
@@ -100,14 +109,57 @@ impl Widget for ControlsBar<'_> {
             y += 1;
         }
 
-        draw_line(buf, area, y, self.status, width, shade(NEAR_WHITE));
-        y += 1;
+        // the mode indicator gets a whole row to itself whenever
+        // there's one to spare: which mode you're in changes what
+        // every other key does, so it can't be something you have to
+        // hunt for. squeezed down to the minimum bar height it
+        // becomes the control line's first segment instead of being
+        // dropped, since that's the one thing here you can't infer
+        // from the rest of the screen.
+        let mode_label = if self.move_mode {
+            "-- MOVE --"
+        } else {
+            "-- INTERACT --"
+        };
+        let rows_left = (area.y + area.height).saturating_sub(y);
+        let mode_on_its_own_row = rows_left >= 2;
+        if mode_on_its_own_row {
+            let hint = if self.move_mode {
+                "wasd/arrows: focus pane, enter: interact"
+            } else {
+                "tab: move focus"
+            };
+            let x = draw_chars(
+                buf,
+                area.x,
+                area.x + area.width,
+                y,
+                mode_label,
+                // bright in move mode: it's the transient one, and
+                // the one where every other key is inert.
+                if self.move_mode {
+                    shade(WHITE)
+                } else {
+                    shade(DIM)
+                },
+            );
+            draw_chars(buf, x, area.x + area.width, y, "  ", shade(DIM));
+            draw_chars(buf, x + 2, area.x + area.width, y, hint, shade(NEAR_BLACK));
+            y += 1;
+        }
         if y >= area.y + area.height {
             return;
         }
 
         let segments: [(Option<Field>, String); 6] = [
-            (None, format!("queue: {}", self.queue_len)),
+            (
+                None,
+                if mode_on_its_own_row {
+                    format!("queue: {}", self.queue_len)
+                } else {
+                    format!("{mode_label}  queue: {}", self.queue_len)
+                },
+            ),
             (Some(Field::Loop), format!("loop: {}", self.loop_label)),
             (
                 Some(Field::Shuffle),
