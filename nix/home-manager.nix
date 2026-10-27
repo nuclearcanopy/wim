@@ -5,9 +5,34 @@
 { wimPackage }:
 { config, lib, pkgs, ... }:
 let
-  inherit (lib) mkEnableOption mkOption mkIf optionalAttrs types;
+  inherit (lib) mkEnableOption mkOption mkIf types;
   cfg = config.programs.wim;
   tomlFormat = pkgs.formats.toml { };
+
+  navidromeServerModule = { ... }: {
+    options = {
+      url = mkOption {
+        type = types.str;
+        description = "Navidrome/Subsonic server URL.";
+      };
+      username = mkOption {
+        type = types.str;
+      };
+      # Deliberately no plaintext `password` option: Nix store paths are
+      # world-readable, so a literal password value here would leak to
+      # every local user. passwordFile composes with agenix/sops-nix —
+      # point it at a decrypted secret path. See docs/architecture.md.
+      passwordFile = mkOption {
+        type = types.path;
+        description = ''
+          Path to a file containing the Navidrome password (e.g. an
+          agenix secret), trailing newline trimmed. Required to
+          actually authenticate — there is no plaintext-password option
+          by design.
+        '';
+      };
+    };
+  };
 in
 {
   options.programs.wim = {
@@ -19,30 +44,14 @@ in
       description = "wim package to install.";
     };
 
-    navidrome = {
-      url = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        description = "Navidrome/Subsonic server URL.";
-      };
-      username = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-      };
-      # Deliberately no plaintext `password` option: Nix store paths are
-      # world-readable, so a literal password value here would leak to
-      # every local user. passwordFile composes with agenix/sops-nix —
-      # point it at a decrypted secret path. See docs/architecture.md.
-      passwordFile = mkOption {
-        type = types.nullOr types.path;
-        default = null;
-        description = ''
-          Path to a file containing the Navidrome password (e.g. an
-          agenix secret), trailing newline trimmed. Required to
-          actually authenticate — there is no plaintext-password option
-          by design.
-        '';
-      };
+    # a list, not a single server: wim merges every configured server
+    # into one unified search corpus rather than picking an "active"
+    # one — see ROADMAP.md. the in-app 'n' profile manager can add more
+    # on top of whatever's declared here.
+    navidromeServers = mkOption {
+      type = types.listOf (types.submodule navidromeServerModule);
+      default = [ ];
+      description = "Navidrome/Subsonic servers to connect on startup.";
     };
 
     albumArt = mkOption {
@@ -68,19 +77,14 @@ in
   config = mkIf cfg.enable {
     home.packages = [ cfg.package ];
 
-    xdg.configFile."wim/config.toml".source = tomlFormat.generate "wim-config.toml" (
-      {
-        album_art = cfg.albumArt;
-        library_paths = cfg.libraryPaths;
-      }
-      // optionalAttrs (cfg.navidrome.url != null) {
-        navidrome = {
-          url = cfg.navidrome.url;
-          username = cfg.navidrome.username;
-        } // optionalAttrs (cfg.navidrome.passwordFile != null) {
-          password_file = toString cfg.navidrome.passwordFile;
-        };
-      }
-    );
+    xdg.configFile."wim/config.toml".source = tomlFormat.generate "wim-config.toml" {
+      album_art = cfg.albumArt;
+      library_paths = cfg.libraryPaths;
+      navidrome_servers = map (s: {
+        url = s.url;
+        username = s.username;
+        password_file = toString s.passwordFile;
+      }) cfg.navidromeServers;
+    };
   };
 }

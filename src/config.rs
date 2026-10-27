@@ -47,7 +47,12 @@ pub enum AlbumArtMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub navidrome: Option<NavidromeConfig>,
+    /// Multiple servers, all merged into one unified search corpus —
+    /// consistent with "search spans everything" rather than requiring
+    /// an "active server" concept to switch between. Add via the 'n'
+    /// profile manager; adding never replaces an existing one.
+    #[serde(default)]
+    pub navidrome_servers: Vec<NavidromeConfig>,
     #[serde(default)]
     pub album_art: AlbumArtMode,
     /// Directories to scan for local music and video.
@@ -58,7 +63,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            navidrome: None,
+            navidrome_servers: Vec::new(),
             album_art: AlbumArtMode::Auto,
             library_paths: Vec::new(),
         }
