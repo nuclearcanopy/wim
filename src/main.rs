@@ -329,7 +329,10 @@ fn main() -> anyhow::Result<()> {
             let bottom_selected = panels.resize_mode && panels.resize_selected == ResizePanel::BottomBar;
 
             f.render_widget(VerticalRule { highlighted: sidebar_selected }, vdivider);
-            f.render_widget(HorizontalRule { highlighted: bottom_selected }, Rect { height: 1, ..bottom });
+            f.render_widget(
+                HorizontalRule { highlighted: bottom_selected, junction_x: Some(vdivider.x) },
+                Rect { height: 1, ..bottom },
+            );
 
             let sidebar_rows =
                 Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(sidebar);
