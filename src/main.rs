@@ -2144,6 +2144,7 @@ fn main() -> anyhow::Result<()> {
                         paused,
                         loop_label: app.loop_mode.label(),
                         shuffle_on: app.shuffle,
+                        keymap: &keymap,
                     },
                     // same y/height as the row carved out above, but
                     // main_content's x/width: the strip must not slide
