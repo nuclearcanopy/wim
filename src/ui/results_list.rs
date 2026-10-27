@@ -3,7 +3,8 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
 use crate::search::SearchItem;
-use crate::theme::{shade, BRIGHT, DIM, NEAR_WHITE};
+use crate::theme::{shade, BRIGHT, DIM};
+use crate::ui::textfit::truncate_with_ellipsis;
 
 pub(crate) fn label(item: &SearchItem) -> String {
     match item {
@@ -39,7 +40,8 @@ impl Widget for ResultsList<'_> {
         }
 
         if self.items.is_empty() {
-            for (col, ch) in self.empty_message.chars().enumerate() {
+            let text = truncate_with_ellipsis(self.empty_message, area.width as usize);
+            for (col, ch) in text.chars().enumerate() {
                 let x = area.x + col as u16;
                 if x >= area.x + area.width {
                     break;
@@ -65,20 +67,21 @@ impl Widget for ResultsList<'_> {
                 break;
             };
             let is_selected = idx == self.selected;
-            let text = format!("[{}] {}", item.kind_label(), label(item));
             let y = area.y + row as u16;
 
-            let fg = if is_selected { shade(NEAR_WHITE) } else { shade(DIM) };
+            let fg = if is_selected { shade(BRIGHT) } else { shade(DIM) };
             let marker = if is_selected { "> " } else { "  " };
+            let full = format!("{marker}[{}] {}", item.kind_label(), label(item));
+            let text = truncate_with_ellipsis(&full, area.width as usize);
 
-            for (col, ch) in marker.chars().chain(text.chars()).enumerate() {
+            for (col, ch) in text.chars().enumerate() {
                 let x = area.x + col as u16;
                 if x >= area.x + area.width {
                     break;
                 }
                 if let Some(cell) = buf.cell_mut((x, y)) {
                     cell.set_char(ch);
-                    cell.set_fg(if is_selected { shade(BRIGHT) } else { fg });
+                    cell.set_fg(fg);
                 }
             }
         }

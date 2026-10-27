@@ -2,7 +2,8 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
-use crate::theme::{shade, DIM, NEAR_WHITE};
+use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
+use crate::ui::textfit::{tail_fit, truncate_with_ellipsis};
 
 /// Interactive Navidrome setup, shown on first run instead of requiring
 /// a hand-edited config.toml before the app is even usable. Esc skips
@@ -53,22 +54,34 @@ impl Widget for LoginView<'_> {
         let rows: [(&str, &str); 3] =
             [("server (https:// assumed)", &self.form.url), ("username", &self.form.username), ("password", &masked_password)];
 
+        let width = area.width as usize;
         let mut y = area.y;
-        draw_line(buf, area, y, "navidrome setup — enter to advance, esc to skip (local files only)", shade(DIM));
+        draw_line(
+            buf,
+            area,
+            y,
+            &truncate_with_ellipsis("navidrome setup — enter to advance, esc to skip (local files only)", width),
+            shade(DIM),
+        );
         y += 1;
-        draw_line(buf, area, y, &"─".repeat(area.width as usize), shade(DIM));
+        draw_line(buf, area, y, &"─".repeat(width), shade(NEAR_BLACK));
         y += 2;
 
         for (i, (label, value)) in rows.iter().enumerate() {
             let active = i == self.form.field;
             let marker = if active { "> " } else { "  " };
-            let line = format!("{marker}{label}: {value}");
+            let prefix = format!("{marker}{label}: ");
+            // the value is what's actively being typed — keep its tail
+            // (cursor end) visible rather than truncating it away, same
+            // as the search query in the status bar.
+            let value_width = width.saturating_sub(prefix.chars().count());
+            let line = format!("{prefix}{}", tail_fit(value, value_width));
             draw_line(buf, area, y, &line, if active { shade(NEAR_WHITE) } else { shade(DIM) });
             y += 1;
         }
 
         y += 1;
-        draw_line(buf, area, y, self.message, shade(DIM));
+        draw_line(buf, area, y, &truncate_with_ellipsis(self.message, width), shade(DIM));
     }
 }
 

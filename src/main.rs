@@ -205,8 +205,9 @@ fn main() -> anyhow::Result<()> {
                         let idle_chunks =
                             Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
                                 .split(chunks[0]);
-                        let phase = start.elapsed().as_secs_f32() * 0.25;
-                        f.render_widget(Banner { phase }, idle_chunks[0]);
+                        let elapsed_secs = start.elapsed().as_secs_f32();
+                        let phase = elapsed_secs * 0.25;
+                        f.render_widget(Banner { phase, elapsed_secs }, idle_chunks[0]);
                         f.render_widget(
                             StatusBar {
                                 editing_query: app.editing_query,
