@@ -14,6 +14,7 @@ mod term;
 mod theme;
 mod ui;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode};
@@ -38,13 +39,53 @@ use ui::searchbox::SearchBox;
 /// Local items resolve straight to a file path mpv can load. Remote
 /// (subsonic) items aren't wired into playback yet; the live loop only
 /// has a local corpus this round; see ROADMAP.md.
+///
+/// A remote `Song` resolves straight to a stream url (mpv loads http
+/// urls the same as local paths, nothing special needed). Remote
+/// `Album`/`Playlist`/`Artist` do NOT resolve here: they represent many
+/// tracks, not one, and get expanded into individual `Song` items by
+/// `resolve_tracks` before anything ever calls this function on them.
 fn playable_path(item: &SearchItem) -> Option<String> {
     match item {
         SearchItem::LocalMusic { path, .. } | SearchItem::LocalVideo { path, .. } => {
             Some(path.to_string_lossy().into_owned())
         }
-        _ => None,
+        SearchItem::Song { id, client, .. } => Some(client.stream_url(id)),
+        SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => None,
     }
+}
+
+/// Expands anything that represents more than one track into its
+/// actual tracks, so playing/queuing an album or playlist means
+/// playing/queuing every song on it, not the (unplayable) album entity
+/// itself. Local items and remote songs are already exactly one track,
+/// so they pass through unchanged. Artist playback isn't wired up yet
+/// (would mean fetching every album by that artist); see ROADMAP.md's
+/// artist profile view.
+fn resolve_tracks(item: &SearchItem) -> Result<Vec<SearchItem>, String> {
+    match item {
+        SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } | SearchItem::Song { .. } => {
+            Ok(vec![item.clone()])
+        }
+        SearchItem::Album { id, client, .. } => client
+            .get_album_songs(id)
+            .map(|songs| songs_to_items(songs, client))
+            .map_err(|e| format!("couldn't load album tracks: {e}")),
+        SearchItem::Playlist { id, client, .. } => client
+            .get_playlist_songs(id)
+            .map(|songs| songs_to_items(songs, client))
+            .map_err(|e| format!("couldn't load playlist tracks: {e}")),
+        SearchItem::Artist { .. } => {
+            Err("artist playback needs the profile view (not built yet); open an album instead".to_string())
+        }
+    }
+}
+
+fn songs_to_items(songs: Vec<subsonic::Song>, client: &Arc<subsonic::Client>) -> Vec<SearchItem> {
+    songs
+        .into_iter()
+        .map(|s| SearchItem::Song { id: s.id, title: s.title, artist: s.artist, album: s.album, client: client.clone() })
+        .collect()
 }
 
 /// (artist, title, album) for a lyrics lookup; only meaningful for
@@ -64,17 +105,17 @@ fn lyrics_query(item: &SearchItem) -> Option<(String, String, String)> {
 
 /// Replaces mpv's whole playlist and plays `item` immediately. Returns
 /// the status line and whether it actually started playing, so the
-/// caller can update `now_playing` only on success.
+/// caller can update `now_playing` only on success. Callers are
+/// expected to have already run `item` through `resolve_tracks`, so in
+/// practice `playable_path` never actually returns `None` here; that
+/// arm only exists because `playable_path` is total over `SearchItem`.
 fn try_play(player: &mpv::Mpv, item: &SearchItem) -> (String, bool) {
     match playable_path(item) {
         Some(path) => match player.load_file(&path) {
             Ok(()) => (format!("playing: {}", label(item)), true),
             Err(e) => (format!("error loading file: {e}"), false),
         },
-        None => (
-            "not playable yet: remote items aren't wired into playback this round".to_string(),
-            false,
-        ),
+        None => ("not directly playable (expand via resolve_tracks first)".to_string(), false),
     }
 }
 
@@ -88,7 +129,7 @@ fn try_enqueue(player: &mpv::Mpv, item: &SearchItem) -> String {
             Ok(()) => format!("queued: {}", label(item)),
             Err(e) => format!("error queuing file: {e}"),
         },
-        None => "not playable yet: remote items aren't wired into playback this round".to_string(),
+        None => "not directly playable (expand via resolve_tracks first)".to_string(),
     }
 }
 
@@ -122,44 +163,67 @@ fn save_playback_state(player: &mpv::Mpv, now_playing: &Option<SearchItem>, queu
     let _ = persistence::save(&state);
 }
 
+/// The catalog shape fetched over the wire, kept separate from `App` so
+/// a background thread can fetch it without touching app state (which
+/// isn't `Send` across the mpv/terminal borrow it lives behind).
+struct FetchedCatalog {
+    client: Arc<subsonic::Client>,
+    artists: Vec<subsonic::Artist>,
+    albums: Vec<subsonic::Album>,
+    playlists: Vec<subsonic::Playlist>,
+}
+
+impl FetchedCatalog {
+    fn summary(&self) -> String {
+        format!(
+            "{} artists, {} albums, {} playlists indexed",
+            self.artists.len(),
+            self.albums.len(),
+            self.playlists.len()
+        )
+    }
+}
+
+/// Pings before fetching; a typo'd url/password surfaces as an error
+/// rather than silently returning an empty catalog. Pure network I/O,
+/// safe to call from any thread.
+fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatalog, String> {
+    let client = subsonic::Client::new(nav)
+        .and_then(|c| c.ping().map(|_| c))
+        .map_err(|e| format!("connection failed: {e}"))?;
+    // getArtists returns everything in one call, getAlbumList2 is
+    // paginated (see subsonic.rs). songs stay search-on-demand via
+    // search3 rather than eagerly fetched; a library this size could be
+    // enormous and isn't needed up front for search to work on
+    // artists/albums.
+    let artists = client.all_artists().unwrap_or_default();
+    let albums = client.all_albums().unwrap_or_default();
+    let playlists = client.playlists().unwrap_or_default();
+    Ok(FetchedCatalog { client: Arc::new(client), artists, albums, playlists })
+}
+
+/// Merges a fetched catalog into the corpus and immediately resyncs
+/// whatever's displayed; the one place this happens, so every caller
+/// (startup, manual reconnect, add-profile, background auto-sync) gets
+/// it for free instead of having to remember it.
+fn merge_catalog_into_app(app: &mut app::App, catalog: FetchedCatalog) {
+    app.corpus.add_subsonic_search_result(
+        subsonic::SearchResult { artists: catalog.artists, albums: catalog.albums, songs: Vec::new() },
+        &catalog.client,
+    );
+    app.corpus.add_playlists(catalog.playlists, &catalog.client);
+    app.resync_results();
+}
+
 /// Shared by onboarding, the profile manager's add flow, and reconnect
 /// on an existing profile; so none of them can drift out of sync.
-/// Pings before the caller saves anything; a typo'd url/password
-/// shows an error rather than silently persisting garbage credentials.
 /// Doesn't touch `Config` itself: callers decide whether/how to
 /// persist (append a new profile vs. just refreshing an existing one).
 fn index_navidrome_server(app: &mut app::App, nav: &config::NavidromeConfig) -> Result<String, String> {
-    match subsonic::Client::new(nav).and_then(|c| c.ping().map(|_| c)) {
-        Ok(client) => {
-            // index the real catalog, not just playlists; getArtists
-            // returns everything in one call, getAlbumList2 is paginated
-            // (see subsonic.rs). songs stay search-on-demand via
-            // search3 rather than eagerly fetched; a library this size
-            // could be enormous and isn't needed up front for search
-            // to work on artists/albums.
-            let artists = client.all_artists().unwrap_or_default();
-            let albums = client.all_albums().unwrap_or_default();
-            let playlists = client.playlists().unwrap_or_default();
-            let (artist_count, album_count, playlist_count) =
-                (artists.len(), albums.len(), playlists.len());
-
-            app.corpus.add_subsonic_search_result(subsonic::SearchResult {
-                artists,
-                albums,
-                songs: Vec::new(),
-            });
-            app.corpus.add_playlists(playlists);
-            // mutating the corpus without this leaves any already-typed
-            // query showing stale results until the user happens to
-            // type or backspace a character — which they may never do
-            // if they already have the query they want. every call
-            // site gets this for free instead of having to remember it.
-            app.resync_results();
-
-            Ok(format!("{artist_count} artists, {album_count} albums, {playlist_count} playlists indexed"))
-        }
-        Err(e) => Err(format!("connection failed: {e}")),
-    }
+    let catalog = fetch_navidrome_catalog(nav)?;
+    let summary = catalog.summary();
+    merge_catalog_into_app(app, catalog);
+    Ok(summary)
 }
 
 /// Plain connectivity check (ping only, no catalog fetch) for every
@@ -238,7 +302,7 @@ fn main() -> anyhow::Result<()> {
         status = if failures.is_empty() {
             format!("{} items indexed (local + navidrome)", app.corpus.len())
         } else {
-            // a failed reconnect must not be silent — the old behavior
+            // a failed reconnect must not be silent; the old behavior
             // only updated `status` on success, so a down server at
             // startup looked identical to "nothing configured", with
             // no hint anything had gone wrong.
@@ -448,7 +512,7 @@ fn main() -> anyhow::Result<()> {
             let ev = event::read()?;
 
             // bracketed paste delivers the whole pasted string as one
-            // event, not synthesized keystrokes — enabling bracketed
+            // event, not synthesized keystrokes; enabling bracketed
             // paste mode (term.rs) without handling this event meant
             // paste did literally nothing. route it to whichever text
             // input is actually active, same priority order as key
@@ -604,7 +668,7 @@ fn main() -> anyhow::Result<()> {
                     // each panel only answers to its one valid resize
                     // axis: sidebar is a vertical strip (left/right
                     // only), bottom bar is a horizontal strip (up/down
-                    // only) — the other axis is a no-op, not a no-op
+                    // only); the other axis is a no-op, not a no-op
                     // that happens to also work the "wrong" way.
                     match (panels.resize_selected, key.code) {
                         (_, KeyCode::Char('r') | KeyCode::Esc) => panels.toggle_resize_mode(),
@@ -677,13 +741,42 @@ fn main() -> anyhow::Result<()> {
                         break;
                     }
                     Action::Play(item) => {
-                        let (s, played) = try_play(&player, &item);
-                        if played {
-                            now_playing = Some(item);
-                        }
-                        status = s;
+                        status = match resolve_tracks(&item) {
+                            Ok(tracks) if tracks.is_empty() => {
+                                "nothing to play (empty album or playlist)".to_string()
+                            }
+                            Ok(mut tracks) => {
+                                let first = tracks.remove(0);
+                                let (s, played) = try_play(&player, &first);
+                                if played {
+                                    for t in &tracks {
+                                        let _ = try_enqueue(&player, t);
+                                    }
+                                    let rest = tracks.len();
+                                    now_playing = Some(first);
+                                    app.queue = tracks;
+                                    if rest == 0 { s } else { format!("{s} (+{rest} more queued)") }
+                                } else {
+                                    s
+                                }
+                            }
+                            Err(msg) => msg,
+                        };
                     }
-                    Action::Queued(item) => status = try_enqueue(&player, &item),
+                    Action::Queued(item) => {
+                        status = match resolve_tracks(&item) {
+                            Ok(tracks) => {
+                                let mut last_status = String::new();
+                                for t in &tracks {
+                                    last_status = try_enqueue(&player, t);
+                                }
+                                let n = tracks.len();
+                                app.queue.extend(tracks);
+                                if n <= 1 { last_status } else { format!("queued {n} tracks") }
+                            }
+                            Err(msg) => msg,
+                        };
+                    }
                     Action::QueueReordered(items) => status = resync_queue(&player, &items),
                     Action::SetLoop(on) => {
                         status = match player.set_loop_file(if on { "inf" } else { "no" }) {

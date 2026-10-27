@@ -23,7 +23,7 @@ pub fn draw_header(
     let header = format!("{title} │ {instructions}");
     let fitted = truncate_with_ellipsis(&header, width);
 
-    // the │ is drawn in rule_color, not text_color — it belongs to the
+    // the │ is drawn in rule_color, not text_color; it belongs to the
     // same vertical line as the ┴ below it, so it must match that
     // line's color throughout, not the surrounding title/instructions
     // text. mixing brightness along what's meant to read as one
@@ -55,7 +55,7 @@ pub fn draw_header(
             // ┴ (stem up), not ┬ (stem down): the │ this connects to is
             // in the row *above* the rule, so the joint must point up
             // into it. same rule_color as the rest of the line, same
-            // as the │ above — one continuous line, one color, the ┴
+            // as the │ above; one continuous line, one color, the ┴
             // shape alone marks where it meets the rule.
             let ch = if junction_col == Some(col) { '┴' } else { '─' };
             if let Some(cell) = buf.cell_mut((x, rule_y)) {

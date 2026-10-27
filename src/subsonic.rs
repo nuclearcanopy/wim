@@ -12,11 +12,26 @@ use crate::config::NavidromeConfig;
 const API_VERSION: &str = "1.16.1";
 const CLIENT_NAME: &str = "wim";
 
+/// Cheap to clone (ureq's `Agent` is `Arc`-backed internally); every
+/// remote `SearchItem` carries an `Arc<Client>` so playback can later
+/// resolve to the right server's stream url without the app needing a
+/// separate "active server" concept to track.
+#[derive(Clone)]
 pub struct Client {
     base_url: String,
     username: String,
     password: String,
     agent: ureq::Agent,
+}
+
+impl std::fmt::Debug for Client {
+    /// Hand-written so the password never ends up in a `{:?}` log line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("base_url", &self.base_url)
+            .field("username", &self.username)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -162,40 +177,28 @@ impl Client {
             })
             .unwrap_or_default();
 
-        let songs = r
-            .get("song")
-            .and_then(|a| a.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|s| {
-                        Some(Song {
-                            id: s.get("id")?.as_str()?.to_string(),
-                            title: s.get("title")?.as_str()?.to_string(),
-                            artist: s
-                                .get("artist")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            album: s
-                                .get("album")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            duration: s
-                                .get("duration")
-                                .and_then(|v| v.as_u64())
-                                .map(|d| d as u32),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let songs = parse_song_array(r.get("song"));
 
         Ok(SearchResult {
             artists,
             albums,
             songs,
         })
+    }
+
+    /// Every track on an album, in album order; used to expand a
+    /// playable album into its actual tracks (playing/queuing an album
+    /// means playing every song on it, not the album entity itself).
+    pub fn get_album_songs(&self, album_id: &str) -> anyhow::Result<Vec<Song>> {
+        let v = self.get("getAlbum", &[("id", album_id)])?;
+        Ok(parse_song_array(v.get("album").and_then(|a| a.get("song"))))
+    }
+
+    /// Same idea for playlists: `getPlaylist`'s tracks live under
+    /// `entry`, not `song`, but the per-track shape is identical.
+    pub fn get_playlist_songs(&self, playlist_id: &str) -> anyhow::Result<Vec<Song>> {
+        let v = self.get("getPlaylist", &[("id", playlist_id)])?;
+        Ok(parse_song_array(v.get("playlist").and_then(|p| p.get("entry"))))
     }
 
     pub fn playlists(&self) -> anyhow::Result<Vec<Playlist>> {
@@ -340,6 +343,27 @@ fn parse_artists_index(v: &serde_json::Value) -> Vec<Artist> {
         .unwrap_or_default()
 }
 
+/// Pure parsing shared by `search3`, `getAlbum`'s track list, and
+/// `getPlaylist`'s track list; all three return the same per-track
+/// shape, just nested under a different parent key.
+fn parse_song_array(arr: Option<&serde_json::Value>) -> Vec<Song> {
+    arr.and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    Some(Song {
+                        id: s.get("id")?.as_str()?.to_string(),
+                        title: s.get("title")?.as_str()?.to_string(),
+                        artist: s.get("artist").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        album: s.get("album").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        duration: s.get("duration").and_then(|v| v.as_u64()).map(|d| d as u32),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Pure parsing for a single `getAlbumList2` page, pulled out of
 /// `all_albums()`'s pagination loop so it's testable in isolation.
 fn parse_album_list2_page(v: &serde_json::Value) -> Vec<Album> {
@@ -428,9 +452,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_album_songs_regardless_of_parent_key() {
+        // getAlbum nests tracks under "song"...
+        let album: serde_json::Value = serde_json::from_str(
+            r#"{"album": {"id": "al-1", "song": [
+                {"id": "s1", "title": "Icedancer", "artist": "Bladee", "album": "Cold Visions", "duration": 180}
+            ]}}"#,
+        )
+        .unwrap();
+        let songs = parse_song_array(album.get("album").and_then(|a| a.get("song")));
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].title, "Icedancer");
+
+        // ...getPlaylist nests them under "entry"; same per-track shape.
+        let playlist: serde_json::Value = serde_json::from_str(
+            r#"{"playlist": {"id": "p1", "entry": [
+                {"id": "s2", "title": "Drain Gang", "artist": "Bladee", "album": "Global", "duration": 120}
+            ]}}"#,
+        )
+        .unwrap();
+        let entries = parse_song_array(playlist.get("playlist").and_then(|p| p.get("entry")));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Drain Gang");
+    }
+
+    #[test]
     fn missing_fields_parse_to_empty_not_a_panic() {
         let v: serde_json::Value = serde_json::from_str(r#"{"status":"ok"}"#).unwrap();
         assert!(parse_artists_index(&v).is_empty());
         assert!(parse_album_list2_page(&v).is_empty());
+        assert!(parse_song_array(None).is_empty());
     }
 }

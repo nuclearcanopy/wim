@@ -8,7 +8,7 @@ use crate::ui::textfit::truncate_with_ellipsis;
 
 /// One glyph per kind. Deliberately plain geometric/text-presentation
 /// unicode symbols, not the literal emoji pictographs (🌐📁💿🎵🎬) the
-/// spec described — those render as fixed-color bitmaps on most
+/// spec described; those render as fixed-color bitmaps on most
 /// systems regardless of the terminal's foreground color, which would
 /// silently break the strict-monochrome rule. These stay plain glyphs
 /// in whatever shade we set.
@@ -17,14 +17,16 @@ pub(crate) fn kind_icon(item: &SearchItem) -> char {
         SearchItem::LocalMusic { .. } | SearchItem::Song { .. } => '♪',
         SearchItem::LocalVideo { .. } => '▶',
         SearchItem::Artist { .. } => '◆',
-        SearchItem::Album { .. } => '◉',
+        // outer rim + inner label circle reads as a vinyl record, not
+        // the eye/target look of a plain dotted circle.
+        SearchItem::Album { .. } => '◎',
         SearchItem::Playlist { .. } => '≡',
     }
 }
 
-/// ○ for remote (navidrome) items, ● for local files — hollow vs.
-/// filled rather than a literal globe/folder, for the same
-/// monochrome-safety reason as `kind_icon`.
+/// ○ for remote (navidrome) items, ● for local files: just two plain
+/// circles, hollow vs. filled, not a literal globe/folder glyph, for
+/// the same monochrome-safety reason as `kind_icon`.
 pub(crate) fn source_icon(item: &SearchItem) -> char {
     match item {
         SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => '●',
@@ -100,7 +102,7 @@ impl Widget for ResultsList<'_> {
             let fg = if is_selected { shade(BRIGHT) } else { shade(DIM) };
             let marker = if is_selected { "> " } else { "  " };
             let full =
-                format!("{marker}{}{} {}", kind_icon(item), source_icon(item), label(item));
+                format!("{marker}{}{} {}", source_icon(item), kind_icon(item), label(item));
             let text = truncate_with_ellipsis(&full, area.width as usize);
 
             for (col, ch) in text.chars().enumerate() {
