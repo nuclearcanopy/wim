@@ -1464,6 +1464,13 @@ fn main() -> anyhow::Result<()> {
     let lyrics_client = lyrics::Client::new();
     let mut lyrics_lines: Option<Vec<String>> = None;
     let mut lyrics_scroll: usize = 0;
+    // which track the open lyrics belong to; shown in their header so
+    // a pane left open across a track change isn't ambiguous.
+    let mut lyrics_track = String::new();
+    // the workspace width the lyrics were last drawn at; wrapping (and
+    // therefore how far they can scroll) depends on it, and only the
+    // draw pass knows it.
+    let mut lyrics_width: u16 = 0;
     // opened via enter on an album/playlist; takes over main_content
     // until esc, same modal-ish precedence as lyrics but independent
     // of it (browsing doesn't require anything to already be playing).
@@ -2005,11 +2012,13 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             } else if let Some(lines) = &lyrics_lines {
+                lyrics_width = main_content.width;
                 let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
                 f.render_widget(
                     LyricsView {
                         lines: &borrowed,
                         scroll: lyrics_scroll,
+                        track: &lyrics_track,
                     },
                     main_content,
                 );
@@ -3266,7 +3275,24 @@ fn main() -> anyhow::Result<()> {
                     let mut handled = true;
                     match key.code {
                         KeyCode::Char('j') | KeyCode::Down => {
-                            lyrics_scroll = lyrics_scroll.saturating_add(1)
+                            {
+                                // clamped against the *wrapped* length,
+                                // which is what's actually on screen;
+                                // j used to scroll into blank space
+                                // indefinitely.
+                                let max = lyrics_lines
+                                    .as_ref()
+                                    .map(|l| {
+                                        let borrowed: Vec<&str> =
+                                            l.iter().map(String::as_str).collect();
+                                        ui::lyrics_view::wrapped_len(
+                                            &borrowed,
+                                            lyrics_width.max(1) as usize,
+                                        )
+                                    })
+                                    .unwrap_or(0);
+                                lyrics_scroll = (lyrics_scroll + 1).min(max.saturating_sub(1));
+                            }
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             lyrics_scroll = lyrics_scroll.saturating_sub(1)
@@ -3456,6 +3482,8 @@ fn main() -> anyhow::Result<()> {
                                         };
                                         lyrics_lines =
                                             Some(text.lines().map(str::to_string).collect());
+                                        lyrics_track = label(item);
+                                        lyrics_scroll = 0;
                                     }
                                     Ok(None) => {
                                         notifications.push(Severity::Info, "no lyrics found")
