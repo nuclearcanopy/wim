@@ -934,6 +934,103 @@ struct BackgroundSyncResult {
     result: Result<FetchedCatalog, String>,
 }
 
+/// How long to let rapid keystrokes settle before actually firing a
+/// `search3` request, so a burst of typing costs one network round-
+/// trip instead of one per character; see `spawn_background_search`.
+const REMOTE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// One query-changed event, carrying the servers to search against at
+/// the time it was sent; `Corpus::remote_clients` (already-indexed
+/// servers only) is cheap to call per-keystroke on the main thread, so
+/// the snapshot travels with the query rather than the background
+/// thread needing its own separate copy of the server list to keep in
+/// sync.
+struct RemoteSearchQuery {
+    query: String,
+    clients: Vec<Arc<subsonic::Client>>,
+}
+
+/// One server's `search3` result for whatever query it was fired for;
+/// not tagged with the query itself; see `spawn_background_search`'s
+/// doc for why that's fine.
+struct RemoteSearchOutcome {
+    client: Arc<subsonic::Client>,
+    result: subsonic::SearchResult,
+}
+
+/// Runs forever on its own thread, debouncing query-changed events
+/// from the main thread and firing Subsonic's `search3` against every
+/// already-indexed navidrome server once typing settles. This is the
+/// live counterpart to `fetch_navidrome_catalog`'s eager indexing:
+/// song titles are deliberately never indexed up front (a library's
+/// songs could be enormous; see that function's own comment), so
+/// without this, searching a song by title only ever worked by
+/// coincidence. Same shape as `spawn_background_sync` — pure network
+/// I/O on its own thread, result handed back over a channel, main
+/// thread owns all the `!Send` state — just triggered by query changes
+/// instead of a fixed timer.
+///
+/// Results aren't tagged with the query they answer and are merged
+/// into the corpus unconditionally rather than discarded if the query
+/// has since changed: `Corpus::add_subsonic_search_result` already
+/// dedups against what's indexed, so a stale answer is harmless to
+/// merge in (it simply enriches the corpus for whatever's searched
+/// next) and the subsequent `resync_results()` re-filters against
+/// whatever the *current* query actually is, so a stale result can
+/// never flash on screen for the wrong query.
+fn spawn_background_search(
+    query_rx: mpsc::Receiver<RemoteSearchQuery>,
+    result_tx: mpsc::Sender<RemoteSearchOutcome>,
+) {
+    thread::spawn(move || loop {
+        let mut pending = match query_rx.recv() {
+            Ok(q) => q,
+            Err(_) => return, // main thread gone (shutting down)
+        };
+        // debounce: keep absorbing newer queries until typing settles
+        // for a full window, so a burst of keystrokes fires exactly
+        // one request rather than one per character.
+        loop {
+            match query_rx.recv_timeout(REMOTE_SEARCH_DEBOUNCE) {
+                Ok(newer) => pending = newer,
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        if pending.query.trim().is_empty() || pending.clients.is_empty() {
+            continue;
+        }
+        // independent per-server requests, same reasoning as every
+        // other multi-server fetch in this file: run them
+        // concurrently rather than making every server wait its turn.
+        let outcomes: Vec<RemoteSearchOutcome> = thread::scope(|scope| {
+            pending
+                .clients
+                .iter()
+                .map(|client| {
+                    let query = pending.query.clone();
+                    let client = client.clone();
+                    scope.spawn(move || (client.clone(), client.search3(&query)))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter_map(|handle| {
+                    let (client, result) = handle.join().ok()?;
+                    Some(RemoteSearchOutcome {
+                        client,
+                        result: result.ok()?,
+                    })
+                })
+                .collect()
+        });
+        for outcome in outcomes {
+            if result_tx.send(outcome).is_err() {
+                return; // main thread is gone (shutting down)
+            }
+        }
+    });
+}
+
 /// Runs forever on its own thread, re-fetching every server's catalog
 /// on a timer and reporting each attempt back over `result_tx`; the
 /// main thread owns `App`/mpv/the terminal, none of which are `Send`
@@ -982,6 +1079,26 @@ fn spawn_background_sync(
                 }
             }
         }
+    });
+}
+
+/// Pushes the current query to the background `search3` thread (see
+/// `spawn_background_search`) whenever typing/pasting actually changed
+/// it; a no-op while the query's empty or no server has been indexed
+/// yet, same as the background thread's own guard, just avoiding the
+/// channel send entirely in the common "nothing to search remotely"
+/// case.
+fn notify_query_changed(app: &app::App, remote_search_tx: &mpsc::Sender<RemoteSearchQuery>) {
+    if app.query.trim().is_empty() {
+        return;
+    }
+    let clients = app.corpus.remote_clients();
+    if clients.is_empty() {
+        return;
+    }
+    let _ = remote_search_tx.send(RemoteSearchQuery {
+        query: app.query.clone(),
+        clients,
     });
 }
 
@@ -1383,6 +1500,13 @@ fn main() -> anyhow::Result<()> {
     let (sync_tx, sync_rx) = mpsc::channel::<BackgroundSyncResult>();
     let (servers_tx, servers_rx) = mpsc::channel::<Vec<config::NavidromeConfig>>();
     spawn_background_sync(cfg.navidrome_servers.clone(), sync_tx, servers_rx);
+
+    // live remote search (song titles especially; see
+    // `spawn_background_search`'s own doc) debounced off query
+    // changes rather than a timer, polled every frame same as `sync_rx`.
+    let (remote_search_tx, remote_search_rx) = mpsc::channel::<RemoteSearchQuery>();
+    let (remote_search_result_tx, remote_search_result_rx) = mpsc::channel::<RemoteSearchOutcome>();
+    spawn_background_search(remote_search_rx, remote_search_result_tx);
 
     // 'n' opens the profile manager standalone, later.
     let mut nav_manager: Option<NavManager> = None;
@@ -2196,6 +2320,17 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        // drain whatever the live remote-search thread answered since
+        // the last frame; merged unconditionally and re-filtered
+        // against whatever's actually typed right now (see
+        // `spawn_background_search`'s doc for why that's safe even if
+        // the query's since moved on).
+        while let Ok(outcome) = remote_search_result_rx.try_recv() {
+            app.corpus
+                .add_subsonic_search_result(outcome.result, &outcome.client);
+            app.resync_results();
+        }
+
         if last_cache_sweep.elapsed() >= CACHE_SWEEP_INTERVAL {
             sweep_cache(&cache_index, cfg.cache_eviction_days);
             last_cache_sweep = Instant::now();
@@ -2257,7 +2392,11 @@ fn main() -> anyhow::Result<()> {
                     // worth pasting rather than typing by hand.
                     settings_token_input.push_str(text);
                 } else if !help_open {
+                    let before = app.query.clone();
                     app.paste_into_query(text);
+                    if app.query != before {
+                        notify_query_changed(&app, &remote_search_tx);
+                    }
                 }
             }
 
@@ -2454,7 +2593,11 @@ fn main() -> anyhow::Result<()> {
                 // in the text box): editing a query claims every key,
                 // full stop, before anything else gets a chance at it.
                 if app.editing_query {
+                    let before = app.query.clone();
                     app.handle_key(key.code, &keymap);
+                    if app.query != before {
+                        notify_query_changed(&app, &remote_search_tx);
+                    }
                     continue;
                 }
 

@@ -168,6 +168,18 @@ impl SearchItem {
             SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => None,
         }
     }
+
+    /// `None` for local items; the originating server's client for
+    /// everything else, for `Corpus::remote_clients`.
+    fn client(&self) -> Option<&Arc<Client>> {
+        match self {
+            SearchItem::Artist { client, .. }
+            | SearchItem::Album { client, .. }
+            | SearchItem::Song { client, .. }
+            | SearchItem::Playlist { client, .. } => Some(client),
+            SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => None,
+        }
+    }
 }
 
 /// The merged corpus to search over, built once per library scan /
@@ -270,6 +282,25 @@ impl Corpus {
         self.items.is_empty()
     }
 
+    /// Every distinct navidrome server already represented in the
+    /// corpus (deduped by base url), for firing a live `search3`
+    /// request against; a server only shows up here once something
+    /// from it has actually been indexed (artists/albums/playlists via
+    /// `fetch_navidrome_catalog`), which is also exactly when it's
+    /// safe to assume the connection is good.
+    pub fn remote_clients(&self) -> Vec<Arc<Client>> {
+        let mut seen = HashSet::new();
+        let mut clients = Vec::new();
+        for item in &self.items {
+            if let Some(client) = item.client() {
+                if seen.insert(client.base_url().to_string()) {
+                    clients.push(client.clone());
+                }
+            }
+        }
+        clients
+    }
+
     /// Local count plus a per-navidrome-server count, in first-seen
     /// order; computed on demand ('I') rather than announced on every
     /// startup/rescan.
@@ -335,6 +366,27 @@ impl Corpus {
 
         scored.sort_by_key(|a| std::cmp::Reverse(a.0));
 
+        // relative score cutoff: nucleo's own subsequence matcher will
+        // happily return *some* nonzero score for almost any haystack
+        // against a short query (e.g. "crest" is a valid, if scattered,
+        // subsequence of "Cigarettes After Sex"), and with no floor at
+        // all every one of those sparse, low-quality matches rendered
+        // right alongside a genuine exact title hit. Anything scoring
+        // under `WEAK_MATCH_CUTOFF_FRACTION` of the *best* match in
+        // this search is almost certainly that kind of noise rather
+        // than something the user meant, so drop it. This is
+        // self-limiting rather than needing a separate "don't leave it
+        // empty" guard: the top result's score always clears its own
+        // threshold, so the list can never be pruned to nothing, and
+        // when every candidate is in the same (even if low) ballpark —
+        // no single standout match — they're all close enough to the
+        // top score to clear the cutoff together, so weak guesses
+        // still show exactly when there's nothing better on offer.
+        if let Some(&(top_score, _)) = scored.first() {
+            let threshold = (top_score as f64 * WEAK_MATCH_CUTOFF_FRACTION).round() as u32;
+            scored.retain(|(s, _)| *s >= threshold);
+        }
+
         // group same-category items together (section headers in the
         // results list), but order the groups themselves by each
         // one's single best match rather than a fixed kind ordering:
@@ -363,12 +415,30 @@ impl Corpus {
     }
 }
 
+/// Below this fraction of the best match's score in a given search, a
+/// result is treated as noise rather than a real candidate; see the
+/// cutoff's own call site in `Corpus::search` for the "crest" bug this
+/// exists to fix. Picked empirically against that exact bug report:
+/// nucleo's word-start bonus means a purely coincidental scattered
+/// match (e.g. "crest" landing on word-initial letters scattered
+/// across "...And Justice for All"/"The College Dropout") still scores
+/// 60%+ of a genuine exact-title hit, so the cutoff has to sit above
+/// that to actually remove it; 0.65 does, while an equally-weighted
+/// second match (e.g. two near-identical candidates, or two albums by
+/// the same artist that are each a comparably good hit) still clears
+/// it since neither is *that* far below the other.
+const WEAK_MATCH_CUTOFF_FRACTION: f64 = 0.65;
+
 /// How many edits (insert/delete/substitute/adjacent-transpose) we'll
-/// tolerate for a query of this length, scaled generously since missing a
-/// result entirely is worse than a slightly loose match: roughly half the
-/// query length, rounded up, minimum 1.
+/// tolerate for a query of this length. Deliberately tight and scaling
+/// slowly: a loose budget (the old `query_len / 2`) meant a 5-letter
+/// query like "crest" tolerated 3 edits, which is enough to "correct"
+/// into almost any other short word, defeating the point of a typo
+/// fallback. One edit covers genuine single-letter typos/transpositions
+/// regardless of query length; only noticeably longer queries get a
+/// second.
 fn edit_distance_budget(query_len: usize) -> usize {
-    query_len.div_ceil(2).max(1)
+    1 + query_len.saturating_sub(1) / 6
 }
 
 /// Converts an edit distance into a score comparable to nucleo's fuzzy
@@ -548,6 +618,133 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, SearchItem::Artist { name, .. } if name == "Branimir")),
             "transposition typo should still match via edit-distance fallback"
+        );
+    }
+
+    /// Regression test for the reported bug: searching "crest" (an
+    /// exact album title) returned "Crest" ranked first, immediately
+    /// followed by dozens of unrelated albums that merely contain
+    /// "crest"'s letters as a scattered subsequence somewhere across
+    /// their (often multi-word) title. With a real top match on the
+    /// board, that noise should be cut, not rendered alongside it.
+    #[test]
+    fn one_great_match_suppresses_unrelated_noise() {
+        let client = test_client();
+        let mut c = Corpus::new();
+        c.add_subsonic_search_result(
+            SubsonicSearchResult {
+                artists: vec![],
+                albums: vec![
+                    Album {
+                        id: "al1".into(),
+                        name: "Crest".into(),
+                        artist: "Bladee".into(),
+                    },
+                    Album {
+                        id: "al2".into(),
+                        name: "I.".into(),
+                        artist: "Various Artists".into(),
+                    },
+                    Album {
+                        id: "al3".into(),
+                        name: "Affection".into(),
+                        artist: "Someone".into(),
+                    },
+                    Album {
+                        id: "al4".into(),
+                        name: "Anna Karenina".into(),
+                        artist: "Someone Else".into(),
+                    },
+                    Album {
+                        id: "al5".into(),
+                        name: "Bubblegum".into(),
+                        artist: "Another Artist".into(),
+                    },
+                    Album {
+                        id: "al6".into(),
+                        name: "Cigarettes After Sex".into(),
+                        artist: "Cigarettes After Sex".into(),
+                    },
+                    Album {
+                        id: "al7".into(),
+                        name: "X's".into(),
+                        artist: "Someone".into(),
+                    },
+                    Album {
+                        id: "al8".into(),
+                        name: "...And Justice for All".into(),
+                        artist: "Metallica".into(),
+                    },
+                    Album {
+                        id: "al9".into(),
+                        name: "The College Dropout".into(),
+                        artist: "Kanye West".into(),
+                    },
+                ],
+                songs: vec![],
+            },
+            &client,
+        );
+
+        let results = c.search("crest");
+        let names: Vec<&str> = results
+            .iter()
+            .map(|i| match i {
+                SearchItem::Album { name, .. } => name.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["Crest"],
+            "the exact title should suppress every unrelated scattered-subsequence/typo match: got {names:?}"
+        );
+    }
+
+    /// Mirror of the above: when nothing in the corpus is a strong
+    /// match, the relative cutoff must not prune the list down to
+    /// nothing/near-nothing; weak guesses are exactly what should show
+    /// when there's nothing better on offer.
+    #[test]
+    fn weak_matches_still_show_when_nothing_is_a_great_match() {
+        let client = test_client();
+        let mut c = Corpus::new();
+        c.add_subsonic_search_result(
+            SubsonicSearchResult {
+                artists: vec![],
+                albums: vec![
+                    Album {
+                        id: "al1".into(),
+                        name: "Zzyzx".into(),
+                        artist: "Someone".into(),
+                    },
+                    Album {
+                        id: "al2".into(),
+                        name: "Zzyzx Road".into(),
+                        artist: "Someone Else".into(),
+                    },
+                    Album {
+                        id: "al3".into(),
+                        name: "Zzyzx Junction".into(),
+                        artist: "Another Artist".into(),
+                    },
+                ],
+                songs: vec![],
+            },
+            &client,
+        );
+
+        // none of these clearly beats the others (all three contain
+        // "zyzx" as a word); with no standout leader, all three should
+        // stay close enough in score to the top one to clear the
+        // relative cutoff together, rather than the two runners-up
+        // getting cut just for not being *the* best.
+        let results = c.search("zyzx");
+        assert_eq!(
+            results.len(),
+            3,
+            "no standout match among near-equal candidates; none should be cut: got {results:?}"
         );
     }
 }
