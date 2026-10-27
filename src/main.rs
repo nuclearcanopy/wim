@@ -1050,9 +1050,10 @@ fn playback_info(player: &mpv::Mpv) -> (Option<f64>, Option<f64>, bool) {
 /// property. If that property path doesn't resolve the way expected
 /// (wrong mpv version, filter not actually in the graph yet, af-
 /// metadata represented differently than guessed), this falls back to
-/// a calm idle sine pulse instead of silently showing a dead meter;
-/// `phase` drives that fallback and is advanced by the caller.
-fn audio_level(player: &mpv::Mpv, phase: f32) -> f32 {
+/// a calm idle breathe instead of silently showing a dead meter,
+/// driven off `elapsed` (time since app start) like every other
+/// animation.
+fn audio_level(player: &mpv::Mpv, elapsed: Duration) -> f32 {
     let key = format!(
         "af-metadata/{}/lavfi.astats.Overall.RMS_level",
         eq::LEVEL_METADATA_LABEL
@@ -1063,7 +1064,7 @@ fn audio_level(player: &mpv::Mpv, phase: f32) -> f32 {
         // narrower one that'd clip real audio's dynamic range.
         return ((db as f32 + 60.0) / 60.0).clamp(0.0, 1.0);
     }
-    (phase.sin() * 0.3 + 0.35).clamp(0.0, 1.0)
+    (anim::pulse(elapsed, anim::LEVEL_FALLBACK_PERIOD) * 0.6 + 0.05).clamp(0.0, 1.0)
 }
 
 /// How often the background thread (see `spawn_background_sync`)
@@ -1941,12 +1942,21 @@ fn main() -> anyhow::Result<()> {
     // album's art changes; `ratatui-image` owns the actual resize/
     // encode caching per protocol instance.
     let mut real_art_protocol: Option<StatefulProtocol> = None;
+    // the display's refresh rate decides how often an animation is
+    // sampled (never how fast it runs, see `anim`); one subprocess on
+    // a thread, applied whenever it answers, so the first frame never
+    // waits on a compositor. 60hz until then.
+    let frame_rx = anim::spawn_probe();
+    let mut frame = anim::FrameBudget::default();
     // everything that costs an ipc round-trip per track runs on the
     // first pass through the loop instead of before it; see the drain
     // right after `draw`.
     let mut first_frame_drawn = false;
     loop {
         notifications.expire();
+        if let Ok(detected) = frame_rx.try_recv() {
+            frame = detected;
+        }
         // sampled once per frame rather than per widget, so everything
         // on screen animates off the same instant.
         let frame_elapsed = start.elapsed();
@@ -2178,8 +2188,9 @@ fn main() -> anyhow::Result<()> {
                 },
             );
 
-            // classic terminal cursor blink: ~530ms per half-phase.
-            let cursor_visible = (start.elapsed().as_millis() / 530).is_multiple_of(2);
+            // classic terminal cursor blink, off the same wall clock
+            // as every other animation (see `anim::CURSOR_BLINK`).
+            let cursor_visible = anim::blink(frame_elapsed, anim::CURSOR_BLINK);
             f.render_widget(
                 SearchBox {
                     query: &app.query,
@@ -2242,8 +2253,7 @@ fn main() -> anyhow::Result<()> {
                     main_content,
                 );
 
-                let phase = start.elapsed().as_secs_f32() * 2.0;
-                level_history.push(audio_level(&player, phase));
+                level_history.push(audio_level(&player, frame_elapsed));
                 let max_history = main_content.width.max(1) as usize;
                 if level_history.len() > max_history {
                     level_history.drain(..level_history.len() - max_history);
@@ -2302,12 +2312,9 @@ fn main() -> anyhow::Result<()> {
                     main_content,
                 );
             } else {
-                let elapsed_secs = start.elapsed().as_secs_f32();
-                let phase = elapsed_secs * 0.25;
                 f.render_widget(
                     Banner {
-                        phase,
-                        elapsed_secs,
+                        elapsed: frame_elapsed,
                         logo_index,
                         keymap: &keymap,
                     },
@@ -2439,10 +2446,8 @@ fn main() -> anyhow::Result<()> {
             let resize_hint = panels
                 .resize_mode
                 .then_some("resize mode: a=sidebar s=bottom bar, arrows stretch, r/esc exit");
-            let flash_level = flash.map(|(field, at)| {
-                let t = at.elapsed().as_secs_f32() / FLASH_DURATION.as_secs_f32();
-                (field, (1.0 - t).clamp(0.0, 1.0))
-            });
+            let flash_level =
+                flash.map(|(field, at)| (field, anim::decay(at.elapsed(), FLASH_DURATION)));
             f.render_widget(
                 ControlsBar {
                     move_mode: input_mode == InputMode::Move,
@@ -2786,7 +2791,40 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        if event::poll(Duration::from_millis(100))? {
+        // whichever animations are actually live this frame set the
+        // poll timeout: the display's frame budget while something is
+        // moving, a long idle sleep otherwise. a static screen (no
+        // selection pulse, no blinking cursor, nothing playing) must
+        // not redraw at 60fps just because the display could.
+        let overlay = onboarding.is_some()
+            || nav_manager.is_some()
+            || help_open
+            || settings_menu_open
+            || keybinds_menu_open
+            || eq_menu_open;
+        let selection_pulsing = match focus {
+            Focus::Sidebar => !app.results.is_empty(),
+            Focus::Workspace => browse_view.is_some(),
+            Focus::BottomBar => false,
+        };
+        let banner_showing =
+            now_playing.is_none() && browse_view.is_none() && lyrics_lines.is_none();
+        let animating = !overlay
+            && (selection_pulsing
+                || banner_showing
+                || app.editing_query
+                || browse_view.as_ref().is_some_and(|bv| bv.filtering)
+                || (now_playing.is_some() && !player_minimized)
+                || input_mode == InputMode::Move
+                || Instant::now() < focus_flash_until
+                || flash.is_some_and(|(_, at)| at.elapsed() < FLASH_DURATION));
+        let timeout = if animating {
+            frame.interval()
+        } else {
+            anim::IDLE_POLL
+        };
+
+        if event::poll(timeout)? {
             let ev = event::read()?;
 
             // bracketed paste delivers the whole pasted string as one

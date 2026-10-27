@@ -85,12 +85,11 @@ pub struct Notification {
 
 impl Notification {
     /// Seconds left before this one expires, for the countdown shown
-    /// in its box; saturates at 0 rather than going negative in the
-    /// one frame between it passing `lifetime` and `expire()` running.
+    /// in its box; `anim::countdown_secs` rounds up and saturates at
+    /// 0, so it never goes negative in the one frame between passing
+    /// `lifetime` and `expire()` running.
     pub fn remaining_secs(&self) -> u64 {
-        self.lifetime
-            .saturating_sub(self.shown_at.elapsed())
-            .as_secs()
+        crate::anim::countdown_secs(self.shown_at.elapsed(), self.lifetime)
     }
 
     /// Text for the bottom-border countdown/status: a live percentage
