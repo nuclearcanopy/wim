@@ -37,6 +37,10 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Fixed("esc"), "back / close"),
             (Key::Bound(KeyAction::FocusSidebar), "focus sidebar"),
             (Key::Bound(KeyAction::FocusWorkspace), "focus workspace"),
+            (
+                Key::Bound(KeyAction::FocusBottomBar),
+                "focus bottom bar: j/k select, enter tweaks",
+            ),
             (Key::Fixed("left/right"), "cycle home screen logo"),
             (Key::Fixed("0"), "reset logo to default"),
         ],
