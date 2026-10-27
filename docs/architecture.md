@@ -58,6 +58,44 @@ with terminal auto-detection. the `album_art` config option
   who want the "pure tui" look get it consistently rather than a
   colorful image poking a hole in an otherwise monochrome interface.
 
+## startup: nothing blocks the first frame
+
+the app has to be on screen immediately, so the only work between
+process start and the first `terminal.draw` is work that cannot be
+deferred: reading config, spawning mpv, setting up the terminal. every
+other startup cost either runs on a background thread and streams its
+results into the main loop, or waits until the first frame is up.
+
+- **local library scan** (`library::spawn_scan`): a tag read
+  (`Probe::read`) per music file, the biggest cost of all; runs on its
+  own thread, reads tags across a pool sized to the machine, and sends
+  batches of tracks over a channel the main loop drains next to
+  `sync_rx`. the channel disconnecting is how "scan finished" is
+  reported. `library::TagIndex` caches `path -> (mtime, tags)` under the
+  cache dir, so a warm start is a `stat` pass with no tag parsing at
+  all.
+- **navidrome** (`spawn_background_sync`): every configured server is
+  connected by the sync thread, which now fetches first and waits
+  `AUTO_SYNC_INTERVAL` afterwards. this used to be a synchronous
+  ping + catalog + starred-songs fetch per server before the first
+  frame, so a stalled server held the ui at a black screen for as long
+  as it stalled.
+- **restored queue**: handing mpv a saved queue costs one blocking ipc
+  round-trip per track, so the appends happen on the first pass through
+  the main loop, right after the first `draw`. `app.queue` is filled
+  before it (pure memory), so the ui never disagrees with what's
+  actually queued.
+- **subtitle auto-fetch** (`fire_subtitle_fetch`): two network
+  round-trips, on a thread that reports the written file back over a
+  channel; the main thread calls `sub_add`, since the `Mpv` handle
+  isn't `Send`.
+
+an empty corpus therefore means "still loading" for the first moment of
+a session, which the results pane says outright
+(`main::loading_message`) instead of claiming an empty library.
+`WIM_STARTUP_TRACE=1` (`src/trace.rs`) prints every milestone's elapsed
+time to stderr for measuring any of this.
+
 ## search: two signals, not one
 
 `src/search.rs` merges two independent matching passes into one ranked
