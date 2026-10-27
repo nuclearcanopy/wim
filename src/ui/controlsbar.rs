@@ -16,6 +16,33 @@ pub enum Field {
     Crossfade,
 }
 
+/// Same order the state line itself draws them in; `Focus::BottomBar`
+/// navigation (main.rs) cycles through exactly this list.
+pub const FIELDS: [Field; 5] = [
+    Field::Loop,
+    Field::Shuffle,
+    Field::Speed,
+    Field::Eq,
+    Field::Crossfade,
+];
+
+impl Field {
+    fn index(self) -> usize {
+        FIELDS
+            .iter()
+            .position(|f| *f == self)
+            .expect("every Field variant is listed in FIELDS")
+    }
+
+    pub fn next(self) -> Self {
+        FIELDS[(self.index() + 1) % FIELDS.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        FIELDS[(self.index() + FIELDS.len() - 1) % FIELDS.len()]
+    }
+}
+
 /// Bottom playback bar: as many lines as `area.height` allows, most
 /// important first, rather than cramming everything onto one status
 /// line. Resizable (bottom bar, vertical axis only); more rows reveal
@@ -36,6 +63,11 @@ pub struct ControlsBar<'a> {
     /// row above (which reads as the app typing a message at you for
     /// something the state line already shows).
     pub flash: Option<(Field, f32)>,
+    /// `Focus::BottomBar`'s own selection cursor, if that pane
+    /// currently has focus; renders the same brightened as a fully
+    /// "hot" flash (see `draw_segments`), just steady instead of
+    /// decaying, since a cursor position doesn't fade on its own.
+    pub selected: Option<Field>,
     pub resize_hint: Option<&'a str>,
 }
 
@@ -72,7 +104,7 @@ impl Widget for ControlsBar<'_> {
                 ),
             ),
         ];
-        draw_segments(buf, area, y, width, &segments, self.flash);
+        draw_segments(buf, area, y, width, &segments, self.flash, self.selected);
     }
 }
 
@@ -83,6 +115,7 @@ fn draw_segments(
     width: usize,
     segments: &[(Option<Field>, String)],
     flash: Option<(Field, f32)>,
+    selected: Option<Field>,
 ) {
     let limit = area.x + width.min(area.width as usize) as u16;
     let mut x = area.x;
@@ -93,11 +126,23 @@ fn draw_segments(
         if i > 0 {
             x = draw_chars(buf, x, limit, y, "  ", shade(DIM));
         }
-        let color = match (field, flash) {
-            (Some(f), Some((hot_field, level))) if *f == hot_field => {
-                shade(lerp(DIM, WHITE, level))
-            }
-            _ => shade(DIM),
+        let flash_level = match (field, flash) {
+            (Some(f), Some((hot_field, level))) if *f == hot_field => level,
+            _ => 0.0,
+        };
+        // the selection cursor reads as a fully "hot" flash rather
+        // than a third brightness tier of its own; unlike flash it
+        // never decays, so it stays lit the whole time this field is
+        // `Focus::BottomBar`'s current pick.
+        let level = if *field == selected {
+            flash_level.max(1.0)
+        } else {
+            flash_level
+        };
+        let color = if level > 0.0 {
+            shade(lerp(DIM, WHITE, level))
+        } else {
+            shade(DIM)
         };
         x = draw_chars(buf, x, limit, y, text, color);
     }
