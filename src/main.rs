@@ -48,7 +48,7 @@ use theme::{shade, NEAR_BLACK};
 use ui::albumart::AsciiArt;
 use ui::banner::Banner;
 use ui::browse::BrowseListView;
-use ui::controlsbar::{ControlsBar, Field};
+use ui::controlsbar::{ControlsBar, Field, Scrub, SCRUB_STEP, SCRUB_STEP_COARSE};
 use ui::divider::{HorizontalRule, VerticalRule};
 use ui::login::{LoginForm, LoginView};
 use ui::lyrics_view::LyricsView;
@@ -1901,16 +1901,25 @@ fn main() -> anyhow::Result<()> {
     // no notion of this, so it's tracked entirely on our side and
     // cleared once the fade finishes.
     let mut fade_in_started_at: Option<Instant> = None;
-    // Which ControlsBar state-line field most recently changed, and
-    // when; render computes a decaying brightness from the elapsed
-    // time rather than a one-off status sentence, so a toggle just
-    // lights up the value it already shows permanently.
+    // Which ControlsBar control most recently changed, and when;
+    // render computes a decaying brightness from the elapsed time
+    // rather than a one-off status sentence, so a toggle just lights
+    // up the glyph it already shows permanently.
     let mut flash: Option<(Field, Instant)> = None;
     const FLASH_DURATION: Duration = Duration::from_millis(700);
     // `Focus::BottomBar`'s own selection cursor; independent of
     // `flash`, a steady cursor position rather than a transient
     // acknowledgment, but both feed `ControlsBar`'s rendering.
-    let mut bottombar_selected = Field::Loop;
+    let mut bottombar_selected = Field::Pause;
+    // `Some` while enter-on-the-scrubber holds a drag open: arrows
+    // move `Scrub::target_secs` locally and the absolute seek is
+    // coalesced behind it, so holding one down can't spend an ipc
+    // round-trip per keypress. `scrub_pending` is a target the throttle
+    // hasn't sent yet; the loop flushes it before the next poll.
+    let mut scrub: Option<Scrub> = None;
+    let mut scrub_pending = false;
+    let mut scrub_sent_at: Option<Instant> = None;
+    const SCRUB_SEEK_INTERVAL: Duration = Duration::from_millis(80);
     // enter on the bottom bar's Eq field opens this instead of just
     // cycling presets like the bare 'e' key does; full-workspace, same
     // treatment as the settings/keybinds menus.
@@ -2446,14 +2455,24 @@ fn main() -> anyhow::Result<()> {
                         Focus::Workspace => "workspace",
                         Focus::BottomBar => "bottom bar",
                     },
+                    focused: focus == Focus::BottomBar,
                     queue_len: app.queue.len(),
-                    loop_label: app.loop_mode.label(),
+                    loop_mode: app.loop_mode,
                     shuffle_on: app.shuffle,
                     speed: app.speed,
-                    eq_preset: eq_label(&app),
+                    // the preset's name lives in the eq menu now; the
+                    // bar only answers "is the eq doing anything".
+                    eq_active: eq_label(&app) != "flat",
                     crossfade_on: crossfade_enabled,
+                    paused,
+                    // mid-drag the bar draws the pending target, not
+                    // mpv's position: the seek is throttled, the
+                    // keypress shouldn't look like it was.
+                    elapsed_secs: scrub.map(|s| s.target_secs).or(elapsed_secs),
+                    duration_secs,
                     flash: flash_level,
                     selected: (focus == Focus::BottomBar).then_some(bottombar_selected),
+                    scrubbing: scrub.is_some(),
                     resize_hint,
                 },
                 Rect {
@@ -2778,6 +2797,24 @@ fn main() -> anyhow::Result<()> {
                         format!("download failed: {label}: {error}"),
                     );
                 }
+            }
+        }
+
+        // the throttled half of scrub mode: arrows only moved the
+        // target, this sends at most one absolute seek per interval, so
+        // a held arrow key costs one ipc round-trip per 80ms instead of
+        // one per keypress. the poll below bounds the lag at a frame.
+        if scrub_pending {
+            match scrub {
+                Some(s) if scrub_sent_at.is_none_or(|at| at.elapsed() >= SCRUB_SEEK_INTERVAL) => {
+                    if let Err(e) = player.seek(s.target_secs, false) {
+                        notifications.push(Severity::Error, format!("error seeking: {e}"));
+                    }
+                    scrub_sent_at = Some(Instant::now());
+                    scrub_pending = false;
+                }
+                None => scrub_pending = false,
+                _ => {}
             }
         }
 
@@ -3442,24 +3479,76 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                // scrub/drag mode, entered with enter on the bottom
+                // bar's scrubber. ahead of everything else below
+                // (including the bottom bar's own selection keys): a
+                // drag owns left/right and enter outright until it's
+                // committed, so nothing can move the cursor out from
+                // under an open seek.
+                if let Some(s) = scrub {
+                    let coarse = key.modifiers.contains(KeyModifiers::SHIFT);
+                    let step = if coarse {
+                        SCRUB_STEP_COARSE
+                    } else {
+                        SCRUB_STEP
+                    };
+                    match key.code {
+                        KeyCode::Left | KeyCode::Char('h' | 'H') => {
+                            scrub = Some(s.step(-step));
+                            scrub_pending = true;
+                        }
+                        KeyCode::Right | KeyCode::Char('l' | 'L') => {
+                            scrub = Some(s.step(step));
+                            scrub_pending = true;
+                        }
+                        // both commit: the target was already applied
+                        // on the way there, so there's nothing esc
+                        // could roll back to that wouldn't itself be
+                        // another seek the user didn't ask for.
+                        KeyCode::Enter | KeyCode::Esc => {
+                            if let Err(e) = player.seek(s.target_secs, false) {
+                                notifications.push(Severity::Error, format!("error seeking: {e}"));
+                            }
+                            scrub = None;
+                            scrub_pending = false;
+                            scrub_sent_at = None;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // pane-local navigation for the bottom bar, same
-                // "only j/k/arrows/enter care which pane has focus"
-                // rule as the browse view further down: global
+                // "only the arrows and enter care which pane has
+                // focus" rule as the browse view further down: global
                 // playback controls (space/f/b/c/etc.) fall through
-                // untouched below regardless of focus, only these
-                // four keys are intercepted here.
+                // untouched below regardless of focus, only these keys
+                // are intercepted here.
                 if focus == Focus::BottomBar {
                     match key.code {
-                        KeyCode::Char('j') | KeyCode::Down => {
+                        // left/right, not j/k: the bar is a horizontal
+                        // strip and its elements sit beside each other,
+                        // so the cursor moves the way the row reads.
+                        KeyCode::Char('l') | KeyCode::Right => {
                             bottombar_selected = bottombar_selected.next();
                             continue;
                         }
-                        KeyCode::Char('k') | KeyCode::Up => {
+                        KeyCode::Char('h') | KeyCode::Left => {
                             bottombar_selected = bottombar_selected.prev();
                             continue;
                         }
+                        // inert rather than falling through: up/down
+                        // have nothing to mean on a one-row strip, and
+                        // letting them through would scroll the result
+                        // list in the pane that doesn't have focus.
+                        KeyCode::Up | KeyCode::Down => continue,
                         KeyCode::Enter => {
                             match bottombar_selected {
+                                Field::Pause => match player.toggle_pause() {
+                                    Ok(()) => flash = Some((Field::Pause, Instant::now())),
+                                    Err(e) => notifications
+                                        .push(Severity::Error, format!("error pausing: {e}")),
+                                },
                                 Field::Loop => {
                                     let mode = app.cycle_loop();
                                     let mpv_loop = if mode == LoopMode::One { "inf" } else { "no" };
@@ -3505,6 +3594,22 @@ fn main() -> anyhow::Result<()> {
                                         let _ = player.set_volume(base_volume);
                                     }
                                     flash = Some((Field::Crossfade, Instant::now()));
+                                }
+                                Field::Progress => {
+                                    // duration is captured here, once,
+                                    // so each arrow key can clamp
+                                    // without asking mpv again; nothing
+                                    // loaded means nothing to scrub, so
+                                    // the drag just doesn't open.
+                                    let (elapsed, duration, _) = playback_info(&player);
+                                    if let Some(at) = elapsed {
+                                        scrub = Some(Scrub {
+                                            target_secs: at,
+                                            duration_secs: duration,
+                                        });
+                                        scrub_pending = false;
+                                        scrub_sent_at = None;
+                                    }
                                 }
                             }
                             continue;

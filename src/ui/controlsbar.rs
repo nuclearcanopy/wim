@@ -1,18 +1,63 @@
+use std::cmp::Ordering;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::widgets::Widget;
 
-use crate::theme::{lerp, shade, DIM, NEAR_BLACK, NEAR_WHITE, WHITE};
-use crate::ui::textfit::truncate_with_ellipsis;
+use crate::app::LoopMode;
+use crate::theme::{lerp, shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE, WHITE};
+use crate::ui::progress::fmt_time;
+use crate::ui::textfit::{char_cells, truncate_to_width, truncate_with_ellipsis, width};
 
-/// How many of `lengths` (each segment's own character count, in
-/// priority order) fit within `available_width` once a 2-char
+/// Every glyph on this line is drawn from a block unicode never gave
+/// an emoji presentation to (latin-1, box drawing, block elements,
+/// geometric shapes, math operators, and the arrows outside
+/// `U+2190..U+21AA`). Same hazard `notify::Severity::icon` documents:
+/// a codepoint with an emoji form can come back double-width from the
+/// font stack and shove every column after it out of alignment.
+const GLYPH_QUEUE: char = '≡'; // U+2261 identical to
+const GLYPH_PLAY: char = '▸'; // U+25B8 black right-pointing small triangle
+const GLYPH_PAUSE: char = '‖'; // U+2016 double vertical line
+const GLYPH_LOOP: char = '↻'; // U+21BB clockwise open circle arrow
+const GLYPH_SHUFFLE: char = '⇄'; // U+21C4 rightwards arrow over leftwards arrow
+const GLYPH_SPEED: char = '×'; // U+00D7 multiplication sign
+const GLYPH_EQ: &str = "▂▅▃"; // U+2582/2585/2583 lower block eighths
+const GLYPH_CROSSFADE: &str = "◢◣"; // U+25E2/25E3 black lower right/left triangle
+const TRACK_DONE: char = '━'; // U+2501 box drawings heavy horizontal
+const TRACK_LEFT: char = '─'; // U+2500 box drawings light horizontal
+const TRACK_HEAD: char = '●'; // U+25CF black circle
+const TRACK_HEAD_DRAG: char = '◆'; // U+25C6 black diamond
+
+/// Minimum track the scrubber is ever drawn with; narrower than this
+/// the whole progress element is dropped like any other, rather than
+/// shown as a bar too short to read a position off.
+const TRACK_MIN: usize = 6;
+
+/// Brightness plate behind the selected element. A plate, not a
+/// border: every element here is one to six cells wide, and a box
+/// around each would be more ink than the glyph it frames.
+const SELECT_BG: f32 = 0.20;
+/// The same plate, brighter, while the scrubber is being dragged, so
+/// scrub mode never reads as merely selected.
+const SCRUB_BG: f32 = 0.34;
+
+/// How far `speed` has to sit from 1.0 before it's worth a readout;
+/// matches the two decimals the readout itself prints.
+const SPEED_EPSILON: f64 = 0.005;
+
+/// Seconds one arrow key moves the scrub target, and the coarse step
+/// shift takes instead.
+pub const SCRUB_STEP: f64 = 5.0;
+pub const SCRUB_STEP_COARSE: f64 = 30.0;
+
+/// How many of `lengths` (each element's own display width, in
+/// priority order) fit within `available_width` once a 2-cell
 /// separator between every pair is accounted for. Dropping whole
-/// lowest-priority (rightmost) segments once the full line stops
-/// fitting, rather than cutting the last one off mid-word ("cros"
-/// from "crossfade: off", which is what a plain per-character
-/// truncation at `available_width` used to produce).
+/// lowest-priority (rightmost) elements once the full line stops
+/// fitting, rather than cutting the last one off mid-element (half a
+/// crossfade icon, or a scrubber too short to show a position, which
+/// is what a plain per-cell truncation at `available_width` produces).
 fn segments_that_fit(lengths: &[usize], available_width: usize) -> usize {
     let mut used = 0usize;
     for (i, &len) in lengths.iter().enumerate() {
@@ -25,24 +70,31 @@ fn segments_that_fit(lengths: &[usize], available_width: usize) -> usize {
     lengths.len()
 }
 
-/// Which state-line value last changed, for `ControlsBar::flash`.
+/// One selectable control on the bar. Named `Field` from when the bar
+/// was a line of `label: value` text; it is now the selection cursor's
+/// alphabet, so the progress bar and the play/pause glyph (both things
+/// you can land on and press enter against) are in it too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
+    Pause,
     Loop,
     Shuffle,
     Speed,
     Eq,
     Crossfade,
+    Progress,
 }
 
-/// Same order the state line itself draws them in; `Focus::BottomBar`
-/// navigation (main.rs) cycles through exactly this list.
-pub const FIELDS: [Field; 5] = [
+/// Same left-to-right order the bar itself draws them in, so left and
+/// right on the selection cursor move the way the row looks.
+pub const FIELDS: [Field; 7] = [
+    Field::Pause,
     Field::Loop,
     Field::Shuffle,
     Field::Speed,
     Field::Eq,
     Field::Crossfade,
+    Field::Progress,
 ];
 
 impl Field {
@@ -62,6 +114,34 @@ impl Field {
     }
 }
 
+/// Live scrub state while enter-on-the-progress-bar holds the drag
+/// open. `target_secs` is ours, not mpv's: the bar redraws from it the
+/// instant a key lands and the actual seek is coalesced behind it, so
+/// holding an arrow key can't queue up an ipc round-trip per keypress.
+/// `duration_secs` is captured on entry for the same reason, so every
+/// step clamps without asking mpv again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Scrub {
+    pub target_secs: f64,
+    pub duration_secs: Option<f64>,
+}
+
+impl Scrub {
+    pub fn step(self, delta: f64) -> Self {
+        let target = self.target_secs + delta;
+        let target = match self.duration_secs {
+            Some(d) if d > 0.0 => target.clamp(0.0, d),
+            // a stream mpv never reported a duration for has no end
+            // to clamp against, only a start.
+            _ => target.max(0.0),
+        };
+        Scrub {
+            target_secs: target,
+            ..self
+        }
+    }
+}
+
 /// Bottom playback bar: controls and current input mode, nothing
 /// else. It deliberately has no status/message line: transient
 /// messages ("now playing: x", "error loading file", "starred") used
@@ -70,6 +150,9 @@ impl Field {
 /// already happened. Anything genuinely worth surfacing goes to the
 /// notification overlay instead; this bar only ever shows state that
 /// is still true.
+/// Every control is a glyph whose brightness is its state (dim off,
+/// bright on), not a `label: value` pair; see the glyph constants
+/// above for why those particular codepoints.
 /// Resizable (bottom bar, vertical axis only); more rows reveal more
 /// lines gracefully, fewer rows collapse the mode indicator into the
 /// control line rather than dropping it.
@@ -81,35 +164,47 @@ pub struct ControlsBar<'a> {
     /// "where will the next keypress land" outright instead of leaving
     /// it to be inferred from a highlighted border somewhere else.
     pub focus_label: &'a str,
+    /// Whether that pane is this bar, which is what decides whether
+    /// the mode line hints the selection keys or the focus keys.
+    pub focused: bool,
     pub queue_len: usize,
-    pub loop_label: &'a str,
+    pub loop_mode: LoopMode,
     pub shuffle_on: bool,
     pub speed: f64,
-    pub eq_preset: &'a str,
+    /// Whether the eq is doing anything at all; the preset's name was
+    /// the kind of word this line stopped printing, and the eq menu
+    /// (enter on the eq glyph) is where the name belongs.
+    pub eq_active: bool,
     pub crossfade_on: bool,
+    pub paused: bool,
+    /// Playback position the scrubber draws from; while `scrubbing`
+    /// this is the pending drag target rather than mpv's own
+    /// `time-pos`, so the bar tracks the keypress and not the socket.
+    pub elapsed_secs: Option<f64>,
+    pub duration_secs: Option<f64>,
     /// Field that changed most recently and how "hot" it still is:
     /// `1.0` right after the toggle, decaying to `0.0` back at the
-    /// line's normal DIM. Acknowledges a toggle by briefly
-    /// brightening the value that already has a permanent spot on
-    /// this line, instead of writing a one-off sentence to the status
-    /// row above (which reads as the app typing a message at you for
-    /// something the state line already shows).
+    /// element's resting brightness. Acknowledges a toggle by briefly
+    /// lifting the glyph that already has a permanent spot on this
+    /// line, instead of writing a one-off sentence to a status row
+    /// (which reads as the app typing a message at you for something
+    /// the bar already shows).
     pub flash: Option<(Field, f32)>,
-    /// `Focus::BottomBar`'s own selection cursor, if that pane
-    /// currently has focus; renders the same brightened as a fully
-    /// "hot" flash (see `draw_segments`), just steady instead of
-    /// decaying, since a cursor position doesn't fade on its own.
+    /// The bar's own selection cursor, if it currently has focus;
+    /// drawn as a background plate rather than a brightness tier, so
+    /// brightness stays free to mean on/off (see `draw_segments`).
     pub selected: Option<Field>,
+    /// `true` while enter-on-the-scrubber has a drag open.
+    pub scrubbing: bool,
     pub resize_hint: Option<&'a str>,
 }
 
 impl Widget for ControlsBar<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let width = area.width as usize;
         let mut y = area.y;
 
         if let Some(hint) = self.resize_hint {
-            draw_line(buf, area, y, hint, width, shade(NEAR_WHITE));
+            draw_line(buf, area, y, hint, shade(NEAR_WHITE));
             y += 1;
         }
 
@@ -130,6 +225,10 @@ impl Widget for ControlsBar<'_> {
         if mode_on_its_own_row {
             let hint = if self.move_mode {
                 "wasd/arrows: focus pane, enter: interact"
+            } else if self.scrubbing {
+                "arrows: seek, shift: coarse, enter/esc: done"
+            } else if self.focused {
+                "arrows: pick, enter: use, tab: move focus"
             } else {
                 "tab: move focus"
             };
@@ -146,40 +245,145 @@ impl Widget for ControlsBar<'_> {
                 } else {
                     shade(DIM)
                 },
+                None,
             );
-            draw_chars(buf, x, area.x + area.width, y, "  ", shade(DIM));
-            draw_chars(buf, x + 2, area.x + area.width, y, hint, shade(NEAR_BLACK));
+            draw_chars(buf, x, area.x + area.width, y, "  ", shade(DIM), None);
+            draw_chars(
+                buf,
+                x + 2,
+                area.x + area.width,
+                y,
+                hint,
+                shade(NEAR_BLACK),
+                None,
+            );
             y += 1;
         }
         if y >= area.y + area.height {
             return;
         }
 
-        let segments: [(Option<Field>, String); 6] = [
-            (
-                None,
-                if mode_on_its_own_row {
-                    format!("queue: {}", self.queue_len)
+        let segments = self.segments((!mode_on_its_own_row).then_some(mode_label.as_str()));
+        draw_segments(
+            buf,
+            area,
+            y,
+            &segments,
+            self.flash,
+            self.selected,
+            self.scrubbing,
+        );
+    }
+}
+
+impl ControlsBar<'_> {
+    /// The control line's elements in priority order, which is also
+    /// draw order: the scrubber is last because it's the one element
+    /// that stretches, so it ends flush with the right edge.
+    fn segments(&self, mode_inline: Option<&str>) -> Vec<Segment> {
+        let queue = match mode_inline {
+            Some(mode) => format!("{mode}  {GLYPH_QUEUE}{}", self.queue_len),
+            None => format!("{GLYPH_QUEUE}{}", self.queue_len),
+        };
+        let speed_changed = (self.speed - 1.0).abs() >= SPEED_EPSILON;
+        vec![
+            Segment {
+                field: None,
+                lit: self.queue_len > 0,
+                body: Body::Glyph(queue),
+            },
+            Segment {
+                field: Some(Field::Pause),
+                // lit means "audio is moving", so the play triangle is
+                // the bright state and the pause bars the dim one.
+                lit: !self.paused,
+                body: Body::Glyph(if self.paused {
+                    GLYPH_PAUSE.to_string()
                 } else {
-                    format!("{mode_label}  queue: {}", self.queue_len)
+                    GLYPH_PLAY.to_string()
+                }),
+            },
+            Segment {
+                field: Some(Field::Loop),
+                lit: self.loop_mode != LoopMode::Off,
+                // off and all share one glyph and differ by
+                // brightness; one gets the digit, since "repeat just
+                // this track" isn't a brightness of "repeat".
+                body: Body::Glyph(match self.loop_mode {
+                    LoopMode::Off | LoopMode::All => GLYPH_LOOP.to_string(),
+                    LoopMode::One => format!("{GLYPH_LOOP}1"),
+                }),
+            },
+            Segment {
+                field: Some(Field::Shuffle),
+                lit: self.shuffle_on,
+                body: Body::Glyph(GLYPH_SHUFFLE.to_string()),
+            },
+            Segment {
+                field: Some(Field::Speed),
+                lit: speed_changed,
+                // 1.00x is "no change" and needs no readout, just the
+                // sign; any other rate is a number no glyph carries.
+                body: Body::Glyph(if speed_changed {
+                    format!("{GLYPH_SPEED}{:.2}", self.speed)
+                } else {
+                    GLYPH_SPEED.to_string()
+                }),
+            },
+            Segment {
+                field: Some(Field::Eq),
+                lit: self.eq_active,
+                body: Body::Glyph(GLYPH_EQ.to_string()),
+            },
+            Segment {
+                field: Some(Field::Crossfade),
+                lit: self.crossfade_on,
+                body: Body::Glyph(GLYPH_CROSSFADE.to_string()),
+            },
+            Segment {
+                field: Some(Field::Progress),
+                lit: self.elapsed_secs.is_some(),
+                body: Body::Track {
+                    elapsed: fmt_time(self.elapsed_secs),
+                    total: fmt_time(self.duration_secs),
+                    frac: match (self.elapsed_secs, self.duration_secs) {
+                        (Some(e), Some(d)) if d > 0.0 => (e / d).clamp(0.0, 1.0),
+                        _ => 0.0,
+                    },
                 },
-            ),
-            (Some(Field::Loop), format!("loop: {}", self.loop_label)),
-            (
-                Some(Field::Shuffle),
-                format!("shuffle: {}", if self.shuffle_on { "on" } else { "off" }),
-            ),
-            (Some(Field::Speed), format!("speed: {:.2}x", self.speed)),
-            (Some(Field::Eq), format!("eq: {}", self.eq_preset)),
-            (
-                Some(Field::Crossfade),
-                format!(
-                    "crossfade: {}",
-                    if self.crossfade_on { "on" } else { "off" }
-                ),
-            ),
-        ];
-        draw_segments(buf, area, y, width, &segments, self.flash, self.selected);
+            },
+        ]
+    }
+}
+
+enum Body {
+    /// A fixed-width glyph (or glyph plus numeric readout).
+    Glyph(String),
+    /// The scrubber: two fixed time readouts around a track that
+    /// absorbs whatever width the fixed elements left over.
+    Track {
+        elapsed: String,
+        total: String,
+        frac: f64,
+    },
+}
+
+struct Segment {
+    field: Option<Field>,
+    /// Resting brightness: an active control is `BRIGHT`, an inactive
+    /// one `DIM`. This is the whole point of dropping the labels; off
+    /// is a dim glyph, not the word "off".
+    lit: bool,
+    body: Body,
+}
+
+impl Segment {
+    fn min_width(&self) -> usize {
+        match &self.body {
+            Body::Glyph(s) => width(s),
+            // two spaces: one either side of the track.
+            Body::Track { elapsed, total, .. } => width(elapsed) + width(total) + 2 + TRACK_MIN,
+        }
     }
 }
 
@@ -187,89 +391,202 @@ fn draw_segments(
     buf: &mut Buffer,
     area: Rect,
     y: u16,
-    width: usize,
-    segments: &[(Option<Field>, String)],
+    segments: &[Segment],
     flash: Option<(Field, f32)>,
     selected: Option<Field>,
+    scrubbing: bool,
 ) {
-    let limit = area.x + width.min(area.width as usize) as u16;
-    let lengths: Vec<usize> = segments
-        .iter()
-        .map(|(_, text)| text.chars().count())
-        .collect();
-    let fits = segments_that_fit(&lengths, limit.saturating_sub(area.x) as usize);
+    let limit = area.x + area.width;
+    let avail = area.width as usize;
+    let mins: Vec<usize> = segments.iter().map(Segment::min_width).collect();
+    let fits = segments_that_fit(&mins, avail);
+    let used: usize = mins[..fits].iter().sum::<usize>() + fits.saturating_sub(1) * 2;
+    // whatever the fixed elements left over goes to the scrubber, so
+    // the bar reaches the right edge instead of leaving a ragged gap
+    // there; it's the only element that stretches.
+    let slack = avail.saturating_sub(used);
+
     let mut x = area.x;
-    for (i, (field, text)) in segments.iter().take(fits).enumerate() {
+    for (i, seg) in segments.iter().take(fits).enumerate() {
         if x >= limit {
             break;
         }
         if i > 0 {
-            x = draw_chars(buf, x, limit, y, "  ", shade(DIM));
+            x = draw_chars(buf, x, limit, y, "  ", shade(DIM), None);
         }
-        let flash_level = match (field, flash) {
-            (Some(f), Some((hot_field, level))) if *f == hot_field => level,
+        let is_selected = seg.field.is_some() && seg.field == selected;
+        let dragging = is_selected && scrubbing && seg.field == Some(Field::Progress);
+        let flash_level = match (seg.field, flash) {
+            (Some(f), Some((hot_field, level))) if f == hot_field => level,
             _ => 0.0,
         };
-        // the selection cursor reads as a fully "hot" flash rather
-        // than a third brightness tier of its own; unlike flash it
-        // never decays, so it stays lit the whole time this field is
-        // `Focus::BottomBar`'s current pick.
-        let level = if *field == selected {
-            flash_level.max(1.0)
+        // the plate marks the cursor, which leaves brightness free to
+        // keep meaning on/off; an inactive glyph is only lifted to MID
+        // so it stays legible against the plate, still well below an
+        // active one. flash lifts from wherever that lands.
+        let base = if dragging {
+            WHITE
+        } else if seg.lit {
+            BRIGHT
         } else {
-            flash_level
+            DIM
         };
-        let color = if level > 0.0 {
-            shade(lerp(DIM, WHITE, level))
+        let base = if is_selected { base.max(MID) } else { base };
+        let level = lerp(base, WHITE, flash_level);
+        let bg = if dragging {
+            Some(shade(SCRUB_BG))
+        } else if is_selected {
+            Some(shade(SELECT_BG))
         } else {
-            shade(DIM)
+            None
         };
-        x = draw_chars(buf, x, limit, y, text, color);
+        let text = match &seg.body {
+            Body::Glyph(s) => s.clone(),
+            Body::Track {
+                elapsed,
+                total,
+                frac,
+            } => format!(
+                "{elapsed} {} {total}",
+                track(*frac, TRACK_MIN + slack, dragging)
+            ),
+        };
+        // one cell of padding each side, so a single-glyph element's
+        // plate reads as a plate and not as one stray lit cell.
+        if let Some(bg) = bg {
+            let end = x.saturating_add(width(&text) as u16).saturating_add(1);
+            fill_bg(buf, x.saturating_sub(1).max(area.x), end.min(limit), y, bg);
+        }
+        x = draw_chars(buf, x, limit, y, &text, shade(level), bg);
     }
 }
 
-fn draw_chars(buf: &mut Buffer, start_x: u16, limit: u16, y: u16, text: &str, color: Color) -> u16 {
-    let mut x = start_x;
-    for ch in text.chars() {
-        if x >= limit {
-            break;
+/// Same scrubber convention as `ui::progress::bar` (heavy track
+/// behind the head, light ahead of it); the head swaps to a diamond
+/// while dragging, so scrub mode shows in the bar itself rather than
+/// only in the plate behind it.
+fn track(frac: f64, cells: usize, dragging: bool) -> String {
+    let cells = cells.max(TRACK_MIN);
+    let head = if dragging {
+        TRACK_HEAD_DRAG
+    } else {
+        TRACK_HEAD
+    };
+    let pos = ((frac.clamp(0.0, 1.0) * (cells - 1) as f64).round() as usize).min(cells - 1);
+    (0..cells)
+        .map(|i| match i.cmp(&pos) {
+            Ordering::Less => TRACK_DONE,
+            Ordering::Equal => head,
+            Ordering::Greater => TRACK_LEFT,
+        })
+        .collect()
+}
+
+fn fill_bg(buf: &mut Buffer, from_x: u16, to_x: u16, y: u16, bg: Color) {
+    for x in from_x..to_x {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_bg(bg);
         }
+    }
+}
+
+/// Draws `text` from `start_x` up to (never past) `limit`, returning
+/// the next free column. Advances by each char's display width, not by
+/// one per char, so a double-width glyph owns the two cells it
+/// actually paints over.
+fn draw_chars(
+    buf: &mut Buffer,
+    start_x: u16,
+    limit: u16,
+    y: u16,
+    text: &str,
+    color: Color,
+    bg: Option<Color>,
+) -> u16 {
+    let budget = limit.saturating_sub(start_x) as usize;
+    let mut x = start_x;
+    for ch in truncate_to_width(text, budget).chars() {
+        let cells = char_cells(ch) as u16;
         if let Some(cell) = buf.cell_mut((x, y)) {
             cell.set_char(ch);
             cell.set_fg(color);
+            if let Some(bg) = bg {
+                cell.set_bg(bg);
+            }
         }
-        x += 1;
+        // the trailing half of a wide glyph is blanked rather than
+        // left holding whatever was under it, which would print twice.
+        for off in 1..cells {
+            if let Some(cell) = buf.cell_mut((x + off, y)) {
+                cell.set_symbol("");
+                if let Some(bg) = bg {
+                    cell.set_bg(bg);
+                }
+            }
+        }
+        x += cells;
     }
     x
 }
 
-fn draw_line(
-    buf: &mut Buffer,
-    area: Rect,
-    y: u16,
-    text: &str,
-    width: usize,
-    color: ratatui::style::Color,
-) {
+fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: Color) {
     if y >= area.y + area.height {
         return;
     }
-    let fitted = truncate_with_ellipsis(text, width);
-    for (col, ch) in fitted.chars().enumerate() {
-        let x = area.x + col as u16;
-        if x >= area.x + area.width {
-            break;
-        }
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_fg(color);
-        }
-    }
+    let fitted = truncate_with_ellipsis(text, area.width as usize);
+    draw_chars(buf, area.x, area.x + area.width, y, &fitted, color, None);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::testbuf::{buffer, grid};
+
+    fn bar_at(width: u16, height: u16, f: impl FnOnce(&mut ControlsBar)) -> Buffer {
+        let mut cb = ControlsBar {
+            move_mode: false,
+            focus_label: "bottom bar",
+            focused: false,
+            queue_len: 0,
+            loop_mode: LoopMode::Off,
+            shuffle_on: false,
+            speed: 1.0,
+            eq_active: false,
+            crossfade_on: false,
+            paused: false,
+            elapsed_secs: Some(30.0),
+            duration_secs: Some(120.0),
+            flash: None,
+            selected: None,
+            scrubbing: false,
+            resize_hint: None,
+        };
+        f(&mut cb);
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = buffer(width, height);
+        cb.render(area, &mut buf);
+        buf
+    }
+
+    /// Column the first `ch` sits in on row `y`; every assertion below
+    /// locates an element by its glyph rather than a hardcoded column,
+    /// so reordering the row doesn't invalidate the brightness tests.
+    fn col_of(buf: &Buffer, y: u16, ch: char) -> u16 {
+        (buf.area.x..buf.area.x + buf.area.width)
+            .find(|x| {
+                buf.cell((*x, y))
+                    .is_some_and(|c| c.symbol().starts_with(ch))
+            })
+            .unwrap_or_else(|| panic!("no {ch:?} on row {y}:\n{}", grid(buf)))
+    }
+
+    fn fg_of(buf: &Buffer, y: u16, ch: char) -> Color {
+        buf.cell((col_of(buf, y, ch), y)).unwrap().fg
+    }
+
+    fn bg_of(buf: &Buffer, y: u16, ch: char) -> Color {
+        buf.cell((col_of(buf, y, ch), y)).unwrap().bg
+    }
 
     #[test]
     fn every_segment_fits_when_there_is_room() {
@@ -279,10 +596,10 @@ mod tests {
     }
 
     #[test]
-    fn drops_whole_trailing_segments_instead_of_cutting_one_mid_word() {
-        // "queue: 0" (8) + "  " + "crossfade: off" (14) = 24; a width
-        // of 20 can't fit the second segment at all, so it should be
-        // dropped entirely rather than showing "crossfade: o".
+    fn drops_whole_trailing_segments_instead_of_cutting_one_mid_element() {
+        // 8 cells + "  " + a 14-cell element = 24; a width of 20 can't
+        // fit the second element at all, so it's dropped entirely
+        // rather than shown as the left 12 cells of itself.
         let lengths = [8, 14];
         assert_eq!(segments_that_fit(&lengths, 20), 1);
     }
@@ -302,5 +619,285 @@ mod tests {
     #[test]
     fn empty_segments_list_fits_trivially() {
         assert_eq!(segments_that_fit(&[], 0), 0);
+    }
+
+    #[test]
+    fn every_glyph_is_exactly_one_cell_per_codepoint() {
+        // the whole reason these codepoints were picked: a glyph the
+        // font stack renders emoji-wide would silently eat the cell
+        // after it and shift the rest of the row.
+        for ch in [
+            GLYPH_QUEUE,
+            GLYPH_PLAY,
+            GLYPH_PAUSE,
+            GLYPH_LOOP,
+            GLYPH_SHUFFLE,
+            GLYPH_SPEED,
+            TRACK_DONE,
+            TRACK_LEFT,
+            TRACK_HEAD,
+            TRACK_HEAD_DRAG,
+        ] {
+            assert_eq!(char_cells(ch), 1, "{ch:?} is not one cell wide");
+        }
+        assert_eq!(width(GLYPH_EQ), GLYPH_EQ.chars().count());
+        assert_eq!(width(GLYPH_CROSSFADE), GLYPH_CROSSFADE.chars().count());
+    }
+
+    #[test]
+    fn the_control_line_has_no_words_on_it() {
+        let buf = bar_at(100, 2, |cb| {
+            cb.loop_mode = LoopMode::All;
+            cb.shuffle_on = true;
+            cb.crossfade_on = true;
+            cb.eq_active = true;
+        });
+        let line = grid(&buf).lines().nth(1).unwrap().to_string();
+        for word in [
+            "loop",
+            "shuffle",
+            "crossfade",
+            "speed",
+            "queue",
+            "eq",
+            "off",
+        ] {
+            assert!(!line.contains(word), "{word:?} still printed:\n{line}");
+        }
+    }
+
+    #[test]
+    fn an_off_control_renders_dim_and_an_on_control_bright() {
+        let off = bar_at(100, 2, |_| {});
+        assert_eq!(fg_of(&off, 1, GLYPH_SHUFFLE), shade(DIM));
+        let on = bar_at(100, 2, |cb| cb.shuffle_on = true);
+        assert_eq!(fg_of(&on, 1, GLYPH_SHUFFLE), shade(BRIGHT));
+    }
+
+    #[test]
+    fn loop_off_and_all_differ_only_in_brightness_and_one_adds_a_digit() {
+        let off = bar_at(100, 2, |_| {});
+        let all = bar_at(100, 2, |cb| cb.loop_mode = LoopMode::All);
+        let one = bar_at(100, 2, |cb| cb.loop_mode = LoopMode::One);
+        assert_eq!(fg_of(&off, 1, GLYPH_LOOP), shade(DIM));
+        assert_eq!(fg_of(&all, 1, GLYPH_LOOP), shade(BRIGHT));
+        assert_eq!(fg_of(&one, 1, GLYPH_LOOP), shade(BRIGHT));
+
+        // the three states have to be told apart without reading a
+        // word: off/all by brightness, one by the digit beside it.
+        let digit_col = col_of(&one, 1, GLYPH_LOOP) + 1;
+        assert_eq!(one.cell((digit_col, 1)).unwrap().symbol(), "1");
+        let all_next = col_of(&all, 1, GLYPH_LOOP) + 1;
+        assert_eq!(all.cell((all_next, 1)).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn pause_shows_playback_state_not_the_key_it_would_press() {
+        let playing = bar_at(100, 2, |_| {});
+        assert_eq!(fg_of(&playing, 1, GLYPH_PLAY), shade(BRIGHT));
+        let paused = bar_at(100, 2, |cb| cb.paused = true);
+        assert_eq!(fg_of(&paused, 1, GLYPH_PAUSE), shade(DIM));
+    }
+
+    #[test]
+    fn speed_drops_its_readout_at_1x_and_shows_it_otherwise() {
+        let normal = bar_at(100, 2, |_| {});
+        let col = col_of(&normal, 1, GLYPH_SPEED);
+        assert_eq!(normal.cell((col + 1, 1)).unwrap().symbol(), " ");
+        assert_eq!(fg_of(&normal, 1, GLYPH_SPEED), shade(DIM));
+
+        let fast = bar_at(100, 2, |cb| cb.speed = 1.25);
+        let line = grid(&fast).lines().nth(1).unwrap().to_string();
+        assert!(line.contains("×1.25"), "no speed readout:\n{line}");
+        assert_eq!(fg_of(&fast, 1, GLYPH_SPEED), shade(BRIGHT));
+    }
+
+    #[test]
+    fn the_selected_element_gets_a_background_plate_padded_either_side() {
+        let buf = bar_at(100, 2, |cb| cb.selected = Some(Field::Shuffle));
+        let col = col_of(&buf, 1, GLYPH_SHUFFLE);
+        assert_eq!(bg_of(&buf, 1, GLYPH_SHUFFLE), shade(SELECT_BG));
+        assert_eq!(buf.cell((col - 1, 1)).unwrap().bg, shade(SELECT_BG));
+        assert_eq!(buf.cell((col + 1, 1)).unwrap().bg, shade(SELECT_BG));
+        // nothing else on the row is plated, and an unselected
+        // neighbour keeps its own state brightness.
+        assert_eq!(bg_of(&buf, 1, GLYPH_LOOP), Color::Reset);
+        assert_eq!(fg_of(&buf, 1, GLYPH_LOOP), shade(DIM));
+    }
+
+    #[test]
+    fn selecting_an_off_control_lifts_it_enough_to_read_off_the_plate() {
+        let buf = bar_at(100, 2, |cb| cb.selected = Some(Field::Shuffle));
+        // still clearly below an active control, so the plate marks
+        // the cursor without faking an "on" state.
+        assert_eq!(fg_of(&buf, 1, GLYPH_SHUFFLE), shade(MID));
+        const { assert!(MID < BRIGHT) };
+    }
+
+    #[test]
+    fn scrub_mode_renders_differently_from_a_merely_selected_scrubber() {
+        let selected = bar_at(100, 2, |cb| cb.selected = Some(Field::Progress));
+        let dragging = bar_at(100, 2, |cb| {
+            cb.selected = Some(Field::Progress);
+            cb.scrubbing = true;
+        });
+        // the head glyph changes, so the mode is visible in the bar
+        // and not only in the plate behind it.
+        assert_eq!(fg_of(&selected, 1, TRACK_HEAD), shade(BRIGHT));
+        assert!(!grid(&selected).contains(TRACK_HEAD_DRAG));
+        assert_eq!(fg_of(&dragging, 1, TRACK_HEAD_DRAG), shade(WHITE));
+        assert!(!grid(&dragging).contains(TRACK_HEAD));
+        assert_eq!(bg_of(&dragging, 1, TRACK_HEAD_DRAG), shade(SCRUB_BG));
+        const { assert!(SCRUB_BG > SELECT_BG) };
+    }
+
+    #[test]
+    fn the_scrubber_absorbs_the_leftover_width_up_to_the_right_edge() {
+        for width_cells in [60u16, 80, 120] {
+            let buf = bar_at(width_cells, 2, |_| {});
+            let line = grid(&buf).lines().nth(1).unwrap().to_string();
+            assert!(
+                !line.ends_with('.'),
+                "{width_cells} cells left a gap at the edge:\n{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrow_bar_drops_whole_elements_from_the_right() {
+        // wide enough for the glyph controls but not the scrubber, so
+        // the scrubber goes whole rather than as a stub.
+        let buf = bar_at(30, 2, |cb| {
+            cb.loop_mode = LoopMode::All;
+            cb.crossfade_on = true;
+        });
+        let line = grid(&buf).lines().nth(1).unwrap().to_string();
+        assert!(line.contains(GLYPH_LOOP), "lost the loop glyph:\n{line}");
+        assert!(!line.contains(TRACK_HEAD), "half a scrubber:\n{line}");
+        assert!(!line.contains(TRACK_DONE), "half a scrubber:\n{line}");
+
+        // narrower still and the trailing glyph controls go too, in
+        // right-to-left order, never half-drawn.
+        let tiny = bar_at(12, 2, |cb| cb.crossfade_on = true);
+        let tiny_line = grid(&tiny).lines().nth(1).unwrap().to_string();
+        assert!(
+            !tiny_line.contains(GLYPH_CROSSFADE),
+            "crossfade survived a 12-cell bar:\n{tiny_line}"
+        );
+        for ch in GLYPH_CROSSFADE.chars() {
+            assert!(!tiny_line.contains(ch), "half a crossfade:\n{tiny_line}");
+        }
+    }
+
+    #[test]
+    fn the_mode_indicator_survives_the_shortest_possible_bar() {
+        let buf = bar_at(100, 1, |_| {});
+        let line = grid(&buf).lines().next().unwrap().to_string();
+        assert!(line.contains("-- INTERACT: bottom bar --"), "{line}");
+        // and it still gets the controls beside it, not instead of it.
+        assert!(line.contains(GLYPH_QUEUE), "{line}");
+    }
+
+    #[test]
+    fn the_mode_line_hints_the_keys_that_actually_do_something() {
+        let idle = bar_at(100, 2, |_| {});
+        assert!(grid(&idle).contains("tab: move focus"));
+        let focused = bar_at(100, 2, |cb| cb.focused = true);
+        assert!(grid(&focused).contains("arrows: pick, enter: use"));
+        let dragging = bar_at(100, 2, |cb| {
+            cb.focused = true;
+            cb.scrubbing = true;
+        });
+        assert!(grid(&dragging).contains("arrows: seek"));
+    }
+
+    #[test]
+    fn a_flash_lifts_only_its_own_element() {
+        let buf = bar_at(100, 2, |cb| cb.flash = Some((Field::Shuffle, 1.0)));
+        assert_eq!(fg_of(&buf, 1, GLYPH_SHUFFLE), shade(WHITE));
+        assert_eq!(fg_of(&buf, 1, GLYPH_LOOP), shade(DIM));
+    }
+
+    #[test]
+    fn selection_moves_left_and_right_and_wraps_both_ways() {
+        assert_eq!(Field::Pause.next(), Field::Loop);
+        assert_eq!(Field::Loop.prev(), Field::Pause);
+        // the ends wrap, so holding one arrow never dead-ends.
+        assert_eq!(Field::Progress.next(), Field::Pause);
+        assert_eq!(Field::Pause.prev(), Field::Progress);
+        // every variant is reachable from any other by next alone.
+        let mut seen = vec![Field::Pause];
+        let mut f = Field::Pause;
+        for _ in 1..FIELDS.len() {
+            f = f.next();
+            assert!(!seen.contains(&f), "{f:?} repeated before the cycle ended");
+            seen.push(f);
+        }
+        assert_eq!(seen.len(), FIELDS.len());
+    }
+
+    #[test]
+    fn a_scrub_step_clamps_to_the_track_at_both_ends() {
+        let s = Scrub {
+            target_secs: 10.0,
+            duration_secs: Some(120.0),
+        };
+        assert_eq!(s.step(SCRUB_STEP).target_secs, 15.0);
+        assert_eq!(s.step(-SCRUB_STEP).target_secs, 5.0);
+        // seeking past either end parks at the end, it doesn't wrap or
+        // hand mpv a negative/out-of-range absolute seek.
+        assert_eq!(s.step(-60.0).target_secs, 0.0);
+        assert_eq!(s.step(SCRUB_STEP_COARSE * 10.0).target_secs, 120.0);
+    }
+
+    #[test]
+    fn a_scrub_step_on_an_unknown_duration_only_clamps_at_zero() {
+        let s = Scrub {
+            target_secs: 10.0,
+            duration_secs: None,
+        };
+        assert_eq!(s.step(SCRUB_STEP_COARSE).target_secs, 40.0);
+        assert_eq!(s.step(-100.0).target_secs, 0.0);
+        // a zero/unknown duration is the same case: no end to clamp to.
+        let zero = Scrub {
+            target_secs: 0.0,
+            duration_secs: Some(0.0),
+        };
+        assert_eq!(zero.step(SCRUB_STEP).target_secs, SCRUB_STEP);
+    }
+
+    #[test]
+    fn the_track_marks_the_head_once_at_either_extreme() {
+        let start = track(0.0, 10, false);
+        assert_eq!(start.chars().next(), Some(TRACK_HEAD));
+        assert_eq!(start.matches(TRACK_HEAD).count(), 1);
+        let end = track(1.0, 10, false);
+        assert_eq!(end.chars().last(), Some(TRACK_HEAD));
+        assert_eq!(end.matches(TRACK_HEAD).count(), 1);
+        // the track is exactly the cells it was asked for, which is
+        // what keeps the bar flush with the right edge.
+        for cells in 0..20 {
+            assert_eq!(width(&track(0.5, cells, false)), cells.max(TRACK_MIN));
+        }
+    }
+
+    #[test]
+    fn nothing_playing_leaves_the_scrubber_dim_with_no_fake_position() {
+        let buf = bar_at(100, 2, |cb| {
+            cb.elapsed_secs = None;
+            cb.duration_secs = None;
+        });
+        let line = grid(&buf).lines().nth(1).unwrap().to_string();
+        assert!(line.contains("--:--"), "{line}");
+        assert_eq!(fg_of(&buf, 1, TRACK_HEAD), shade(DIM));
+    }
+
+    #[test]
+    fn the_resize_hint_takes_the_top_row_and_pushes_everything_down() {
+        let buf = bar_at(100, 3, |cb| cb.resize_hint = Some("resize mode: a=sidebar"));
+        let rows: Vec<String> = grid(&buf).lines().map(str::to_string).collect();
+        assert!(rows[0].contains("resize mode"), "{:?}", rows[0]);
+        assert!(rows[1].contains("-- INTERACT"), "{:?}", rows[1]);
+        assert!(rows[2].contains(GLYPH_QUEUE), "{:?}", rows[2]);
     }
 }
