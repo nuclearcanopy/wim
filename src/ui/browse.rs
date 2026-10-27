@@ -11,6 +11,7 @@ use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::albumart::AsciiArt;
 use crate::ui::header::draw_header;
 use crate::ui::results_list::draw_header_row;
+use crate::ui::scroll;
 use crate::ui::searchbox::SearchBox;
 use crate::ui::textfit::truncate_with_ellipsis;
 
@@ -242,12 +243,17 @@ fn draw_simple_list(
     selected: usize,
     focused: bool,
 ) {
-    for (row, item) in items.iter().enumerate() {
-        let y = area.y + row as u16;
-        if y >= area.y + area.height {
+    // same clamp-to-selection scroll as the track list beside it; it
+    // had none at all, so past the pane height `j` moved a cursor
+    // nothing on screen ever showed.
+    let visible_rows = area.height as usize;
+    let scroll_offset = scroll::offset_for(selected, visible_rows);
+    for row in 0..visible_rows {
+        let Some(item) = items.get(scroll_offset + row) else {
             break;
-        }
-        let is_selected = row == selected;
+        };
+        let y = area.y + row as u16;
+        let is_selected = scroll_offset + row == selected;
         let marker = if is_selected { "> " } else { "  " };
         let name = match item {
             SearchItem::Album { name, .. } => name.as_str(),
@@ -289,11 +295,7 @@ fn draw_track_list(
     // shouldn't be unreachable past the bottom of the pane.
     let selected_row = indices.iter().position(|&i| i == selected).unwrap_or(0);
     let visible_rows = area.height as usize;
-    let scroll_offset = if selected_row >= visible_rows {
-        selected_row + 1 - visible_rows
-    } else {
-        0
-    };
+    let scroll_offset = scroll::offset_for(selected_row, visible_rows);
 
     for row in 0..visible_rows {
         let Some(&idx) = indices.get(scroll_offset + row) else {
@@ -475,6 +477,87 @@ mod tests {
                 "................│........................................",
             ]
             .join("\n")
+        );
+    }
+
+    use crate::browse::tests::{test_client, test_songs, test_view};
+
+    fn row_text(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| {
+                buf.cell((x, y))
+                    .map_or(' ', |c| c.symbol().chars().next().unwrap_or(' '))
+            })
+            .collect()
+    }
+
+    fn render_view(view: &BrowseView, area: Rect) -> Buffer {
+        let mut buf = Buffer::empty(area);
+        let favorites = Favorites::default();
+        let remote_starred = HashSet::new();
+        BrowseListView {
+            view,
+            favorites: &favorites,
+            remote_starred: &remote_starred,
+            art_mode: ArtMode::Off,
+            cell_aspect: 2.0,
+            cursor_visible: false,
+        }
+        .render(area, &mut buf);
+        buf
+    }
+
+    fn test_albums(n: usize) -> Vec<SearchItem> {
+        let client = test_client();
+        (0..n)
+            .map(|i| SearchItem::Album {
+                id: format!("album-{i}"),
+                name: format!("album {i}"),
+                artist: "artist".to_string(),
+                client: client.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_albums_column_scrolls_to_keep_the_selection_on_screen() {
+        let mut view = test_view(test_songs(3));
+        view.is_artist = true;
+        view.albums = test_albums(20);
+        view.albums_selected = 15;
+        view.albums_focused = true;
+
+        let area = Rect::new(0, 0, 60, 14);
+        let buf = render_view(&view, area);
+        let screen: String = (0..area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("> album 15"),
+            "a selection past the pane height must scroll into view:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_track_cursor_lands_on_the_row_enter_would_act_on() {
+        let mut view = test_view(test_songs(5));
+        view.selected = 4;
+        // what a reloaded/shortened listing does; the cursor has to
+        // follow `selected`, not stay on a row that no longer exists.
+        view.set_tracks(test_songs(3));
+
+        let area = Rect::new(0, 0, 40, 12);
+        let buf = render_view(&view, area);
+        let marked: Vec<String> = (0..area.height)
+            .map(|y| row_text(&buf, y))
+            .filter(|row| row.starts_with('>'))
+            .collect();
+        assert_eq!(marked.len(), 1, "exactly one row carries the cursor");
+        assert!(
+            marked[0].contains("song 2"),
+            "cursor must sit on the selected track: {:?}",
+            marked[0]
         );
     }
 }

@@ -298,6 +298,10 @@ impl App {
         self.selected = new as usize;
     }
 
+    /// Re-filters for a query the user just changed, which genuinely
+    /// should jump back to the best match; anything that re-filters
+    /// *under* an unchanged query goes through `resync_results`
+    /// instead, which keeps the selection where it was.
     fn refresh_results(&mut self) {
         self.results = self.corpus.search(&self.query);
         self.selected = 0;
@@ -323,8 +327,33 @@ impl App {
     /// whatever matched the *old*, smaller corpus until the user
     /// happens to type or backspace a character, which they may never
     /// do if they already have the query they want.
+    ///
+    /// The query itself hasn't changed here, so the selection must
+    /// survive: this runs off the 45s background sync and off every
+    /// debounced remote-search answer, and zeroing it (what
+    /// `refresh_results` does, correctly, for a *typed* query) meant
+    /// scrolling to row 7 and then having a sync land silently snapped
+    /// you back to row 0, with enter playing the wrong thing. The
+    /// previously selected item is found again by identity; if it's
+    /// genuinely gone from the new list, the index is clamped instead.
     pub fn resync_results(&mut self) {
-        self.refresh_results();
+        let previous = self.results.get(self.selected).map(|item| {
+            let (tag, key) = item.identity();
+            (tag, key.into_owned())
+        });
+        self.results = self.corpus.search(&self.query);
+        let last = self.results.len().saturating_sub(1);
+        self.selected = match previous {
+            Some((tag, key)) => self
+                .results
+                .iter()
+                .position(|item| {
+                    let (t, k) = item.identity();
+                    t == tag && k.as_ref() == key.as_str()
+                })
+                .unwrap_or(self.selected.min(last)),
+            None => 0,
+        };
     }
 }
 
@@ -408,6 +437,73 @@ mod tests {
         assert_eq!(app.results.len(), 3);
         assert_eq!(app.selected, 0);
         assert!(!app.editing_query);
+    }
+
+    fn selected_title(app: &App) -> String {
+        match app.results.get(app.selected) {
+            Some(SearchItem::LocalMusic { title, .. }) => title.clone(),
+            other => panic!("expected a local music result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resync_keeps_the_selection_on_the_same_item_even_if_the_list_reorders() {
+        let mut app = app_with_three_results();
+        let keymap = Keymap::default();
+        let _ = app.handle_key(KeyCode::Char('j'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('j'), &keymap);
+        assert_eq!(selected_title(&app), "matchable track 2");
+
+        // what a background sync / remote-search answer does: new
+        // items land in the corpus, and the exact-title one outranks
+        // the fixture's rows, so the old index points elsewhere.
+        app.corpus.add_local_tracks([LocalTrack {
+            path: PathBuf::from("/music/exact.flac"),
+            title: "matchable".to_string(),
+            artist: None,
+            album: None,
+            duration_secs: None,
+            kind: MediaKind::Music,
+        }]);
+        app.resync_results();
+
+        assert_eq!(app.results.len(), 4);
+        assert_eq!(
+            selected_title(&app),
+            "matchable track 2",
+            "a sync landing mid-scroll must not move the selection to another item"
+        );
+    }
+
+    #[test]
+    fn resync_clamps_when_the_selected_item_is_gone() {
+        let mut app = app_with_three_results();
+        // a row that the corpus can no longer produce: resync has
+        // nothing to restore onto, so it clamps instead of panicking
+        // or silently jumping to the top.
+        app.results.push(SearchItem::LocalMusic {
+            path: PathBuf::from("/music/vanished.flac"),
+            title: "matchable vanished".to_string(),
+            artist: None,
+            album: None,
+        });
+        app.selected = 3;
+        app.resync_results();
+        assert_eq!(app.selected, 2);
+    }
+
+    #[test]
+    fn typing_still_resets_the_selection_to_the_top() {
+        let mut app = app_with_three_results();
+        let keymap = Keymap::default();
+        let _ = app.handle_key(KeyCode::Char('G'), &keymap);
+        assert_eq!(app.selected, 2);
+        let _ = app.handle_key(KeyCode::Char('/'), &keymap);
+        let _ = app.handle_key(KeyCode::Char(' '), &keymap);
+        assert_eq!(
+            app.selected, 0,
+            "a genuinely new query should rank fresh and select the best match"
+        );
     }
 
     #[test]

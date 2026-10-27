@@ -19,6 +19,7 @@ pub mod onboarding;
 pub mod player;
 pub mod progress;
 pub mod results_list;
+pub mod scroll;
 pub mod searchbox;
 pub mod settings_menu;
 pub mod subtitle_menu;
