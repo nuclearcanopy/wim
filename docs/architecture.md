@@ -82,9 +82,10 @@ results into the main loop, or waits until the first frame is up.
   as it stalled.
 - **restored queue**: handing mpv a saved queue costs one blocking ipc
   round-trip per track, so the appends happen on the first pass through
-  the main loop, right after the first `draw`. `app.queue` is filled
-  before it (pure memory), so the ui never disagrees with what's
-  actually queued.
+  the main loop, right after the first `draw`. the index map is filled
+  by the same call that does each append (see "the queue is mpv's
+  playlist" below), so the ui never disagrees with what's actually
+  queued.
 - **subtitle auto-fetch** (`fire_subtitle_fetch`): two network
   round-trips, on a thread that reports the written file back over a
   channel; the main thread calls `sub_add`, since the `Mpv` handle
@@ -142,6 +143,35 @@ nix-managed config are indistinguishable to the app. credentials use a
 inline nix option value, since nix store paths are world-readable and a
 plaintext password embedded in a derivation would leak to every local
 user.
+
+## the queue is mpv's playlist
+
+there is one queue and mpv owns it. `src/playqueue.rs`'s `PlayQueue` is
+not a second copy of it; it's a map from an mpv playlist index to the
+`SearchItem` that index was built from, which mpv can't hold itself
+(it has no title/artist/album art for a remote stream url). the
+invariant is written at the top of that module: `entries` is mpv's
+playlist, same items in the same order, and `pos` is the index mpv
+reports it is playing.
+
+so "what's playing" is *resolved*, never guessed: `playlist-pos` and
+`idle-active` are `observe_property`'d (`Mpv::observe_playback`) and
+every display, the scrobbler and the download trigger read whatever
+the last reported index resolves to. the previous design inferred the
+position by counting `end-file` events, which is what showed the wrong
+track: `loadfile replace` emits an end-file for the track it *evicts*,
+so starting anything new mid-playback counted a phantom advance and
+left the whole app one track ahead of mpv for the rest of the session.
+an absolute index can't drift that way; a notification that never
+arrives only delays the next correction.
+
+mpv's playlist and the index map are only ever written together, by
+`main::load_playlist`, `main::enqueue_track` and
+`main::resync_upcoming`. every play, queue, shuffle, back and loop-all
+restart goes through one of those three. `loop all` is the one thing
+mpv has no concept of, so `PlayQueue::session` keeps the list to
+restart from; it is deliberately not index-mapped, since
+`playlist-clear` drops the already-played prefix from mpv.
 
 ## app state is decoupled from rendering
 

@@ -3,7 +3,6 @@
 //! don't have in this headless build/test context).
 
 use crossterm::event::KeyCode;
-use rand::Rng;
 
 use crate::eq;
 use crate::keymap::{KeyAction, Keymap};
@@ -23,10 +22,11 @@ pub enum Action {
     Quit,
     Play(SearchItem),
     Queued(SearchItem),
-    /// Queue order changed (currently only from shuffle); caller
-    /// should resync mpv's own playlist to match this new order,
-    /// without disturbing whatever's currently playing.
-    QueueReordered(Vec<SearchItem>),
+    /// Shuffle was toggled to the carried state. The queue itself lives
+    /// in `playqueue::PlayQueue` (mpv's playlist, resolved by index),
+    /// so turning shuffle on means the caller reshuffles *that* and
+    /// resyncs mpv; `App` only owns the flag.
+    ShuffleToggled(bool),
     SetLoop(LoopMode),
     SetSpeed(f64),
     SetEq(&'static str, [f64; 10]),
@@ -67,12 +67,6 @@ pub struct App {
     pub results: Vec<SearchItem>,
     pub selected: usize,
     pub editing_query: bool,
-    /// explicit play queue; deliberately *not* auto-populated from
-    /// search results on enter (unlike album-browsing players): in a
-    /// search-first ui the "next" search result usually isn't a related
-    /// track, so implicitly bulk-queuing them would be surprising. `a`
-    /// enqueues explicitly instead. See docs/features.md.
-    pub queue: Vec<SearchItem>,
     pub loop_mode: LoopMode,
     pub shuffle: bool,
     pub speed: f64,
@@ -109,7 +103,6 @@ impl App {
             results: Vec::new(),
             selected: 0,
             editing_query: false,
-            queue: Vec::new(),
             loop_mode: LoopMode::Off,
             shuffle: false,
             speed: 1.0,
@@ -130,13 +123,13 @@ impl App {
         self.loop_mode
     }
 
-    /// Toggles shuffle (see `toggle_shuffle` for the reshuffle-in-place
-    /// behavior) and hands back the queue's new order, same payload
-    /// `Action::QueueReordered` already carries, for the caller to
-    /// resync mpv's own playlist to.
-    pub fn toggle_shuffle_and_get_queue(&mut self) -> Vec<SearchItem> {
-        self.toggle_shuffle();
-        self.queue.clone()
+    /// Toggles shuffle and reports the new state; shared by the
+    /// `ToggleShuffle` keymap path and `Focus::BottomBar`'s
+    /// enter-to-tweak, same as `cycle_loop`. Reshuffling the actual
+    /// queue is the caller's job (see `Action::ShuffleToggled`).
+    pub fn toggle_shuffle(&mut self) -> bool {
+        self.shuffle = !self.shuffle;
+        self.shuffle
     }
 
     /// One speed step, `dir` positive (`SpeedUp`) or negative
@@ -144,43 +137,6 @@ impl App {
     pub fn bump_speed(&mut self, dir: f64) -> f64 {
         self.speed = (self.speed + dir * SPEED_STEP).clamp(MIN_SPEED, MAX_SPEED);
         self.speed
-    }
-
-    /// Pops and returns the next queued item, for the caller to actually
-    /// hand to mpv on end-of-file (auto-advance). `App` doesn't know
-    /// whether playback succeeds; that's main.rs's concern.
-    pub fn pop_queue(&mut self) -> Option<SearchItem> {
-        if self.queue.is_empty() {
-            None
-        } else {
-            Some(self.queue.remove(0))
-        }
-    }
-
-    /// Appends to the queue normally, or inserts at a random position
-    /// while shuffle is on, so newly-added items don't just pile up in
-    /// strict order after a shuffle.
-    fn enqueue(&mut self, item: SearchItem) {
-        if self.shuffle && !self.queue.is_empty() {
-            let idx = rand::thread_rng().gen_range(0..=self.queue.len());
-            self.queue.insert(idx, item);
-        } else {
-            self.queue.push(item);
-        }
-    }
-
-    /// Toggles shuffle; turning it on reshuffles the current queue in
-    /// place (Fisher-Yates) so it takes effect immediately rather than
-    /// only affecting items added afterward.
-    fn toggle_shuffle(&mut self) {
-        self.shuffle = !self.shuffle;
-        if self.shuffle {
-            let mut rng = rand::thread_rng();
-            for i in (1..self.queue.len()).rev() {
-                let j = rng.gen_range(0..=i);
-                self.queue.swap(i, j);
-            }
-        }
     }
 
     pub fn handle_key(&mut self, key: KeyCode, keymap: &Keymap) -> Action {
@@ -213,7 +169,6 @@ impl App {
             KeyCode::Enter => {
                 self.editing_query = false;
                 if let Some(item) = self.results.get(self.selected) {
-                    self.queue.clear();
                     return Action::Play(item.clone());
                 }
             }
@@ -254,9 +209,6 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(item) = self.results.get(self.selected) {
-                    // playing something fresh replaces mpv's whole
-                    // playlist, so our own queue view should match.
-                    self.queue.clear();
                     return Action::Play(item.clone());
                 }
                 return Action::None;
@@ -268,14 +220,12 @@ impl App {
             self.editing_query = true;
         } else if key == keymap.get(KeyAction::Enqueue) {
             if let Some(item) = self.results.get(self.selected) {
-                let item = item.clone();
-                self.enqueue(item.clone());
-                return Action::Queued(item);
+                return Action::Queued(item.clone());
             }
         } else if key == keymap.get(KeyAction::CycleLoop) {
             return Action::SetLoop(self.cycle_loop());
         } else if key == keymap.get(KeyAction::ToggleShuffle) {
-            return Action::QueueReordered(self.toggle_shuffle_and_get_queue());
+            return Action::ShuffleToggled(self.toggle_shuffle());
         } else if key == keymap.get(KeyAction::SpeedUp) {
             return Action::SetSpeed(self.bump_speed(1.0));
         } else if key == keymap.get(KeyAction::SpeedDown) {
@@ -421,23 +371,15 @@ mod tests {
     }
 
     #[test]
-    fn esc_while_typing_cancels_without_touching_the_queue() {
+    fn esc_while_typing_cancels_without_acting_on_the_selection() {
         let mut app = app_with_three_results();
         let keymap = Keymap::default();
-        let _ = app.handle_key(KeyCode::Char('a'), &keymap);
-        assert_eq!(app.queue.len(), 1);
-
         let _ = app.handle_key(KeyCode::Char('/'), &keymap);
         assert!(matches!(
             app.handle_key(KeyCode::Esc, &keymap),
             Action::None
         ));
         assert!(!app.editing_query);
-        assert_eq!(
-            app.queue.len(),
-            1,
-            "esc cancels; only enter replaces the playlist, so only enter clears the queue"
-        );
     }
 
     #[test]
@@ -603,22 +545,6 @@ mod tests {
     }
 
     #[test]
-    fn enter_clears_the_queue_since_mpvs_whole_playlist_gets_replaced() {
-        let mut app = app_with_three_results();
-        let keymap = Keymap::default();
-        let _ = app.handle_key(KeyCode::Char('a'), &keymap);
-        let _ = app.handle_key(KeyCode::Char('j'), &keymap);
-        let _ = app.handle_key(KeyCode::Char('a'), &keymap);
-        assert_eq!(app.queue.len(), 2);
-
-        let _ = app.handle_key(KeyCode::Enter, &keymap);
-        assert!(
-            app.queue.is_empty(),
-            "a fresh enter-to-play replaces mpv's whole playlist, so our queue view must match"
-        );
-    }
-
-    #[test]
     fn q_quits() {
         let mut app = app_with_three_results();
         let keymap = Keymap::default();
@@ -639,26 +565,6 @@ mod tests {
             }
             _ => panic!("expected Action::Queued"),
         }
-        assert_eq!(app.queue.len(), 1);
-    }
-
-    #[test]
-    fn pop_queue_is_fifo_and_empties_cleanly() {
-        let mut app = app_with_three_results();
-        let keymap = Keymap::default();
-        let _ = app.handle_key(KeyCode::Char('a'), &keymap); // queues track 0
-        let _ = app.handle_key(KeyCode::Char('j'), &keymap);
-        let _ = app.handle_key(KeyCode::Char('a'), &keymap); // queues track 1
-
-        let first = app.pop_queue();
-        assert!(
-            matches!(first, Some(SearchItem::LocalMusic { ref title, .. }) if title == "matchable track 0")
-        );
-        let second = app.pop_queue();
-        assert!(
-            matches!(second, Some(SearchItem::LocalMusic { ref title, .. }) if title == "matchable track 1")
-        );
-        assert!(app.pop_queue().is_none());
     }
 
     #[test]
@@ -700,56 +606,19 @@ mod tests {
     }
 
     #[test]
-    fn shuffle_preserves_every_queued_item() {
+    fn s_toggles_shuffle_and_reports_the_new_state() {
         let mut app = app_with_three_results();
         let keymap = Keymap::default();
-        let _ = app.handle_key(KeyCode::Char('a'), &keymap);
-        let _ = app.handle_key(KeyCode::Char('j'), &keymap);
-        let _ = app.handle_key(KeyCode::Char('a'), &keymap);
-        let _ = app.handle_key(KeyCode::Char('j'), &keymap);
-        let _ = app.handle_key(KeyCode::Char('a'), &keymap);
-        assert_eq!(app.queue.len(), 3);
-
-        let _ = app.handle_key(KeyCode::Char('s'), &keymap); // shuffle on, reshuffles in place
-        assert!(app.shuffle);
-        assert_eq!(
-            app.queue.len(),
-            3,
-            "shuffle must not drop or duplicate items"
-        );
-
-        let mut titles: Vec<String> = app
-            .queue
-            .iter()
-            .map(|i| match i {
-                SearchItem::LocalMusic { title, .. } => title.clone(),
-                _ => unreachable!(),
-            })
-            .collect();
-        titles.sort();
-        assert_eq!(
-            titles,
-            vec![
-                "matchable track 0",
-                "matchable track 1",
-                "matchable track 2"
-            ]
-        );
-    }
-
-    #[test]
-    fn enqueue_while_shuffled_still_lands_in_the_queue() {
-        let mut app = app_with_three_results();
-        let keymap = Keymap::default();
-        let _ = app.handle_key(KeyCode::Char('a'), &keymap); // one item, shuffle has nothing to reorder yet
-        let _ = app.handle_key(KeyCode::Char('s'), &keymap); // shuffle on
-        let _ = app.handle_key(KeyCode::Char('j'), &keymap);
-        let _ = app.handle_key(KeyCode::Char('a'), &keymap); // enqueue track 1 while shuffled
-
-        assert_eq!(app.queue.len(), 2);
-        assert!(app.queue.iter().any(
-            |i| matches!(i, SearchItem::LocalMusic { title, .. } if title == "matchable track 1")
+        assert!(matches!(
+            app.handle_key(KeyCode::Char('s'), &keymap),
+            Action::ShuffleToggled(true)
         ));
+        assert!(app.shuffle);
+        assert!(matches!(
+            app.handle_key(KeyCode::Char('s'), &keymap),
+            Action::ShuffleToggled(false)
+        ));
+        assert!(!app.shuffle);
     }
 
     #[test]
