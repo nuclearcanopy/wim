@@ -109,10 +109,28 @@ pub struct Config {
     /// leniency as every other best-effort field.
     #[serde(default)]
     pub keybinds: HashMap<String, String>,
+    /// How many times a remote song must start playing before it's
+    /// automatically downloaded to the local cache (see `cache.rs`).
+    /// Tweakable live in the settings menu ('u').
+    #[serde(default = "default_cache_listens_threshold")]
+    pub cache_listens_threshold: u32,
+    /// How many days a cached track can go unplayed before it's
+    /// evicted (the file deleted, not its play history) to free disk
+    /// space. Also tweakable in the settings menu.
+    #[serde(default = "default_cache_eviction_days")]
+    pub cache_eviction_days: u64,
 }
 
 fn default_subtitle_language() -> String {
     "en".to_string()
+}
+
+fn default_cache_listens_threshold() -> u32 {
+    2
+}
+
+fn default_cache_eviction_days() -> u64 {
+    7
 }
 
 impl Config {
@@ -200,6 +218,8 @@ impl Default for Config {
             subtitle_language: default_subtitle_language(),
             logo_style: None,
             keybinds: HashMap::new(),
+            cache_listens_threshold: default_cache_listens_threshold(),
+            cache_eviction_days: default_cache_eviction_days(),
         }
     }
 }

@@ -169,6 +169,26 @@ in
       example = { skip_next = "f5"; toggle_shuffle = "x"; };
       description = "Overrides for the remappable keybinds (action name -> key name, same as 'K' in-app writes to config.toml; see keymap::KeyAction::name/key_label in the wim source for the exact strings). Only needs entries for actions actually remapped away from their default.";
     };
+
+    cacheListensThreshold = mkOption {
+      type = types.int;
+      default = 2;
+      description = ''
+        How many times a remote song must start playing before wim
+        automatically downloads it to the local cache
+        (~/.cache/wim/tracks). Tweakable live in the settings menu ('u').
+      '';
+    };
+
+    cacheEvictionDays = mkOption {
+      type = types.int;
+      default = 7;
+      description = ''
+        How many days a cached track can go unplayed before its
+        downloaded file is evicted to free disk space (play history
+        itself is kept). Also tweakable in the settings menu.
+      '';
+    };
   };
 
   config = mkIf cfg.enable {
@@ -189,6 +209,8 @@ in
         color_level = cfg.subtitles.colorLevel;
       };
       subtitle_language = cfg.subtitleLanguage;
+      cache_listens_threshold = cfg.cacheListensThreshold;
+      cache_eviction_days = cfg.cacheEvictionDays;
       navidrome_servers = map (s: {
         url = s.url;
         username = s.username;
