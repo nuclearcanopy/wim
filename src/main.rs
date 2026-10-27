@@ -1565,6 +1565,12 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // a restored queue goes into mpv's own playlist one blocking ipc
+    // round-trip per track, so the appends wait until the first frame
+    // is up (see the drain right after the first `draw`); `app.queue`
+    // itself is filled here, since that's pure in-memory work.
+    let mut pending_enqueue: Vec<SearchItem> = Vec::new();
+
     // resuming across restarts is standard in any serious media player;
     // a missing/corrupt state file just means nothing to resume, not an
     // error; see persistence.rs.
@@ -1592,7 +1598,7 @@ fn main() -> anyhow::Result<()> {
         }
         for queued_path in &saved.queue_paths {
             if let Some(item) = persistence::item_from_path(queued_path) {
-                let _ = try_enqueue(&player, &item, &cache_index);
+                pending_enqueue.push(item.clone());
                 app.queue.push(item);
             }
         }
@@ -1600,6 +1606,7 @@ fn main() -> anyhow::Result<()> {
             let _ = player.set_volume(vol);
         }
     }
+    trace::mark("playback state restored (queue deferred)");
 
     // the ceiling crossfade's fade-out/fade-in ramps scale against;
     // read back rather than assuming 100, since persistence may have
@@ -1641,6 +1648,10 @@ fn main() -> anyhow::Result<()> {
     // album's art changes; `ratatui-image` owns the actual resize/
     // encode caching per protocol instance.
     let mut real_art_protocol: Option<StatefulProtocol> = None;
+    // everything that costs an ipc round-trip per track runs on the
+    // first pass through the loop instead of before it; see the drain
+    // right after `draw`.
+    let mut first_frame_drawn = false;
     loop {
         notifications.expire();
         guard.terminal.draw(|f| {
@@ -2216,6 +2227,19 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         })?;
+
+        // the ui is on screen; now hand mpv the restored queue, which
+        // is one blocking ipc round-trip per track (200 of them on a
+        // real saved queue) and has no business delaying the first
+        // frame. one-shot, not per-frame work.
+        if !first_frame_drawn {
+            first_frame_drawn = true;
+            trace::mark("first frame drawn");
+            for item in pending_enqueue.drain(..) {
+                let _ = try_enqueue(&player, &item, &cache_index);
+            }
+            trace::mark("mpv playlist refilled");
+        }
 
         // non-blocking: mpv auto-advances its own playlist on
         // end-of-file (gaplessly); this just keeps our queue *view* in
