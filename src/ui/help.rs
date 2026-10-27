@@ -109,7 +109,10 @@ impl Widget for HelpOverlay<'_> {
             area,
             area.y,
             "keybinds",
-            "? or esc to close",
+            &format!(
+                "{} or esc to close",
+                key_label(self.keymap.get(KeyAction::OpenHelp))
+            ),
             shade(DIM),
             shade(NEAR_BLACK),
         ) + 1;
@@ -304,6 +307,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_header_hint_follows_the_live_keymap() {
+        use crossterm::event::KeyCode;
+        let mut keymap = Keymap::default();
+        keymap.set(KeyAction::OpenHelp, KeyCode::Char('y'));
+        let area = Rect::new(0, 0, 120, 24);
+        let mut buf = Buffer::empty(area);
+        HelpOverlay { keymap: &keymap }.render(area, &mut buf);
+        let top: String = (0..area.width)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
+            .collect();
+        assert!(top.contains("y or esc to close"), "got:\n{top}");
+        assert!(!top.contains("? or esc to close"), "stale default:\n{top}");
     }
 
     #[test]
