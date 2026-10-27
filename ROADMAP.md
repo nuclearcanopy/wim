@@ -13,6 +13,18 @@ spec (eq presets, gapless/crossfade, smart shuffle, a queue, a now-
 playing audio level visualizer, resuming playback state). read
 `docs/architecture.md` before touching the areas it covers.
 
+**UX self-check, every single feature, no exceptions:** before calling
+anything done, ask "is this the best UX, intuitive and beautiful?" The
+honest answer is almost always no the first time — that's expected,
+not a failure, but it means keep iterating rather than stopping at
+"it compiles and has a test." A feature that works but looks/feels
+barebones is not actually done. This was learned the hard way: a
+whole session's worth of backend work shipped before anyone actually
+looked at the rendered screen, and the first real look was a blank
+void with no onboarding, no indexed library, and a thin unimpressive
+title card. Visual/UX work specifically needs a human to actually look
+at it — don't mark it done on build+test passing alone.
+
 **rules for anyone (human or loop) working from this file:**
 - small progressive commits, one coherent change each, lowercase subject,
   no ai co-author trailer (this is the maintainer's own repo)
