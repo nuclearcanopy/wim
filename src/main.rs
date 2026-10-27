@@ -1827,11 +1827,10 @@ fn main() -> anyhow::Result<()> {
                 && panels.resize_selected == ResizePanel::BottomBar)
                 || (!panels.resize_mode && focus_lit && focus == Focus::BottomBar);
 
-            // search box, a one-row separator rule, then the results
-            // list; the separator used to not exist at all, so the
-            // list's first row (or its first section header) sat
-            // directly against the search box's own bottom border
-            // with no breathing room between two stacked rules.
+            // search box, one blank gap row, then the results list.
+            // that gap row used to be a horizontal rule, which stacked
+            // a third parallel line between the search box's own
+            // bottom border and the list's first section-header rule.
             let sidebar_rows = Layout::vertical([
                 Constraint::Length(3),
                 Constraint::Length(1),
@@ -1839,51 +1838,19 @@ fn main() -> anyhow::Result<()> {
             ])
             .split(sidebar);
             let search_rect = sidebar_rows[0];
-            let separator_rect = sidebar_rows[1];
             let results_rect = sidebar_rows[2];
-            // the search box is open on its own right edge (see
-            // ui/searchbox.rs) and relies on this divider for its
-            // closing line instead: ┬ where its top border meets the
-            // divider (nothing above that row, the divider only
-            // continues down from there), ┤ everywhere else a
-            // horizontal rule crosses it (the divider continues both
-            // up and down through those rows). the browse view's own
-            // header draws a second, separate internal horizontal
-            // rule right at main_content's left edge; the banner (now
-            // a LazyVim-style logo+menu, no framing rules) and the
-            // player/lyrics don't, so that one only applies sometimes.
-            let mut junction_rows = vec![
-                (search_rect.y, '┬', shade(NEAR_BLACK)),
-                (
-                    search_rect.y + search_rect.height - 1,
-                    '┤',
-                    shade(NEAR_BLACK),
-                ),
-                (separator_rect.y, '┤', shade(NEAR_BLACK)),
-            ];
-            if browse_view.is_some() {
-                // main_content.y itself is now a plain leading rule
-                // too (see ui/browse.rs), which is exactly what the
-                // existing '┬' junction at that same row (search_rect.y,
-                // above) already assumed was there; draw_header's own
-                // title+rule sits one row further down than it used to
-                // (asked to start at main_content.y + 1), so its rule
-                // lands at + 2, not + 1.
-                junction_rows.push((main_content.y + 2, '├', shade(NEAR_BLACK)));
-            }
-            // each results-list section header is itself a full-width
-            // rule (see ui::results_list::draw_header_row); same
-            // layout() call the list's own render uses, so a header's
-            // row here always matches exactly where one actually is.
-            let (results_rows, results_scroll) =
-                ui::results_list::layout(&app.results, app.selected, results_rect.height as usize);
-            for row in 0..results_rect.height as usize {
-                if let Some(ui::results_list::DisplayRow::Header(_)) =
-                    results_rows.get(results_scroll + row)
-                {
-                    junction_rows.push((results_rect.y + row as u16, '┤', shade(NEAR_BLACK)));
+            // which rules reach this divider from the right depends on
+            // what main content shows: the browse view's header rules,
+            // the mini player's strip, nothing at all from the player,
+            // lyrics or banner. the glyph per row is derived from that
+            // (see `ui::junctions`): ┬/┼ where a rule continues right,
+            // ┐/┤ where it doesn't.
+            let mut main_content_rules = match &browse_view {
+                Some(bv) if !show_full_player => {
+                    ui::browse::rule_rows(main_content, bv, art_mode, cell_aspect())
                 }
-            }
+                _ => Vec::new(),
+            };
             // the divider used to stop at the bottom of `top`, one row
             // short of the mini player strip below it (a separate row
             // in the outer vertical split, sidebar-width columns
@@ -1891,10 +1858,9 @@ fn main() -> anyhow::Result<()> {
             // junction expecting a line to feed into it from above,
             // so with the mini bar showing, that line had already
             // stopped 3 rows earlier. Stretch the divider down through
-            // the mini bar's own height too in that case, with a ┼
-            // where its own internal rule (its first row) crosses.
+            // the mini bar's own height too in that case.
             let vdivider_rect = if show_mini_bar {
-                junction_rows.push((mini_bar_row.y, '┼', shade(NEAR_BLACK)));
+                main_content_rules.push(mini_bar_row.y);
                 Rect {
                     height: vdivider.height + mini_bar_row.height,
                     ..vdivider
@@ -1902,6 +1868,17 @@ fn main() -> anyhow::Result<()> {
             } else {
                 vdivider
             };
+            let junction_rows = ui::junctions::SidebarDivider {
+                search: search_rect,
+                results_header_rows: &ui::results_list::header_rows(
+                    &app.results,
+                    app.selected,
+                    results_rect,
+                ),
+                main_content_rule_rows: &main_content_rules,
+                bottom_rule_row: bottom.y,
+            }
+            .junctions(shade(NEAR_BLACK));
             f.render_widget(
                 VerticalRule {
                     highlighted: sidebar_selected,
@@ -1937,16 +1914,11 @@ fn main() -> anyhow::Result<()> {
                     editing: app.editing_query,
                     label: "search",
                     cursor_visible,
+                    // closed by the vertical divider instead, which
+                    // sits one column past this rect.
                     right_border: false,
                 },
                 search_rect,
-            );
-            f.render_widget(
-                HorizontalRule {
-                    highlighted: false,
-                    junctions: Vec::new(),
-                },
-                separator_rect,
             );
             f.render_widget(
                 ResultsList {

@@ -36,6 +36,38 @@ pub struct BrowseListView<'a> {
     pub cursor_visible: bool,
 }
 
+/// Row offsets inside this view's own header block, from `area.y`: a
+/// plain rule, the title line, then the title's own rule (the latter
+/// two are `draw_header`'s). `browse::HEADER_HEIGHT` reserves one
+/// blank row after them.
+const TOP_RULE_ROW: u16 = 0;
+const TITLE_ROW: u16 = 1;
+const TITLE_RULE_ROW: u16 = TITLE_ROW + 1;
+
+/// Rows where this view draws a horizontal rule that actually reaches
+/// `area`'s left edge, so the sidebar divider one column left of it
+/// can join them (see `ui::junctions`). The artist profile's column
+/// labels count only when no art panel pushed them right; a rule
+/// starting mid-pane never touches the divider.
+pub fn rule_rows(area: Rect, view: &BrowseView, art_mode: ArtMode, cell_aspect: f32) -> Vec<u16> {
+    let mut rows = vec![area.y + TOP_RULE_ROW, area.y + TITLE_RULE_ROW];
+    if view.is_artist {
+        let has_art = view.art.is_some() && art_mode != ArtMode::Off;
+        let (_, list_area) = crate::browse::layout(
+            area,
+            has_art,
+            view.bio.is_some(),
+            view.is_artist,
+            cell_aspect,
+        );
+        if list_area.x == area.x {
+            rows.push(list_area.y);
+        }
+    }
+    rows.retain(|y| *y < area.y + area.height);
+    rows
+}
+
 fn is_starred(track: &SearchItem, favorites: &Favorites, remote_starred: &HashSet<String>) -> bool {
     match track {
         SearchItem::LocalMusic { path, .. } | SearchItem::LocalVideo { path, .. } => {
@@ -55,14 +87,12 @@ impl Widget for BrowseListView<'_> {
             (true, None) => String::new(),
         };
         let title_line = format!("{}{subtitle}", self.view.title);
-        // a plain rule first, continuing the sidebar's own search-box
-        // top border straight across (see main.rs's vdivider junction
-        // at this exact row) rather than letting the title text share
-        // that row and read as crammed against it; the title itself
-        // sits one row lower, where that border used to be visually
-        // adjacent to nothing.
+        // exactly one rule above the title and one below it: this
+        // first one continues the sidebar's search-box top border
+        // straight across (`ui::junctions` puts the ┬ there),
+        // draw_header draws the second under the title itself.
         for col in 0..area.width {
-            if let Some(cell) = buf.cell_mut((area.x + col, area.y)) {
+            if let Some(cell) = buf.cell_mut((area.x + col, area.y + TOP_RULE_ROW)) {
                 cell.set_char('─');
                 cell.set_fg(shade(NEAR_BLACK));
             }
@@ -70,7 +100,7 @@ impl Widget for BrowseListView<'_> {
         draw_header(
             buf,
             area,
-            area.y + 1,
+            area.y + TITLE_ROW,
             &title_line,
             "enter: play from here, esc: close",
             shade(DIM),
@@ -154,7 +184,11 @@ impl BrowseListView<'_> {
             );
         }
 
+        // the blank row between the SONGS rule and the filter box is
+        // load-bearing: the box's own top border is a second parallel
+        // rule, and stacking the two reads as one doubled line.
         let song_rows = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Min(0),
@@ -166,11 +200,13 @@ impl BrowseListView<'_> {
             editing: self.view.filtering,
             label: "filter songs",
             cursor_visible: self.cursor_visible,
+            // nothing to the right of this one but the terminal edge,
+            // so it closes itself rather than trailing off.
             right_border: true,
         }
-        .render(song_rows[1], buf);
+        .render(song_rows[2], buf);
 
-        let songs_rect = song_rows[2];
+        let songs_rect = song_rows[3];
         let visible = self.view.visible_track_indices();
         if visible.is_empty() {
             let msg = if self.view.filter_query.is_empty() {
@@ -304,5 +340,141 @@ fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::s
             cell.set_char(ch);
             cell.set_fg(color);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::NEAR_BLACK;
+    use crate::ui::divider::VerticalRule;
+    use crate::ui::junctions::SidebarDivider;
+    use crate::ui::testbuf::{buffer, grid};
+
+    fn view(title: &str, is_artist: bool) -> BrowseView {
+        BrowseView {
+            title: title.to_string(),
+            subtitle: String::new(),
+            year: None,
+            tracks: Vec::new(),
+            selected: 0,
+            art: None,
+            bio: None,
+            is_artist,
+            albums: Vec::new(),
+            albums_selected: 0,
+            albums_focused: true,
+            filter_query: String::new(),
+            filtering: false,
+            show_track_artist: false,
+        }
+    }
+
+    fn render(area: Rect, view: &BrowseView, buf: &mut Buffer) {
+        BrowseListView {
+            view,
+            favorites: &Favorites::default(),
+            remote_starred: &HashSet::new(),
+            art_mode: ArtMode::Off,
+            cell_aspect: 2.0,
+            cursor_visible: false,
+        }
+        .render(area, buf);
+    }
+
+    /// One rule above the title and one below it, nothing stacked.
+    #[test]
+    fn header_is_rule_title_rule() {
+        let area = Rect::new(0, 0, 24, 6);
+        let mut buf = buffer(24, 6);
+        render(area, &view("Bladee", false), &mut buf);
+        assert_eq!(
+            grid(&buf),
+            [
+                "────────────────────────",
+                "Bladee │ enter: play fr…",
+                "───────┴────────────────",
+                "........................",
+                "(no tracks).............",
+                "........................",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn rule_rows_are_the_two_header_rules_for_an_album() {
+        let area = Rect::new(10, 0, 24, 10);
+        let rows = rule_rows(area, &view("Bladee", false), ArtMode::Off, 2.0);
+        assert_eq!(rows, vec![0, 2]);
+    }
+
+    /// The artist profile's column labels are a third rule at the
+    /// left edge, so the divider has to join that row too.
+    #[test]
+    fn rule_rows_include_the_artist_column_labels() {
+        let area = Rect::new(10, 0, 24, 10);
+        let rows = rule_rows(area, &view("Bladee", true), ArtMode::Off, 2.0);
+        assert_eq!(rows, vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn rule_rows_outside_a_short_area_are_dropped() {
+        let area = Rect::new(10, 0, 24, 2);
+        let rows = rule_rows(area, &view("Bladee", true), ArtMode::Off, 2.0);
+        assert_eq!(rows, vec![0]);
+    }
+
+    /// The artist page as actually laid out next to the sidebar: the
+    /// divider joins every rule that reaches it (┬ then ┼ then ├), the
+    /// song filter box closes its own right edge, and a blank row
+    /// keeps the SONGS rule off that box's top border. '.' is a cell
+    /// nothing drew into.
+    #[test]
+    fn artist_page_next_to_the_sidebar_renders_connected() {
+        let search = Rect::new(0, 0, 16, 3);
+        let main = Rect::new(17, 0, 40, 12);
+        let bv = view("Bladee", true);
+        let mut buf = buffer(57, 12);
+
+        SearchBox {
+            query: "",
+            editing: false,
+            label: "search",
+            cursor_visible: false,
+            right_border: false,
+        }
+        .render(search, &mut buf);
+        render(main, &bv, &mut buf);
+        VerticalRule {
+            highlighted: false,
+            junction_rows: SidebarDivider {
+                search,
+                results_header_rows: &[],
+                main_content_rule_rows: &rule_rows(main, &bv, ArtMode::Off, 2.0),
+                bottom_rule_row: 12,
+            }
+            .junctions(shade(NEAR_BLACK)),
+        }
+        .render(Rect::new(16, 0, 1, 12), &mut buf);
+
+        assert_eq!(
+            grid(&buf),
+            [
+                "┌┤ search ├─────┬────────────────────────────────────────",
+                "│search.........│Bladee │ enter: play from here, esc: cl…",
+                "└───────────────┼───────┴────────────────────────────────",
+                "................│........................................",
+                "................├─── ALBUMS ──────────── SONGS ──────────",
+                "................│(no albums).............................",
+                "................│..............┌┤ filter songs ├────────┐",
+                "................│..............│search..................│",
+                "................│..............└────────────────────────┘",
+                "................│..............(no tracks)...............",
+                "................│........................................",
+                "................│........................................",
+            ]
+            .join("\n")
+        );
     }
 }

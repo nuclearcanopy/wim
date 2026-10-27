@@ -7,6 +7,7 @@ pub mod eq_menu;
 pub mod header;
 pub mod help;
 pub mod helpbox;
+pub mod junctions;
 pub mod keybinds_menu;
 pub mod login;
 pub mod logos;
@@ -21,5 +22,7 @@ pub mod results_list;
 pub mod searchbox;
 pub mod settings_menu;
 pub mod subtitle_menu;
+#[cfg(test)]
+pub mod testbuf;
 pub mod textfit;
 pub mod visualizer;

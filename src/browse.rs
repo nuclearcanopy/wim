@@ -41,9 +41,9 @@ impl ArtMode {
 /// blank gap row after it; fixed because the header's own content is
 /// fixed, not computed dynamically per open view. The leading plain
 /// rule exists so this view's very first row is a continuation of
-/// the sidebar's own search-box top border (see `main.rs`'s vdivider
-/// junction at that row) rather than title text sharing a row with
-/// that border and reading as crammed against it.
+/// the sidebar's own search-box top border (`ui::junctions` joins the
+/// two) rather than title text sharing a row with that border and
+/// reading as crammed against it.
 const HEADER_HEIGHT: u16 = 4;
 
 /// Artist bios get up to 3 wrapped lines plus one gap row; albums/

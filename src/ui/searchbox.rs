@@ -5,12 +5,13 @@ use ratatui::widgets::Widget;
 use crate::theme::{lerp, shade, DIM, MID, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::textfit::tail_fit;
 
-/// A hand-drawn box around a search input, labelled in its own top
-/// border so two of these on screen at once can't be confused for each
-/// other. There are exactly two (the sidebar's library search and the
-/// artist profile's song filter), and "i am trying to type in the song
-/// search section but i am typing in the sidebar search" was the
-/// result of them rendering identically.
+/// A hand-drawn box around a search input: "search..." as a dim
+/// placeholder when empty, replaced by the live query once typing
+/// starts. Labelled in its own top border so the two instances on
+/// screen (the sidebar's library search and the artist profile's song
+/// filter) can't be confused for each other; "i am trying to type in
+/// the song search section but i am typing in the sidebar search" was
+/// the result of them rendering identically.
 pub struct SearchBox<'a> {
     pub query: &'a str,
     pub editing: bool,
@@ -22,15 +23,12 @@ pub struct SearchBox<'a> {
     /// while `editing`. The caller toggles this on a timer so the
     /// widget itself stays a pure render of whatever state it's given.
     pub cursor_visible: bool,
-    /// `false` for the sidebar's search box only: the sidebar's own
-    /// vertical divider sits one column past `area`'s right edge
-    /// already, so a second parallel line right next to it just
-    /// looked like a disconnected box bolted onto the layout rather
-    /// than part of it. Closing that side is main.rs's job instead,
-    /// via the vdivider's own `junction_rows` at this box's top/bottom
-    /// rows (┬ and ┤). Every other caller has nothing else to close
-    /// it, so they need `true` or the box's right edge just trails
-    /// off with nothing to meet it.
+    /// `false` only for the sidebar instance, whose right edge is
+    /// closed by the vertical divider sitting one column past `area`
+    /// (see `ui::junctions`); a second parallel line right next to
+    /// that divider read as a box bolted onto the layout. Anything
+    /// else has nothing to its right, so it closes its own edge
+    /// rather than trailing off into the terminal.
     pub right_border: bool,
 }
 
@@ -66,11 +64,9 @@ impl Widget for SearchBox<'_> {
 
         draw_border_label(buf, area, self.label, self.editing, border_color);
 
-        let inner_width = if self.right_border {
-            w.saturating_sub(2)
-        } else {
-            w.saturating_sub(1)
-        } as usize;
+        // the left border column always costs one, the right one only
+        // when it's actually drawn.
+        let inner_width = w.saturating_sub(if self.right_border { 2 } else { 1 }) as usize;
         // the placeholder only makes sense when there's nothing typed
         // *and* nothing being typed; once editing starts on an empty
         // query, the cursor alone is the "you're in here" signal, not
@@ -148,6 +144,7 @@ fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: ratatui::style::Color)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::testbuf::{buffer, grid};
 
     fn render_to_string(sb: SearchBox, width: u16, height: u16) -> String {
         let area = Rect::new(0, 0, width, height);
@@ -263,5 +260,46 @@ mod tests {
         );
         assert!(out.contains("search..."));
         assert!(!out.contains('█'));
+    }
+
+    fn render(query: &str, right_border: bool) -> String {
+        let mut buf = buffer(10, 3);
+        SearchBox {
+            query,
+            editing: false,
+            label: "search",
+            cursor_visible: false,
+            right_border,
+        }
+        .render(Rect::new(0, 0, 10, 3), &mut buf);
+        grid(&buf)
+    }
+
+    /// The sidebar instance: open on the right on purpose, the
+    /// vertical divider one column over closes it.
+    #[test]
+    fn open_right_edge_leaves_the_border_unterminated() {
+        assert_eq!(
+            render("", false),
+            ["┌─────────", "│search...", "└─────────"].join("\n")
+        );
+    }
+
+    /// Standalone instance (the artist profile's song filter): nothing
+    /// is to its right, so it closes its own corners.
+    #[test]
+    fn closed_right_edge_draws_its_own_corners() {
+        assert_eq!(
+            render("", true),
+            ["┌────────┐", "│search..│", "└────────┘"].join("\n")
+        );
+    }
+
+    #[test]
+    fn closed_right_edge_keeps_the_query_inside_the_box() {
+        assert_eq!(
+            render("abcdefghij", true),
+            ["┌────────┐", "│cdefghij│", "└────────┘"].join("\n")
+        );
     }
 }
