@@ -339,11 +339,11 @@ fn open_starred_view(
             tracks.push(item);
         }
     }
-    browse::BrowseView {
+    let mut view = browse::BrowseView {
         title: "starred songs".to_string(),
         subtitle: String::new(),
         year: None,
-        tracks,
+        tracks: Vec::new(),
         selected: 0,
         art: None,
         bio: None,
@@ -354,7 +354,11 @@ fn open_starred_view(
         filter_query: String::new(),
         filtering: false,
         show_track_artist: true,
-    }
+    };
+    // through `set_tracks`, not a bare assignment: it re-clamps
+    // `selected` with the list it's an index into.
+    view.set_tracks(tracks);
+    view
 }
 
 /// Best-effort: a missing/unreadable cover is not worth surfacing as
@@ -2898,11 +2902,11 @@ fn main() -> anyhow::Result<()> {
                         match key.code {
                             KeyCode::Char(c) => {
                                 bv.filter_query.push(c);
-                                bv.clamp_selection_to_filter();
+                                bv.clamp_selection();
                             }
                             KeyCode::Backspace => {
                                 bv.filter_query.pop();
-                                bv.clamp_selection_to_filter();
+                                bv.clamp_selection();
                             }
                             KeyCode::Esc | KeyCode::Enter => bv.filtering = false,
                             _ => {}
@@ -3532,13 +3536,15 @@ fn main() -> anyhow::Result<()> {
                     // being open silently ate every other keybind.
                     let mut handled = true;
                     match key.code {
+                        // clamped to the content: scrolling past the
+                        // last line just parks the view on blank space.
                         KeyCode::Char('j') | KeyCode::Down => {
                             {
-                                // clamped against the *wrapped* length,
-                                // which is what's actually on screen;
-                                // j used to scroll into blank space
-                                // indefinitely.
-                                let max = lyrics_lines
+                                // against the *wrapped* length, which
+                                // is what's actually on screen; the
+                                // raw line count under-counts once
+                                // long lines wrap.
+                                let rows = lyrics_lines
                                     .as_ref()
                                     .map(|l| {
                                         let borrowed: Vec<&str> =
@@ -3549,7 +3555,8 @@ fn main() -> anyhow::Result<()> {
                                         )
                                     })
                                     .unwrap_or(0);
-                                lyrics_scroll = (lyrics_scroll + 1).min(max.saturating_sub(1));
+                                lyrics_scroll =
+                                    ui::scroll::clamp_to_content(lyrics_scroll + 1, rows);
                             }
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
