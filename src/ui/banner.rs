@@ -4,27 +4,25 @@ use ratatui::widgets::Widget;
 
 use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK, WHITE};
 
-/// Real isometric 3D block lettering (figlet's `isometric1` font,
-/// `figlet -f isometric1 WIM`), baked in as static art rather than
-/// hand-rolled: the "3D" look in terminal ascii logos (same family used
-/// by countless project banners) comes from the font's own `/`, `\`,
-/// `:`, `|`, `_` character choices simulating isometric perspective,
-/// not from anything done at render time. No figlet dependency at
-/// runtime — "WIM" never changes, so this is just baked-in text.
+/// Real bold 3D block lettering (figlet's `larry3d` font,
+/// `figlet -f larry3d WIM`), baked in as static art rather than
+/// hand-rolled. Tried `isometric1` first, but that font simulates true
+/// isometric perspective, which shifts each letter diagonally relative
+/// to the ones before it — reads as "stacked behind each other" rather
+/// than clean 3D weight. `larry3d` gives bold slanted depth per letter
+/// without that progressive diagonal drift across the whole word. No
+/// figlet dependency at runtime — "WIM" never changes, so this is just
+/// baked-in text.
 const LOGO: &[&str] = &[
-    r"      ___                       ___     ",
-    r"     /\__\          ___        /\__\    ",
-    r"    /:/ _/_        /\  \      /::|  |   ",
-    r"   /:/ /\__\       \:\  \    /:|:|  |   ",
-    r"  /:/ /:/ _/_      /::\__\  /:/|:|__|__ ",
-    r" /:/_/:/ /\__\  __/:/\/__/ /:/ |::::\__\",
-    r" \:\/:/ /:/  / /\/:/  /    \/__/~~/:/  /",
-    r"  \::/_/:/  /  \::/__/           /:/  / ",
-    r"   \:\/:/  /    \:\__\          /:/  /  ",
-    r"    \::/  /      \/__/         /:/  /   ",
-    r"     \/__/                     \/__/    ",
+    r" __      __  ______               ",
+    r"/\ \  __/\ \/\__  _\   /'\_/`\    ",
+    r"\ \ \/\ \ \ \/_/\ \/  /\      \   ",
+    r" \ \ \ \ \ \ \ \ \ \  \ \ \__\ \  ",
+    r"  \ \ \_/ \_\ \ \_\ \__\ \ \_/\ \ ",
+    r"   \ `\___x___/ /\_____\\ \_\\ \_\",
+    r"    '\/__//__/  \/_____/ \/_/ \/_/",
 ];
-pub const GLYPH_HEIGHT: usize = 11;
+pub const GLYPH_HEIGHT: usize = 7;
 
 /// Renders the logo with a brightness sweep plus a slower overall pulse
 /// layered on top (two independent motions read as more "alive" than a
