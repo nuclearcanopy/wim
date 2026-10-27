@@ -53,6 +53,23 @@ pub fn layout(
     (rows, scroll_offset)
 }
 
+/// Absolute rows of `area` on which `render` draws a section-header
+/// rule, which is what the divider immediately right of this list
+/// needs to join them (see `ui::junctions`); derived from the same
+/// `layout` call the render itself uses, so the two can't disagree
+/// about where a header actually lands.
+pub fn header_rows(items: &[SearchItem], selected: usize, area: Rect) -> Vec<u16> {
+    if items.is_empty() || area.height == 0 {
+        return Vec::new();
+    }
+    let visible_rows = area.height as usize;
+    let (rows, scroll_offset) = layout(items, selected, visible_rows);
+    (0..visible_rows)
+        .filter(|row| matches!(rows.get(scroll_offset + row), Some(DisplayRow::Header(_))))
+        .map(|row| area.y + row as u16)
+        .collect()
+}
+
 /// Plain ASCII, not unicode pictographs: even nominally "geometric,
 /// not emoji" symbols (e.g. the bullseye tried earlier for albums)
 /// can still be flagged emoji-presentation in some fonts/terminals, or
