@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
@@ -383,15 +384,45 @@ impl Corpus {
         let query_len = query_lower.chars().count();
         let typo_budget = edit_distance_budget(query_len);
 
-        let mut scratch = self.scratch.borrow_mut();
-        let mut scored = score_chunk(
-            &self.items,
-            &pattern,
-            &query_lower,
-            query_len,
-            typo_budget,
-            &mut scratch,
-        );
+        let mut scored: Vec<(u32, &SearchItem)> = if self.items.len() >= PARALLEL_SCORING_FLOOR {
+            // chunks are joined back in corpus order, so the stable
+            // sort below still breaks ties exactly as it does
+            // single-threaded; each thread needs its own scratch.
+            let threads = thread::available_parallelism().map_or(1, |n| n.get());
+            let chunk = self.items.len().div_ceil(threads);
+            let parts: Vec<Vec<(u32, &SearchItem)>> = thread::scope(|scope| {
+                self.items
+                    .chunks(chunk)
+                    .map(|part| {
+                        scope.spawn(|| {
+                            let mut scratch = Scratch::default();
+                            score_chunk(
+                                part,
+                                &pattern,
+                                &query_lower,
+                                query_len,
+                                typo_budget,
+                                &mut scratch,
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap_or_default())
+                    .collect()
+            });
+            parts.concat()
+        } else {
+            let mut scratch = self.scratch.borrow_mut();
+            score_chunk(
+                &self.items,
+                &pattern,
+                &query_lower,
+                query_len,
+                typo_budget,
+                &mut scratch,
+            )
+        };
 
         scored.sort_by_key(|a| std::cmp::Reverse(a.0));
 
@@ -445,8 +476,9 @@ impl Corpus {
 }
 
 /// Scores one slice of the corpus against `pattern`, reusing a single
-/// `Scratch` for every item instead of rebuilding one per item. Keeps
-/// corpus order, which the caller's stable sort relies on.
+/// `Scratch` for every item; the whole per-item hot path lives here so
+/// the threaded and single-threaded paths can't score differently.
+/// Keeps corpus order, which the caller's stable sort relies on.
 fn score_chunk<'a>(
     entries: &'a [Entry],
     pattern: &Pattern,
@@ -496,6 +528,13 @@ fn char_count(s: &str) -> usize {
         s.chars().count()
     }
 }
+
+/// Corpus size at which `search` fans per-item scoring out across
+/// threads. Below it the fixed cost of the fan-out (spawn/join plus a
+/// fresh ~135kb matcher per thread, measured at ~0.8ms on 8 cores)
+/// dominates: at 100 items it made every query ~8x slower, at 500 it
+/// broke even, and from ~2k up it's a consistent ~2x win.
+const PARALLEL_SCORING_FLOOR: usize = 2_000;
 
 /// Below this fraction of the best match's score in a given search, a
 /// result is treated as noise rather than a real candidate; see the
