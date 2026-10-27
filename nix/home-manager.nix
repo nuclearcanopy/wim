@@ -214,13 +214,15 @@ in
       '';
     };
 
-    cacheListensThreshold = mkOption {
+    cacheDaysThreshold = mkOption {
       type = types.int;
       default = 2;
       description = ''
-        How many times a remote song must start playing before wim
-        automatically downloads it to the local cache
-        (~/.cache/wim/tracks). Tweakable live in the settings menu ('u').
+        On how many distinct calendar days a remote song must have been
+        played before wim automatically downloads it to the local cache
+        (~/.cache/wim/tracks); playing it twice in one sitting does not
+        count, coming back to it another day does. Tweakable live in the
+        settings menu ('u').
       '';
     };
 
@@ -281,7 +283,7 @@ in
       subtitle_language = cfg.subtitleLanguage;
       sidebar_width = cfg.sidebarWidth;
       bottom_bar_height = cfg.bottomBarHeight;
-      cache_listens_threshold = cfg.cacheListensThreshold;
+      cache_days_threshold = cfg.cacheDaysThreshold;
       cache_eviction_days = cfg.cacheEvictionDays;
       scrobble = {
         threshold_percent = cfg.scrobble.thresholdPercent;

@@ -745,7 +745,9 @@ struct DownloadCtx<'a> {
     cache: &'a Arc<Mutex<CacheIndex>>,
     download_tx: &'a mpsc::Sender<DownloadEvent>,
     downloading: &'a mut HashSet<String>,
-    listens_threshold: u32,
+    /// Distinct play days a track needs before it auto-downloads; see
+    /// `config::Config::cache_days_threshold`.
+    day_threshold: u32,
 }
 
 /// Bundles the two independent "a track just started" trackers
@@ -890,7 +892,7 @@ fn dispatch_action(action: Action, ctx: &mut ActionCtx) -> Dispatch {
                             cache: ctx.cache,
                             download_tx: ctx.download_tx,
                             downloading: ctx.downloading,
-                            listens_threshold: ctx.cfg.cache_listens_threshold,
+                            day_threshold: ctx.cfg.cache_days_threshold,
                         };
                         note_playback_started(&first, &mut dctx, ctx.notifications);
                         start_tracking_playback(ctx.cfg, &first, ctx.scrobble);
@@ -979,12 +981,31 @@ fn dispatch_action(action: Action, ctx: &mut ActionCtx) -> Dispatch {
     Dispatch::Continue
 }
 
+/// Whether a play that just happened should kick off a background
+/// download. Pure, and kept apart from the clock and the cache file so
+/// the policy itself is testable: `days_played` is the number of
+/// *distinct calendar days* the track has been played on, never the
+/// raw play count, which is what made pressing enter twice in one
+/// sitting download a track nobody asked to cache.
+fn should_auto_download(
+    days_played: u32,
+    day_threshold: u32,
+    already_cached: bool,
+    in_flight: bool,
+) -> bool {
+    days_played >= day_threshold.max(1) && !already_cached && !in_flight
+}
+
 /// Called every time a remote song actually starts playing (every
-/// track-change call site threads this through): bumps its play count
-/// and, once that crosses `dctx.listens_threshold`, kicks off a
-/// background download so the track is cached for next time (see
-/// `cache.rs`/`download.rs`). A no-op for local items (never cached
-/// at all) and for anything already cached or already mid-download.
+/// track-change call site threads this through): records the play
+/// against today's date and, once the track has been played on
+/// `dctx.day_threshold` distinct days, kicks off a background download
+/// so it's cached for next time (see `cache.rs`/`download.rs`). A
+/// no-op for local items (never cached at all) and for anything
+/// already cached or already mid-download.
+///
+/// `today` is read off the clock here and nowhere deeper; everything
+/// that actually decides anything takes the day as an argument.
 ///
 /// This is also the one call site a future scrobble submission
 /// (ListenBrainz, separate work happening elsewhere) would hook into:
@@ -1004,15 +1025,21 @@ fn note_playback_started(
     else {
         return;
     };
-    let (count, already_cached) = match dctx.cache.lock() {
+    let today = cache::today();
+    let (days, already_cached) = match dctx.cache.lock() {
         Ok(mut idx) => {
-            let count = idx.record_play(id);
+            let days = idx.record_play(id, &today);
             let _ = idx.save();
-            (count, idx.cached_path(id).is_some())
+            (days, idx.cached_path(id).is_some())
         }
         Err(_) => return,
     };
-    if count < dctx.listens_threshold || already_cached || dctx.downloading.contains(id) {
+    if !should_auto_download(
+        days,
+        dctx.day_threshold,
+        already_cached,
+        dctx.downloading.contains(id),
+    ) {
         return;
     }
     dctx.downloading.insert(id.clone());
@@ -1031,7 +1058,9 @@ fn note_playback_started(
 /// every remote song in the result concurrently (one thread each, see
 /// `download::spawn_tracks`), and skips anything already cached,
 /// already downloading, or not actually a remote track (local files
-/// are already local, nothing to cache).
+/// are already local, nothing to cache). Deliberately ignores
+/// `day_threshold`: asking for a download outright is explicit, and
+/// has no business waiting on a listening-habit heuristic.
 fn trigger_downloads(
     item: &SearchItem,
     dctx: &mut DownloadCtx,
@@ -1938,7 +1967,7 @@ fn main() -> anyhow::Result<()> {
                     cache: &cache_index,
                     download_tx: &download_tx,
                     downloading: &mut downloading,
-                    listens_threshold: cfg.cache_listens_threshold,
+                    day_threshold: cfg.cache_days_threshold,
                 };
                 note_playback_started(&item, &mut dctx, &mut notifications);
                 start_tracking_playback(&cfg, &item, &mut scrobble);
@@ -2432,7 +2461,7 @@ fn main() -> anyhow::Result<()> {
                     format!("{art_mode_label} ('i' also cycles this)"),
                     if crossfade_enabled { "on" } else { "off" }.to_string(),
                     format!("{:.1}s", cfg.crossfade_seconds),
-                    format!("{} plays", cfg.cache_listens_threshold),
+                    format!("{} days played", cfg.cache_days_threshold),
                     format!("{} days", cfg.cache_eviction_days),
                     format!("{:.0}%", cfg.scrobble.threshold_percent),
                     format!("{:.0}s", cfg.scrobble.threshold_seconds),
@@ -2641,7 +2670,7 @@ fn main() -> anyhow::Result<()> {
                 cache: &cache_index,
                 download_tx: &download_tx,
                 downloading: &mut downloading,
-                listens_threshold: cfg.cache_listens_threshold,
+                day_threshold: cfg.cache_days_threshold,
             };
             note_playback_started(&next, &mut dctx, &mut notifications);
             start_tracking_playback(&cfg, &next, &mut scrobble);
@@ -2684,7 +2713,7 @@ fn main() -> anyhow::Result<()> {
                         cache: &cache_index,
                         download_tx: &download_tx,
                         downloading: &mut downloading,
-                        listens_threshold: cfg.cache_listens_threshold,
+                        day_threshold: cfg.cache_days_threshold,
                     };
                     note_playback_started(&first, &mut dctx, &mut notifications);
                     start_tracking_playback(&cfg, &first, &mut scrobble);
@@ -3313,11 +3342,11 @@ fn main() -> anyhow::Result<()> {
                             cfg.crossfade_seconds = (cfg.crossfade_seconds + 0.5).clamp(1.0, 15.0);
                         }
                         KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 3 => {
-                            cfg.cache_listens_threshold =
-                                cfg.cache_listens_threshold.saturating_sub(1).max(1);
+                            cfg.cache_days_threshold =
+                                cfg.cache_days_threshold.saturating_sub(1).max(1);
                         }
                         KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 3 => {
-                            cfg.cache_listens_threshold = (cfg.cache_listens_threshold + 1).min(20);
+                            cfg.cache_days_threshold = (cfg.cache_days_threshold + 1).min(20);
                         }
                         KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 4 => {
                             cfg.cache_eviction_days =
@@ -3753,7 +3782,7 @@ fn main() -> anyhow::Result<()> {
                                         cache: &cache_index,
                                         download_tx: &download_tx,
                                         downloading: &mut downloading,
-                                        listens_threshold: cfg.cache_listens_threshold,
+                                        day_threshold: cfg.cache_days_threshold,
                                     };
                                     note_playback_started(&first, &mut dctx, &mut notifications);
                                     start_tracking_playback(&cfg, &first, &mut scrobble);
@@ -3796,7 +3825,7 @@ fn main() -> anyhow::Result<()> {
                                     cache: &cache_index,
                                     download_tx: &download_tx,
                                     downloading: &mut downloading,
-                                    listens_threshold: cfg.cache_listens_threshold,
+                                    day_threshold: cfg.cache_days_threshold,
                                 };
                                 let _ = trigger_downloads(&item, &mut dctx, &mut notifications);
                             }
@@ -3980,7 +4009,7 @@ fn main() -> anyhow::Result<()> {
                         cache: &cache_index,
                         download_tx: &download_tx,
                         downloading: &mut downloading,
-                        listens_threshold: cfg.cache_listens_threshold,
+                        day_threshold: cfg.cache_days_threshold,
                     };
                     let mut hooks = TrackChangeCtx {
                         dctx: &mut dctx,
@@ -4024,7 +4053,7 @@ fn main() -> anyhow::Result<()> {
                             cache: &cache_index,
                             download_tx: &download_tx,
                             downloading: &mut downloading,
-                            listens_threshold: cfg.cache_listens_threshold,
+                            day_threshold: cfg.cache_days_threshold,
                         };
                         let _ = trigger_downloads(&item, &mut dctx, &mut notifications);
                     }
@@ -4106,6 +4135,64 @@ fn main() -> anyhow::Result<()> {
     drop(guard);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod download_policy_tests {
+    use super::*;
+
+    #[test]
+    fn two_plays_on_one_day_never_trigger_a_download() {
+        // "if i press enter on a song twice it downloads it, thats not
+        // what i want": the play count used to be what crossed the
+        // threshold, so it did.
+        let mut idx = CacheIndex::default();
+        let days = idx.record_play("t1", "2026-03-01");
+        assert!(!should_auto_download(days, 2, false, false));
+        let days = idx.record_play("t1", "2026-03-01");
+        assert!(!should_auto_download(days, 2, false, false));
+    }
+
+    #[test]
+    fn two_distinct_days_do_trigger_a_download() {
+        let mut idx = CacheIndex::default();
+        idx.record_play("t1", "2026-03-01");
+        let days = idx.record_play("t1", "2026-03-02");
+        assert!(should_auto_download(days, 2, false, false));
+    }
+
+    #[test]
+    fn the_day_threshold_is_configurable() {
+        let mut idx = CacheIndex::default();
+        idx.record_play("t1", "2026-03-01");
+        let days = idx.record_play("t1", "2026-03-02");
+        assert!(!should_auto_download(days, 3, false, false));
+        let days = idx.record_play("t1", "2026-03-03");
+        assert!(should_auto_download(days, 3, false, false));
+        // a threshold of 1 (or a nonsense 0) downloads on first play.
+        let mut idx = CacheIndex::default();
+        let days = idx.record_play("t2", "2026-03-01");
+        assert!(should_auto_download(days, 1, false, false));
+        assert!(should_auto_download(days, 0, false, false));
+    }
+
+    #[test]
+    fn an_already_cached_or_in_flight_track_is_left_alone() {
+        assert!(!should_auto_download(5, 2, true, false));
+        assert!(!should_auto_download(5, 2, false, true));
+    }
+
+    #[test]
+    fn a_config_with_the_old_play_count_field_still_loads() {
+        // renaming the field must not hard-error someone's existing
+        // config.toml; the old name is an alias of the new one, and
+        // both defaults were 2, so the value carries straight over.
+        let cfg: config::Config =
+            toml::from_str("cache_listens_threshold = 4\n").expect("old field must still load");
+        assert_eq!(cfg.cache_days_threshold, 4);
+        let cfg: config::Config = toml::from_str("").expect("an empty config is all defaults");
+        assert_eq!(cfg.cache_days_threshold, 2);
+    }
 }
 
 #[cfg(test)]
