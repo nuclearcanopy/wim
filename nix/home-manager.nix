@@ -169,9 +169,38 @@ in
       example = { skip_next = "f5"; toggle_shuffle = "x"; };
       description = "Overrides for the remappable keybinds (action name -> key name, same as 'K' in-app writes to config.toml; see keymap::KeyAction::name/key_label in the wim source for the exact strings). Only needs entries for actions actually remapped away from their default.";
     };
+
+    eqPreset = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = ''
+        Name of an eq::PRESETS entry (e.g. "bass boost") to start
+        with, cycled through with 'e' in-app or picked directly from
+        the eq menu (enter on the bottom bar's eq field while it has
+        focus). Null falls back to eqGains, or flat if that's also
+        unset.
+      '';
+    };
+
+    eqGains = mkOption {
+      type = types.nullOr (types.listOf types.float);
+      default = null;
+      description = ''
+        10 hand-tuned per-band dB gains (31Hz..16000Hz order, -12..12
+        each) for a custom eq, used when eqPreset is null. Must have
+        exactly 10 entries.
+      '';
+    };
   };
 
   config = mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = cfg.eqGains == null || builtins.length cfg.eqGains == 10;
+        message = "programs.wim.eqGains must have exactly 10 entries (one per eq::BAND_HZ band) when set.";
+      }
+    ];
+
     home.packages = [ cfg.package ];
 
     xdg.configFile."wim/config.toml".source = tomlFormat.generate "wim-config.toml" ({
@@ -202,6 +231,10 @@ in
       logo_style = cfg.logoStyle;
     } // lib.optionalAttrs (cfg.keybinds != { }) {
       keybinds = cfg.keybinds;
+    } // lib.optionalAttrs (cfg.eqPreset != null) {
+      eq_preset = cfg.eqPreset;
+    } // lib.optionalAttrs (cfg.eqGains != null) {
+      eq_gains = cfg.eqGains;
     });
   };
 }
