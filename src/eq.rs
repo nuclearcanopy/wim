@@ -60,15 +60,33 @@ pub fn index_of(name: &str) -> Option<usize> {
 /// meter. Doesn't touch the audio itself, purely an analysis tap.
 pub const LEVEL_METADATA_LABEL: &str = "wimlevel";
 
-/// Builds an mpv `af` filter-graph string applying `gains` (dB per
-/// band, `BAND_HZ` order) as a chain of lavfi `equalizer` filters,
-/// plus a labeled `astats` tap at the end for the level meter.
+/// True when no band asks for anything, i.e. the eq has nothing to do
+/// and `build_af_filter` must not emit a single `equalizer` stage (see
+/// its doc for why identity stages are not free).
+pub fn is_flat(gains: &[f64; 10]) -> bool {
+    gains.iter().all(|g| *g == 0.0)
+}
+
+/// Below this the printed `g=` would be inaudible anyway, so the whole
+/// biquad is dropped rather than cascading an identity stage (float
+/// rounding, see `build_af_filter`).
+const MIN_AUDIBLE_DB: f64 = 0.01;
+
+/// Builds an mpv `af` filter-graph string realizing `gains` (dB per
+/// band, `BAND_HZ` order), plus a labeled `astats` tap at the end for
+/// the level meter. A flat eq emits only the tap: ten identity biquads
+/// are not free (they measured ~-77 dB of float rounding residue), and
+/// an `astats`-only graph null-tests bit-transparent.
 pub fn build_af_filter(gains: &[f64; 10]) -> String {
-    let mut stages: Vec<String> = BAND_HZ
-        .iter()
-        .zip(gains.iter())
-        .map(|(hz, g)| format!("equalizer=f={hz}:width_type=o:width=1:g={g}"))
-        .collect();
+    let mut stages: Vec<String> = Vec::with_capacity(BAND_HZ.len() + 1);
+    if !is_flat(gains) {
+        for (hz, g) in BAND_HZ.iter().zip(gains.iter()) {
+            if g.abs() < MIN_AUDIBLE_DB {
+                continue;
+            }
+            stages.push(format!("equalizer=f={hz}:width_type=o:width=1:g={g:.3}"));
+        }
+    }
     stages.push(format!("astats@{LEVEL_METADATA_LABEL}=metadata=1:reset=1"));
     format!("lavfi=[{}]", stages.join(","))
 }
@@ -84,13 +102,12 @@ mod tests {
     }
 
     #[test]
-    fn filter_string_has_one_stage_per_band_in_order() {
+    fn filter_string_emits_bands_low_to_high() {
         let filter = build_af_filter(&PRESETS[1].gains); // bass boost
         assert!(filter.starts_with("lavfi=["));
         assert!(filter.ends_with(']'));
-        assert_eq!(filter.matches("equalizer=f=").count(), 10);
-        // first band (31 Hz) should come before the last (16000 Hz)
-        assert!(filter.find("f=31:").unwrap() < filter.find("f=16000:").unwrap());
+        assert_eq!(filter.matches("equalizer=f=").count(), 4);
+        assert!(filter.find("f=31:").unwrap() < filter.find("f=250:").unwrap());
     }
 
     #[test]
@@ -98,5 +115,48 @@ mod tests {
         for preset in PRESETS {
             assert_eq!(preset.gains.len(), BAND_HZ.len());
         }
+    }
+
+    #[test]
+    fn is_flat_only_accepts_an_untouched_curve() {
+        assert!(is_flat(&[0.0; 10]));
+        assert!(!is_flat(&[
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5
+        ]));
+        assert!(!is_flat(&[
+            -0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        ]));
+    }
+
+    /// A flat eq must not color the sound at all, so it may not emit a
+    /// single biquad; only the level meter's analysis tap, which
+    /// null-tests bit-transparent (see docs/audio-quality.md).
+    #[test]
+    fn flat_gains_emit_only_the_level_meter_tap() {
+        let filter = build_af_filter(&[0.0; 10]);
+        assert!(!filter.contains("equalizer"));
+        assert_eq!(
+            filter,
+            format!("lavfi=[astats@{LEVEL_METADATA_LABEL}=metadata=1:reset=1]")
+        );
+    }
+
+    #[test]
+    fn every_filter_keeps_the_level_meter_tap() {
+        for preset in PRESETS {
+            let filter = build_af_filter(&preset.gains);
+            assert!(filter.contains(&format!("astats@{LEVEL_METADATA_LABEL}=")));
+        }
+    }
+
+    #[test]
+    fn untouched_bands_are_dropped_rather_than_cascaded() {
+        // an identity biquad is not free (float rounding), so a band
+        // left at 0 dB must not reach the graph at all.
+        let mut gains = [0.0; 10];
+        gains[0] = 6.0;
+        let filter = build_af_filter(&gains);
+        assert_eq!(filter.matches("equalizer=f=").count(), 1);
+        assert!(filter.contains("f=31:"));
     }
 }
