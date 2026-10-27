@@ -90,8 +90,13 @@ impl Widget for BrowseListView<'_> {
         }
 
         let has_art = self.view.art.is_some() && self.art_mode != ArtMode::Off;
-        let (art_rect, list_area) =
-            crate::browse::layout(area, has_art, self.view.bio.is_some(), self.cell_aspect);
+        let (art_rect, list_area) = crate::browse::layout(
+            area,
+            has_art,
+            self.view.bio.is_some(),
+            self.view.is_artist,
+            self.cell_aspect,
+        );
         let y = list_area.y;
         if let (Some(rect), ArtMode::Ascii) = (art_rect, self.art_mode) {
             AsciiArt {

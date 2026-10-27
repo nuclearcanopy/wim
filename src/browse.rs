@@ -61,16 +61,59 @@ const BIO_HEIGHT: u16 = BIO_LINES as u16 + 1;
 /// agree with *each other*, but not necessarily with the terminal's
 /// real font metrics, which is what actually made the art look
 /// slightly too tall at some sizes.
-pub fn layout(area: Rect, has_art: bool, has_bio: bool, cell_aspect: f32) -> (Option<Rect>, Rect) {
+pub fn layout(
+    area: Rect,
+    has_art: bool,
+    has_bio: bool,
+    is_artist: bool,
+    cell_aspect: f32,
+) -> (Option<Rect>, Rect) {
     let bio_height = if has_bio { BIO_HEIGHT } else { 0 };
     let y = area.y + HEADER_HEIGHT + bio_height;
     let body_height = (area.y + area.height).saturating_sub(y);
-    // width wants to be `cell_aspect`x height in cells to look square.
-    // Capping width against `area.width / 3` without also shrinking
-    // height the same way left the art rect itself non-square (full
-    // body_height, clipped width); the rect handed to the widget has
-    // to be square first, so height is always re-derived from
-    // whatever width actually ends up being, never kept independently.
+
+    if has_art && !is_artist && body_height > 1 {
+        // Plain album view: cover big across the top, full-width track
+        // list below it, rather than the narrow-side-column split used
+        // for the artist profile. Art gets up to ~60% of the vertical
+        // space as a starting budget, but (same "square first" rule as
+        // below) width is what's actually capped against the pane, and
+        // height is re-derived from that so the art never overflows
+        // sideways or crowds out every row of the track list under it.
+        let budget_height = ((body_height as f32 * 0.6).round() as u16)
+            .min(body_height.saturating_sub(1))
+            .max(1);
+        let art_width = ((budget_height as f32 * cell_aspect).round() as u16)
+            .min(area.width)
+            .max(1);
+        let art_height = ((art_width as f32 / cell_aspect).round() as u16)
+            .max(1)
+            .min(body_height.saturating_sub(1));
+        let art_rect = Some(Rect {
+            x: area.x,
+            y,
+            width: art_width,
+            height: art_height,
+        });
+        let list_y = y + art_height + 1; // gap row between art and list
+        let list_height = (area.y + area.height).saturating_sub(list_y);
+        let list_rect = Rect {
+            x: area.x,
+            y: list_y,
+            width: area.width,
+            height: list_height,
+        };
+        return (art_rect, list_rect);
+    }
+
+    // Artist profile (two columns, no big-art path applies) or no art
+    // at all: original side-by-side split. width wants to be
+    // `cell_aspect`x height in cells to look square. Capping width
+    // against `area.width / 3` without also shrinking height the same
+    // way left the art rect itself non-square (full body_height,
+    // clipped width); the rect handed to the widget has to be square
+    // first, so height is always re-derived from whatever width
+    // actually ends up being, never kept independently.
     let art_width = if has_art && body_height > 0 {
         ((body_height as f32 * cell_aspect).round() as u16)
             .min(area.width / 3)
