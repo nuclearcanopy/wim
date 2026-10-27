@@ -120,7 +120,7 @@ impl Widget for QueueView<'_> {
             area,
             area.y,
             &title,
-            "enter: jump here, esc: close",
+            "enter: jump, d: remove, J/K: move, esc: close",
             shade(DIM),
             shade(NEAR_BLACK),
         );

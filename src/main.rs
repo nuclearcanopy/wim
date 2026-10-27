@@ -4136,6 +4136,49 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        KeyCode::Char('d') => {
+                            if play_queue.remove(queue_selected) {
+                                if let Err(e) = player.playlist_remove(queue_selected) {
+                                    notifications
+                                        .push(Severity::Error, format!("error removing: {e}"));
+                                }
+                                // the cursor keeps its position in the
+                                // list rather than its index, so
+                                // holding 'd' walks down the queue.
+                                let left = play_queue.entries().len();
+                                queue_selected = queue_selected.min(left.saturating_sub(1));
+                            }
+                        }
+                        // reorder is upcoming-only: moving a played
+                        // entry does nothing anyone wants, and in the
+                        // played run the display is reversed, so J
+                        // would visibly move a row the wrong way.
+                        KeyCode::Char('J') | KeyCode::Char('K') => {
+                            let down = key.code == KeyCode::Char('J');
+                            let first_upcoming = play_queue.pos().map_or(0, |p| p + 1);
+                            let last = play_queue.entries().len().saturating_sub(1);
+                            let target = if down {
+                                queue_selected + 1
+                            } else {
+                                queue_selected.saturating_sub(1)
+                            };
+                            if queue_selected < first_upcoming {
+                                notifications
+                                    .push(Severity::Info, "only upcoming tracks can be reordered");
+                            } else if target >= first_upcoming
+                                && target <= last
+                                && target != queue_selected
+                                && play_queue.move_entry(queue_selected, target)
+                            {
+                                if let Err(e) = player.playlist_move(queue_selected, target) {
+                                    notifications
+                                        .push(Severity::Error, format!("error moving: {e}"));
+                                }
+                                // follow the row that moved, not the
+                                // slot it left.
+                                queue_selected = target;
+                            }
+                        }
                         KeyCode::Esc => {
                             queue_view_open = false;
                             focus = Focus::Sidebar;
