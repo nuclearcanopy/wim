@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
@@ -1565,6 +1565,15 @@ fn main() -> anyhow::Result<()> {
             }
 
             if let Event::Key(key) = ev {
+                // the one unconditional quit, regardless of what
+                // modal/menu is open; 'q' still works too but only
+                // where nothing else claims it first (see app.rs),
+                // same as every other single-letter shortcut.
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    save_playback_state(&player, &now_playing, &app.queue);
+                    break;
+                }
+
                 if let Some(ob) = &mut onboarding {
                     match ob.step {
                         Step::Welcome | Step::Controls => ob.advance(),
