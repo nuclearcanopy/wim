@@ -378,8 +378,8 @@ impl Corpus {
         // self-limiting rather than needing a separate "don't leave it
         // empty" guard: the top result's score always clears its own
         // threshold, so the list can never be pruned to nothing, and
-        // when every candidate is in the same (even if low) ballpark —
-        // no single standout match — they're all close enough to the
+        // when every candidate is in the same (even if low) ballpark
+        // (no single standout match) they're all close enough to the
         // top score to clear the cutoff together, so weak guesses
         // still show exactly when there's nothing better on offer.
         if let Some(&(top_score, _)) = scored.first() {
