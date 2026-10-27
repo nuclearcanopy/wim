@@ -157,6 +157,28 @@ in
       description = "Preferred language code for opensubtitles auto-fetch.";
     };
 
+    # same plaintext-vs-file split as opensubtitlesApiKeyFile, same
+    # reason; neither set means scrobbling never runs. the token comes
+    # from listenbrainz.org -> profile -> settings, not a password.
+    listenbrainzUserTokenFile = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      description = "Path to a file containing a ListenBrainz user token. Null disables scrobbling entirely.";
+    };
+
+    scrobble = {
+      thresholdPercent = mkOption {
+        type = types.float;
+        default = 50.0;
+        description = "Percent of a track's duration that must have played before scrobbling (listenbrainz's own convention: half the track). Whichever of this or thresholdSeconds is crossed first wins.";
+      };
+      thresholdSeconds = mkOption {
+        type = types.float;
+        default = 240.0;
+        description = "Seconds of elapsed listening that trigger a scrobble regardless of track length (listenbrainz's own convention: 4 minutes).";
+      };
+    };
+
     logoStyle = mkOption {
       type = types.nullOr types.str;
       default = null;
@@ -189,6 +211,10 @@ in
         color_level = cfg.subtitles.colorLevel;
       };
       subtitle_language = cfg.subtitleLanguage;
+      scrobble = {
+        threshold_percent = cfg.scrobble.thresholdPercent;
+        threshold_seconds = cfg.scrobble.thresholdSeconds;
+      };
       navidrome_servers = map (s: {
         url = s.url;
         username = s.username;
@@ -198,6 +224,8 @@ in
       // lib.optionalAttrs (s.transcodeFormat != null) { transcode_format = s.transcodeFormat; }) cfg.navidromeServers;
     } // lib.optionalAttrs (cfg.opensubtitlesApiKeyFile != null) {
       opensubtitles_api_key_file = toString cfg.opensubtitlesApiKeyFile;
+    } // lib.optionalAttrs (cfg.listenbrainzUserTokenFile != null) {
+      listenbrainz_user_token_file = toString cfg.listenbrainzUserTokenFile;
     } // lib.optionalAttrs (cfg.logoStyle != null) {
       logo_style = cfg.logoStyle;
     } // lib.optionalAttrs (cfg.keybinds != { }) {
