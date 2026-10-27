@@ -3,6 +3,8 @@
 //! we need (ping, search3, playlists, stream urls) is small enough that
 //! owning it directly is simpler than fighting someone else's types.
 
+use std::io::Read;
+
 use md5::{Digest, Md5};
 use rand::Rng;
 use serde::Deserialize;
@@ -314,6 +316,22 @@ impl Client {
             "{}/rest/stream?id={}&u={}&t={}&s={}&v={}&c={}",
             self.base_url, song_id, self.username, token, salt, API_VERSION, CLIENT_NAME
         )
+    }
+
+    /// Raw image bytes for an album's (or song's) cover art; navidrome
+    /// accepts the album id directly as the `getCoverArt` id in the
+    /// common case. Not JSON, so this bypasses `get()` and reads the
+    /// response body straight off the connection.
+    pub fn get_cover_art_bytes(&self, cover_art_id: &str) -> anyhow::Result<Vec<u8>> {
+        let url = format!("{}/rest/getCoverArt", self.base_url);
+        let mut req = self.agent.get(&url);
+        for (k, v) in self.auth_params() {
+            req = req.query(&k, &v);
+        }
+        req = req.query("id", cover_art_id);
+        let mut bytes = Vec::new();
+        req.call()?.into_reader().read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
 }
 
