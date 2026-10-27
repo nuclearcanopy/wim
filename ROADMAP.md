@@ -70,6 +70,15 @@ at it; don't mark it done on build+test passing alone.
       form that looked destructive even though it wasn't. banner swap
       to larry3d (non-isometric, no diagonal letter drift), bracketed
       paste support, url ghost-prefix input all landed alongside this.
+- [x] navidrome reliability pass: corpus mutation now resyncs the
+      displayed results immediately (no more stale list until you
+      happen to type a character), startup reconnect failures are
+      reported instead of silently looking like nothing's configured,
+      remote items dedup by (kind, id) so reconnecting never
+      duplicates the catalog, and the profile manager pings every
+      server up front showing ✓/✗ per row.
+- [x] blinking cursor block in the search box while editing
+      (`src/ui/searchbox.rs`), classic terminal-style ~530ms blink.
 
 ## layout overhaul + artist/album browsing (explicit spec, do these in order; each depends on the one before)
 
@@ -85,12 +94,12 @@ layout. the actual design:
 2. [x] **resize mode** (`src/layout.rs`, tested): `r` toggles it, `a`/`s`
    select sidebar/bottom bar, arrow keys stretch along that panel's
    one valid axis only (the other axis is a genuine no-op per panel).
-3. **result row icons**, one per kind, monochrome (unicode glyphs, not
-   color-coded; color is reserved per the monochrome rule): disc for
-   albums, musical note for songs, a "reel" glyph for video, plus a
-   *source* glyph layered on top; globe for navidrome/remote, folder
-   for local. e.g. an album row reads like
-   `( albumart? ) COLD VISIONS` with a disc glyph and a globe glyph.
+3. [x] **result row icons**, one per kind, monochrome (plain
+   text-presentation unicode glyphs, not emoji pictographs, since
+   those render as fixed-color bitmaps regardless of terminal fg
+   color; not color-coded either, per the monochrome rule): ♪ songs/
+   local music, ▶ video, ◆ artist, ◉ album, ≡ playlist, plus a hollow/
+   filled source glyph (○ remote, ● local) layered alongside.
 4. **artist profile view**: press enter (or a dedicated key) on an
    artist to open a dedicated view, not just play/search. shows: a
    bio (navidrome's own `getArtistInfo2` already proxies one from
