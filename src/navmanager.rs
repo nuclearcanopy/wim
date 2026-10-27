@@ -1,5 +1,5 @@
 //! Navidrome profile management ('n' key): list configured servers,
-//! add a new one, remove one. Adding always appends — it never
+//! add a new one, remove one. Adding always appends; it never
 //! replaces an existing profile, so there's no "did that just erase my
 //! setup?" ambiguity the way a single always-blank login form had.
 

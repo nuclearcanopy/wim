@@ -17,7 +17,7 @@ pub enum Action {
     Quit,
     Play(SearchItem),
     Queued(SearchItem),
-    /// Queue order changed (currently only from shuffle) — caller
+    /// Queue order changed (currently only from shuffle); caller
     /// should resync mpv's own playlist to match this new order,
     /// without disturbing whatever's currently playing.
     QueueReordered(Vec<SearchItem>),
@@ -32,7 +32,7 @@ pub struct App {
     pub results: Vec<SearchItem>,
     pub selected: usize,
     pub editing_query: bool,
-    /// explicit play queue — deliberately *not* auto-populated from
+    /// explicit play queue; deliberately *not* auto-populated from
     /// search results on enter (unlike album-browsing players): in a
     /// search-first ui the "next" search result usually isn't a related
     /// track, so implicitly bulk-queuing them would be surprising. `a`
@@ -65,7 +65,7 @@ impl App {
 
     /// Pops and returns the next queued item, for the caller to actually
     /// hand to mpv on end-of-file (auto-advance). `App` doesn't know
-    /// whether playback succeeds — that's main.rs's concern.
+    /// whether playback succeeds; that's main.rs's concern.
     pub fn pop_queue(&mut self) -> Option<SearchItem> {
         if self.queue.is_empty() {
             None

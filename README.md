@@ -39,7 +39,7 @@ module is exposed as `homeManagerModules.default`:
   imports = [ wim.homeManagerModules.default ];
   programs.wim = {
     enable = true;
-    # a list — every configured server feeds the same unified search,
+    # a list; every configured server feeds the same unified search,
     # no "active server" to switch between. the in-app 'n' profile
     # manager can add more on top of whatever's declared here.
     navidromeServers = [
@@ -55,7 +55,7 @@ module is exposed as `homeManagerModules.default`:
 }
 ```
 
-there's deliberately no plaintext `navidrome.password` option — nix
+there's deliberately no plaintext `navidrome.password` option; nix
 store paths are world-readable, so `passwordFile` (composes with
 agenix/sops-nix) is the only way to set credentials declaratively.
 
@@ -71,18 +71,18 @@ home-manager module instead. `library_paths` defaults to `~/Music` and
 
 vim-like, settled as the app grows; this list is the source of truth.
 
-- `/` — start/edit the live search query
-- `j` / `k` (or down/up) — move selection
-- `gg` / `G` — jump to first/last result
-- `enter` — play the selected result immediately
-- `a` — add the selected result to the queue (doesn't interrupt playback)
-- `l` — toggle loop on the current track
-- `s` — toggle shuffle (reshuffles the current queue immediately)
-- `[` / `]` — speed down/up (0.25x–3x, 0.1x steps)
-- `e` — cycle eq preset (flat/bass boost/vocal boost/treble boost/rock/classical)
-- `L` — fetch and show lyrics for what's currently playing (j/k to scroll, L/esc/q to close)
-- `n` — manage navidrome profiles (list/add/remove; j/k select, enter reconnect/add, d remove)
-- `q` / `esc` — quit
+- `/`; start/edit the live search query
+- `j` / `k` (or down/up); move selection
+- `gg` / `G`; jump to first/last result
+- `enter`; play the selected result immediately
+- `a`; add the selected result to the queue (doesn't interrupt playback)
+- `l`; toggle loop on the current track
+- `s`; toggle shuffle (reshuffles the current queue immediately)
+- `[` / `]`; speed down/up (0.25x–3x, 0.1x steps)
+- `e`; cycle eq preset (flat/bass boost/vocal boost/treble boost/rock/classical)
+- `L`; fetch and show lyrics for what's currently playing (j/k to scroll, L/esc/q to close)
+- `n`; manage navidrome profiles (list/add/remove; j/k select, enter reconnect/add, d remove)
+- `q` / `esc`; quit
 
 the queue auto-advances when the current track ends; nothing plays next
 if the queue is empty.

@@ -15,7 +15,7 @@ playing audio level visualizer, resuming playback state). read
 
 **UX self-check, every single feature, no exceptions:** before calling
 anything done, ask "is this the best UX, intuitive and beautiful?" The
-honest answer is almost always no the first time — that's expected,
+honest answer is almost always no the first time; that's expected,
 not a failure, but it means keep iterating rather than stopping at
 "it compiles and has a test." A feature that works but looks/feels
 barebones is not actually done. This was learned the hard way: a
@@ -23,7 +23,7 @@ whole session's worth of backend work shipped before anyone actually
 looked at the rendered screen, and the first real look was a blank
 void with no onboarding, no indexed library, and a thin unimpressive
 title card. Visual/UX work specifically needs a human to actually look
-at it — don't mark it done on build+test passing alone.
+at it; don't mark it done on build+test passing alone.
 
 **rules for anyone (human or loop) working from this file:**
 - small progressive commits, one coherent change each, lowercase subject,
@@ -33,13 +33,13 @@ at it — don't mark it done on build+test passing alone.
 - strictly monochrome ui: every color is `Color::Rgb(v,v,v)` via
   `src/theme.rs` helpers, never a hue, anywhere, including album art in
   `blocks` mode (real sixel/kitty/iterm2 art can stay true color)
-- no stock ratatui `Block`/`Paragraph`/`List` widgets — custom-painted
+- no stock ratatui `Block`/`Paragraph`/`List` widgets; custom-painted
   widgets only (see `src/ui/banner.rs` for the pattern)
 - can't test raw-mode TUI rendering headlessly (no real tty in CI/loop
-  context) — rely on `cargo build`/`cargo check`/unit tests for logic,
+  context); rely on `cargo build`/`cargo check`/unit tests for logic,
   note in the commit body what still needs a human to eyeball
 - genuinely blocked on a decision only the maintainer can make? don't
-  stop — write it to QUESTIONS.md and move to the next unblocked item
+  stop; write it to QUESTIONS.md and move to the next unblocked item
 
 ## done
 
@@ -52,7 +52,7 @@ at it — don't mark it done on build+test passing alone.
       but unused
 - [x] ui: custom-painted `Banner` widget proving the no-stock-widgets,
       monochrome-gradient, animated approach (later replaced with real
-      figlet isometric1 3d lettering — see below)
+      figlet isometric1 3d lettering; see below)
 - [x] onboarding (`src/onboarding.rs`, `src/ui/onboarding.rs`): real
       guided first-run sequence (welcome/controls/navidrome/library
       paths/done), not a disconnected login popup. config.rs no longer
@@ -64,14 +64,14 @@ at it — don't mark it done on build+test passing alone.
       login now fetches the actual artist/album catalog
       (getArtists/getAlbumList2, checked against Feishin's real
       implementation first) instead of only playlists. config schema
-      is `navidrome_servers: Vec<..>` — multiple servers, all merged
+      is `navidrome_servers: Vec<..>`; multiple servers, all merged
       into one corpus, no "active server" concept. 'n' opens a profile
       manager (list/add/remove), replacing a single always-blank login
       form that looked destructive even though it wasn't. banner swap
       to larry3d (non-isometric, no diagonal letter drift), bracketed
       paste support, url ghost-prefix input all landed alongside this.
 
-## layout overhaul + artist/album browsing (explicit spec, do these in order — each depends on the one before)
+## layout overhaul + artist/album browsing (explicit spec, do these in order; each depends on the one before)
 
 the current single-pane results list is a placeholder, not the real
 layout. the actual design:
@@ -79,27 +79,27 @@ layout. the actual design:
 1. **sidebar + bottom bar layout.** left column: a boxed "search ..."
    input (text replaced once typing starts) with results below it.
    bottom: playback controls (not a one-line status string). the
-   sidebar is a vertical strip — only horizontally resizable. the
-   bottom bar is a horizontal strip — only vertically resizable. this
+   sidebar is a vertical strip; only horizontally resizable. the
+   bottom bar is a horizontal strip; only vertically resizable. this
    has to exist before anything else below makes sense.
 2. **resize mode.** a keybind enters it; wasd selects which panel
    (sidebar/bottom bar/main content), arrow keys stretch the selected
    panel along its one valid axis only (sidebar: left/right arrows
    only; bottom bar: up/down only). esc or the same keybind exits.
 3. **result row icons**, one per kind, monochrome (unicode glyphs, not
-   color-coded — color is reserved per the monochrome rule): disc for
+   color-coded; color is reserved per the monochrome rule): disc for
    albums, musical note for songs, a "reel" glyph for video, plus a
-   *source* glyph layered on top — globe for navidrome/remote, folder
+   *source* glyph layered on top; globe for navidrome/remote, folder
    for local. e.g. an album row reads like
    `( albumart? ) COLD VISIONS` with a disc glyph and a globe glyph.
 4. **artist profile view**: press enter (or a dedicated key) on an
    artist to open a dedicated view, not just play/search. shows: a
    bio (navidrome's own `getArtistInfo2` already proxies one from
-   last.fm, no separate api key needed — use that by default; true
+   last.fm, no separate api key needed; use that by default; true
    genius-sourced bios would need a separate integration, logged in
    QUESTIONS.md as a possible upgrade, not blocking this), albums in
    chronological order, and **every song by that artist across every
-   album including compilations** — see the Global-album problem below.
+   album including compilations**; see the Global-album problem below.
 5. **album view**: spotify-style track listing when you open an album
    from search or from an artist profile.
 6. **the "Global/Various Artists" compilation problem**: the
@@ -108,7 +108,7 @@ layout. the actual design:
    Artists" per navidrome convention. an artist's profile must still
    surface their songs out of that album. the fix: Subsonic's
    `getAlbum(id)` returns each song with its own *track-level* `artist`
-   field, distinct from the album-level artist — when building an
+   field, distinct from the album-level artist; when building an
    artist's song list, don't filter by album artist, filter by each
    song's own artist field. this works for any compilation album, not
    just a hardcoded "Global" special case.
@@ -120,13 +120,13 @@ layout. the actual design:
       official api docs example.
 - [x] local library scanner (`src/library.rs`): walks `config.library_paths`
       (defaulting to `~/Music`/`~/Videos` via `default_library_paths()`
-      when unset — most people shouldn't have to configure paths just
+      when unset; most people shouldn't have to configure paths just
       to get started), classifies by extension, reads audio tags via
       `lofty`.
 - [x] unified search (`src/search.rs`): one corpus over local tracks +
       local video + navidrome artists/albums/songs/playlists, merged
       and ranked together. includes typo tolerance (nucleo subsequence
-      fuzzy + damerau-levenshtein edit-distance fallback) — see
+      fuzzy + damerau-levenshtein edit-distance fallback); see
       `docs/features.md` for why that's not optional.
 - [x] app key-handling state machine (`src/app.rs`): vim-like nav
       (j/k, gg/G, `/` to edit the query live, enter, q/esc), fully
@@ -142,12 +142,12 @@ layout. the actual design:
 - [x] playback controls: loop-file (`l`), speed (`[`/`]`), shuffle (`s`,
       reshuffles the queue in place + randomizes future inserts).
       "avoid immediate repeats" smart-shuffle is more meaningful once
-      there's a "shuffle whole library into queue" feature — not
+      there's a "shuffle whole library into queue" feature; not
       applicable to today's small explicit queue the same way.
 - [x] gapless playback: queue (`a`) now appends to mpv's own native
       playlist instead of us reactively reloading on `end-file`, so mpv
       auto-advances internally with no ipc round-trip gap.
-- [ ] optional crossfade (toggle + duration, off by default) — separate
+- [ ] optional crossfade (toggle + duration, off by default); separate
       from gapless; mpv doesn't do this natively the way it handles
       playlist auto-advance, needs its own mechanism (likely dual
       mpv instances or a scripted volume ramp). see `docs/features.md`.
@@ -155,7 +155,7 @@ layout. the actual design:
       boost/treble boost/rock/classical), `e` cycles. applied via
       chained lavfi `equalizer` filters on mpv's `af` property. preset
       gain values are heuristic starting points, not acoustically
-      tuned — a "custom" user-editable preset is still open.
+      tuned; a "custom" user-editable preset is still open.
 - [ ] now-playing audio level visualizer: animated unicode-block meter
       (think `cava`) fitting the monochrome custom-painted aesthetic
       already established. genuinely loved in the terminal-tool space
@@ -166,7 +166,7 @@ layout. the actual design:
       directions (missing file, gone path, or a failed save are all
       silently fine, not errors).
 - [x] replaygain: mpv reads embedded tags itself once `replaygain=track`
-      is set — enabled by default at startup, no extraction needed on
+      is set; enabled by default at startup, no extraction needed on
       our end for local files. subsonic's replayGain fields for remote
       tracks deferred along with the rest of live navidrome wiring.
 - [ ] transcoding: let navidrome/subsonic transcode server-side per its
@@ -176,18 +176,18 @@ layout. the actual design:
       view/close, j/k to scroll. known gap: blocking fetch on the
       render thread (visible hitch during lookup), and SearchItem
       doesn't carry duration so local lookups always use the fuzzy
-      /search endpoint rather than the exact /get one — both noted
+      /search endpoint rather than the exact /get one; both noted
       inline, not blocking, fine to revisit.
 - [ ] album art (`ratatui-image`): wire the `album_art` config mode
       (auto/blocks/sixel/kitty/iterm2/off). `blocks` must desaturate to
       grayscale to match the monochrome ui; other modes show true color
       since that's real image data, not ui chrome.
 - [ ] video playback + opensubtitles: auto-fetch subs for local video.
-      needs an opensubtitles api key from the maintainer — build the
+      needs an opensubtitles api key from the maintainer; build the
       integration behind a config field, note in QUESTIONS.md that it
       needs a real key to live-test, keep building everything else.
 - [ ] subtitle styling: delay, language, size, outline, background
-      opacity/blur/radius, position — all via mpv `sub-*` properties;
+      opacity/blur/radius, position; all via mpv `sub-*` properties;
       color stays grayscale per the monochrome rule.
 - [x] nix packaging: `packages.<system>.wim` (and `.default`) via
       `rustPlatform.buildRustPackage`. mpv is a runtime subprocess dep

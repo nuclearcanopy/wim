@@ -24,7 +24,7 @@ struct Pending {
 }
 
 /// A running mpv instance controlled over its JSON IPC socket, rather than
-/// linking libmpv directly — keeps the build free of C FFI/pkg-config and
+/// linking libmpv directly; keeps the build free of C FFI/pkg-config and
 /// matches how mpv is normally driven by external controllers.
 pub struct Mpv {
     child: Child,
@@ -165,7 +165,7 @@ impl Mpv {
     }
 
     /// Replaces mpv's entire playlist and plays `path_or_url`
-    /// immediately — for "play this now" (enter), not queuing.
+    /// immediately; for "play this now" (enter), not queuing.
     pub fn load_file(&self, path_or_url: &str) -> Result<()> {
         self.command(&[json!("loadfile"), json!(path_or_url), json!("replace")])?;
         Ok(())
@@ -191,7 +191,7 @@ impl Mpv {
 
     /// `mode`: "no" | "track" | "album". mpv reads replaygain tags
     /// embedded in the file itself (via its own demuxer/decoder) and
-    /// applies the matching gain automatically — we don't need to
+    /// applies the matching gain automatically; we don't need to
     /// extract gain values ourselves for local files.
     pub fn set_replaygain(&self, mode: &str) -> Result<()> {
         self.set_property("replaygain", json!(mode))

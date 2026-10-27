@@ -93,7 +93,7 @@ fn video_track(path: &Path) -> LocalTrack {
 }
 
 /// Standard XDG user dirs (`~/Music`, `~/Videos`), used when the config
-/// doesn't list any explicit `library_paths` — most people keep their
+/// doesn't list any explicit `library_paths`; most people keep their
 /// media in the usual home-folder layout and shouldn't have to configure
 /// paths just to get started.
 pub fn default_library_paths() -> Vec<String> {
@@ -106,7 +106,7 @@ pub fn default_library_paths() -> Vec<String> {
 }
 
 /// Recursively scans each configured library path, returning every music
-/// and video file found. Unreadable tags are not fatal — the file still
+/// and video file found. Unreadable tags are not fatal; the file still
 /// gets indexed with a filename-derived title. Falls back to
 /// `default_library_paths()` when `paths` is empty.
 pub fn scan(paths: &[String]) -> Vec<LocalTrack> {

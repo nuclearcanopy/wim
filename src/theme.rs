@@ -1,5 +1,5 @@
 //! Strictly monochrome palette: every color used anywhere in the UI is a
-//! shade of gray between `#000000` and `#ffffff`. No hues, ever — state
+//! shade of gray between `#000000` and `#ffffff`. No hues, ever; state
 //! (errors, selection, emphasis) is conveyed via brightness, weight, and
 //! modifiers instead of color.
 

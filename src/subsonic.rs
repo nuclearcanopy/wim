@@ -218,7 +218,7 @@ impl Client {
         Ok(list)
     }
 
-    /// The entire artist catalog in one call — `getArtists` (ID3
+    /// The entire artist catalog in one call; `getArtists` (ID3
     /// browsing) returns everything grouped alphabetically by index
     /// letter, unlike album/song listing which is paginated. Matches
     /// how real clients (e.g. Feishin) index artists: flatten every
@@ -229,12 +229,12 @@ impl Client {
     }
 
     /// The entire album catalog, paginated via `getAlbumList2`
-    /// (`offset`/`size`) — unlike artists, album listing has no
+    /// (`offset`/`size`); unlike artists, album listing has no
     /// single-call "everything" mode, so this loops until a page
     /// returns fewer than requested (the standard termination
     /// condition; Navidrome also reports `x-total-count` but that
     /// requires reading response headers, which ureq's `into_json()`
-    /// convenience here doesn't expose — the fewer-than-requested check
+    /// convenience here doesn't expose; the fewer-than-requested check
     /// is sufficient and matches what the spec guarantees).
     pub fn all_albums(&self) -> anyhow::Result<Vec<Album>> {
         const PAGE_SIZE: usize = 500;
@@ -261,7 +261,7 @@ impl Client {
     }
 
     /// Stream url for a song id. Transcoding is left to the server's own
-    /// configured profile by default (no format/bitrate override) — see
+    /// configured profile by default (no format/bitrate override); see
     /// ROADMAP.md.
     pub fn stream_url(&self, song_id: &str) -> String {
         let salt: String = {
@@ -303,7 +303,7 @@ struct SubsonicError {
 }
 
 /// So typing a bare `myserver.com` (no scheme) in the login prompt
-/// actually works instead of silently failing to connect — defaults to
+/// actually works instead of silently failing to connect; defaults to
 /// https, since that's the sane assumption for anything reachable from
 /// outside localhost. Trailing slashes are trimmed either way.
 fn normalize_url(url: &str) -> String {
@@ -317,7 +317,7 @@ fn normalize_url(url: &str) -> String {
 
 /// Pure parsing, pulled out of `all_artists()` so it's testable against
 /// a realistic fixture without a live server. `getArtists` groups
-/// results by alphabetical index letter — flatten every index's
+/// results by alphabetical index letter; flatten every index's
 /// `artist` array into one flat list, same as Feishin's own subsonic
 /// controller does.
 fn parse_artists_index(v: &serde_json::Value) -> Vec<Artist> {
