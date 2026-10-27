@@ -13,6 +13,11 @@ const MIN_SPEED: f64 = 0.25;
 const MAX_SPEED: f64 = 3.0;
 const SPEED_STEP: f64 = 0.1;
 
+/// `#[must_use]`: an action dropped on the floor is a keypress that
+/// silently does nothing, which is exactly how enter-while-typing
+/// stayed broken (see `dispatch_action` in main.rs); make it a
+/// compile error instead of a bug report.
+#[must_use]
 pub enum Action {
     None,
     Quit,
@@ -345,10 +350,56 @@ mod tests {
         let mut app = App::new(corpus);
         app.editing_query = true;
         for c in "matchable".chars() {
-            app.handle_key(KeyCode::Char(c), &keymap);
+            let _ = app.handle_key(KeyCode::Char(c), &keymap);
         }
-        app.handle_key(KeyCode::Enter, &keymap); // exit editing mode
+        let _ = app.handle_key(KeyCode::Enter, &keymap); // exit editing mode
         app
+    }
+
+    /// Same corpus and query as `app_with_three_results`, but left
+    /// mid-typing (`editing_query` still true), which is the state the
+    /// enter/esc tests below are actually about.
+    fn app_still_typing() -> App {
+        let mut app = app_with_three_results();
+        let keymap = Keymap::default();
+        let _ = app.handle_key(KeyCode::Char('/'), &keymap);
+        assert!(app.editing_query);
+        app
+    }
+
+    #[test]
+    fn enter_while_typing_plays_the_highlighted_result() {
+        // the "i search bladee, press enter, nothing happens" bug: this
+        // action exists, it just used to get discarded at the call site.
+        let mut app = app_still_typing();
+        let keymap = Keymap::default();
+        match app.handle_key(KeyCode::Enter, &keymap) {
+            Action::Play(SearchItem::LocalMusic { title, .. }) => {
+                assert_eq!(title, "matchable track 0");
+            }
+            _ => panic!("expected Action::Play"),
+        }
+        assert!(!app.editing_query, "enter also commits the text box");
+    }
+
+    #[test]
+    fn esc_while_typing_cancels_without_touching_the_queue() {
+        let mut app = app_with_three_results();
+        let keymap = Keymap::default();
+        let _ = app.handle_key(KeyCode::Char('a'), &keymap);
+        assert_eq!(app.queue.len(), 1);
+
+        let _ = app.handle_key(KeyCode::Char('/'), &keymap);
+        assert!(matches!(
+            app.handle_key(KeyCode::Esc, &keymap),
+            Action::None
+        ));
+        assert!(!app.editing_query);
+        assert_eq!(
+            app.queue.len(),
+            1,
+            "esc cancels; only enter replaces the playlist, so only enter clears the queue"
+        );
     }
 
     #[test]
@@ -372,7 +423,7 @@ mod tests {
         // typo fallback's edit-distance slack (which got intentionally
         // tightened; see search.rs's `edit_distance_budget`).
         let before = app.query.clone();
-        app.handle_key(KeyCode::Char('/'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('/'), &keymap);
         app.paste_into_query(" track");
         assert_eq!(app.query, format!("{before} track"));
         assert_eq!(
@@ -398,15 +449,15 @@ mod tests {
     fn j_and_k_move_selection_and_clamp_at_bounds() {
         let mut app = app_with_three_results();
         let keymap = Keymap::default();
-        app.handle_key(KeyCode::Char('j'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('j'), &keymap);
         assert_eq!(app.selected, 1);
-        app.handle_key(KeyCode::Char('j'), &keymap);
-        app.handle_key(KeyCode::Char('j'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('j'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('j'), &keymap);
         assert_eq!(
             app.selected, 2,
             "clamps at the last result, doesn't wrap/overflow"
         );
-        app.handle_key(KeyCode::Char('k'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('k'), &keymap);
         assert_eq!(app.selected, 1);
     }
 
@@ -414,10 +465,10 @@ mod tests {
     fn gg_jumps_to_top_g_jumps_to_bottom() {
         let mut app = app_with_three_results();
         let keymap = Keymap::default();
-        app.handle_key(KeyCode::Char('G'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('G'), &keymap);
         assert_eq!(app.selected, 2);
-        app.handle_key(KeyCode::Char('g'), &keymap);
-        app.handle_key(KeyCode::Char('g'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('g'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('g'), &keymap);
         assert_eq!(app.selected, 0);
     }
 
@@ -425,9 +476,9 @@ mod tests {
     fn single_g_then_other_key_does_not_jump() {
         let mut app = app_with_three_results();
         let keymap = Keymap::default();
-        app.handle_key(KeyCode::Char('G'), &keymap); // selected = 2
-        app.handle_key(KeyCode::Char('g'), &keymap);
-        app.handle_key(KeyCode::Char('j'), &keymap); // cancels pending g, moves down instead
+        let _ = app.handle_key(KeyCode::Char('G'), &keymap); // selected = 2
+        let _ = app.handle_key(KeyCode::Char('g'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('j'), &keymap); // cancels pending g, moves down instead
         assert_eq!(
             app.selected, 2,
             "already at bottom; j is clamped, not a stray top-jump"
@@ -450,12 +501,12 @@ mod tests {
     fn enter_clears_the_queue_since_mpvs_whole_playlist_gets_replaced() {
         let mut app = app_with_three_results();
         let keymap = Keymap::default();
-        app.handle_key(KeyCode::Char('a'), &keymap);
-        app.handle_key(KeyCode::Char('j'), &keymap);
-        app.handle_key(KeyCode::Char('a'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('a'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('j'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('a'), &keymap);
         assert_eq!(app.queue.len(), 2);
 
-        app.handle_key(KeyCode::Enter, &keymap);
+        let _ = app.handle_key(KeyCode::Enter, &keymap);
         assert!(
             app.queue.is_empty(),
             "a fresh enter-to-play replaces mpv's whole playlist, so our queue view must match"
@@ -476,7 +527,7 @@ mod tests {
     fn a_enqueues_the_selected_item_without_playing_it() {
         let mut app = app_with_three_results();
         let keymap = Keymap::default();
-        app.handle_key(KeyCode::Char('j'), &keymap); // select track 1
+        let _ = app.handle_key(KeyCode::Char('j'), &keymap); // select track 1
         match app.handle_key(KeyCode::Char('a'), &keymap) {
             Action::Queued(SearchItem::LocalMusic { title, .. }) => {
                 assert_eq!(title, "matchable track 1");
@@ -490,9 +541,9 @@ mod tests {
     fn pop_queue_is_fifo_and_empties_cleanly() {
         let mut app = app_with_three_results();
         let keymap = Keymap::default();
-        app.handle_key(KeyCode::Char('a'), &keymap); // queues track 0
-        app.handle_key(KeyCode::Char('j'), &keymap);
-        app.handle_key(KeyCode::Char('a'), &keymap); // queues track 1
+        let _ = app.handle_key(KeyCode::Char('a'), &keymap); // queues track 0
+        let _ = app.handle_key(KeyCode::Char('j'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('a'), &keymap); // queues track 1
 
         let first = app.pop_queue();
         assert!(
@@ -534,11 +585,11 @@ mod tests {
             matches!(app.handle_key(KeyCode::Char(']'), &keymap), Action::SetSpeed(s) if (s - 1.1).abs() < 1e-9)
         );
         for _ in 0..50 {
-            app.handle_key(KeyCode::Char(']'), &keymap);
+            let _ = app.handle_key(KeyCode::Char(']'), &keymap);
         }
         assert!((app.speed - MAX_SPEED).abs() < 1e-9, "clamped at max speed");
         for _ in 0..100 {
-            app.handle_key(KeyCode::Char('['), &keymap);
+            let _ = app.handle_key(KeyCode::Char('['), &keymap);
         }
         assert!((app.speed - MIN_SPEED).abs() < 1e-9, "clamped at min speed");
     }
@@ -547,14 +598,14 @@ mod tests {
     fn shuffle_preserves_every_queued_item() {
         let mut app = app_with_three_results();
         let keymap = Keymap::default();
-        app.handle_key(KeyCode::Char('a'), &keymap);
-        app.handle_key(KeyCode::Char('j'), &keymap);
-        app.handle_key(KeyCode::Char('a'), &keymap);
-        app.handle_key(KeyCode::Char('j'), &keymap);
-        app.handle_key(KeyCode::Char('a'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('a'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('j'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('a'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('j'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('a'), &keymap);
         assert_eq!(app.queue.len(), 3);
 
-        app.handle_key(KeyCode::Char('s'), &keymap); // shuffle on, reshuffles in place
+        let _ = app.handle_key(KeyCode::Char('s'), &keymap); // shuffle on, reshuffles in place
         assert!(app.shuffle);
         assert_eq!(
             app.queue.len(),
@@ -585,10 +636,10 @@ mod tests {
     fn enqueue_while_shuffled_still_lands_in_the_queue() {
         let mut app = app_with_three_results();
         let keymap = Keymap::default();
-        app.handle_key(KeyCode::Char('a'), &keymap); // one item, shuffle has nothing to reorder yet
-        app.handle_key(KeyCode::Char('s'), &keymap); // shuffle on
-        app.handle_key(KeyCode::Char('j'), &keymap);
-        app.handle_key(KeyCode::Char('a'), &keymap); // enqueue track 1 while shuffled
+        let _ = app.handle_key(KeyCode::Char('a'), &keymap); // one item, shuffle has nothing to reorder yet
+        let _ = app.handle_key(KeyCode::Char('s'), &keymap); // shuffle on
+        let _ = app.handle_key(KeyCode::Char('j'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('a'), &keymap); // enqueue track 1 while shuffled
 
         assert_eq!(app.queue.len(), 2);
         assert!(app.queue.iter().any(
@@ -612,7 +663,7 @@ mod tests {
             assert_eq!(app.eq_preset, expected_idx);
         }
         // one more press wraps back to the first preset (flat)
-        app.handle_key(KeyCode::Char('e'), &keymap);
+        let _ = app.handle_key(KeyCode::Char('e'), &keymap);
         assert_eq!(app.eq_preset, 0);
     }
 }
