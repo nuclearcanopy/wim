@@ -791,6 +791,11 @@ fn main() -> anyhow::Result<()> {
     // tweaks instead of only the ,/. delay-only adjustment.
     let mut subtitle_menu_open = false;
     let mut subtitle_menu_selected: usize = 0;
+    // 'u': the discoverable "where are the app's own settings" home,
+    // covering the whole workspace like the video pane's fullscreen
+    // mode does, never the bottom bar.
+    let mut settings_menu_open = false;
+    let mut settings_menu_selected: usize = 0;
     // left/right cycles through ui::banner::LOGOS while the workspace
     // has focus and the banner is what's showing; '0' resets to the
     // default (index 0, ANSI Shadow). Restored from config by name,
@@ -1273,6 +1278,29 @@ fn main() -> anyhow::Result<()> {
                 );
             }
 
+            // 'u': settings, over the whole workspace (sidebar
+            // included) same as the video pane's fullscreen mode,
+            // never the bottom bar; painted last for the same reason.
+            if settings_menu_open {
+                let art_mode_label = match art_mode {
+                    browse::ArtMode::Ascii => "ascii",
+                    browse::ArtMode::Real => "real",
+                    browse::ArtMode::Off => "off",
+                };
+                let values = [
+                    format!("{art_mode_label} ('i' also cycles this)"),
+                    if crossfade_enabled { "on" } else { "off" }.to_string(),
+                    format!("{:.1}s", cfg.crossfade_seconds),
+                ];
+                f.render_widget(
+                    ui::settings_menu::SettingsMenu {
+                        values: [values[0].as_str(), values[1].as_str(), values[2].as_str()],
+                        selected: settings_menu_selected,
+                    },
+                    top,
+                );
+            }
+
             if show_mini_bar {
                 let item = now_playing.as_ref().expect("show_mini_bar implies Some");
                 let (elapsed_secs, duration_secs, paused) = playback_info(&player);
@@ -1689,6 +1717,54 @@ fn main() -> anyhow::Result<()> {
                 }
                 if key.code == KeyCode::Char('t') {
                     subtitle_menu_open = true;
+                    continue;
+                }
+
+                if settings_menu_open {
+                    match key.code {
+                        KeyCode::Char('u') | KeyCode::Esc => {
+                            settings_menu_open = false;
+                            cfg.crossfade_enabled = crossfade_enabled;
+                            let _ = config::save(&cfg);
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            settings_menu_selected =
+                                (settings_menu_selected + 1) % ui::settings_menu::FIELD_COUNT;
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            settings_menu_selected =
+                                (settings_menu_selected + ui::settings_menu::FIELD_COUNT - 1)
+                                    % ui::settings_menu::FIELD_COUNT;
+                        }
+                        // art mode is a 3-state cycle (ascii -> real
+                        // -> off); both directions step the same way
+                        // 'i' already does, rather than adding a
+                        // second reverse-cycle method just for this.
+                        KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right
+                            if settings_menu_selected == 0 =>
+                        {
+                            art_mode = art_mode.toggle();
+                        }
+                        KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 1 => {
+                            crossfade_enabled = false;
+                            fade_in_started_at = None;
+                            let _ = player.set_volume(base_volume);
+                        }
+                        KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 1 => {
+                            crossfade_enabled = true;
+                        }
+                        KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 2 => {
+                            cfg.crossfade_seconds = (cfg.crossfade_seconds - 0.5).clamp(1.0, 15.0);
+                        }
+                        KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 2 => {
+                            cfg.crossfade_seconds = (cfg.crossfade_seconds + 0.5).clamp(1.0, 15.0);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                if key.code == KeyCode::Char('u') {
+                    settings_menu_open = true;
                     continue;
                 }
 
