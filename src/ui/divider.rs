@@ -47,18 +47,18 @@ impl Widget for HorizontalRule {
 /// Vertical counterpart (`│`), same highlight convention.
 pub struct VerticalRule {
     pub highlighted: bool,
-    /// `(y, color)` pairs where something on the other side (main
-    /// content, e.g. the banner's own internal rules) draws a
-    /// horizontal line that starts right at this divider; drawn as `├`
-    /// there instead of a plain `│`, in the given color rather than
-    /// the rule's own, same reasoning as `HorizontalRule`'s
+    /// `(y, glyph, color)` triples where something on the other side
+    /// (the search box's open right edge, the browse header's own
+    /// internal rule, the banner's rule) meets this divider; drawn as
+    /// `glyph` there instead of a plain `│`, in the given color rather
+    /// than the rule's own, same reasoning as `HorizontalRule`'s
     /// `junctions`: two lines meeting from different widgets don't
     /// connect (or animate in sync) on their own. A static color is
-    /// just `shade(level)` with a fixed level; the banner's junction
-    /// passes its current pulse level instead, so the junction glows
-    /// in lockstep with the animated rule it's joining rather than
-    /// sitting there as the one dead pixel on an otherwise alive line.
-    pub junction_rows: Vec<(u16, ratatui::style::Color)>,
+    /// just `shade(level)` with a fixed level; a caller animating its
+    /// own rule can pass its current pulse level instead, so the
+    /// junction stays in lockstep rather than sitting there as the one
+    /// dead pixel on an otherwise alive line.
+    pub junction_rows: Vec<(u16, char, ratatui::style::Color)>,
 }
 
 impl Widget for VerticalRule {
@@ -68,9 +68,9 @@ impl Widget for VerticalRule {
         }
         let default_color = shade(if self.highlighted { DIM } else { NEAR_BLACK });
         for y in area.y..area.y + area.height {
-            let junction = self.junction_rows.iter().find(|(jy, _)| *jy == y);
+            let junction = self.junction_rows.iter().find(|(jy, _, _)| *jy == y);
             let (ch, color) = match junction {
-                Some((_, color)) => ('├', *color),
+                Some((_, ch, color)) => (*ch, *color),
                 None => ('│', default_color),
             };
             if let Some(cell) = buf.cell_mut((area.x, y)) {
