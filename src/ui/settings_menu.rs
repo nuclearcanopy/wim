@@ -5,8 +5,15 @@ use ratatui::widgets::Widget;
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
 
-pub const FIELD_COUNT: usize = 3;
-pub const FIELD_LABELS: [&str; FIELD_COUNT] = ["album art", "crossfade", "crossfade seconds"];
+pub const FIELD_COUNT: usize = 6;
+pub const FIELD_LABELS: [&str; FIELD_COUNT] = [
+    "album art",
+    "crossfade",
+    "crossfade seconds",
+    "scrobble % threshold",
+    "scrobble seconds threshold",
+    "listenbrainz token",
+];
 
 /// Takes over the whole workspace (sidebar included, never the
 /// bottom bar) the same way the help overlay takes over the whole
@@ -52,7 +59,13 @@ impl Widget for SettingsMenu<'_> {
             y += 1;
         }
         y += 1;
-        draw_line(buf, area, y, "j/k select, h/l adjust", shade(DIM));
+        draw_line(
+            buf,
+            area,
+            y,
+            "j/k select, h/l adjust, enter on 'listenbrainz token' to set/change it",
+            shade(DIM),
+        );
         y += 1;
         draw_line(
             buf,
