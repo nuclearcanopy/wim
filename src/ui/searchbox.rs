@@ -70,9 +70,12 @@ impl Widget for SearchBox<'_> {
         // the placeholder only makes sense when there's nothing typed
         // *and* nothing being typed; once editing starts on an empty
         // query, the cursor alone is the "you're in here" signal, not
-        // placeholder text fighting it for the same cell.
+        // placeholder text fighting it for the same cell. just the
+        // ellipsis, not the word: the label in the border already says
+        // which box this is, so spelling it out again read as the word
+        // "search" twice over.
         let (text, color) = if self.query.is_empty() && !self.editing {
-            ("search...".to_string(), shade(DIM))
+            ("...".to_string(), shade(DIM))
         } else {
             (tail_fit(self.query, inner_width), shade(NEAR_WHITE))
         };
@@ -258,7 +261,7 @@ mod tests {
             24,
             3,
         );
-        assert!(out.contains("search..."));
+        assert!(out.contains("..."));
         assert!(!out.contains('█'));
     }
 
@@ -281,7 +284,7 @@ mod tests {
     fn open_right_edge_leaves_the_border_unterminated() {
         assert_eq!(
             render("", false),
-            ["┌─────────", "│search...", "└─────────"].join("\n")
+            ["┌─────────", "│.........", "└─────────"].join("\n")
         );
     }
 
@@ -291,7 +294,7 @@ mod tests {
     fn closed_right_edge_draws_its_own_corners() {
         assert_eq!(
             render("", true),
-            ["┌────────┐", "│search..│", "└────────┘"].join("\n")
+            ["┌────────┐", "│........│", "└────────┘"].join("\n")
         );
     }
 
