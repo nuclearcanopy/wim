@@ -50,6 +50,21 @@ impl Mpv {
         let child = Command::new("mpv")
             .arg("--idle=yes")
             .arg("--no-terminal")
+            // this is the actual fix for mpv opening its own native
+            // window: `vid` (which track to decode, toggled per-item
+            // in set_vid_for_item) and `vo` (where a decoded frame
+            // gets displayed) are independent. Never setting `vo`
+            // left mpv on its own default (a real gpu/x11/wayland
+            // window) regardless of vid, so video played with a
+            // window popping up right alongside this one even though
+            // nothing ever asked for that; closing that window quits
+            // mpv's whole process, breaking the ipc socket this app
+            // depends on. `--vo=null` discards the frame instead of
+            // displaying it anywhere; `screenshot-raw` (the embedded
+            // video pane's own frame source) still works, since a
+            // screenshot is taken from the decoded/filtered frame,
+            // not from whatever vo would've shown it in.
+            .arg("--vo=null")
             .arg(format!("--input-ipc-server={}", sock_path.display()))
             .stdin(Stdio::null())
             .stdout(Stdio::null())

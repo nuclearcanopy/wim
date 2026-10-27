@@ -54,10 +54,22 @@ impl Widget for BrowseListView<'_> {
             (true, None) => String::new(),
         };
         let title_line = format!("{}{subtitle}", self.view.title);
+        // a plain rule first, continuing the sidebar's own search-box
+        // top border straight across (see main.rs's vdivider junction
+        // at this exact row) rather than letting the title text share
+        // that row and read as crammed against it; the title itself
+        // sits one row lower, where that border used to be visually
+        // adjacent to nothing.
+        for col in 0..area.width {
+            if let Some(cell) = buf.cell_mut((area.x + col, area.y)) {
+                cell.set_char('─');
+                cell.set_fg(shade(NEAR_BLACK));
+            }
+        }
         draw_header(
             buf,
             area,
-            area.y,
+            area.y + 1,
             &title_line,
             "enter: play from here, esc: close",
             shade(DIM),
