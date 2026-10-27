@@ -35,13 +35,14 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Fixed("gg / G"), "jump to top / bottom"),
             (Key::Fixed("enter"), "play / open"),
             (Key::Fixed("esc"), "back / close"),
+            (Key::Fixed("tab"), "enter move mode (focus a pane)"),
             (
-                Key::Fixed("shift+left/right"),
-                "focus sidebar <-> workspace",
+                Key::Fixed("wasd / arrows"),
+                "move mode: focus pane left/down/up/right",
             ),
             (
-                Key::Fixed("shift+down/up"),
-                "focus bottom bar (j/k select, enter tweaks) / back",
+                Key::Fixed("enter / esc"),
+                "move mode: back to interact mode",
             ),
             (Key::Fixed("left/right"), "cycle home screen logo"),
             (Key::Fixed("0"), "reset logo to default"),
