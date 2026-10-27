@@ -11,18 +11,28 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
+/// `observe_property` registration ids. mpv echoes the id back with
+/// every change, but the handler matches on the property name, so
+/// these only have to be distinct from each other.
+const OBS_PLAYLIST_POS: u64 = 1;
+const OBS_IDLE_ACTIVE: u64 = 2;
+
+/// Current index into mpv's own playlist, or -1 when nothing is
+/// loaded; the single source of truth for which track is playing.
+pub const PROP_PLAYLIST_POS: &str = "playlist-pos";
+/// True once mpv has run out of playlist and gone back to idling,
+/// i.e. the queue actually drained. Unambiguous in a way end-of-file
+/// never was: `loadfile replace` emits an end-file for the track it
+/// evicts, but never leaves mpv idle.
+pub const PROP_IDLE_ACTIVE: &str = "idle-active";
+
 /// Property-change and other async events pushed by mpv over the IPC socket.
 #[derive(Debug, Clone)]
 pub enum Event {
-    // reserved for the audio-level visualizer (astats/showvolume
-    // af-metadata polling): nothing calls `observe_property` yet, so
-    // this never actually fires today.
-    #[allow(dead_code)]
     PropertyChange {
         name: String,
         value: Value,
     },
-    EndFile,
     #[allow(dead_code)]
     Other(Value),
 }
@@ -132,9 +142,6 @@ impl Mpv {
                             });
                         }
                     }
-                    Some("end-file") => {
-                        let _ = event_tx.send(Event::EndFile);
-                    }
                     Some(_) => {
                         let _ = event_tx.send(Event::Other(v));
                     }
@@ -193,10 +200,20 @@ impl Mpv {
         Ok(())
     }
 
-    // reserved for the audio-level visualizer; see `Event::PropertyChange`.
-    #[allow(dead_code)]
     pub fn observe_property(&self, id: u64, name: &str) -> Result<()> {
         self.command(&[json!("observe_property"), json!(id), json!(name)])?;
+        Ok(())
+    }
+
+    /// Asks mpv to push `playlist-pos`/`idle-active` changes instead of
+    /// us polling for them, which is what lets the current track be
+    /// resolved from mpv's own state. Registering fires one change
+    /// event per property immediately with its current value, so this
+    /// has to run *after* any startup playback is already loaded or
+    /// the first events describe an mpv that's still idle.
+    pub fn observe_playback(&self) -> Result<()> {
+        self.observe_property(OBS_PLAYLIST_POS, PROP_PLAYLIST_POS)?;
+        self.observe_property(OBS_IDLE_ACTIVE, PROP_IDLE_ACTIVE)?;
         Ok(())
     }
 
@@ -222,6 +239,15 @@ impl Mpv {
     /// rebuilt (e.g. after a shuffle) without interrupting playback.
     pub fn playlist_clear(&self) -> Result<()> {
         self.command(&[json!("playlist-clear")])?;
+        Ok(())
+    }
+
+    /// Moves the entry at `from` so it takes the place of the entry at
+    /// `to`. Only ever called with `from > to` here (a just-appended
+    /// track being dropped back into a shuffled queue), which is the
+    /// case where the moved entry really does end up at index `to`.
+    pub fn playlist_move(&self, from: usize, to: usize) -> Result<()> {
+        self.command(&[json!("playlist-move"), json!(from), json!(to)])?;
         Ok(())
     }
 

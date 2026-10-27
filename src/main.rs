@@ -16,6 +16,7 @@ mod notify;
 mod onboarding;
 mod opensubtitles;
 mod persistence;
+mod playqueue;
 mod search;
 mod subsonic;
 mod term;
@@ -43,6 +44,7 @@ use layout::{PanelLayout, ResizePanel};
 use navmanager::{NavManager, NavManagerStep};
 use notify::{Notifications, Severity};
 use onboarding::{Onboarding, Step};
+use playqueue::{PlayQueue, PosChange};
 use search::SearchItem;
 use theme::{shade, NEAR_BLACK};
 use ui::albumart::AsciiArt;
@@ -623,44 +625,106 @@ fn set_vid_for_item(player: &mpv::Mpv, item: &SearchItem) {
     let _ = player.set_property("vid", vid);
 }
 
-/// Appends `item` to mpv's own playlist (plays immediately if nothing
-/// was already loaded, otherwise queues gaplessly; mpv auto-advances
-/// its own playlist on end-of-file with none of the round-trip gap that
-/// reactively reloading on our end would introduce).
-fn try_enqueue(player: &mpv::Mpv, item: &SearchItem, cache: &Arc<Mutex<CacheIndex>>) -> String {
-    match resolve_playable(item, cache) {
-        Some(path) => match player.playlist_append(&path) {
-            Ok(()) => format!("queued: {}", label(item)),
-            Err(e) => format!("error queuing file: {e}"),
-        },
-        None => "not directly playable (expand via resolve_tracks first)".to_string(),
-    }
+/// Whether a playlist rewrite starts a fresh session (so "loop all"
+/// restarts from it) or just re-lays-out the session already running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionStart {
+    New,
+    Keep,
 }
 
-/// Resyncs mpv's upcoming playlist to `items` (e.g. after a shuffle)
+/// The only way mpv's playlist is ever replaced wholesale: `items[0]`
+/// takes over from whatever was loaded, the rest are appended for
+/// gapless auto-advance, and `queue` is re-pointed at that exact list
+/// so index `i` resolves to `items[i]`. Writing both sides here (and in
+/// `enqueue_track`/`resync_upcoming`) is what keeps the index map
+/// honest; the caller still fires its own track-change hooks for
+/// `items[0]`, since `queue` already knows it is at position 0 and will
+/// report mpv's confirming `playlist-pos` as `Unchanged`.
+fn load_playlist(
+    player: &mpv::Mpv,
+    cache: &Arc<Mutex<CacheIndex>>,
+    queue: &mut PlayQueue,
+    items: Vec<SearchItem>,
+    session: SessionStart,
+) -> (String, bool) {
+    let Some(first) = items.first() else {
+        return ("nothing to play".to_string(), false);
+    };
+    let (status, played) = try_play(player, first, cache);
+    if !played {
+        return (status, false);
+    }
+    for item in &items[1..] {
+        if let Some(path) = resolve_playable(item, cache) {
+            let _ = player.playlist_append(&path);
+        }
+    }
+    match session {
+        SessionStart::New => queue.reset(items),
+        SessionStart::Keep => queue.rebuild(items),
+    }
+    (status, true)
+}
+
+/// Appends `item` to mpv's own playlist and to the index map together
+/// (plays immediately if nothing was loaded, otherwise queues
+/// gaplessly; mpv auto-advances its own playlist with none of the
+/// round-trip gap reloading on our end would introduce). While shuffle
+/// is on the new entry is then moved into a random upcoming slot, which
+/// `App::enqueue` used to do to its own queue copy alone, desyncing it
+/// from mpv's strictly-appended playlist on the spot.
+fn enqueue_track(
+    player: &mpv::Mpv,
+    item: &SearchItem,
+    cache: &Arc<Mutex<CacheIndex>>,
+    queue: &mut PlayQueue,
+    shuffle: bool,
+) -> String {
+    let Some(path) = resolve_playable(item, cache) else {
+        return "not directly playable (expand via resolve_tracks first)".to_string();
+    };
+    if let Err(e) = player.playlist_append(&path) {
+        return format!("error queuing file: {e}");
+    }
+    let appended = queue.append(item.clone(), shuffle);
+    if let Some(to) = appended.moved_to {
+        let _ = player.playlist_move(appended.appended_at, to);
+    }
+    format!("queued: {}", label(item))
+}
+
+/// Resyncs mpv's upcoming playlist to `items` (after a shuffle)
 /// without disturbing whatever's currently playing; mpv's own
-/// `playlist-clear` semantics already preserve the current file.
-fn resync_queue(player: &mpv::Mpv, items: &[SearchItem], cache: &Arc<Mutex<CacheIndex>>) -> String {
+/// `playlist-clear` keeps the current file and drops the rest, so both
+/// sides end up as `[current] + items` at position 0.
+fn resync_upcoming(
+    player: &mpv::Mpv,
+    cache: &Arc<Mutex<CacheIndex>>,
+    queue: &mut PlayQueue,
+    items: Vec<SearchItem>,
+) -> String {
     if let Err(e) = player.playlist_clear() {
         return format!("error resyncing queue: {e}");
     }
-    for item in items {
+    for item in &items {
         if let Some(path) = resolve_playable(item, cache) {
             if let Err(e) = player.playlist_append(&path) {
                 return format!("error resyncing queue: {e}");
             }
         }
     }
+    queue.replace_upcoming(items);
     "shuffled".to_string()
 }
 
 /// Snapshots now-playing/queue/position/volume for next launch to
 /// resume. Best-effort: a failed save just means nothing to resume
 /// next time, not worth surfacing since we're already quitting.
-fn save_playback_state(player: &mpv::Mpv, now_playing: &Option<SearchItem>, queue: &[SearchItem]) {
+fn save_playback_state(player: &mpv::Mpv, queue: &PlayQueue) {
     let state = persistence::PlaybackState {
-        now_playing_path: now_playing.as_ref().and_then(playable_path),
-        queue_paths: queue.iter().filter_map(playable_path).collect(),
+        now_playing_path: queue.current().and_then(playable_path),
+        queue_paths: queue.upcoming().iter().filter_map(playable_path).collect(),
         position_secs: player
             .get_property("time-pos")
             .ok()
@@ -670,14 +734,6 @@ fn save_playback_state(player: &mpv::Mpv, now_playing: &Option<SearchItem>, queu
     let _ = persistence::save(&state);
 }
 
-/// "Back" re-plays whatever was playing before the current track,
-/// putting the interrupted track at the front of the queue so it
-/// picks up right where it would have anyway. Deliberately our own
-/// bookkeeping rather than mpv's `playlist-prev`: that command would
-/// move mpv's playlist-position pointer independently of our own
-/// `app.queue`, desyncing the two; replaying `previous_track` directly
-/// keeps everything flowing through the one path we already control.
-/// Only ever tracks one step back, not a full history.
 /// Bundles everything the auto/manual download paths need to touch:
 /// the shared cache index, the channel to report progress back on,
 /// and the set of track ids currently mid-transfer. One struct instead
@@ -705,27 +761,36 @@ struct TrackChangeCtx<'a, 'b> {
     subtitle_tx: &'a mpsc::Sender<SubtitleReady>,
 }
 
+/// "Back" re-plays whatever was playing before the current track,
+/// putting the interrupted track right behind it so playback picks up
+/// where it would have anyway. Deliberately our own bookkeeping rather
+/// than mpv's `playlist-prev`: the already-played prefix of mpv's
+/// playlist is dropped by every `playlist-clear`, so prev isn't
+/// reliably still there to step back onto. Rebuilding the playlist as
+/// `[prev, interrupted, ...upcoming]` through `load_playlist` keeps
+/// mpv and the index map written together, which inserting into a
+/// separate queue copy (while mpv's own playlist got replaced out from
+/// under it) did not. Only ever one step back, not a full history.
 fn go_to_previous(
     cfg: &config::Config,
     player: &mpv::Mpv,
     notifications: &mut Notifications,
-    now_playing: &mut Option<SearchItem>,
     previous_track: &mut Option<SearchItem>,
-    queue: &mut Vec<SearchItem>,
+    queue: &mut PlayQueue,
     hooks: &mut TrackChangeCtx,
 ) -> String {
     let Some(prev) = previous_track.take() else {
         return "no previous track".to_string();
     };
-    let (status, played) = try_play(player, &prev, hooks.dctx.cache);
+    let mut items = vec![prev.clone()];
+    items.extend(queue.current().cloned());
+    items.extend(queue.upcoming().to_vec());
+    let (status, played) =
+        load_playlist(player, hooks.dctx.cache, queue, items, SessionStart::Keep);
     if played {
-        if let Some(interrupted) = now_playing.take() {
-            queue.insert(0, interrupted);
-        }
         fire_subtitle_fetch(cfg, hooks.subtitle_tx, &prev);
         note_playback_started(&prev, hooks.dctx, notifications);
         start_tracking_playback(cfg, &prev, hooks.scrobble);
-        *now_playing = Some(prev);
     } else {
         *previous_track = Some(prev);
     }
@@ -751,9 +816,10 @@ struct ActionCtx<'a> {
     player: &'a mpv::Mpv,
     app: &'a mut app::App,
     notifications: &'a mut Notifications,
-    now_playing: &'a mut Option<SearchItem>,
+    /// mpv's playlist as an index -> item map; the only queue there is,
+    /// and the only thing "what's playing" is ever read out of.
+    queue: &'a mut PlayQueue,
     previous_track: &'a mut Option<SearchItem>,
-    original_queue: &'a mut Vec<SearchItem>,
     player_minimized: &'a mut bool,
     browse_view: &'a mut Option<browse::BrowseView>,
     real_art_protocol: &'a mut Option<StatefulProtocol>,
@@ -776,7 +842,7 @@ struct ActionCtx<'a> {
 fn dispatch_action(action: Action, ctx: &mut ActionCtx) -> Dispatch {
     match action {
         Action::Quit => {
-            save_playback_state(ctx.player, ctx.now_playing, &ctx.app.queue);
+            save_playback_state(ctx.player, ctx.queue);
             return Dispatch::Quit;
         }
         // albums/playlists/artists open a track-listing view instead
@@ -813,16 +879,12 @@ fn dispatch_action(action: Action, ctx: &mut ActionCtx) -> Dispatch {
                 Ok(tracks) if tracks.is_empty() => ctx
                     .notifications
                     .push(Severity::Info, "nothing to play (empty album or playlist)"),
-                Ok(mut tracks) => {
-                    let first = tracks.remove(0);
-                    let (s, played) = try_play(ctx.player, &first, ctx.cache);
+                Ok(tracks) => {
+                    let first = tracks[0].clone();
+                    let interrupted = ctx.queue.current().cloned();
+                    let (s, played) =
+                        load_playlist(ctx.player, ctx.cache, ctx.queue, tracks, SessionStart::New);
                     if played {
-                        for t in &tracks {
-                            let _ = try_enqueue(ctx.player, t, ctx.cache);
-                        }
-                        *ctx.original_queue = std::iter::once(first.clone())
-                            .chain(tracks.iter().cloned())
-                            .collect();
                         fire_subtitle_fetch(ctx.cfg, ctx.subtitle_tx, &first);
                         let mut dctx = DownloadCtx {
                             cache: ctx.cache,
@@ -832,8 +894,7 @@ fn dispatch_action(action: Action, ctx: &mut ActionCtx) -> Dispatch {
                         };
                         note_playback_started(&first, &mut dctx, ctx.notifications);
                         start_tracking_playback(ctx.cfg, &first, ctx.scrobble);
-                        *ctx.previous_track = ctx.now_playing.replace(first);
-                        ctx.app.queue = tracks;
+                        *ctx.previous_track = interrupted;
                         // a standalone play (not from an open
                         // album/playlist) takes over the full player
                         // by default.
@@ -853,13 +914,12 @@ fn dispatch_action(action: Action, ctx: &mut ActionCtx) -> Dispatch {
             match resolve_tracks(&item) {
                 Ok(tracks) => {
                     for t in &tracks {
-                        let s = try_enqueue(ctx.player, t, ctx.cache);
+                        let s = enqueue_track(ctx.player, t, ctx.cache, ctx.queue, ctx.app.shuffle);
                         if s.starts_with("error") {
                             ctx.notifications.push(Severity::Error, s);
                         }
                     }
                     let n = tracks.len();
-                    ctx.app.queue.extend(tracks);
                     ctx.notifications.push(
                         Severity::Info,
                         if n == 1 {
@@ -872,19 +932,25 @@ fn dispatch_action(action: Action, ctx: &mut ActionCtx) -> Dispatch {
                 Err(msg) => ctx.notifications.push(Severity::Error, msg),
             }
         }
-        Action::QueueReordered(items) => {
-            let msg = resync_queue(ctx.player, &items, ctx.cache);
-            if msg.starts_with("error") {
-                ctx.notifications.push(Severity::Error, msg);
-            } else {
-                *ctx.flash = Some((Field::Shuffle, Instant::now()));
+        Action::ShuffleToggled(on) => {
+            // turning it off leaves the order alone (nothing to put
+            // back); turning it on reshuffles what's still upcoming so
+            // it takes effect now, not only on later additions.
+            if on {
+                let shuffled = ctx.queue.shuffled_upcoming();
+                let msg = resync_upcoming(ctx.player, ctx.cache, ctx.queue, shuffled);
+                if msg.starts_with("error") {
+                    ctx.notifications.push(Severity::Error, msg);
+                    return Dispatch::Continue;
+                }
             }
+            *ctx.flash = Some((Field::Shuffle, Instant::now()));
         }
         Action::SetLoop(mode) => {
             // "loop all" isn't an mpv concept; it's tracked ourselves
-            // (see `original_queue`) and acted on when the queue
-            // empties, not here. mpv only ever needs to know about
-            // single-file loop.
+            // (see `PlayQueue::session`) and acted on once mpv's
+            // playlist drains, not here. mpv only ever needs to know
+            // about single-file loop.
             let mpv_loop = if mode == LoopMode::One { "inf" } else { "no" };
             match ctx.player.set_loop_file(mpv_loop) {
                 Ok(()) => *ctx.flash = Some((Field::Loop, Instant::now())),
@@ -914,12 +980,11 @@ fn dispatch_action(action: Action, ctx: &mut ActionCtx) -> Dispatch {
 }
 
 /// Called every time a remote song actually starts playing (every
-/// `now_playing`-replacing call site threads this through): bumps its
-/// play count and, once that crosses `dctx.listens_threshold`, kicks
-/// off a background download so the track is cached for next time
-/// (see `cache.rs`/`download.rs`). A no-op for local items (never
-/// cached at all) and for anything already cached or already
-/// mid-download.
+/// track-change call site threads this through): bumps its play count
+/// and, once that crosses `dctx.listens_threshold`, kicks off a
+/// background download so the track is cached for next time (see
+/// `cache.rs`/`download.rs`). A no-op for local items (never cached
+/// at all) and for anything already cached or already mid-download.
 ///
 /// This is also the one call site a future scrobble submission
 /// (ListenBrainz, separate work happening elsewhere) would hook into:
@@ -1692,7 +1757,9 @@ fn main() -> anyhow::Result<()> {
     // flight when it happened.
     let mut remote_starred: HashSet<String> = HashSet::new();
 
-    let mut now_playing: Option<SearchItem> = None;
+    // mpv's playlist as an index -> `SearchItem` map; the one queue
+    // there is, and what every "what's playing" read resolves through.
+    let mut play_queue = PlayQueue::default();
     // whatever was playing right before `now_playing` last changed;
     // purely for the player view's "previous: ..." line.
     let mut previous_track: Option<SearchItem> = None;
@@ -1786,11 +1853,6 @@ fn main() -> anyhow::Result<()> {
     // until esc, same modal-ish precedence as lyrics but independent
     // of it (browsing doesn't require anything to already be playing).
     let mut browse_view: Option<browse::BrowseView> = None;
-    // the full track list a play session started with (first track +
-    // everything that got queued alongside it), kept around purely so
-    // "loop all" has something to restart from once `app.queue` drains;
-    // `app.queue` itself is a live, shrinking FIFO, not a fixed list.
-    let mut original_queue: Vec<SearchItem> = Vec::new();
 
     // tracks the last known reachability per server url, so the
     // background sync below only notifies on an actual transition
@@ -1860,7 +1922,14 @@ fn main() -> anyhow::Result<()> {
             .as_deref()
             .and_then(persistence::item_from_path)
         {
-            if try_play(&player, &item, &cache_index).1 {
+            let (_, played) = load_playlist(
+                &player,
+                &cache_index,
+                &mut play_queue,
+                vec![item.clone()],
+                SessionStart::New,
+            );
+            if played {
                 if let Some(pos) = saved.position_secs {
                     let _ = player.seek(pos, false);
                 }
@@ -1873,13 +1942,11 @@ fn main() -> anyhow::Result<()> {
                 };
                 note_playback_started(&item, &mut dctx, &mut notifications);
                 start_tracking_playback(&cfg, &item, &mut scrobble);
-                now_playing = Some(item);
             }
         }
         for queued_path in &saved.queue_paths {
             if let Some(item) = persistence::item_from_path(queued_path) {
-                pending_enqueue.push(item.clone());
-                app.queue.push(item);
+                pending_enqueue.push(item);
             }
         }
         if let Some(vol) = saved.volume {
@@ -1887,6 +1954,17 @@ fn main() -> anyhow::Result<()> {
         }
     }
     trace::mark("playback state restored (queue deferred)");
+
+    // only now that any restored track is already loaded: registering
+    // an observer makes mpv report the property's *current* value
+    // immediately, and doing it before the restore would have the first
+    // `idle-active` describe an mpv that hadn't started playing yet.
+    if let Err(e) = player.observe_playback() {
+        notifications.push(
+            Severity::Error,
+            format!("mpv won't report playback position: {e}"),
+        );
+    }
 
     // the ceiling crossfade's fade-out/fade-in ramps scale against;
     // read back rather than assuming 100, since persistence may have
@@ -1946,6 +2024,12 @@ fn main() -> anyhow::Result<()> {
     let mut first_frame_drawn = false;
     loop {
         notifications.expire();
+        // re-derived every frame and never kept across one: whatever
+        // mpv's last reported `playlist-pos` resolves to. Everything
+        // downstream (title, mini bar, lyrics header, scrobbling)
+        // reads this, so none of them can show a track mpv isn't
+        // actually playing.
+        let mut now_playing = play_queue.current().cloned();
         guard.terminal.draw(|f| {
             let area = f.area();
 
@@ -2217,7 +2301,7 @@ fn main() -> anyhow::Result<()> {
                 let item = now_playing.as_ref().expect("show_full_player implies Some");
                 let (elapsed_secs, duration_secs, paused) = playback_info(&player);
                 let previous_label = previous_track.as_ref().map(label);
-                let next_label = app.queue.first().map(label);
+                let next_label = play_queue.peek_next().map(label);
                 f.render_widget(
                     PlayerView {
                         title: &label(item),
@@ -2443,7 +2527,7 @@ fn main() -> anyhow::Result<()> {
                         Focus::Workspace => "workspace",
                         Focus::BottomBar => "bottom bar",
                     },
-                    queue_len: app.queue.len(),
+                    queue_len: play_queue.upcoming_len(),
                     loop_label: app.loop_mode.label(),
                     shuffle_on: app.shuffle,
                     speed: app.speed,
@@ -2518,71 +2602,103 @@ fn main() -> anyhow::Result<()> {
             first_frame_drawn = true;
             trace::mark("first frame drawn");
             for item in pending_enqueue.drain(..) {
-                let _ = try_enqueue(&player, &item, &cache_index);
+                let _ = enqueue_track(&player, &item, &cache_index, &mut play_queue, app.shuffle);
             }
             trace::mark("mpv playlist refilled");
         }
 
-        // non-blocking: mpv auto-advances its own playlist on
-        // end-of-file (gaplessly); this just keeps our queue *view* in
-        // sync with what mpv already moved past, nothing to load here.
-        if let Ok(mpv::Event::EndFile) = player.events().try_recv() {
-            match app.pop_queue() {
-                Some(next) => {
-                    set_vid_for_item(&player, &next);
-                    fire_subtitle_fetch(&cfg, &subtitle_tx, &next);
+        // mpv is the source of truth for which track is playing, and
+        // these are its push notifications about that (see
+        // `Mpv::observe_playback`). The whole channel is drained, not
+        // one event per frame: mpv emits plenty of events we ignore,
+        // and taking one at a time let them delay the ones we don't.
+        //
+        // the old design counted `end-file` events to guess the
+        // position instead, which is what showed the wrong track: a
+        // `loadfile replace` (any fresh play, or back) emits an
+        // end-file for the track it *evicts*, so starting something new
+        // mid-playback counted a phantom advance and left the display a
+        // track ahead of mpv for the rest of the session.
+        let mut advanced_to: Option<SearchItem> = None;
+        let mut playlist_drained = false;
+        while let Ok(ev) = player.events().try_recv() {
+            let mpv::Event::PropertyChange { name, value } = ev else {
+                continue;
+            };
+            if name == mpv::PROP_PLAYLIST_POS {
+                if let PosChange::Advanced(_) = play_queue.set_pos(value.as_i64().unwrap_or(-1)) {
+                    advanced_to = play_queue.current().cloned();
+                }
+            } else if name == mpv::PROP_IDLE_ACTIVE {
+                playlist_drained = value.as_bool().unwrap_or(false);
+            }
+        }
+
+        if let Some(next) = advanced_to {
+            set_vid_for_item(&player, &next);
+            fire_subtitle_fetch(&cfg, &subtitle_tx, &next);
+            let mut dctx = DownloadCtx {
+                cache: &cache_index,
+                download_tx: &download_tx,
+                downloading: &mut downloading,
+                listens_threshold: cfg.cache_listens_threshold,
+            };
+            note_playback_started(&next, &mut dctx, &mut notifications);
+            start_tracking_playback(&cfg, &next, &mut scrobble);
+            previous_track = now_playing.replace(next);
+            // a track just started: either start it quiet and ramp up
+            // (crossfade on), or make sure it's at full volume
+            // regardless of wherever a fade-out left things (crossfade
+            // just got disabled mid-fade, say).
+            if crossfade_enabled {
+                let _ = player.set_volume(0.0);
+                fade_in_started_at = Some(Instant::now());
+            } else {
+                let _ = player.set_volume(base_volume);
+            }
+        }
+
+        // mpv went back to idling, so its playlist really did run out
+        // (unlike end-of-file, which also fires for a track that just
+        // got replaced). The upcoming-empty check guards against
+        // acting on a stale idle report from before something loaded.
+        if playlist_drained && play_queue.upcoming_len() == 0 {
+            // mpv has no concept of "the session we built", only its
+            // own now-empty playlist; "loop all" replaying from the top
+            // is purely our own bookkeeping (`PlayQueue::session`).
+            let session = play_queue.session().to_vec();
+            if app.loop_mode == LoopMode::All && !session.is_empty() {
+                let first = session[0].clone();
+                let (s, played) = load_playlist(
+                    &player,
+                    &cache_index,
+                    &mut play_queue,
+                    session,
+                    SessionStart::Keep,
+                );
+                if !played {
+                    notifications.push(Severity::Error, s);
+                } else {
+                    fire_subtitle_fetch(&cfg, &subtitle_tx, &first);
                     let mut dctx = DownloadCtx {
                         cache: &cache_index,
                         download_tx: &download_tx,
                         downloading: &mut downloading,
                         listens_threshold: cfg.cache_listens_threshold,
                     };
-                    note_playback_started(&next, &mut dctx, &mut notifications);
-                    start_tracking_playback(&cfg, &next, &mut scrobble);
-                    previous_track = now_playing.replace(next);
-                }
-                // mpv has no concept of "the queue we built", only its
-                // own (now-empty) playlist; "loop all" replaying from
-                // the top is purely our own bookkeeping via
-                // `original_queue`, reloaded the same first-play-then-
-                // enqueue-the-rest way a fresh play does.
-                None if app.loop_mode == LoopMode::All && !original_queue.is_empty() => {
-                    let mut tracks = original_queue.clone().into_iter();
-                    let first = tracks.next().expect("checked non-empty above");
-                    let (s, played) = try_play(&player, &first, &cache_index);
-                    if !played {
-                        notifications.push(Severity::Error, s);
+                    note_playback_started(&first, &mut dctx, &mut notifications);
+                    start_tracking_playback(&cfg, &first, &mut scrobble);
+                    previous_track = now_playing.replace(first);
+                    if crossfade_enabled {
+                        let _ = player.set_volume(0.0);
+                        fade_in_started_at = Some(Instant::now());
                     } else {
-                        let rest: Vec<SearchItem> = tracks.collect();
-                        for t in &rest {
-                            let _ = try_enqueue(&player, t, &cache_index);
-                        }
-                        fire_subtitle_fetch(&cfg, &subtitle_tx, &first);
-                        let mut dctx = DownloadCtx {
-                            cache: &cache_index,
-                            download_tx: &download_tx,
-                            downloading: &mut downloading,
-                            listens_threshold: cfg.cache_listens_threshold,
-                        };
-                        note_playback_started(&first, &mut dctx, &mut notifications);
-                        start_tracking_playback(&cfg, &first, &mut scrobble);
-                        previous_track = now_playing.replace(first);
-                        app.queue = rest;
+                        let _ = player.set_volume(base_volume);
                     }
                 }
-                None => now_playing = None,
-            }
-            // a track just ended; either start the new one quiet and
-            // ramp it up (crossfade on), or make sure it's at full
-            // volume regardless of wherever a fade-out left things
-            // (crossfade just got disabled mid-fade, say).
-            if now_playing.is_some() {
-                if crossfade_enabled {
-                    let _ = player.set_volume(0.0);
-                    fade_in_started_at = Some(Instant::now());
-                } else {
-                    let _ = player.set_volume(base_volume);
-                }
+            } else {
+                play_queue.clear();
+                now_playing = None;
             }
         }
 
@@ -2818,7 +2934,7 @@ fn main() -> anyhow::Result<()> {
                 // where nothing else claims it first (see app.rs),
                 // same as every other single-letter shortcut.
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    save_playback_state(&player, &now_playing, &app.queue);
+                    save_playback_state(&player, &play_queue);
                     break;
                 }
 
@@ -3039,9 +3155,8 @@ fn main() -> anyhow::Result<()> {
                             player: &player,
                             app: &mut app,
                             notifications: &mut notifications,
-                            now_playing: &mut now_playing,
+                            queue: &mut play_queue,
                             previous_track: &mut previous_track,
-                            original_queue: &mut original_queue,
                             player_minimized: &mut player_minimized,
                             browse_view: &mut browse_view,
                             real_art_protocol: &mut real_art_protocol,
@@ -3469,8 +3584,21 @@ fn main() -> anyhow::Result<()> {
                                     }
                                 }
                                 Field::Shuffle => {
-                                    let items = app.toggle_shuffle_and_get_queue();
-                                    let msg = resync_queue(&player, &items, &cache_index);
+                                    // same semantics as the 's' key
+                                    // (`Action::ShuffleToggled`):
+                                    // turning it on reshuffles what's
+                                    // upcoming, turning it off leaves
+                                    // the order alone.
+                                    let mut msg = String::new();
+                                    if app.toggle_shuffle() {
+                                        let shuffled = play_queue.shuffled_upcoming();
+                                        msg = resync_upcoming(
+                                            &player,
+                                            &cache_index,
+                                            &mut play_queue,
+                                            shuffled,
+                                        );
+                                    }
                                     if msg.starts_with("error") {
                                         notifications.push(Severity::Error, msg);
                                     } else {
@@ -3610,14 +3738,16 @@ fn main() -> anyhow::Result<()> {
                                 .iter()
                                 .map(|&i| bv.tracks[i].clone())
                                 .collect();
-                            let mut tracks = session.clone().into_iter();
-                            if let Some(first) = tracks.next() {
-                                let (s, played) = try_play(&player, &first, &cache_index);
+                            if let Some(first) = session.first().cloned() {
+                                let interrupted = play_queue.current().cloned();
+                                let (s, played) = load_playlist(
+                                    &player,
+                                    &cache_index,
+                                    &mut play_queue,
+                                    session,
+                                    SessionStart::New,
+                                );
                                 if played {
-                                    let rest: Vec<SearchItem> = tracks.collect();
-                                    for t in &rest {
-                                        let _ = try_enqueue(&player, t, &cache_index);
-                                    }
                                     fire_subtitle_fetch(&cfg, &subtitle_tx, &first);
                                     let mut dctx = DownloadCtx {
                                         cache: &cache_index,
@@ -3627,9 +3757,7 @@ fn main() -> anyhow::Result<()> {
                                     };
                                     note_playback_started(&first, &mut dctx, &mut notifications);
                                     start_tracking_playback(&cfg, &first, &mut scrobble);
-                                    previous_track = now_playing.replace(first);
-                                    app.queue = rest;
-                                    original_queue = session;
+                                    previous_track = interrupted;
                                     // keep the album/playlist listing
                                     // visible rather than replacing it
                                     // with the full player.
@@ -3863,9 +3991,8 @@ fn main() -> anyhow::Result<()> {
                         &cfg,
                         &player,
                         &mut notifications,
-                        &mut now_playing,
                         &mut previous_track,
-                        &mut app.queue,
+                        &mut play_queue,
                         &mut hooks,
                     );
                     continue;
@@ -3955,9 +4082,8 @@ fn main() -> anyhow::Result<()> {
                         player: &player,
                         app: &mut app,
                         notifications: &mut notifications,
-                        now_playing: &mut now_playing,
+                        queue: &mut play_queue,
                         previous_track: &mut previous_track,
-                        original_queue: &mut original_queue,
                         player_minimized: &mut player_minimized,
                         browse_view: &mut browse_view,
                         real_art_protocol: &mut real_art_protocol,
