@@ -11,6 +11,7 @@ use ratatui::layout::Rect;
 
 use crate::search::SearchItem;
 use crate::subsonic::Client;
+use crate::ui::textfit;
 
 /// Ascii is the "pure-TUI purity" default: a grayscale block
 /// rasterization that stays strictly monochrome and needs nothing
@@ -202,6 +203,9 @@ pub fn bio_rect(area: Rect, has_bio: bool) -> Option<Rect> {
 /// Naive greedy word-wrap, no hyphenation; the last line gets an
 /// ellipsis if there was more text than `max_lines` could hold, same
 /// "truncate rather than overflow" rule as everywhere else in the ui.
+/// Measured in display cells throughout (`textfit`), not bytes: a
+/// cyrillic/CJK bio measured by `str::len` wraps at a third to a half
+/// of the width it was given.
 pub fn wrap_bio(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines: Vec<String> = Vec::new();
@@ -214,9 +218,9 @@ pub fn wrap_bio(text: &str, width: usize, max_lines: usize) -> Vec<String> {
             break;
         }
         let would_be = if current.is_empty() {
-            word.len()
+            textfit::width(word)
         } else {
-            current.len() + 1 + word.len()
+            textfit::width(&current) + 1 + textfit::width(word)
         };
         if would_be > width && !current.is_empty() {
             lines.push(std::mem::take(&mut current));
@@ -236,10 +240,9 @@ pub fn wrap_bio(text: &str, width: usize, max_lines: usize) -> Vec<String> {
 
     if truncated {
         if let Some(last) = lines.last_mut() {
-            let max_chars = width.saturating_sub(1);
-            if last.chars().count() > max_chars {
-                *last = last.chars().take(max_chars).collect();
-            }
+            // always re-fit, not only when it overflows: the '…' has
+            // to fit inside `width` alongside whatever's kept.
+            *last = textfit::truncate_to_width(last, width.saturating_sub(1));
             last.push('…');
         }
     }
@@ -268,14 +271,30 @@ impl BrowseView {
             .collect()
     }
 
-    /// Snaps `selected` onto the nearest still-visible track after
-    /// the filter changes, rather than leaving it pointed at a row
-    /// that's no longer shown at all.
-    pub fn clamp_selection_to_filter(&mut self) {
+    /// Forces `selected` back inside `tracks` *and* onto a row the
+    /// filter actually shows. Call after anything that mutates either
+    /// one: a stale `selected` isn't visible as a stale cursor (the
+    /// draw path falls back to row 0 when it can't find the selected
+    /// index), so enter silently acts on a different track than the
+    /// `>` marker points at.
+    pub fn clamp_selection(&mut self) {
+        if self.tracks.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        self.selected = self.selected.min(self.tracks.len() - 1);
         let visible = self.visible_track_indices();
         if !visible.contains(&self.selected) {
             self.selected = visible.first().copied().unwrap_or(0);
         }
+    }
+
+    /// The one way to replace the track list after construction, so
+    /// the `selected`-stays-in-`tracks` invariant can't be dropped by
+    /// whoever assigns it next.
+    pub fn set_tracks(&mut self, tracks: Vec<SearchItem>) {
+        self.tracks = tracks;
+        self.clamp_selection();
     }
 
     pub fn next(&mut self) {
@@ -323,9 +342,94 @@ pub fn songs_to_items(songs: Vec<crate::subsonic::Song>, client: &Arc<Client>) -
         .collect()
 }
 
+// `pub(crate)` purely so `ui::browse`'s own render tests can reuse
+// these fixtures instead of keeping a second copy of them.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A client that never talks to anything; remote `SearchItem`s all
+    /// carry one, and building it is offline (no ping on construct).
+    pub(crate) fn test_client() -> Arc<Client> {
+        Arc::new(
+            Client::new(&crate::config::NavidromeConfig {
+                url: "https://example.invalid".into(),
+                username: "test".into(),
+                password: Some("pw".into()),
+                password_file: None,
+                max_bitrate_kbps: None,
+                transcode_format: None,
+            })
+            .unwrap(),
+        )
+    }
+
+    pub(crate) fn test_songs(n: usize) -> Vec<SearchItem> {
+        let client = test_client();
+        (0..n)
+            .map(|i| SearchItem::Song {
+                id: format!("song-{i}"),
+                title: format!("song {i}"),
+                artist: "artist".to_string(),
+                album: "album".to_string(),
+                client: client.clone(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn test_view(tracks: Vec<SearchItem>) -> BrowseView {
+        BrowseView {
+            title: "album".to_string(),
+            subtitle: String::new(),
+            year: None,
+            tracks,
+            selected: 0,
+            art: None,
+            bio: None,
+            is_artist: false,
+            albums: Vec::new(),
+            albums_selected: 0,
+            albums_focused: false,
+            filter_query: String::new(),
+            filtering: false,
+            show_track_artist: false,
+        }
+    }
+
+    #[test]
+    fn set_tracks_clamps_selection_into_the_shorter_list() {
+        let mut view = test_view(test_songs(5));
+        view.selected = 4;
+        view.set_tracks(test_songs(3));
+        assert_eq!(
+            view.selected, 2,
+            "selected must stay a valid index into tracks"
+        );
+    }
+
+    #[test]
+    fn set_tracks_resets_selection_when_the_list_empties() {
+        let mut view = test_view(test_songs(5));
+        view.selected = 3;
+        view.set_tracks(Vec::new());
+        assert_eq!(view.selected, 0);
+    }
+
+    #[test]
+    fn clamp_selection_snaps_onto_a_still_visible_filtered_row() {
+        let mut view = test_view(test_songs(5));
+        view.filter_query = "song 3".to_string();
+        view.clamp_selection();
+        assert_eq!(view.selected, 3);
+    }
+
+    #[test]
+    fn clamp_selection_fixes_an_out_of_bounds_index() {
+        let mut view = test_view(test_songs(2));
+        view.selected = 99;
+        view.clamp_selection();
+        assert_eq!(view.selected, 1);
+    }
 
     #[test]
     fn wrap_bio_fits_short_text_on_one_line() {
@@ -348,5 +452,41 @@ mod tests {
     #[test]
     fn wrap_bio_handles_empty_text() {
         assert!(wrap_bio("", 40, 3).is_empty());
+    }
+
+    #[test]
+    fn wrap_bio_measures_cells_not_bytes() {
+        // five cyrillic words, 2 bytes per char: by `str::len` this
+        // would wrap after the first word, by display width all five
+        // fit on one 30-cell line.
+        let lines = wrap_bio("гнев это дар судьбы наш", 30, 3);
+        assert_eq!(lines, vec!["гнев это дар судьбы наш".to_string()]);
+    }
+
+    #[test]
+    fn wrap_bio_keeps_wide_characters_inside_the_width() {
+        // each cjk char is two cells, so three words of three chars
+        // can't share an 8-cell line.
+        let lines = wrap_bio("日本語 音楽家 東京都", 8, 3);
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            assert!(
+                textfit::width(line) <= 8,
+                "line wider than the pane: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_bio_truncation_fits_the_ellipsis_in_cells() {
+        let text = "日本語 音楽家 東京都 作曲家 演奏者";
+        let lines = wrap_bio(text, 8, 2);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].ends_with('…'));
+        assert!(
+            textfit::width(&lines[1]) <= 8,
+            "truncated line wider than the pane: {:?}",
+            lines[1]
+        );
     }
 }
