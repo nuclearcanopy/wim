@@ -1629,10 +1629,14 @@ fn main() -> anyhow::Result<()> {
                 (separator_rect.y, '┤', shade(NEAR_BLACK)),
             ];
             if browse_view.is_some() {
-                // draw_header's rule sits one row below where it's
-                // asked to start, which is always main_content.y here;
-                // static color matching draw_header's own rule_color.
-                junction_rows.push((main_content.y + 1, '├', shade(NEAR_BLACK)));
+                // main_content.y itself is now a plain leading rule
+                // too (see ui/browse.rs), which is exactly what the
+                // existing '┬' junction at that same row (search_rect.y,
+                // above) already assumed was there; draw_header's own
+                // title+rule sits one row further down than it used to
+                // (asked to start at main_content.y + 1), so its rule
+                // lands at + 2, not + 1.
+                junction_rows.push((main_content.y + 2, '├', shade(NEAR_BLACK)));
             }
             // each results-list section header is itself a full-width
             // rule (see ui::results_list::draw_header_row); same
