@@ -11,13 +11,15 @@ mod term;
 mod theme;
 mod ui;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::layout::{Constraint, Layout};
 
 use app::Action;
 use search::SearchItem;
+use ui::banner::Banner;
+use ui::login::{LoginForm, LoginView};
 use ui::lyrics_view::LyricsView;
 use ui::results_list::{label, ResultsList};
 use ui::status::StatusBar;
@@ -109,8 +111,22 @@ fn save_playback_state(player: &mpv::Mpv, now_playing: &Option<SearchItem>, queu
     let _ = persistence::save(&state);
 }
 
+/// What the results list should say instead of rendering nothing when
+/// there's nothing to show — a blank screen with no explanation is a
+/// dead end, never the right default.
+fn empty_results_message(app: &app::App) -> String {
+    if app.corpus.is_empty() {
+        "no local music/video found — check library_paths in config, or set up navidrome (n)"
+            .to_string()
+    } else if app.editing_query && !app.query.is_empty() {
+        format!("no matches for \"{}\"", app.query)
+    } else {
+        format!("{} items indexed — press / to search", app.corpus.len())
+    }
+}
+
 fn main() -> anyhow::Result<()> {
-    let cfg = config::load_or_init()?;
+    let mut cfg = config::load_or_init()?;
 
     let tracks = library::scan(&cfg.library_paths);
     let mut corpus = search::Corpus::new();
@@ -122,7 +138,7 @@ fn main() -> anyhow::Result<()> {
     player.set_replaygain("track")?;
     let mut app = app::App::new(corpus);
     let mut status = format!(
-        "{} local items indexed — / search, j/k move, gg/G jump, enter play, a queue, L lyrics, q quit",
+        "{} local items indexed — / search, j/k move, gg/G jump, enter play, a queue, L lyrics, n navidrome, q quit",
         app.corpus.len()
     );
 
@@ -130,6 +146,12 @@ fn main() -> anyhow::Result<()> {
     let lyrics_client = lyrics::Client::new();
     let mut lyrics_lines: Option<Vec<String>> = None;
     let mut lyrics_scroll: usize = 0;
+
+    // shown automatically on first run instead of requiring a
+    // hand-edited config.toml before the app is even usable; `n`
+    // reopens it later too.
+    let mut login_form: Option<LoginForm> = if cfg.navidrome.is_none() { Some(LoginForm::new()) } else { None };
+    let mut login_message = String::new();
 
     // resuming across restarts is standard in any serious media player;
     // a missing/corrupt state file just means nothing to resume, not an
@@ -154,23 +176,56 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    let start = Instant::now();
     let mut guard = term::TerminalGuard::new()?;
     loop {
         guard.terminal.draw(|f| {
             let area = f.area();
-            let chunks =
-                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+            let chunks = Layout::vertical([
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+            f.render_widget(ui::divider::HorizontalRule, chunks[1]);
 
-            match &lyrics_lines {
-                Some(lines) => {
-                    let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
-                    f.render_widget(LyricsView { lines: &borrowed, scroll: lyrics_scroll }, chunks[0]);
-                }
-                None => {
-                    f.render_widget(
-                        ResultsList { items: &app.results, selected: app.selected },
-                        chunks[0],
-                    );
+            if let Some(form) = &login_form {
+                f.render_widget(LoginView { form, message: &login_message }, chunks[0]);
+            } else {
+                match &lyrics_lines {
+                    Some(lines) => {
+                        let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+                        f.render_widget(LyricsView { lines: &borrowed, scroll: lyrics_scroll }, chunks[0]);
+                    }
+                    None if app.results.is_empty() => {
+                        // nothing to show — the animated title card, not
+                        // a blank void. splitting leaves one line at the
+                        // bottom of the content area for the contextual
+                        // hint (why it's empty / what to do next).
+                        let idle_chunks =
+                            Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
+                                .split(chunks[0]);
+                        let phase = start.elapsed().as_secs_f32() * 0.25;
+                        f.render_widget(Banner { phase }, idle_chunks[0]);
+                        f.render_widget(
+                            StatusBar {
+                                editing_query: app.editing_query,
+                                query: &app.query,
+                                message: &empty_results_message(&app),
+                            },
+                            idle_chunks[1],
+                        );
+                    }
+                    None => {
+                        f.render_widget(
+                            ResultsList {
+                                items: &app.results,
+                                selected: app.selected,
+                                empty_message: &empty_results_message(&app),
+                            },
+                            chunks[0],
+                        );
+                    }
                 }
             }
 
@@ -184,7 +239,7 @@ fn main() -> anyhow::Result<()> {
             );
             f.render_widget(
                 StatusBar { editing_query: app.editing_query, query: &app.query, message: &status_line },
-                chunks[1],
+                chunks[2],
             );
         })?;
 
@@ -207,6 +262,45 @@ fn main() -> anyhow::Result<()> {
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                if let Some(form) = &mut login_form {
+                    match key.code {
+                        KeyCode::Esc => {
+                            login_form = None;
+                            status = "navidrome setup skipped — local files only".to_string();
+                        }
+                        KeyCode::Char(c) => form.current_mut().push(c),
+                        KeyCode::Backspace => {
+                            form.current_mut().pop();
+                        }
+                        KeyCode::Tab => form.next_field(),
+                        KeyCode::Enter if !form.is_last_field() => form.next_field(),
+                        KeyCode::Enter => {
+                            let nav = config::NavidromeConfig {
+                                url: form.url.clone(),
+                                username: form.username.clone(),
+                                password: Some(form.password.clone()),
+                                password_file: None,
+                            };
+                            match subsonic::Client::new(&nav).and_then(|c| c.ping().map(|_| c)) {
+                                Ok(client) => {
+                                    cfg.navidrome = Some(nav);
+                                    let _ = config::save(&cfg);
+                                    if let Ok(playlists) = client.playlists() {
+                                        app.corpus.add_playlists(playlists);
+                                    }
+                                    status = "navidrome connected and saved".to_string();
+                                    login_form = None;
+                                }
+                                Err(e) => {
+                                    login_message = format!("login failed: {e} — esc to skip");
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // lyrics view intercepts input directly rather than going
                 // through App, since scrolling it shouldn't move the
                 // underlying results selection.
@@ -220,6 +314,12 @@ fn main() -> anyhow::Result<()> {
                         }
                         _ => {}
                     }
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('n') {
+                    login_form = Some(LoginForm::new());
+                    login_message.clear();
                     continue;
                 }
 
