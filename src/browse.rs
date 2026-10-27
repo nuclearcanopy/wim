@@ -50,24 +50,33 @@ const BIO_HEIGHT: u16 = BIO_LINES as u16 + 1;
 /// Single source of truth for where the art panel and the track list
 /// each land, so the widget (which draws into them) and main.rs
 /// (which overlays a real image on the same spot in `Real` mode) can
-/// never disagree about where that spot actually is.
-pub fn layout(area: Rect, has_art: bool, has_bio: bool) -> (Option<Rect>, Rect) {
+/// never disagree about where that spot actually is. `cell_aspect` is
+/// the terminal's actual cell height:width ratio (see
+/// `main::cell_aspect`), not a hardcoded guess: using a fixed "2" here
+/// while the widget sampled with a different fixed "2" happened to
+/// agree with *each other*, but not necessarily with the terminal's
+/// real font metrics, which is what actually made the art look
+/// slightly too tall at some sizes.
+pub fn layout(area: Rect, has_art: bool, has_bio: bool, cell_aspect: f32) -> (Option<Rect>, Rect) {
     let bio_height = if has_bio { BIO_HEIGHT } else { 0 };
     let y = area.y + HEADER_HEIGHT + bio_height;
     let body_height = (area.y + area.height).saturating_sub(y);
-    // roughly square given ~2:1 terminal cell aspect: width wants to
-    // be ~2x height in cells. Capping width against `area.width / 3`
-    // without also shrinking height the same way left the art rect
-    // itself non-square (full body_height, clipped width), which is
-    // what actually stretched the art tall regardless of what
-    // AsciiArt's own sampling did; the rect handed to it has to be
-    // square first.
+    // width wants to be `cell_aspect`x height in cells to look square.
+    // Capping width against `area.width / 3` without also shrinking
+    // height the same way left the art rect itself non-square (full
+    // body_height, clipped width); the rect handed to the widget has
+    // to be square first, so height is always re-derived from
+    // whatever width actually ends up being, never kept independently.
     let art_width = if has_art && body_height > 0 {
-        (body_height * 2).min(area.width / 3).max(1)
+        ((body_height as f32 * cell_aspect).round() as u16)
+            .min(area.width / 3)
+            .max(1)
     } else {
         0
     };
-    let art_height = (art_width / 2).max(1).min(body_height);
+    let art_height = ((art_width as f32 / cell_aspect).round() as u16)
+        .max(1)
+        .min(body_height);
     let art_rect = (art_width > 0).then_some(Rect {
         x: area.x,
         y,

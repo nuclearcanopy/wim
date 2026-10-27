@@ -282,6 +282,25 @@ fn initial_art_mode(mode: config::AlbumArtMode) -> browse::ArtMode {
     }
 }
 
+/// Real cell height:width ratio from the terminal's own reported
+/// pixel size, rather than assuming a fixed 2:1; most terminals that
+/// matter here (kitty, alacritty, foot, wezterm, ...) answer this via
+/// the same ioctl crossterm uses, and a fixed guess is exactly what
+/// made album art look slightly too tall at some sizes but not
+/// others, depending how close the real font metrics happened to
+/// land to "2". Falls back to 2.0 when a terminal reports zero pixel
+/// dims (no pixel-size support at all).
+fn cell_aspect() -> f32 {
+    match crossterm::terminal::window_size() {
+        Ok(ws) if ws.width > 0 && ws.height > 0 && ws.columns > 0 && ws.rows > 0 => {
+            let cell_w = ws.width as f32 / ws.columns as f32;
+            let cell_h = ws.height as f32 / ws.rows as f32;
+            (cell_h / cell_w).clamp(1.0, 4.0)
+        }
+        _ => 2.0,
+    }
+}
+
 /// Best-effort, fire-and-forget from the caller's point of view: a
 /// no-op whenever `item` isn't a local video, no api key is
 /// configured, or the search/download fails for any reason (no
@@ -1080,19 +1099,25 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
             } else if let Some(bv) = &browse_view {
+                let aspect = cell_aspect();
                 f.render_widget(
                     BrowseListView {
                         view: bv,
                         favorites: &favorites,
                         remote_starred: &remote_starred,
                         art_mode,
+                        cell_aspect: aspect,
                     },
                     main_content,
                 );
                 if art_mode == browse::ArtMode::Real {
                     if let Some(protocol) = &mut real_art_protocol {
-                        let (art_rect, _) =
-                            browse::layout(main_content, bv.art.is_some(), bv.bio.is_some());
+                        let (art_rect, _) = browse::layout(
+                            main_content,
+                            bv.art.is_some(),
+                            bv.bio.is_some(),
+                            aspect,
+                        );
                         if let Some(rect) = art_rect {
                             f.render_stateful_widget(StatefulImage::default(), rect, protocol);
                         }
