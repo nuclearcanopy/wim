@@ -903,6 +903,15 @@ fn adjust_subtitle_field(sub: &mut config::SubtitleConfig, field: usize, dir: f6
     }
 }
 
+/// Persists config, surfacing a failure instead of swallowing it: a
+/// read-only config dir or a full disk used to mean every setting
+/// silently reverted on the next launch with nothing said about it.
+fn save_config(cfg: &config::Config, notifications: &mut Notifications) {
+    if let Err(e) = config::save(cfg) {
+        notifications.push(Severity::Error, format!("couldn't save settings: {e}"));
+    }
+}
+
 /// Enter on a preset row of the eq menu applies it, same effect as
 /// pressing the bare `CycleEq` key would have for that one preset; a
 /// no-op when `row` is a band row instead, since adjusting those is
@@ -2485,7 +2494,7 @@ fn main() -> anyhow::Result<()> {
                                 match index_navidrome_server(&mut app, &nav) {
                                     Ok(msg) => {
                                         cfg.navidrome_servers.push(nav);
-                                        let _ = config::save(&cfg);
+                                        save_config(&cfg, &mut notifications);
                                         let _ = servers_tx.send(cfg.navidrome_servers.clone());
                                         notifications.push(
                                             Severity::Info,
@@ -2508,7 +2517,7 @@ fn main() -> anyhow::Result<()> {
                                 let token = ob.listenbrainz_token_input.trim().to_string();
                                 if !token.is_empty() {
                                     cfg.listenbrainz_user_token = Some(token);
-                                    let _ = config::save(&cfg);
+                                    save_config(&cfg, &mut notifications);
                                     notifications
                                         .push(Severity::Info, "listenbrainz scrobbling enabled");
                                 }
@@ -2527,7 +2536,7 @@ fn main() -> anyhow::Result<()> {
                             }
                             KeyCode::Enter | KeyCode::Esc => {
                                 cfg.library_paths = ob.library_paths.clone();
-                                let _ = config::save(&cfg);
+                                save_config(&cfg, &mut notifications);
                                 app.corpus = rebuild_corpus(&cfg);
                                 ob.advance();
                             }
@@ -2555,7 +2564,7 @@ fn main() -> anyhow::Result<()> {
                                     if nm.selected < nm.connection_status.len() {
                                         nm.connection_status.remove(nm.selected);
                                     }
-                                    let _ = config::save(&cfg);
+                                    save_config(&cfg, &mut notifications);
                                     nm.selected = nm.selected.min(cfg.navidrome_servers.len());
                                     nm.message = "profile removed (already-indexed items stay until restart)".to_string();
                                 }
@@ -2609,7 +2618,7 @@ fn main() -> anyhow::Result<()> {
                                             format!("connected: {}", nav.url),
                                         );
                                         cfg.navidrome_servers.push(nav);
-                                        let _ = config::save(&cfg);
+                                        save_config(&cfg, &mut notifications);
                                         nm.connection_status.push(Some(true));
                                         nm.selected = cfg.navidrome_servers.len() - 1;
                                         nm.step = NavManagerStep::List;
@@ -2685,7 +2694,7 @@ fn main() -> anyhow::Result<()> {
                         || key.code == keymap.get(KeyAction::OpenSubtitleMenu)
                     {
                         subtitle_menu_open = false;
-                        let _ = config::save(&cfg);
+                        save_config(&cfg, &mut notifications);
                         continue;
                     }
                     match key.code {
@@ -2736,7 +2745,7 @@ fn main() -> anyhow::Result<()> {
                                 let token = settings_token_input.trim().to_string();
                                 cfg.listenbrainz_user_token =
                                     if token.is_empty() { None } else { Some(token) };
-                                let _ = config::save(&cfg);
+                                save_config(&cfg, &mut notifications);
                                 settings_token_editing = false;
                                 settings_token_input.clear();
                             }
@@ -2749,7 +2758,7 @@ fn main() -> anyhow::Result<()> {
                     {
                         settings_menu_open = false;
                         cfg.crossfade_enabled = crossfade_enabled;
-                        let _ = config::save(&cfg);
+                        save_config(&cfg, &mut notifications);
                         continue;
                     }
                     match key.code {
@@ -2841,7 +2850,7 @@ fn main() -> anyhow::Result<()> {
                             Some(eq::PRESETS[app.eq_preset].name.to_string())
                         };
                         cfg.eq_gains = app.eq_gains;
-                        let _ = config::save(&cfg);
+                        save_config(&cfg, &mut notifications);
                         continue;
                     }
                     match key.code {
@@ -2900,7 +2909,7 @@ fn main() -> anyhow::Result<()> {
                                 .filter(|owner| *owner != action);
                             keymap.set(action, key.code);
                             cfg.keybinds = keymap.overrides();
-                            let _ = config::save(&cfg);
+                            save_config(&cfg, &mut notifications);
                         }
                         capturing_key = false;
                         continue;
@@ -2925,12 +2934,12 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Char('0') => {
                             keymap.reset(keymap::ALL_ACTIONS[keybinds_menu_selected]);
                             cfg.keybinds = keymap.overrides();
-                            let _ = config::save(&cfg);
+                            save_config(&cfg, &mut notifications);
                         }
                         KeyCode::Char('R') => {
                             keymap.reset_all();
                             cfg.keybinds = keymap.overrides();
-                            let _ = config::save(&cfg);
+                            save_config(&cfg, &mut notifications);
                         }
                         _ => {}
                     }
@@ -3098,19 +3107,19 @@ fn main() -> anyhow::Result<()> {
                             logo_index = (logo_index + ui::banner::logo_count() - 1)
                                 % ui::banner::logo_count();
                             cfg.logo_style = ui::banner::logo_name(logo_index).map(String::from);
-                            let _ = config::save(&cfg);
+                            save_config(&cfg, &mut notifications);
                             continue;
                         }
                         KeyCode::Right => {
                             logo_index = (logo_index + 1) % ui::banner::logo_count();
                             cfg.logo_style = ui::banner::logo_name(logo_index).map(String::from);
-                            let _ = config::save(&cfg);
+                            save_config(&cfg, &mut notifications);
                             continue;
                         }
                         KeyCode::Char('0') => {
                             logo_index = 0;
                             cfg.logo_style = None;
-                            let _ = config::save(&cfg);
+                            save_config(&cfg, &mut notifications);
                             continue;
                         }
                         _ => {}
