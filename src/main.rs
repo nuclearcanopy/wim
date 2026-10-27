@@ -3159,12 +3159,19 @@ fn main() -> anyhow::Result<()> {
                                     downloading: &mut downloading,
                                     listens_threshold: cfg.cache_listens_threshold,
                                 };
-                                status = trigger_downloads(&item, &mut dctx, &mut notifications);
+                                let _ = trigger_downloads(&item, &mut dctx, &mut notifications);
                             }
                         }
                         _ => handled = false,
                     }
-                    if handled || open_album.is_some() {
+                    // `open_album` deliberately falls *through* to the
+                    // block right below, which is what actually opens
+                    // it; swallowing the key here just because it was
+                    // handled meant enter on an album in the artist
+                    // profile set `open_album` and then immediately
+                    // skipped past the only code that reads it, so
+                    // enter looked completely dead.
+                    if handled && open_album.is_none() {
                         continue;
                     }
                 }
