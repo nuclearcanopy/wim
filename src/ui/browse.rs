@@ -1,8 +1,11 @@
+use std::collections::HashSet;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
 use crate::browse::BrowseView;
+use crate::favorites::Favorites;
 use crate::search::SearchItem;
 use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK};
 use crate::ui::header::draw_header;
@@ -13,6 +16,18 @@ use crate::ui::textfit::truncate_with_ellipsis;
 /// "the main workspace" getting overwritten, not a modal on top of it).
 pub struct BrowseListView<'a> {
     pub view: &'a BrowseView,
+    pub favorites: &'a Favorites,
+    pub remote_starred: &'a HashSet<String>,
+}
+
+fn is_starred(track: &SearchItem, favorites: &Favorites, remote_starred: &HashSet<String>) -> bool {
+    match track {
+        SearchItem::LocalMusic { path, .. } | SearchItem::LocalVideo { path, .. } => {
+            favorites.is_starred(&path.to_string_lossy())
+        }
+        SearchItem::Song { id, .. } => remote_starred.contains(id),
+        SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => false,
+    }
 }
 
 impl Widget for BrowseListView<'_> {
@@ -60,7 +75,8 @@ impl Widget for BrowseListView<'_> {
                 SearchItem::Song { title, artist, .. } => format!("{title} · {artist}"),
                 _ => String::new(),
             };
-            let line = format!("{marker}{:>2}. {label}", idx + 1);
+            let star = if is_starred(track, self.favorites, self.remote_starred) { "* " } else { "" };
+            let line = format!("{marker}{:>2}. {star}{label}", idx + 1);
             draw_line(
                 buf,
                 area,

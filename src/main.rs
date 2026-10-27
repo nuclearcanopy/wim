@@ -2,6 +2,7 @@ mod app;
 mod browse;
 mod config;
 mod eq;
+mod favorites;
 mod layout;
 mod library;
 mod lyrics;
@@ -16,7 +17,7 @@ mod term;
 mod theme;
 mod ui;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread;
@@ -25,7 +26,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::layout::{Constraint, Layout, Rect};
 
-use app::Action;
+use app::{Action, LoopMode};
 use layout::{PanelLayout, ResizePanel};
 use navmanager::{NavManager, NavManagerStep};
 use notify::{Notifications, Severity};
@@ -118,6 +119,59 @@ fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
         }
         _ => unreachable!("open_browse_view only called for Album/Playlist"),
     }
+}
+
+/// Local files flip the persisted favorites set; remote songs call
+/// navidrome's own star/unstar so it stays in sync with any other
+/// subsonic client hitting the same server. Returns the new state.
+fn toggle_star(
+    item: &SearchItem,
+    favorites: &mut favorites::Favorites,
+    remote_starred: &mut HashSet<String>,
+) -> Result<bool, String> {
+    match item {
+        SearchItem::LocalMusic { path, .. } | SearchItem::LocalVideo { path, .. } => {
+            let now_starred = favorites.toggle(&path.to_string_lossy());
+            let _ = favorites::save(favorites);
+            Ok(now_starred)
+        }
+        SearchItem::Song { id, client, .. } => {
+            if remote_starred.contains(id) {
+                client.unstar(id).map_err(|e| format!("couldn't unstar: {e}"))?;
+                remote_starred.remove(id);
+                Ok(false)
+            } else {
+                client.star(id).map_err(|e| format!("couldn't star: {e}"))?;
+                remote_starred.insert(id.clone());
+                Ok(true)
+            }
+        }
+        SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => {
+            Err("only tracks can be starred".to_string())
+        }
+    }
+}
+
+/// Starred songs browsed the same way an album is: merges every
+/// configured server's own starred list with local favorites into one
+/// `BrowseView`. Fetched fresh on open rather than cached, same as
+/// opening an album, so it can't go stale.
+fn open_starred_view(servers: &[config::NavidromeConfig], favorites: &favorites::Favorites) -> browse::BrowseView {
+    let mut tracks = Vec::new();
+    for nav in servers {
+        if let Ok(client) = subsonic::Client::new(nav) {
+            if let Ok(songs) = client.get_starred_songs() {
+                let client = Arc::new(client);
+                tracks.extend(browse::songs_to_items(songs, &client));
+            }
+        }
+    }
+    for path in favorites.paths() {
+        if let Some(item) = persistence::item_from_path(path) {
+            tracks.push(item);
+        }
+    }
+    browse::BrowseView { title: "starred songs".to_string(), subtitle: String::new(), year: None, tracks, selected: 0 }
 }
 
 /// (artist, title, album) for a lyrics lookup; only meaningful for
@@ -352,9 +406,15 @@ fn main() -> anyhow::Result<()> {
     player.set_replaygain("track")?;
     let mut app = app::App::new(corpus);
     let mut status = format!(
-        "{} local items indexed | / search, j/k move, gg/G jump, enter play, a queue, L lyrics, n navidrome, q quit",
+        "{} local items indexed | / search, j/k move, gg/G jump, enter play, a queue, * star, S starred, L lyrics, n navidrome, q quit",
         app.corpus.len()
     );
+
+    let mut favorites = favorites::load();
+    // song ids this session knows are starred, across every configured
+    // server; populated at startup and kept current on every manual
+    // toggle (not re-fetched constantly, starring is low-frequency).
+    let mut remote_starred: HashSet<String> = HashSet::new();
 
     let mut now_playing: Option<SearchItem> = None;
     let mut notifications = Notifications::default();
@@ -365,6 +425,11 @@ fn main() -> anyhow::Result<()> {
     // until esc, same modal-ish precedence as lyrics but independent
     // of it (browsing doesn't require anything to already be playing).
     let mut browse_view: Option<browse::BrowseView> = None;
+    // the full track list a play session started with (first track +
+    // everything that got queued alongside it), kept around purely so
+    // "loop all" has something to restart from once `app.queue` drains;
+    // `app.queue` itself is a live, shrinking FIFO, not a fixed list.
+    let mut original_queue: Vec<SearchItem> = Vec::new();
 
     // connect every configured server on startup; all of them feed
     // the same unified corpus, there's no "active server" concept to
@@ -410,6 +475,14 @@ fn main() -> anyhow::Result<()> {
     let (sync_tx, sync_rx) = mpsc::channel::<BackgroundSyncResult>();
     let (servers_tx, servers_rx) = mpsc::channel::<Vec<config::NavidromeConfig>>();
     spawn_background_sync(cfg.navidrome_servers.clone(), sync_tx, servers_rx);
+
+    for nav in &cfg.navidrome_servers {
+        if let Ok(client) = subsonic::Client::new(nav) {
+            if let Ok(songs) = client.get_starred_songs() {
+                remote_starred.extend(songs.into_iter().map(|s| s.id));
+            }
+        }
+    }
 
     // 'n' opens the profile manager standalone, later.
     let mut nav_manager: Option<NavManager> = None;
@@ -560,12 +633,17 @@ fn main() -> anyhow::Result<()> {
                     items: &app.results,
                     selected: app.selected,
                     empty_message: &empty_results_message(&app),
+                    favorites: &favorites,
+                    remote_starred: &remote_starred,
                 },
                 sidebar_rows[1],
             );
 
             match &browse_view {
-                Some(bv) => f.render_widget(BrowseListView { view: bv }, main_content),
+                Some(bv) => f.render_widget(
+                    BrowseListView { view: bv, favorites: &favorites, remote_starred: &remote_starred },
+                    main_content,
+                ),
                 None => match &lyrics_lines {
                     Some(lines) => {
                         let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -589,7 +667,7 @@ fn main() -> anyhow::Result<()> {
                 ControlsBar {
                     status: &status,
                     queue_len: app.queue.len(),
-                    loop_on: app.loop_file,
+                    loop_label: app.loop_mode.label(),
                     shuffle_on: app.shuffle,
                     speed: app.speed,
                     eq_preset: eq::PRESETS[app.eq_preset].name,
@@ -608,6 +686,25 @@ fn main() -> anyhow::Result<()> {
                 Some(next) => {
                     let s = format!("now playing: {}", label(&next));
                     now_playing = Some(next);
+                    s
+                }
+                // mpv has no concept of "the queue we built", only its
+                // own (now-empty) playlist; "loop all" replaying from
+                // the top is purely our own bookkeeping via
+                // `original_queue`, reloaded the same first-play-then-
+                // enqueue-the-rest way a fresh play does.
+                None if app.loop_mode == LoopMode::All && !original_queue.is_empty() => {
+                    let mut tracks = original_queue.clone().into_iter();
+                    let first = tracks.next().expect("checked non-empty above");
+                    let (s, played) = try_play(&player, &first);
+                    if played {
+                        let rest: Vec<SearchItem> = tracks.collect();
+                        for t in &rest {
+                            let _ = try_enqueue(&player, t);
+                        }
+                        now_playing = Some(first);
+                        app.queue = rest;
+                    }
                     s
                 }
                 None => {
@@ -808,8 +905,12 @@ fn main() -> anyhow::Result<()> {
                     // that happens to also work the "wrong" way.
                     match (panels.resize_selected, key.code) {
                         (_, KeyCode::Char('r') | KeyCode::Esc) => panels.toggle_resize_mode(),
-                        (_, KeyCode::Char('a')) => panels.select(ResizePanel::Sidebar),
-                        (_, KeyCode::Char('s')) => panels.select(ResizePanel::BottomBar),
+                        // wasd selects between panels (w/a -> sidebar,
+                        // s/d -> bottom bar); only two panels exist
+                        // today so this is a 2-way split of a 4-way
+                        // scheme, ready for whenever a third shows up.
+                        (_, KeyCode::Char('a' | 'w')) => panels.select(ResizePanel::Sidebar),
+                        (_, KeyCode::Char('s' | 'd')) => panels.select(ResizePanel::BottomBar),
                         (ResizePanel::Sidebar, KeyCode::Left) => panels.shrink(),
                         (ResizePanel::Sidebar, KeyCode::Right) => panels.grow(),
                         (ResizePanel::BottomBar, KeyCode::Up) => panels.grow(),
@@ -834,7 +935,8 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Char('j') | KeyCode::Down => bv.next(),
                         KeyCode::Char('k') | KeyCode::Up => bv.prev(),
                         KeyCode::Enter => {
-                            let mut tracks = bv.tracks[bv.selected..].to_vec().into_iter();
+                            let session: Vec<SearchItem> = bv.tracks[bv.selected..].to_vec();
+                            let mut tracks = session.clone().into_iter();
                             if let Some(first) = tracks.next() {
                                 let (s, played) = try_play(&player, &first);
                                 if played {
@@ -844,10 +946,23 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     now_playing = Some(first);
                                     app.queue = rest;
+                                    original_queue = session;
                                 } else {
                                     notifications.push(Severity::Error, s.clone());
                                 }
                                 status = s;
+                            }
+                        }
+                        KeyCode::Char('*') => {
+                            if let Some(item) = bv.tracks.get(bv.selected).cloned() {
+                                status = match toggle_star(&item, &mut favorites, &mut remote_starred) {
+                                    Ok(true) => "starred".to_string(),
+                                    Ok(false) => "unstarred".to_string(),
+                                    Err(msg) => {
+                                        notifications.push(Severity::Error, msg.clone());
+                                        msg
+                                    }
+                                };
                             }
                         }
                         KeyCode::Esc | KeyCode::Char('q') => browse_view = None,
@@ -881,6 +996,30 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     nav_manager = Some(nm);
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('S') {
+                    browse_view = Some(open_starred_view(&cfg.navidrome_servers, &favorites));
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('*') {
+                    // the browse-view case is handled inside its own
+                    // intercept above; this only ever runs when
+                    // nothing's being browsed, so it's always the
+                    // selected search result.
+                    status = match app.results.get(app.selected).cloned() {
+                        Some(item) => match toggle_star(&item, &mut favorites, &mut remote_starred) {
+                            Ok(true) => "starred".to_string(),
+                            Ok(false) => "unstarred".to_string(),
+                            Err(msg) => {
+                                notifications.push(Severity::Error, msg.clone());
+                                msg
+                            }
+                        },
+                        None => "nothing selected".to_string(),
+                    };
                     continue;
                 }
 
@@ -948,6 +1087,7 @@ fn main() -> anyhow::Result<()> {
                                         let _ = try_enqueue(&player, t);
                                     }
                                     let rest = tracks.len();
+                                    original_queue = std::iter::once(first.clone()).chain(tracks.iter().cloned()).collect();
                                     now_playing = Some(first);
                                     app.queue = tracks;
                                     if rest == 0 { s } else { format!("{s} (+{rest} more queued)") }
@@ -980,9 +1120,14 @@ fn main() -> anyhow::Result<()> {
                         };
                     }
                     Action::QueueReordered(items) => status = resync_queue(&player, &items),
-                    Action::SetLoop(on) => {
-                        status = match player.set_loop_file(if on { "inf" } else { "no" }) {
-                            Ok(()) => format!("loop: {}", if on { "on" } else { "off" }),
+                    Action::SetLoop(mode) => {
+                        // "loop all" isn't an mpv concept; it's tracked
+                        // ourselves (see `original_queue`) and acted on
+                        // when the queue empties, not here. mpv only
+                        // ever needs to know about single-file loop.
+                        let mpv_loop = if mode == LoopMode::One { "inf" } else { "no" };
+                        status = match player.set_loop_file(mpv_loop) {
+                            Ok(()) => format!("loop: {}", mode.label()),
                             Err(e) => format!("error setting loop: {e}"),
                         };
                     }

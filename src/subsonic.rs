@@ -214,6 +214,25 @@ impl Client {
         Ok(parse_song_array(v.get("playlist").and_then(|p| p.get("entry"))))
     }
 
+    pub fn star(&self, id: &str) -> anyhow::Result<()> {
+        self.get("star", &[("id", id)])?;
+        Ok(())
+    }
+
+    pub fn unstar(&self, id: &str) -> anyhow::Result<()> {
+        self.get("unstar", &[("id", id)])?;
+        Ok(())
+    }
+
+    /// Every song this server has starred; used both to know which
+    /// rows should show the star marker and to populate the "starred
+    /// songs" browse view (which behaves like any other track
+    /// listing, just sourced from here instead of one album).
+    pub fn get_starred_songs(&self) -> anyhow::Result<Vec<Song>> {
+        let v = self.get("getStarred2", &[])?;
+        Ok(parse_song_array(v.get("starred2").and_then(|s| s.get("song"))))
+    }
+
     pub fn playlists(&self) -> anyhow::Result<Vec<Playlist>> {
         let v = self.get("getPlaylists", &[])?;
         let list = v

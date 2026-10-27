@@ -1,7 +1,10 @@
+use std::collections::HashSet;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
+use crate::favorites::Favorites;
 use crate::search::SearchItem;
 use crate::theme::{shade, BRIGHT, DIM};
 use crate::ui::textfit::truncate_with_ellipsis;
@@ -45,6 +48,36 @@ pub(crate) fn label(item: &SearchItem) -> String {
     }
 }
 
+/// Same as `label`, but the artist/album metadata only shows on the
+/// hovered (selected) row; everywhere else just the bare title, so a
+/// long results list doesn't read as a wall of repeated artist names.
+fn row_label(item: &SearchItem, hovered: bool) -> String {
+    if hovered {
+        return label(item);
+    }
+    match item {
+        SearchItem::LocalMusic { title, .. } => title.clone(),
+        SearchItem::LocalVideo { title, .. } => title.clone(),
+        SearchItem::Artist { name, .. } => name.clone(),
+        SearchItem::Album { name, .. } => name.clone(),
+        SearchItem::Song { title, .. } => title.clone(),
+        SearchItem::Playlist { name, .. } => name.clone(),
+    }
+}
+
+/// Only tracks are starrable (see `main.rs::is_starred`); this is a
+/// display-only mirror of that same check, since the widget only gets
+/// the raw favorites/remote-starred state, not the logic that owns it.
+fn is_starred(item: &SearchItem, favorites: &Favorites, remote_starred: &HashSet<String>) -> bool {
+    match item {
+        SearchItem::LocalMusic { path, .. } | SearchItem::LocalVideo { path, .. } => {
+            favorites.is_starred(&path.to_string_lossy())
+        }
+        SearchItem::Song { id, .. } => remote_starred.contains(id),
+        SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => false,
+    }
+}
+
 /// Custom-painted results list: no stock `List` widget. Each row is
 /// `[kind] label`, the selected row rendered near-white, others dim, and
 /// the window scrolls to keep the selection visible without wrapping.
@@ -56,6 +89,8 @@ pub struct ResultsList<'a> {
     pub items: &'a [SearchItem],
     pub selected: usize,
     pub empty_message: &'a str,
+    pub favorites: &'a Favorites,
+    pub remote_starred: &'a HashSet<String>,
 }
 
 impl Widget for ResultsList<'_> {
@@ -96,8 +131,13 @@ impl Widget for ResultsList<'_> {
 
             let fg = if is_selected { shade(BRIGHT) } else { shade(DIM) };
             let marker = if is_selected { "> " } else { "  " };
-            let full =
-                format!("{marker}[{}{}] {}", source_code(item), kind_code(item), label(item));
+            let star = if is_starred(item, self.favorites, self.remote_starred) { "* " } else { "" };
+            let full = format!(
+                "{marker}[{}{}] {star}{}",
+                source_code(item),
+                kind_code(item),
+                row_label(item, is_selected)
+            );
             let text = truncate_with_ellipsis(&full, area.width as usize);
 
             for (col, ch) in text.chars().enumerate() {
