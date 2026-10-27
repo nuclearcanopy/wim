@@ -11,17 +11,20 @@
 //! learn, not easier.
 //!
 //! Switching focus between the sidebar/workspace/bottom bar is the
-//! same kind of fixed convention, not a named command either: it's
-//! shift+arrows, directional (which neighboring pane a direction
-//! leads to, sway/i3-style, not three unrelated "go to X" bindings
-//! that are easy to mix up and give no sense of layout), handled
-//! directly in `main.rs` rather than through this keymap. A first
-//! attempt at three separate absolute `KeyAction`s for this
-//! (focus_sidebar/focus_workspace/focus_bottom_bar, each its own
-//! unrelated letter) was hard to actually learn: nothing about
-//! "focus_bottom_bar is shift+w" tells you anything about where the
-//! bottom bar *is* relative to wherever you already are, which is
-//! the whole point of a directional scheme.
+//! same kind of fixed convention, not a named command either: `tab`
+//! enters move mode, where wasd/arrows move focus directionally
+//! (sway/i3-style, so a direction tells you where you'll end up) and
+//! nothing else responds. Handled directly in `main.rs` via
+//! `InputMode`, not through this keymap. Two earlier attempts are
+//! worth not repeating: three absolute `KeyAction`s
+//! (focus_sidebar/focus_workspace/focus_bottom_bar, each an unrelated
+//! letter) taught you nothing about the layout, and plain
+//! shift+direction moved focus with no indication it had, so the next
+//! keypress landed somewhere unexpected.
+//!
+//! `reserved_key_purpose` is the machine-readable form of all of the
+//! above: a binding onto one of those keys is refused rather than
+//! silently shadowed at runtime.
 
 use std::collections::HashMap;
 
@@ -239,6 +242,25 @@ pub fn key_label(key: KeyCode) -> String {
     key_to_name(key).unwrap_or_else(|| "?".to_string())
 }
 
+/// What a key is permanently used for, if it's one of the fixed
+/// navigation conventions rather than a remappable action. These are
+/// checked before every input handler that consults the keymap, so an
+/// action bound to one of them would simply never fire; refusing the
+/// binding and saying why beats a key that silently does nothing.
+pub fn reserved_key_purpose(key: KeyCode) -> Option<&'static str> {
+    Some(match key {
+        KeyCode::Char('j') | KeyCode::Char('k') => "move selection",
+        KeyCode::Char('g') | KeyCode::Char('G') => "jump to top / bottom",
+        KeyCode::Char('K') => "the remap menu itself",
+        KeyCode::Enter => "play / open",
+        KeyCode::Esc => "back / close",
+        KeyCode::Tab => "move mode",
+        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => "navigation",
+        KeyCode::Backspace => "editing a query",
+        _ => return None,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct Keymap {
     bindings: HashMap<KeyAction, KeyCode>,
@@ -263,7 +285,13 @@ impl Keymap {
         for action in ALL_ACTIONS {
             if let Some(name) = overrides.get(action.name()) {
                 if let Some(key) = name_to_key(name) {
-                    map.bindings.insert(*action, key);
+                    // a key the fixed conventions already own would be
+                    // shadowed by them at runtime, leaving the action
+                    // permanently unreachable with nothing to explain
+                    // why; keep the default instead.
+                    if reserved_key_purpose(key).is_none() {
+                        map.bindings.insert(*action, key);
+                    }
                 }
             }
         }
@@ -374,5 +402,43 @@ mod tests {
             Some(KeyAction::Quit)
         );
         assert_eq!(map.action_bound_to(KeyCode::F(9)), None);
+    }
+
+    #[test]
+    fn no_default_binding_sits_on_a_reserved_key() {
+        // a default that collided with a fixed convention would be
+        // dead on arrival, and would also make that key unbindable
+        // for everyone via from_overrides.
+        for action in ALL_ACTIONS {
+            let key = action.default_key();
+            assert!(
+                reserved_key_purpose(key).is_none(),
+                "{} defaults to {}, which is reserved for {:?}",
+                action.name(),
+                key_label(key),
+                reserved_key_purpose(key)
+            );
+        }
+    }
+
+    #[test]
+    fn an_override_onto_a_reserved_key_is_refused() {
+        let mut overrides = HashMap::new();
+        // tab is move mode; an action bound to it would never fire.
+        overrides.insert(KeyAction::Quit.name().to_string(), "tab".to_string());
+        let map = Keymap::from_overrides(&overrides);
+        assert_eq!(
+            map.get(KeyAction::Quit),
+            KeyAction::Quit.default_key(),
+            "a shadowed binding should fall back to the default"
+        );
+    }
+
+    #[test]
+    fn an_override_onto_a_free_key_still_applies() {
+        let mut overrides = HashMap::new();
+        overrides.insert(KeyAction::Quit.name().to_string(), "x".to_string());
+        let map = Keymap::from_overrides(&overrides);
+        assert_eq!(map.get(KeyAction::Quit), KeyCode::Char('x'));
     }
 }
