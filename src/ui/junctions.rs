@@ -305,6 +305,8 @@ mod tests {
             empty_message: "",
             favorites: &favorites,
             remote_starred: &starred,
+            focused: true,
+            elapsed: std::time::Duration::ZERO,
         }
         .render(results, &mut buf);
         VerticalRule {
