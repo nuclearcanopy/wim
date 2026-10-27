@@ -16,7 +16,10 @@ mod term;
 mod theme;
 mod ui;
 
+use std::collections::HashMap;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode};
@@ -192,6 +195,49 @@ fn save_playback_state(player: &mpv::Mpv, now_playing: &Option<SearchItem>, queu
     let _ = persistence::save(&state);
 }
 
+/// How often the background thread (see `spawn_background_sync`)
+/// re-fetches every configured server, so navidrome stays "constantly
+/// updating" without the user ever pressing a manual refresh key.
+const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(45);
+
+/// A completed background sync attempt for one server, tagged by url
+/// since several servers' results arrive interleaved on the same
+/// channel with no other way to tell them apart.
+struct BackgroundSyncResult {
+    url: String,
+    result: Result<FetchedCatalog, String>,
+}
+
+/// Runs forever on its own thread, re-fetching every server's catalog
+/// on a timer and reporting each attempt back over `result_tx`; the
+/// main thread owns `App`/mpv/the terminal, none of which are `Send`
+/// across this boundary, so this only ever does pure network I/O and
+/// hands the result back rather than touching app state directly.
+/// `servers_rx` lets the main thread push an updated server list (add/
+/// remove a profile) without restarting the thread.
+fn spawn_background_sync(
+    initial_servers: Vec<config::NavidromeConfig>,
+    result_tx: mpsc::Sender<BackgroundSyncResult>,
+    servers_rx: mpsc::Receiver<Vec<config::NavidromeConfig>>,
+) {
+    thread::spawn(move || {
+        let mut servers = initial_servers;
+        loop {
+            match servers_rx.recv_timeout(AUTO_SYNC_INTERVAL) {
+                Ok(updated) => servers = updated,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            for nav in &servers {
+                let result = fetch_navidrome_catalog(nav);
+                if result_tx.send(BackgroundSyncResult { url: nav.url.clone(), result }).is_err() {
+                    return; // main thread is gone (shutting down)
+                }
+            }
+        }
+    });
+}
+
 /// The catalog shape fetched over the wire, kept separate from `App` so
 /// a background thread can fetch it without touching app state (which
 /// isn't `Send` across the mpv/terminal borrow it lives behind).
@@ -325,17 +371,27 @@ fn main() -> anyhow::Result<()> {
     // pick between (consistent with search spanning everything). best
     // effort: one server being down shouldn't block startup or hide
     // the others.
+    // tracks the last known reachability per server url, so the
+    // background sync below only notifies on an actual transition
+    // (going offline, coming back), not every single retry while a
+    // server stays down.
+    let mut server_reachable: HashMap<String, bool> = HashMap::new();
     if !cfg.navidrome_servers.is_empty() {
         let mut failures = Vec::new();
         for nav in &cfg.navidrome_servers {
-            if let Err(msg) = index_navidrome_server(&mut app, nav) {
-                // a failed reconnect must not be silent; the old
-                // behavior only updated `status` on success, so a down
-                // server at startup looked identical to "nothing
-                // configured", with no hint anything had gone wrong.
-                notifications.push(Severity::Error, format!("{}: {msg}", nav.url));
-                failures.push(nav.url.clone());
-            }
+            let ok = match index_navidrome_server(&mut app, nav) {
+                Ok(_) => true,
+                Err(msg) => {
+                    // a failed reconnect must not be silent; the old
+                    // behavior only updated `status` on success, so a down
+                    // server at startup looked identical to "nothing
+                    // configured", with no hint anything had gone wrong.
+                    notifications.push(Severity::Error, format!("{}: {msg}", nav.url));
+                    failures.push(nav.url.clone());
+                    false
+                }
+            };
+            server_reachable.insert(nav.url.clone(), ok);
         }
         app.resync_results();
         status = if failures.is_empty() {
@@ -348,6 +404,12 @@ fn main() -> anyhow::Result<()> {
             )
         };
     }
+
+    // background re-sync so navidrome stays live without a manual
+    // refresh key ("constantly updating" per the spec).
+    let (sync_tx, sync_rx) = mpsc::channel::<BackgroundSyncResult>();
+    let (servers_tx, servers_rx) = mpsc::channel::<Vec<config::NavidromeConfig>>();
+    spawn_background_sync(cfg.navidrome_servers.clone(), sync_tx, servers_rx);
 
     // 'n' opens the profile manager standalone, later.
     let mut nav_manager: Option<NavManager> = None;
@@ -465,10 +527,16 @@ fn main() -> anyhow::Result<()> {
             let sidebar_selected = panels.resize_mode && panels.resize_selected == ResizePanel::Sidebar;
             let bottom_selected = panels.resize_mode && panels.resize_selected == ResizePanel::BottomBar;
 
-            // only the banner draws its own internal horizontal rules in
-            // main_content; lyrics/now-playing/browse don't, so there's
-            // nothing to join against in those cases.
-            let junction_rows = if browse_view.is_none() && lyrics_lines.is_none() && now_playing.is_none() {
+            // the banner and the browse view's own header both draw
+            // internal horizontal rules right at main_content's left
+            // edge; lyrics/now-playing don't. same join as the bottom
+            // bar: whichever one's actually showing needs its rule row
+            // marked, or the vertical divider crosses it with a gap.
+            let junction_rows = if browse_view.is_some() {
+                // draw_header's rule sits one row below where it's
+                // asked to start, which is always main_content.y here.
+                vec![main_content.y + 1]
+            } else if lyrics_lines.is_none() && now_playing.is_none() {
                 ui::banner::rule_rows(main_content).to_vec()
             } else {
                 Vec::new()
@@ -549,6 +617,25 @@ fn main() -> anyhow::Result<()> {
             };
         }
 
+        // drain whatever the background sync thread finished since the
+        // last frame; only notify on an actual offline/online
+        // transition, not every retry while a server stays down.
+        while let Ok(sr) = sync_rx.try_recv() {
+            match sr.result {
+                Ok(catalog) => {
+                    merge_catalog_into_app(&mut app, catalog);
+                    if server_reachable.insert(sr.url.clone(), true) == Some(false) {
+                        notifications.push(Severity::Info, format!("{} is back online", sr.url));
+                    }
+                }
+                Err(msg) => {
+                    if server_reachable.insert(sr.url.clone(), false) != Some(false) {
+                        notifications.push(Severity::Alert, format!("{} went offline: {msg}", sr.url));
+                    }
+                }
+            }
+        }
+
         if event::poll(Duration::from_millis(100))? {
             let ev = event::read()?;
 
@@ -598,6 +685,7 @@ fn main() -> anyhow::Result<()> {
                                     Ok(msg) => {
                                         cfg.navidrome_servers.push(nav);
                                         let _ = config::save(&cfg);
+                                        let _ = servers_tx.send(cfg.navidrome_servers.clone());
                                         status = format!("navidrome connected: {msg}");
                                         ob.advance();
                                     }
@@ -835,15 +923,15 @@ fn main() -> anyhow::Result<()> {
                     // through the songs" first); songs/local files
                     // still play straight away.
                     Action::Play(item @ SearchItem::Album { .. }) | Action::Play(item @ SearchItem::Playlist { .. }) => {
-                        status = match open_browse_view(&item) {
-                            Ok(bv) => {
-                                let msg = format!("opened: {} ({} tracks)", bv.title, bv.tracks.len());
-                                browse_view = Some(bv);
-                                msg
-                            }
+                        // on success, the opened view itself (title +
+                        // track count in its header) is the
+                        // confirmation; no need to also repeat it on
+                        // the status line.
+                        match open_browse_view(&item) {
+                            Ok(bv) => browse_view = Some(bv),
                             Err(msg) => {
                                 notifications.push(Severity::Error, msg.clone());
-                                msg
+                                status = msg;
                             }
                         };
                     }
