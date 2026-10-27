@@ -26,7 +26,7 @@ impl Widget for NavManagerListView<'_> {
             area,
             area.y,
             "navidrome profiles",
-            "enter: reconnect/add, d: remove, esc: close",
+            "enter: reconnect/add, d d: remove, esc: close",
             shade(DIM),
             shade(NEAR_BLACK),
         );
