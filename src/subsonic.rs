@@ -81,6 +81,12 @@ pub struct AlbumDetails {
 #[derive(Debug, Clone)]
 pub struct ArtistAlbum {
     pub id: String,
+    /// `getArtist` already carries every album name, so the artist
+    /// view's ALBUMS column can render off one round trip instead of
+    /// waiting on a `getAlbum` per album to learn the names. Read by
+    /// the ui wiring that lands separately, hence the allow.
+    #[allow(dead_code)]
+    pub name: String,
     /// `None` sorts last rather than first; an unknown release date
     /// shouldn't jump to the front of a chronological listing.
     pub year: Option<u32>,
@@ -459,6 +465,11 @@ fn parse_artist_albums(v: &serde_json::Value) -> Vec<ArtistAlbum> {
                 .filter_map(|a| {
                     Some(ArtistAlbum {
                         id: a.get("id")?.as_str()?.to_string(),
+                        name: a
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                         year: a.get("year").and_then(|y| y.as_u64()).map(|y| y as u32),
                     })
                 })
@@ -642,7 +653,9 @@ mod tests {
         .unwrap();
         let albums = parse_artist_albums(&v);
         assert_eq!(albums.len(), 2);
+        assert_eq!(albums[0].name, "Cold Visions");
         assert_eq!(albums[0].year, Some(2024));
+        assert_eq!(albums[1].name, "Global");
         assert_eq!(albums[1].year, None);
     }
 
