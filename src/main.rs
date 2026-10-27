@@ -1872,6 +1872,11 @@ fn main() -> anyhow::Result<()> {
     // doesn't kick off a duplicate transfer of the same file.
     let mut downloading: HashSet<String> = HashSet::new();
     let lyrics_client = lyrics::Client::new();
+    // the queue view owns main_content like the browse/lyrics views do;
+    // its cursor is separate from playback, so scrolling it never moves
+    // what mpv is playing.
+    let mut queue_view_open = false;
+    let mut queue_selected: usize = 0;
     let mut lyrics_lines: Option<Vec<String>> = None;
     let mut lyrics_scroll: usize = 0;
     // which track the open lyrics belong to; shown in their header so
@@ -2427,6 +2432,17 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+            } else if queue_view_open {
+                f.render_widget(
+                    ui::queue::QueueView {
+                        entries: play_queue.entries(),
+                        pos: play_queue.pos(),
+                        selected: queue_selected,
+                        focused: focus == Focus::Workspace,
+                        elapsed: frame_elapsed,
+                    },
+                    main_content,
+                );
             } else if let Some(lines) = &lyrics_lines {
                 lyrics_width = main_content.width;
                 let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -4084,6 +4100,63 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     nav_manager = Some(nm);
+                    continue;
+                }
+
+                // the queue view's own navigation, same shape as the
+                // browse/lyrics tiers: only swallow keys it actually
+                // handles, or an open view eats every other keybind.
+                if queue_view_open && focus == Focus::Workspace {
+                    let order = ui::queue::selectable(play_queue.entries(), play_queue.pos());
+                    let at = order.iter().position(|i| *i == queue_selected).unwrap_or(0);
+                    let mut handled = true;
+                    match key.code {
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if let Some(next) = order.get(at + 1) {
+                                queue_selected = *next;
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            if at > 0 {
+                                if let Some(prev) = order.get(at - 1) {
+                                    queue_selected = *prev;
+                                }
+                            }
+                        }
+                        KeyCode::Enter => {
+                            // jumping is a playlist-pos write, not a
+                            // reload: mpv keeps the same playlist so
+                            // `entries` stays index-aligned with it.
+                            if order.contains(&queue_selected) {
+                                if let Err(e) = player
+                                    .set_property("playlist-pos", serde_json::json!(queue_selected))
+                                {
+                                    notifications
+                                        .push(Severity::Error, format!("error jumping: {e}"));
+                                }
+                            }
+                        }
+                        KeyCode::Esc => {
+                            queue_view_open = false;
+                            focus = Focus::Sidebar;
+                        }
+                        _ => handled = false,
+                    }
+                    if handled {
+                        continue;
+                    }
+                }
+
+                if key.code == keymap.get(KeyAction::OpenQueueView) {
+                    queue_view_open = !queue_view_open;
+                    if queue_view_open {
+                        // land on what's playing, which is what you
+                        // opened it to see, falling back to the top.
+                        queue_selected = play_queue.pos().unwrap_or(0);
+                        focus = Focus::Workspace;
+                    } else {
+                        focus = Focus::Sidebar;
+                    }
                     continue;
                 }
 
