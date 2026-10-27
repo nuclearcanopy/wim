@@ -398,16 +398,26 @@ fn cell_aspect() -> f32 {
     }
 }
 
-/// Best-effort, fire-and-forget from the caller's point of view: a
-/// no-op whenever `item` isn't a local video, no api key is
-/// configured, or the search/download fails for any reason (no
-/// matches, network error, quota exhausted). Blocking on the render
-/// thread, same documented tradeoff as the lyrics lookup; a brief
-/// hitch right when a video starts, not a background thread.
-fn maybe_fetch_subtitles(
+/// A subtitle file the background fetch wrote to disk. `sub_add` isn't
+/// called there: the `Mpv` handle isn't `Send`, so the main thread
+/// loads it when this lands, same division of labor as every other
+/// background worker in this file.
+struct SubtitleReady {
+    path: String,
+    release: String,
+    language: String,
+}
+
+/// Starts an opensubtitles search + download on its own thread, same
+/// fire-and-forget contract as `fire_playing_now`: a no-op whenever
+/// `item` isn't a local video, no api key is configured, or the
+/// search/download fails for any reason (no matches, network error,
+/// quota exhausted). Two network round-trips, so it never runs inline;
+/// it used to, which on startup meant holding the first frame behind
+/// opensubtitles' response time.
+fn fire_subtitle_fetch(
     cfg: &config::Config,
-    player: &mpv::Mpv,
-    notifications: &mut Notifications,
+    subtitle_tx: &mpsc::Sender<SubtitleReady>,
     item: &SearchItem,
 ) {
     let SearchItem::LocalVideo { path, title } = item else {
@@ -416,25 +426,30 @@ fn maybe_fetch_subtitles(
     let Some(api_key) = cfg.resolve_opensubtitles_api_key() else {
         return;
     };
-    let client = opensubtitles::Client::new(api_key);
-    let Ok(results) = client.search(title, &cfg.subtitle_language) else {
-        return;
-    };
-    let Some(best) = results.first() else {
-        return;
-    };
-    let Ok(bytes) = client.download(best.file_id) else {
-        return;
-    };
+    let language = cfg.subtitle_language.clone();
+    let title = title.clone();
     let sub_path = path.with_extension("wim-auto.srt");
-    if std::fs::write(&sub_path, bytes).is_ok()
-        && player.sub_add(&sub_path.to_string_lossy()).is_ok()
-    {
-        notifications.push(
-            Severity::Info,
-            format!("subtitle: {} ({})", best.release, best.language),
-        );
-    }
+    let subtitle_tx = subtitle_tx.clone();
+    thread::spawn(move || {
+        let client = opensubtitles::Client::new(api_key);
+        let Ok(results) = client.search(&title, &language) else {
+            return;
+        };
+        let Some(best) = results.first() else {
+            return;
+        };
+        let Ok(bytes) = client.download(best.file_id) else {
+            return;
+        };
+        if std::fs::write(&sub_path, bytes).is_err() {
+            return;
+        }
+        let _ = subtitle_tx.send(SubtitleReady {
+            path: sub_path.to_string_lossy().into_owned(),
+            release: best.release.clone(),
+            language: best.language.clone(),
+        });
+    });
 }
 
 /// (artist, title, album) for a lyrics lookup; only meaningful for
@@ -670,6 +685,9 @@ struct DownloadCtx<'a> {
 struct TrackChangeCtx<'a, 'b> {
     dctx: &'a mut DownloadCtx<'b>,
     scrobble: &'a mut ScrobbleState,
+    /// where `fire_subtitle_fetch` reports back; bundled here for the
+    /// same argument-count reason as everything else in this struct.
+    subtitle_tx: &'a mpsc::Sender<SubtitleReady>,
 }
 
 fn go_to_previous(
@@ -689,7 +707,7 @@ fn go_to_previous(
         if let Some(interrupted) = now_playing.take() {
             queue.insert(0, interrupted);
         }
-        maybe_fetch_subtitles(cfg, player, notifications, &prev);
+        fire_subtitle_fetch(cfg, hooks.subtitle_tx, &prev);
         note_playback_started(&prev, hooks.dctx, notifications);
         start_tracking_playback(cfg, &prev, hooks.scrobble);
         *now_playing = Some(prev);
@@ -1540,6 +1558,11 @@ fn main() -> anyhow::Result<()> {
     let (servers_tx, servers_rx) = mpsc::channel::<Vec<config::NavidromeConfig>>();
     spawn_background_sync(cfg.navidrome_servers.clone(), sync_tx, servers_rx);
 
+    // subtitles found by `fire_subtitle_fetch`'s thread, loaded into
+    // mpv here (it owns the handle); polled every frame same as
+    // `sync_rx`.
+    let (subtitle_tx, subtitle_rx) = mpsc::channel::<SubtitleReady>();
+
     // live remote search (song titles especially; see
     // `spawn_background_search`'s own doc) debounced off query
     // changes rather than a timer, polled every frame same as `sync_rx`.
@@ -1584,7 +1607,7 @@ fn main() -> anyhow::Result<()> {
                 if let Some(pos) = saved.position_secs {
                     let _ = player.seek(pos, false);
                 }
-                maybe_fetch_subtitles(&cfg, &player, &mut notifications, &item);
+                fire_subtitle_fetch(&cfg, &subtitle_tx, &item);
                 let mut dctx = DownloadCtx {
                     cache: &cache_index,
                     download_tx: &download_tx,
@@ -2248,7 +2271,7 @@ fn main() -> anyhow::Result<()> {
             match app.pop_queue() {
                 Some(next) => {
                     set_vid_for_item(&player, &next);
-                    maybe_fetch_subtitles(&cfg, &player, &mut notifications, &next);
+                    fire_subtitle_fetch(&cfg, &subtitle_tx, &next);
                     let mut dctx = DownloadCtx {
                         cache: &cache_index,
                         download_tx: &download_tx,
@@ -2275,7 +2298,7 @@ fn main() -> anyhow::Result<()> {
                         for t in &rest {
                             let _ = try_enqueue(&player, t, &cache_index);
                         }
-                        maybe_fetch_subtitles(&cfg, &player, &mut notifications, &first);
+                        fire_subtitle_fetch(&cfg, &subtitle_tx, &first);
                         let mut dctx = DownloadCtx {
                             cache: &cache_index,
                             download_tx: &download_tx,
@@ -2411,6 +2434,17 @@ fn main() -> anyhow::Result<()> {
                         .push(Severity::Alert, format!("{} went offline: {msg}", sr.url)),
                     Some(false) => {}
                 },
+            }
+        }
+
+        // a subtitle `fire_subtitle_fetch` landed; loading it is this
+        // thread's job, it owns the mpv handle.
+        while let Ok(sub) = subtitle_rx.try_recv() {
+            if player.sub_add(&sub.path).is_ok() {
+                notifications.push(
+                    Severity::Info,
+                    format!("subtitle: {} ({})", sub.release, sub.language),
+                );
             }
         }
 
@@ -3213,12 +3247,7 @@ fn main() -> anyhow::Result<()> {
                                     for t in &rest {
                                         let _ = try_enqueue(&player, t, &cache_index);
                                     }
-                                    maybe_fetch_subtitles(
-                                        &cfg,
-                                        &player,
-                                        &mut notifications,
-                                        &first,
-                                    );
+                                    fire_subtitle_fetch(&cfg, &subtitle_tx, &first);
                                     let mut dctx = DownloadCtx {
                                         cache: &cache_index,
                                         download_tx: &download_tx,
@@ -3429,6 +3458,7 @@ fn main() -> anyhow::Result<()> {
                     let mut hooks = TrackChangeCtx {
                         dctx: &mut dctx,
                         scrobble: &mut scrobble,
+                        subtitle_tx: &subtitle_tx,
                     };
                     let _ = go_to_previous(
                         &cfg,
@@ -3566,12 +3596,7 @@ fn main() -> anyhow::Result<()> {
                                     original_queue = std::iter::once(first.clone())
                                         .chain(tracks.iter().cloned())
                                         .collect();
-                                    maybe_fetch_subtitles(
-                                        &cfg,
-                                        &player,
-                                        &mut notifications,
-                                        &first,
-                                    );
+                                    fire_subtitle_fetch(&cfg, &subtitle_tx, &first);
                                     let mut dctx = DownloadCtx {
                                         cache: &cache_index,
                                         download_tx: &download_tx,
