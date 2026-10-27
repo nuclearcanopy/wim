@@ -164,6 +164,7 @@ impl BrowseListView<'_> {
         SearchBox {
             query: &self.view.filter_query,
             editing: self.view.filtering,
+            label: "filter songs",
             cursor_visible: self.cursor_visible,
             right_border: true,
         }
