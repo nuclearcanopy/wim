@@ -20,10 +20,11 @@ mod search;
 mod subsonic;
 mod term;
 mod theme;
+mod trace;
 mod ui;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -368,17 +369,28 @@ fn fetch_cover_art(client: &subsonic::Client, album_id: &str) -> Option<image::D
     image::load_from_memory(&bytes).ok()
 }
 
+/// Whether the config names a graphics protocol outright, which is an
+/// explicit ask for real raster art; `auto` isn't one of those (it
+/// documents ascii as its starting point, with 'i' to switch).
+fn wants_real_art(mode: config::AlbumArtMode) -> bool {
+    matches!(
+        mode,
+        config::AlbumArtMode::Sixel | config::AlbumArtMode::Kitty | config::AlbumArtMode::Iterm2
+    )
+}
+
 /// `Auto`/`Blocks` both start in ascii (the strictly-monochrome
-/// default); `Sixel`/`Kitty`/`Iterm2` start in real-image mode since
-/// configuring one specifically is an explicit ask for it. `i` still
-/// cycles through all three regardless of where it started.
-fn initial_art_mode(mode: config::AlbumArtMode) -> browse::ArtMode {
+/// default); a named protocol starts in real-image mode, but only once
+/// the terminal has actually answered the graphics probe (see the
+/// `picker_rx` drain). Real mode with no `Picker` renders no art at
+/// all, so claiming it before the answer is in would mean an empty
+/// pane rather than the ascii fallback. `i` still cycles through all
+/// three regardless of where it started.
+fn art_mode_for_picker(mode: config::AlbumArtMode, protocol_detected: bool) -> browse::ArtMode {
     match mode {
-        config::AlbumArtMode::Auto | config::AlbumArtMode::Blocks => browse::ArtMode::Ascii,
-        config::AlbumArtMode::Sixel
-        | config::AlbumArtMode::Kitty
-        | config::AlbumArtMode::Iterm2 => browse::ArtMode::Real,
         config::AlbumArtMode::Off => browse::ArtMode::Off,
+        _ if wants_real_art(mode) && protocol_detected => browse::ArtMode::Real,
+        _ => browse::ArtMode::Ascii,
     }
 }
 
@@ -401,16 +413,26 @@ fn cell_aspect() -> f32 {
     }
 }
 
-/// Best-effort, fire-and-forget from the caller's point of view: a
-/// no-op whenever `item` isn't a local video, no api key is
-/// configured, or the search/download fails for any reason (no
-/// matches, network error, quota exhausted). Blocking on the render
-/// thread, same documented tradeoff as the lyrics lookup; a brief
-/// hitch right when a video starts, not a background thread.
-fn maybe_fetch_subtitles(
+/// A subtitle file the background fetch wrote to disk. `sub_add` isn't
+/// called there: the `Mpv` handle isn't `Send`, so the main thread
+/// loads it when this lands, same division of labor as every other
+/// background worker in this file.
+struct SubtitleReady {
+    path: String,
+    release: String,
+    language: String,
+}
+
+/// Starts an opensubtitles search + download on its own thread, same
+/// fire-and-forget contract as `fire_playing_now`: a no-op whenever
+/// `item` isn't a local video, no api key is configured, or the
+/// search/download fails for any reason (no matches, network error,
+/// quota exhausted). Two network round-trips, so it never runs inline;
+/// it used to, which on startup meant holding the first frame behind
+/// opensubtitles' response time.
+fn fire_subtitle_fetch(
     cfg: &config::Config,
-    player: &mpv::Mpv,
-    notifications: &mut Notifications,
+    subtitle_tx: &mpsc::Sender<SubtitleReady>,
     item: &SearchItem,
 ) {
     let SearchItem::LocalVideo { path, title } = item else {
@@ -419,25 +441,30 @@ fn maybe_fetch_subtitles(
     let Some(api_key) = cfg.resolve_opensubtitles_api_key() else {
         return;
     };
-    let client = opensubtitles::Client::new(api_key);
-    let Ok(results) = client.search(title, &cfg.subtitle_language) else {
-        return;
-    };
-    let Some(best) = results.first() else {
-        return;
-    };
-    let Ok(bytes) = client.download(best.file_id) else {
-        return;
-    };
+    let language = cfg.subtitle_language.clone();
+    let title = title.clone();
     let sub_path = path.with_extension("wim-auto.srt");
-    if std::fs::write(&sub_path, bytes).is_ok()
-        && player.sub_add(&sub_path.to_string_lossy()).is_ok()
-    {
-        notifications.push(
-            Severity::Info,
-            format!("subtitle: {} ({})", best.release, best.language),
-        );
-    }
+    let subtitle_tx = subtitle_tx.clone();
+    thread::spawn(move || {
+        let client = opensubtitles::Client::new(api_key);
+        let Ok(results) = client.search(&title, &language) else {
+            return;
+        };
+        let Some(best) = results.first() else {
+            return;
+        };
+        let Ok(bytes) = client.download(best.file_id) else {
+            return;
+        };
+        if std::fs::write(&sub_path, bytes).is_err() {
+            return;
+        }
+        let _ = subtitle_tx.send(SubtitleReady {
+            path: sub_path.to_string_lossy().into_owned(),
+            release: best.release.clone(),
+            language: best.language.clone(),
+        });
+    });
 }
 
 /// (artist, title, album) for a lyrics lookup; only meaningful for
@@ -673,6 +700,9 @@ struct DownloadCtx<'a> {
 struct TrackChangeCtx<'a, 'b> {
     dctx: &'a mut DownloadCtx<'b>,
     scrobble: &'a mut ScrobbleState,
+    /// where `fire_subtitle_fetch` reports back; bundled here for the
+    /// same argument-count reason as everything else in this struct.
+    subtitle_tx: &'a mpsc::Sender<SubtitleReady>,
 }
 
 fn go_to_previous(
@@ -692,7 +722,7 @@ fn go_to_previous(
         if let Some(interrupted) = now_playing.take() {
             queue.insert(0, interrupted);
         }
-        maybe_fetch_subtitles(cfg, player, notifications, &prev);
+        fire_subtitle_fetch(cfg, hooks.subtitle_tx, &prev);
         note_playback_started(&prev, hooks.dctx, notifications);
         start_tracking_playback(cfg, &prev, hooks.scrobble);
         *now_playing = Some(prev);
@@ -734,6 +764,9 @@ struct ActionCtx<'a> {
     download_tx: &'a mpsc::Sender<DownloadEvent>,
     downloading: &'a mut HashSet<String>,
     scrobble: &'a mut ScrobbleState,
+    /// Where a backgrounded subtitle fetch reports back; see
+    /// `fire_subtitle_fetch`, which no longer blocks the input path.
+    subtitle_tx: &'a mpsc::Sender<SubtitleReady>,
 }
 
 /// The one place an `Action` from `app.handle_key` is acted on. Both
@@ -790,7 +823,7 @@ fn dispatch_action(action: Action, ctx: &mut ActionCtx) -> Dispatch {
                         *ctx.original_queue = std::iter::once(first.clone())
                             .chain(tracks.iter().cloned())
                             .collect();
-                        maybe_fetch_subtitles(ctx.cfg, ctx.player, ctx.notifications, &first);
+                        fire_subtitle_fetch(ctx.cfg, ctx.subtitle_tx, &first);
                         let mut dctx = DownloadCtx {
                             cache: ctx.cache,
                             download_tx: ctx.download_tx,
@@ -1142,10 +1175,13 @@ fn adjust_eq_band(
 
 /// A completed background sync attempt for one server, tagged by url
 /// since several servers' results arrive interleaved on the same
-/// channel with no other way to tell them apart.
+/// channel with no other way to tell them apart. Carries the starred
+/// song ids too: they used to be fetched synchronously before the
+/// first frame, and they ride the connection this thread is already
+/// making rather than needing one of their own.
 struct BackgroundSyncResult {
     url: String,
-    result: Result<FetchedCatalog, String>,
+    result: NavidromeEverything,
 }
 
 /// How long to let rapid keystrokes settle before actually firing a
@@ -1251,7 +1287,10 @@ fn spawn_background_search(
 /// across this boundary, so this only ever does pure network I/O and
 /// hands the result back rather than touching app state directly.
 /// `servers_rx` lets the main thread push an updated server list (add/
-/// remove a profile) without restarting the thread.
+/// remove a profile) without restarting the thread. This is also the
+/// initial connect: it fetches first and waits afterwards, so a
+/// configured server is reached as fast as the network allows without
+/// anything on the main thread blocking on it.
 fn spawn_background_sync(
     initial_servers: Vec<config::NavidromeConfig>,
     result_tx: mpsc::Sender<BackgroundSyncResult>,
@@ -1259,22 +1298,18 @@ fn spawn_background_sync(
 ) {
     thread::spawn(move || {
         let mut servers = initial_servers;
+        let mut first_pass = true;
         loop {
-            match servers_rx.recv_timeout(AUTO_SYNC_INTERVAL) {
-                Ok(updated) => servers = updated,
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-            // same reasoning as the startup fetch: independent
-            // per-server requests, so run them concurrently rather
-            // than making every server wait for the one before it.
+            // independent per-server requests, so run them
+            // concurrently rather than making every server wait for
+            // the one before it.
             let results: Vec<BackgroundSyncResult> = thread::scope(|scope| {
                 servers
                     .iter()
                     .map(|nav| {
                         (
                             nav.url.clone(),
-                            scope.spawn(|| fetch_navidrome_catalog(nav)),
+                            scope.spawn(|| fetch_navidrome_everything(nav)),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1287,10 +1322,19 @@ fn spawn_background_sync(
                     })
                     .collect()
             });
+            if first_pass && !servers.is_empty() {
+                trace::mark("navidrome: first sync landed");
+                first_pass = false;
+            }
             for result in results {
                 if result_tx.send(result).is_err() {
                     return; // main thread is gone (shutting down)
                 }
+            }
+            match servers_rx.recv_timeout(AUTO_SYNC_INTERVAL) {
+                Ok(updated) => servers = updated,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
             }
         }
     });
@@ -1462,12 +1506,30 @@ fn navidrome_config_from_form(form: &LoginForm) -> config::NavidromeConfig {
     }
 }
 
+/// What an empty corpus is still waiting on, or `None` once both the
+/// local scan and the first server sync have reported in. Startup fills
+/// the corpus from two background threads, so "nothing found" is only
+/// honest after both have answered; until then this says which. Kept
+/// short enough to fit the sidebar's width without being truncated
+/// (see `ui::results_list`).
+fn loading_message(scanning_library: bool, syncing_servers: bool) -> Option<&'static str> {
+    match (scanning_library, syncing_servers) {
+        (true, true) => Some("loading library..."),
+        (true, false) => Some("scanning local library..."),
+        (false, true) => Some("connecting to navidrome..."),
+        (false, false) => None,
+    }
+}
+
 /// What the results list should say instead of rendering nothing when
 /// there's nothing to show; a blank screen with no explanation is a
 /// dead end, never the right default.
 fn empty_results_message(app: &app::App) -> String {
     if app.corpus.is_empty() {
-        "no local music/video found: check library_paths in config, or set up navidrome (n)"
+        loading_message(app.scanning_library, app.syncing_servers)
+            .unwrap_or(
+                "no local music/video found: check library_paths in config, or set up navidrome (n)",
+            )
             .to_string()
     } else if app.editing_query && !app.query.is_empty() {
         format!("no matches for \"{}\"", app.query)
@@ -1557,11 +1619,20 @@ fn eq_label(app: &app::App) -> &'static str {
 }
 
 fn main() -> anyhow::Result<()> {
+    trace::init();
     let is_first_run = !config::config_path()?.exists();
     let mut cfg = config::load_or_init()?;
-    let corpus = rebuild_corpus(&cfg);
+    trace::mark("config loaded");
+    // the local scan is the biggest single startup cost (a blocking tag
+    // read per music file); it streams into the corpus from its own
+    // thread while the ui is already up, drained next to `sync_rx` in
+    // the main loop. nothing between here and the first frame waits on
+    // it. see docs/architecture.md.
+    let (scan_tx, scan_rx) = mpsc::channel::<library::ScanBatch>();
+    library::spawn_scan(cfg.library_paths.clone(), scan_tx);
 
     let player = mpv::Mpv::spawn()?;
+    trace::mark("mpv spawned");
     // per-track normalization is the sensible default; mpv reads the
     // gain from each file's own embedded tags as it plays.
     player.set_replaygain("track")?;
@@ -1574,7 +1645,11 @@ fn main() -> anyhow::Result<()> {
     // (universal navigation primitives, applied the same way
     // everywhere rather than individually named commands).
     let mut keymap = Keymap::from_overrides(&cfg.keybinds);
-    let mut app = app::App::new(corpus);
+    let mut app = app::App::new(search::Corpus::new());
+    // so the first frame says "scanning" rather than "no local music
+    // found"; cleared when the scan thread drops its sender. the
+    // server equivalent is set below.
+    app.scanning_library = true;
     // restores whichever eq state was last active (a named preset, or
     // a hand-tuned custom set) by name rather than a raw index, same
     // reasoning as `logo_style`; applied to mpv immediately so a
@@ -1611,8 +1686,10 @@ fn main() -> anyhow::Result<()> {
 
     let mut favorites = favorites::load();
     // song ids this session knows are starred, across every configured
-    // server; populated at startup and kept current on every manual
-    // toggle (not re-fetched constantly, starring is low-frequency).
+    // server; arrives with each background sync result and is kept
+    // current on every manual toggle. unioned rather than replaced, so
+    // a toggle can't be clobbered by a fetch that was already in
+    // flight when it happened.
     let mut remote_starred: HashSet<String> = HashSet::new();
 
     let mut now_playing: Option<SearchItem> = None;
@@ -1626,8 +1703,12 @@ fn main() -> anyhow::Result<()> {
     // 'm' toggles it by hand either way.
     let mut player_minimized = false;
     // 'i' cycles ascii -> real -> off from here; this is just the
-    // config-driven starting point.
-    let mut art_mode = initial_art_mode(cfg.album_art);
+    // config-driven starting point, with the graphics probe still out
+    // (so never Real yet, see `art_mode_for_picker`). kept around so
+    // the probe landing can only upgrade a mode the user hasn't since
+    // cycled by hand.
+    let art_mode_pending = art_mode_for_picker(cfg.album_art, false);
+    let mut art_mode = art_mode_pending;
     // latest captured frame while playing a local video, rendered
     // through the same ascii pipeline as album art instead of mpv
     // opening its own window; `None` whenever nothing video is
@@ -1711,69 +1792,33 @@ fn main() -> anyhow::Result<()> {
     // `app.queue` itself is a live, shrinking FIFO, not a fixed list.
     let mut original_queue: Vec<SearchItem> = Vec::new();
 
-    // connect every configured server on startup; all of them feed
-    // the same unified corpus, there's no "active server" concept to
-    // pick between (consistent with search spanning everything). best
-    // effort: one server being down shouldn't block startup or hide
-    // the others.
     // tracks the last known reachability per server url, so the
     // background sync below only notifies on an actual transition
     // (going offline, coming back), not every single retry while a
     // server stays down.
     let mut server_reachable: HashMap<String, bool> = HashMap::new();
-    if !cfg.navidrome_servers.is_empty() {
-        // every configured server connects (catalog + starred songs)
-        // in parallel rather than one after another; applying each
-        // result to `app`/`remote_starred` still happens here on the
-        // main thread, sequentially, but that's pure in-memory work,
-        // not the network latency that actually made startup slow.
-        let results: Vec<(String, NavidromeEverything)> = thread::scope(|scope| {
-            cfg.navidrome_servers
-                .iter()
-                .map(|nav| {
-                    (
-                        nav.url.clone(),
-                        scope.spawn(|| fetch_navidrome_everything(nav)),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|(url, handle)| {
-                    let result = handle
-                        .join()
-                        .unwrap_or_else(|_| Err("panicked while connecting".to_string()));
-                    (url, result)
-                })
-                .collect()
-        });
+    // every configured server is connected by the background sync
+    // thread, never here: a round-trip per server before the first
+    // frame meant a stalled server could hold the whole ui at a black
+    // screen indefinitely. all of them feed the same unified corpus,
+    // there's no "active server" concept to pick between (consistent
+    // with search spanning everything), and each one's reachability is
+    // reported as it lands (see the `sync_rx` drain). 'I' shows a full
+    // local/per-server breakdown on demand instead of announcing a
+    // count unprompted on every startup.
+    app.syncing_servers = !cfg.navidrome_servers.is_empty();
 
-        for (url, result) in results {
-            let ok = match result {
-                Ok((catalog, starred)) => {
-                    merge_catalog_into_app(&mut app, catalog);
-                    remote_starred.extend(starred);
-                    true
-                }
-                Err(msg) => {
-                    // a failed reconnect must not be silent; push it
-                    // as its own notification rather than folding it
-                    // into a summary status line nobody asked for.
-                    notifications.push(Severity::Error, format!("{url}: {msg}"));
-                    false
-                }
-            };
-            server_reachable.insert(url, ok);
-        }
-        app.resync_results();
-        // 'I' shows a full local/per-server breakdown on demand
-        // instead of announcing a count unprompted on every startup.
-    }
-
-    // background re-sync so navidrome stays live without a manual
-    // refresh key ("constantly updating" per the spec).
+    // background re-sync, which also does the initial connect; keeps
+    // navidrome live without a manual refresh key ("constantly
+    // updating" per the spec).
     let (sync_tx, sync_rx) = mpsc::channel::<BackgroundSyncResult>();
     let (servers_tx, servers_rx) = mpsc::channel::<Vec<config::NavidromeConfig>>();
     spawn_background_sync(cfg.navidrome_servers.clone(), sync_tx, servers_rx);
+
+    // subtitles found by `fire_subtitle_fetch`'s thread, loaded into
+    // mpv here (it owns the handle); polled every frame same as
+    // `sync_rx`.
+    let (subtitle_tx, subtitle_rx) = mpsc::channel::<SubtitleReady>();
 
     // live remote search (song titles especially; see
     // `spawn_background_search`'s own doc) debounced off query
@@ -1800,6 +1845,12 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // a restored queue goes into mpv's own playlist one blocking ipc
+    // round-trip per track, so the appends wait until the first frame
+    // is up (see the drain right after the first `draw`); `app.queue`
+    // itself is filled here, since that's pure in-memory work.
+    let mut pending_enqueue: Vec<SearchItem> = Vec::new();
+
     // resuming across restarts is standard in any serious media player;
     // a missing/corrupt state file just means nothing to resume, not an
     // error; see persistence.rs.
@@ -1813,7 +1864,7 @@ fn main() -> anyhow::Result<()> {
                 if let Some(pos) = saved.position_secs {
                     let _ = player.seek(pos, false);
                 }
-                maybe_fetch_subtitles(&cfg, &player, &mut notifications, &item);
+                fire_subtitle_fetch(&cfg, &subtitle_tx, &item);
                 let mut dctx = DownloadCtx {
                     cache: &cache_index,
                     download_tx: &download_tx,
@@ -1827,7 +1878,7 @@ fn main() -> anyhow::Result<()> {
         }
         for queued_path in &saved.queue_paths {
             if let Some(item) = persistence::item_from_path(queued_path) {
-                let _ = try_enqueue(&player, &item, &cache_index);
+                pending_enqueue.push(item.clone());
                 app.queue.push(item);
             }
         }
@@ -1835,6 +1886,7 @@ fn main() -> anyhow::Result<()> {
             let _ = player.set_volume(vol);
         }
     }
+    trace::mark("playback state restored (queue deferred)");
 
     // the ceiling crossfade's fade-out/fade-in ramps scale against;
     // read back rather than assuming 100, since persistence may have
@@ -1871,11 +1923,27 @@ fn main() -> anyhow::Result<()> {
     // queries the terminal over stdio for font-cell size and graphics
     // protocol support; best-effort, 'i' (real image mode) just stays
     // unavailable if this fails rather than erroring the whole app.
-    let mut picker = Picker::from_query_stdio().ok();
+    // on its own thread because the terminal may simply never answer,
+    // in which case ratatui-image waits out a full second: the single
+    // largest thing the first frame used to sit behind. spawned after
+    // raw mode is already on, since the probe saves and restores
+    // whatever termios state it finds.
+    let (picker_tx, picker_rx) = mpsc::channel::<Option<Picker>>();
+    thread::spawn(move || {
+        let _ = picker_tx.send(Picker::from_query_stdio().ok());
+        trace::mark("graphics probe answered");
+    });
+    let mut picker: Option<Picker> = None;
+    let mut picker_probed = false;
+    trace::mark("terminal ready");
     // rebuilt (not re-encoded every frame) whenever a newly-opened
     // album's art changes; `ratatui-image` owns the actual resize/
     // encode caching per protocol instance.
     let mut real_art_protocol: Option<StatefulProtocol> = None;
+    // everything that costs an ipc round-trip per track runs on the
+    // first pass through the loop instead of before it; see the drain
+    // right after `draw`.
+    let mut first_frame_drawn = false;
     loop {
         notifications.expire();
         guard.terminal.draw(|f| {
@@ -2442,6 +2510,19 @@ fn main() -> anyhow::Result<()> {
             }
         })?;
 
+        // the ui is on screen; now hand mpv the restored queue, which
+        // is one blocking ipc round-trip per track (200 of them on a
+        // real saved queue) and has no business delaying the first
+        // frame. one-shot, not per-frame work.
+        if !first_frame_drawn {
+            first_frame_drawn = true;
+            trace::mark("first frame drawn");
+            for item in pending_enqueue.drain(..) {
+                let _ = try_enqueue(&player, &item, &cache_index);
+            }
+            trace::mark("mpv playlist refilled");
+        }
+
         // non-blocking: mpv auto-advances its own playlist on
         // end-of-file (gaplessly); this just keeps our queue *view* in
         // sync with what mpv already moved past, nothing to load here.
@@ -2449,7 +2530,7 @@ fn main() -> anyhow::Result<()> {
             match app.pop_queue() {
                 Some(next) => {
                     set_vid_for_item(&player, &next);
-                    maybe_fetch_subtitles(&cfg, &player, &mut notifications, &next);
+                    fire_subtitle_fetch(&cfg, &subtitle_tx, &next);
                     let mut dctx = DownloadCtx {
                         cache: &cache_index,
                         download_tx: &download_tx,
@@ -2476,7 +2557,7 @@ fn main() -> anyhow::Result<()> {
                         for t in &rest {
                             let _ = try_enqueue(&player, t, &cache_index);
                         }
-                        maybe_fetch_subtitles(&cfg, &player, &mut notifications, &first);
+                        fire_subtitle_fetch(&cfg, &subtitle_tx, &first);
                         let mut dctx = DownloadCtx {
                             cache: &cache_index,
                             download_tx: &download_tx,
@@ -2565,23 +2646,89 @@ fn main() -> anyhow::Result<()> {
             video_frame = None;
         }
 
+        // the terminal's answer to the graphics probe, or `None` if it
+        // never gave one. a config that named a protocol only gets
+        // real art from here on; until (or unless) this lands it stays
+        // ascii, and a terminal that stayed silent is said so out loud
+        // rather than leaving an art pane that never fills.
+        if !picker_probed {
+            match picker_rx.try_recv() {
+                Ok(probed) => {
+                    picker_probed = true;
+                    picker = probed;
+                    if art_mode == art_mode_pending {
+                        art_mode = art_mode_for_picker(cfg.album_art, picker.is_some());
+                    }
+                    if picker.is_none() && wants_real_art(cfg.album_art) {
+                        notifications.push(
+                            Severity::Alert,
+                            "album art: terminal reported no graphics protocol, using ascii",
+                        );
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => picker_probed = true,
+            }
+        }
+
+        // drain whatever the library scan thread read since the last
+        // frame, in batches rather than per file; the channel
+        // disconnecting is the scan thread signing off (it drops its
+        // sender), which is what clears the "scanning" message.
+        let mut scanned_batches = 0;
+        loop {
+            match scan_rx.try_recv() {
+                Ok(batch) => {
+                    app.corpus.add_local_tracks(batch);
+                    scanned_batches += 1;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    app.scanning_library = false;
+                    break;
+                }
+            }
+        }
+        if scanned_batches > 0 {
+            app.resync_results();
+        }
+
         // drain whatever the background sync thread finished since the
         // last frame; only notify on an actual offline/online
         // transition, not every retry while a server stays down.
         while let Ok(sr) = sync_rx.try_recv() {
+            // reported either way: a server that answered with an
+            // error has still answered, so nothing is left "connecting"
+            // forever.
+            app.syncing_servers = false;
             match sr.result {
-                Ok(catalog) => {
+                Ok((catalog, starred)) => {
                     merge_catalog_into_app(&mut app, catalog);
+                    remote_starred.extend(starred);
                     if server_reachable.insert(sr.url.clone(), true) == Some(false) {
                         notifications.push(Severity::Info, format!("{} is back online", sr.url));
                     }
                 }
-                Err(msg) => {
-                    if server_reachable.insert(sr.url.clone(), false) != Some(false) {
-                        notifications
-                            .push(Severity::Alert, format!("{} went offline: {msg}", sr.url));
-                    }
-                }
+                Err(msg) => match server_reachable.insert(sr.url.clone(), false) {
+                    // a server that's been unreachable since launch was
+                    // never online to go offline from; failing the
+                    // first connect is its own (never silent) message.
+                    None => notifications.push(Severity::Error, format!("{}: {msg}", sr.url)),
+                    Some(true) => notifications
+                        .push(Severity::Alert, format!("{} went offline: {msg}", sr.url)),
+                    Some(false) => {}
+                },
+            }
+        }
+
+        // a subtitle `fire_subtitle_fetch` landed; loading it is this
+        // thread's job, it owns the mpv handle.
+        while let Ok(sub) = subtitle_rx.try_recv() {
+            if player.sub_add(&sub.path).is_ok() {
+                notifications.push(
+                    Severity::Info,
+                    format!("subtitle: {} ({})", sub.release, sub.language),
+                );
             }
         }
 
@@ -2905,6 +3052,7 @@ fn main() -> anyhow::Result<()> {
                             download_tx: &download_tx,
                             downloading: &mut downloading,
                             scrobble: &mut scrobble,
+                            subtitle_tx: &subtitle_tx,
                         },
                     );
                     if dispatch == Dispatch::Quit {
@@ -3470,12 +3618,7 @@ fn main() -> anyhow::Result<()> {
                                     for t in &rest {
                                         let _ = try_enqueue(&player, t, &cache_index);
                                     }
-                                    maybe_fetch_subtitles(
-                                        &cfg,
-                                        &player,
-                                        &mut notifications,
-                                        &first,
-                                    );
+                                    fire_subtitle_fetch(&cfg, &subtitle_tx, &first);
                                     let mut dctx = DownloadCtx {
                                         cache: &cache_index,
                                         download_tx: &download_tx,
@@ -3714,6 +3857,7 @@ fn main() -> anyhow::Result<()> {
                     let mut hooks = TrackChangeCtx {
                         dctx: &mut dctx,
                         scrobble: &mut scrobble,
+                        subtitle_tx: &subtitle_tx,
                     };
                     let _ = go_to_previous(
                         &cfg,
@@ -3824,6 +3968,7 @@ fn main() -> anyhow::Result<()> {
                         download_tx: &download_tx,
                         downloading: &mut downloading,
                         scrobble: &mut scrobble,
+                        subtitle_tx: &subtitle_tx,
                     },
                 );
                 if dispatch == Dispatch::Quit {
@@ -3938,5 +4083,85 @@ mod focus_tests {
             focus_in_direction(Focus::BottomBar, KeyCode::Right),
             Focus::BottomBar
         );
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn loading_message_names_whatever_is_still_in_flight() {
+        assert_eq!(loading_message(true, true), Some("loading library..."));
+        assert_eq!(
+            loading_message(true, false),
+            Some("scanning local library...")
+        );
+        assert_eq!(
+            loading_message(false, true),
+            Some("connecting to navidrome...")
+        );
+    }
+
+    #[test]
+    fn loading_message_is_none_once_both_sources_have_reported() {
+        assert_eq!(
+            loading_message(false, false),
+            None,
+            "with nothing pending, an empty corpus really is empty"
+        );
+    }
+
+    #[test]
+    fn a_named_protocol_only_claims_real_art_once_the_probe_answers() {
+        assert_eq!(
+            art_mode_for_picker(config::AlbumArtMode::Kitty, true),
+            browse::ArtMode::Real
+        );
+        assert_eq!(
+            art_mode_for_picker(config::AlbumArtMode::Kitty, false),
+            browse::ArtMode::Ascii,
+            "real mode without a picker renders nothing at all"
+        );
+        assert_eq!(
+            art_mode_for_picker(config::AlbumArtMode::Sixel, false),
+            browse::ArtMode::Ascii
+        );
+    }
+
+    #[test]
+    fn auto_and_blocks_stay_ascii_whatever_the_probe_says() {
+        for detected in [true, false] {
+            assert_eq!(
+                art_mode_for_picker(config::AlbumArtMode::Auto, detected),
+                browse::ArtMode::Ascii
+            );
+            assert_eq!(
+                art_mode_for_picker(config::AlbumArtMode::Blocks, detected),
+                browse::ArtMode::Ascii
+            );
+            assert_eq!(
+                art_mode_for_picker(config::AlbumArtMode::Off, detected),
+                browse::ArtMode::Off
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_named_protocol_counts_as_asking_for_real_art() {
+        assert!(wants_real_art(config::AlbumArtMode::Kitty));
+        assert!(wants_real_art(config::AlbumArtMode::Sixel));
+        assert!(wants_real_art(config::AlbumArtMode::Iterm2));
+        assert!(!wants_real_art(config::AlbumArtMode::Auto));
+        assert!(!wants_real_art(config::AlbumArtMode::Blocks));
+        assert!(!wants_real_art(config::AlbumArtMode::Off));
+    }
+
+    #[test]
+    fn loading_messages_fit_a_narrow_sidebar() {
+        for (scanning, syncing) in [(true, true), (true, false), (false, true)] {
+            let msg = loading_message(scanning, syncing).unwrap();
+            assert!(msg.len() <= 30, "{msg:?} would be truncated in the sidebar");
+        }
     }
 }
