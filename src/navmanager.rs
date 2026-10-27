@@ -14,11 +14,21 @@ pub struct NavManager {
     pub step: NavManagerStep,
     pub selected: usize,
     pub message: String,
+    /// Connectivity check per configured server, same index as
+    /// `cfg.navidrome_servers`; `None` = not tested this session yet.
+    /// Tested all at once right when the manager opens, not lazily per
+    /// row, so you see where every profile stands immediately.
+    pub connection_status: Vec<Option<bool>>,
 }
 
 impl NavManager {
     pub fn new() -> Self {
-        NavManager { step: NavManagerStep::List, selected: 0, message: String::new() }
+        NavManager {
+            step: NavManagerStep::List,
+            selected: 0,
+            message: String::new(),
+            connection_status: Vec::new(),
+        }
     }
 }
 
