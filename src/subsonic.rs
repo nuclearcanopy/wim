@@ -294,9 +294,11 @@ impl Client {
         Ok(albums)
     }
 
-    /// Stream url for a song id. Transcoding is left to the server's own
-    /// configured profile by default (no format/bitrate override); see
-    /// ROADMAP.md.
+    /// Stream url for a song id. Asks for `format=raw` (the subsonic
+    /// idiom for "don't transcode") unless the config overrides format
+    /// or bitrate, so playback is the original file rather than
+    /// whatever profile the server happens to have on this player; see
+    /// docs/audio-quality.md.
     pub fn stream_url(&self, song_id: &str) -> String {
         let salt: String = {
             let mut rng = rand::thread_rng();
@@ -316,8 +318,12 @@ impl Client {
         if let Some(kbps) = self.max_bitrate_kbps {
             url.push_str(&format!("&maxBitRate={kbps}"));
         }
-        if let Some(format) = &self.transcode_format {
-            url.push_str(&format!("&format={format}"));
+        match &self.transcode_format {
+            Some(format) => url.push_str(&format!("&format={format}")),
+            // a bitrate cap only means anything if the server may
+            // re-encode, so raw is only safe to force without one.
+            None if self.max_bitrate_kbps.is_none() => url.push_str("&format=raw"),
+            None => {}
         }
         url
     }
@@ -530,8 +536,11 @@ fn parse_search3_response(v: &serde_json::Value) -> SearchResult {
 mod tests {
     use super::*;
 
+    /// Without an explicit format a server-side player profile decides
+    /// what wim gets, which is how the same track can arrive as a lossy
+    /// re-encode here and as the original in a browser; raw pins it.
     #[test]
-    fn stream_url_omits_overrides_by_default_and_includes_them_when_set() {
+    fn stream_url_asks_for_raw_when_nothing_is_overridden() {
         let plain = Client::new(&NavidromeConfig {
             url: "https://example.invalid".into(),
             username: "test".into(),
@@ -543,8 +552,29 @@ mod tests {
         .unwrap();
         let url = plain.stream_url("song-1");
         assert!(!url.contains("maxBitRate"));
-        assert!(!url.contains("format="));
+        assert!(url.contains("format=raw"));
+    }
 
+    /// A bitrate cap is a request to re-encode, so raw must not be
+    /// forced alongside it (the server would have to ignore one).
+    #[test]
+    fn stream_url_drops_raw_when_a_bitrate_cap_is_set() {
+        let capped = Client::new(&NavidromeConfig {
+            url: "https://example.invalid".into(),
+            username: "test".into(),
+            password: Some("pw".into()),
+            password_file: None,
+            max_bitrate_kbps: Some(192),
+            transcode_format: None,
+        })
+        .unwrap();
+        let url = capped.stream_url("song-1");
+        assert!(url.contains("maxBitRate=192"));
+        assert!(!url.contains("format="));
+    }
+
+    #[test]
+    fn stream_url_includes_overrides_when_set() {
         let overridden = Client::new(&NavidromeConfig {
             url: "https://example.invalid".into(),
             username: "test".into(),
