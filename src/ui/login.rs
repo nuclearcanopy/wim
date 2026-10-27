@@ -51,7 +51,7 @@ impl Widget for LoginView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let masked_password: String = "*".repeat(self.form.password.chars().count());
         let rows: [(&str, &str); 3] =
-            [("navidrome url", &self.form.url), ("username", &self.form.username), ("password", &masked_password)];
+            [("server (https:// assumed)", &self.form.url), ("username", &self.form.username), ("password", &masked_password)];
 
         let mut y = area.y;
         draw_line(buf, area, y, "navidrome setup — enter to advance, esc to skip (local files only)", shade(DIM));

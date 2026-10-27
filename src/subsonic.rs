@@ -57,7 +57,7 @@ pub struct SearchResult {
 impl Client {
     pub fn new(cfg: &NavidromeConfig) -> anyhow::Result<Self> {
         Ok(Client {
-            base_url: cfg.url.trim_end_matches('/').to_string(),
+            base_url: normalize_url(&cfg.url),
             username: cfg.username.clone(),
             password: cfg.resolve_password()?,
             agent: ureq::AgentBuilder::new().build(),
@@ -260,6 +260,19 @@ struct SubsonicError {
     message: String,
 }
 
+/// So typing a bare `myserver.com` (no scheme) in the login prompt
+/// actually works instead of silently failing to connect — defaults to
+/// https, since that's the sane assumption for anything reachable from
+/// outside localhost. Trailing slashes are trimmed either way.
+fn normalize_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +285,16 @@ mod tests {
         let token = format!("{:x}", hasher.finalize());
         // known-answer check against the Subsonic API docs example
         assert_eq!(token, "26719a1196d2a940705a59634eb18eab");
+    }
+
+    #[test]
+    fn normalize_url_defaults_to_https_when_scheme_omitted() {
+        assert_eq!(normalize_url("navidrome.example.com"), "https://navidrome.example.com");
+    }
+
+    #[test]
+    fn normalize_url_leaves_an_explicit_scheme_alone() {
+        assert_eq!(normalize_url("http://192.168.1.5:4533"), "http://192.168.1.5:4533");
+        assert_eq!(normalize_url("https://navidrome.example.com/"), "https://navidrome.example.com");
     }
 }
