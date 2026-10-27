@@ -70,37 +70,28 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(dir.join("wim").join("config.toml"))
 }
 
-/// Loads config.toml, writing a commented default template on first run.
+/// Loads config.toml, or starts with defaults on first run — never
+/// bails out to a cli error. A missing navidrome section just means
+/// the in-app login prompt (main.rs) offers to set one up; forcing
+/// people to hand-edit a toml file before they can even see the app
+/// once was a bad first-run experience, not a reasonable default.
 pub fn load_or_init() -> Result<Config> {
     let path = config_path()?;
     if !path.exists() {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, DEFAULT_TEMPLATE)?;
-        anyhow::bail!(
-            "no config found; wrote a template to {} — fill it in and re-run",
-            path.display()
-        );
+        save(&Config::default())?;
+        return Ok(Config::default());
     }
     let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let cfg: Config = toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
     Ok(cfg)
 }
 
-const DEFAULT_TEMPLATE: &str = r#"# wim config
-# this file can also be generated declaratively by the wim home-manager
-# module; hand-editing and Nix-managed config are equivalent to the app.
-
-[navidrome]
-url = "https://navidrome.example.com"
-username = "me"
-# either set a literal password, or point at a file (e.g. an agenix secret)
-# password = "..."
-password_file = "/run/secrets/navidrome-password"
-
-# auto | blocks | sixel | kitty | iterm2 | off
-album_art = "auto"
-
-library_paths = []
-"#;
+pub fn save(cfg: &Config) -> Result<()> {
+    let path = config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let toml = toml::to_string_pretty(cfg)?;
+    fs::write(&path, toml).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
