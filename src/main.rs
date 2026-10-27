@@ -369,7 +369,10 @@ fn lyrics_query(item: &SearchItem) -> Option<(String, String, String)> {
 fn try_play(player: &mpv::Mpv, item: &SearchItem) -> (String, bool) {
     match playable_path(item) {
         Some(path) => match player.load_file(&path) {
-            Ok(()) => (format!("playing: {}", label(item)), true),
+            Ok(()) => {
+                set_vid_for_item(player, item);
+                (format!("playing: {}", label(item)), true)
+            }
             Err(e) => (format!("error loading file: {e}"), false),
         },
         None => (
@@ -377,6 +380,22 @@ fn try_play(player: &mpv::Mpv, item: &SearchItem) -> (String, bool) {
             false,
         ),
     }
+}
+
+/// mpv defaults to opening its own native window for any file with a
+/// video track, including showing embedded cover art as a static
+/// "video" for plain audio files; explicitly disabling it for
+/// anything that isn't actually `LocalVideo` stops a window from
+/// popping up for ordinary music playback. Properly embedding actual
+/// video in the workspace is separate, larger work; this is the
+/// narrow fix for audio never deserving a window at all.
+fn set_vid_for_item(player: &mpv::Mpv, item: &SearchItem) {
+    let vid = if matches!(item, SearchItem::LocalVideo { .. }) {
+        serde_json::json!("auto")
+    } else {
+        serde_json::json!("no")
+    };
+    let _ = player.set_property("vid", vid);
 }
 
 /// Appends `item` to mpv's own playlist (plays immediately if nothing
@@ -1242,6 +1261,7 @@ fn main() -> anyhow::Result<()> {
             status = match app.pop_queue() {
                 Some(next) => {
                     let s = format!("now playing: {}", label(&next));
+                    set_vid_for_item(&player, &next);
                     maybe_fetch_subtitles(&cfg, &player, &mut notifications, &next);
                     previous_track = now_playing.replace(next);
                     s
