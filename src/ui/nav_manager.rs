@@ -14,6 +14,8 @@ pub struct NavManagerListView<'a> {
     pub servers: &'a [NavidromeConfig],
     pub selected: usize,
     pub message: &'a str,
+    /// Same index as `servers`; `None` = not tested this session.
+    pub connection_status: &'a [Option<bool>],
 }
 
 impl Widget for NavManagerListView<'_> {
@@ -38,7 +40,14 @@ impl Widget for NavManagerListView<'_> {
         for (i, server) in self.servers.iter().enumerate() {
             let active = i == self.selected;
             let marker = if active { "> " } else { "  " };
-            let line = format!("{marker}{} ({})", server.url, server.username);
+            // ✓/✗ are plain text-presentation symbols (not emoji
+            // variants), so they stay monochrome like everything else.
+            let status = match self.connection_status.get(i) {
+                Some(Some(true)) => "✓ ",
+                Some(Some(false)) => "✗ ",
+                _ => "  ",
+            };
+            let line = format!("{marker}{status}{} ({})", server.url, server.username);
             draw_line(
                 buf,
                 area,
