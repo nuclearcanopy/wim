@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod eq;
+mod layout;
 mod library;
 mod lyrics;
 mod mpv;
@@ -16,19 +17,23 @@ mod ui;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 
 use app::Action;
+use layout::{PanelLayout, ResizePanel};
 use navmanager::{NavManager, NavManagerStep};
 use onboarding::{Onboarding, Step};
 use search::SearchItem;
 use ui::banner::Banner;
+use ui::controlsbar::ControlsBar;
+use ui::divider::{HorizontalRule, VerticalRule};
 use ui::login::{LoginForm, LoginView};
 use ui::lyrics_view::LyricsView;
 use ui::nav_manager::NavManagerListView;
+use ui::nowplaying::NowPlayingView;
 use ui::onboarding::{ControlsView, DoneView, LibraryPathsView, WelcomeView};
 use ui::results_list::{label, ResultsList};
-use ui::status::StatusBar;
+use ui::searchbox::SearchBox;
 
 /// Local items resolve straight to a file path mpv can load. Remote
 /// (subsonic) items aren't wired into playback yet; the live loop only
@@ -252,6 +257,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    let mut panels = PanelLayout::new();
     let start = Instant::now();
     let mut guard = term::TerminalGuard::new()?;
     loop {
@@ -278,14 +284,9 @@ fn main() -> anyhow::Result<()> {
                 return;
             }
 
-            let chunks = Layout::vertical([
-                Constraint::Min(0),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
-            .split(area);
-            f.render_widget(ui::divider::HorizontalRule { highlighted: false }, chunks[1]);
-
+            // nav manager and login are brief setup flows, same
+            // full-screen-modal treatment as onboarding; they don't
+            // need the sidebar visible while active.
             if let Some(nm) = &nav_manager {
                 match &nm.step {
                     NavManagerStep::List => {
@@ -295,63 +296,82 @@ fn main() -> anyhow::Result<()> {
                                 selected: nm.selected,
                                 message: &nm.message,
                             },
-                            chunks[0],
+                            area,
                         );
                     }
                     NavManagerStep::Add(form) => {
-                        f.render_widget(LoginView { form, message: &nm.message }, chunks[0]);
+                        f.render_widget(LoginView { form, message: &nm.message }, area);
                     }
                 }
-            } else {
-                match &lyrics_lines {
-                    Some(lines) => {
-                        let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
-                        f.render_widget(LyricsView { lines: &borrowed, scroll: lyrics_scroll }, chunks[0]);
-                    }
-                    None if app.results.is_empty() => {
-                        // nothing to show; the animated title card, not
-                        // a blank void. splitting leaves one line at the
-                        // bottom of the content area for the contextual
-                        // hint (why it's empty / what to do next).
-                        let idle_chunks =
-                            Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
-                                .split(chunks[0]);
-                        let elapsed_secs = start.elapsed().as_secs_f32();
-                        let phase = elapsed_secs * 0.25;
-                        f.render_widget(Banner { phase, elapsed_secs }, idle_chunks[0]);
-                        f.render_widget(
-                            StatusBar {
-                                editing_query: app.editing_query,
-                                query: &app.query,
-                                message: &empty_results_message(&app),
-                            },
-                            idle_chunks[1],
-                        );
-                    }
-                    None => {
-                        f.render_widget(
-                            ResultsList {
-                                items: &app.results,
-                                selected: app.selected,
-                                empty_message: &empty_results_message(&app),
-                            },
-                            chunks[0],
-                        );
-                    }
-                }
+                return;
             }
 
-            let status_line = format!(
-                "[queue:{} loop:{} shuffle:{} speed:{:.2}x eq:{}] {status}",
-                app.queue.len(),
-                if app.loop_file { "on" } else { "off" },
-                if app.shuffle { "on" } else { "off" },
-                app.speed,
-                eq::PRESETS[app.eq_preset].name,
+            // sidebar (search + results, only horizontally resizable)
+            // | main content (now playing / lyrics) over a bottom
+            // playback bar (only vertically resizable). resize mode
+            // highlights whichever divider borders the selected panel.
+            let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(panels.bottom_bar_height)])
+                .split(area);
+            let top = rows[0];
+            let bottom = rows[1];
+
+            let cols = Layout::horizontal([
+                Constraint::Length(panels.sidebar_width),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .split(top);
+            let sidebar = cols[0];
+            let vdivider = cols[1];
+            let main_content = cols[2];
+
+            let sidebar_selected = panels.resize_mode && panels.resize_selected == ResizePanel::Sidebar;
+            let bottom_selected = panels.resize_mode && panels.resize_selected == ResizePanel::BottomBar;
+
+            f.render_widget(VerticalRule { highlighted: sidebar_selected }, vdivider);
+            f.render_widget(HorizontalRule { highlighted: bottom_selected }, Rect { height: 1, ..bottom });
+
+            let sidebar_rows =
+                Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(sidebar);
+            f.render_widget(SearchBox { query: &app.query, editing: app.editing_query }, sidebar_rows[0]);
+            f.render_widget(
+                ResultsList {
+                    items: &app.results,
+                    selected: app.selected,
+                    empty_message: &empty_results_message(&app),
+                },
+                sidebar_rows[1],
+            );
+
+            match &lyrics_lines {
+                Some(lines) => {
+                    let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+                    f.render_widget(LyricsView { lines: &borrowed, scroll: lyrics_scroll }, main_content);
+                }
+                None => match &now_playing {
+                    Some(item) => f.render_widget(NowPlayingView { label: &label(item) }, main_content),
+                    None => {
+                        let elapsed_secs = start.elapsed().as_secs_f32();
+                        let phase = elapsed_secs * 0.25;
+                        f.render_widget(Banner { phase, elapsed_secs }, main_content);
+                    }
+                },
+            }
+
+            let resize_hint = panels.resize_mode.then_some(
+                "resize mode: a=sidebar s=bottom bar, arrows stretch, r/esc exit",
             );
             f.render_widget(
-                StatusBar { editing_query: app.editing_query, query: &app.query, message: &status_line },
-                chunks[2],
+                ControlsBar {
+                    status: &status,
+                    queue_len: app.queue.len(),
+                    loop_on: app.loop_file,
+                    shuffle_on: app.shuffle,
+                    speed: app.speed,
+                    eq_preset: eq::PRESETS[app.eq_preset].name,
+                    resize_hint,
+                },
+                Rect { y: bottom.y + 1, height: bottom.height.saturating_sub(1), ..bottom },
             );
         })?;
 
@@ -516,6 +536,29 @@ fn main() -> anyhow::Result<()> {
                             _ => {}
                         },
                     }
+                    continue;
+                }
+
+                if panels.resize_mode {
+                    // each panel only answers to its one valid resize
+                    // axis: sidebar is a vertical strip (left/right
+                    // only), bottom bar is a horizontal strip (up/down
+                    // only) — the other axis is a no-op, not a no-op
+                    // that happens to also work the "wrong" way.
+                    match (panels.resize_selected, key.code) {
+                        (_, KeyCode::Char('r') | KeyCode::Esc) => panels.toggle_resize_mode(),
+                        (_, KeyCode::Char('a')) => panels.select(ResizePanel::Sidebar),
+                        (_, KeyCode::Char('s')) => panels.select(ResizePanel::BottomBar),
+                        (ResizePanel::Sidebar, KeyCode::Left) => panels.shrink(),
+                        (ResizePanel::Sidebar, KeyCode::Right) => panels.grow(),
+                        (ResizePanel::BottomBar, KeyCode::Up) => panels.grow(),
+                        (ResizePanel::BottomBar, KeyCode::Down) => panels.shrink(),
+                        _ => {}
+                    }
+                    continue;
+                }
+                if key.code == KeyCode::Char('r') {
+                    panels.toggle_resize_mode();
                     continue;
                 }
 

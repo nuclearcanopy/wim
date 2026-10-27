@@ -120,6 +120,12 @@ impl Widget for LoginView<'_> {
         }
 
         y += 1;
+        // paste isn't a wim keybind; it's whatever your terminal
+        // emulator binds (often ctrl+shift+v, sometimes middle-click).
+        // bracketed paste is enabled on our end either way, so if your
+        // terminal supports it, it'll just work.
+        draw_line(buf, area, y, "paste with your terminal's shortcut (often ctrl+shift+v)", shade(DIM));
+        y += 1;
         draw_line(buf, area, y, &truncate_with_ellipsis(self.message, width), shade(DIM));
     }
 }
