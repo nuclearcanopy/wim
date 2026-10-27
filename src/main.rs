@@ -1433,6 +1433,24 @@ fn test_navidrome_connectivity(servers: &[config::NavidromeConfig]) -> Vec<Optio
     })
 }
 
+/// Warns once, right after a profile is saved, that the password it
+/// just persisted is cleartext. Typing credentials into the app is the
+/// only way it can store them (subsonic auth needs the cleartext for
+/// every request), so this isn't a thing to fix silently; it's a thing
+/// the user has to know in order to choose `password_file` instead.
+fn warn_plaintext_password(cfg: &config::Config, notifications: &mut Notifications) {
+    let path = config::config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "config.toml".to_string());
+    let _ = cfg;
+    notifications.push(
+        Severity::Alert,
+        format!(
+            "password saved in cleartext (0600) at {path}; use password_file for a secret manager"
+        ),
+    );
+}
+
 fn navidrome_config_from_form(form: &LoginForm) -> config::NavidromeConfig {
     config::NavidromeConfig {
         url: form.url.clone(),
@@ -2820,6 +2838,7 @@ fn main() -> anyhow::Result<()> {
                                         );
                                         cfg.navidrome_servers.push(nav);
                                         save_config(&cfg, &mut notifications);
+                                        warn_plaintext_password(&cfg, &mut notifications);
                                         nm.connection_status.push(Some(true));
                                         nm.selected = cfg.navidrome_servers.len() - 1;
                                         nm.step = NavManagerStep::List;
