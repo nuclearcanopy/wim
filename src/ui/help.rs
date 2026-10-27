@@ -61,7 +61,10 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("r", "resize mode (a/w/s/d select, arrows stretch)"),
         ],
     ),
-    ("other", &[("q", "quit"), ("?", "close this")]),
+    (
+        "other",
+        &[("u", "settings"), ("q", "quit"), ("?", "close this")],
+    ),
 ];
 
 impl Widget for HelpOverlay {
