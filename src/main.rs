@@ -1,3 +1,4 @@
+mod anim;
 mod app;
 mod browse;
 mod cache;
