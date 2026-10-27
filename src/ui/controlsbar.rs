@@ -44,19 +44,6 @@ impl Widget for ControlsBar<'_> {
             self.eq_preset,
         );
         draw_line(buf, area, y, &state_line, width, shade(DIM));
-        y += 1;
-        if y >= area.y + area.height {
-            return;
-        }
-
-        draw_line(
-            buf,
-            area,
-            y,
-            "/ search  enter play  a queue  l loop  s shuffle  e eq  L lyrics  n navidrome  r resize  q quit",
-            width,
-            shade(DIM),
-        );
     }
 }
 
