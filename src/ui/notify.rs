@@ -37,7 +37,7 @@ impl Widget for NotificationOverlay<'_> {
                 Severity::Error => WHITE,
             });
 
-            draw_box(buf, start_x, y, box_width, &text, n.remaining_secs(), color);
+            draw_box(buf, start_x, y, box_width, &text, &n.footer(), color);
             y += 4; // box height (3) + one row of gap before the next
         }
     }
@@ -49,7 +49,7 @@ fn draw_box(
     y: u16,
     width: u16,
     text: &str,
-    remaining_secs: u64,
+    footer: &str,
     color: ratatui::style::Color,
 ) {
     put(buf, x, y, '┌', color);
@@ -64,18 +64,18 @@ fn draw_box(
         put(buf, x + 1 + i as u16, y + 1, ch, color);
     }
 
-    // countdown lives in the bottom-right corner of the border itself,
-    // not a separate line, so the box stays exactly 3 rows regardless
-    // of how much time is left.
+    // the countdown (or, for a download in progress, a live percentage)
+    // lives in the bottom-right corner of the border itself, not a
+    // separate line, so the box stays exactly 3 rows regardless of how
+    // much time is left / how far along the download is.
     put(buf, x, y + 2, '└', color);
     put(buf, x + width - 1, y + 2, '┘', color);
-    let timer = format!("{remaining_secs}s");
-    let timer_width = timer.chars().count() as u16;
-    let timer_start = (width - 1).saturating_sub(timer_width);
+    let footer_width = footer.chars().count() as u16;
+    let footer_start = (width - 1).saturating_sub(footer_width);
     for col in 1..width - 1 {
-        let in_timer = col >= timer_start && col - timer_start < timer_width;
-        let ch = if in_timer {
-            timer.chars().nth((col - timer_start) as usize).unwrap()
+        let in_footer = col >= footer_start && col - footer_start < footer_width;
+        let ch = if in_footer {
+            footer.chars().nth((col - footer_start) as usize).unwrap()
         } else {
             '─'
         };
