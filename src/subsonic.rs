@@ -24,6 +24,10 @@ pub struct Client {
     username: String,
     password: String,
     agent: ureq::Agent,
+    /// Client-side `stream` overrides; `None` means "let the server's
+    /// own configured transcoding profile decide," the default.
+    max_bitrate_kbps: Option<u32>,
+    transcode_format: Option<String>,
 }
 
 impl std::fmt::Debug for Client {
@@ -96,6 +100,8 @@ impl Client {
             username: cfg.username.clone(),
             password: cfg.resolve_password()?,
             agent: ureq::AgentBuilder::new().build(),
+            max_bitrate_kbps: cfg.max_bitrate_kbps,
+            transcode_format: cfg.transcode_format.clone(),
         })
     }
 
@@ -297,10 +303,17 @@ impl Client {
         hasher.update(salt.as_bytes());
         let token = format!("{:x}", hasher.finalize());
 
-        format!(
+        let mut url = format!(
             "{}/rest/stream?id={}&u={}&t={}&s={}&v={}&c={}",
             self.base_url, song_id, self.username, token, salt, API_VERSION, CLIENT_NAME
-        )
+        );
+        if let Some(kbps) = self.max_bitrate_kbps {
+            url.push_str(&format!("&maxBitRate={kbps}"));
+        }
+        if let Some(format) = &self.transcode_format {
+            url.push_str(&format!("&format={format}"));
+        }
+        url
     }
 
     /// Raw image bytes for an album's (or song's) cover art; navidrome
@@ -453,6 +466,35 @@ fn parse_album_list2_page(v: &serde_json::Value) -> Vec<Album> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_url_omits_overrides_by_default_and_includes_them_when_set() {
+        let plain = Client::new(&NavidromeConfig {
+            url: "https://example.invalid".into(),
+            username: "test".into(),
+            password: Some("pw".into()),
+            password_file: None,
+            max_bitrate_kbps: None,
+            transcode_format: None,
+        })
+        .unwrap();
+        let url = plain.stream_url("song-1");
+        assert!(!url.contains("maxBitRate"));
+        assert!(!url.contains("format="));
+
+        let overridden = Client::new(&NavidromeConfig {
+            url: "https://example.invalid".into(),
+            username: "test".into(),
+            password: Some("pw".into()),
+            password_file: None,
+            max_bitrate_kbps: Some(128),
+            transcode_format: Some("opus".into()),
+        })
+        .unwrap();
+        let url = overridden.stream_url("song-1");
+        assert!(url.contains("maxBitRate=128"));
+        assert!(url.contains("format=opus"));
+    }
 
     #[test]
     fn token_is_deterministic_md5_of_password_and_salt() {
