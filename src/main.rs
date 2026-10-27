@@ -38,10 +38,11 @@ use ui::controlsbar::ControlsBar;
 use ui::divider::{HorizontalRule, VerticalRule};
 use ui::login::{LoginForm, LoginView};
 use ui::lyrics_view::LyricsView;
+use ui::miniplayer::MiniPlayerBar;
 use ui::nav_manager::NavManagerListView;
 use ui::notify::NotificationOverlay;
-use ui::nowplaying::NowPlayingView;
 use ui::onboarding::{ControlsView, DoneView, LibraryPathsView, WelcomeView};
+use ui::player::PlayerView;
 use ui::results_list::{label, ResultsList};
 use ui::searchbox::SearchBox;
 
@@ -249,6 +250,16 @@ fn save_playback_state(player: &mpv::Mpv, now_playing: &Option<SearchItem>, queu
     let _ = persistence::save(&state);
 }
 
+/// `(elapsed, duration, paused)` for whatever's currently loaded;
+/// queried fresh each frame rather than cached, so the mini/full
+/// player's progress bar is always showing mpv's actual position.
+fn playback_info(player: &mpv::Mpv) -> (Option<f64>, Option<f64>, bool) {
+    let elapsed = player.get_property("time-pos").ok().and_then(|v| v.as_f64());
+    let duration = player.get_property("duration").ok().and_then(|v| v.as_f64());
+    let paused = player.get_property("pause").ok().and_then(|v| v.as_bool()).unwrap_or(false);
+    (elapsed, duration, paused)
+}
+
 /// How often the background thread (see `spawn_background_sync`)
 /// re-fetches every configured server, so navidrome stays "constantly
 /// updating" without the user ever pressing a manual refresh key.
@@ -417,6 +428,14 @@ fn main() -> anyhow::Result<()> {
     let mut remote_starred: HashSet<String> = HashSet::new();
 
     let mut now_playing: Option<SearchItem> = None;
+    // whatever was playing right before `now_playing` last changed;
+    // purely for the player view's "previous: ..." line.
+    let mut previous_track: Option<SearchItem> = None;
+    // false (full player) by default for a standalone play; starting
+    // playback from an open album/playlist sets this true instead, so
+    // the track listing stays visible rather than getting replaced.
+    // 'm' toggles it by hand either way.
+    let mut player_minimized = false;
     let mut notifications = Notifications::default();
     let lyrics_client = lyrics::Client::new();
     let mut lyrics_lines: Option<Vec<String>> = None;
@@ -578,14 +597,28 @@ fn main() -> anyhow::Result<()> {
                 return;
             }
 
+            // the full player replaces whatever else main_content was
+            // showing; minimized just means "let the album view (if
+            // any) or the banner show instead", with a thin ipod-style
+            // strip taking its place right above the main bottom bar.
+            let show_full_player = now_playing.is_some() && !player_minimized;
+            let show_mini_bar = now_playing.is_some() && player_minimized;
+
             // sidebar (search + results, only horizontally resizable)
-            // | main content (now playing / lyrics) over a bottom
-            // playback bar (only vertically resizable). resize mode
-            // highlights whichever divider borders the selected panel.
-            let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(panels.bottom_bar_height)])
-                .split(area);
+            // | main content (player / now playing / lyrics) over an
+            // optional mini player strip, over a bottom playback bar
+            // (only vertically resizable). resize mode highlights
+            // whichever divider borders the selected panel.
+            let mini_bar_height: u16 = if show_mini_bar { 2 } else { 0 };
+            let rows = Layout::vertical([
+                Constraint::Min(0),
+                Constraint::Length(mini_bar_height),
+                Constraint::Length(panels.bottom_bar_height),
+            ])
+            .split(area);
             let top = rows[0];
-            let bottom = rows[1];
+            let mini_bar_row = rows[1];
+            let bottom = rows[2];
 
             let cols = Layout::horizontal([
                 Constraint::Length(panels.sidebar_width),
@@ -602,14 +635,16 @@ fn main() -> anyhow::Result<()> {
 
             // the banner and the browse view's own header both draw
             // internal horizontal rules right at main_content's left
-            // edge; lyrics/now-playing don't. same join as the bottom
+            // edge; the player/lyrics don't. same join as the bottom
             // bar: whichever one's actually showing needs its rule row
             // marked, or the vertical divider crosses it with a gap.
-            let junction_rows = if browse_view.is_some() {
+            let junction_rows = if show_full_player {
+                Vec::new()
+            } else if browse_view.is_some() {
                 // draw_header's rule sits one row below where it's
                 // asked to start, which is always main_content.y here.
                 vec![main_content.y + 1]
-            } else if lyrics_lines.is_none() && now_playing.is_none() {
+            } else if lyrics_lines.is_none() {
                 ui::banner::rule_rows(main_content).to_vec()
             } else {
                 Vec::new()
@@ -639,25 +674,50 @@ fn main() -> anyhow::Result<()> {
                 sidebar_rows[1],
             );
 
-            match &browse_view {
-                Some(bv) => f.render_widget(
+            if show_full_player {
+                let item = now_playing.as_ref().expect("show_full_player implies Some");
+                let (elapsed_secs, duration_secs, paused) = playback_info(&player);
+                let previous_label = previous_track.as_ref().map(label);
+                let next_label = app.queue.first().map(label);
+                f.render_widget(
+                    PlayerView {
+                        title: &label(item),
+                        elapsed_secs,
+                        duration_secs,
+                        paused,
+                        loop_label: app.loop_mode.label(),
+                        shuffle_on: app.shuffle,
+                        speed: app.speed,
+                        eq_preset: eq::PRESETS[app.eq_preset].name,
+                        previous: previous_label.as_deref(),
+                        next: next_label.as_deref(),
+                    },
+                    main_content,
+                );
+            } else if let Some(bv) = &browse_view {
+                f.render_widget(
                     BrowseListView { view: bv, favorites: &favorites, remote_starred: &remote_starred },
                     main_content,
-                ),
-                None => match &lyrics_lines {
-                    Some(lines) => {
-                        let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
-                        f.render_widget(LyricsView { lines: &borrowed, scroll: lyrics_scroll }, main_content);
-                    }
-                    None => match &now_playing {
-                        Some(item) => f.render_widget(NowPlayingView { label: &label(item) }, main_content),
-                        None => {
-                            let elapsed_secs = start.elapsed().as_secs_f32();
-                            let phase = elapsed_secs * 0.25;
-                            f.render_widget(Banner { phase, elapsed_secs }, main_content);
-                        }
-                    },
-                },
+                );
+            } else if let Some(lines) = &lyrics_lines {
+                let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+                f.render_widget(LyricsView { lines: &borrowed, scroll: lyrics_scroll }, main_content);
+            } else {
+                let elapsed_secs = start.elapsed().as_secs_f32();
+                let phase = elapsed_secs * 0.25;
+                f.render_widget(Banner { phase, elapsed_secs }, main_content);
+            }
+
+            if show_mini_bar {
+                let item = now_playing.as_ref().expect("show_mini_bar implies Some");
+                let (elapsed_secs, duration_secs, paused) = playback_info(&player);
+                f.render_widget(
+                    MiniPlayerBar { title: &label(item), elapsed_secs, duration_secs, paused },
+                    // same y/height as the row carved out above, but
+                    // main_content's x/width: the strip must not slide
+                    // under the sidebar.
+                    Rect { x: main_content.x, width: main_content.width, ..mini_bar_row },
+                );
             }
 
             let resize_hint = panels.resize_mode.then_some(
@@ -685,7 +745,7 @@ fn main() -> anyhow::Result<()> {
             status = match app.pop_queue() {
                 Some(next) => {
                     let s = format!("now playing: {}", label(&next));
-                    now_playing = Some(next);
+                    previous_track = std::mem::replace(&mut now_playing, Some(next));
                     s
                 }
                 // mpv has no concept of "the queue we built", only its
@@ -702,7 +762,7 @@ fn main() -> anyhow::Result<()> {
                         for t in &rest {
                             let _ = try_enqueue(&player, t);
                         }
-                        now_playing = Some(first);
+                        previous_track = std::mem::replace(&mut now_playing, Some(first));
                         app.queue = rest;
                     }
                     s
@@ -944,15 +1004,24 @@ fn main() -> anyhow::Result<()> {
                                     for t in &rest {
                                         let _ = try_enqueue(&player, t);
                                     }
-                                    now_playing = Some(first);
+                                    previous_track = std::mem::replace(&mut now_playing, Some(first));
                                     app.queue = rest;
                                     original_queue = session;
+                                    // keep the album/playlist listing
+                                    // visible rather than replacing it
+                                    // with the full player.
+                                    player_minimized = true;
                                 } else {
                                     notifications.push(Severity::Error, s.clone());
                                 }
                                 status = s;
                             }
                         }
+                        // maximizing replaces this album/playlist view
+                        // with the full player; minimizing again
+                        // brings it right back (not cleared, just not
+                        // on top while the player's maximized).
+                        KeyCode::Char('m') if now_playing.is_some() => player_minimized = !player_minimized,
                         KeyCode::Char('*') => {
                             if let Some(item) = bv.tracks.get(bv.selected).cloned() {
                                 status = match toggle_star(&item, &mut favorites, &mut remote_starred) {
@@ -1001,6 +1070,11 @@ fn main() -> anyhow::Result<()> {
 
                 if key.code == KeyCode::Char('S') {
                     browse_view = Some(open_starred_view(&cfg.navidrome_servers, &favorites));
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('m') && now_playing.is_some() {
+                    player_minimized = !player_minimized;
                     continue;
                 }
 
@@ -1088,8 +1162,12 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     let rest = tracks.len();
                                     original_queue = std::iter::once(first.clone()).chain(tracks.iter().cloned()).collect();
-                                    now_playing = Some(first);
+                                    previous_track = std::mem::replace(&mut now_playing, Some(first));
                                     app.queue = tracks;
+                                    // a standalone play (not from an
+                                    // open album/playlist) takes over
+                                    // the full player by default.
+                                    player_minimized = false;
                                     if rest == 0 { s } else { format!("{s} (+{rest} more queued)") }
                                 } else {
                                     notifications.push(Severity::Error, s.clone());
