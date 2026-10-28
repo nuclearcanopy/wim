@@ -606,8 +606,19 @@ run that edits these files will collide.
       then the sync/channel plumbing, then a `struct Ui` for the ~35
       loose locals, then the draw closure, and only then the input
       tiers (their ordering is load-bearing and heavily commented).
-- [ ] **~10 blocking mpv ipc round-trips per frame**: `playback_info` is
-      called 2-3x per loop iteration plus `audio_level` and
-      `cell_aspect`'s ioctl; `observe_property` exists and is now used
-      for playlist-pos, so the rest should follow and the per-frame
-      polling should go.
+- [x] **the render path no longer polls mpv.** `time-pos`, `duration`
+      and `pause` are observed properties now, folded into
+      `mpv::Playback` as change events arrive on the channel the loop
+      already drains. that removes the last three blocking ipc round
+      trips per frame; `playback_info` is deleted rather than kept
+      around. a null value clears the field instead of leaving a stale
+      reading, which is what happens when the playlist drains (a stale
+      position would keep the scrubber crawling after the music
+      stopped). the one remaining per-frame call is `audio_level`,
+      which is an inherently per-frame sample of the astats tap.
+      `cell_aspect`'s ioctl also went from five calls per frame to one,
+      since the answer cannot change inside a frame. one deliberate
+      exception: shellsong's percent seek still asks for `duration`
+      directly, because it runs once per command and must resolve
+      against the duration as of now rather than the last pushed
+      change.

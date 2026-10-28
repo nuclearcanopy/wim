@@ -16,6 +16,9 @@ use serde_json::{json, Value};
 /// these only have to be distinct from each other.
 const OBS_PLAYLIST_POS: u64 = 1;
 const OBS_IDLE_ACTIVE: u64 = 2;
+const OBS_TIME_POS: u64 = 3;
+const OBS_DURATION: u64 = 4;
+const OBS_PAUSE: u64 = 5;
 
 /// Current index into mpv's own playlist, or -1 when nothing is
 /// loaded; the single source of truth for which track is playing.
@@ -25,6 +28,13 @@ pub const PROP_PLAYLIST_POS: &str = "playlist-pos";
 /// never was: `loadfile replace` emits an end-file for the track it
 /// evicts, but never leaves mpv idle.
 pub const PROP_IDLE_ACTIVE: &str = "idle-active";
+/// Where playback is, how long the file is, and whether it's paused.
+/// Observed rather than polled: the render path reads these every
+/// frame, and `get_property` is a blocking request/reply round trip
+/// over the ipc socket each time.
+pub const PROP_TIME_POS: &str = "time-pos";
+pub const PROP_DURATION: &str = "duration";
+pub const PROP_PAUSE: &str = "pause";
 
 /// Property-change and other async events pushed by mpv over the IPC socket.
 #[derive(Debug, Clone)]
@@ -35,6 +45,38 @@ pub enum Event {
     },
     #[allow(dead_code)]
     Other(Value),
+}
+
+/// Last known playback position, folded from observed property
+/// changes rather than asked for.
+///
+/// This used to be three `get_property` calls per frame
+/// (`playback_info`), so every frame paid three blocking round trips
+/// for values mpv will happily push. The scrubber, the mini bar, the
+/// full player and the scrobble threshold all read it, which is why it
+/// was already hoisted to one call per frame; now it costs none.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Playback {
+    pub elapsed_secs: Option<f64>,
+    pub duration_secs: Option<f64>,
+    pub paused: bool,
+}
+
+impl Playback {
+    /// Folds one observed change in, returning whether it was one of
+    /// these three. mpv sends `null` for a property that currently has
+    /// no value (no file loaded), which is `None` rather than stale.
+    pub fn apply(&mut self, name: &str, value: &Value) -> bool {
+        match name {
+            PROP_TIME_POS => self.elapsed_secs = value.as_f64(),
+            PROP_DURATION => self.duration_secs = value.as_f64(),
+            // an absent `pause` means nothing is loaded, which reads
+            // as not-paused everywhere downstream.
+            PROP_PAUSE => self.paused = value.as_bool().unwrap_or(false),
+            _ => return false,
+        }
+        true
+    }
 }
 
 struct Pending {
@@ -256,6 +298,9 @@ impl Mpv {
     pub fn observe_playback(&self) -> Result<()> {
         self.observe_property(OBS_PLAYLIST_POS, PROP_PLAYLIST_POS)?;
         self.observe_property(OBS_IDLE_ACTIVE, PROP_IDLE_ACTIVE)?;
+        self.observe_property(OBS_TIME_POS, PROP_TIME_POS)?;
+        self.observe_property(OBS_DURATION, PROP_DURATION)?;
+        self.observe_property(OBS_PAUSE, PROP_PAUSE)?;
         Ok(())
     }
 
@@ -504,5 +549,48 @@ mod tests {
             data: vec![0; 4],
         };
         assert!(frame.into_image().is_none());
+    }
+
+    #[test]
+    fn playback_folds_the_three_observed_properties() {
+        let mut pb = Playback::default();
+        assert!(pb.apply(PROP_TIME_POS, &json!(12.5)));
+        assert!(pb.apply(PROP_DURATION, &json!(200.0)));
+        assert!(pb.apply(PROP_PAUSE, &json!(true)));
+        assert_eq!(pb.elapsed_secs, Some(12.5));
+        assert_eq!(pb.duration_secs, Some(200.0));
+        assert!(pb.paused);
+    }
+
+    #[test]
+    fn an_unrelated_property_is_left_for_the_caller() {
+        let mut pb = Playback::default();
+        assert!(!pb.apply(PROP_PLAYLIST_POS, &json!(3)));
+        assert!(!pb.apply("some-other-prop", &json!(1)));
+        assert_eq!(pb.elapsed_secs, None);
+    }
+
+    #[test]
+    fn a_null_value_clears_rather_than_leaving_a_stale_reading() {
+        let mut pb = Playback::default();
+        pb.apply(PROP_TIME_POS, &json!(42.0));
+        pb.apply(PROP_DURATION, &json!(90.0));
+        // mpv sends null for a property with no current value, which
+        // is what happens when the playlist drains.
+        pb.apply(PROP_TIME_POS, &Value::Null);
+        pb.apply(PROP_DURATION, &Value::Null);
+        assert_eq!(
+            pb.elapsed_secs, None,
+            "a stale position would keep the scrubber moving"
+        );
+        assert_eq!(pb.duration_secs, None);
+    }
+
+    #[test]
+    fn an_absent_pause_reads_as_not_paused() {
+        let mut pb = Playback::default();
+        pb.apply(PROP_PAUSE, &json!(true));
+        pb.apply(PROP_PAUSE, &Value::Null);
+        assert!(!pb.paused);
     }
 }
