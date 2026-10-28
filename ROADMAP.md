@@ -392,24 +392,61 @@ run that edits these files will collide.
   bar, enter to interact, and enter on the progress bar entering a
   scrub mode.
 
-## maintainer requests in flight (branches, not merged)
+## shellsong and suggestions (engines merged, hosts not wired)
 
-- `feat/shellsong-complete`: zsh-style autocomplete for shellsong
-  (inline ghost text, tab cycling that only ever extends what was
-  typed, right-arrow/ctrl+f accept, history-ranked candidates), plus
-  the five consistency fixes and the collapse of every screen-opening
-  verb into one `view(target)` (`view(queue)`, `view(suggestions)`,
-  `view(q, bladee)` for the search-and-open form). `show`/`suggest`/
-  `settings`/`keybinds`/`lyrics`/`starred` all fold into it.
-- `feat/suggestions`: the taste-learning engine (`src/suggest.rs`).
-  candidate generation then scoring then diversification, over the
-  play history already in `cache.rs` (`play_days` gives habit and
-  recency) plus library structure. eight generators covering the
-  maintainer's own examples: album gap, track gap, genre
-  under-exploration, daily rotation, rediscovery, starred-but-unplayed,
-  similar artists (`getArtistInfo2` already returns a `similarArtist`
-  list that is currently discarded), album neighbours. engine only; the
-  menu UI and wiring are a follow-up.
+- [x] **shellsong** (`src/shellsong.rs`, `src/ui/shellsong.rs`,
+      `docs/shellsong.md`): a call-only command language on `:`.
+      `play(crest)`, `queue([hex, 4 star crest])`, `queue_aa(...)`,
+      `favorite(...)`, `add_to_queue(front, ...)`, `moveto(10%)`,
+      `seek(+30s)`, and one `view(target)` that every screen-opening
+      verb collapsed into (`view(queue)`, `view(suggestions)`,
+      `view(q, bladee)` to search and open). resumable executor, since
+      search is asynchronous and `play` must await results rather than
+      act on stale ones. zsh-style completion: inline ghost text, tab
+      cycling that only ever *extends* what was typed (fuzzy finds the
+      candidates, then they are filtered to prefix extensions, so no
+      completion can replace typed characters), history-ranked, and a
+      type-driven split where enumerable parameters get insertable
+      candidates while value parameters get a non-insertable hint
+      instead (`volume(` offers `0-100, or ±N%`, never a guess).
+- [x] **suggestion engine** (`src/suggest.rs`, `docs/suggestions.md`):
+      candidate generation, then scoring, then diversification, over
+      the play history already in `cache.rs`. nine generators covering
+      the maintainer's own examples: daily rotation, album gap, track
+      gap, album neighbour, genre under-exploration, rediscovery,
+      starred-but-unplayed, similar artists, popular-unplayed. affinity
+      is `distinct_days + ln(1+plays) + starred`, decayed on a 30-day
+      half-life, normalised per generator before merging so raw
+      magnitude cannot decide the result. diversification caps 3 per
+      artist and 2 per album across the whole menu. every row carries a
+      reason built from the real numbers ("4 of 5 tracks played from
+      Eversince, never this one").
+- [ ] **wire the suggestions menu.** the engine is merged and compiled
+      but nothing calls it; `src/suggest.rs` carries a module-level
+      `allow(dead_code)` that comes off when the menu lands. needs: a
+      `ui/suggestions.rs` rendering grouped, explained sections, a
+      `view(suggestions)` host arm, and three background fetches the
+      engine depends on (`getAlbum` for real album coverage and track
+      order, `getArtistInfo2` for similar artists, `getTopSongs` for
+      popular-unplayed). `suggest::enrichment_targets` says which
+      artists to fetch, top-affinity first.
+- [ ] **wire shellsong to the host.** the language is complete and
+      tested; nothing runs it yet. needs the console opened on `:`,
+      keys and paste routed to `Console`, `ShellsongConsole` rendered,
+      a `Candidates` impl over the local corpus (never firing a remote
+      search), `Env::focus`/`Env::search_settled` supplied, and the
+      `Op` -> host table. unimplemented ops: `OpenPage`, all twelve
+      `View` targets, `SetVolume`, `Mute`, `Sleep`, `Fade`, `Rescan`,
+      `SaveQueue`/`LoadQueue`, `RemoveFromQueue`, `GotoQueue`,
+      `ShuffleQueue`. the queue ops can reuse `PlayQueue::remove`/
+      `move_entry` and the mpv playlist commands already added.
+- [ ] **album/artist identity is name-based.** `SearchItem` carries no
+      `album_id`/`artist_id`, so the suggestion catalog joins on
+      trimmed-lowercased names. two same-named albums by one artist
+      collapse, and a split-credit artist ("Bladee & Ecco2k") rolls up
+      under neither. widening `SearchItem` touches every construction
+      site, so it was left alone deliberately; revisit if the menu's
+      suggestions look wrong in practice.
 
 ## open sub-tasks discovered during the review pass
 

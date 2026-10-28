@@ -21,6 +21,7 @@ mod playqueue;
 mod search;
 mod shellsong;
 mod subsonic;
+mod suggest;
 mod term;
 mod theme;
 mod trace;
