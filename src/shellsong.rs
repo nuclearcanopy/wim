@@ -133,16 +133,11 @@ pub enum Level {
 /// current selection", uniformly across every such command, which is
 /// what keeps one name to one meaning (docs/shellsong.md R11).
 ///
-/// **Load-bearing host contract, do not break:** `Index` is an index
-/// into `Env::results`, and `App::resync_results` reorders that list
-/// every time a remote search outcome lands. The index is therefore
-/// only valid until the next frame boundary. It is safe solely because
-/// the host applies each `Step::Emit` synchronously before calling
-/// `step` again, so nothing can reorder the list between resolving an
-/// index and using it. A host that queued emitted ops to apply later,
-/// or stepped once per frame while holding a resolved index, would act
-/// on the wrong track intermittently. Surfaced by the wiring work;
-/// nothing enforces it at the type level.
+/// **Load-bearing host contract, do not break:** an `Index` is live
+/// only until the next thing that rebuilds the results list, which can
+/// be the very next op of the same program. It survives today because
+/// the host applies each `Step::Emit` before stepping again and nothing
+/// holds one across that; see docs/shellsong.md, "the index contract".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     /// index into `Env::results`, resolved by the executor from a term.
@@ -4110,6 +4105,36 @@ mod tests {
         env.results = vec![Kind::Album];
         env.search_settled = true;
         assert_eq!(program.step(&env), Step::Emit(Op::Play(Target::Index(0))));
+    }
+
+    /// The half of the index contract the language owns (see
+    /// docs/shellsong.md, "the index contract"): an index is computed
+    /// from the env of the step that emits it and never kept, so a
+    /// results list rebuilt mid-program is resolved against afresh.
+    #[test]
+    fn a_resolved_index_comes_from_the_env_of_its_own_step() {
+        let mut program = Program::parse("play(crest); queue(hex)").unwrap();
+        let mut env = Env {
+            results: vec![Kind::Album, Kind::Song],
+            ..SETTLED.clone()
+        };
+        assert_eq!(
+            program.step(&env),
+            Step::Emit(Op::Search("crest".to_string()))
+        );
+        env.query = "crest".to_string();
+        // play prefers songs, so the song at 1 wins over the album.
+        assert_eq!(program.step(&env), Step::Emit(Op::Play(Target::Index(1))));
+        assert_eq!(
+            program.step(&env),
+            Step::Emit(Op::Search("hex".to_string()))
+        );
+        // the host rebuilt the list under the program, which is what
+        // `resync_results` does; index 1 is now the album, so a cached
+        // resolution would queue the wrong row.
+        env.query = "hex".to_string();
+        env.results = vec![Kind::Song, Kind::Album];
+        assert_eq!(program.step(&env), Step::Emit(queued(0)));
     }
 
     // -------------------------------------------------------- go/focus

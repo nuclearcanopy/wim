@@ -593,6 +593,46 @@ edit the line and therefore have to recompute the suggestion; a paste
 that left a stale ghost up would be the same bug as a keystroke that
 did.
 
+### the index contract
+
+`Target::Index(i)` indexes `Env::results`, which the host builds 1:1
+off `App::results`. that list is not stable: `App::resync_results`
+reassigns it wholesale (`corpus.search(&query)`), so rows are added,
+dropped and regrouped, and it runs on every remote search outcome, on
+every library scan batch and on every catalog merge. `Op::Search` and
+`Op::Rescan` rebuild it too, which means a resolved index can be
+invalidated by **the very next op of the same program**, not merely by
+the next frame.
+
+a resolved index is nevertheless safe here, and worth understanding
+before changing either side:
+
+- the executor never stores one. `resolve` computes the index and
+  returns it inside the same `Step::Emit`; no `Node` and no `Program`
+  field holds a `Target`.
+- the host applies each `Emit` immediately, rebuilding `Env` per step
+  rather than per frame, and drains no channel inside that loop.
+- every term-taking handler reads its item out of the list before
+  touching anything, and the only two ops that rebuild the list
+  (`Search`, `Rescan`) carry no `Target`.
+- it is all one thread; the channels carry data, not mutation.
+
+so a host that **batched** emitted ops and applied them after a drain
+would act on the wrong row, intermittently and only under load. one
+route is already closed off: `Resolve` refuses to resolve until it sees
+its own query in `Env` (`env.query != pending.query || !search_settled`
+keeps it on `AwaitResults`), so a host that deferred `Op::Search` fails
+loudly on the await timeout instead of resolving against stale results.
+
+nothing enforces this at the type level. making it structural means
+giving `Env::results` an identity per row (a hash of
+`SearchItem::identity()`, since `SearchItem` cannot be `PartialEq`) and
+having `Target::Index` carry that stamp for the host to verify. that
+touches `Env`, the env builder and every term-op handler, and the
+cheaper half-measure (asserting the list's *length* is unchanged) is
+blind to the equal-length regroup that is `resync_results`'s normal
+outcome, so the contract is written down here instead.
+
 ## pinned behaviours
 
 these were all ambiguous until the host was written, and a reader (or a
