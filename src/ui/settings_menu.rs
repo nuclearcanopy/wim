@@ -96,7 +96,7 @@ fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::testbuf::{buffer, char_at, grid};
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
     use crossterm::event::KeyCode;
 
     fn render(area: Rect, buf: &mut Buffer, values: [&str; FIELD_COUNT]) {
@@ -160,19 +160,7 @@ mod tests {
         let area = Rect::new(2, 1, 24, 11);
         let long = "日本語テスト曲日本語テスト曲日本語テスト曲";
         render(area, &mut buf, [long; FIELD_COUNT]);
-        for y in 0..14u16 {
-            for x in 0..40u16 {
-                let inside = x >= 2 && x < 26 && y >= 1 && y < 12;
-                if !inside {
-                    assert_eq!(
-                        char_at(&buf, x, y),
-                        '.',
-                        "wrote outside its rect at ({x}, {y}):\n{}",
-                        grid(&buf)
-                    );
-                }
-            }
-        }
+        assert_outside_untouched(&buf, area);
     }
 
     #[test]

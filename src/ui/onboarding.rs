@@ -186,28 +186,9 @@ fn draw_centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::testbuf::{buffer, char_at, grid};
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, char_at, grid};
 
     const SIZES: [(u16, u16); 6] = [(1, 1), (1, 40), (2, 1), (40, 0), (0, 0), (3, 2)];
-
-    fn outside_is_untouched(buf: &Buffer, rect: Rect) {
-        for y in buf.area.y..buf.area.y + buf.area.height {
-            for x in buf.area.x..buf.area.x + buf.area.width {
-                let inside = x >= rect.x
-                    && x < rect.x + rect.width
-                    && y >= rect.y
-                    && y < rect.y + rect.height;
-                if !inside {
-                    assert_eq!(
-                        char_at(buf, x, y),
-                        '.',
-                        "wrote outside its rect at ({x}, {y}):\n{}",
-                        grid(buf)
-                    );
-                }
-            }
-        }
-    }
 
     #[test]
     fn the_welcome_screen_centres_its_three_lines() {
@@ -345,19 +326,19 @@ mod tests {
 
         let mut buf = buffer(40, 14);
         WelcomeView.render(rect, &mut buf);
-        outside_is_untouched(&buf, rect);
+        assert_outside_untouched(&buf, rect);
 
         let mut buf = buffer(40, 14);
         DoneView.render(rect, &mut buf);
-        outside_is_untouched(&buf, rect);
+        assert_outside_untouched(&buf, rect);
 
         let mut buf = buffer(40, 14);
         ControlsView.render(rect, &mut buf);
-        outside_is_untouched(&buf, rect);
+        assert_outside_untouched(&buf, rect);
 
         let mut buf = buffer(40, 14);
         ListenBrainzView { input: long }.render(rect, &mut buf);
-        outside_is_untouched(&buf, rect);
+        assert_outside_untouched(&buf, rect);
 
         let mut buf = buffer(40, 14);
         LibraryPathsView {
@@ -365,7 +346,7 @@ mod tests {
             input: long,
         }
         .render(rect, &mut buf);
-        outside_is_untouched(&buf, rect);
+        assert_outside_untouched(&buf, rect);
     }
 
     #[test]

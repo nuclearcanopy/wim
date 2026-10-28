@@ -123,7 +123,7 @@ fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::testbuf::{buffer, grid};
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
 
     fn render(area: Rect, buf: &mut Buffer, selected: usize) {
         EqMenu {
@@ -183,19 +183,7 @@ mod tests {
         let mut buf = buffer(40, 12);
         let area = Rect::new(2, 1, 20, 8);
         render(area, &mut buf, 0);
-        for y in 0..12u16 {
-            for x in 0..40u16 {
-                let inside = x >= 2 && x < 22 && y >= 1 && y < 9;
-                if !inside {
-                    assert_eq!(
-                        crate::ui::testbuf::char_at(&buf, x, y),
-                        '.',
-                        "wrote outside its rect at ({x}, {y}):\n{}",
-                        grid(&buf)
-                    );
-                }
-            }
-        }
+        assert_outside_untouched(&buf, area);
     }
 
     #[test]

@@ -175,7 +175,7 @@ fn draw_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::testbuf::{buffer, char_at, grid};
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
 
     fn form(url: &str, username: &str, password: &str, field: usize) -> LoginForm {
         LoginForm {
@@ -260,19 +260,7 @@ mod tests {
         let area = Rect::new(2, 1, 20, 8);
         let f = form("日本語テスト曲日本語テスト曲", "日本語", "日本語", 0);
         render(area, &mut buf, &f, "日本語テスト曲日本語テスト曲");
-        for y in 0..12u16 {
-            for x in 0..40u16 {
-                let inside = x >= 2 && x < 22 && y >= 1 && y < 9;
-                if !inside {
-                    assert_eq!(
-                        char_at(&buf, x, y),
-                        '.',
-                        "wrote outside its rect at ({x}, {y}):\n{}",
-                        grid(&buf)
-                    );
-                }
-            }
-        }
+        assert_outside_untouched(&buf, area);
     }
 
     #[test]

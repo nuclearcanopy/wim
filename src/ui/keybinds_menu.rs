@@ -90,7 +90,7 @@ fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::testbuf::{buffer, char_at, grid};
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
 
     fn keys() -> Vec<String> {
         ALL_ACTIONS.iter().map(|_| "x".to_string()).collect()
@@ -169,19 +169,7 @@ mod tests {
             *k = "日本語日本語".to_string();
         }
         render(area, &mut buf, &wide, Some("日本語"));
-        for y in 0..12u16 {
-            for x in 0..40u16 {
-                let inside = x >= 2 && x < 22 && y >= 1 && y < 9;
-                if !inside {
-                    assert_eq!(
-                        char_at(&buf, x, y),
-                        '.',
-                        "wrote outside its rect at ({x}, {y}):\n{}",
-                        grid(&buf)
-                    );
-                }
-            }
-        }
+        assert_outside_untouched(&buf, area);
     }
 
     #[test]
