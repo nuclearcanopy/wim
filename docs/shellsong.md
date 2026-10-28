@@ -320,7 +320,7 @@ clear_queue()           empty the queue                        [clear, flush]
 remove(indices)         drop queue entries by position
 goto(index)             jump to a queue position
 save_queue(name)        save the queue as a local playlist
-load_queue(name)        replace the queue with a saved playlist
+load_queue(name)        replace the queue with a saved playlist, and play it
 star(terms?)            star what each term finds              [favorite, fav, like]
 unstar(terms?)          the inverse                            [unfavorite, unfav, unlike]
 download(terms?)        download for offline playback          [dl, offline, cache]
@@ -360,7 +360,10 @@ quit()                  quit wim                               [exit]
 ```
 
 `sleep` reuses the crossfade volume ramp rather than cutting the audio
-dead; remaining time shows in `view(now)`.
+dead: the last `crossfade_seconds` of the wait fade the volume down,
+then it pauses and puts the level back so unpausing later is not
+silent. A toast says so when it fires; there is no countdown on the
+player screen yet.
 
 ### higher-order
 
@@ -530,3 +533,76 @@ already uses, so a shellsong command and a keypress can never drift
 apart. `Env` is the only thing the executor knows about the world,
 which is what makes the whole language testable with no terminal, no
 mpv and no network.
+
+## the host side
+
+the wiring lives in three places. `main.rs` owns the console state, the
+input tier that claims every key and every paste while it is open, the
+per-frame `Program::step` loop and `apply_shellsong_op`, which is the
+whole `Op` -> host table and sits next to `dispatch_action`.
+`shellsong_host.rs` holds the host decisions worth having apart from
+the event loop (all pure, all tested): the completion provider, the
+`search_settled` state machine, percent-to-seconds resolution, the
+volume clamp and the fade/sleep ramps. `queues.rs` is the named-queue
+store behind `save_queue`/`load_queue`.
+
+### routing
+
+anything with an `Action` behind it goes through `dispatch_action`, so
+it cannot behave differently from the keypress: `play`, `queue`,
+`view(q, ...)`, `loop`, `shuffle`, `speed`, `eq`, `quit`. everything
+else goes through the same function the matching keybind calls
+(`go_to_previous`, `toggle_star`, `trigger_downloads`,
+`resync_upcoming`, `apply_eq_preset_row`, `open_starred_view`), or the
+same mpv property/command the keybind writes.
+
+the two shared decisions that used to be inline in the input loop are
+now functions both the keyboard and shellsong call: `browse_session`
+(which tracks enter on a browse row plays) and `App::move_selection` /
+`select_top` / `select_bottom`.
+
+### search_settled
+
+a query is unsettled only because a remote `search3` actually went out
+for it. `notify_query_changed` reports whether it sent anything, so
+with no indexed server there is nothing to wait for and the query
+settles the instant it changes. otherwise the first outcome off the
+channel settles it, and a 1.2s window settles it regardless, which is
+past the 300ms debounce plus a round trip and well inside the
+language's own 8s await timeout: a slow server costs `play(crest)` a
+beat rather than an error.
+
+first-answer-wins rather than one outcome per server is deliberate.
+outcomes carry no query tag and a failed server sends nothing at all,
+so there is no honest count to wait for; a second server's late answer
+is still merged into the corpus, it just does not hold the program up.
+
+### not supported yet
+
+reported through the console rather than faked, because a truthful
+error beats a silent no-op:
+
+- `go()` with the bottom bar's **progress** field selected. enter
+  there opens a keyboard scrub drag, and the open console claims every
+  key the drag needs. it points at `moveto`/`seek` instead, which do
+  the same job without a mode.
+- `view(q, ...)` landing on a **song** whose album is not indexed.
+  `OpenPage` opens an album/artist/playlist directly, and a song's own
+  page is its album's; a `SearchItem::Song` carries its album's *name*
+  but not its id, so the page can only be opened for an album already
+  in the corpus. a local file has no page at all.
+- `sleep(...)` has no remaining-time readout on the player screen.
+
+### where things are stored
+
+```
+$XDG_STATE_HOME/wim/shellsong_history   the command history
+$XDG_STATE_HOME/wim/shellsong_ranks     the completion frequency store
+$XDG_STATE_HOME/wim/queues/<name>.toml  one saved queue each
+```
+
+a saved queue stores more than a path per entry: a remote song keeps
+its server url plus the server-side song id and is re-bound to a live
+client on load, since a stream url carries credentials and expires. an
+entry whose file moved or whose server is no longer configured is
+skipped, same best-effort stance `persistence.rs` takes.
