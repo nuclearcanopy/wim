@@ -5107,4 +5107,50 @@ mod tests {
         ctrl(&mut c, &fake, 'x');
         assert!(c.input.is_empty(), "ctrl+x typed an 'x'");
     }
+
+    // ------------------------------------------------- the published api
+
+    /// Calls every form docs/shellsong.md's "the api a host calls" block
+    /// publishes, spelled exactly as the doc spells it, with each result
+    /// bound to its documented type. A changed signature breaks this
+    /// build rather than leaving the published list quietly wrong, which
+    /// is how `paste(&str)` outlived the `cand` argument.
+    #[test]
+    fn the_published_api_is_callable_as_documented() {
+        let fake = Fake::new(&["flatline"]);
+
+        let _: KeyCode = OPEN_KEY;
+
+        let mut console: Console = Console::empty();
+        let _: ConsoleAction =
+            console.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &fake);
+        console.paste("ause()", &fake);
+        console.note("a note");
+        console.fail("a failure");
+        console.push(LineKind::Command, ": pause()");
+        let _: &[String] = console.history();
+        let _: Option<&Cycle> = console.cycle();
+        let _: &String = &console.input;
+        let _: usize = console.cursor;
+        let _: &Vec<Line> = &console.lines;
+        let _: &Option<String> = &console.error;
+        let _: &Suggestion = &console.suggestion;
+
+        let mut program: Program = Program::parse("pause()").expect("should parse");
+        let _: Step = program.step(&SETTLED);
+        let _: bool = program.is_done();
+        let _: ParseError = Program::parse("pasue()").expect_err("should not parse");
+
+        let _: String = Op::TogglePause.describe();
+        let _: bool = Op::TogglePause.closes_console();
+        let _: bool = ViewTarget::Help.is_screen();
+        let _: Vec<String> = help_lines();
+        let _: Kind = Kind::of(&SearchItem::LocalVideo {
+            path: PathBuf::from("/video/x.mkv"),
+            title: "x".to_string(),
+        });
+
+        let _: Vec<String> = Candidates::corpus(&fake, "fl");
+        let _: Vec<String> = Candidates::saved_queues(&fake);
+    }
 }
