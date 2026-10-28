@@ -29,6 +29,11 @@ pub struct EqMenu<'a> {
 
 impl Widget for EqMenu<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // takes over a rect that already has other content drawn
+        // into it, so it has to own every cell: without the clear,
+        // whatever this menu did not write still showed through.
+        let area = crate::ui::draw::overlay(buf, area);
+
         let mut y = draw_header(
             buf,
             area,
@@ -123,7 +128,9 @@ fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
+    use crate::ui::testbuf::{
+        assert_no_bleed_through, assert_outside_untouched, buffer, grid, plated_buffer,
+    };
 
     fn render(area: Rect, buf: &mut Buffer, selected: usize) {
         EqMenu {
@@ -140,41 +147,41 @@ mod tests {
     /// clipping tests below are what pin the route through `draw`.
     #[test]
     fn renders_the_preset_list_the_band_rows_and_the_state_line() {
-        let area = Rect::new(0, 0, 50, 25);
-        let mut buf = buffer(50, 25);
+        let area = Rect::new(0, 0, 54, 27);
+        let mut buf = buffer(54, 27);
         render(area, &mut buf, 0);
-        assert_eq!(
-            grid(&buf),
-            [
-                "eq │ enter: apply preset, h/l: nudge band, esc: c…",
-                "───┴──────────────────────────────────────────────",
-                "..................................................",
-                "presets...........................................",
-                "> flat  (active)..................................",
-                "  bass boost......................................",
-                "  vocal boost.....................................",
-                "  treble boost....................................",
-                "  rock............................................",
-                "  classical.......................................",
-                "..................................................",
-                "bands (h/l adjust by 1 dB, -12..12)...............",
-                "  31 Hz     +0.0 dB...............................",
-                "  62 Hz     +0.0 dB...............................",
-                "  125 Hz    +0.0 dB...............................",
-                "  250 Hz    +0.0 dB...............................",
-                "  500 Hz    +0.0 dB...............................",
-                "  1000 Hz   +0.0 dB...............................",
-                "  2000 Hz   +0.0 dB...............................",
-                "  4000 Hz   +0.0 dB...............................",
-                "  8000 Hz   +0.0 dB...............................",
-                "  16000 Hz  +0.0 dB...............................",
-                "..................................................",
-                "j/k select, h/l adjust band.......................",
-                "state: preset.....................................",
-            ]
-            .join("\n")
-        );
+        assert_eq!(grid(&buf), SNAPSHOT.join("\n"));
     }
+
+    const SNAPSHOT: [&str; 27] = [
+        "┌────────────────────────────────────────────────────┐",
+        "│ eq │ enter: apply preset, h/l: nudge band, esc: c… │",
+        "│ ───┴────────────────────────────────────────────── │",
+        "│                                                    │",
+        "│ presets                                            │",
+        "│ > flat  (active)                                   │",
+        "│   bass boost                                       │",
+        "│   vocal boost                                      │",
+        "│   treble boost                                     │",
+        "│   rock                                             │",
+        "│   classical                                        │",
+        "│                                                    │",
+        "│ bands (h/l adjust by 1 dB, -12..12)                │",
+        "│   31 Hz     +0.0 dB                                │",
+        "│   62 Hz     +0.0 dB                                │",
+        "│   125 Hz    +0.0 dB                                │",
+        "│   250 Hz    +0.0 dB                                │",
+        "│   500 Hz    +0.0 dB                                │",
+        "│   1000 Hz   +0.0 dB                                │",
+        "│   2000 Hz   +0.0 dB                                │",
+        "│   4000 Hz   +0.0 dB                                │",
+        "│   8000 Hz   +0.0 dB                                │",
+        "│   16000 Hz  +0.0 dB                                │",
+        "│                                                    │",
+        "│ j/k select, h/l adjust band                        │",
+        "│ state: preset                                      │",
+        "└────────────────────────────────────────────────────┘",
+    ];
 
     /// The menu is drawn into a rect that is not the whole buffer, so
     /// an unguarded writer shows up as ink outside it.
@@ -184,6 +191,27 @@ mod tests {
         let area = Rect::new(2, 1, 20, 8);
         render(area, &mut buf, 0);
         assert_outside_untouched(&buf, area);
+    }
+
+    #[test]
+    fn the_overlay_covers_every_cell_of_its_rect() {
+        let mut buf = plated_buffer(44, 20);
+        let area = Rect::new(2, 1, 40, 18);
+        render(area, &mut buf, 0);
+        assert_no_bleed_through(&buf, area);
+    }
+
+    #[test]
+    fn the_frame_closes_all_four_corners() {
+        let mut buf = buffer(44, 20);
+        let area = Rect::new(2, 1, 40, 18);
+        render(area, &mut buf, 0);
+        let g = grid(&buf);
+        let rows: Vec<Vec<char>> = g.lines().map(|r| r.chars().collect()).collect();
+        assert_eq!(
+            (rows[1][2], rows[1][41], rows[18][2], rows[18][41]),
+            ('\u{250c}', '\u{2510}', '\u{2514}', '\u{2518}')
+        );
     }
 
     #[test]
