@@ -500,11 +500,29 @@ yet.
   socket-naming bug: `Mpv::spawn` named the socket by pid alone, so a
   second `Mpv` in one process deleted the first's socket and both
   mpvs answered on the same path.
-- `perf/search` (4 commits, had NOT reported). owns `src/search.rs`,
-  `src/app.rs`. note: `/tmp/sabotage*.py` are this agent's mutation
-  harness (inject a known bug, confirm the suite catches it, restore),
-  not an attack; they are benign and that is the right way to prove a
-  guard has teeth.
+- `perf/search` (REPORTED, all gates clean, 666 tests, `main.rs`
+  untouched at 0 lines). 2.3x to 180x in cpu time at 40k items,
+  depending on query shape; a typo query 54.1ms -> 7.2ms, a no-match
+  query 43.4ms -> 0.24ms. typing "bladee" one char at a time went
+  141.5ms total -> 30.0ms. five exact short circuits, each a
+  *necessary* condition so none can reject a real match (per-entry char
+  mask, word-length bitmask, nearest-length word bounding the best
+  achievable typo score, the char mask as an edit-distance lower
+  bound, and an O(n) byte compare replacing strsim's dp table at
+  budget 1). `PARALLEL_SCORING_FLOOR` moved 2k -> 16k on measurement.
+  **incremental narrowing was verified UNSAFE and deliberately not
+  done**, correcting the brief that proposed it: the candidate set is
+  not monotone under appending because the typo budget grows with
+  query length, and a probe found counterexamples automatically
+  (`brainm` -> `brainmi` adds 1666 candidates; "god" is 2 edits from
+  "goes" while "gods" is 1). pinned as
+  `appending_a_char_can_add_candidates`. the correctness oracle keeps
+  the pre-optimization scorer verbatim and compares item-by-item over
+  38 query shapes; 10 deliberate sabotages were run and **4 initially
+  passed**, exposing real coverage gaps (no budget-1 transposition in
+  the corpus, no distance-2 typo match at all, nothing on the length
+  window's top edge, no >31-char word needing the typo pass) which are
+  now closed. `/tmp/sabotage*.py` is that harness, benign.
 - `perf/shell` (3 commits, had NOT reported). owns `src/shellsong.rs`,
   `src/shellsong_host.rs`, `src/suggest.rs`.
 
@@ -659,6 +677,23 @@ yet.
       `(Source, gains)` for both, so `Op::SetEqPreset` needs to carry
       a `Source` rather than a bare index, and `Words::EqPreset`
       completion wants the saved names too.
+- [ ] **`!foo` does not exclude anything.** pre-existing, found by
+      `perf/search` and now merely pinned: in nucleo 0.3 a `!foo`
+      query scores identically to `'foo`, because negation is not
+      honored by `Pattern::score`. so typing `!` reads as a working
+      exclusion syntax and silently does nothing.
+- [ ] **the remaining search cost is the result clone, and it needs an
+      api change to fix.** for a broad query at 40k items, 3-5ms of a
+      ~7ms search is `rank` cloning ~15k `SearchItem`s. cutting it
+      means not materializing rows nobody scrolled to, which cannot be
+      made invisible while `App::results` is a `Vec<SearchItem>` that
+      `main.rs` reads directly for drawing, `G`, the result counter,
+      shellsong's `Target::Index` and `resync_results`'s identity scan.
+      doing it properly is `App` owning the ranked index list and
+      materializing a growing prefix with those five call sites behind
+      accessors; that is the `main.rs` decomposition item's lane. no
+      cap was added, deliberately, since any cap is visible at all five
+      sites.
 - [ ] **album/artist identity is name-based.** `SearchItem` carries no
       `album_id`/`artist_id`, so the suggestion catalog joins on
       trimmed-lowercased names. two same-named albums by one artist
