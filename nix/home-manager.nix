@@ -48,6 +48,28 @@ let
       };
     };
   };
+  # one of the user's own named eq curves, same shape as
+  # eq::CustomPreset. Declared here and saved in-app with 's' both
+  # land in the same config.toml list.
+  eqPresetModule = { ... }: {
+    options = {
+      name = mkOption {
+        type = types.str;
+        description = "Name shown in the eq menu's \"saved\" group and accepted by eqPreset.";
+      };
+      gains = mkOption {
+        type = types.listOf types.float;
+        description = ''
+          10 per-band dB gains (31Hz..16000Hz order, -12..12 each).
+          The *requested* curve, exactly as the menu shows it; wim
+          compensates for band overlap at apply time (see
+          docs/audio-quality.md), so these are not filter gains.
+        '';
+      };
+    };
+  };
+
+  builtinEqPresets = [ "flat" "bass boost" "vocal boost" "treble boost" "rock" "classical" ];
 in
 {
   options.programs.wim = {
@@ -196,11 +218,11 @@ in
       type = types.nullOr types.str;
       default = null;
       description = ''
-        Name of an eq::PRESETS entry (e.g. "bass boost") to start
-        with, cycled through with 'e' in-app or picked directly from
-        the eq menu (enter on the bottom bar's eq field while it has
-        focus). Null falls back to eqGains, or flat if that's also
-        unset.
+        Name of the eq curve to start with: either a built-in (e.g.
+        "bass boost"), cycled through with 'e' in-app, or one of
+        eqCustomPresets. Picked directly from the eq menu too (enter
+        on the bottom bar's eq field while it has focus). Null falls
+        back to eqGains, or flat if that's also unset.
       '';
     };
 
@@ -209,8 +231,27 @@ in
       default = null;
       description = ''
         10 hand-tuned per-band dB gains (31Hz..16000Hz order, -12..12
-        each) for a custom eq, used when eqPreset is null. Must have
-        exactly 10 entries.
+        each) for a nameless custom eq, used when eqPreset is null.
+        Must have exactly 10 entries. Set alongside eqPreset, it is
+        read as that curve nudged since (the eq menu shows it as
+        "<name> (modified)"); leave it null to get the named curve
+        exactly.
+      '';
+    };
+
+    eqCustomPresets = mkOption {
+      type = types.listOf (types.submodule eqPresetModule);
+      default = [ ];
+      example = [{
+        name = "night bus";
+        gains = [ (-4.0) (-2.0) 0.0 1.0 2.0 3.0 2.0 0.0 (-2.0) (-4.0) ];
+      }];
+      description = ''
+        Named curves listed in the eq menu's "saved" group next to the
+        built-ins, loadable by name via eqPreset. The in-app menu
+        saves, renames and deletes entries in this same list ('s' /
+        'r' / 'd d'), so anything declared here reappears on the next
+        home-manager activation if the app deleted it.
       '';
     };
 
@@ -262,6 +303,24 @@ in
         assertion = cfg.eqGains == null || builtins.length cfg.eqGains == 10;
         message = "programs.wim.eqGains must have exactly 10 entries (one per eq::BAND_HZ band) when set.";
       }
+      {
+        assertion = lib.all (p: builtins.length p.gains == 10) cfg.eqCustomPresets;
+        message = "every programs.wim.eqCustomPresets entry must have exactly 10 gains (one per eq::BAND_HZ band).";
+      }
+      {
+        # wim resolves a name against the built-ins first and refuses
+        # to save over one (eq::NameCheck::Builtin), so a custom curve
+        # sharing a built-in's name would simply be unreachable.
+        assertion = lib.all
+          (p: !(lib.elem (lib.toLower p.name) builtinEqPresets))
+          cfg.eqCustomPresets;
+        message = "programs.wim.eqCustomPresets names must not be one of the built-ins (${lib.concatStringsSep ", " builtinEqPresets}); wim resolves those first.";
+      }
+      {
+        assertion = lib.length (lib.unique (map (p: lib.toLower p.name) cfg.eqCustomPresets))
+          == lib.length cfg.eqCustomPresets;
+        message = "programs.wim.eqCustomPresets names must be unique (wim compares them case-insensitively).";
+      }
     ];
 
     home.packages = [ cfg.package ];
@@ -308,6 +367,8 @@ in
       eq_preset = cfg.eqPreset;
     } // lib.optionalAttrs (cfg.eqGains != null) {
       eq_gains = cfg.eqGains;
+    } // lib.optionalAttrs (cfg.eqCustomPresets != [ ]) {
+      eq_custom_presets = map (p: { inherit (p) name gains; }) cfg.eqCustomPresets;
     });
   };
 }

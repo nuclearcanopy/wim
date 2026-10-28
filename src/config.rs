@@ -115,17 +115,26 @@ pub struct Config {
     /// happens to be first".
     #[serde(default)]
     pub logo_style: Option<String>,
-    /// Name of the active `eq::PRESETS` entry (restored by name, same
-    /// reasoning as `logo_style`), or `None` while a hand-tuned
-    /// `eq_gains` is active instead (see `app::App::eq_custom`).
+    /// Name of the active curve, either an `eq::PRESETS` entry or one
+    /// of `eq_custom_presets` (restored by name, same reasoning as
+    /// `logo_style`), or `None` while a nameless hand-tuned
+    /// `eq_gains` is active instead. See `eq::restore`.
     #[serde(default = "default_eq_preset")]
     pub eq_preset: Option<String>,
     /// Always kept in sync with whatever's actually applied (the
-    /// active preset's gains, or a hand-tuned set); read back on
-    /// startup regardless of `eq_preset`, so a custom eq survives a
-    /// restart even though it has no name of its own.
-    #[serde(default = "default_eq_gains")]
-    pub eq_gains: [f64; 10],
+    /// active curve's gains, or a hand-tuned set); read back on
+    /// startup alongside `eq_preset`, so both a nameless custom eq
+    /// and a named one nudged since survive a restart. `None` means
+    /// nothing was ever applied, which is the declarative case: a
+    /// config setting only `eq_preset` gets that curve exactly rather
+    /// than reading as "that preset, modified to flat".
+    #[serde(default)]
+    pub eq_gains: Option<[f64; 10]>,
+    /// The user's own named curves, saved from the eq menu and listed
+    /// there alongside the built-ins. Holds *requested* gains; see
+    /// `eq::CustomPreset`.
+    #[serde(default)]
+    pub eq_custom_presets: eq::CustomPresets,
     /// Action name (`keymap::KeyAction::name`) -> key name
     /// (`keymap::key_label`'s inverse); only non-default bindings
     /// need to appear here (see `Keymap::overrides`), so most users
@@ -166,10 +175,6 @@ fn default_subtitle_language() -> String {
 
 fn default_eq_preset() -> Option<String> {
     Some(eq::PRESETS[0].name.to_string())
-}
-
-fn default_eq_gains() -> [f64; 10] {
-    eq::PRESETS[0].gains
 }
 
 fn default_sidebar_width() -> u16 {
@@ -313,7 +318,8 @@ impl Default for Config {
             scrobble: ScrobbleConfig::default(),
             logo_style: None,
             eq_preset: default_eq_preset(),
-            eq_gains: default_eq_gains(),
+            eq_gains: None,
+            eq_custom_presets: eq::CustomPresets::default(),
             sidebar_width: default_sidebar_width(),
             bottom_bar_height: default_bottom_bar_height(),
             keybinds: HashMap::new(),
@@ -372,13 +378,81 @@ fn restrict_to_owner(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+
+    /// The saved eq presets are an array of tables, which toml can
+    /// only emit after every plain key; serializing the whole struct
+    /// is the only thing that proves the field order still works.
+    #[test]
+    fn a_config_with_saved_eq_presets_round_trips_through_toml() {
+        let mut cfg = Config::default();
+        let tuned = [3.0, -2.0, 1.0, 0.5, -4.0, 6.0, -1.5, 2.0, -3.0, 12.0];
+        cfg.eq_custom_presets.insert("night", tuned);
+        cfg.eq_custom_presets.insert("car", [1.0; 10]);
+        cfg.eq_preset = Some("night".to_string());
+        cfg.eq_gains = Some(tuned);
+
+        let text = toml::to_string_pretty(&cfg).expect("serializing");
+        let back: Config = toml::from_str(&text).expect("parsing back");
+
+        assert_eq!(back.eq_custom_presets, cfg.eq_custom_presets);
+        assert_eq!(back.eq_preset.as_deref(), Some("night"));
+        assert_eq!(back.eq_gains, Some(tuned));
+
+        // and the first-run shape, with nothing saved and no gains
+        // ever applied, is what `save` writes before anything else
+        // happens; an unset `eq_gains` has to stay unset rather than
+        // being written out as a flat curve (see `eq::restore`).
+        let fresh = toml::to_string_pretty(&Config::default()).expect("serializing a fresh config");
+        assert!(!fresh.contains("eq_gains"), "unset, so omitted:\n{fresh}");
+        assert!(fresh.contains("eq_custom_presets = []"), "{fresh}");
+        let fresh: Config = toml::from_str(&fresh).expect("parsing a fresh config back");
+        assert_eq!(fresh.eq_gains, None);
+    }
+
+    /// Every eq field is optional: a config written before saved
+    /// presets existed (and one written by hand with no eq section at
+    /// all) has to keep loading.
+    #[test]
+    fn a_config_with_no_eq_section_loads_with_an_empty_store() {
+        let cfg: Config = toml::from_str("album_art = \"auto\"\n").expect("parsing");
+        assert!(cfg.eq_custom_presets.is_empty());
+        assert_eq!(cfg.eq_gains, None);
+    }
+
+    /// Verbatim shape `nix/home-manager.nix` generates for a declared
+    /// curve: a name and no `eq_gains`, which has to come back as that
+    /// curve exactly rather than as "modified to flat".
+    #[test]
+    fn a_declaratively_set_curve_loads_as_itself() {
+        let raw = r#"
+eq_preset = "night bus"
+
+[[eq_custom_presets]]
+gains = [-4.0, -2.0, 0.0, 1.0, 2.0, 3.0, 2.0, 0.0, -2.0, -4.0]
+name = "night bus"
+"#;
+        let cfg: Config = toml::from_str(raw).expect("parsing");
+        let restored = eq::restore(
+            cfg.eq_preset.as_deref(),
+            cfg.eq_gains,
+            &cfg.eq_custom_presets,
+        );
+        assert_eq!(restored.source, Some(eq::Source::Saved(0)));
+        assert!(!restored.modified);
+        assert_eq!(
+            restored.gains,
+            [-4.0, -2.0, 0.0, 1.0, 2.0, 3.0, 2.0, 0.0, -2.0, -4.0]
+        );
+    }
 
     #[test]
+    #[cfg(unix)]
     fn restrict_to_owner_drops_group_and_other_access() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = std::env::temp_dir().join(format!("wim-cfgtest-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
