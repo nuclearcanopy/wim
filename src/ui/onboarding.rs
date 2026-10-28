@@ -129,19 +129,10 @@ impl Screen {
     }
 
     fn render(self, area: Rect, buf: &mut Buffer) {
-        draw::frame(buf, area, shade(DIM));
-        let inner = draw::framed_inner(area);
-        if inner.width == 0 || inner.height == 0 {
+        let body = chrome(buf, area, self.step);
+        if body.width == 0 || body.height == 0 {
             return;
         }
-
-        // the rail owns the bottom row plus a blank one above it, so
-        // content is never flush against it.
-        let rail_rows = if inner.height >= 3 { 2 } else { 0 };
-        let body = Rect {
-            height: inner.height.saturating_sub(rail_rows),
-            ..inner
-        };
 
         let art_rows = if self.art.is_empty() {
             0
@@ -166,10 +157,32 @@ impl Screen {
             }
             y += 1;
         }
+    }
+}
 
-        if rail_rows > 0 {
-            draw_rail(buf, inner, self.step);
-        }
+/// `LoginView`'s place in the flow. It lives in login.rs, which cannot
+/// know what it is embedded in.
+pub const NAVIDROME_STEP: usize = 3;
+
+/// Wraps `area` in the flow's chrome (frame plus the step rail) and
+/// returns the interior left over for content. Shared with
+/// `ui::login`, whose screen is step 3 here but is also reopened
+/// standalone, where there is no flow for it to be a step of.
+pub(crate) fn chrome(buf: &mut Buffer, area: Rect, step: usize) -> Rect {
+    draw::frame(buf, area, shade(DIM));
+    let inner = draw::framed_inner(area);
+    if inner.width == 0 || inner.height == 0 {
+        return inner;
+    }
+    // the rail owns the bottom row plus a blank one above it, so
+    // content is never flush against it.
+    let rail_rows = if inner.height >= 3 { 2 } else { 0 };
+    if rail_rows > 0 {
+        draw_rail(buf, inner, step);
+    }
+    Rect {
+        height: inner.height.saturating_sub(rail_rows),
+        ..inner
     }
 }
 
