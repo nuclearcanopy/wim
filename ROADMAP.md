@@ -43,6 +43,27 @@ at it; don't mark it done on build+test passing alone.
 
 ## done
 
+- [x] **onboarding looked like a debug dump, and taught wrong keys.**
+      two problems in one file. visually: five screens each painting
+      raw left-aligned lines at `area.y`, no frame, no vertical
+      centring, no sense of progress, and a plain-text "welcome to wim"
+      where the ansi-shadow wordmark should be; exactly the "thin
+      unimpressive title card" the ux self-check above was written
+      about. all five now share one `Screen` chrome (frame, content
+      block centred as a unit so short and long rows do not stagger, a
+      progress rail pinned to the interior's bottom row) and welcome
+      draws `banner::logo_lines(0)`.
+      correctness: the controls list baked in key literals ("l",
+      "[ / ]", "a"), so onboarding confidently taught the defaults to
+      anyone with a custom keymap. `help.rs` had this exact bug and
+      fixed it with its `Key` enum; that enum is now `pub(crate)` with
+      a `label(&Keymap)` method and onboarding resolves through it, so
+      a rebound key is shown as what it is actually bound to. the
+      guard test was verified to FAIL when the old behaviour is
+      simulated, rather than just passing.
+      the rail degrades rather than clipping: under ~23 interior cells
+      the dots are dropped and the words "step n of 6" alone remain.
+
 - [x] scaffold: flake.nix devshell, AGPL-3.0, README
 - [x] cargo init, full dependency set pinned
 - [x] config: toml file at `$XDG_CONFIG_HOME/wim/config.toml`, templated
@@ -531,6 +552,21 @@ docs rather than forcing one of them.
       rate.** `selection_pulsing` only counted the browse view for
       `Focus::Workspace`, so both of those idled at the 100ms poll and
       animated their selection plate at a tenth of the display rate.
+- [ ] **the navidrome step has no progress rail.** steps 1, 2, 4, 5
+      and 6 show it; step 3 does not, because that screen is
+      `ui::login::LoginView`, shared with the standalone "reopen
+      navidrome setup" path where a "step 3 of 6" rail would be a lie.
+      it needs an optional progress field set only from the onboarding
+      render site. left out rather than hacked: an inconsistent rail is
+      worse than a missing one only on the screen that cannot honestly
+      carry it, and this needs one more call-site field.
+- [ ] **help.rs pads its key column by char count.** the row format is
+      `format!("  {key_text:<13} {desc}")`; `{:<13}` counts chars, so a
+      key bound to a wide or multi-byte char leaves the description
+      column jagged. `banner.rs` records fixing exactly this in its own
+      menu (pad by `textfit::width` from the resolved labels, by hand);
+      onboarding's new controls column does it that way too. help.rs is
+      the last one still counting chars.
 - [ ] **shellsong's `eq(<preset>)` cannot reach saved curves.** it
       resolves names through `eq::index_of`, which is built-ins only.
       `eq::resolve(name, &cfg.eq_custom_presets)` already returns
