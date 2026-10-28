@@ -93,23 +93,15 @@ impl<'a> Pixels<'a> {
             gray,
         })
     }
+}
 
-    /// Luma `0..=255` of the pixel starting at byte offset `off`.
-    #[inline]
-    fn luma_at(&self, off: usize) -> u32 {
-        if self.gray {
-            self.data[off] as u32
-        } else {
-            // integer luma weights summing to 256, so a neutral pixel
-            // maps exactly to itself and the division is a shift. the
-            // drift from the exact 0.2126/0.7152/0.0722 coefficients
-            // is under half a level, invisible at 256 shades.
-            let r = self.data[off] as u32;
-            let g = self.data[off + 1] as u32;
-            let b = self.data[off + 2] as u32;
-            (54 * r + 183 * g + 19 * b) >> 8
-        }
-    }
+/// Luma `0..=255` of one rgb pixel. Integer weights summing to 256, so
+/// the divide is a shift and a neutral pixel maps exactly to itself;
+/// the drift from the exact 0.2126/0.7152/0.0722 coefficients is under
+/// half a level, invisible at 256 shades.
+#[inline]
+fn rgb_luma(p: &[u8]) -> u32 {
+    (54 * p[0] as u32 + 183 * p[1] as u32 + 19 * p[2] as u32) >> 8
 }
 
 /// A reusable half-block rasterizer. Owns its scratch buffers, so
@@ -208,13 +200,24 @@ impl Raster {
             acc.fill(0);
             for t in 0..taps_y {
                 let y = (s0 + (s1 - s0) * t / taps_y).min(px.h - 1);
-                let row = y as usize * px.stride;
-                for (ox, slot) in acc.iter_mut().enumerate() {
-                    let mut sum = 0u32;
-                    for &dx in &xs[ox * taps_x..(ox + 1) * taps_x] {
-                        sum += px.luma_at(row + dx as usize);
+                // the row as one slice and the taps as fixed-size
+                // chunks, so the whole inner loop carries one bounds
+                // check per tap instead of one per channel, and the
+                // gray/colour branch is hoisted out of it entirely.
+                let row = &px.data[y as usize * px.stride..][..px.stride];
+                let taps = xs.chunks_exact(taps_x);
+                if px.gray {
+                    for (slot, taps) in acc.iter_mut().zip(taps) {
+                        for &dx in taps {
+                            *slot += row[dx as usize] as u32;
+                        }
                     }
-                    *slot += sum;
+                } else {
+                    for (slot, taps) in acc.iter_mut().zip(taps) {
+                        for &dx in taps {
+                            *slot += rgb_luma(&row[dx as usize..dx as usize + 3]);
+                        }
+                    }
                 }
             }
             let base = (off_y + oy) as usize * grid_w as usize + off_x as usize;
@@ -360,19 +363,109 @@ fn shades() -> &'static [Color; 256] {
     SHADES.get_or_init(|| std::array::from_fn(|i| shade(i as f32 / 255.0)))
 }
 
+/// Everything a sampling depends on. Two renders agreeing on all of
+/// it produce byte-identical grids, which is the entire basis for
+/// `Memo` skipping the second one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sampled {
+    /// Names the *image*. Not the track, not the rect: see `Memo`.
+    key: String,
+    /// The rect's size only. The same grid moved elsewhere on screen
+    /// is the same rasterization, so a pane sliding sideways is not a
+    /// resample.
+    width: u16,
+    height: u16,
+    /// Bitwise, since this is an identity check and not a measurement.
+    aspect: u32,
+    fit: Fit,
+}
+
+/// A `Raster` plus what it was last sampled from, so a picture that
+/// has not changed is not resampled every frame. Painting still
+/// happens every frame (the buffer is rebuilt each one); only the
+/// sampling, which is the expensive half, is skipped.
+///
+/// `key` has to name the *image*. That is the whole correctness
+/// argument: the grid handed back belongs to whatever was last
+/// sampled under that key, so two different pictures sharing a key
+/// would show one in place of the other. Album art passes
+/// `coverart::art_key`, the same name the `ratatui-image` protocol
+/// cache is already invalidated by.
+///
+/// Invalidated by any change to the key, the target size, the cell
+/// aspect or the fit. Worst-case staleness is unbounded in *time* and
+/// zero in content: an entry lives until one of those changes, and
+/// while none of them has changed there is nothing new to compute.
+#[derive(Debug, Default)]
+pub struct Memo {
+    raster: Raster,
+    /// `None` before the first sample, i.e. always a miss.
+    last: Option<Sampled>,
+}
+
+impl Memo {
+    /// Samples `img` only if `key`, the rect's size, `cell_aspect` or
+    /// `fit` differ from the last call, then paints. Returns whether
+    /// it had to resample, which is what the tests assert on.
+    pub fn render(
+        &mut self,
+        key: &str,
+        img: &DynamicImage,
+        area: Rect,
+        cell_aspect: f32,
+        fit: Fit,
+        buf: &mut Buffer,
+    ) -> bool {
+        let aspect = cell_aspect.to_bits();
+        // compared field by field rather than against a built
+        // `Sampled`, so a hit (the common case, every frame) does not
+        // allocate a copy of the key just to throw it away.
+        let resampled = !self.last.as_ref().is_some_and(|l| {
+            l.key == key
+                && l.width == area.width
+                && l.height == area.height
+                && l.aspect == aspect
+                && l.fit == fit
+        });
+        if resampled {
+            self.raster.sample(img, area, cell_aspect, fit);
+            self.last = Some(Sampled {
+                key: key.to_string(),
+                width: area.width,
+                height: area.height,
+                aspect,
+                fit,
+            });
+        }
+        self.raster.paint(area, buf);
+        resampled
+    }
+}
+
 thread_local! {
-    /// The render path's one `Raster`. ratatui draws on the thread
-    /// that owns the terminal, so a thread-local is exactly as shared
-    /// as the draw call is; keeping it is what makes a steady frame
-    /// rate allocation-free, with a resize the only event that
-    /// reallocates.
+    /// The render path's one unkeyed `Raster`, for a source that
+    /// changes every frame anyway (a video pane). ratatui draws on
+    /// the thread that owns the terminal, so a thread-local is
+    /// exactly as shared as the draw call is; keeping it is what makes
+    /// a steady frame rate allocation-free, with a resize the only
+    /// event that reallocates.
     static SCRATCH: RefCell<Raster> = RefCell::new(Raster::new());
+    /// The render path's one `Memo`, for static pictures. One slot is
+    /// enough because the art panes are mutually exclusive branches
+    /// of the workspace: at most one of them draws per frame.
+    static MEMO: RefCell<Memo> = RefCell::new(Memo::default());
 }
 
 /// Runs `f` with the calling thread's kept `Raster`. Not reentrant:
 /// `f` must not call back into this (nothing in a render path does).
 pub fn with_scratch<R>(f: impl FnOnce(&mut Raster) -> R) -> R {
     SCRATCH.with(|r| f(&mut r.borrow_mut()))
+}
+
+/// Runs `f` with the calling thread's kept `Memo`. Same reentrancy
+/// rule as `with_scratch`.
+pub fn with_memo<R>(f: impl FnOnce(&mut Memo) -> R) -> R {
+    MEMO.with(|m| f(&mut m.borrow_mut()))
 }
 
 #[cfg(test)]
@@ -562,6 +655,112 @@ mod tests {
     }
 
     #[test]
+    fn the_memo_resamples_once_and_then_stops() {
+        let mut buf = buffer(8, 4);
+        let rect = Rect::new(0, 0, 8, 4);
+        let img = ramp(200, 200);
+        let mut m = Memo::default();
+        assert!(m.render("a:x", &img, rect, 2.0, Fit::Contain, &mut buf));
+        for _ in 0..5 {
+            assert!(
+                !m.render("a:x", &img, rect, 2.0, Fit::Contain, &mut buf),
+                "an unchanged cover in an unchanged rect was resampled"
+            );
+        }
+    }
+
+    #[test]
+    fn the_memo_still_paints_on_a_hit() {
+        // the sampling is what is skipped, never the drawing: the
+        // buffer is rebuilt every frame, so a cached frame that drew
+        // nothing would be a blank pane.
+        let rect = Rect::new(0, 0, 6, 3);
+        let img = flat(32, 32, 180);
+        let mut m = Memo::default();
+        let mut first = buffer(6, 3);
+        m.render("a:x", &img, rect, 2.0, Fit::Contain, &mut first);
+        let mut second = buffer(6, 3);
+        assert!(!m.render("a:x", &img, rect, 2.0, Fit::Contain, &mut second));
+        assert_eq!(first, second, "a cached frame drew something different");
+    }
+
+    #[test]
+    fn the_memo_invalidates_on_a_new_cover_a_resize_or_a_new_aspect() {
+        let mut buf = buffer(12, 6);
+        let img = flat(32, 32, 100);
+        let rect = Rect::new(0, 0, 8, 4);
+        let mut m = Memo::default();
+        m.render("a:x", &img, rect, 2.0, Fit::Contain, &mut buf);
+        assert!(
+            m.render("a:y", &img, rect, 2.0, Fit::Contain, &mut buf),
+            "a different album must not reuse the last one's grid"
+        );
+        assert!(
+            m.render(
+                "a:y",
+                &img,
+                Rect::new(0, 0, 12, 6),
+                2.0,
+                Fit::Contain,
+                &mut buf
+            ),
+            "a resize must resample"
+        );
+        let wider = Rect::new(0, 0, 12, 6);
+        assert!(
+            m.render("a:y", &img, wider, 1.8, Fit::Contain, &mut buf),
+            "a new cell aspect must resample"
+        );
+        assert!(
+            m.render("a:y", &img, wider, 1.8, Fit::Stretch, &mut buf),
+            "a new fit must resample"
+        );
+    }
+
+    #[test]
+    fn the_memo_ignores_where_the_rect_sits_on_screen() {
+        // the same grid moved sideways is the same rasterization; a
+        // pane sliding across should not pay to resample.
+        let mut buf = buffer(20, 8);
+        let img = flat(32, 32, 100);
+        let mut m = Memo::default();
+        m.render(
+            "a:x",
+            &img,
+            Rect::new(0, 0, 8, 4),
+            2.0,
+            Fit::Contain,
+            &mut buf,
+        );
+        assert!(!m.render(
+            "a:x",
+            &img,
+            Rect::new(9, 3, 8, 4),
+            2.0,
+            Fit::Contain,
+            &mut buf
+        ));
+        assert_eq!(char_at(&buf, 9, 3), HALF_BLOCK, "it moved with the rect");
+    }
+
+    #[test]
+    fn a_new_cover_under_the_same_key_is_the_one_thing_the_memo_cannot_see() {
+        // stated outright because it is the contract callers have to
+        // honour: the key names the picture. two pictures under one
+        // key, same size, and the first one keeps showing.
+        let rect = Rect::new(0, 0, 4, 2);
+        let mut buf = buffer(4, 2);
+        let mut m = Memo::default();
+        m.render("same", &flat(8, 8, 10), rect, 2.0, Fit::Stretch, &mut buf);
+        assert!(!m.render("same", &flat(8, 8, 250), rect, 2.0, Fit::Stretch, &mut buf));
+        assert_eq!(
+            buf.cell((0, 0)).unwrap().fg,
+            shade(10.0 / 255.0),
+            "documented: the key is the whole invalidation story"
+        );
+    }
+
+    #[test]
     fn it_never_writes_outside_its_rect() {
         let mut buf = buffer(12, 8);
         let rect = Rect::new(3, 2, 5, 4);
@@ -702,13 +901,29 @@ mod tests {
         assert_eq!(first, second, "the same grid should not reallocate");
     }
 
-    /// Numbers for the report, not a pass/fail gate; `cargo test --
-    /// --ignored --nocapture raster_cost` prints them.
+    /// Fastest per-iteration time over `batches` batches of `n`. The
+    /// minimum, not the mean: this machine runs other builds, and a
+    /// mean measures their scheduling as much as this code.
+    #[cfg(test)]
+    fn best(batches: u32, n: u32, mut f: impl FnMut()) -> std::time::Duration {
+        use std::time::Instant;
+        (0..batches)
+            .map(|_| {
+                let t = Instant::now();
+                for _ in 0..n {
+                    f();
+                }
+                t.elapsed() / n
+            })
+            .min()
+            .unwrap_or_default()
+    }
+
+    /// Numbers for the report, not a pass/fail gate; `cargo test
+    /// --release -- --ignored --nocapture raster_cost` prints them.
     #[test]
     #[ignore = "timing, run explicitly"]
     fn raster_cost() {
-        use std::time::Instant;
-
         let cover = ramp(640, 640);
         let frame = ramp(1920, 1080);
         let cases: [(&str, &DynamicImage, Rect); 4] = [
@@ -736,20 +951,17 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 400, 200));
         for (name, img, rect) in cases {
             let mut r = Raster::new();
-            r.render(img, rect, 2.0, Fit::Contain, &mut buf);
-            let n = 200;
-            let t = Instant::now();
-            for _ in 0..n {
-                r.render(img, rect, 2.0, Fit::Contain, &mut buf);
-            }
-            let each = t.elapsed() / n;
+            let each = best(5, 100, || r.render(img, rect, 2.0, Fit::Contain, &mut buf));
             // sample alone, to split rasterization from painting.
-            let t = Instant::now();
-            for _ in 0..n {
-                r.sample(img, rect, 2.0, Fit::Contain);
-            }
-            let sample = t.elapsed() / n;
-            println!("{name}: render {each:?} (sample {sample:?})");
+            let sample = best(5, 100, || r.sample(img, rect, 2.0, Fit::Contain));
+            // and what the same frame costs once the grid is
+            // memoized: paint only, the part that cannot be skipped.
+            let mut m = Memo::default();
+            m.render("k", img, rect, 2.0, Fit::Contain, &mut buf);
+            let memoized = best(5, 100, || {
+                assert!(!m.render("k", img, rect, 2.0, Fit::Contain, &mut buf));
+            });
+            println!("{name}: render {each:?} (sample {sample:?}, memoized {memoized:?})");
         }
     }
 
@@ -759,7 +971,6 @@ mod tests {
     #[ignore = "timing, run explicitly"]
     fn legacy_raster_cost() {
         use image::GenericImageView;
-        use std::time::Instant;
 
         /// Verbatim copy of the pre-`raster` sampler, kept here only
         /// so the before number is measured rather than remembered.
@@ -818,9 +1029,7 @@ mod tests {
             let (iw, ih) = img.dimensions();
             let out_w = rect.width as u32;
             let out_h = rect.height as u32 * 2;
-            let n = 5;
-            let t = Instant::now();
-            for _ in 0..n {
+            let each = best(3, 3, || {
                 let mut sink = 0f32;
                 for row in 0..rect.height {
                     for col in 0..rect.width {
@@ -830,8 +1039,8 @@ mod tests {
                     }
                 }
                 assert!(sink >= 0.0);
-            }
-            println!("legacy {name}: {:?}", t.elapsed() / n);
+            });
+            println!("legacy {name}: {each:?}");
         }
     }
 }
