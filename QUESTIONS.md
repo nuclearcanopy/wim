@@ -48,3 +48,19 @@ not "fixing" later: `play(...)` accepts songs or albums, `queue(...)`
 is song-preferring, `queue_aa(...)` widens to albums. maintainer has
 asked for substantially more design work, polish, and brainstorming
 before this is considered done; it is explicitly not finished.
+
+## suggestions menu keybind
+
+`R` for "recommendations". `s` and `S` were already shuffle and
+starred songs, and `R` keeps the shift-letter convention the other
+view-openers use (`S` starred, `L` lyrics, `I` index, `Q` queue,
+`K` keybinds). Remappable like any other action if that reads wrong.
+
+## suggestions menu scope
+
+shipped against local play history only; the three network-backed
+generators stay quiet until their fetches are wired (see ROADMAP).
+That was deliberate rather than blocking the whole menu on network
+plumbing: the history-driven sections are the ones that work with no
+server at all, and the view already carries an `enriching` flag so a
+thin list says "so far" instead of presenting itself as complete.
