@@ -992,6 +992,205 @@ impl Drop for Mpv {
         let _ = std::fs::remove_file(&self.sock_path);
     }
 }
+
+/// Measurements of the paths the render thread walks, not correctness
+/// checks; `#[ignore]`d because they spawn a real mpv and take seconds.
+/// Run with
+/// `cargo test --release -- --ignored --nocapture bench_`.
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    /// A `width x height` bgr0 frame with mpv's own row padding, i.e.
+    /// exactly the shape `screenshot-raw` hands back.
+    fn synthetic_frame(width: u32, height: u32) -> RawFrame {
+        let stride = width * 4 + 64;
+        let mut data = vec![0u8; (stride * height) as usize];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        RawFrame {
+            width,
+            height,
+            stride,
+            data,
+        }
+    }
+
+    /// The conversion as it was before: one `push` per channel into a
+    /// `Vec`, bounds-checked per pixel. Kept here only so the bench
+    /// below reports both numbers from one run.
+    fn to_image_push_per_pixel(frame: &RawFrame) -> Option<image::RgbImage> {
+        let mut rgb = Vec::with_capacity((frame.width * frame.height * 3) as usize);
+        for row in 0..frame.height {
+            let row_start = (row * frame.stride) as usize;
+            for col in 0..frame.width {
+                let px = row_start + (col * 4) as usize;
+                let pixel = frame.data.get(px..px + 3)?;
+                rgb.push(pixel[2]);
+                rgb.push(pixel[1]);
+                rgb.push(pixel[0]);
+            }
+        }
+        image::RgbImage::from_raw(frame.width, frame.height, rgb)
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_raw_frame_to_image() {
+        const N: u32 = 30;
+        for (w, h) in [(640u32, 480u32), (1280, 720), (1920, 1080)] {
+            let frame = synthetic_frame(w, h);
+            let t0 = Instant::now();
+            for _ in 0..N {
+                assert!(to_image_push_per_pixel(&frame).is_some());
+            }
+            let before = t0.elapsed() / N;
+            let t0 = Instant::now();
+            for _ in 0..N {
+                assert!(frame.to_image().is_some());
+            }
+            let after = t0.elapsed() / N;
+            // the two must agree pixel for pixel, or this is a
+            // benchmark of the wrong thing.
+            assert_eq!(
+                to_image_push_per_pixel(&frame).unwrap().into_raw(),
+                frame.to_image().unwrap().into_raw()
+            );
+            println!(
+                "to_image {w}x{h}: push-per-pixel {:.3}ms, row-wise {:.3}ms",
+                before.as_secs_f64() * 1e3,
+                after.as_secs_f64() * 1e3
+            );
+        }
+    }
+
+    /// What the level meter used to cost the render path (one blocking
+    /// request/reply per frame) against what it costs now (a read of
+    /// the folded observed value).
+    #[test]
+    #[ignore]
+    fn bench_level_read_blocking_vs_observed() {
+        let mpv = Mpv::spawn().expect("mpv on PATH");
+        // these run on a desktop that may have a real wim playing;
+        // measure the filter chain, don't put a tone on the speakers.
+        let _ = mpv.set_property("ao", json!("null"));
+        let _ = mpv.set_volume(0.0);
+        mpv.set_af(&crate::eq::build_af_filter(&[0.0; 10]))
+            .expect("set af");
+        mpv.load_file("av://lavfi:sine=frequency=440:duration=600")
+            .expect("load");
+        mpv.observe_playback().expect("observe");
+        thread::sleep(Duration::from_millis(1500));
+
+        // the mean understates the problem: a frame is only as fast as
+        // the slowest round trip it waits on, so report the worst too.
+        const N: u32 = 300;
+        let mut worst = Duration::ZERO;
+        let t0 = Instant::now();
+        for _ in 0..N {
+            let one = Instant::now();
+            let _ = mpv.get_property(PROP_LEVEL_RMS);
+            worst = worst.max(one.elapsed());
+        }
+        let blocking = t0.elapsed() / N;
+
+        let mut playback = Playback::default();
+        while let Ok(event) = mpv.events().try_recv() {
+            if let Event::PropertyChange { name, value } = event {
+                playback.apply(&name, &value);
+            }
+        }
+        const M: u32 = 100_000;
+        let t0 = Instant::now();
+        for _ in 0..M {
+            let _ = playback.level();
+        }
+        let observed = t0.elapsed() / M;
+        println!(
+            "level read: blocking get_property {:.0}us mean / {:.0}us worst, \
+             Playback::level() {:.4}us (reading {:?})",
+            blocking.as_secs_f64() * 1e6,
+            worst.as_secs_f64() * 1e6,
+            observed.as_secs_f64() * 1e6,
+            playback.level()
+        );
+    }
+
+    /// Seven `sub-*` properties: one round trip each, or one for the
+    /// whole pipelined batch.
+    #[test]
+    #[ignore]
+    fn bench_subtitle_style_batch_vs_sequential() {
+        let mpv = Mpv::spawn().expect("mpv on PATH");
+        let cfg = crate::config::SubtitleConfig::default();
+        const N: u32 = 100;
+
+        let t0 = Instant::now();
+        for _ in 0..N {
+            let _ = mpv.set_property("sub-delay", json!(cfg.delay_secs));
+            let _ = mpv.set_property("sub-font-size", json!(cfg.font_size));
+            let _ = mpv.set_property("sub-pos", json!(cfg.position));
+            let _ = mpv.set_property("sub-border-size", json!(cfg.outline_size));
+            let _ = mpv.set_property("sub-blur", json!(cfg.blur));
+            let _ = mpv.set_property("sub-color", json!("#FFFFFFFF"));
+            let _ = mpv.set_property("sub-back-color", json!("#FF000000"));
+        }
+        let seq = t0.elapsed() / N;
+
+        let t0 = Instant::now();
+        for _ in 0..N {
+            mpv.set_subtitle_style(&cfg);
+        }
+        let batched = t0.elapsed() / N;
+        println!(
+            "subtitle style: sequential {:.0}us, batched {:.0}us",
+            seq.as_secs_f64() * 1e6,
+            batched.as_secs_f64() * 1e6
+        );
+    }
+
+    /// The render path's own cost of asking for a video frame: what
+    /// `screenshot_raw()` charged the caller, against what reading the
+    /// pump's latest frame charges it.
+    #[test]
+    #[ignore]
+    fn bench_video_frame_on_the_calling_thread() {
+        let mpv = Mpv::spawn().expect("mpv on PATH");
+        mpv.load_file("av://lavfi:testsrc=size=1920x1080:rate=30")
+            .expect("load");
+        thread::sleep(Duration::from_millis(1500));
+
+        // what the render path used to do once per VIDEO_FRAME_INTERVAL.
+        let t0 = Instant::now();
+        let got = mpv.command(&[json!("screenshot-raw")]);
+        println!(
+            "blocking screenshot-raw on the calling thread: {:.0}ms, ok={}",
+            t0.elapsed().as_secs_f64() * 1e3,
+            got.is_ok()
+        );
+
+        let pump = mpv.frame_pump().expect("second ipc connection");
+        pump.set_capture(Capture {
+            on: true,
+            interval: Duration::from_millis(150),
+            max_edge: None,
+        });
+        thread::sleep(Duration::from_millis(1500));
+        const N: u32 = 10_000;
+        let t0 = Instant::now();
+        for _ in 0..N {
+            let _ = pump.latest();
+        }
+        println!(
+            "FramePump::latest(): {:.3}us per call, state={:?}",
+            t0.elapsed().as_secs_f64() * 1e6 / f64::from(N),
+            pump.state()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
