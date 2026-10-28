@@ -22,7 +22,10 @@ pub struct HelpOverlay<'a> {
 /// conventions that deliberately aren't part of the remappable
 /// keymap (see keymap.rs); `Bound` for anything that is, so its
 /// label always reflects whatever it's actually currently bound to.
-enum Key {
+/// Lives here rather than in keymap.rs because it is about *showing* a
+/// binding, not resolving one; onboarding's controls screen shares it
+/// (it had the same baked-in-literal bug this enum exists to prevent).
+pub(crate) enum Key {
     Fixed(&'static str),
     Bound(KeyAction),
     /// Two remappable actions that read as one row ("speed down /
@@ -30,6 +33,24 @@ enum Key {
     /// this table ended up lying about four rebindable keys: the text
     /// was baked in, so a remap left the help showing the old pair.
     Pair(KeyAction, KeyAction),
+}
+
+impl Key {
+    /// The label to print, resolved against the live keymap so a
+    /// rebound key is never shown as the default it replaced.
+    pub(crate) fn label(&self, keymap: &Keymap) -> String {
+        match self {
+            Key::Fixed(s) => (*s).to_string(),
+            Key::Bound(action) => key_label(keymap.get(*action)),
+            Key::Pair(a, b) => {
+                format!(
+                    "{} / {}",
+                    key_label(keymap.get(*a)),
+                    key_label(keymap.get(*b))
+                )
+            }
+        }
+    }
 }
 
 const SECTIONS: &[(&str, &[(Key, &str)])] = &[
@@ -182,15 +203,7 @@ impl HelpOverlay<'_> {
                     level: NEAR_WHITE,
                 }];
                 for (key, desc) in *binds {
-                    let key_text = match key {
-                        Key::Fixed(s) => (*s).to_string(),
-                        Key::Bound(action) => key_label(self.keymap.get(*action)),
-                        Key::Pair(a, b) => format!(
-                            "{} / {}",
-                            key_label(self.keymap.get(*a)),
-                            key_label(self.keymap.get(*b))
-                        ),
-                    };
+                    let key_text = key.label(self.keymap);
                     block.push(Line {
                         text: format!("  {key_text:<13} {desc}"),
                         level: DIM,
