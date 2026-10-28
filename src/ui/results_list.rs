@@ -177,16 +177,7 @@ impl Widget for ResultsList<'_> {
 
         if self.items.is_empty() {
             let text = truncate_with_ellipsis(self.empty_message, area.width as usize);
-            for (col, ch) in text.chars().enumerate() {
-                let x = area.x + col as u16;
-                if x >= area.x + area.width {
-                    break;
-                }
-                if let Some(cell) = buf.cell_mut((x, area.y)) {
-                    cell.set_char(ch);
-                    cell.set_fg(shade(DIM));
-                }
-            }
+            crate::ui::draw::line(buf, area, area.y, &text, shade(DIM));
             return;
         }
 
@@ -231,16 +222,7 @@ impl Widget for ResultsList<'_> {
                     );
                     let text = truncate_with_ellipsis(&full, area.width as usize);
 
-                    for (col, ch) in text.chars().enumerate() {
-                        let x = area.x + col as u16;
-                        if x >= area.x + area.width {
-                            break;
-                        }
-                        if let Some(cell) = buf.cell_mut((x, y)) {
-                            cell.set_char(ch);
-                            cell.set_fg(fg);
-                        }
-                    }
+                    crate::ui::draw::line(buf, area, y, &text, fg);
                 }
             }
         }
@@ -278,18 +260,12 @@ pub(crate) fn draw_header_row(buf: &mut Buffer, area: Rect, y: u16, label: &str)
         }
     }
     let text = format!(" {label} ");
-    let text_width = text.chars().count() as u16;
-    let start_x = area.x + area.width.saturating_sub(text_width) / 2;
-    for (i, ch) in text.chars().enumerate() {
-        let x = start_x + i as u16;
-        if x >= area.x + area.width {
-            break;
-        }
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_fg(shade(DIM));
-        }
-    }
+    let row = Rect {
+        y,
+        height: 1,
+        ..area
+    };
+    crate::ui::draw::centered(buf, row, y, &text, shade(DIM));
 }
 
 #[cfg(test)]

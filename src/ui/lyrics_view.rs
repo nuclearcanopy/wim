@@ -44,15 +44,7 @@ impl Widget for LyricsView<'_> {
             .enumerate()
         {
             let y = body_top + row as u16;
-            for (col, ch) in line.chars().enumerate() {
-                if col >= area.width as usize {
-                    break;
-                }
-                if let Some(cell) = buf.cell_mut((area.x + col as u16, y)) {
-                    cell.set_char(ch);
-                    cell.set_fg(shade(NEAR_WHITE));
-                }
-            }
+            crate::ui::draw::line(buf, area, y, line, shade(NEAR_WHITE));
         }
     }
 }
