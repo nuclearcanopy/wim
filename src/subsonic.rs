@@ -82,9 +82,17 @@ pub struct Song {
     pub album: String,
     // parsed for fidelity to the api response but not read anywhere
     // yet; same documented gap as LocalTrack::duration_secs (see
-    // library.rs) — SearchItem::Song doesn't carry duration either.
+    // library.rs): SearchItem::Song doesn't carry duration either.
     #[allow(dead_code)]
     pub duration: Option<u32>,
+    /// Every genre tag the server has for this track, in server order
+    /// (empty when untagged). Navidrome reports both a legacy single
+    /// `genre` string and a multi-valued `genres` array; see
+    /// `parse_genres`. The only genre source the suggestion engine
+    /// has, so it is as good as the server's tags and no better.
+    // read by `suggest`; drop the allow once the menu is wired up.
+    #[allow(dead_code)]
+    pub genres: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -614,10 +622,38 @@ fn parse_song_array(arr: Option<&serde_json::Value>) -> Vec<Song> {
                             .unwrap_or_default()
                             .to_string(),
                         duration: s.get("duration").and_then(|v| v.as_u64()).map(|d| d as u32),
+                        genres: parse_genres(s),
                     })
                 })
                 .collect()
         })
+        .unwrap_or_default()
+}
+
+/// Genre tags off one song object. Navidrome serves both shapes: the
+/// legacy single `genre` string every subsonic client reads, and a
+/// multi-valued `genres: [{name}]` array. Prefer the array (a track
+/// tagged "Hip-Hop; Cloud Rap" is two signals, not one) and fall back
+/// to the string, so a server that only sends one still works.
+fn parse_genres(song: &serde_json::Value) -> Vec<String> {
+    let multi: Vec<String> = song
+        .get("genres")
+        .and_then(|g| g.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|g| g.get("name").and_then(|n| n.as_str()))
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !multi.is_empty() {
+        return multi;
+    }
+    song.get("genre")
+        .and_then(|g| g.as_str())
+        .filter(|g| !g.is_empty())
+        .map(|g| vec![g.to_string()])
         .unwrap_or_default()
 }
 
@@ -1022,6 +1058,38 @@ mod tests {
         assert!(parse_artists_index(&v).is_empty());
         assert!(parse_album_list2_page(&v).is_empty());
         assert!(parse_song_array(None).is_empty());
+    }
+
+    /// Navidrome serves the multi-valued `genres` array alongside the
+    /// legacy single `genre` string; the array wins when both are
+    /// there, since a two-genre track is two signals.
+    #[test]
+    fn parses_the_multi_valued_genres_array_in_preference_to_the_legacy_string() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"song": [
+                {"id": "s1", "title": "Be Nice 2 Me", "artist": "Bladee", "album": "Eversince",
+                 "genre": "Hip-Hop", "genres": [{"name": "Hip-Hop"}, {"name": "Cloud Rap"}]}
+            ]}"#,
+        )
+        .unwrap();
+        let songs = parse_song_array(v.get("song"));
+        assert_eq!(songs[0].genres, vec!["Hip-Hop", "Cloud Rap"]);
+    }
+
+    #[test]
+    fn falls_back_to_the_legacy_genre_string_and_tolerates_no_genre_at_all() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"song": [
+                {"id": "s1", "title": "One", "artist": "Metallica", "album": "Black", "genre": "Metal"},
+                {"id": "s2", "title": "Two", "artist": "Metallica", "album": "Black"},
+                {"id": "s3", "title": "Three", "artist": "Metallica", "album": "Black", "genre": "", "genres": []}
+            ]}"#,
+        )
+        .unwrap();
+        let songs = parse_song_array(v.get("song"));
+        assert_eq!(songs[0].genres, vec!["Metal"]);
+        assert!(songs[1].genres.is_empty());
+        assert!(songs[2].genres.is_empty(), "empty tags are not a genre");
     }
 
     #[test]
