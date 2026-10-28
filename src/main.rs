@@ -3815,6 +3815,7 @@ fn main() -> anyhow::Result<()> {
                     PlayerView {
                         title: &label(item),
                         art: playing_art,
+                        art_key: &coverart::art_key(item),
                         art_mode,
                         cell_aspect: aspect,
                         // mid-drag the screen draws the pending target,
