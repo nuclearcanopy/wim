@@ -448,6 +448,13 @@ struct AlbumEntry {
     /// Real track count, known only from a full album fetch. Without
     /// it, coverage is measured against the tracks we happen to know.
     track_total: Option<usize>,
+    /// Whether a tracklist fetch has been attempted, regardless of
+    /// what came back. Distinct from `track_total.is_some()` on
+    /// purpose: a fetch can fail, or return an empty list, and
+    /// treating "no track total" as "never asked" made those albums
+    /// permanent re-fetch targets. The host used to carry its own set
+    /// for exactly this.
+    asked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -563,10 +570,22 @@ impl Catalog {
     /// One album's full track list from `getAlbum`, in album order.
     /// The only ingest that yields real album coverage (a known track
     /// total) and track adjacency.
-    pub fn ingest_album(&mut self, album_name: &str, songs: &[Song], client: &Arc<Client>) {
-        let artist = songs.first().map(|s| s.artist.as_str()).unwrap_or_default();
-        let slot = self.album_slot(artist, album_name);
+    /// `album_artist` is the album's *credited* artist, which the
+    /// caller knows from the row it fetched for. Deriving it from the
+    /// first track instead filed a compilation's tracklist under that
+    /// track's artist, which is a different slot from the corpus row,
+    /// so the row stayed `track_total: None` and was re-offered every
+    /// cycle while the fetched data sat somewhere nothing read it.
+    pub fn ingest_album(
+        &mut self,
+        album_artist: &str,
+        album_name: &str,
+        songs: &[Song],
+        client: &Arc<Client>,
+    ) {
+        let slot = self.album_slot(album_artist, album_name);
         self.albums[slot].track_total = Some(songs.len());
+        self.albums[slot].asked = true;
         for (position, song) in songs.iter().enumerate() {
             let item = song_item(song, client);
             self.upsert_track(
@@ -580,6 +599,14 @@ impl Catalog {
                 Some(slot),
             );
         }
+    }
+
+    /// Records that a tracklist fetch was attempted and produced
+    /// nothing usable, so `album_targets` stops offering it. Without
+    /// this a server that 404s one album re-offers it forever.
+    pub fn mark_album_asked(&mut self, album_artist: &str, album_name: &str) {
+        let slot = self.album_slot(album_artist, album_name);
+        self.albums[slot].asked = true;
     }
 
     /// Insert or enrich. A track can arrive first from the corpus
@@ -679,6 +706,7 @@ impl Catalog {
             item: None,
             tracks: Vec::new(),
             track_total: None,
+            asked: false,
         });
         self.by_album.insert(key, slot);
         slot
@@ -1060,24 +1088,27 @@ impl Candidate {
 
 /// The whole engine. Pure: same inputs, same output, every time.
 pub fn suggest(req: &Request<'_>) -> Suggestions {
-    let model = Model::build(req);
+    suggest_with(&Model::build(req), req)
+}
+
+fn suggest_with(model: &Model, req: &Request<'_>) -> Suggestions {
     if model.total_plays == 0 {
         // nothing played, ever: there is no affinity to weight a gap
         // by, so every scored generator would be guessing.
-        return cold_start(&model, req);
+        return cold_start(model, req);
     }
 
     // stage 1: candidate generation, one pool per generator.
     let pools = vec![
-        daily_rotation(&model),
-        album_gap(&model),
-        track_gap(&model),
-        album_neighbours(&model),
-        genre_under_explored(&model),
-        rediscovery(&model),
-        starred_unplayed(&model),
-        similar_artists(&model, req.enrichment),
-        popular_unplayed(&model, req.enrichment),
+        daily_rotation(model),
+        album_gap(model),
+        track_gap(model),
+        album_neighbours(model),
+        genre_under_explored(model),
+        rediscovery(model),
+        starred_unplayed(model),
+        similar_artists(model, req.enrichment),
+        popular_unplayed(model, req.enrichment),
     ];
 
     // stage 2: scoring. normalise inside each pool first, so a
@@ -1098,7 +1129,7 @@ pub fn suggest(req: &Request<'_>) -> Suggestions {
     if sections.is_empty() {
         // a library with history but no gaps worth showing (tiny, or
         // fully explored) must still not render an empty screen.
-        return cold_start(&model, req);
+        return cold_start(model, req);
     }
     Suggestions { sections }
 }
@@ -1106,9 +1137,36 @@ pub fn suggest(req: &Request<'_>) -> Suggestions {
 /// Top-affinity artists with a server-side id, which is what the host
 /// should fetch `getArtistInfo2`/`getTopSongs` for before the next
 /// open. Exposed separately so the fetching stays out of the engine.
-pub fn enrichment_targets(req: &Request<'_>, limit: usize) -> Vec<ArtistTarget> {
+/// Both halves of one enrichment batch, from a single pass over the
+/// corpus.
+///
+/// `enrichment_targets` and `album_targets` each build the whole
+/// affinity model from scratch, so asking for both walked every track
+/// twice. They stay as they are for callers that want one answer (and
+/// for the tests); this is for the host, which always wants both at
+/// once. `suggest` is deliberately not folded in: the menu asks for
+/// suggestions and the scheduler asks for targets, never at the same
+/// moment, so including it would mean computing a result nobody
+/// reads.
+pub struct EnrichmentPlan {
+    pub artists: Vec<ArtistTarget>,
+    pub albums: Vec<AlbumTarget>,
+}
+
+pub fn enrichment_plan(
+    req: &Request<'_>,
+    artist_limit: usize,
+    album_limit: usize,
+) -> EnrichmentPlan {
     let model = Model::build(req);
-    top_artists(&model, limit)
+    EnrichmentPlan {
+        artists: enrichment_targets_with(&model, artist_limit),
+        albums: album_targets_with(&model, album_limit),
+    }
+}
+
+fn enrichment_targets_with(model: &Model, limit: usize) -> Vec<ArtistTarget> {
+    top_artists(model, limit)
         .into_iter()
         .filter_map(|slot| {
             let artist = &model.catalog.artists[slot];
@@ -1135,14 +1193,11 @@ pub struct ArtistTarget {
 /// The "has a play" filter is also what bounds a warm-up on a large
 /// library: you have only ever played from a fraction of it, and the
 /// rest is already covered by `AlbumGap`, which needs no fetch.
-pub fn album_targets(req: &Request<'_>, limit: usize) -> Vec<AlbumTarget> {
-    let model = Model::build(req);
+fn album_targets_with(model: &Model, limit: usize) -> Vec<AlbumTarget> {
     let mut slots: Vec<usize> = (0..model.catalog.albums.len())
         .filter(|&slot| {
             let album = &model.catalog.albums[slot];
-            album.track_total.is_none()
-                && album.item.is_some()
-                && model.albums[slot].played_tracks > 0
+            !album.asked && album.item.is_some() && model.albums[slot].played_tracks > 0
         })
         .collect();
     slots.sort_by(|&a, &b| {
@@ -1164,6 +1219,7 @@ pub fn album_targets(req: &Request<'_>, limit: usize) -> Vec<AlbumTarget> {
                 SearchItem::Album { id, client, .. } => Some(AlbumTarget {
                     id: id.clone(),
                     name: album.name.clone(),
+                    artist: album.artist.clone(),
                     client: client.clone(),
                 }),
                 _ => None,
@@ -1175,10 +1231,13 @@ pub fn album_targets(req: &Request<'_>, limit: usize) -> Vec<AlbumTarget> {
 #[derive(Debug, Clone)]
 pub struct AlbumTarget {
     pub id: String,
-    /// The name the album is already known by, which is the one
-    /// `Catalog::ingest_album` must be fed so the fetched tracklist
-    /// lands on the existing album rather than beside it.
+    /// The name and credited artist the album is already known by,
+    /// which are what `Catalog::ingest_album` must be fed so the
+    /// fetched tracklist lands on the existing album rather than
+    /// beside it. The artist matters for compilations, where track
+    /// one's artist is not the album's.
     pub name: String,
+    pub artist: String,
     pub client: Arc<Client>,
 }
 
@@ -2010,6 +2069,7 @@ mod tests {
         catalog.ingest_item(&album_item("al-1", "Eversince", "Bladee"));
         catalog.ingest_item(&album_item("al-2", "Crest", "Bladee"));
         catalog.ingest_album(
+            "Bladee",
             "Eversince",
             &[
                 song("s1", "Be Nice 2 Me", "Bladee", "Eversince", &["Cloud Rap"]),
@@ -2160,6 +2220,7 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog.ingest_item(&artist_item("ar-1", "Burial"));
         catalog.ingest_album(
+            "Burial",
             "Untrue",
             &[
                 song("b1", "Archangel", "Burial", "Untrue", &["Dubstep"]),
@@ -2501,7 +2562,7 @@ mod tests {
                 &format!("album {album}"),
                 "Prolific",
             ));
-            catalog.ingest_album(&format!("album {album}"), &songs, &client);
+            catalog.ingest_album("A", &format!("album {album}"), &songs, &client);
             cache = cache.played(&format!("p-{album}-0"), 20, 10, 1);
         }
         let out = run(&catalog, &cache.build(), &HashSet::new());
@@ -2742,7 +2803,8 @@ mod tests {
             .played("z1", 50, 30, 1)
             .build();
         let starred = HashSet::new();
-        let targets = enrichment_targets(&Request::new(&catalog, &cache, &starred, NOW), 5);
+        let req = Request::new(&catalog, &cache, &starred, NOW);
+        let targets = enrichment_targets_with(&Model::build(&req), 5);
         assert_eq!(
             targets,
             vec![
@@ -2847,6 +2909,7 @@ mod tests {
         // Eversince has already been fetched whole, so there is
         // nothing left to learn about it.
         catalog.ingest_album(
+            "Bladee",
             "Eversince",
             &[song("e1", "Rosier", "Bladee", "Eversince", &[])],
             &client,
@@ -2861,7 +2924,7 @@ mod tests {
         let starred = HashSet::new();
         let request = Request::new(&catalog, &cache, &starred, NOW);
 
-        let targets = album_targets(&request, 10);
+        let targets = album_targets_with(&Model::build(&request), 10);
         let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
             names,
@@ -2871,7 +2934,7 @@ mod tests {
         assert_eq!(targets[0].id, "al-1", "the id getAlbum needs comes along");
 
         assert_eq!(
-            album_targets(&request, 1)
+            album_targets_with(&Model::build(&request), 1)
                 .iter()
                 .map(|t| t.name.as_str())
                 .collect::<Vec<_>>(),
@@ -2892,7 +2955,8 @@ mod tests {
         );
         let cache = History::new().played("s1", 9, 4, 1).build();
         let starred = HashSet::new();
-        let targets = album_targets(&Request::new(&catalog, &cache, &starred, NOW), 10);
+        let req = Request::new(&catalog, &cache, &starred, NOW);
+        let targets = album_targets_with(&Model::build(&req), 10);
         assert!(targets.is_empty());
     }
 
@@ -2923,6 +2987,7 @@ mod tests {
         assert_eq!(catalog.track_count(), 1);
         assert!(catalog.tracks[0].genres.is_empty());
         catalog.ingest_album(
+            "Bladee",
             "Eversince",
             &[song(
                 "s1",
@@ -2936,5 +3001,67 @@ mod tests {
         assert_eq!(catalog.track_count(), 1, "the same id is one track");
         assert_eq!(catalog.tracks[0].genres, vec!["Cloud Rap"]);
         assert_eq!(catalog.tracks[0].position, Some(0));
+    }
+
+    #[test]
+    fn a_compilations_tracklist_lands_on_the_row_it_was_fetched_for() {
+        // the album is credited to "Various Artists" but track one is
+        // not, which is what used to file the tracklist on a second,
+        // unread slot and leave this row looking never-fetched.
+        let client = client();
+        let mut catalog = Catalog::new();
+        catalog.ingest_item(&album_item("comp", "A Compilation", "Various Artists"));
+        catalog.ingest_album(
+            "Various Artists",
+            "A Compilation",
+            &[
+                song("c1", "First", "Someone Else", "A Compilation", &[]),
+                song("c2", "Second", "Another One", "A Compilation", &[]),
+            ],
+            &client,
+        );
+
+        let cache = CacheIndex::default();
+        let starred = HashSet::new();
+        let req = Request::new(&catalog, &cache, &starred, NOW);
+        let targets = album_targets_with(&Model::build(&req), 10);
+        assert!(
+            !targets.iter().any(|t| t.name == "A Compilation"),
+            "the fetched album must not be offered again: {:?}",
+            targets.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_album_whose_fetch_returned_nothing_is_not_re_offered() {
+        // the track comes from the corpus, not from ingest_album,
+        // which would itself mark the album asked and make the
+        // precondition unreachable.
+        let client = client();
+        let mut catalog = Catalog::new();
+        catalog.ingest_item(&album_item("a1", "Eversince", "Bladee"));
+        catalog.ingest_item(&song_item(
+            &song("s1", "Obedient", "Bladee", "Eversince", &[]),
+            &client,
+        ));
+        let mut cache = CacheIndex::default();
+        cache.record_play("s1", "2024-01-01");
+
+        let starred = HashSet::new();
+        let before = {
+            let req = Request::new(&catalog, &cache, &starred, NOW);
+            album_targets_with(&Model::build(&req), 10)
+        };
+        assert!(before.iter().any(|t| t.name == "Eversince"), "precondition");
+
+        catalog.mark_album_asked("Bladee", "Eversince");
+        let after = {
+            let req = Request::new(&catalog, &cache, &starred, NOW);
+            album_targets_with(&Model::build(&req), 10)
+        };
+        assert!(
+            !after.iter().any(|t| t.name == "Eversince"),
+            "a failed fetch must be remembered, not retried forever"
+        );
     }
 }

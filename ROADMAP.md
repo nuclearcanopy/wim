@@ -454,23 +454,30 @@ run that edits these files will collide.
       with the fetch wired; the handler now ingests the response too.
 - [x] **narrowed `suggest.rs`'s `allow(dead_code)`** from one
       module-level blanket to four per-item allows, each with a reason.
-- [ ] **`Catalog` should answer all three questions from one walk.**
-      `enrichment_targets`, `album_targets` and `suggest` each build
-      the model independently, so a cycle walks the whole corpus three
-      times. Cheap next to a round trip, but an entry point that built
-      it once is the obvious refactor.
-- [ ] **`ingest_album` derives an album's artist from its first
-      track**, so a compilation's tracklist lands on a different
-      catalog slot than the corpus row it was fetched for, leaving
-      that row looking unfetched forever. The host works around it
-      with a session-scoped `asked_albums` set; the engine should take
-      the credited artist, or expose an explicit mark-as-asked (there
-      is also no way to record a *failed* fetch).
-- [ ] **the suggestions menu pulses at 10fps.** `selection_pulsing` in
-      the loop's pacing calc only counts `browse_view` for
-      `Focus::Workspace`, so with nothing playing the menu idles at the
-      100ms poll and its selection plate animates at a tenth of the
-      display rate. one condition, in the per-frame pacing block.
+- [x] **`ingest_album` takes the album's credited artist.** it derived
+      it from track one, so a compilation's tracklist landed on a
+      different catalog slot than the corpus row it was fetched for:
+      that row kept `track_total: None`, was re-offered every cycle,
+      and the fetched data sat where nothing read it. `AlbumTarget`
+      carries the artist through so the reply lands where it was asked
+      from. an explicit `asked` flag on the album replaces "no track
+      total means never asked", which also closes the failure case:
+      the fetch now always reports, with empty songs on failure, and
+      `mark_album_asked` records the attempt. the host's
+      session-scoped `asked_albums` workaround is deleted, and its
+      test now drives the real flag instead of the workaround.
+- [x] **one model build per enrichment batch.** `enrichment_plan`
+      builds the affinity model once and answers both target
+      questions; asking `enrichment_targets` and `album_targets`
+      separately walked every track twice. `suggest` is deliberately
+      left out of it: the menu asks for suggestions and the scheduler
+      asks for targets, never at the same moment, so folding it in
+      would compute a result nobody reads. the two single-answer
+      wrappers are gone rather than left as dead public API.
+- [x] **the suggestions menu and queue view pulse at the display
+      rate.** `selection_pulsing` only counted the browse view for
+      `Focus::Workspace`, so both of those idled at the 100ms poll and
+      animated their selection plate at a tenth of the display rate.
 - [ ] **shellsong's `eq(<preset>)` cannot reach saved curves.** it
       resolves names through `eq::index_of`, which is built-ins only.
       `eq::resolve(name, &cfg.eq_custom_presets)` already returns
