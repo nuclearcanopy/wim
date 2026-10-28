@@ -364,6 +364,40 @@ measurements are what settled it.
   measured spill matrix; a flat eq emits no biquads at all and null
   tests bit-identical.
 
+## video in the workspace (maintainer spec, 2026-10-28)
+
+real video is the DEFAULT and stays the default. the ascii path is a
+thing the user turns on deliberately, never something they land in by
+accident.
+
+- [ ] **video plays as real video in the workspace.** confirm the
+      maximized-song path actually shows a real video surface for a
+      video file, not the album-art fallback and not ascii.
+- [ ] **ascii video renderer, opt-in.** same technique as album art,
+      via the shared rasterizer being extracted on `perf/art`:
+      half-block glyphs so one cell carries two vertical samples.
+      toggled by the user (config key plus a shellsong command plus a
+      key binding); default off.
+- [ ] **usable at absurd zoom-out.** ascii video is only watchable
+      once the font is small enough to give a few hundred cells across,
+      so the layout has to survive that: sidebar and bottom bar must
+      stay visible and operable at very small cell sizes, rather than
+      the video eating the frame or the chrome collapsing to unreadable
+      slivers. this is a layout constraint, not a rendering one; the
+      chrome should scale its own footprint, not vanish.
+- [ ] **frame budget.** a few hundred cells across times a few hundred
+      down, at video frame rate, is the real cost. the work is CPU
+      (decode, downscale, per-cell sampling, diffing the buffer), not
+      gpu: the terminal emulator rasterizes glyphs on the gpu and that
+      part is cheap even for a full-screen repaint. the things that will
+      actually cook a core, in order: decoding every frame at full
+      resolution rather than downscaling once to the cell grid,
+      per-pixel `get_pixel` instead of a contiguous walk, reallocating
+      the output buffer per frame, and repainting cells that did not
+      change. decouple the ascii frame rate from the display refresh
+      rate and make it tunable; dropping to a lower rate must degrade
+      smoothness, never block the input path.
+
 ## in flight (branches, NOT merged; do not start work that touches these)
 
 five branches exist with uncommitted-to-master work. check
