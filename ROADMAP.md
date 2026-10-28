@@ -434,56 +434,43 @@ run that edits these files will collide.
       open rather than per frame (it walks the whole corpus and the
       play history). `cache::now_secs` became `pub` instead of adding
       a second clock read.
-- [ ] **suggestions: the three background fetches.** only the
-      history-driven generators can fire today (daily rotation, album
-      gap, genre under-exploration, rediscovery, starred-unplayed, and
-      the cold-start paths). `TrackGap` and `AlbumNeighbour` need
-      `getAlbum` for real coverage and track order, `SimilarArtist`
-      needs `getArtistInfo2`, `PopularUnplayed` needs `getTopSongs`.
-      `suggest::enrichment_targets` already says which artists to fetch
-      top-affinity first, and `EnrichmentCache::needs_*` remembers what
-      has been asked including negative answers; the view takes an
-      `enriching` flag so a thin list says "so far" rather than looking
-      final. `Client::stream_artist_tracks` already fetches exactly the
-      `getAlbum` data for the artist view and discards it.
-- [ ] **drop `suggest.rs`'s module-level `allow(dead_code)`.** the menu
-      now calls `suggest`, `Catalog::from_corpus` and `Request::new`,
-      but the tuning knobs, `enrichment_targets` and `EnrichmentCache`
-      stay unread until the fetches above land.
-- [x] **wire shellsong to the host.** `:` opens the console, which then
-      claims every key and every paste at the same input tier
-      `editing_query` does; `ShellsongConsole` draws last of everything
-      so nothing can land on top of it. a submitted line is held as a
-      `Program` and stepped in a loop each frame, applying every `Emit`
-      before the next `step` and stopping on `AwaitResults`/`Done`, so
-      a searching command never blocks the loop. the `Op` -> host table
-      is `apply_shellsong_op`, next to `dispatch_action` and routing
-      through it wherever an `Action` exists. `shellsong_host.rs` holds
-      the pure host decisions (local-corpus `Candidates`,
-      `search_settled`, percent-to-seconds, the volume clamp, the
-      fade/sleep ramps); `queues.rs` is the named-queue store.
-      `browse_session` and `App::move_selection`/`select_top`/
-      `select_bottom` were extracted so the keyboard and the language
-      share one code path rather than two. two things report "not
-      supported yet" rather than faking it: `go()` on the bottom bar's
-      progress field (enter there opens a scrub drag whose keys the
-      open console would swallow; `moveto`/`seek` do the same job), and
-      `view(q, ...)` landing on a song whose album is not in the corpus
-      (`SearchItem::Song` carries its album's name, not its id). see
-      docs/shellsong.md's host section.
-- [x] **the published console api.** there was no api summary behind
-      the claim that one said `paste(&str)`; docs/shellsong.md now has
-      the real surface (`paste(&mut self, &str, &dyn Candidates)`, which
-      takes the provider because it refreshes the suggestion), and a
-      test calls every documented form so a signature cannot change
-      without failing the build.
-- [x] **`ViewTarget::Help` is reachable.** `view(help)` lowers to
-      `Op::View(ViewTarget::Help)` like every other target instead of to
-      console notes, so the host's arm is live rather than dead code and
-      no target is special-cased in lowering. the listing still comes
-      from `help_lines()`, which is what keeps it identical to `help()`.
-      `dry(view(help))` now reports the plan instead of dumping the
-      whole listing.
+- [x] **suggestions: the three background fetches.** all nine
+      generators can fire now. `spawn_background_enrichment` follows
+      the `spawn_background_sync`/`spawn_background_search` shape: one
+      job in flight at a time so a keypress costs one job, 8 artists
+      and 12 albums per job, 4-way striped inside. the real bound is
+      `album_targets`, which only offers albums with a played track
+      and no known tracklist; everything else is `AlbumGap`'s job and
+      needs no fetch. warming only runs while the menu is open, so the
+      first open never blocks. artist answers persist to
+      `~/.cache/wim/enrichment.toml` including the negatives, so a
+      server with no last.fm metadata is asked once ever; tracklists
+      are not persisted (bulky, and rebuilding a `SearchItem::Song`
+      needs the `Arc<Client>`) and are instead kept in one long-lived
+      `Catalog` across menu opens.
+      `PopularUnplayed` needed a step nobody had flagged: song titles
+      are never eagerly indexed, so `getTopSongs` ids resolved against
+      an empty catalog and the generator would have stayed silent even
+      with the fetch wired; the handler now ingests the response too.
+- [x] **narrowed `suggest.rs`'s `allow(dead_code)`** from one
+      module-level blanket to four per-item allows, each with a reason.
+- [ ] **`Catalog` should answer all three questions from one walk.**
+      `enrichment_targets`, `album_targets` and `suggest` each build
+      the model independently, so a cycle walks the whole corpus three
+      times. Cheap next to a round trip, but an entry point that built
+      it once is the obvious refactor.
+- [ ] **`ingest_album` derives an album's artist from its first
+      track**, so a compilation's tracklist lands on a different
+      catalog slot than the corpus row it was fetched for, leaving
+      that row looking unfetched forever. The host works around it
+      with a session-scoped `asked_albums` set; the engine should take
+      the credited artist, or expose an explicit mark-as-asked (there
+      is also no way to record a *failed* fetch).
+- [ ] **the suggestions menu pulses at 10fps.** `selection_pulsing` in
+      the loop's pacing calc only counts `browse_view` for
+      `Focus::Workspace`, so with nothing playing the menu idles at the
+      100ms poll and its selection plate animates at a tenth of the
+      display rate. one condition, in the per-frame pacing block.
 - [ ] **album/artist identity is name-based.** `SearchItem` carries no
       `album_id`/`artist_id`, so the suggestion catalog joins on
       trimmed-lowercased names. two same-named albums by one artist
