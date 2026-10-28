@@ -248,13 +248,18 @@ an unknown target is matched against this list and suggests the closest
 real one; `view()` with nothing at all lists them.
 
 the screens take over the display and close the console behind them;
-the four listings (`queue`, `index`, `history`, `playlists`) and `help`
+the five listings (`queue`, `index`, `history`, `playlists`, `help`)
 print into the scrollback and leave it open. `view` means "put this on
 screen" either way, and a listing satisfies that; there is deliberately
 no second verb for the distinction.
 
-`help` is the one target generated here rather than read from the app,
-so `view(help)` and `help()` print exactly the same lines.
+`help` is the one target whose lines the language generates itself,
+from the same command table `help()` reads, so `view(help)` and
+`help()` can never print different things. it is still an ordinary
+target otherwise: every spelling in the table lowers to one
+`Op::View(target)` and the host prints it, so no target is reachable
+only through the console's scrollback and no host has an arm for an op
+that cannot arrive.
 
 ### the query form
 
@@ -545,6 +550,88 @@ the event loop (all pure, all tested): the completion provider, the
 `search_settled` state machine, percent-to-seconds resolution, the
 volume clamp and the fade/sleep ramps. `queues.rs` is the named-queue
 store behind `save_queue`/`load_queue`.
+
+### the api a host calls
+
+the whole surface, copied from the real signatures and pinned by a
+test that calls every one of these forms, so the list cannot drift
+without failing the build.
+
+```rust
+const OPEN_KEY: KeyCode                 // ':', also reserved in keymap
+
+Console::new() -> Console               // loads history + ranks; the only i/o
+Console::handle_key(&mut self, key: KeyEvent, cand: &dyn Candidates)
+    -> ConsoleAction                    // None | Close | Run(Box<Program>)
+Console::paste(&mut self, text: &str, cand: &dyn Candidates)
+Console::note(&mut self, text: impl Into<String>)
+Console::fail(&mut self, text: impl Into<String>)
+Console::push(&mut self, kind: LineKind, text: impl Into<String>)
+Console::history(&self) -> &[String]
+Console::cycle(&self) -> Option<&Cycle>
+// read by the overlay: input, cursor (byte index), lines, error,
+// suggestion.
+
+Program::parse(input: &str) -> Result<Program, ParseError>
+Program::step(&mut self, env: &Env) -> Step
+Program::is_done(&self) -> bool
+
+Op::describe(&self) -> String           // the one scrollback line (r9)
+Op::closes_console(&self) -> bool
+ViewTarget::is_screen(self) -> bool
+Kind::of(item: &SearchItem) -> Kind      // for Env::results
+help_lines() -> Vec<String>              // what view(help) prints
+
+trait Candidates {
+    fn corpus(&self, token: &str) -> Vec<String>;
+    fn saved_queues(&self) -> Vec<String> { Vec::new() }
+}
+```
+
+both `handle_key` and `paste` take the candidate provider because both
+edit the line and therefore have to recompute the suggestion; a paste
+that left a stale ghost up would be the same bug as a keystroke that
+did.
+
+### the index contract
+
+`Target::Index(i)` indexes `Env::results`, which the host builds 1:1
+off `App::results`. that list is not stable: `App::resync_results`
+reassigns it wholesale (`corpus.search(&query)`), so rows are added,
+dropped and regrouped, and it runs on every remote search outcome, on
+every library scan batch and on every catalog merge. `Op::Search` and
+`Op::Rescan` rebuild it too, which means a resolved index can be
+invalidated by **the very next op of the same program**, not merely by
+the next frame.
+
+a resolved index is nevertheless safe here, and worth understanding
+before changing either side:
+
+- the executor never stores one. `resolve` computes the index and
+  returns it inside the same `Step::Emit`; no `Node` and no `Program`
+  field holds a `Target`.
+- the host applies each `Emit` immediately, rebuilding `Env` per step
+  rather than per frame, and drains no channel inside that loop.
+- every term-taking handler reads its item out of the list before
+  touching anything, and the only two ops that rebuild the list
+  (`Search`, `Rescan`) carry no `Target`.
+- it is all one thread; the channels carry data, not mutation.
+
+so a host that **batched** emitted ops and applied them after a drain
+would act on the wrong row, intermittently and only under load. one
+route is already closed off: `Resolve` refuses to resolve until it sees
+its own query in `Env` (`env.query != pending.query || !search_settled`
+keeps it on `AwaitResults`), so a host that deferred `Op::Search` fails
+loudly on the await timeout instead of resolving against stale results.
+
+nothing enforces this at the type level. making it structural means
+giving `Env::results` an identity per row (a hash of
+`SearchItem::identity()`, since `SearchItem` cannot be `PartialEq`) and
+having `Target::Index` carry that stamp for the host to verify. that
+touches `Env`, the env builder and every term-op handler, and the
+cheaper half-measure (asserting the list's *length* is unchanged) is
+blind to the equal-length regroup that is `resync_results`'s normal
+outcome, so the contract is written down here instead.
 
 ## pinned behaviours
 

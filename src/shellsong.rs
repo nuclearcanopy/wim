@@ -23,14 +23,11 @@ use crate::ui::textfit;
 /// and then silently shadowed by this.
 pub const OPEN_KEY: KeyCode = KeyCode::Char(':');
 
-/// How long a `Resolve` will wait for the search it follows before
-/// giving up. Comfortably past the host's 300ms remote-search debounce
-/// plus a slow round trip; a wedged search subsystem reports instead of
-/// hanging the program forever.
-/// Backstop for a host whose searches never settle. Unreachable
-/// against the current one, which settles within 1.2s (and instantly
-/// with no indexed server), so this exists for a future host with a
-/// slower rule rather than for anything live today.
+/// How long a `Resolve` waits for the search it follows before giving
+/// up: a backstop for a host whose searches never settle, so a wedged
+/// search subsystem reports instead of hanging the program forever.
+/// Unreachable against the current host, which settles within 1.2s and
+/// instantly with no indexed server.
 const AWAIT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Upper bound on `repeat(n, ...)`; the expansion is static, so an
@@ -136,16 +133,11 @@ pub enum Level {
 /// current selection", uniformly across every such command, which is
 /// what keeps one name to one meaning (docs/shellsong.md R11).
 ///
-/// **Load-bearing host contract, do not break:** `Index` is an index
-/// into `Env::results`, and `App::resync_results` reorders that list
-/// every time a remote search outcome lands. The index is therefore
-/// only valid until the next frame boundary. It is safe solely because
-/// the host applies each `Step::Emit` synchronously before calling
-/// `step` again, so nothing can reorder the list between resolving an
-/// index and using it. A host that queued emitted ops to apply later,
-/// or stepped once per frame while holding a resolved index, would act
-/// on the wrong track intermittently. Surfaced by the wiring work;
-/// nothing enforces it at the type level.
+/// **Load-bearing host contract, do not break:** an `Index` is live
+/// only until the next thing that rebuilds the results list, which can
+/// be the very next op of the same program. It survives today because
+/// the host applies each `Step::Emit` before stepping again and nothing
+/// holds one across that; see docs/shellsong.md, "the index contract".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     /// index into `Env::results`, resolved by the executor from a term.
@@ -194,10 +186,11 @@ pub enum ViewTarget {
     History,
     Playlists,
     Eq,
-    /// The command listing. Unlike every other target this is generated
-    /// here rather than read from the app, so it lowers to the same
-    /// notes `help()` produces instead of to an op; `view` still means
-    /// "put this on screen" either way.
+    /// The command listing: the one target whose content is generated
+    /// by the language itself (`help_lines`, off `COMMANDS`) rather than
+    /// read from the app, so `view(help)` and `help()` cannot drift. It
+    /// still lowers to this op like every other target; the host prints
+    /// the lines, same as it does for the other listings.
     Help,
 }
 
@@ -1472,14 +1465,9 @@ impl Lowering {
         let Some(target) = call.keyword(Words::ViewTarget).and_then(view_target) else {
             return;
         };
-        // the command listing is generated here, not read from the app,
-        // so it lands in the scrollback exactly as `help()` does.
-        if target == ViewTarget::Help {
-            for line in help_lines() {
-                self.nodes.push(Node::Note(line));
-            }
-            return;
-        }
+        // every target lowers the same way, `help` included: it reads
+        // its lines from `help_lines()` rather than from the app, but
+        // that is the host's business, not a second lowering.
         self.nodes.push(Node::Emit(Op::View(target)));
     }
 
@@ -3362,12 +3350,82 @@ mod tests {
         assert!(out[0].starts_with("shuffle(state?)"), "{out:?}");
     }
 
-    /// `view(help)` and `help()` are the same listing; `view` means
-    /// "put this on screen" and a scrollback listing satisfies that.
+    /// `view(help)` is an op like every other target (it used to lower
+    /// to notes, which made `ViewTarget::Help` unconstructable and the
+    /// host's arm for it dead code). The listing itself still comes from
+    /// `help_lines()`, which is what keeps it identical to `help()`.
     #[test]
-    fn view_help_is_the_same_listing_help_prints() {
-        assert_eq!(notes("view(help)"), notes("help()"));
-        assert_eq!(notes("view(help)").len(), COMMANDS.len());
+    fn view_help_is_an_op_like_every_other_target() {
+        assert_eq!(ops("view(help)"), vec![Op::View(ViewTarget::Help)]);
+        assert!(notes("view(help)").is_empty());
+        assert_eq!(notes("help()"), help_lines());
+        assert_eq!(help_lines().len(), COMMANDS.len());
+        // and `dry` reports the plan rather than dumping the listing,
+        // which is what it does for every other view target.
+        assert_eq!(notes("dry(view(help))").len(), 2);
+    }
+
+    /// `help` is a listing, so the console stays open and the lines land
+    /// in its scrollback; it is not a screen that would cover the
+    /// console it was typed into.
+    #[test]
+    fn view_help_is_a_listing_not_a_screen() {
+        assert!(!ViewTarget::Help.is_screen());
+        assert!(!Op::View(ViewTarget::Help).closes_console());
+    }
+
+    /// No `ViewTarget` may be unreachable: `view(help)` lowering to
+    /// notes instead of an op is exactly how `Help` became a variant no
+    /// parser could construct, leaving every host with an arm for an op
+    /// that never arrives. The match is exhaustive, so a new target has
+    /// to name its spelling here, and the count check makes it have one
+    /// in `VIEW_NAMES`.
+    #[test]
+    fn every_view_target_is_constructible_by_the_parser() {
+        const ALL: &[ViewTarget] = &[
+            ViewTarget::Queue,
+            ViewTarget::Now,
+            ViewTarget::Suggestions,
+            ViewTarget::Settings,
+            ViewTarget::Keybinds,
+            ViewTarget::Lyrics,
+            ViewTarget::Starred,
+            ViewTarget::Index,
+            ViewTarget::History,
+            ViewTarget::Playlists,
+            ViewTarget::Eq,
+            ViewTarget::Help,
+        ];
+        fn spelling(t: ViewTarget) -> &'static str {
+            match t {
+                ViewTarget::Queue => "queue",
+                ViewTarget::Now => "now",
+                ViewTarget::Suggestions => "suggestions",
+                ViewTarget::Settings => "settings",
+                ViewTarget::Keybinds => "keybinds",
+                ViewTarget::Lyrics => "lyrics",
+                ViewTarget::Starred => "starred",
+                ViewTarget::Index => "index",
+                ViewTarget::History => "history",
+                ViewTarget::Playlists => "playlists",
+                ViewTarget::Eq => "eq",
+                ViewTarget::Help => "help",
+            }
+        }
+        assert_eq!(
+            ALL.len(),
+            VIEW_NAMES.iter().filter(|v| v.canonical).count(),
+            "a target is missing from ALL or from VIEW_NAMES"
+        );
+        for t in ALL {
+            assert_eq!(view_name(*t), spelling(*t));
+            assert_eq!(
+                ops(&format!("view({})", spelling(*t))),
+                vec![Op::View(*t)],
+                "view({})",
+                spelling(*t)
+            );
+        }
     }
 
     // ---------------------------------------------------- bare words
@@ -3462,9 +3520,6 @@ mod tests {
     #[test]
     fn every_view_spelling_resolves_to_its_target() {
         for v in VIEW_NAMES {
-            if v.target == ViewTarget::Help {
-                continue; // a listing, asserted separately
-            }
             assert_eq!(
                 ops(&format!("view({})", v.word)),
                 vec![Op::View(v.target)],
@@ -4052,6 +4107,36 @@ mod tests {
         assert_eq!(program.step(&env), Step::Emit(Op::Play(Target::Index(0))));
     }
 
+    /// The half of the index contract the language owns (see
+    /// docs/shellsong.md, "the index contract"): an index is computed
+    /// from the env of the step that emits it and never kept, so a
+    /// results list rebuilt mid-program is resolved against afresh.
+    #[test]
+    fn a_resolved_index_comes_from_the_env_of_its_own_step() {
+        let mut program = Program::parse("play(crest); queue(hex)").unwrap();
+        let mut env = Env {
+            results: vec![Kind::Album, Kind::Song],
+            ..SETTLED.clone()
+        };
+        assert_eq!(
+            program.step(&env),
+            Step::Emit(Op::Search("crest".to_string()))
+        );
+        env.query = "crest".to_string();
+        // play prefers songs, so the song at 1 wins over the album.
+        assert_eq!(program.step(&env), Step::Emit(Op::Play(Target::Index(1))));
+        assert_eq!(
+            program.step(&env),
+            Step::Emit(Op::Search("hex".to_string()))
+        );
+        // the host rebuilt the list under the program, which is what
+        // `resync_results` does; index 1 is now the album, so a cached
+        // resolution would queue the wrong row.
+        env.query = "hex".to_string();
+        env.results = vec![Kind::Song, Kind::Album];
+        assert_eq!(program.step(&env), Step::Emit(queued(0)));
+    }
+
     // -------------------------------------------------------- go/focus
 
     /// `go()` means "what enter does", and what enter does depends on
@@ -4290,6 +4375,7 @@ mod tests {
         assert!(Op::Quit.closes_console());
         assert!(!Op::View(ViewTarget::Queue).closes_console());
         assert!(!Op::View(ViewTarget::History).closes_console());
+        assert!(!Op::View(ViewTarget::Help).closes_console());
         assert!(!Op::TogglePause.closes_console());
     }
 
@@ -5045,5 +5131,51 @@ mod tests {
         let mut c = Console::empty();
         ctrl(&mut c, &fake, 'x');
         assert!(c.input.is_empty(), "ctrl+x typed an 'x'");
+    }
+
+    // ------------------------------------------------- the published api
+
+    /// Calls every form docs/shellsong.md's "the api a host calls" block
+    /// publishes, spelled exactly as the doc spells it, with each result
+    /// bound to its documented type. A changed signature breaks this
+    /// build rather than leaving the published list quietly wrong, which
+    /// is how `paste(&str)` outlived the `cand` argument.
+    #[test]
+    fn the_published_api_is_callable_as_documented() {
+        let fake = Fake::new(&["flatline"]);
+
+        let _: KeyCode = OPEN_KEY;
+
+        let mut console: Console = Console::empty();
+        let _: ConsoleAction =
+            console.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &fake);
+        console.paste("ause()", &fake);
+        console.note("a note");
+        console.fail("a failure");
+        console.push(LineKind::Command, ": pause()");
+        let _: &[String] = console.history();
+        let _: Option<&Cycle> = console.cycle();
+        let _: &String = &console.input;
+        let _: usize = console.cursor;
+        let _: &Vec<Line> = &console.lines;
+        let _: &Option<String> = &console.error;
+        let _: &Suggestion = &console.suggestion;
+
+        let mut program: Program = Program::parse("pause()").expect("should parse");
+        let _: Step = program.step(&SETTLED);
+        let _: bool = program.is_done();
+        let _: ParseError = Program::parse("pasue()").expect_err("should not parse");
+
+        let _: String = Op::TogglePause.describe();
+        let _: bool = Op::TogglePause.closes_console();
+        let _: bool = ViewTarget::Help.is_screen();
+        let _: Vec<String> = help_lines();
+        let _: Kind = Kind::of(&SearchItem::LocalVideo {
+            path: PathBuf::from("/video/x.mkv"),
+            title: "x".to_string(),
+        });
+
+        let _: Vec<String> = Candidates::corpus(&fake, "fl");
+        let _: Vec<String> = Candidates::saved_queues(&fake);
     }
 }
