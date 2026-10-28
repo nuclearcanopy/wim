@@ -33,23 +33,14 @@ const MAX_CORPUS_CANDIDATES: usize = 50;
 
 impl Candidates for CorpusCandidates<'_> {
     fn corpus(&self, token: &str) -> Vec<String> {
-        let mut names: Vec<String> = Vec::new();
-        for item in self.corpus.search(token) {
-            let name = item.primary_name();
-            // deliberately the bare name, not `results_list::label`'s
-            // "title · artist": a candidate is inserted back into the
-            // command line, so the decorated form would never be a
-            // prefix extension of what was typed and the completer
-            // would drop every one of them.
-            if name.is_empty() || names.iter().any(|n| n == name) {
-                continue;
-            }
-            names.push(name.to_string());
-            if names.len() >= MAX_CORPUS_CANDIDATES {
-                break;
-            }
-        }
-        names
+        // `search_names` rather than `search`: same ranking, but it
+        // stops at the cap and never clones a `SearchItem`, which on a
+        // wide token is thousands of them per keystroke. Deliberately
+        // the bare name, not `results_list::label`'s "title · artist":
+        // a candidate is inserted back into the command line, so the
+        // decorated form would never be a prefix extension of what was
+        // typed and the completer would drop every one of them.
+        self.corpus.search_names(token, MAX_CORPUS_CANDIDATES)
     }
 
     fn saved_queues(&self) -> Vec<String> {
