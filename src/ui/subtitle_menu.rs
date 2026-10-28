@@ -47,7 +47,11 @@ impl Widget for SubtitleMenu<'_> {
             width: WIDTH,
             height,
         };
-        draw_box(buf, rect, shade(NEAR_BLACK));
+        // clear, not just the spaces draw_box used to lay down: a
+        // selection plate underneath sets a background, which a space
+        // with no style reset would leave showing through this box.
+        crate::ui::draw::clear(buf, rect);
+        crate::ui::draw::frame(buf, rect, shade(NEAR_BLACK));
         // the close key is remappable; j/k and h/l are the fixed
         // conventions reserved in keymap.rs, so they stay literal.
         let close = key_label(self.keymap.get(KeyAction::OpenSubtitleMenu));
@@ -90,30 +94,6 @@ impl Widget for SubtitleMenu<'_> {
     }
 }
 
-fn draw_box(buf: &mut Buffer, rect: Rect, color: ratatui::style::Color) {
-    put(buf, rect.x, rect.y, '┌', color);
-    put(buf, rect.x + rect.width - 1, rect.y, '┐', color);
-    put(buf, rect.x, rect.y + rect.height - 1, '└', color);
-    put(
-        buf,
-        rect.x + rect.width - 1,
-        rect.y + rect.height - 1,
-        '┘',
-        color,
-    );
-    for x in 1..rect.width - 1 {
-        put(buf, rect.x + x, rect.y, '─', color);
-        put(buf, rect.x + x, rect.y + rect.height - 1, '─', color);
-    }
-    for y in 1..rect.height - 1 {
-        put(buf, rect.x, rect.y + y, '│', color);
-        put(buf, rect.x + rect.width - 1, rect.y + y, '│', color);
-        for x in 1..rect.width - 1 {
-            put(buf, rect.x + x, rect.y + y, ' ', color);
-        }
-    }
-}
-
 /// Clipped to `rect`, the box this menu owns; the old copy had no
 /// bounds guard at all and ran to the buffer's own edge, over whatever
 /// the overlay is sitting on top of.
@@ -132,15 +112,20 @@ fn draw_text(
     crate::ui::draw::at(buf, x, y, text, color, right.saturating_sub(x) as usize);
 }
 
-fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: ratatui::style::Color) {
-    crate::ui::draw::put(buf, x, y, ch, color);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
+    use crate::ui::testbuf::{
+        assert_no_bleed_through, assert_outside_untouched, buffer, grid, plated_buffer,
+    };
     use crossterm::event::KeyCode;
+
+    /// Where the box lands inside an `area` of this size: it centres
+    /// itself, so the tests have to derive the rect the same way.
+    fn box_rect(w: u16, h: u16) -> Rect {
+        let height = FIELD_COUNT as u16 + 4;
+        Rect::new((w - WIDTH) / 2, h.saturating_sub(height) / 2, WIDTH, height)
+    }
 
     fn render(area: Rect, buf: &mut Buffer, values: [&str; FIELD_COUNT]) {
         SubtitleMenu {
@@ -193,6 +178,16 @@ mod tests {
         assert_eq!((row[26], row[27], row[28], row[29]), ('日', ' ', '本', ' '));
     }
 
+    /// This one always drew a border, but its interior was spaces with
+    /// no style reset, so a selection plate underneath still showed
+    /// through the box as a background.
+    #[test]
+    fn the_box_covers_every_cell_of_its_own_footprint() {
+        let mut buf = plated_buffer(40, 16);
+        render(Rect::new(0, 0, 40, 16), &mut buf, ["0.0s"; FIELD_COUNT]);
+        assert_no_bleed_through(&buf, box_rect(40, 16));
+    }
+
     #[test]
     fn nothing_is_drawn_outside_the_box() {
         let mut buf = buffer(40, 16);
@@ -200,12 +195,7 @@ mod tests {
         render(Rect::new(0, 0, 40, 16), &mut buf, [long; FIELD_COUNT]);
         // the box is centred in the area; everything outside it stays
         // as the overlay found it.
-        let box_rect = Rect::new(
-            (40 - WIDTH) / 2,
-            (16 - (FIELD_COUNT as u16 + 4)) / 2,
-            WIDTH,
-            FIELD_COUNT as u16 + 4,
-        );
+        let box_rect = box_rect(40, 16);
         assert_outside_untouched(&buf, box_rect);
     }
 
