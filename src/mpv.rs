@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -19,6 +19,10 @@ const OBS_IDLE_ACTIVE: u64 = 2;
 const OBS_TIME_POS: u64 = 3;
 const OBS_DURATION: u64 = 4;
 const OBS_PAUSE: u64 = 5;
+const OBS_LEVEL_RMS: u64 = 6;
+
+/// How long any one blocking command waits for mpv's reply.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Current index into mpv's own playlist, or -1 when nothing is
 /// loaded; the single source of truth for which track is playing.
@@ -35,6 +39,25 @@ pub const PROP_IDLE_ACTIVE: &str = "idle-active";
 pub const PROP_TIME_POS: &str = "time-pos";
 pub const PROP_DURATION: &str = "duration";
 pub const PROP_PAUSE: &str = "pause";
+/// RMS output level in dBFS, from the labeled `astats` tap
+/// `eq::build_af_filter` puts at the end of the af chain; drives the
+/// now-playing level meter. Spelled out rather than built with
+/// `format!` so it can be matched in `Playback::apply` for free; a
+/// test ties it back to `eq::LEVEL_METADATA_LABEL`.
+///
+/// The label has to be mpv's *own* filter label (`af=@wimlevel:lavfi=
+/// [...]`), not a label inside the lavfi graph: `af-metadata/<label>`
+/// resolves nothing at all for the latter, which is what left this
+/// meter dead while still paying a round trip per frame for it.
+pub const PROP_LEVEL_RMS: &str = "af-metadata/wimlevel/lavfi.astats.Overall.RMS_level";
+
+/// How long the last pushed level reading is believed. mpv pushes
+/// ~20/s while audio flows and simply stops pushing when it doesn't
+/// (pause), so without a horizon a paused meter would sit frozen at
+/// whatever the last frame measured. Worst-case staleness is therefore
+/// this value; af being cleared or playback stopping both push an
+/// explicit "no value" that clears it immediately.
+const LEVEL_FRESH_FOR: Duration = Duration::from_millis(300);
 
 /// Property-change and other async events pushed by mpv over the IPC socket.
 #[derive(Debug, Clone)]
@@ -60,12 +83,16 @@ pub struct Playback {
     pub elapsed_secs: Option<f64>,
     pub duration_secs: Option<f64>,
     pub paused: bool,
+    /// Last pushed `astats` RMS reading and when it landed; private
+    /// because the pair is only meaningful together, see `level`.
+    level_db: Option<f64>,
+    level_at: Option<Instant>,
 }
 
 impl Playback {
     /// Folds one observed change in, returning whether it was one of
-    /// these three. mpv sends `null` for a property that currently has
-    /// no value (no file loaded), which is `None` rather than stale.
+    /// ours. mpv sends `null` for a property that currently has no
+    /// value (no file loaded), which is `None` rather than stale.
     pub fn apply(&mut self, name: &str, value: &Value) -> bool {
         match name {
             PROP_TIME_POS => self.elapsed_secs = value.as_f64(),
@@ -73,9 +100,44 @@ impl Playback {
             // an absent `pause` means nothing is loaded, which reads
             // as not-paused everywhere downstream.
             PROP_PAUSE => self.paused = value.as_bool().unwrap_or(false),
+            PROP_LEVEL_RMS => {
+                // mpv hands af-metadata values through as the strings
+                // the filter wrote; `as_f64` alone reads every one of
+                // them as absent. a number is accepted too in case a
+                // later mpv types them.
+                self.level_db = value
+                    .as_f64()
+                    .or_else(|| value.as_str().and_then(|s| s.parse().ok()));
+                self.level_at = self.level_db.map(|_| Instant::now());
+            }
             _ => return false,
         }
         true
+    }
+
+    /// Output level 0..1 for the level meter, or `None` when no fresh
+    /// reading is in hand (paused, stopped, or an af chain without the
+    /// tap); callers fall back to their own idle animation. Costs no
+    /// IPC: this is the last value mpv pushed.
+    pub fn level(&self) -> Option<f32> {
+        self.level_as_of(Instant::now())
+    }
+
+    fn level_as_of(&self, now: Instant) -> Option<f32> {
+        let db = self.level_db?;
+        if now.duration_since(self.level_at?) > LEVEL_FRESH_FOR {
+            return None;
+        }
+        // RMS level is dBFS, roughly -60 (near silent) to 0 (full
+        // scale); map that range rather than guessing a narrower one
+        // that'd clip real audio's dynamic range. digital silence
+        // reads -inf, which clamps to 0.
+        let scaled = (db as f32 + 60.0) / 60.0;
+        Some(if scaled.is_nan() {
+            0.0
+        } else {
+            scaled.clamp(0.0, 1.0)
+        })
     }
 }
 
@@ -216,13 +278,16 @@ impl Mpv {
                 }
                 match v.get("event").and_then(Value::as_str) {
                     Some("property-change") => {
-                        if let (Some(name), Some(value)) = (
-                            v.get("name").and_then(Value::as_str),
-                            v.get("data").cloned(),
-                        ) {
+                        // mpv omits `data` entirely (rather than
+                        // sending null) when the property has become
+                        // unavailable: af cleared, playback stopped.
+                        // requiring it dropped exactly the event that
+                        // says "this reading is gone", leaving the
+                        // last one standing forever.
+                        if let Some(name) = v.get("name").and_then(Value::as_str) {
                             let _ = event_tx.send(Event::PropertyChange {
                                 name: name.to_string(),
-                                value,
+                                value: v.get("data").cloned().unwrap_or(Value::Null),
                             });
                         }
                     }
@@ -265,7 +330,7 @@ impl Mpv {
             .write_all(&line)
             .context("writing to mpv ipc socket")?;
 
-        match rx.recv_timeout(Duration::from_secs(10)) {
+        match rx.recv_timeout(REPLY_TIMEOUT) {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => bail!("mpv command error: {e}"),
             Err(_) => {
@@ -273,6 +338,72 @@ impl Mpv {
                 bail!("timed out waiting for mpv reply")
             }
         }
+    }
+
+    /// Sends a command and does not wait for its reply. For values the
+    /// next frame supersedes anyway (the volume ramps), where the
+    /// ~2ms round trip is the entire cost. mpv applies one
+    /// connection's commands in the order they arrive, so a ramp's
+    /// last write still wins; the reply comes back to a request id
+    /// with no pending entry and is dropped by the reader.
+    pub fn command_nowait(&self, args: &[Value]) -> Result<()> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let payload = json!({ "command": args, "request_id": id });
+        let mut line = serde_json::to_vec(&payload)?;
+        line.push(b'\n');
+        self.sock
+            .lock()
+            .unwrap()
+            .write_all(&line)
+            .context("writing to mpv ipc socket")?;
+        Ok(())
+    }
+
+    /// Writes every command, then collects every reply: the whole
+    /// batch costs one round trip's latency instead of one each, since
+    /// mpv reads a connection's commands in order and answers them in
+    /// order. One result per input, in the same order; a failure in
+    /// one says nothing about the others.
+    pub fn command_batch(&self, cmds: &[Vec<Value>]) -> Vec<Result<Value>> {
+        let mut ids = Vec::with_capacity(cmds.len());
+        let mut rxs = Vec::with_capacity(cmds.len());
+        let mut wire = Vec::new();
+        {
+            let mut pending = self.pending.lock().unwrap();
+            for args in cmds {
+                let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = mpsc::channel();
+                pending.insert(id, Pending { reply_tx: tx });
+                ids.push(id);
+                rxs.push(rx);
+                let payload = json!({ "command": args, "request_id": id });
+                let mut line = serde_json::to_vec(&payload).unwrap_or_default();
+                line.push(b'\n');
+                wire.extend_from_slice(&line);
+            }
+        }
+
+        if let Err(e) = self.sock.lock().unwrap().write_all(&wire) {
+            let mut pending = self.pending.lock().unwrap();
+            for id in &ids {
+                pending.remove(id);
+            }
+            return (0..cmds.len())
+                .map(|_| Err(anyhow::anyhow!("writing to mpv ipc socket: {e}")))
+                .collect();
+        }
+
+        ids.into_iter()
+            .zip(rxs)
+            .map(|(id, rx)| match rx.recv_timeout(REPLY_TIMEOUT) {
+                Ok(Ok(v)) => Ok(v),
+                Ok(Err(e)) => Err(anyhow::anyhow!("mpv command error: {e}")),
+                Err(_) => {
+                    self.pending.lock().unwrap().remove(&id);
+                    Err(anyhow::anyhow!("timed out waiting for mpv reply"))
+                }
+            })
+            .collect()
     }
 
     pub fn get_property(&self, name: &str) -> Result<Value> {
@@ -284,23 +415,28 @@ impl Mpv {
         Ok(())
     }
 
-    pub fn observe_property(&self, id: u64, name: &str) -> Result<()> {
-        self.command(&[json!("observe_property"), json!(id), json!(name)])?;
-        Ok(())
-    }
-
-    /// Asks mpv to push `playlist-pos`/`idle-active` changes instead of
-    /// us polling for them, which is what lets the current track be
-    /// resolved from mpv's own state. Registering fires one change
-    /// event per property immediately with its current value, so this
-    /// has to run *after* any startup playback is already loaded or
-    /// the first events describe an mpv that's still idle.
+    /// Asks mpv to push every property the render path reads instead of
+    /// us polling for them, which is what lets the current track and
+    /// the level meter be resolved from mpv's own state. Registering
+    /// fires one change event per property immediately with its current
+    /// value, so this has to run *after* any startup playback is
+    /// already loaded or the first events describe an mpv that's still
+    /// idle. Pipelined: five registrations, one round trip.
     pub fn observe_playback(&self) -> Result<()> {
-        self.observe_property(OBS_PLAYLIST_POS, PROP_PLAYLIST_POS)?;
-        self.observe_property(OBS_IDLE_ACTIVE, PROP_IDLE_ACTIVE)?;
-        self.observe_property(OBS_TIME_POS, PROP_TIME_POS)?;
-        self.observe_property(OBS_DURATION, PROP_DURATION)?;
-        self.observe_property(OBS_PAUSE, PROP_PAUSE)?;
+        let cmds: Vec<Vec<Value>> = [
+            (OBS_PLAYLIST_POS, PROP_PLAYLIST_POS),
+            (OBS_IDLE_ACTIVE, PROP_IDLE_ACTIVE),
+            (OBS_TIME_POS, PROP_TIME_POS),
+            (OBS_DURATION, PROP_DURATION),
+            (OBS_PAUSE, PROP_PAUSE),
+            (OBS_LEVEL_RMS, PROP_LEVEL_RMS),
+        ]
+        .into_iter()
+        .map(|(id, name)| vec![json!("observe_property"), json!(id), json!(name)])
+        .collect();
+        for result in self.command_batch(&cmds) {
+            result?;
+        }
         Ok(())
     }
 
@@ -360,9 +496,12 @@ impl Mpv {
         self.set_property("replaygain", json!(mode))
     }
 
+    /// One round trip: mpv flips the flag itself. Reading `pause` and
+    /// writing the negation cost two, and acted on a value that could
+    /// already have changed in between.
     pub fn toggle_pause(&self) -> Result<()> {
-        let paused = self.get_property("pause")?.as_bool().unwrap_or(false);
-        self.set_property("pause", json!(!paused))
+        self.command(&[json!("cycle"), json!("pause")])?;
+        Ok(())
     }
 
     /// `"weak"`: a no-op (not an error) if there's nothing further
@@ -376,6 +515,13 @@ impl Mpv {
 
     pub fn set_volume(&self, vol: f64) -> Result<()> {
         self.set_property("volume", json!(vol))
+    }
+
+    /// `set_volume` without waiting for mpv's reply, for the crossfade
+    /// and shellsong ramps that write it once per frame; see
+    /// `command_nowait` for why that is safe for a ramp.
+    pub fn set_volume_nowait(&self, vol: f64) -> Result<()> {
+        self.command_nowait(&[json!("set_property"), json!("volume"), json!(vol)])
     }
 
     pub fn set_speed(&self, speed: f64) -> Result<()> {
@@ -396,22 +542,44 @@ impl Mpv {
     /// Applies every `sub-*` style property from config/runtime state
     /// at once; best-effort per property (one unsupported/malformed
     /// value on an older mpv shouldn't block the rest from applying).
+    /// Pipelined, because the subtitle menu calls this on every single
+    /// keypress and seven sequential round trips was the whole cost.
     pub fn set_subtitle_style(&self, cfg: &crate::config::SubtitleConfig) {
-        let _ = self.set_property("sub-delay", json!(cfg.delay_secs));
-        let _ = self.set_property("sub-font-size", json!(cfg.font_size));
-        let _ = self.set_property("sub-pos", json!(cfg.position));
-        let _ = self.set_property("sub-border-size", json!(cfg.outline_size));
-        let _ = self.set_property("sub-blur", json!(cfg.blur));
-        let _ = self.set_property("sub-color", json!(gray_color(cfg.color_level, 1.0)));
-        // the background box itself always renders near-black
-        // regardless of the text's own level; a box that matched a
-        // bright text color would defeat its own purpose (readability
-        // contrast), and there's no separate background-color config
-        // field to let it drift from that.
-        let _ = self.set_property(
-            "sub-back-color",
-            json!(gray_color(0.0, cfg.background_opacity as f32)),
-        );
+        let cmds = vec![
+            vec![
+                json!("set_property"),
+                json!("sub-delay"),
+                json!(cfg.delay_secs),
+            ],
+            vec![
+                json!("set_property"),
+                json!("sub-font-size"),
+                json!(cfg.font_size),
+            ],
+            vec![json!("set_property"), json!("sub-pos"), json!(cfg.position)],
+            vec![
+                json!("set_property"),
+                json!("sub-border-size"),
+                json!(cfg.outline_size),
+            ],
+            vec![json!("set_property"), json!("sub-blur"), json!(cfg.blur)],
+            vec![
+                json!("set_property"),
+                json!("sub-color"),
+                json!(gray_color(cfg.color_level, 1.0)),
+            ],
+            // the background box itself always renders near-black
+            // regardless of the text's own level; a box that matched a
+            // bright text color would defeat its own purpose (readability
+            // contrast), and there's no separate background-color config
+            // field to let it drift from that.
+            vec![
+                json!("set_property"),
+                json!("sub-back-color"),
+                json!(gray_color(0.0, cfg.background_opacity as f32)),
+            ],
+        ];
+        let _ = self.command_batch(&cmds);
     }
 
     /// Loads an external subtitle file onto the currently playing
@@ -593,4 +761,68 @@ mod tests {
         pb.apply(PROP_PAUSE, &Value::Null);
         assert!(!pb.paused);
     }
+
+    /// The property path and the af label are one contract written in
+    /// two places; mpv resolves neither half on its own.
+    #[test]
+    fn the_level_property_path_matches_the_af_label() {
+        assert_eq!(
+            PROP_LEVEL_RMS,
+            format!(
+                "af-metadata/{}/lavfi.astats.Overall.RMS_level",
+                crate::eq::LEVEL_METADATA_LABEL
+            )
+        );
+    }
+
+    /// mpv hands af-metadata through as the string the filter wrote,
+    /// not as a json number; reading it as a number gets `None` for
+    /// every frame, which is a silently dead meter.
+    #[test]
+    fn a_level_reading_arrives_as_a_string() {
+        let mut pb = Playback::default();
+        assert!(pb.apply(PROP_LEVEL_RMS, &json!("-21.008032")));
+        let level = pb.level().expect("fresh reading");
+        assert!((level - (60.0 - 21.008032) / 60.0).abs() < 1e-5, "{level}");
+    }
+
+    #[test]
+    fn a_level_reading_also_accepts_a_number() {
+        let mut pb = Playback::default();
+        pb.apply(PROP_LEVEL_RMS, &json!(-30.0));
+        assert_eq!(pb.level(), Some(0.5));
+    }
+
+    #[test]
+    fn digital_silence_reads_as_the_bottom_of_the_meter() {
+        let mut pb = Playback::default();
+        pb.apply(PROP_LEVEL_RMS, &json!("-inf"));
+        assert_eq!(pb.level(), Some(0.0));
+    }
+
+    /// af cleared or playback stopped: mpv pushes a change with no
+    /// value at all, which must drop the meter back to its fallback
+    /// rather than leaving the last reading on screen.
+    #[test]
+    fn a_vanished_level_reading_clears_immediately() {
+        let mut pb = Playback::default();
+        pb.apply(PROP_LEVEL_RMS, &json!("-12.0"));
+        assert!(pb.level().is_some());
+        pb.apply(PROP_LEVEL_RMS, &Value::Null);
+        assert_eq!(pb.level(), None);
+    }
+
+    /// mpv simply stops pushing while paused, so a reading is only
+    /// believed for `LEVEL_FRESH_FOR` past when it landed.
+    #[test]
+    fn a_stale_level_reading_is_not_believed() {
+        let mut pb = Playback::default();
+        pb.apply(PROP_LEVEL_RMS, &json!("-12.0"));
+        let landed = pb.level_at.expect("timestamped");
+        assert!(pb.level_as_of(landed + LEVEL_FRESH_FOR).is_some());
+        assert!(pb
+            .level_as_of(landed + LEVEL_FRESH_FOR + Duration::from_millis(1))
+            .is_none());
+    }
+
 }
