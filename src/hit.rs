@@ -687,7 +687,18 @@ mod tests {
     fn pointer_motion_and_unused_buttons_do_nothing() {
         let m = map();
         for kind in [Kind::Other, Kind::Up] {
-            assert_eq!(act(&m, Click { kind, col: 5, row: 5 }, false), Act::Nothing);
+            assert_eq!(
+                act(
+                    &m,
+                    Click {
+                        kind,
+                        col: 5,
+                        row: 5
+                    },
+                    false
+                ),
+                Act::Nothing
+            );
         }
     }
 
