@@ -180,6 +180,21 @@ impl Scrub {
             ..self
         }
     }
+
+    /// Absolute target at a fraction of the duration: what a click or a
+    /// drag on the track means, against the same captured duration
+    /// `step` clamps to. A stream mpv never reported a duration for has
+    /// no fraction to land on, so the drag stays where it was rather
+    /// than jumping to zero.
+    pub fn at_fraction(self, frac: f64) -> Self {
+        match self.duration_secs {
+            Some(d) if d > 0.0 => Scrub {
+                target_secs: frac.clamp(0.0, 1.0) * d,
+                ..self
+            },
+            _ => self,
+        }
+    }
 }
 
 /// Bottom playback bar: controls and current input mode, nothing
@@ -241,28 +256,17 @@ pub struct ControlsBar<'a> {
 
 impl Widget for ControlsBar<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let mut y = area.y;
-
         if let Some(hint) = self.resize_hint {
-            draw_line(buf, area, y, hint, shade(NEAR_WHITE));
-            y += 1;
+            draw_line(buf, area, area.y, hint, shade(NEAR_WHITE));
         }
 
-        // the mode indicator gets a whole row to itself whenever
-        // there's one to spare: which mode you're in changes what
-        // every other key does, so it can't be something you have to
-        // hunt for. squeezed down to the minimum bar height it
-        // becomes the control line's first segment instead of being
-        // dropped, since that's the one thing here you can't infer
-        // from the rest of the screen.
-        let mode_label = if self.move_mode {
-            format!("-- MOVE: {} --", self.focus_label)
-        } else {
-            format!("-- INTERACT: {} --", self.focus_label)
-        };
-        let rows_left = (area.y + area.height).saturating_sub(y);
-        let mode_on_its_own_row = rows_left >= 2;
+        let (y, inline_mode) = self.control_row(area);
+        let mode_label = self.mode_label();
+        let mode_on_its_own_row = inline_mode.is_none();
         if mode_on_its_own_row {
+            // the row directly above the controls, which `control_row`
+            // already accounted for.
+            let y = y - 1;
             let hint = if self.move_mode {
                 "wasd/arrows: focus pane, enter: interact"
             } else if self.scrubbing {
@@ -297,26 +301,74 @@ impl Widget for ControlsBar<'_> {
                 shade(NEAR_BLACK),
                 None,
             );
-            y += 1;
         }
         if y >= area.y + area.height {
             return;
         }
 
-        let segments = self.segments((!mode_on_its_own_row).then_some(mode_label.as_str()));
-        draw_segments(
-            buf,
-            area,
-            y,
-            &segments,
-            self.flash,
-            self.selected,
-            self.scrubbing,
-        );
+        let segments = self.segments(inline_mode.as_deref());
+        for placed in place(&segments, area, y) {
+            draw_placed(
+                buf,
+                area,
+                &placed,
+                self.flash,
+                self.selected,
+                self.scrubbing,
+            );
+        }
     }
 }
 
 impl ControlsBar<'_> {
+    /// Which row the controls land on, and the mode label to put in
+    /// front of them when the bar is too short to give it a row of its
+    /// own. Shared by `render` and `layout`: a click has to land on the
+    /// line that was actually drawn.
+    fn control_row(&self, area: Rect) -> (u16, Option<String>) {
+        let mode_y = area.y + u16::from(self.resize_hint.is_some());
+        // the mode indicator gets a whole row to itself whenever
+        // there's one to spare: which mode you're in changes what
+        // every other key does, so it can't be something you have to
+        // hunt for. squeezed down to the minimum bar height it
+        // becomes the control line's first segment instead of being
+        // dropped, since that's the one thing here you can't infer
+        // from the rest of the screen.
+        let own_row = (area.y + area.height).saturating_sub(mode_y) >= 2;
+        (
+            mode_y + u16::from(own_row),
+            (!own_row).then(|| self.mode_label()),
+        )
+    }
+
+    fn mode_label(&self) -> String {
+        if self.move_mode {
+            format!("-- MOVE: {} --", self.focus_label)
+        } else {
+            format!("-- INTERACT: {} --", self.focus_label)
+        }
+    }
+
+    /// Where every control the bar drew ended up. `pub` for the host's
+    /// hit map (see `hit::HitMap`): these columns are only knowable
+    /// from the same fit pass the render does, and a guess at them
+    /// would put a click on a control a narrow bar had dropped.
+    pub fn layout(&self, area: Rect) -> BarLayout {
+        let (y, inline_mode) = self.control_row(area);
+        if y >= area.y + area.height {
+            return BarLayout::default();
+        }
+        let segments = self.segments(inline_mode.as_deref());
+        let placed = place(&segments, area, y);
+        BarLayout {
+            controls: placed
+                .iter()
+                .filter_map(|p| p.seg.field.map(|f| (f, p.rect)))
+                .collect(),
+            track: placed.iter().find_map(|p| p.track),
+        }
+    }
+
     /// The control line's elements in priority order, which is also
     /// draw order: the scrubber is last because it's the one element
     /// that stretches, so it ends flush with the right edge.
@@ -427,15 +479,38 @@ impl Segment {
     }
 }
 
-fn draw_segments(
-    buf: &mut Buffer,
-    area: Rect,
-    y: u16,
-    segments: &[Segment],
-    flash: Option<(Field, f32)>,
-    selected: Option<Field>,
-    scrubbing: bool,
-) {
+/// Where each control the bar drew ended up, for hit-testing a click
+/// against the row that was on screen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BarLayout {
+    /// Only the controls that actually fit; a narrow bar drops whole
+    /// trailing elements and they have no columns at all.
+    pub controls: Vec<(Field, Rect)>,
+    /// The scrubber's track cells only. The time readouts either side
+    /// are part of the element, but are not positions on the track, so
+    /// a fraction measured against the whole element would be wrong.
+    pub track: Option<Rect>,
+}
+
+/// One element as the row draws it: the text at the width the scrubber
+/// ended up with, the columns it occupies, and (for the scrubber) the
+/// track cells inside those.
+struct Placed<'s> {
+    seg: &'s Segment,
+    text: String,
+    rect: Rect,
+    track: Option<Rect>,
+    /// Cells `track` was built at, which stays right even where the
+    /// rect above got clipped by the bar's right edge; the drag redraw
+    /// has to ask for the same width or the row shifts mid-drag.
+    track_cells: usize,
+}
+
+/// Lays the control line out once. `render` paints from this and
+/// `ControlsBar::layout` hit-tests against it, which is the whole
+/// point: the fit pass (`segments_that_fit`) and the stretching
+/// scrubber mean the columns are not derivable from the field list.
+fn place<'s>(segments: &'s [Segment], area: Rect, y: u16) -> Vec<Placed<'s>> {
     let limit = area.x + area.width;
     let avail = area.width as usize;
     let mins: Vec<usize> = segments.iter().map(Segment::min_width).collect();
@@ -446,59 +521,120 @@ fn draw_segments(
     // there; it's the only element that stretches.
     let slack = avail.saturating_sub(used);
 
+    let mut out = Vec::with_capacity(fits);
     let mut x = area.x;
     for (i, seg) in segments.iter().take(fits).enumerate() {
+        if i > 0 {
+            x += 2;
+        }
         if x >= limit {
             break;
         }
-        if i > 0 {
-            x = draw_chars(buf, x, limit, y, "  ", shade(DIM), None);
-        }
-        let is_selected = seg.field.is_some() && seg.field == selected;
-        let dragging = is_selected && scrubbing && seg.field == Some(Field::Progress);
-        let flash_level = match (seg.field, flash) {
-            (Some(f), Some((hot_field, level))) if f == hot_field => level,
-            _ => 0.0,
-        };
-        // the plate marks the cursor, which leaves brightness free to
-        // keep meaning on/off; an inactive glyph is only lifted to MID
-        // so it stays legible against the plate, still well below an
-        // active one. flash lifts from wherever that lands.
-        let base = if dragging {
-            WHITE
-        } else if seg.lit {
-            BRIGHT
-        } else {
-            DIM
-        };
-        let base = if is_selected { base.max(MID) } else { base };
-        let level = lerp(base, WHITE, flash_level);
-        let bg = if dragging {
-            Some(shade(SCRUB_BG))
-        } else if is_selected {
-            Some(shade(SELECT_BG))
-        } else {
-            None
-        };
-        let text = match &seg.body {
-            Body::Glyph(s) => s.clone(),
+        let (text, track_cells) = match &seg.body {
+            Body::Glyph(s) => (s.clone(), None),
             Body::Track {
                 elapsed,
                 total,
                 frac,
-            } => format!(
-                "{elapsed} {} {total}",
-                track(*frac, TRACK_MIN + slack, dragging)
-            ),
+            } => {
+                let cells = TRACK_MIN + slack;
+                (
+                    format!("{elapsed} {} {total}", track(*frac, cells, false)),
+                    Some((width(elapsed) + 1, cells)),
+                )
+            }
         };
-        // one cell of padding each side, so a single-glyph element's
-        // plate reads as a plate and not as one stray lit cell.
-        if let Some(bg) = bg {
-            let end = x.saturating_add(width(&text) as u16).saturating_add(1);
-            fill_bg(buf, x.saturating_sub(1).max(area.x), end.min(limit), y, bg);
-        }
-        x = draw_chars(buf, x, limit, y, &text, shade(level), bg);
+        let drawn = (width(&text) as u16).min(limit - x);
+        out.push(Placed {
+            seg,
+            track_cells: track_cells.map_or(TRACK_MIN, |(_, cells)| cells),
+            track: track_cells.and_then(|(offset, cells)| {
+                let tx = x + offset as u16;
+                (tx < limit).then(|| Rect {
+                    x: tx,
+                    y,
+                    width: (cells as u16).min(limit - tx),
+                    height: 1,
+                })
+            }),
+            rect: Rect {
+                x,
+                y,
+                width: drawn,
+                height: 1,
+            },
+            text,
+        });
+        x += drawn;
     }
+    out
+}
+
+fn draw_placed(
+    buf: &mut Buffer,
+    area: Rect,
+    placed: &Placed,
+    flash: Option<(Field, f32)>,
+    selected: Option<Field>,
+    scrubbing: bool,
+) {
+    let limit = area.x + area.width;
+    let seg = placed.seg;
+    let is_selected = seg.field.is_some() && seg.field == selected;
+    let dragging = is_selected && scrubbing && seg.field == Some(Field::Progress);
+    let flash_level = match (seg.field, flash) {
+        (Some(f), Some((hot_field, level))) if f == hot_field => level,
+        _ => 0.0,
+    };
+    // the plate marks the cursor, which leaves brightness free to
+    // keep meaning on/off; an inactive glyph is only lifted to MID
+    // so it stays legible against the plate, still well below an
+    // active one. flash lifts from wherever that lands.
+    let base = if dragging {
+        WHITE
+    } else if seg.lit {
+        BRIGHT
+    } else {
+        DIM
+    };
+    let base = if is_selected { base.max(MID) } else { base };
+    let level = lerp(base, WHITE, flash_level);
+    let bg = if dragging {
+        Some(shade(SCRUB_BG))
+    } else if is_selected {
+        Some(shade(SELECT_BG))
+    } else {
+        None
+    };
+    let x = placed.rect.x;
+    let y = placed.rect.y;
+    if x > area.x {
+        draw_chars(buf, x - 2, limit, y, "  ", shade(DIM), None);
+    }
+    // the drag head is a different glyph, so the text has to be built
+    // knowing the mode; `place` has no business knowing it, which is
+    // the one thing redrawn here rather than reused.
+    let text = match (&seg.body, dragging) {
+        (
+            Body::Track {
+                elapsed,
+                total,
+                frac,
+            },
+            true,
+        ) => format!(
+            "{elapsed} {} {total}",
+            track(*frac, placed.track_cells, true)
+        ),
+        _ => placed.text.clone(),
+    };
+    // one cell of padding each side, so a single-glyph element's
+    // plate reads as a plate and not as one stray lit cell.
+    if let Some(bg) = bg {
+        let end = x.saturating_add(width(&text) as u16).saturating_add(1);
+        fill_bg(buf, x.saturating_sub(1).max(area.x), end.min(limit), y, bg);
+    }
+    draw_chars(buf, x, limit, y, &text, shade(level), bg);
 }
 
 /// Same scrubber convention as `ui::progress::bar` (heavy track
@@ -585,8 +721,8 @@ mod tests {
     use super::*;
     use crate::ui::testbuf::{buffer, grid};
 
-    fn bar_at(width: u16, height: u16, f: impl FnOnce(&mut ControlsBar)) -> Buffer {
-        let mut cb = ControlsBar {
+    fn plain_bar() -> ControlsBar<'static> {
+        ControlsBar {
             move_mode: false,
             focus_label: "bottom bar",
             focused: false,
@@ -603,12 +739,31 @@ mod tests {
             selected: None,
             scrubbing: false,
             resize_hint: None,
-        };
+        }
+    }
+
+    fn bar_at(width: u16, height: u16, f: impl FnOnce(&mut ControlsBar)) -> Buffer {
+        let mut cb = plain_bar();
         f(&mut cb);
         let area = Rect::new(0, 0, width, height);
         let mut buf = buffer(width, height);
         cb.render(area, &mut buf);
         buf
+    }
+
+    /// The layout the host hit-tests against, and the buffer the same
+    /// bar drew; one `f` configures both, which is the only way to
+    /// assert the two agree.
+    fn bar_and_layout(
+        width: u16,
+        height: u16,
+        f: impl Fn(&mut ControlsBar),
+    ) -> (Buffer, BarLayout) {
+        let area = Rect::new(0, 0, width, height);
+        let mut probe = plain_bar();
+        f(&mut probe);
+        let layout = probe.layout(area);
+        (bar_at(width, height, f), layout)
     }
 
     /// Column the first `ch` sits in on row `y`; every assertion below
@@ -914,6 +1069,113 @@ mod tests {
         // hand mpv a negative/out-of-range absolute seek.
         assert_eq!(s.step(-60.0).target_secs, 0.0);
         assert_eq!(s.step(SCRUB_STEP_COARSE * 10.0).target_secs, 120.0);
+    }
+
+    #[test]
+    fn a_scrub_lands_on_the_fraction_of_the_track_it_was_given() {
+        let s = Scrub {
+            target_secs: 10.0,
+            duration_secs: Some(120.0),
+        };
+        assert_eq!(s.at_fraction(0.0).target_secs, 0.0);
+        assert_eq!(s.at_fraction(0.5).target_secs, 60.0);
+        assert_eq!(s.at_fraction(1.0).target_secs, 120.0);
+        assert_eq!(s.at_fraction(-1.0).target_secs, 0.0);
+        assert_eq!(s.at_fraction(9.0).target_secs, 120.0);
+        // no duration means no fraction to resolve, so the drag holds
+        // instead of jumping to the start of a stream.
+        let live = Scrub {
+            target_secs: 10.0,
+            duration_secs: None,
+        };
+        assert_eq!(live.at_fraction(0.5).target_secs, 10.0);
+    }
+
+    /// The layout the host hit-tests a click against has to name the
+    /// same columns the glyphs were painted on; a guess at them is
+    /// exactly what the fit pass makes wrong.
+    #[test]
+    fn the_exposed_layout_points_at_the_columns_the_row_drew_on() {
+        for width_cells in [20u16, 40, 60, 100, 160] {
+            let (buf, layout) = bar_and_layout(width_cells, 2, |cb| {
+                cb.queue_len = 3;
+                cb.loop_mode = LoopMode::One;
+                cb.shuffle_on = true;
+                cb.speed = 1.25;
+                cb.eq_active = true;
+                cb.crossfade_on = true;
+            });
+
+            for (field, glyph) in [
+                (Field::Pause, GLYPH_PLAY),
+                (Field::Loop, GLYPH_LOOP),
+                (Field::Shuffle, GLYPH_SHUFFLE),
+                (Field::Speed, GLYPH_SPEED),
+                (Field::Progress, TRACK_HEAD),
+            ] {
+                let rect = layout.controls.iter().find(|(f, _)| *f == field);
+                let Some((_, rect)) = rect else {
+                    // dropped at this width, so it must not be drawn
+                    // either: that is the invariant worth checking.
+                    assert!(
+                        !grid(&buf).contains(glyph),
+                        "{field:?} has no rect at {width_cells} cells but was drawn"
+                    );
+                    continue;
+                };
+                assert_eq!(rect.y, 1, "{field:?} at {width_cells} cells");
+                let col = col_of(&buf, 1, glyph);
+                assert!(
+                    col >= rect.x && col < rect.x + rect.width,
+                    "{field:?}: {glyph:?} drawn at {col} but rect is {rect:?} ({width_cells} cells)"
+                );
+            }
+
+            // the track rect is the track cells and nothing else: its
+            // first and last column are both track, and the cell
+            // before it is the space after the elapsed readout.
+            if let Some(track) = layout.track {
+                for x in [track.x, track.x + track.width - 1] {
+                    let sym = buf.cell((x, 1)).unwrap().symbol().to_string();
+                    assert!(
+                        [TRACK_DONE, TRACK_LEFT, TRACK_HEAD]
+                            .iter()
+                            .any(|c| sym.starts_with(*c)),
+                        "column {x} of the track rect holds {sym:?} at {width_cells} cells"
+                    );
+                }
+                assert_eq!(buf.cell((track.x - 1, 1)).unwrap().symbol(), " ");
+            }
+        }
+    }
+
+    /// A one-row bar puts the controls on the only row there is, and a
+    /// resize hint pushes them down; the layout has to follow.
+    /// A one-row bar puts the controls on the only row there is, and a
+    /// resize hint pushes them down; the layout has to follow, or a
+    /// click in resize mode lands a row above every control.
+    #[test]
+    fn the_exposed_layout_follows_the_control_row_up_and_down() {
+        for (height, hint) in [
+            (1u16, None),
+            (2, None),
+            (4, None),
+            (2, Some("resize mode")),
+            (3, Some("resize mode")),
+        ] {
+            let (buf, layout) = bar_and_layout(100, height, |cb| cb.resize_hint = hint);
+            let drawn_row = grid(&buf)
+                .lines()
+                .position(|line| line.contains(GLYPH_PLAY))
+                .unwrap_or_else(|| panic!("the play glyph is on no row at height {height}"))
+                as u16;
+            let (_, rect) = layout
+                .controls
+                .iter()
+                .find(|(f, _)| *f == Field::Pause)
+                .unwrap_or_else(|| panic!("no pause rect at height {height}"));
+            assert_eq!(rect.y, drawn_row, "height {height}, hint {hint:?}");
+        }
     }
 
     #[test]
