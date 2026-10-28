@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 
+use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -16,31 +17,34 @@ use crate::ui::textfit::{char_cells, truncate_to_width, truncate_with_ellipsis, 
 /// `U+2190..U+21AA`). Same hazard `notify::Severity::icon` documents:
 /// a codepoint with an emoji form can come back double-width from the
 /// font stack and shove every column after it out of alignment.
+/// The transport glyphs are `pub`: the maximized player draws the
+/// same six controls, and a second copy of this alphabet would let the
+/// two surfaces drift apart.
 const GLYPH_QUEUE: char = '≡'; // U+2261 identical to
-const GLYPH_PLAY: char = '▸'; // U+25B8 black right-pointing small triangle
-const GLYPH_PAUSE: char = '‖'; // U+2016 double vertical line
-const GLYPH_LOOP: char = '↻'; // U+21BB clockwise open circle arrow
-const GLYPH_SHUFFLE: char = '⇄'; // U+21C4 rightwards arrow over leftwards arrow
-const GLYPH_SPEED: char = '×'; // U+00D7 multiplication sign
-const GLYPH_EQ: &str = "▂▅▃"; // U+2582/2585/2583 lower block eighths
-const GLYPH_CROSSFADE: &str = "◢◣"; // U+25E2/25E3 black lower right/left triangle
+pub const GLYPH_PLAY: char = '▸'; // U+25B8 black right-pointing small triangle
+pub const GLYPH_PAUSE: char = '‖'; // U+2016 double vertical line
+pub const GLYPH_LOOP: char = '↻'; // U+21BB clockwise open circle arrow
+pub const GLYPH_SHUFFLE: char = '⇄'; // U+21C4 rightwards arrow over leftwards arrow
+pub const GLYPH_SPEED: char = '×'; // U+00D7 multiplication sign
+pub const GLYPH_EQ: &str = "▂▅▃"; // U+2582/2585/2583 lower block eighths
+pub const GLYPH_CROSSFADE: &str = "◢◣"; // U+25E2/25E3 black lower right/left triangle
 const TRACK_DONE: char = '━'; // U+2501 box drawings heavy horizontal
 const TRACK_LEFT: char = '─'; // U+2500 box drawings light horizontal
-const TRACK_HEAD: char = '●'; // U+25CF black circle
-const TRACK_HEAD_DRAG: char = '◆'; // U+25C6 black diamond
+pub const TRACK_HEAD: char = '●'; // U+25CF black circle
+pub const TRACK_HEAD_DRAG: char = '◆'; // U+25C6 black diamond
 
 /// Minimum track the scrubber is ever drawn with; narrower than this
 /// the whole progress element is dropped like any other, rather than
 /// shown as a bar too short to read a position off.
-const TRACK_MIN: usize = 6;
+pub const TRACK_MIN: usize = 6;
 
 /// Brightness plate behind the selected element. A plate, not a
 /// border: every element here is one to six cells wide, and a box
 /// around each would be more ink than the glyph it frames.
-const SELECT_BG: f32 = 0.20;
+pub const SELECT_BG: f32 = 0.20;
 /// The same plate, brighter, while the scrubber is being dragged, so
 /// scrub mode never reads as merely selected.
-const SCRUB_BG: f32 = 0.34;
+pub const SCRUB_BG: f32 = 0.34;
 
 /// How far `speed` has to sit from 1.0 before it's worth a readout;
 /// matches the two decimals the readout itself prints.
@@ -52,16 +56,16 @@ pub const SCRUB_STEP: f64 = 5.0;
 pub const SCRUB_STEP_COARSE: f64 = 30.0;
 
 /// How many of `lengths` (each element's own display width, in
-/// priority order) fit within `available_width` once a 2-cell
+/// priority order) fit within `available_width` once a `sep`-cell
 /// separator between every pair is accounted for. Dropping whole
 /// lowest-priority (rightmost) elements once the full line stops
 /// fitting, rather than cutting the last one off mid-element (half a
 /// crossfade icon, or a scrubber too short to show a position, which
 /// is what a plain per-cell truncation at `available_width` produces).
-fn segments_that_fit(lengths: &[usize], available_width: usize) -> usize {
+pub fn segments_that_fit(lengths: &[usize], available_width: usize, sep: usize) -> usize {
     let mut used = 0usize;
     for (i, &len) in lengths.iter().enumerate() {
-        let needed = len + if i > 0 { 2 } else { 0 };
+        let needed = len + if i > 0 { sep } else { 0 };
         if used + needed > available_width {
             return i;
         }
@@ -111,6 +115,42 @@ impl Field {
 
     pub fn prev(self) -> Self {
         FIELDS[(self.index() + FIELDS.len() - 1) % FIELDS.len()]
+    }
+}
+
+/// What a keypress does to a transport cursor. Pure, so the two
+/// surfaces that carry one (this bar and the maximized player) share a
+/// single answer to "which control is selected and how does a key move
+/// it"; main.rs keeps only the dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nav {
+    Prev,
+    Next,
+    Activate,
+    /// Consumed on purpose: the key means nothing here and must not
+    /// fall through to whatever it means in another pane.
+    Inert,
+}
+
+/// Which key set a surface answers to. The bar is a one-row strip that
+/// owns h/l outright and has nothing above or below it, so it also
+/// swallows up/down. The maximized player is a whole screen where
+/// those letters still have to reach their global bindings ('l' is
+/// cycle-loop), so there it is arrows only and anything else falls
+/// through untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavKeys {
+    BarStrip,
+    ArrowsOnly,
+}
+
+pub fn nav(code: KeyCode, keys: NavKeys) -> Option<Nav> {
+    match (code, keys) {
+        (KeyCode::Right, _) | (KeyCode::Char('l'), NavKeys::BarStrip) => Some(Nav::Next),
+        (KeyCode::Left, _) | (KeyCode::Char('h'), NavKeys::BarStrip) => Some(Nav::Prev),
+        (KeyCode::Enter, _) => Some(Nav::Activate),
+        (KeyCode::Up | KeyCode::Down, NavKeys::BarStrip) => Some(Nav::Inert),
+        _ => None,
     }
 }
 
@@ -399,7 +439,7 @@ fn draw_segments(
     let limit = area.x + area.width;
     let avail = area.width as usize;
     let mins: Vec<usize> = segments.iter().map(Segment::min_width).collect();
-    let fits = segments_that_fit(&mins, avail);
+    let fits = segments_that_fit(&mins, avail, 2);
     let used: usize = mins[..fits].iter().sum::<usize>() + fits.saturating_sub(1) * 2;
     // whatever the fixed elements left over goes to the scrubber, so
     // the bar reaches the right edge instead of leaving a ragged gap
@@ -464,8 +504,9 @@ fn draw_segments(
 /// Same scrubber convention as `ui::progress::bar` (heavy track
 /// behind the head, light ahead of it); the head swaps to a diamond
 /// while dragging, so scrub mode shows in the bar itself rather than
-/// only in the plate behind it.
-fn track(frac: f64, cells: usize, dragging: bool) -> String {
+/// only in the plate behind it. `pub` for the maximized player, which
+/// draws the same scrubber at its own width.
+pub fn track(frac: f64, cells: usize, dragging: bool) -> String {
     let cells = cells.max(TRACK_MIN);
     let head = if dragging {
         TRACK_HEAD_DRAG
@@ -482,7 +523,9 @@ fn track(frac: f64, cells: usize, dragging: bool) -> String {
         .collect()
 }
 
-fn fill_bg(buf: &mut Buffer, from_x: u16, to_x: u16, y: u16, bg: Color) {
+/// One row of plate between two columns; `pub` for the player's
+/// transport, which marks its own cursor the same way.
+pub fn fill_bg(buf: &mut Buffer, from_x: u16, to_x: u16, y: u16, bg: Color) {
     for x in from_x..to_x {
         if let Some(cell) = buf.cell_mut((x, y)) {
             cell.set_bg(bg);
@@ -591,8 +634,11 @@ mod tests {
     #[test]
     fn every_segment_fits_when_there_is_room() {
         let lengths = [5, 10, 3]; // + 2*2 separators = 22
-        assert_eq!(segments_that_fit(&lengths, 22), 3);
-        assert_eq!(segments_that_fit(&lengths, 100), 3);
+        assert_eq!(segments_that_fit(&lengths, 22, 2), 3);
+        assert_eq!(segments_that_fit(&lengths, 100, 2), 3);
+        // a wider separator is what the player's word-labeled row
+        // spends its extra room on, and it counts against the fit.
+        assert_eq!(segments_that_fit(&lengths, 22, 3), 2);
     }
 
     #[test]
@@ -601,24 +647,44 @@ mod tests {
         // fit the second element at all, so it's dropped entirely
         // rather than shown as the left 12 cells of itself.
         let lengths = [8, 14];
-        assert_eq!(segments_that_fit(&lengths, 20), 1);
+        assert_eq!(segments_that_fit(&lengths, 20, 2), 1);
     }
 
     #[test]
     fn keeps_the_first_segment_even_if_nothing_else_fits() {
         let lengths = [8, 14];
-        assert_eq!(segments_that_fit(&lengths, 10), 1);
+        assert_eq!(segments_that_fit(&lengths, 10, 2), 1);
     }
 
     #[test]
     fn returns_zero_when_not_even_the_first_segment_fits() {
         let lengths = [8, 14];
-        assert_eq!(segments_that_fit(&lengths, 5), 0);
+        assert_eq!(segments_that_fit(&lengths, 5, 2), 0);
     }
 
     #[test]
     fn empty_segments_list_fits_trivially() {
-        assert_eq!(segments_that_fit(&[], 0), 0);
+        assert_eq!(segments_that_fit(&[], 0, 2), 0);
+    }
+
+    #[test]
+    fn the_bar_owns_hl_and_updown_but_the_player_leaves_them_alone() {
+        for keys in [NavKeys::BarStrip, NavKeys::ArrowsOnly] {
+            assert_eq!(nav(KeyCode::Right, keys), Some(Nav::Next));
+            assert_eq!(nav(KeyCode::Left, keys), Some(Nav::Prev));
+            assert_eq!(nav(KeyCode::Enter, keys), Some(Nav::Activate));
+            assert_eq!(nav(KeyCode::Char('x'), keys), None);
+        }
+        assert_eq!(nav(KeyCode::Char('l'), NavKeys::BarStrip), Some(Nav::Next));
+        assert_eq!(nav(KeyCode::Char('h'), NavKeys::BarStrip), Some(Nav::Prev));
+        assert_eq!(nav(KeyCode::Up, NavKeys::BarStrip), Some(Nav::Inert));
+        assert_eq!(nav(KeyCode::Down, NavKeys::BarStrip), Some(Nav::Inert));
+        // on a full screen 'l' is still the global cycle-loop key and
+        // up/down still mean whatever they mean elsewhere.
+        assert_eq!(nav(KeyCode::Char('l'), NavKeys::ArrowsOnly), None);
+        assert_eq!(nav(KeyCode::Char('h'), NavKeys::ArrowsOnly), None);
+        assert_eq!(nav(KeyCode::Up, NavKeys::ArrowsOnly), None);
+        assert_eq!(nav(KeyCode::Down, NavKeys::ArrowsOnly), None);
     }
 
     #[test]
