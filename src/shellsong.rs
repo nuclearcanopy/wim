@@ -3193,6 +3193,7 @@ fn save_history(history: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     const SETTLED: Env = Env {
         now: Duration::ZERO,
@@ -5207,5 +5208,710 @@ mod tests {
         // it used to be an alias of clear_queue; anyone typing clear()
         // expecting the terminal behaviour would have wiped the queue.
         assert_ne!(ops("clear()"), vec![Op::ClearQueue]);
+    }
+
+    // --------------------------------------------- pinned completion
+
+    /// The corpus the pinned table below completes against. Deliberately
+    /// mixed case and full of non-prefix fuzzy hits, since `Fake::corpus`
+    /// ignores the token and hands back the lot: the prefix filter is
+    /// what has to earn every line of the table.
+    const PINNED_CORPUS: &[&str] = &[
+        "flatline",
+        "Flatline (Remix)",
+        "floor",
+        "sulfur surfer",
+        "4 star crest",
+        "crest",
+        "hex",
+        "Icedancer",
+        "Eversince",
+    ];
+
+    const PINNED_QUEUES: &[&str] = &["late-night", "late-bloom", "gym"];
+
+    const PINNED_INPUTS: &[&str] = &[
+        "",
+        "p",
+        "pl",
+        "play",
+        "qu",
+        "vol",
+        "xyzzy",
+        "view(",
+        "view(q",
+        "view(que",
+        "view(sugg",
+        "play(",
+        "play(fl",
+        "play(FL",
+        "play(fl,",
+        "queue([a, fl",
+        "queue([4 star cre",
+        "dry(queue([fl",
+        "dry(",
+        "repeat(",
+        "repeat(3, sk",
+        "volume(",
+        "seek(",
+        "moveto(",
+        "speed(",
+        "sleep(",
+        "goto(",
+        "remove(",
+        "save_queue(",
+        "load_queue(",
+        "load_queue(late",
+        "add_to_queue(",
+        "add_to_queue(fr",
+        "loop(",
+        "shuffle(",
+        "eq(",
+        "eq(ba",
+        "fade(",
+        "help(",
+        "help(pl",
+        "search(cre",
+        "star(hex",
+        "quit(",
+        "nonexistent(fl",
+    ];
+
+    /// One row of the pinned table: typed keys, the buffer they produce
+    /// (auto-pairing included), the ghost, the hint, the signature with
+    /// its active parameter, and the whole candidate list in order.
+    ///
+    /// This is the guard an optimisation has to get past: it pins what
+    /// the user actually sees for every class of parameter at once, so a
+    /// faster candidate path that reorders, over-offers or drops a
+    /// prefix match fails here rather than in the app.
+    fn pin(
+        keys: &str,
+        buffer: &str,
+        ghost: &str,
+        hint: Option<&'static str>,
+        signature: Option<(&str, usize)>,
+        candidates: &[&str],
+    ) {
+        let mut fake = Fake::new(PINNED_CORPUS);
+        fake.queues = PINNED_QUEUES.to_vec();
+        let c = console_with(&fake, keys);
+        let here = site(&c.input, c.cursor);
+        assert_eq!(c.input, buffer, "buffer for {keys:?}");
+        assert_eq!(c.suggestion.ghost, ghost, "ghost for {keys:?}");
+        assert_eq!(c.suggestion.hint, hint, "hint for {keys:?}");
+        assert_eq!(
+            here.signature,
+            signature.map(|(s, i)| (s.to_string(), i)),
+            "signature for {keys:?}"
+        );
+        let want: Vec<String> = candidates.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            c.candidates_at(&here, &fake),
+            want,
+            "candidates for {keys:?}"
+        );
+    }
+
+    /// Captured off the implementation this pins, with `gen_pinned`.
+    #[test]
+    fn completion_output_is_pinned_across_every_parameter_class() {
+        pin(
+            "",
+            "",
+            "",
+            None,
+            None,
+            &[
+                "add_to_queue",
+                "back",
+                "bottom",
+                "cache",
+                "clear",
+                "clear_queue",
+                "cls",
+                "crossfade",
+                "dl",
+                "down",
+                "download",
+                "dry",
+                "enqueue",
+                "enter",
+                "eq",
+                "equalizer",
+                "exit",
+                "explain",
+                "fade",
+                "fav",
+                "favorite",
+                "find",
+                "flush",
+                "forward",
+                "fwd",
+                "go",
+                "goto",
+                "grep",
+                "help",
+                "like",
+                "load_queue",
+                "loop",
+                "ls",
+                "move",
+                "moveto",
+                "mute",
+                "next",
+                "offline",
+                "open",
+                "pause",
+                "play",
+                "play_pause",
+                "prev",
+                "previous",
+                "qclear",
+                "queue",
+                "quit",
+                "random",
+                "randomize",
+                "remove",
+            ],
+        );
+        pin(
+            "p",
+            "p",
+            "ause",
+            None,
+            None,
+            &["pause", "play", "play_pause", "prev", "previous"],
+        );
+        pin("pl", "pl", "ay", None, None, &["play", "play_pause"]);
+        pin("play", "play", "_pause", None, None, &["play_pause"]);
+        pin("qu", "qu", "eue", None, None, &["queue", "quit"]);
+        pin("vol", "vol", "ume", None, None, &["volume"]);
+        pin("xyzzy", "xyzzy", "", None, None, &[]);
+        pin(
+            "view(",
+            "view()",
+            "q",
+            None,
+            Some(("view(target, terms?)", 0)),
+            &[
+                "q",
+                "queue",
+                "now",
+                "suggestions",
+                "settings",
+                "keybinds",
+                "lyrics",
+                "starred",
+                "index",
+                "history",
+                "playlists",
+                "eq",
+                "help",
+            ],
+        );
+        pin(
+            "view(q",
+            "view(q)",
+            "ueue",
+            None,
+            Some(("view(target, terms?)", 0)),
+            &["queue"],
+        );
+        pin(
+            "view(que",
+            "view(que)",
+            "ue",
+            None,
+            Some(("view(target, terms?)", 0)),
+            &["queue"],
+        );
+        pin(
+            "view(sugg",
+            "view(sugg)",
+            "estions",
+            None,
+            Some(("view(target, terms?)", 0)),
+            &["suggestions"],
+        );
+        pin(
+            "play(",
+            "play()",
+            "flatline",
+            None,
+            Some(("play(terms?)", 0)),
+            &[
+                "flatline",
+                "Flatline (Remix)",
+                "floor",
+                "sulfur surfer",
+                "4 star crest",
+                "crest",
+                "hex",
+                "Icedancer",
+                "Eversince",
+            ],
+        );
+        pin(
+            "play(fl",
+            "play(fl)",
+            "atline",
+            None,
+            Some(("play(terms?)", 0)),
+            &["flatline", "Flatline (Remix)", "floor"],
+        );
+        pin(
+            "play(FL",
+            "play(FL)",
+            "atline",
+            None,
+            Some(("play(terms?)", 0)),
+            &["flatline", "Flatline (Remix)", "floor"],
+        );
+        pin(
+            "play(fl,",
+            "play(fl,)",
+            "",
+            Some("no more arguments"),
+            Some(("play(terms?)", 1)),
+            &[],
+        );
+        pin(
+            "queue([a, fl",
+            "queue([a, fl])",
+            "atline",
+            None,
+            Some(("queue(terms?)", 0)),
+            &["flatline", "Flatline (Remix)", "floor"],
+        );
+        pin(
+            "queue([4 star cre",
+            "queue([4 star cre])",
+            "st",
+            None,
+            Some(("queue(terms?)", 0)),
+            &["4 star crest"],
+        );
+        pin(
+            "dry(queue([fl",
+            "dry(queue([fl]))",
+            "atline",
+            None,
+            Some(("queue(terms?)", 0)),
+            &["flatline", "Flatline (Remix)", "floor"],
+        );
+        pin(
+            "dry(",
+            "dry()",
+            "add_to_queue",
+            None,
+            Some(("dry(call)", 0)),
+            &[
+                "add_to_queue",
+                "back",
+                "bottom",
+                "cache",
+                "clear",
+                "clear_queue",
+                "cls",
+                "crossfade",
+                "dl",
+                "down",
+                "download",
+                "dry",
+                "enqueue",
+                "enter",
+                "eq",
+                "equalizer",
+                "exit",
+                "explain",
+                "fade",
+                "fav",
+                "favorite",
+                "find",
+                "flush",
+                "forward",
+                "fwd",
+                "go",
+                "goto",
+                "grep",
+                "help",
+                "like",
+                "load_queue",
+                "loop",
+                "ls",
+                "move",
+                "moveto",
+                "mute",
+                "next",
+                "offline",
+                "open",
+                "pause",
+                "play",
+                "play_pause",
+                "prev",
+                "previous",
+                "qclear",
+                "queue",
+                "quit",
+                "random",
+                "randomize",
+                "remove",
+            ],
+        );
+        pin(
+            "repeat(",
+            "repeat()",
+            "",
+            Some("how many times, 1-256"),
+            Some(("repeat(count, call)", 0)),
+            &[],
+        );
+        pin(
+            "repeat(3, sk",
+            "repeat(3, sk)",
+            "ip",
+            None,
+            Some(("repeat(count, call)", 1)),
+            &["skip"],
+        );
+        pin(
+            "volume(",
+            "volume()",
+            "",
+            Some("0-100, or +N% / -N%"),
+            Some(("volume(level)", 0)),
+            &[],
+        );
+        pin(
+            "seek(",
+            "seek()",
+            "",
+            Some("+30s / -10s (sign required)"),
+            Some(("seek(offset)", 0)),
+            &[],
+        );
+        pin(
+            "moveto(",
+            "moveto()",
+            "",
+            Some("10% / 90 / 1m20s"),
+            Some(("moveto(pos)", 0)),
+            &[],
+        );
+        pin(
+            "speed(",
+            "speed()",
+            "",
+            Some("0.25-3.0, or up / down / reset"),
+            Some(("speed(speed)", 0)),
+            &[],
+        );
+        pin(
+            "sleep(",
+            "sleep()",
+            "",
+            Some("30m / off"),
+            Some(("sleep(after)", 0)),
+            &[],
+        );
+        pin(
+            "goto(",
+            "goto()",
+            "",
+            Some("a queue position, 1 or higher"),
+            Some(("goto(index)", 0)),
+            &[],
+        );
+        pin(
+            "remove(",
+            "remove()",
+            "",
+            Some("1, or [1, 3, 5]"),
+            Some(("remove(indices)", 0)),
+            &[],
+        );
+        pin(
+            "save_queue(",
+            "save_queue()",
+            "",
+            Some("a name to save it under"),
+            Some(("save_queue(name)", 0)),
+            &[],
+        );
+        pin(
+            "load_queue(",
+            "load_queue()",
+            "late-night",
+            None,
+            Some(("load_queue(name)", 0)),
+            &["late-night", "late-bloom", "gym"],
+        );
+        pin(
+            "load_queue(late",
+            "load_queue(late)",
+            "-night",
+            None,
+            Some(("load_queue(name)", 0)),
+            &["late-night", "late-bloom"],
+        );
+        pin(
+            "add_to_queue(",
+            "add_to_queue()",
+            "front",
+            None,
+            Some(("add_to_queue(position, terms?)", 0)),
+            &["front", "back"],
+        );
+        pin(
+            "add_to_queue(fr",
+            "add_to_queue(fr)",
+            "ont",
+            None,
+            Some(("add_to_queue(position, terms?)", 0)),
+            &["front"],
+        );
+        pin(
+            "loop(",
+            "loop()",
+            "one",
+            None,
+            Some(("loop(mode?)", 0)),
+            &["one", "all", "off"],
+        );
+        pin(
+            "shuffle(",
+            "shuffle()",
+            "on",
+            None,
+            Some(("shuffle(state?)", 0)),
+            &["on", "off"],
+        );
+        pin(
+            "eq(",
+            "eq()",
+            "flat",
+            None,
+            Some(("eq(preset)", 0)),
+            &[
+                "flat",
+                "bass boost",
+                "vocal boost",
+                "treble boost",
+                "rock",
+                "classical",
+            ],
+        );
+        pin(
+            "eq(ba",
+            "eq(ba)",
+            "ss boost",
+            None,
+            Some(("eq(preset)", 0)),
+            &["bass boost"],
+        );
+        pin(
+            "fade(",
+            "fade()",
+            "in",
+            None,
+            Some(("fade(direction, over?)", 0)),
+            &["in", "out"],
+        );
+        pin(
+            "help(",
+            "help()",
+            "add_to_queue",
+            None,
+            Some(("help(name?)", 0)),
+            &[
+                "add_to_queue",
+                "back",
+                "bottom",
+                "cache",
+                "clear",
+                "clear_queue",
+                "cls",
+                "crossfade",
+                "dl",
+                "down",
+                "download",
+                "dry",
+                "enqueue",
+                "enter",
+                "eq",
+                "equalizer",
+                "exit",
+                "explain",
+                "fade",
+                "fav",
+                "favorite",
+                "find",
+                "flush",
+                "forward",
+                "fwd",
+                "go",
+                "goto",
+                "grep",
+                "help",
+                "like",
+                "load_queue",
+                "loop",
+                "ls",
+                "move",
+                "moveto",
+                "mute",
+                "next",
+                "offline",
+                "open",
+                "pause",
+                "play",
+                "play_pause",
+                "prev",
+                "previous",
+                "qclear",
+                "queue",
+                "quit",
+                "random",
+                "randomize",
+                "remove",
+            ],
+        );
+        pin(
+            "help(pl",
+            "help(pl)",
+            "ay",
+            None,
+            Some(("help(name?)", 0)),
+            &["play", "play_pause"],
+        );
+        pin(
+            "search(cre",
+            "search(cre)",
+            "st",
+            None,
+            Some(("search(query)", 0)),
+            &["crest"],
+        );
+        pin(
+            "star(hex",
+            "star(hex)",
+            "",
+            None,
+            Some(("star(terms?)", 0)),
+            &[],
+        );
+        pin(
+            "quit(",
+            "quit()",
+            "",
+            Some("no more arguments"),
+            Some(("quit()", 0)),
+            &[],
+        );
+        pin(
+            "nonexistent(fl",
+            "nonexistent(fl)",
+            "ush",
+            None,
+            None,
+            &["flush"],
+        );
+    }
+
+    /// Prints the table above in source form, for when a deliberate
+    /// behaviour change makes all 44 rows need updating:
+    /// `cargo test --bin wim -- --ignored --nocapture gen_pinned`.
+    #[test]
+    #[ignore = "writes the pinned table, run manually"]
+    fn gen_pinned() {
+        let mut fake = Fake::new(PINNED_CORPUS);
+        fake.queues = PINNED_QUEUES.to_vec();
+        for input in PINNED_INPUTS {
+            let c = console_with(&fake, input);
+            let here = site(&c.input, c.cursor);
+            let hits = c.candidates_at(&here, &fake);
+            let sig = match &here.signature {
+                None => "None".to_string(),
+                Some((s, i)) => format!("Some((\"{s}\", {i}))"),
+            };
+            let hint = match here.completes {
+                Completes::Hint(h) => format!("Some(\"{h}\")"),
+                _ => "None".to_string(),
+            };
+            let cands = hits
+                .iter()
+                .map(|h| format!("\"{h}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "        pin(\"{}\", \"{}\", \"{}\", {}, {}, &[{}]);",
+                input.escape_debug(),
+                c.input.escape_debug(),
+                c.suggestion.ghost.escape_debug(),
+                hint,
+                sig,
+                cands
+            );
+        }
+    }
+
+    // ------------------------------------------------------- benchmarks
+
+    /// A host-shaped provider: hands back exactly the 50 names the real
+    /// `CorpusCandidates` caps at, so the console-side cost is measured
+    /// against the list length it really sees.
+    struct FiftyNames(Vec<String>);
+
+    impl FiftyNames {
+        fn new() -> FiftyNames {
+            FiftyNames(
+                (0..MAX_CANDIDATES)
+                    .map(|i| format!("blade runner blues {i}"))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Candidates for FiftyNames {
+        fn corpus(&self, _token: &str) -> Vec<String> {
+            self.0.clone()
+        }
+    }
+
+    /// Not an assertion: prints the per-keystroke wall time of the whole
+    /// `handle_key` -> `refresh` path, which is what decides whether the
+    /// prompt feels instant. Absolute numbers are machine-dependent.
+    /// `cargo test --release --bin wim -- --ignored --nocapture bench_keystrokes`
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_keystrokes() {
+        let cand = FiftyNames::new();
+        // a command name (every_name + the prefix filter), a corpus
+        // term (the 50-name list), and a value parameter (hint only,
+        // the cheap case) in one line each.
+        for line in [
+            "play(blade runner blues 1)",
+            "queue([blade runner blues 1, blade runner blues 2])",
+            "volume(50%)",
+            "repeat(3, skip())",
+            "add_to_queue(front, blade runner blues 7)",
+        ] {
+            let iters = 200u32;
+            let mut worst = Duration::ZERO;
+            let start = Instant::now();
+            for _ in 0..iters {
+                let mut console = Console::empty();
+                for ch in line.chars() {
+                    let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+                    let one = Instant::now();
+                    console.handle_key(key, &cand);
+                    worst = worst.max(one.elapsed());
+                }
+            }
+            let keys = line.chars().count() as u32;
+            let per = start.elapsed() / (iters * keys);
+            println!("{:<52} {per:>10.3?}/key  worst {worst:>10.3?}", line);
+        }
     }
 }
