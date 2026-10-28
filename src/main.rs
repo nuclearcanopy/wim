@@ -1542,7 +1542,16 @@ fn run_shellsong_op(op: Op, ctx: &mut ShellsongCtx) -> (Dispatch, Report) {
             op_note(status)
         }
         Op::SeekAbsolute(pos) => {
-            let (_, duration, _) = playback_info(ctx.actx.player);
+            // asked for directly rather than read from the observed
+            // cache: this runs once per command, not per frame, and a
+            // percent target must resolve against the duration as of
+            // now rather than whatever the last pushed change said.
+            let duration = ctx
+                .actx
+                .player
+                .get_property(mpv::PROP_DURATION)
+                .ok()
+                .and_then(|v| v.as_f64());
             match shellsong_host::seek_target(pos, duration) {
                 Ok(secs) => match ctx.actx.player.seek(secs, false) {
                     Ok(()) => op_note(format!("moved to {secs:.0}s")),
@@ -2038,26 +2047,6 @@ fn trigger_downloads(
     } else {
         "nothing to download (local files are already local)".to_string()
     }
-}
-
-/// `(elapsed, duration, paused)` for whatever's currently loaded;
-/// queried fresh each frame rather than cached, so the mini/full
-/// player's progress bar is always showing mpv's actual position.
-fn playback_info(player: &mpv::Mpv) -> (Option<f64>, Option<f64>, bool) {
-    let elapsed = player
-        .get_property("time-pos")
-        .ok()
-        .and_then(|v| v.as_f64());
-    let duration = player
-        .get_property("duration")
-        .ok()
-        .and_then(|v| v.as_f64());
-    let paused = player
-        .get_property("pause")
-        .ok()
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    (elapsed, duration, paused)
 }
 
 /// Current output level, 0..1, for the now-playing level meter.
@@ -2730,6 +2719,9 @@ fn main() -> anyhow::Result<()> {
     // mpv's playlist as an index -> `SearchItem` map; the one queue
     // there is, and what every "what's playing" read resolves through.
     let mut play_queue = PlayQueue::default();
+    // folded from mpv's own observed property changes; see
+    // `Mpv::observe_playback`. Never polled.
+    let mut playback = mpv::Playback::default();
     // whatever was playing right before `now_playing` last changed;
     // purely for the player view's "previous: ..." line.
     let mut previous_track: Option<SearchItem> = None;
@@ -3053,7 +3045,17 @@ fn main() -> anyhow::Result<()> {
         // scrubber in the bottom bar, the mini bar and the full player
         // all read the same position, and each call is three ipc
         // round-trips.
-        let (elapsed_secs, duration_secs, paused) = playback_info(&player);
+        // one ioctl per frame instead of one per widget that wants it:
+        // five render sites asked independently, and the answer cannot
+        // change inside a single frame.
+        let aspect = cell_aspect();
+        // no ipc here any more: these arrive as observed property
+        // changes on the event channel drained just below.
+        let (elapsed_secs, duration_secs, paused) = (
+            playback.elapsed_secs,
+            playback.duration_secs,
+            playback.paused,
+        );
         // re-derived every frame and never kept across one: whatever
         // mpv's last reported `playlist-pos` resolves to. Everything
         // downstream (title, mini bar, lyrics header, scrobbling)
@@ -3225,7 +3227,7 @@ fn main() -> anyhow::Result<()> {
             // ┐/┤ where it doesn't.
             let mut main_content_rules = match &browse_view {
                 Some(bv) if !show_full_player => {
-                    ui::browse::rule_rows(main_content, bv, art_mode, cell_aspect())
+                    ui::browse::rule_rows(main_content, bv, art_mode, aspect)
                 }
                 _ => Vec::new(),
             };
@@ -3328,7 +3330,7 @@ fn main() -> anyhow::Result<()> {
                 f.render_widget(
                     AsciiArt {
                         image: video_frame.as_ref(),
-                        cell_aspect: cell_aspect(),
+                        cell_aspect: aspect,
                     },
                     main_content,
                 );
@@ -3336,7 +3338,6 @@ fn main() -> anyhow::Result<()> {
                 let item = now_playing.as_ref().expect("show_full_player implies Some");
                 let previous_label = previous_track.as_ref().map(label);
                 let next_label = play_queue.peek_next().map(label);
-                let aspect = cell_aspect();
                 // the cover for what is *playing*: an open browse view's
                 // art is only that when the queue is playing out of that
                 // same view (the view outlives maximizing the player, so
@@ -3413,7 +3414,6 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
             } else if let Some(bv) = &browse_view {
-                let aspect = cell_aspect();
                 f.render_widget(
                     BrowseListView {
                         view: bv,
@@ -3497,7 +3497,7 @@ fn main() -> anyhow::Result<()> {
                 f.render_widget(
                     AsciiArt {
                         image: video_frame.as_ref(),
-                        cell_aspect: cell_aspect(),
+                        cell_aspect: aspect,
                     },
                     top,
                 );
@@ -3733,6 +3733,9 @@ fn main() -> anyhow::Result<()> {
             let mpv::Event::PropertyChange { name, value } = ev else {
                 continue;
             };
+            if playback.apply(&name, &value) {
+                continue;
+            }
             if name == mpv::PROP_PLAYLIST_POS {
                 if let PosChange::Advanced(_) = play_queue.set_pos(value.as_i64().unwrap_or(-1)) {
                     advanced_to = play_queue.current().cloned();
@@ -3824,8 +3827,9 @@ fn main() -> anyhow::Result<()> {
                     fade_in_started_at = None;
                 }
             } else {
-                let (elapsed, duration, _) = playback_info(&player);
-                if let (Some(elapsed), Some(duration)) = (elapsed, duration) {
+                if let (Some(elapsed), Some(duration)) =
+                    (playback.elapsed_secs, playback.duration_secs)
+                {
                     let remaining = duration - elapsed;
                     if remaining <= cfg.crossfade_seconds {
                         let t = (remaining / cfg.crossfade_seconds).clamp(0.0, 1.0);
@@ -3843,8 +3847,9 @@ fn main() -> anyhow::Result<()> {
         // configured at all.
         if !scrobble.scrobbled {
             if let Some(item) = &now_playing {
-                let (elapsed, duration, _) = playback_info(&player);
-                if let (Some(elapsed), Some(duration)) = (elapsed, duration) {
+                if let (Some(elapsed), Some(duration)) =
+                    (playback.elapsed_secs, playback.duration_secs)
+                {
                     if listenbrainz::should_scrobble(&cfg.scrobble, elapsed, duration) {
                         let listened_at =
                             scrobble.started_unix.unwrap_or_else(listenbrainz::now_unix);
@@ -5047,7 +5052,8 @@ fn main() -> anyhow::Result<()> {
                                     // without asking mpv again; nothing
                                     // loaded means nothing to scrub, so
                                     // the drag just doesn't open.
-                                    let (elapsed, duration, _) = playback_info(&player);
+                                    let (elapsed, duration) =
+                                        (playback.elapsed_secs, playback.duration_secs);
                                     if let Some(at) = elapsed {
                                         scrub = Some(Scrub {
                                             target_secs: at,
