@@ -3,6 +3,7 @@ mod app;
 mod browse;
 mod cache;
 mod config;
+mod coverart;
 mod download;
 mod eq;
 mod favorites;
@@ -2722,6 +2723,9 @@ fn main() -> anyhow::Result<()> {
     // folded from mpv's own observed property changes; see
     // `Mpv::observe_playback`. Never polled.
     let mut playback = mpv::Playback::default();
+    // covers for tracks the open browse view does not have art for;
+    // fetched on its own thread, see `coverart`.
+    let mut cover_art = coverart::Cache::default();
     // whatever was playing right before `now_playing` last changed;
     // purely for the player view's "previous: ..." line.
     let mut previous_track: Option<SearchItem> = None;
@@ -3062,6 +3066,14 @@ fn main() -> anyhow::Result<()> {
         // reads this, so none of them can show a track mpv isn't
         // actually playing.
         let mut now_playing = play_queue.current().cloned();
+        // take delivery of any cover that finished, then ask for the
+        // playing track's if it is not already in hand. both are
+        // no-ops once an album's cover has arrived, so this is cheap
+        // to run every frame.
+        cover_art.poll();
+        if let Some(item) = &now_playing {
+            cover_art.request(item);
+        }
         if let Ok(detected) = frame_rx.try_recv() {
             frame = detected;
         }
@@ -3345,13 +3357,18 @@ fn main() -> anyhow::Result<()> {
                 // a view since closed, needs its own getCoverArt fetch
                 // keyed on the song's own id; until that lands those
                 // tracks show no art rather than the wrong one.
+                // the open view's art when the playing track is one of
+                // its own (no fetch needed, and it is already decoded
+                // at the right size), otherwise whatever the
+                // background fetch has for that album.
                 let playing_art = browse_view
                     .as_ref()
                     .filter(|bv| {
                         let id = item.identity();
                         bv.tracks.iter().any(|t| t.identity() == id)
                     })
-                    .and_then(|bv| bv.art.as_ref());
+                    .and_then(|bv| bv.art.as_ref())
+                    .or_else(|| cover_art.get(item));
                 let has_context = previous_label.is_some() || next_label.is_some();
                 f.render_widget(
                     PlayerView {
