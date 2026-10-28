@@ -16,7 +16,6 @@
 //! nothing here reads a clock or a thread rng, and the one impure
 //! input (last.fm-proxied similar artists, `getArtistInfo2`) arrives
 //! through the `Enrichment` trait so tests fake it.
-#![allow(dead_code)] // consumed by the suggestions menu; ui wiring lands separately
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -233,12 +232,21 @@ pub struct Suggestion {
     pub reason_text: String,
     /// Weighted, generator-normalised score in 0..=1. Rows arrive
     /// already ordered; diversification reorders without rewriting
-    /// this, so the number stays comparable across sections.
+    /// this, so the number stays comparable across sections. Part of
+    /// the documented output shape, and the one number a menu that
+    /// later wants to show "why this ranked here" would read; the
+    /// current menu renders rows in the order they arrive.
+    #[allow(dead_code)]
     pub score: f32,
 }
 
 #[derive(Debug, Clone)]
 pub struct Section {
+    /// `reason.title()` at build time. The menu calls `title()` on the
+    /// reason itself (it needs it for headings it renders without a
+    /// section), so this is carried for hosts that only have the
+    /// section.
+    #[allow(dead_code)]
     pub title: String,
     pub reason: Reason,
     pub items: Vec<Suggestion>,
@@ -325,6 +333,9 @@ fn enrichment_path() -> Result<PathBuf> {
 }
 
 impl EnrichmentCache {
+    // the host loads rather than constructs; `new` is what this
+    // module's own tests build their fixtures with.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -413,6 +424,9 @@ pub struct Track {
     pub item: SearchItem,
     pub title: String,
     pub artist: String,
+    /// Display name; the generators join through `track_album` instead,
+    /// so this is only here to keep a `Track` self-describing.
+    #[allow(dead_code)]
     pub album: String,
     /// Empty unless the track came in through `ingest_songs`/
     /// `ingest_album`; `SearchItem` does not carry genre.
@@ -682,14 +696,21 @@ impl Catalog {
         }
     }
 
+    // the three below are assertions this module's own tests make
+    // about ingest, not host api; nothing outside needs to ask the
+    // catalog its size, since the host only ever hands it to
+    // `suggest`.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.tracks.is_empty() && self.albums.is_empty() && self.artists.is_empty()
     }
 
+    #[allow(dead_code)]
     pub fn track_count(&self) -> usize {
         self.tracks.len()
     }
 
+    #[allow(dead_code)]
     pub fn artist_count(&self) -> usize {
         self.artists.len()
     }
