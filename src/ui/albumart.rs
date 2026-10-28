@@ -34,6 +34,32 @@ impl Widget for AsciiArt<'_> {
     }
 }
 
+/// `AsciiArt` for a picture that does not change between frames:
+/// identical rasterization, but skipped outright when neither the
+/// picture nor the rect's size has moved since the last frame (see
+/// `raster::Memo`). Painting still happens every frame.
+///
+/// `key` names the *image*, which is the whole invalidation story:
+/// album art passes `coverart::art_key`, the same name the
+/// `ratatui-image` protocol cache is already rebuilt on, so a cover
+/// can only ever be reused for the album it was fetched for.
+pub struct CachedArt<'a> {
+    pub image: Option<&'a image::DynamicImage>,
+    pub cell_aspect: f32,
+    pub key: &'a str,
+}
+
+impl Widget for CachedArt<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let Some(img) = self.image else {
+            return;
+        };
+        raster::with_memo(|m| {
+            m.render(self.key, img, area, self.cell_aspect, Fit::Contain, buf);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
