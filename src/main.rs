@@ -2102,11 +2102,18 @@ fn sweep_cache(cache: &Arc<Mutex<CacheIndex>>, eviction_days: u64) {
     }
 }
 
-/// How often the embedded video pane pulls a fresh frame from mpv;
-/// each pull is an IPC round-trip plus a base64 decode, not free, and
-/// the ascii/halfblock rendering it feeds was never going to look
-/// smooth at real video frame rates anyway.
+/// How often the frame pump pulls a fresh frame from mpv; each pull is
+/// an IPC round-trip plus a base64 decode, all of it on the pump's own
+/// thread, so this only sets how smooth the pane looks, never whether
+/// the UI stalls.
 const VIDEO_FRAME_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Longest edge the pump scales a captured frame down to, or `None` for
+/// the source resolution. `None` today because the pane's rasterizer
+/// averages over every source pixel, and changing that changes what is
+/// drawn; the knob is here for the renderer being built on `perf/art`,
+/// which will want the frame already near its cell grid.
+const VIDEO_FRAME_MAX_EDGE: Option<u32> = None;
 
 fn now_playing_is_video(now_playing: &Option<SearchItem>) -> bool {
     matches!(now_playing, Some(SearchItem::LocalVideo { .. }))
@@ -3132,11 +3139,13 @@ fn main() -> anyhow::Result<()> {
     // playing or a capture hasn't landed yet. 'v' expands its pane
     // from main_content to the whole workspace (sidebar included),
     // never the bottom bar.
-    let mut video_frame: Option<image::DynamicImage> = None;
+    let mut video_frame: Option<std::sync::Arc<image::DynamicImage>> = None;
     let mut video_fullscreen = false;
-    // throttles screenshot-raw calls (an IPC round-trip each time) to
-    // a modest rate rather than once per render tick.
-    let mut last_video_frame_at = Instant::now() - VIDEO_FRAME_INTERVAL;
+    // captures and decodes frames on its own thread and its own ipc
+    // connection, so the render path only ever reads the newest one
+    // (see `mpv::FramePump`).
+    let frame_pump = player.frame_pump().ok();
+    let mut video_frames_unsupported = false;
     // full keybind reference, opened with '?'; takes over the whole
     // screen the same way onboarding/the nav manager do.
     let mut help_open = false;
@@ -3786,7 +3795,7 @@ fn main() -> anyhow::Result<()> {
                 // picture that's already moving.
                 f.render_widget(
                     AsciiArt {
-                        image: video_frame.as_ref(),
+                        image: video_frame.as_deref(),
                         cell_aspect: aspect,
                     },
                     main_content,
@@ -3946,7 +3955,7 @@ fn main() -> anyhow::Result<()> {
             if video_fullscreen && show_full_player && now_playing_is_video(&now_playing) {
                 f.render_widget(
                     AsciiArt {
-                        image: video_frame.as_ref(),
+                        image: video_frame.as_deref(),
                         cell_aspect: aspect,
                     },
                     top,
@@ -4321,15 +4330,23 @@ fn main() -> anyhow::Result<()> {
         // actually on screen right now would be wasted IPC/decode
         // work the moment it's covered by the browse view or help
         // overlay; only bother while it'd actually be visible.
-        if now_playing_is_video(&now_playing) && !help_open {
-            if last_video_frame_at.elapsed() >= VIDEO_FRAME_INTERVAL {
-                if let Ok(frame) = player.screenshot_raw() {
-                    video_frame = frame.into_image().map(image::DynamicImage::ImageRgb8);
-                }
-                last_video_frame_at = Instant::now();
+        if let Some(pump) = &frame_pump {
+            pump.set_capture(mpv::Capture {
+                on: now_playing_is_video(&now_playing) && !help_open,
+                interval: VIDEO_FRAME_INTERVAL,
+                max_edge: VIDEO_FRAME_MAX_EDGE,
+            });
+            video_frame = pump.latest().map(|f| f.image);
+            // said once per session: this mpv cannot hand frames over
+            // json ipc at all, so the pane would otherwise just stay
+            // empty with no explanation.
+            if pump.state() == mpv::PumpState::Unsupported && !video_frames_unsupported {
+                video_frames_unsupported = true;
+                notifications.push(
+                    Severity::Alert,
+                    "video frames: this mpv won't return screenshot-raw over ipc",
+                );
             }
-        } else {
-            video_frame = None;
         }
 
         // the terminal's answer to the graphics probe, or `None` if it
