@@ -450,16 +450,27 @@ run that edits these files will collide.
       now calls `suggest`, `Catalog::from_corpus` and `Request::new`,
       but the tuning knobs, `enrichment_targets` and `EnrichmentCache`
       stay unread until the fetches above land.
-- [ ] **wire shellsong to the host.** the language is complete and
-      tested; nothing runs it yet. needs the console opened on `:`,
-      keys and paste routed to `Console`, `ShellsongConsole` rendered,
-      a `Candidates` impl over the local corpus (never firing a remote
-      search), `Env::focus`/`Env::search_settled` supplied, and the
-      `Op` -> host table. unimplemented ops: `OpenPage`, all twelve
-      `View` targets, `SetVolume`, `Mute`, `Sleep`, `Fade`, `Rescan`,
-      `SaveQueue`/`LoadQueue`, `RemoveFromQueue`, `GotoQueue`,
-      `ShuffleQueue`. the queue ops can reuse `PlayQueue::remove`/
-      `move_entry` and the mpv playlist commands already added.
+- [x] **wire shellsong to the host.** `:` opens the console, which then
+      claims every key and every paste at the same input tier
+      `editing_query` does; `ShellsongConsole` draws last of everything
+      so nothing can land on top of it. a submitted line is held as a
+      `Program` and stepped in a loop each frame, applying every `Emit`
+      before the next `step` and stopping on `AwaitResults`/`Done`, so
+      a searching command never blocks the loop. the `Op` -> host table
+      is `apply_shellsong_op`, next to `dispatch_action` and routing
+      through it wherever an `Action` exists. `shellsong_host.rs` holds
+      the pure host decisions (local-corpus `Candidates`,
+      `search_settled`, percent-to-seconds, the volume clamp, the
+      fade/sleep ramps); `queues.rs` is the named-queue store.
+      `browse_session` and `App::move_selection`/`select_top`/
+      `select_bottom` were extracted so the keyboard and the language
+      share one code path rather than two. two things report "not
+      supported yet" rather than faking it: `go()` on the bottom bar's
+      progress field (enter there opens a scrub drag whose keys the
+      open console would swallow; `moveto`/`seek` do the same job), and
+      `view(q, ...)` landing on a song whose album is not in the corpus
+      (`SearchItem::Song` carries its album's name, not its id). see
+      docs/shellsong.md's host section.
 - [ ] **album/artist identity is name-based.** `SearchItem` carries no
       `album_id`/`artist_id`, so the suggestion catalog joins on
       trimmed-lowercased names. two same-named albums by one artist
@@ -493,10 +504,13 @@ run that edits these files will collide.
       correct when moving upwards (its doc admitted as much); it now
       converts, so downward moves land where asked. the old single
       caller only moved upwards, so it is unaffected.
-- [ ] **queue view: the ops shellsong will need.** `remove(n)`/
-      `goto(n)`/`shuffle_queue()` from the shellsong branch can now
-      reuse `PlayQueue::remove`/`move_entry` plus the mpv commands
-      added here, but still need the `Op` -> host wiring.
+- [x] **queue view: the ops shellsong will need.** `remove(n)`,
+      `goto(n)` and `shuffle_queue()` are wired, reusing
+      `PlayQueue::remove`/`move_entry`, `Mpv::playlist_remove` and the
+      `playlist-pos` write the view's own keys already use.
+      `clear_queue()` goes through mpv's `playlist-clear`, which keeps
+      the playing file and drops the rest, plus
+      `PlayQueue::replace_upcoming` to mirror it.
 - [x] **wide characters overlapping their neighbour.** `src/ui/draw.rs`
       is now the one place text reaches a `Buffer`: it advances by
       `char_cells` and blanks the trailing cell of a wide glyph, so a
