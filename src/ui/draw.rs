@@ -85,6 +85,63 @@ pub fn line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: Color) {
     at(buf, area.x, y, text, color, area.width as usize);
 }
 
+/// Blanks every cell of `area`: a space, and the style reset. An
+/// overlay that owns a rect owns all of it; none of the full-screen
+/// menus cleared theirs, so a sidebar's results, a track list and a
+/// stale selection plate all showed through the cells the menu
+/// happened not to write. Resetting the background matters as much as
+/// the char: `results_list::fill_row_bg` leaves a plate behind that a
+/// space alone would not cover.
+pub fn clear(buf: &mut Buffer, area: Rect) {
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.reset();
+            }
+        }
+    }
+}
+
+/// `┌─┐`/`└─┘` one cell thick around `area`, interior untouched (clear
+/// it first). Callers pass `NEAR_BLACK`: a border at the same
+/// brightness as its content reads as noise rather than structure, the
+/// same rule `ui::divider` states.
+pub fn frame(buf: &mut Buffer, area: Rect, color: Color) {
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
+    let right = area.x + area.width - 1;
+    let bottom = area.y + area.height - 1;
+    put(buf, area.x, area.y, '┌', color);
+    put(buf, right, area.y, '┐', color);
+    put(buf, area.x, bottom, '└', color);
+    put(buf, right, bottom, '┘', color);
+    for x in area.x + 1..right {
+        put(buf, x, area.y, '─', color);
+        put(buf, x, bottom, '─', color);
+    }
+    for y in area.y + 1..bottom {
+        put(buf, area.x, y, '│', color);
+        put(buf, right, y, '│', color);
+    }
+}
+
+/// The content rect inside a `frame`: the border column plus one of
+/// horizontal breathing room, matching `subtitle_menu`'s box. Zero
+/// width when `area` is too small to hold both, so the writers clip to
+/// nothing instead of drawing over the border.
+pub fn framed_inner(area: Rect) -> Rect {
+    if area.width < 5 || area.height < 3 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    Rect {
+        x: area.x + 2,
+        y: area.y + 1,
+        width: area.width - 4,
+        height: area.height - 2,
+    }
+}
+
 /// Centred by *display* width, so a wide-char title still sits in the
 /// middle rather than drifting right by its own overhang.
 pub fn centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: Color) {
@@ -106,7 +163,7 @@ pub fn centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: Color) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::{shade, NEAR_WHITE};
+    use crate::theme::{shade, NEAR_BLACK, NEAR_WHITE};
     use crate::ui::testbuf::{buffer, grid};
 
     fn row(buf: &Buffer, y: u16, w: u16) -> String {
@@ -182,6 +239,53 @@ mod tests {
         // "日本" is 4 cells wide, so it centres at x=3, not x=4.
         centered(&mut buf, area, 0, "日本", shade(NEAR_WHITE));
         assert_eq!(buf.cell((3, 0)).unwrap().symbol(), "日");
+    }
+
+    #[test]
+    fn clear_blanks_the_char_and_the_background() {
+        let mut buf = buffer(6, 3);
+        let plated = Rect::new(1, 1, 3, 1);
+        for x in 1..4u16 {
+            let cell = buf.cell_mut((x, 1)).unwrap();
+            cell.set_char('z');
+            cell.set_bg(shade(NEAR_WHITE));
+        }
+        clear(&mut buf, plated);
+        for x in 1..4u16 {
+            let cell = buf.cell((x, 1)).unwrap();
+            assert_eq!(cell.symbol(), " ");
+            assert_eq!(cell.bg, Color::Reset, "a stale plate still shows through");
+        }
+        // outside the cleared rect nothing moved
+        assert_eq!(row(&buf, 0, 6), "......");
+    }
+
+    #[test]
+    fn frame_draws_corners_edges_and_leaves_the_interior_alone() {
+        let mut buf = buffer(6, 4);
+        frame(&mut buf, Rect::new(0, 0, 6, 4), shade(NEAR_BLACK));
+        assert_eq!(
+            grid(&buf),
+            ["┌────┐", "│....│", "│....│", "└────┘"].join("\n")
+        );
+    }
+
+    #[test]
+    fn frame_and_framed_inner_do_nothing_at_degenerate_sizes() {
+        for (w, h) in [(0u16, 0u16), (1, 1), (2, 1), (1, 4), (4, 2)] {
+            let mut buf = buffer(w.max(1), h.max(1));
+            let area = Rect::new(0, 0, w, h);
+            frame(&mut buf, area, shade(NEAR_BLACK));
+            let inner = framed_inner(area);
+            line(&mut buf, inner, inner.y, "bleed", shade(NEAR_WHITE));
+            assert!(!grid(&buf).contains('b'), "{}x{} drew content", w, h);
+        }
+    }
+
+    #[test]
+    fn framed_inner_sits_one_row_and_two_columns_inside() {
+        let inner = framed_inner(Rect::new(3, 2, 20, 10));
+        assert_eq!(inner, Rect::new(5, 3, 16, 8));
     }
 
     #[test]
