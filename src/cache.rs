@@ -59,7 +59,10 @@ pub struct CacheIndex {
     entries: HashMap<String, CacheEntry>,
 }
 
-fn now_secs() -> u64 {
+/// Wall clock in unix seconds. The one clock read in the crate;
+/// everything that scores off time takes it as a parameter so it
+/// stays reproducible in a test.
+pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

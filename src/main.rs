@@ -1216,6 +1216,19 @@ fn adjust_subtitle_field(sub: &mut config::SubtitleConfig, field: usize, dir: f6
     }
 }
 
+/// The one starred set `suggest::Request` wants: remote song ids and
+/// local favorite paths together, matching `suggest::Track::key`.
+fn suggestion_starred_keys(
+    remote_starred: &HashSet<String>,
+    favorites: &favorites::Favorites,
+) -> HashSet<String> {
+    remote_starred
+        .iter()
+        .cloned()
+        .chain(favorites.paths().cloned())
+        .collect()
+}
+
 /// Persists config, surfacing a failure instead of swallowing it: a
 /// read-only config dir or a full disk used to mean every setting
 /// silently reverted on the next launch with nothing said about it.
@@ -1878,6 +1891,11 @@ fn main() -> anyhow::Result<()> {
     // what mpv is playing.
     let mut queue_view_open = false;
     let mut queue_selected: usize = 0;
+    // computed once when the menu opens rather than per frame: the
+    // engine walks the whole corpus and the play history, which is
+    // not something to redo sixty times a second for a static list.
+    let mut suggestions: Option<suggest::Suggestions> = None;
+    let mut suggestions_selected: usize = 0;
     let mut lyrics_lines: Option<Vec<String>> = None;
     let mut lyrics_scroll: usize = 0;
     // which track the open lyrics belong to; shown in their header so
@@ -2433,6 +2451,19 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+            } else if let Some(sug) = &suggestions {
+                f.render_widget(
+                    ui::suggestions::SuggestionsView {
+                        suggestions: sug,
+                        selected: suggestions_selected,
+                        focused: focus == Focus::Workspace,
+                        elapsed: frame_elapsed,
+                        // the network-backed generators are a later
+                        // slice; nothing is in flight yet.
+                        enriching: false,
+                    },
+                    main_content,
+                );
             } else if queue_view_open {
                 f.render_widget(
                     ui::queue::QueueView {
@@ -3904,6 +3935,7 @@ fn main() -> anyhow::Result<()> {
                 // below, computed here but applied after this borrow
                 // of `browse_view` ends).
                 let mut open_album: Option<SearchItem> = None;
+                let mut open_suggestion: Option<SearchItem> = None;
                 if let (Some(bv), Focus::Workspace) = (&mut browse_view, focus) {
                     if bv.is_artist && key.code == keymap.get(KeyAction::StartSearch) {
                         bv.filtering = true;
@@ -4101,6 +4133,90 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     nav_manager = Some(nm);
+                    continue;
+                }
+
+                if let (Some(sug), Focus::Workspace) = (&suggestions, focus) {
+                    let total = ui::suggestions::count(sug);
+                    let mut handled = true;
+                    match key.code {
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            suggestions_selected =
+                                (suggestions_selected + 1).min(total.saturating_sub(1));
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            suggestions_selected = suggestions_selected.saturating_sub(1);
+                        }
+                        KeyCode::Enter => {
+                            // a suggestion is a plain SearchItem, so
+                            // enter goes through the same dispatch a
+                            // search result does; no second code path.
+                            open_suggestion = sug
+                                .flat()
+                                .nth(suggestions_selected)
+                                .map(|(_, s)| s.item.clone());
+                        }
+                        KeyCode::Esc => {
+                            suggestions = None;
+                            focus = Focus::Sidebar;
+                        }
+                        _ => handled = false,
+                    }
+                    if handled && open_suggestion.is_none() {
+                        continue;
+                    }
+                }
+                if let Some(item) = open_suggestion {
+                    suggestions = None;
+                    // a suggestion row is a plain SearchItem, so this is
+                    // the same Action a search result's enter produces:
+                    // songs play, albums and artists open their page.
+                    let dispatch = dispatch_action(
+                        app::Action::Play(item),
+                        &mut ActionCtx {
+                            cfg: &cfg,
+                            player: &player,
+                            app: &mut app,
+                            notifications: &mut notifications,
+                            queue: &mut play_queue,
+                            previous_track: &mut previous_track,
+                            player_minimized: &mut player_minimized,
+                            browse_view: &mut browse_view,
+                            real_art_protocol: &mut real_art_protocol,
+                            picker: &mut picker,
+                            focus: &mut focus,
+                            flash: &mut flash,
+                            cache: &cache_index,
+                            download_tx: &download_tx,
+                            downloading: &mut downloading,
+                            scrobble: &mut scrobble,
+                            subtitle_tx: &subtitle_tx,
+                        },
+                    );
+                    if dispatch == Dispatch::Quit {
+                        break;
+                    }
+                    continue;
+                }
+
+                if key.code == keymap.get(KeyAction::OpenSuggestions) {
+                    if suggestions.is_some() {
+                        suggestions = None;
+                        focus = Focus::Sidebar;
+                    } else {
+                        let starred = suggestion_starred_keys(&remote_starred, &favorites);
+                        let catalog = suggest::Catalog::from_corpus(&app.corpus);
+                        let guard = cache_index.lock().expect("cache mutex poisoned");
+                        suggestions = Some(suggest::suggest(&suggest::Request::new(
+                            &catalog,
+                            &guard,
+                            &starred,
+                            cache::now_secs(),
+                        )));
+                        drop(guard);
+                        suggestions_selected = 0;
+                        focus = Focus::Workspace;
+                    }
                     continue;
                 }
 

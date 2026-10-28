@@ -55,6 +55,7 @@ pub enum KeyAction {
     OpenNavManager,
     OpenStarredView,
     OpenQueueView,
+    OpenSuggestions,
     OpenSubtitleMenu,
     OpenSettingsMenu,
     OpenHelp,
@@ -88,6 +89,7 @@ pub const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::OpenNavManager,
     KeyAction::OpenStarredView,
     KeyAction::OpenQueueView,
+    KeyAction::OpenSuggestions,
     KeyAction::OpenSubtitleMenu,
     KeyAction::OpenSettingsMenu,
     KeyAction::OpenHelp,
@@ -124,6 +126,7 @@ impl KeyAction {
             KeyAction::OpenNavManager => "open_navidrome_profiles",
             KeyAction::OpenStarredView => "open_starred_songs",
             KeyAction::OpenQueueView => "open_queue_view",
+            KeyAction::OpenSuggestions => "open_suggestions",
             KeyAction::OpenSubtitleMenu => "open_subtitle_menu",
             KeyAction::OpenSettingsMenu => "open_settings_menu",
             KeyAction::OpenHelp => "open_help",
@@ -158,6 +161,7 @@ impl KeyAction {
             KeyAction::OpenNavManager => "navidrome profiles",
             KeyAction::OpenStarredView => "starred songs",
             KeyAction::OpenQueueView => "the queue",
+            KeyAction::OpenSuggestions => "suggestions",
             KeyAction::OpenSubtitleMenu => "subtitle settings menu",
             KeyAction::OpenSettingsMenu => "settings menu",
             KeyAction::OpenHelp => "help",
@@ -197,6 +201,10 @@ impl KeyAction {
             // already uses, and esc closes it so a mis-shift to 'q'
             // is the only risk, same as every other one of those.
             KeyAction::OpenQueueView => KeyCode::Char('Q'),
+            // 'R' for recommendations: 's'/'S' were already shuffle
+            // and starred, and it keeps the shift-letter convention
+            // S/L/I/K/Q already established for view-openers.
+            KeyAction::OpenSuggestions => KeyCode::Char('R'),
             KeyAction::OpenSubtitleMenu => KeyCode::Char('t'),
             KeyAction::OpenSettingsMenu => KeyCode::Char('u'),
             KeyAction::OpenHelp => KeyCode::Char('?'),

@@ -421,15 +421,35 @@ run that edits these files will collide.
       artist and 2 per album across the whole menu. every row carries a
       reason built from the real numbers ("4 of 5 tracks played from
       Eversince, never this one").
-- [ ] **wire the suggestions menu.** the engine is merged and compiled
-      but nothing calls it; `src/suggest.rs` carries a module-level
-      `allow(dead_code)` that comes off when the menu lands. needs: a
-      `ui/suggestions.rs` rendering grouped, explained sections, a
-      `view(suggestions)` host arm, and three background fetches the
-      engine depends on (`getAlbum` for real album coverage and track
-      order, `getArtistInfo2` for similar artists, `getTopSongs` for
-      popular-unplayed). `suggest::enrichment_targets` says which
-      artists to fetch, top-affinity first.
+- [x] **suggestions menu** (`src/ui/suggestions.rs`, `R`): grouped
+      sections with each row's reason printed under it. the reason is
+      rendered, not just computed: a recommendation with no stated
+      cause is indistinguishable from a random row, and the engine
+      already knows exactly why it fired. so a suggestion is two rows,
+      the selection plate spans both so they read as one unit, and the
+      reason brightens only on the row you are on so every explanation
+      does not compete with the titles. enter reuses
+      `Action::Play`, so a suggested song plays and a suggested album
+      opens its page with no second code path. the engine runs once on
+      open rather than per frame (it walks the whole corpus and the
+      play history). `cache::now_secs` became `pub` instead of adding
+      a second clock read.
+- [ ] **suggestions: the three background fetches.** only the
+      history-driven generators can fire today (daily rotation, album
+      gap, genre under-exploration, rediscovery, starred-unplayed, and
+      the cold-start paths). `TrackGap` and `AlbumNeighbour` need
+      `getAlbum` for real coverage and track order, `SimilarArtist`
+      needs `getArtistInfo2`, `PopularUnplayed` needs `getTopSongs`.
+      `suggest::enrichment_targets` already says which artists to fetch
+      top-affinity first, and `EnrichmentCache::needs_*` remembers what
+      has been asked including negative answers; the view takes an
+      `enriching` flag so a thin list says "so far" rather than looking
+      final. `Client::stream_artist_tracks` already fetches exactly the
+      `getAlbum` data for the artist view and discards it.
+- [ ] **drop `suggest.rs`'s module-level `allow(dead_code)`.** the menu
+      now calls `suggest`, `Catalog::from_corpus` and `Request::new`,
+      but the tuning knobs, `enrichment_targets` and `EnrichmentCache`
+      stay unread until the fetches above land.
 - [ ] **wire shellsong to the host.** the language is complete and
       tested; nothing runs it yet. needs the console opened on `:`,
       keys and paste routed to `Console`, `ShellsongConsole` rendered,
