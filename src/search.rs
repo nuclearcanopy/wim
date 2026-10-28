@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -218,26 +218,103 @@ impl SearchItem {
     }
 }
 
-/// A corpus item plus the two haystacks `search` would otherwise
-/// rebuild for every item on every keystroke: the matcher text in its
-/// original case (nucleo's smart-case matching reads it) and a
-/// lowercased copy the edit-distance fallback splits into words.
+/// A corpus item plus what `search` would otherwise rebuild for every
+/// item on every keystroke: the matcher text in its original case
+/// (nucleo's smart-case matching reads it), a lowercased copy the
+/// edit-distance fallback splits into words, and the char mask both
+/// prefilters test against.
 #[derive(Debug, Clone)]
 struct Entry {
     item: SearchItem,
     haystack: String,
     haystack_lower: String,
+    /// `char_mask` of `haystack_lower`, or `u64::MAX` when the
+    /// haystack is not ascii. nucleo matches an ascii pattern against
+    /// *normalized* text ("blade" hits "blàde"), so a raw char mask
+    /// would reject accented haystacks it shouldn't; `MAX` opts those
+    /// out of both prefilters instead of guessing.
+    mask: u64,
 }
 
 impl Entry {
     fn new(item: SearchItem) -> Self {
         let haystack = item.haystack();
         let haystack_lower = haystack.to_lowercase();
+        let mask = if haystack_lower.is_ascii() {
+            char_mask(haystack_lower.chars())
+        } else {
+            u64::MAX
+        };
         Self {
             item,
             haystack,
             haystack_lower,
+            mask,
         }
+    }
+}
+
+/// One bit per character, `ch as u32 % 64`, which gives every ascii
+/// letter and digit its own bit and lets anything else collide. Two
+/// cheap necessary conditions ride on this: a subsequence match needs
+/// every pattern char present in the haystack, and an edit distance is
+/// at least the number of distinct chars one side has and the other
+/// lacks. Collisions only ever drop a bit from the "missing" set, so
+/// they weaken the filters and can never reject a real match.
+fn char_mask(chars: impl Iterator<Item = char>) -> u64 {
+    chars.fold(0u64, |mask, ch| mask | 1u64 << (ch as u32 % 64))
+}
+
+/// Everything derived from the query that is identical for every item,
+/// hoisted out of the per-item loop.
+#[derive(Debug)]
+struct Needle {
+    pattern: Pattern,
+    /// Lowercased query text, what the edit-distance pass compares
+    /// against each haystack word.
+    lower: String,
+    /// `true` when `lower` is ascii, so the distance fast path can
+    /// treat bytes as chars.
+    ascii: bool,
+    len: usize,
+    budget: usize,
+    /// Chars every fuzzy match must contain, or 0 (prefilter off) when
+    /// the query holds anything nucleo's pattern parser might read as
+    /// syntax rather than as literal haystack text.
+    fuzzy_mask: u64,
+    /// Chars of the whole query, for the edit-distance lower bound.
+    typo_mask: u64,
+}
+
+impl Needle {
+    fn new(query: &str) -> Self {
+        let lower = query.to_lowercase();
+        let len = lower.chars().count();
+        // nucleo reads `^ $ ! ' \ |` and whitespace as pattern syntax
+        // (anchors, negation, exact-match, escapes), so only a plain
+        // alphanumeric query is guaranteed to be literal text that a
+        // match has to actually contain.
+        let literal = lower.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ');
+        Self {
+            pattern: Pattern::parse(query, CaseMatching::Smart, Normalization::Smart),
+            ascii: lower.is_ascii(),
+            len,
+            budget: edit_distance_budget(len),
+            fuzzy_mask: if literal {
+                char_mask(lower.chars().filter(|c| *c != ' '))
+            } else {
+                0
+            },
+            typo_mask: char_mask(lower.chars()),
+            lower,
+        }
+    }
+
+    /// How many distinct chars `self` has that `mask` lacks; a lower
+    /// bound on the edit distance (every one of them needs at least an
+    /// insertion or a substitution), so over budget means no match.
+    fn missing_from(&self, mask: u64) -> usize {
+        (self.typo_mask & !mask).count_ones() as usize
     }
 }
 
@@ -446,31 +523,20 @@ impl Corpus {
         if query.trim().is_empty() {
             return Vec::new();
         }
-        let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
-        let query_lower = query.to_lowercase();
-        let query_len = query_lower.chars().count();
-        let typo_budget = edit_distance_budget(query_len);
+        let needle = Needle::new(query);
 
         if parallel {
             // chunks are joined back in corpus order, so the stable
             // sort below still breaks ties exactly as it does
             // single-threaded; each thread needs its own scratch.
-            let threads = thread::available_parallelism().map_or(1, |n| n.get());
-            let chunk = self.items.len().div_ceil(threads);
+            let chunk = self.items.len().div_ceil(thread_count());
             let parts: Vec<Vec<(u32, &SearchItem)>> = thread::scope(|scope| {
                 self.items
                     .chunks(chunk)
                     .map(|part| {
                         scope.spawn(|| {
                             let mut scratch = Scratch::default();
-                            score_chunk(
-                                part,
-                                &pattern,
-                                &query_lower,
-                                query_len,
-                                typo_budget,
-                                &mut scratch,
-                            )
+                            score_chunk(part, &needle, &mut scratch)
                         })
                     })
                     .collect::<Vec<_>>()
@@ -481,24 +547,24 @@ impl Corpus {
             parts.concat()
         } else {
             let mut scratch = self.scratch.borrow_mut();
-            score_chunk(
-                &self.items,
-                &pattern,
-                &query_lower,
-                query_len,
-                typo_budget,
-                &mut scratch,
-            )
+            score_chunk(&self.items, &needle, &mut scratch)
         }
     }
+}
+
+/// Cores to fan scoring out over, asked once rather than per keystroke:
+/// `available_parallelism` reads the current affinity mask/cgroup quota
+/// every call, and the answer cannot change under us in a way that
+/// matters here.
+fn thread_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| thread::available_parallelism().map_or(1, |n| n.get()))
 }
 
 /// Phase two of `search`: sort, cut weak matches, group by category,
 /// materialize. Takes the scored candidates in corpus order, which the
 /// stable sort relies on for tie-breaking.
 fn rank(mut scored: Vec<(u32, &SearchItem)>) -> Vec<SearchItem> {
-    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
-
     // relative score cutoff: nucleo's own subsequence matcher will
     // happily return *some* nonzero score for almost any haystack
     // against a short query (e.g. "crest" is a valid, if scattered,
@@ -515,10 +581,19 @@ fn rank(mut scored: Vec<(u32, &SearchItem)>) -> Vec<SearchItem> {
     // (no single standout match), they're all close enough to the
     // top score to clear the cutoff together, so weak guesses
     // still show exactly when there's nothing better on offer.
-    if let Some(&(top_score, _)) = scored.first() {
-        let threshold = (top_score as f64 * WEAK_MATCH_CUTOFF_FRACTION).round() as u32;
-        scored.retain(|(s, _)| *s >= threshold);
-    }
+    //
+    // Cut before sorting, not after: the threshold depends only on the
+    // best score, so one max pass finds it, and a broad query ("bla"
+    // over a 40k library) then sorts the few thousand survivors
+    // instead of the tens of thousands of candidates. `retain` keeps
+    // corpus order, which the stable sort below needs for ties, so
+    // this is the same list in the same order either way.
+    let Some(top_score) = scored.iter().map(|&(score, _)| score).max() else {
+        return Vec::new();
+    };
+    let threshold = (top_score as f64 * WEAK_MATCH_CUTOFF_FRACTION).round() as u32;
+    scored.retain(|(s, _)| *s >= threshold);
+    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
 
     // group same-category items together (section headers in the
     // results list), but order the groups themselves by each
@@ -536,15 +611,16 @@ fn rank(mut scored: Vec<(u32, &SearchItem)>) -> Vec<SearchItem> {
             group_order.push(cat);
         }
     }
-    group_order
-        .into_iter()
-        .flat_map(|cat| {
+    let mut out = Vec::with_capacity(scored.len());
+    for cat in group_order {
+        out.extend(
             scored
                 .iter()
-                .filter(move |(_, item)| item.category() == cat)
-                .map(|(_, item)| (*item).clone())
-        })
-        .collect()
+                .filter(|(_, item)| item.category() == cat)
+                .map(|(_, item)| (*item).clone()),
+        );
+    }
+    out
 }
 
 /// Scores one slice of the corpus against `pattern`, reusing a single
@@ -553,41 +629,111 @@ fn rank(mut scored: Vec<(u32, &SearchItem)>) -> Vec<SearchItem> {
 /// Keeps corpus order, which the caller's stable sort relies on.
 fn score_chunk<'a>(
     entries: &'a [Entry],
-    pattern: &Pattern,
-    query_lower: &str,
-    query_len: usize,
-    typo_budget: usize,
+    needle: &Needle,
     scratch: &mut Scratch,
 ) -> Vec<(u32, &'a SearchItem)> {
     let Scratch { matcher, buf } = scratch;
     let mut scored = Vec::new();
     for entry in entries {
-        let utf32 = Utf32Str::new(&entry.haystack, buf);
-        let fuzzy_score = pattern.score(utf32, matcher);
-
-        // two free skips of the edit-distance pass, both no-ops on the
-        // final score: a typo can never beat `typo_score(0)`, and edit
-        // distance is at least the length difference, so a word that
-        // far off can't come in under budget.
-        let typo_score = if fuzzy_score.is_some_and(|s| s >= typo_score(0)) {
+        // a subsequence match needs every pattern char somewhere in
+        // the haystack, so one mask test retires the items nucleo
+        // would walk the whole haystack only to reject.
+        let fuzzy_score = if needle.fuzzy_mask & !entry.mask != 0 {
             None
         } else {
-            entry
-                .haystack_lower
-                .split_whitespace()
-                .filter(|word| char_count(word).abs_diff(query_len) <= typo_budget)
-                .map(|word| strsim::damerau_levenshtein(query_lower, word))
-                .filter(|&dist| dist <= typo_budget)
-                .map(typo_score)
-                .max()
+            let utf32 = Utf32Str::new(&entry.haystack, buf);
+            needle.pattern.score(utf32, matcher)
         };
 
-        match (fuzzy_score, typo_score) {
+        // three free skips of the edit-distance pass, none of which can
+        // change the final score: a typo can never beat
+        // `typo_score(0)`; the distance is at least the number of query
+        // chars the whole haystack lacks; and, per word, at least the
+        // length difference.
+        let typo = if fuzzy_score.is_some_and(|s| s >= typo_score(0))
+            || needle.missing_from(entry.mask) > needle.budget
+        {
+            None
+        } else {
+            best_typo_score(entry, needle)
+        };
+
+        match (fuzzy_score, typo) {
             (None, None) => {}
             (a, b) => scored.push((a.unwrap_or(0).max(b.unwrap_or(0)), &entry.item)),
         }
     }
     scored
+}
+
+/// Best (lowest-distance) typo score over the haystack's words, or
+/// `None` if no word comes in under budget.
+fn best_typo_score(entry: &Entry, needle: &Needle) -> Option<u32> {
+    let mut best: Option<usize> = None;
+    for word in entry.haystack_lower.split_whitespace() {
+        if char_count(word).abs_diff(needle.len) > needle.budget {
+            continue;
+        }
+        let dist = if needle.budget == 1 && needle.ascii && word.is_ascii() {
+            distance_at_most_one(needle.lower.as_bytes(), word.as_bytes())
+        } else if word_is_reachable(word, needle) {
+            let dist = strsim::damerau_levenshtein(&needle.lower, word);
+            (dist <= needle.budget).then_some(dist)
+        } else {
+            None
+        };
+        if let Some(dist) = dist {
+            if best.is_none_or(|b| dist < b) {
+                best = Some(dist);
+                if dist == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    best.map(typo_score)
+}
+
+/// Whether `word` is close enough to the query to be worth the full
+/// distance computation: each distinct char one side has and the other
+/// lacks costs at least one edit, in both directions.
+fn word_is_reachable(word: &str, needle: &Needle) -> bool {
+    let mask = char_mask(word.chars());
+    needle.missing_from(mask) <= needle.budget
+        && (mask & !needle.typo_mask).count_ones() as usize <= needle.budget
+}
+
+/// `Some(damerau_levenshtein(a, b))` when that distance is 0 or 1,
+/// `None` when it is more, over ascii bytes and without strsim's dp
+/// table and position hashmap. Exact rather than approximate: a single
+/// edit is trivially an edit no substring sees twice, so the restricted
+/// and unrestricted distances agree at 1, and every way to be one edit
+/// apart is one of the four cases below. Only used where the budget
+/// *is* 1; a budget of 2 keeps the full strsim distance, where that
+/// equivalence no longer holds (classically "ca" to "abc": 2
+/// unrestricted, 3 restricted).
+fn distance_at_most_one(a: &[u8], b: &[u8]) -> Option<usize> {
+    if a.len().abs_diff(b.len()) > 1 {
+        return None;
+    }
+    let common = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    if common == a.len() && common == b.len() {
+        return Some(0);
+    }
+    let (ra, rb) = (&a[common..], &b[common..]);
+    if a.len() == b.len() {
+        // one substitution, or one adjacent transposition
+        let sub = ra[1..] == rb[1..];
+        let swap = ra.len() >= 2 && ra[0] == rb[1] && ra[1] == rb[0] && ra[2..] == rb[2..];
+        return (sub || swap).then_some(1);
+    }
+    // one insertion or deletion: drop the extra char from the longer side
+    let (long, short) = if a.len() > b.len() {
+        (ra, rb)
+    } else {
+        (rb, ra)
+    };
+    (long[1..] == *short).then_some(1)
 }
 
 /// `chars().count()` with the ascii fast path spelled out; the typo
@@ -813,6 +959,54 @@ mod tests {
                 .any(|i| matches!(i, SearchItem::Artist { name, .. } if name == "Branimir")),
             "transposition typo should still match via edit-distance fallback"
         );
+
+        // "brainmirr": the same transposition plus a doubled last
+        // letter, so distance 2, which only a query this long has the
+        // budget for. Pins that queries over the one-edit budget keep
+        // the full distance rather than the budget-1 fast path.
+        let two_edits = c.search("brainmirr");
+        assert!(
+            two_edits
+                .iter()
+                .any(|i| matches!(i, SearchItem::Artist { name, .. } if name == "Branimir")),
+            "a 9-char query has a 2-edit budget and must still match"
+        );
+    }
+
+    /// Exhaustive proof of the fast distance's equivalence to strsim
+    /// at a budget of 1: every pair of strings up to 4 chars over a
+    /// 3-letter alphabet (plus a few longer hand-picked ones), which
+    /// covers every substitution, insertion, deletion and adjacent
+    /// transposition shape there is.
+    #[test]
+    fn distance_at_most_one_matches_strsim_exactly() {
+        let mut words: Vec<String> = vec![String::new()];
+        for _ in 0..4 {
+            let grown: Vec<String> = words
+                .iter()
+                .flat_map(|w| "abc".chars().map(move |c| format!("{w}{c}")))
+                .collect();
+            words.extend(grown);
+        }
+        words.extend(
+            [
+                "branimir",
+                "brainmir",
+                "icedancer",
+                "icedacnre",
+                "blade",
+                "balde",
+            ]
+            .map(String::from),
+        );
+        for a in &words {
+            for b in &words {
+                let real = strsim::damerau_levenshtein(a, b);
+                let fast = distance_at_most_one(a.as_bytes(), b.as_bytes());
+                let want = (real <= 1).then_some(real);
+                assert_eq!(fast, want, "distance {a:?} -> {b:?} is {real}");
+            }
+        }
     }
 
     /// Regression test for the reported bug: searching "crest" (an
@@ -961,19 +1155,63 @@ mod tests {
     /// for result-set size; this one is the realistic case.
     fn varied_corpus(n: usize) -> Corpus {
         const WORDS: [&str; 48] = [
-            "blade", "runner", "blues", "cold", "visions", "crest", "icedancer", "eversince",
-            "obedient", "rewind", "decay", "drownin", "sunset", "mall", "western", "union",
-            "hotel", "breakfast", "into", "dust", "tears", "joy", "paranoid", "blackout",
-            "selected", "ambient", "works", "music", "right", "children", "lift", "skinny",
-            "fists", "college", "dropout", "justice", "metal", "essentials", "midnight", "city",
-            "velvet", "mirror", "static", "garden", "ghost", "parade", "winter", "signal",
+            "blade",
+            "runner",
+            "blues",
+            "cold",
+            "visions",
+            "crest",
+            "icedancer",
+            "eversince",
+            "obedient",
+            "rewind",
+            "decay",
+            "drownin",
+            "sunset",
+            "mall",
+            "western",
+            "union",
+            "hotel",
+            "breakfast",
+            "into",
+            "dust",
+            "tears",
+            "joy",
+            "paranoid",
+            "blackout",
+            "selected",
+            "ambient",
+            "works",
+            "music",
+            "right",
+            "children",
+            "lift",
+            "skinny",
+            "fists",
+            "college",
+            "dropout",
+            "justice",
+            "metal",
+            "essentials",
+            "midnight",
+            "city",
+            "velvet",
+            "mirror",
+            "static",
+            "garden",
+            "ghost",
+            "parade",
+            "winter",
+            "signal",
         ];
         // deterministic lcg; a real library's vocabulary is wide and
         // its distribution lumpy, and a fixed stride would correlate
         // every field of an item with every other.
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut next = move |m: usize| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 33) as usize) % m
         };
         let mut words = move |k: usize| {
@@ -1048,7 +1286,24 @@ mod tests {
     /// non-ascii, and the characters nucleo's own pattern parser
     /// treats as operators (`^ $ ! ' \ |`), which any prefilter must
     /// not assume are literal haystack text.
-    const GUARD_QUERIES: [&str; 29] = [
+    const GUARD_QUERIES: [&str; 35] = [
+        // two substitutions over a word whose substituted letters are
+        // unique to it, so both directions of the char-mask lower
+        // bound sit exactly on a 2-edit budget: "midnight" and
+        // "obedient" with two letters each swapped for letters
+        // neither word contains
+        "xidnighy",
+        "obedixnz",
+        // adjacent transpositions inside a 1-edit budget, the one
+        // shape `distance_at_most_one` handles that a plain
+        // substitution/insertion/deletion check would miss
+        "balde",
+        "clod",
+        // 8 and 9 chars, where the budget is 2 and the fast path
+        // hands back off to strsim: one edit from "obedient", two
+        // (two transpositions) from "icedancer"
+        "obedeint",
+        "icedacnre",
         "b",
         "bl",
         "bla",
@@ -1108,7 +1363,13 @@ mod tests {
     /// deliberate. Regenerate by running the test and pasting the table
     /// it prints.
     #[rustfmt::skip]
-    const PINNED: [(&str, usize, u64); 29] = [
+    const PINNED: [(&str, usize, u64); 35] = [
+        ("xidnighy", 354, 0x304c_09f0_ed6e_ea13),
+        ("obedixnz", 315, 0xdfad_bcd4_8e6c_8b68),
+        ("balde", 387, 0x385d_1bdd_4dd7_c7df),
+        ("clod", 474, 0x6a83_5d47_2ec9_e1c0),
+        ("obedeint", 129, 0xb3b3_8077_be08_5dce),
+        ("icedacnre", 73, 0xd229_2d69_866b_4280),
         ("b", 1094, 0xb7e9_d075_2c60_f452),
         ("bl", 867, 0xba5b_70fc_7a23_c14b),
         ("bla", 717, 0x2eda_b913_f7b3_caf4),
@@ -1156,7 +1417,8 @@ mod tests {
             let table: String = actual
                 .iter()
                 .map(|(q, n, h)| {
-                    let (a, b, c, d) = (h >> 48, (h >> 32) & 0xffff, (h >> 16) & 0xffff, h & 0xffff);
+                    let (a, b, c, d) =
+                        (h >> 48, (h >> 32) & 0xffff, (h >> 16) & 0xffff, h & 0xffff);
                     format!("        ({q:?}, {n}, 0x{a:04x}_{b:04x}_{c:04x}_{d:04x}),\n")
                 })
                 .collect();
@@ -1206,29 +1468,19 @@ mod tests {
         let c = varied_corpus(4_000);
         let mut matcher = Matcher::default();
         for query in GUARD_QUERIES {
-            let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
-            let query_lower = query.to_lowercase();
-            let query_len = query_lower.chars().count();
-            let budget = edit_distance_budget(query_len);
+            let needle = Needle::new(query);
             let mut scratch = Scratch::default();
-            let fast = score_chunk(
-                &c.items,
-                &pattern,
-                &query_lower,
-                query_len,
-                budget,
-                &mut scratch,
-            );
+            let fast = score_chunk(&c.items, &needle, &mut scratch);
             let expected: Vec<(u32, &SearchItem)> = c
                 .items
                 .iter()
                 .filter_map(|e| {
                     reference_score(
                         e,
-                        &pattern,
-                        &query_lower,
-                        query_len,
-                        budget,
+                        &needle.pattern,
+                        &needle.lower,
+                        needle.len,
+                        needle.budget,
                         &mut matcher,
                     )
                     .map(|s| (s, &e.item))
