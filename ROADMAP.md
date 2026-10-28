@@ -400,31 +400,50 @@ accident.
 
 ## in flight (branches, NOT merged; do not start work that touches these)
 
-five branches exist with uncommitted-to-master work. check
-`git worktree list` and `git branch` before picking anything up; a loop
-run that edits these files will collide.
+**this section goes stale fast and a stale version is worse than none:
+it reads as "these files are free" when they are not. verify against
+`git worktree list` and `git branch --no-merged master` before trusting
+it, and update it when you merge something.** the four branches listed
+here previously (feat/shellsong, feat/pulse-animations,
+fix/nowplaying-queue, feat/controls-bar-icons) were all merged and
+deleted long ago; the list sat unchanged while six new branches went
+live, which is exactly the trap.
 
-- `feat/shellsong` + `wim-wt-shellsong`: "shellsong", a music command
-  language on `:` (`src/shellsong.rs`, `src/ui/shellsong.rs`,
-  `docs/shellsong.md`). call-only grammar, `play(crest)`,
-  `queue([hex, 4 star crest])`, `queue_aa(...)`, `favorite(...)`,
-  `add_to_queue(front, ...)`, `moveto(10%)`, `seek(+30s)`. deliberately
-  scoped to pure modules with zero main.rs edits; **host wiring is
-  still to do** and is the one remaining step.
-- `feat/pulse-animations` + `wim-wt-pulse`: selection shown by a
-  pulsing row background instead of border colour, plus one `src/anim.rs`
-  driving every animation off wall-clock time scaled to the display's
-  refresh rate (the loop currently polls a flat 100ms, so everything
-  animates at ~10fps).
-- `fix/nowplaying-queue` + `wim-wt-queue`: "now playing" shows the
-  wrong track because the app mirrors mpv's playlist position by
-  counting end-file events instead of observing `playlist-pos`; any
-  missed event desyncs it permanently. also moves the download trigger
-  from "played twice" to "played on two distinct days".
-- `feat/controls-bar-icons` + `wim-wt-controls`: bottom controls bar to
-  glyphs instead of `loop: off` text, arrow-key selection within the
-  bar, enter to interact, and enter on the progress bar entering a
-  scrub mode.
+as of 2026-10-28 six worktrees are live, one feature and five
+performance. the file ownership matters more than the branch names: a
+loop run that edits an owned file will collide with an agent mid-edit.
+
+- `feat/mouse` + `wim-wt-mouse`: mouse support, click to move focus and
+  press buttons. owns `src/main.rs`, `src/ui/controlsbar.rs`,
+  `src/ui/player.rs`, `src/term.rs`, `src/config.rs`, and the list
+  widgets (`src/ui/results_list.rs`, `browse.rs`, `queue.rs`,
+  `suggestions.rs`, `lyrics_view.rs`).
+- `perf/mpv` + `wim-wt-mpv`: owns `src/mpv.rs`. kills the last
+  per-frame blocking ipc round trip (`audio_level` sampling the astats
+  tap) and moves video frame decode off the render thread. also exposes
+  a cheap non-blocking "latest decoded frame" api for the future ascii
+  video renderer.
+- `perf/search` + `wim-wt-search`: owns `src/search.rs`, `src/app.rs`.
+  stops cloning the whole retained result set per keystroke and narrows
+  the previous result set instead of rescanning the corpus.
+- `perf/art` + `wim-wt-art`: owns `src/ui/albumart.rs`,
+  `src/coverart.rs`, and a new shared rasterizer module. extracts
+  image-to-cells (half-block) rasterization for reuse by ascii video,
+  plus a disk cache for cover bytes.
+- `perf/startup` + `wim-wt-startup`: owns `src/subsonic.rs`,
+  `src/library.rs`, `src/cache.rs`, `src/browse.rs`. persistent library
+  cache so startup paints from disk, bounded-concurrency fetches
+  instead of serial round trips.
+- `perf/shell` + `wim-wt-shell`: owns `src/shellsong.rs`,
+  `src/shellsong_host.rs`, `src/suggest.rs`. per-keystroke lex/parse/
+  complete cost and the recommender's scoring passes.
+
+consequence worth stating plainly: **every currently unchecked roadmap
+item below touches an owned file**, so there is no unblocked item right
+now. the video items additionally depend on two of those branches
+landing first (the rasterizer from `perf/art`, the frame api from
+`perf/mpv`). a loop run arriving here should do uncontested polish or
+docs rather than forcing one of them.
 
 ## shellsong and suggestions (engines merged, hosts not wired)
 
