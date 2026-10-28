@@ -166,7 +166,10 @@ mod tests {
         let buf = render(&n, 40, 8);
         let bottom = grid(&buf).lines().nth(2).unwrap().to_string();
         assert!(bottom.contains('s'), "a countdown belongs here: {bottom:?}");
-        assert!(bottom.starts_with(|c: char| c == ' ' || c == '└') || bottom.contains('└'));
+        assert!(
+            bottom.contains('└'),
+            "and the border still closes: {bottom:?}"
+        );
     }
 
     #[test]
