@@ -640,7 +640,7 @@ mod tests {
         let map = rows(area, &view, ArtMode::Off, 2.0);
 
         let (albums_rect, album_rows) = map.albums.expect("an artist profile has an albums column");
-        assert!(album_rows.iter().any(|r| *r == Some(15)), "{album_rows:?}");
+        assert!(album_rows.contains(&Some(15)), "{album_rows:?}");
         for (row, idx) in album_rows.iter().enumerate() {
             let text = row_text(&buf, albums_rect.y + row as u16);
             match idx {
@@ -656,7 +656,7 @@ mod tests {
         }
 
         let (songs_rect, song_rows) = map.tracks;
-        assert!(song_rows.iter().any(|r| *r == Some(17)), "{song_rows:?}");
+        assert!(song_rows.contains(&Some(17)), "{song_rows:?}");
         for (row, idx) in song_rows.iter().enumerate() {
             let text = row_text(&buf, songs_rect.y + row as u16);
             match idx {
