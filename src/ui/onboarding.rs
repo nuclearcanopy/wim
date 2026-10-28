@@ -172,37 +172,198 @@ impl Widget for DoneView {
 }
 
 fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
-    if y >= area.y + area.height {
-        return;
-    }
     let fitted = truncate_with_ellipsis(text, area.width as usize);
-    for (col, ch) in fitted.chars().enumerate() {
-        let x = area.x + col as u16;
-        if x >= area.x + area.width {
-            break;
-        }
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_fg(color);
-        }
-    }
+    crate::ui::draw::line(buf, area, y, &fitted, color);
 }
 
+/// `draw::centered` pads by display width; this centred by char count,
+/// so a wide-char line sat right of centre by its own overhang.
 fn draw_centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
-    if y >= area.y + area.height {
-        return;
+    let fitted = truncate_with_ellipsis(text, area.width as usize);
+    crate::ui::draw::centered(buf, area, y, &fitted, color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, char_at, grid};
+
+    const SIZES: [(u16, u16); 6] = [(1, 1), (1, 40), (2, 1), (40, 0), (0, 0), (3, 2)];
+
+    #[test]
+    fn the_welcome_screen_centres_its_three_lines() {
+        let mut buf = buffer(30, 5);
+        WelcomeView.render(Rect::new(0, 0, 30, 5), &mut buf);
+        assert_eq!(
+            grid(&buf),
+            [
+                "........welcome to wim........",
+                "..............................",
+                "a terminal omniplayer for you…",
+                "..............................",
+                "press any key to set things up",
+            ]
+            .join("\n")
+        );
     }
-    let text = truncate_with_ellipsis(text, area.width as usize);
-    let text_width = text.chars().count() as u16;
-    let start_x = area.x + area.width.saturating_sub(text_width) / 2;
-    for (i, ch) in text.chars().enumerate() {
-        let x = start_x + i as u16;
-        if x >= area.x + area.width {
-            break;
+
+    #[test]
+    fn the_done_screen_centres_both_of_its_lines() {
+        let mut buf = buffer(30, 3);
+        DoneView.render(Rect::new(0, 0, 30, 3), &mut buf);
+        assert_eq!(
+            grid(&buf),
+            [
+                "........you're all set........",
+                "..............................",
+                "....press any key to start....",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn the_controls_screen_lists_every_binding_and_the_continue_hint() {
+        let h = CONTROLS.len() as u16 + 4;
+        let mut buf = buffer(50, h);
+        ControlsView.render(Rect::new(0, 0, 50, h), &mut buf);
+        let g = grid(&buf);
+        assert!(g.starts_with("controls"), "{g}");
+        for line in CONTROLS {
+            assert!(g.contains(line), "missing {line:?}:\n{g}");
         }
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_fg(color);
+        assert!(g.contains("press any key to continue"), "{g}");
+    }
+
+    #[test]
+    fn the_token_screen_masks_the_input_one_star_per_char() {
+        let mut buf = buffer(72, 9);
+        ListenBrainzView { input: "abc123" }.render(Rect::new(0, 0, 72, 9), &mut buf);
+        let g = grid(&buf);
+        assert!(g.contains("scrobble to listenbrainz? (optional)"), "{g}");
+        assert!(g.contains("token: ******"), "{g}");
+        assert!(
+            !g.contains("abc123"),
+            "the token must never be echoed:\n{g}"
+        );
+    }
+
+    #[test]
+    fn the_paths_screen_lists_what_was_found_and_the_add_line() {
+        let mut buf = buffer(40, 8);
+        LibraryPathsView {
+            paths: &["/home/a/music".to_string()],
+            input: "/mnt/b",
+        }
+        .render(Rect::new(0, 0, 40, 8), &mut buf);
+        assert_eq!(
+            grid(&buf),
+            [
+                "where's your media?.....................",
+                "........................................",
+                "  /home/a/music.........................",
+                "........................................",
+                "add path: /mnt/b........................",
+                "........................................",
+                "enter to add, enter on empty to continue",
+                "........................................",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn an_empty_paths_list_says_so() {
+        let mut buf = buffer(70, 8);
+        LibraryPathsView {
+            paths: &[],
+            input: "",
+        }
+        .render(Rect::new(0, 0, 70, 8), &mut buf);
+        assert!(grid(&buf).contains("(no paths found:"), "{}", grid(&buf));
+    }
+
+    /// A library path is typed, so it can be non-ascii: the glyphs
+    /// after a wide one must not slide a cell left per wide char.
+    #[test]
+    fn a_wide_library_path_does_not_shift_the_glyphs_after_it() {
+        let mut buf = buffer(40, 8);
+        LibraryPathsView {
+            paths: &["日本x".to_string()],
+            input: "日本x",
+        }
+        .render(Rect::new(0, 0, 40, 8), &mut buf);
+        let g = grid(&buf);
+        let listed: Vec<char> = g.lines().nth(2).unwrap().chars().collect();
+        assert_eq!((listed[2], listed[3], listed[4]), ('日', ' ', '本'));
+        assert_eq!(listed[6], 'x');
+        let typed: Vec<char> = g.lines().nth(4).unwrap().chars().collect();
+        let start = 10; // "add path: "
+        assert_eq!((typed[start], typed[start + 1]), ('日', ' '));
+        assert_eq!(typed[start + 4], 'x');
+    }
+
+    /// `draw_centered` used to pad by char count, which put a wide-char
+    /// line right of centre by its own overhang.
+    #[test]
+    fn a_centred_wide_line_sits_in_the_middle_by_cells() {
+        // "日本" is 4 cells in a 10-wide rect, so x=3, not x=4.
+        let mut buf = buffer(10, 1);
+        draw_centered(
+            &mut buf,
+            Rect::new(0, 0, 10, 1),
+            0,
+            "日本",
+            shade(NEAR_WHITE),
+        );
+        assert_eq!(char_at(&buf, 3, 0), '日');
+    }
+
+    #[test]
+    fn nothing_is_drawn_outside_the_rect() {
+        let rect = Rect::new(2, 1, 20, 10);
+        let long = "日本語テスト曲日本語テスト曲日本語テスト曲";
+
+        let mut buf = buffer(40, 14);
+        WelcomeView.render(rect, &mut buf);
+        assert_outside_untouched(&buf, rect);
+
+        let mut buf = buffer(40, 14);
+        DoneView.render(rect, &mut buf);
+        assert_outside_untouched(&buf, rect);
+
+        let mut buf = buffer(40, 14);
+        ControlsView.render(rect, &mut buf);
+        assert_outside_untouched(&buf, rect);
+
+        let mut buf = buffer(40, 14);
+        ListenBrainzView { input: long }.render(rect, &mut buf);
+        assert_outside_untouched(&buf, rect);
+
+        let mut buf = buffer(40, 14);
+        LibraryPathsView {
+            paths: &[long.to_string(), long.to_string()],
+            input: long,
+        }
+        .render(rect, &mut buf);
+        assert_outside_untouched(&buf, rect);
+    }
+
+    #[test]
+    fn degenerate_sizes_do_not_panic() {
+        let long = "日本語テスト曲";
+        for (w, h) in SIZES {
+            let mut buf = buffer(w.max(1), h.max(1));
+            let area = Rect::new(0, 0, w, h);
+            WelcomeView.render(area, &mut buf);
+            DoneView.render(area, &mut buf);
+            ControlsView.render(area, &mut buf);
+            ListenBrainzView { input: long }.render(area, &mut buf);
+            LibraryPathsView {
+                paths: &[long.to_string()],
+                input: long,
+            }
+            .render(area, &mut buf);
         }
     }
 }
