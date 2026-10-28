@@ -2371,6 +2371,258 @@ fn spawn_background_sync(
     });
 }
 
+/// How many top-affinity artists get offered to the enrichment
+/// fetcher. `suggest::Tuning::similar_seed_artists` is 5, so the two
+/// network-fed generators never read past the top five; 8 is headroom
+/// for the affinity ranking shifting as listening does, without
+/// paying a round trip for the rest of the library.
+const ENRICH_ARTIST_TARGETS: usize = 8;
+
+/// `getTopSongs` rows asked for per artist. The engine's rank falloff
+/// has already discounted rank 20 to under a third of rank 1, so
+/// asking deeper buys nothing that could place in the menu.
+const ENRICH_TOP_SONGS: usize = 20;
+
+/// `getAlbum` fetches per enrichment job, and the real bound on the
+/// work: one job runs at a time and the next is only picked once it
+/// finishes, so opening the menu costs twelve album round trips, not
+/// one per album in the library. The warm-up then continues in
+/// batches for as long as the menu stays open.
+const ENRICH_ALBUMS_PER_JOB: usize = 12;
+
+/// Requests in flight within one job; same order of magnitude as
+/// `subsonic`'s own album fetch concurrency, and for the same reason:
+/// these are independent GETs and nothing should wait out twelve
+/// serial latencies.
+const ENRICH_CONCURRENCY: usize = 4;
+
+/// One enrichment answer from the background fetcher. The engine is
+/// re-run when any of these lands, so an open menu fills in rather
+/// than only improving on the next open.
+enum EnrichmentEvent {
+    /// `getArtistInfo2`, recorded even when the similar list came back
+    /// empty so `EnrichmentCache::needs_similar` stops asking. Enables
+    /// `SimilarArtist`.
+    ArtistInfo {
+        id: String,
+        info: subsonic::ArtistInfo,
+    },
+    /// `getTopSongs`. The songs are ingested as well as recorded: song
+    /// titles are deliberately never eagerly indexed (see
+    /// `fetch_navidrome_catalog`), so without that the returned ids
+    /// would resolve against nothing and `PopularUnplayed` could not
+    /// fire. Enables `PopularUnplayed`.
+    TopSongs {
+        artist: String,
+        songs: Vec<subsonic::Song>,
+        client: Arc<subsonic::Client>,
+    },
+    /// `getAlbum`: a real track total and real track order, which is
+    /// all `TrackGap` and `AlbumNeighbour` were ever missing.
+    Album {
+        name: String,
+        songs: Vec<subsonic::Song>,
+        client: Arc<subsonic::Client>,
+    },
+    /// Every fetch in one job has finished, successes and failures
+    /// alike; what takes the menu title back out of "so far".
+    JobDone,
+}
+
+/// One bounded batch of fetches. The main thread picks the targets (it
+/// owns the catalog and the play history) and the background thread
+/// only performs them.
+struct EnrichmentJob {
+    artists: Vec<ArtistFetch>,
+    albums: Vec<suggest::AlbumTarget>,
+}
+
+struct ArtistFetch {
+    target: suggest::ArtistTarget,
+    client: Arc<subsonic::Client>,
+    /// Which halves are still unanswered. A negative answer counts as
+    /// answered, so a server with no last.fm metadata behind it is
+    /// asked once and then left alone.
+    similar: bool,
+    top: bool,
+}
+
+/// One independent unit of network work.
+enum Fetch {
+    Similar {
+        id: String,
+        client: Arc<subsonic::Client>,
+    },
+    Top {
+        name: String,
+        client: Arc<subsonic::Client>,
+    },
+    Album(suggest::AlbumTarget),
+}
+
+impl EnrichmentJob {
+    fn is_empty(&self) -> bool {
+        self.artists.is_empty() && self.albums.is_empty()
+    }
+
+    /// Flattened, artists first: they are at most two calls each and
+    /// each one unlocks a whole generator, while album coverage only
+    /// ever improves incrementally.
+    fn fetches(&self) -> Vec<Fetch> {
+        let mut out = Vec::new();
+        for artist in &self.artists {
+            if artist.similar {
+                out.push(Fetch::Similar {
+                    id: artist.target.id.clone(),
+                    client: artist.client.clone(),
+                });
+            }
+            if artist.top {
+                out.push(Fetch::Top {
+                    name: artist.target.name.clone(),
+                    client: artist.client.clone(),
+                });
+            }
+        }
+        out.extend(self.albums.iter().cloned().map(Fetch::Album));
+        out
+    }
+}
+
+/// `None` on any failure: one unreachable artist or album must not
+/// cost the rest of the batch, and the main thread's own
+/// already-asked bookkeeping is what stops a failure being retried
+/// all session.
+fn run_enrichment_fetch(fetch: &Fetch) -> Option<EnrichmentEvent> {
+    match fetch {
+        Fetch::Similar { id, client } => Some(EnrichmentEvent::ArtistInfo {
+            id: id.clone(),
+            info: client.get_artist_info(id).ok()?,
+        }),
+        Fetch::Top { name, client } => Some(EnrichmentEvent::TopSongs {
+            artist: name.clone(),
+            songs: client.get_top_songs(name, ENRICH_TOP_SONGS).ok()?,
+            client: client.clone(),
+        }),
+        Fetch::Album(target) => Some(EnrichmentEvent::Album {
+            name: target.name.clone(),
+            songs: target.client.get_album(&target.id).ok()?.songs,
+            client: target.client.clone(),
+        }),
+    }
+}
+
+/// Runs forever on its own thread, performing whichever enrichment
+/// fetches the main thread asked for and reporting each answer back
+/// over `event_tx`. Same shape as `spawn_background_sync` and
+/// `spawn_background_search`: pure network I/O here, every piece of
+/// app state stays on the main thread. These are the calls behind
+/// `TrackGap`, `AlbumNeighbour`, `SimilarArtist` and `PopularUnplayed`
+/// (see docs/suggestions.md's host wiring section), so none of them
+/// may ever happen on the render or input path.
+fn spawn_background_enrichment(
+    job_rx: mpsc::Receiver<EnrichmentJob>,
+    event_tx: mpsc::Sender<EnrichmentEvent>,
+) {
+    thread::spawn(move || {
+        while let Ok(job) = job_rx.recv() {
+            let fetches = job.fetches();
+            let workers = ENRICH_CONCURRENCY.min(fetches.len());
+            if workers > 0 {
+                let fetches = &fetches;
+                thread::scope(|scope| {
+                    for worker in 0..workers {
+                        let event_tx = event_tx.clone();
+                        scope.spawn(move || {
+                            for fetch in fetches.iter().skip(worker).step_by(workers) {
+                                let Some(event) = run_enrichment_fetch(fetch) else {
+                                    continue;
+                                };
+                                if event_tx.send(event).is_err() {
+                                    return; // main thread is gone (shutting down)
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+            if event_tx.send(EnrichmentEvent::JobDone).is_err() {
+                return;
+            }
+        }
+    });
+}
+
+/// The next batch worth fetching: the top-affinity artists whose
+/// similar-artist/top-song answers are still unknown, plus the
+/// highest-affinity played albums whose tracklist has never been asked
+/// for. Pure, so the selection and ordering are testable without a
+/// server.
+///
+/// `asked_albums` is session-scoped on purpose. The tracklists
+/// themselves are not persisted, and an album whose fetch failed (or
+/// whose songs are credited to a different artist than the album is,
+/// so the ingest landed on a neighbouring row and left this one with
+/// no track total) must not be asked about again in a loop.
+fn next_enrichment_job(
+    catalog: &suggest::Catalog,
+    cache: &CacheIndex,
+    starred: &HashSet<String>,
+    enrichment: &suggest::EnrichmentCache,
+    asked_albums: &HashSet<String>,
+) -> EnrichmentJob {
+    let request = suggest::Request {
+        enrichment,
+        ..suggest::Request::new(catalog, cache, starred, cache::now_secs())
+    };
+    let artists = suggest::enrichment_targets(&request, ENRICH_ARTIST_TARGETS)
+        .into_iter()
+        .filter_map(|target| {
+            let similar = enrichment.needs_similar(&target.id);
+            let top = enrichment.needs_top_songs(&target.name);
+            if !similar && !top {
+                return None;
+            }
+            let client = catalog.artist_client(&target.name)?;
+            Some(ArtistFetch {
+                target,
+                client,
+                similar,
+                top,
+            })
+        })
+        .collect();
+    // asked-but-still-untotalled albums are filtered after the engine
+    // ranked them, so a handful of stuck ones cannot starve the batch;
+    // ask deeper than the cap and keep the first unasked ones.
+    let albums = suggest::album_targets(&request, ENRICH_ALBUMS_PER_JOB * 4)
+        .into_iter()
+        .filter(|target| !asked_albums.contains(&target.id))
+        .take(ENRICH_ALBUMS_PER_JOB)
+        .collect();
+    EnrichmentJob { artists, albums }
+}
+
+/// Rebuilds the menu from everything known right now. The catalog is
+/// kept across opens rather than rebuilt per open, because the fetched
+/// tracklists and top songs live in it; re-ingesting the corpus is an
+/// upsert, so newly indexed library rows still land.
+fn recompute_suggestions(
+    catalog: &mut suggest::Catalog,
+    corpus: &search::Corpus,
+    cache: &Arc<Mutex<CacheIndex>>,
+    starred: &HashSet<String>,
+    enrichment: &suggest::EnrichmentCache,
+) -> suggest::Suggestions {
+    catalog.ingest_corpus(corpus);
+    let guard = cache.lock().expect("cache mutex poisoned");
+    let request = suggest::Request {
+        enrichment,
+        ..suggest::Request::new(catalog, &guard, starred, cache::now_secs())
+    };
+    suggest::suggest(&request)
+}
+
 /// Pushes the current query to the background `search3` thread (see
 /// `spawn_background_search`) whenever typing/pasting actually changed
 /// it; a no-op while the query's empty or no server has been indexed
@@ -2832,11 +3084,31 @@ fn main() -> anyhow::Result<()> {
     // what mpv is playing.
     let mut queue_view_open = false;
     let mut queue_selected: usize = 0;
-    // computed once when the menu opens rather than per frame: the
-    // engine walks the whole corpus and the play history, which is
-    // not something to redo sixty times a second for a static list.
+    // computed when the menu opens and again when a background
+    // enrichment answer lands, never per frame: the engine walks the
+    // whole corpus and the play history, which is not something to
+    // redo sixty times a second for a list that only changes when its
+    // inputs do.
     let mut suggestions: Option<suggest::Suggestions> = None;
     let mut suggestions_selected: usize = 0;
+    // the engine's view of the library, kept across menu opens because
+    // the background fetches land in here; rebuilding it from the
+    // corpus per open would throw every fetched tracklist away.
+    let mut suggest_catalog = suggest::Catalog::new();
+    // getArtistInfo2/getTopSongs answers from previous sessions as
+    // well as this one, negative answers included.
+    let mut enrichment = suggest::EnrichmentCache::load();
+    // album ids already asked about this session; see
+    // `next_enrichment_job` for why this is not persisted.
+    let mut asked_albums: HashSet<String> = HashSet::new();
+    let mut suggestions_open_last_frame = false;
+    // an answer landed, so the menu owes exactly one re-run.
+    let mut suggestions_stale = false;
+    // something changed that could make a fetch worth firing (menu
+    // opened, batch finished, corpus grew). picking targets costs a
+    // corpus walk, so it only happens when this is set.
+    let mut enrich_probe = false;
+    let mut enrich_job_in_flight = false;
     let mut lyrics_lines: Option<Vec<String>> = None;
     let mut lyrics_scroll: usize = 0;
     // which track the open lyrics belong to; shown in their header so
@@ -2885,6 +3157,14 @@ fn main() -> anyhow::Result<()> {
     let (remote_search_tx, remote_search_rx) = mpsc::channel::<RemoteSearchQuery>();
     let (remote_search_result_tx, remote_search_result_rx) = mpsc::channel::<RemoteSearchOutcome>();
     spawn_background_search(remote_search_rx, remote_search_result_tx);
+
+    // the suggestions menu's getAlbum/getArtistInfo2/getTopSongs
+    // fetches, which are what let four of the nine generators fire at
+    // all; jobs out, answers back, polled every frame same as
+    // `sync_rx`. See `spawn_background_enrichment`.
+    let (enrich_job_tx, enrich_job_rx) = mpsc::channel::<EnrichmentJob>();
+    let (enrich_tx, enrich_rx) = mpsc::channel::<EnrichmentEvent>();
+    spawn_background_enrichment(enrich_job_rx, enrich_tx);
 
     // 'n' opens the profile manager standalone, later.
     let mut nav_manager: Option<NavManager> = None;
@@ -3448,9 +3728,9 @@ fn main() -> anyhow::Result<()> {
                         selected: suggestions_selected,
                         focused: focus == Focus::Workspace,
                         elapsed: frame_elapsed,
-                        // the network-backed generators are a later
-                        // slice; nothing is in flight yet.
-                        enriching: false,
+                        // a thin list must not read as the whole
+                        // answer while fetches are still landing.
+                        enriching: enrich_job_in_flight,
                     },
                     main_content,
                 );
@@ -3929,6 +4209,9 @@ fn main() -> anyhow::Result<()> {
                 Ok((catalog, starred)) => {
                     merge_catalog_into_app(&mut app, catalog);
                     remote_starred.extend(starred);
+                    // a freshly indexed server brings artists and
+                    // albums the last enrichment probe never saw.
+                    enrich_probe = true;
                     if server_reachable.insert(sr.url.clone(), true) == Some(false) {
                         notifications.push(Severity::Info, format!("{} is back online", sr.url));
                     }
@@ -3965,9 +4248,105 @@ fn main() -> anyhow::Result<()> {
             app.corpus
                 .add_subsonic_search_result(outcome.result, &outcome.client);
             app.resync_results();
+            // a wider corpus can mean more artists and albums worth
+            // enriching than the last probe found.
+            enrich_probe = true;
             // an answer is in, so the results for whatever is typed are
             // as complete as a shellsong program should wait for.
             settle.answered();
+        }
+
+        // drain whatever the background enrichment fetcher answered
+        // since the last frame. nothing here touches the network: it
+        // folds the answers into the engine's inputs and marks the
+        // menu for one re-run, however many answers arrived.
+        let mut enrichment_grew = false;
+        while let Ok(event) = enrich_rx.try_recv() {
+            match event {
+                EnrichmentEvent::ArtistInfo { id, info } => {
+                    enrichment.add_artist_info(&id, &info);
+                    enrichment_grew = true;
+                    suggestions_stale = true;
+                }
+                EnrichmentEvent::TopSongs {
+                    artist,
+                    songs,
+                    client,
+                } => {
+                    suggest_catalog.ingest_songs(&songs, &client);
+                    enrichment.add_top_songs(&artist, &songs);
+                    enrichment_grew = true;
+                    suggestions_stale = true;
+                }
+                EnrichmentEvent::Album {
+                    name,
+                    songs,
+                    client,
+                } => {
+                    // an empty tracklist would record a track total of
+                    // zero and permanently blind both coverage
+                    // generators to the album; `asked_albums` already
+                    // stops it being re-requested.
+                    if !songs.is_empty() {
+                        suggest_catalog.ingest_album(&name, &songs, &client);
+                        suggestions_stale = true;
+                    }
+                }
+                EnrichmentEvent::JobDone => {
+                    enrich_job_in_flight = false;
+                    enrich_probe = true;
+                }
+            }
+        }
+        if enrichment_grew {
+            // a small file written at most once per frame that saw an
+            // answer; a failed write only ever costs a re-fetch.
+            let _ = enrichment.save();
+        }
+        if suggestions_stale {
+            if suggestions.is_some() {
+                let starred = suggestion_starred_keys(&remote_starred, &favorites);
+                let refreshed = recompute_suggestions(
+                    &mut suggest_catalog,
+                    &app.corpus,
+                    &cache_index,
+                    &starred,
+                    &enrichment,
+                );
+                // the list can shrink as well as grow (a row dedups
+                // into a stronger reason), so the cursor is clamped
+                // rather than assumed still valid.
+                suggestions_selected =
+                    suggestions_selected.min(ui::suggestions::count(&refreshed).saturating_sub(1));
+                suggestions = Some(refreshed);
+            }
+            suggestions_stale = false;
+        }
+        if suggestions.is_some() && !suggestions_open_last_frame {
+            enrich_probe = true;
+        }
+        suggestions_open_last_frame = suggestions.is_some();
+        // warm up only while the menu is open: these are network calls
+        // for one feature, nobody should pay for them unprompted, and
+        // the next batch is only picked once the last one finished.
+        if enrich_probe && !enrich_job_in_flight {
+            enrich_probe = false;
+            if suggestions.is_some() {
+                let starred = suggestion_starred_keys(&remote_starred, &favorites);
+                let guard = cache_index.lock().expect("cache mutex poisoned");
+                let job = next_enrichment_job(
+                    &suggest_catalog,
+                    &guard,
+                    &starred,
+                    &enrichment,
+                    &asked_albums,
+                );
+                drop(guard);
+                if !job.is_empty() {
+                    asked_albums.extend(job.albums.iter().map(|a| a.id.clone()));
+                    enrich_job_in_flight = enrich_job_tx.send(job).is_ok();
+                }
+            }
         }
 
         if last_cache_sweep.elapsed() >= CACHE_SWEEP_INTERVAL {
@@ -5392,16 +5771,19 @@ fn main() -> anyhow::Result<()> {
                         suggestions = None;
                         focus = Focus::Sidebar;
                     } else {
+                        // opens instantly off what is already known;
+                        // the background fetches that make the
+                        // network-fed generators fire are kicked off
+                        // by the main loop's enrichment probe, and the
+                        // menu refills itself as they land.
                         let starred = suggestion_starred_keys(&remote_starred, &favorites);
-                        let catalog = suggest::Catalog::from_corpus(&app.corpus);
-                        let guard = cache_index.lock().expect("cache mutex poisoned");
-                        suggestions = Some(suggest::suggest(&suggest::Request::new(
-                            &catalog,
-                            &guard,
+                        suggestions = Some(recompute_suggestions(
+                            &mut suggest_catalog,
+                            &app.corpus,
+                            &cache_index,
                             &starred,
-                            cache::now_secs(),
-                        )));
-                        drop(guard);
+                            &enrichment,
+                        ));
                         suggestions_selected = 0;
                         focus = Focus::Workspace;
                     }
@@ -6123,5 +6505,214 @@ mod startup_tests {
             let msg = loading_message(scanning, syncing).unwrap();
             assert!(msg.len() <= 30, "{msg:?} would be truncated in the sidebar");
         }
+    }
+}
+
+#[cfg(test)]
+mod enrichment_plumbing_tests {
+    use super::*;
+    use crate::browse::tests::test_client;
+
+    /// `days` consecutive distinct days ending today, one play each.
+    /// `CacheIndex::record_play` stamps `last_played_secs` off the wall
+    /// clock, so the day labels have to come off the same clock or the
+    /// recency decay and the day count disagree.
+    fn play(cache: &mut CacheIndex, id: &str, days: u64) {
+        let now = cache::now_secs();
+        for back in (0..days).rev() {
+            cache.record_play(id, &cache::day_of(now - back * 86_400));
+        }
+    }
+
+    fn song(id: &str, artist: &str, album: &str) -> subsonic::Song {
+        subsonic::Song {
+            id: id.into(),
+            title: format!("track {id}"),
+            artist: artist.into(),
+            album: album.into(),
+            duration: None,
+            genres: Vec::new(),
+        }
+    }
+
+    fn catalog_of(
+        artists: Vec<subsonic::Artist>,
+        albums: Vec<subsonic::Album>,
+        songs: Vec<subsonic::Song>,
+    ) -> suggest::Catalog {
+        let mut corpus = search::Corpus::new();
+        corpus.add_subsonic_search_result(
+            subsonic::SearchResult {
+                artists,
+                albums,
+                songs,
+            },
+            &test_client(),
+        );
+        suggest::Catalog::from_corpus(&corpus)
+    }
+
+    fn two_artists() -> suggest::Catalog {
+        catalog_of(
+            vec![
+                subsonic::Artist {
+                    id: "ar-bladee".into(),
+                    name: "Bladee".into(),
+                },
+                subsonic::Artist {
+                    id: "ar-burial".into(),
+                    name: "Burial".into(),
+                },
+            ],
+            Vec::new(),
+            vec![
+                song("b1", "Bladee", "Eversince"),
+                song("u1", "Burial", "Untrue"),
+            ],
+        )
+    }
+
+    /// One album per index, each with one song, so album affinity
+    /// orders exactly as the play counts do.
+    fn many_albums(n: usize) -> suggest::Catalog {
+        catalog_of(
+            Vec::new(),
+            (0..n)
+                .map(|i| subsonic::Album {
+                    id: format!("al-{i}"),
+                    name: format!("album {i}"),
+                    artist: "Bladee".into(),
+                })
+                .collect(),
+            (0..n)
+                .map(|i| song(&format!("s{i}"), "Bladee", &format!("album {i}")))
+                .collect(),
+        )
+    }
+
+    fn job(
+        catalog: &suggest::Catalog,
+        cache: &CacheIndex,
+        enrichment: &suggest::EnrichmentCache,
+        asked_albums: &HashSet<String>,
+    ) -> EnrichmentJob {
+        next_enrichment_job(catalog, cache, &HashSet::new(), enrichment, asked_albums)
+    }
+
+    #[test]
+    fn the_job_takes_the_top_affinity_artists_in_order() {
+        let catalog = two_artists();
+        let mut cache = CacheIndex::default();
+        play(&mut cache, "b1", 5);
+        play(&mut cache, "u1", 2);
+        let job = job(
+            &catalog,
+            &cache,
+            &suggest::EnrichmentCache::new(),
+            &HashSet::new(),
+        );
+        let names: Vec<&str> = job.artists.iter().map(|a| a.target.name.as_str()).collect();
+        assert_eq!(names, ["Bladee", "Burial"]);
+        assert!(
+            job.artists.iter().all(|a| a.similar && a.top),
+            "nothing asked yet, so both halves are still open"
+        );
+    }
+
+    #[test]
+    fn an_answered_artist_is_not_asked_about_again() {
+        let catalog = two_artists();
+        let mut cache = CacheIndex::default();
+        play(&mut cache, "b1", 5);
+        play(&mut cache, "u1", 2);
+        let mut enrichment = suggest::EnrichmentCache::new();
+        // both halves answered, both of them negatively.
+        enrichment.add_artist_info("ar-bladee", &subsonic::ArtistInfo::default());
+        enrichment.add_top_songs("Bladee", &[]);
+        // and one half answered for the other artist.
+        enrichment.add_top_songs("Burial", &[song("x", "Burial", "Untrue")]);
+
+        let job = job(&catalog, &cache, &enrichment, &HashSet::new());
+        let names: Vec<&str> = job.artists.iter().map(|a| a.target.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Burial"],
+            "an empty answer is an answer; re-asking it every open is unbounded cost"
+        );
+        assert!(job.artists[0].similar);
+        assert!(!job.artists[0].top);
+        assert_eq!(
+            job.fetches().len(),
+            1,
+            "only the half that is actually still open gets fetched"
+        );
+    }
+
+    #[test]
+    fn the_album_cap_holds_and_asked_albums_drop_out() {
+        let catalog = many_albums(ENRICH_ALBUMS_PER_JOB * 2);
+        let mut cache = CacheIndex::default();
+        // later albums are played on more days, so affinity order is
+        // the reverse of the id order and a plain "first n" would fail.
+        for i in 0..ENRICH_ALBUMS_PER_JOB * 2 {
+            play(&mut cache, &format!("s{i}"), i as u64 + 1);
+        }
+        let enrichment = suggest::EnrichmentCache::new();
+        let first = job(&catalog, &cache, &enrichment, &HashSet::new());
+        assert_eq!(first.albums.len(), ENRICH_ALBUMS_PER_JOB);
+        let names: Vec<&str> = first.albums.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names[0],
+            format!("album {}", ENRICH_ALBUMS_PER_JOB * 2 - 1),
+            "highest affinity first: {names:?}"
+        );
+
+        let asked: HashSet<String> = first.albums.iter().map(|a| a.id.clone()).collect();
+        let second = job(&catalog, &cache, &enrichment, &asked);
+        assert_eq!(second.albums.len(), ENRICH_ALBUMS_PER_JOB);
+        assert!(
+            second.albums.iter().all(|a| !asked.contains(&a.id)),
+            "a batch never re-asks what the last one already asked"
+        );
+
+        let everything: HashSet<String> = asked
+            .into_iter()
+            .chain(second.albums.iter().map(|a| a.id.clone()))
+            .collect();
+        assert!(
+            job(&catalog, &cache, &enrichment, &everything).is_empty(),
+            "nothing left to ask means no job at all, not an empty one fired forever"
+        );
+    }
+
+    #[test]
+    fn artists_are_fetched_before_albums() {
+        // artists are two calls each and each unlocks a whole
+        // generator; album coverage only ever improves incrementally.
+        let catalog = catalog_of(
+            vec![subsonic::Artist {
+                id: "ar-bladee".into(),
+                name: "Bladee".into(),
+            }],
+            vec![subsonic::Album {
+                id: "al-1".into(),
+                name: "Eversince".into(),
+                artist: "Bladee".into(),
+            }],
+            vec![song("b1", "Bladee", "Eversince")],
+        );
+        let mut cache = CacheIndex::default();
+        play(&mut cache, "b1", 4);
+        let fetches = job(
+            &catalog,
+            &cache,
+            &suggest::EnrichmentCache::new(),
+            &HashSet::new(),
+        )
+        .fetches();
+        assert!(matches!(fetches[0], Fetch::Similar { .. }));
+        assert!(matches!(fetches[1], Fetch::Top { .. }));
+        assert!(matches!(fetches[2], Fetch::Album(_)));
+        assert_eq!(fetches.len(), 3);
     }
 }
