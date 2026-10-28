@@ -3,9 +3,12 @@
 //! we need (ping, catalog browsing, playlists, stream urls) is small enough that
 //! owning it directly is simpler than fighting someone else's types.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use md5::{Digest, Md5};
 use rand::Rng;
@@ -38,6 +41,99 @@ const ALBUM_PAGE_SIZE: usize = 500;
 /// server at the same time.
 const ALBUM_PAGE_CONCURRENCY: usize = 4;
 
+/// How long a cached navigation answer (a tracklist, an album's year,
+/// an artist's album list, a bio) may be served from memory. Pinned to
+/// the background catalog sync's own interval, so nothing a server
+/// changes is ever more than one sync cycle stale; see
+/// docs/startup-cache.md.
+const NAV_CACHE_TTL: Duration = Duration::from_secs(45);
+
+/// Cached navigation answers per server. 256 covers any plausible
+/// browsing session (an album tracklist each) and bounds what a day-
+/// long session can hold.
+const NAV_CACHE_CAPACITY: usize = 256;
+
+/// One cached response, with when it was fetched.
+struct CachedResponse {
+    at: Instant,
+    value: serde_json::Value,
+}
+
+/// Request-keyed navigation responses plus the catalog fingerprints
+/// that invalidate them. Insertion-ordered keys so the cap evicts the
+/// oldest entry rather than an arbitrary one.
+#[derive(Default)]
+struct NavCache {
+    entries: HashMap<String, CachedResponse>,
+    order: Vec<String>,
+    /// Per catalog endpoint, a digest of the ids it last answered with
+    /// (see `catalog_fingerprint`). A change means the server's
+    /// catalog moved under us, so every cached tracklist for it is
+    /// suspect and goes immediately rather than waiting out its ttl.
+    fingerprints: HashMap<&'static str, String>,
+}
+
+impl NavCache {
+    fn get(&self, key: &str) -> Option<serde_json::Value> {
+        let hit = self.entries.get(key)?;
+        (hit.at.elapsed() < NAV_CACHE_TTL).then(|| hit.value.clone())
+    }
+
+    fn put(&mut self, key: String, value: serde_json::Value) {
+        self.order.retain(|k| k != &key);
+        self.order.push(key.clone());
+        self.entries.insert(
+            key,
+            CachedResponse {
+                at: Instant::now(),
+                value,
+            },
+        );
+        while self.order.len() > NAV_CACHE_CAPACITY {
+            let oldest = self.order.remove(0);
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+}
+
+/// Navigation caches keyed by `username@base_url`, so every `Client`
+/// built for one server shares one: the catalog sync builds a fresh
+/// client per pass, and it is the thing that knows the catalog
+/// changed, while the clients the corpus hands to the ui live for the
+/// whole session. Holds parsed responses and id digests only, never a
+/// credential (see docs/security.md).
+static NAV_CACHES: OnceLock<Mutex<HashMap<String, Arc<Mutex<NavCache>>>>> = OnceLock::new();
+
+fn nav_cache_for(username: &str, base_url: &str) -> Arc<Mutex<NavCache>> {
+    let registry = NAV_CACHES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = format!("{username}@{base_url}");
+    let Ok(mut registry) = registry.lock() else {
+        // a poisoned registry means some thread panicked holding it;
+        // an unshared cache is still correct, just not shared.
+        return Arc::new(Mutex::new(NavCache::default()));
+    };
+    registry.entry(key).or_default().clone()
+}
+
+/// Order-independent digest of whatever ids a catalog endpoint
+/// answered with: the cheapest "did this server's catalog change"
+/// signal available without the server telling us.
+fn catalog_fingerprint(ids: impl Iterator<Item = impl AsRef<str>>) -> String {
+    let mut sorted: Vec<String> = ids.map(|id| id.as_ref().to_string()).collect();
+    sorted.sort_unstable();
+    let mut hasher = Md5::new();
+    for id in sorted {
+        hasher.update(id.as_bytes());
+        hasher.update(b"\n");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// Cheap to clone (ureq's `Agent` is `Arc`-backed internally); every
 /// remote `SearchItem` carries an `Arc<Client>` so playback can later
 /// resolve to the right server's stream url without the app needing a
@@ -59,6 +155,9 @@ pub struct Client {
     /// own configured transcoding profile decide," the default.
     max_bitrate_kbps: Option<u32>,
     transcode_format: Option<String>,
+    /// Shared with every other `Client` for the same server; see
+    /// `NAV_CACHES`.
+    nav_cache: Arc<Mutex<NavCache>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -185,8 +284,10 @@ impl Client {
     }
 
     pub fn new(cfg: &NavidromeConfig) -> anyhow::Result<Self> {
+        let base_url = normalize_url(&cfg.url);
         Ok(Client {
-            base_url: normalize_url(&cfg.url),
+            nav_cache: nav_cache_for(&cfg.username, &base_url),
+            base_url,
             username: cfg.username.clone(),
             password: Zeroizing::new(cfg.resolve_password()?),
             agent: ureq::AgentBuilder::new()
@@ -243,6 +344,57 @@ impl Client {
         Ok(serde_json::to_value(body.subsonic_response)?)
     }
 
+    /// `get` for the listings a navigation hit is made of, served from
+    /// memory while an answer younger than `NAV_CACHE_TTL` is around.
+    /// Only ever used for idempotent reads whose answer is the same
+    /// for every caller; the catalog endpoints deliberately stay
+    /// uncached, since they are the invalidation signal and the thing
+    /// asking for them is the sync that wants fresh data.
+    fn get_cached(
+        &self,
+        endpoint: &str,
+        extra: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        let key = extra.iter().fold(endpoint.to_string(), |mut key, (k, v)| {
+            key.push('\u{1f}');
+            key.push_str(k);
+            key.push('=');
+            key.push_str(v);
+            key
+        });
+        if let Some(hit) = self.nav_cache.lock().ok().and_then(|c| c.get(&key)) {
+            return Ok(hit);
+        }
+        let value = self.get(endpoint, extra)?;
+        if let Ok(mut cache) = self.nav_cache.lock() {
+            cache.put(key, value.clone());
+        }
+        Ok(value)
+    }
+
+    /// Drops every cached navigation answer for this server when
+    /// `ids` differ from what the same endpoint answered last time.
+    /// Called from the catalog endpoints, which is what makes the
+    /// background sync the invalidation path rather than the ttl
+    /// alone.
+    fn invalidate_on_catalog_change(
+        &self,
+        endpoint: &'static str,
+        ids: impl Iterator<Item = impl AsRef<str>>,
+    ) {
+        let fingerprint = catalog_fingerprint(ids);
+        let Ok(mut cache) = self.nav_cache.lock() else {
+            return;
+        };
+        match cache.fingerprints.insert(endpoint, fingerprint.clone()) {
+            // first catalog fetch of the process: nothing cached yet
+            // from before it, so there is nothing to drop.
+            None => {}
+            Some(previous) if previous == fingerprint => {}
+            Some(_) => cache.clear(),
+        }
+    }
+
     pub fn ping(&self) -> anyhow::Result<()> {
         self.get("ping", &[])?;
         Ok(())
@@ -254,7 +406,7 @@ impl Client {
     /// album into its actual tracks and to populate the track-listing
     /// view when you open one.
     pub fn get_album(&self, album_id: &str) -> anyhow::Result<AlbumDetails> {
-        let v = self.get("getAlbum", &[("id", album_id)])?;
+        let v = self.get_cached("getAlbum", &[("id", album_id)])?;
         let album = v.get("album");
         Ok(AlbumDetails {
             year: album
@@ -270,7 +422,7 @@ impl Client {
     /// songs; see `get_album` per-album for those (and the Global/
     /// Various-Artists filtering that requires).
     pub fn get_artist(&self, artist_id: &str) -> anyhow::Result<Vec<ArtistAlbum>> {
-        let v = self.get("getArtist", &[("id", artist_id)])?;
+        let v = self.get_cached("getArtist", &[("id", artist_id)])?;
         Ok(parse_artist_albums(&v))
     }
 
@@ -280,7 +432,7 @@ impl Client {
     /// when the server has nothing (unknown artist, no internet
     /// metadata lookup configured, etc.).
     pub fn get_artist_info(&self, artist_id: &str) -> anyhow::Result<ArtistInfo> {
-        let v = self.get("getArtistInfo2", &[("id", artist_id)])?;
+        let v = self.get_cached("getArtistInfo2", &[("id", artist_id)])?;
         Ok(parse_artist_info(&v))
     }
 
@@ -294,7 +446,7 @@ impl Client {
     /// `entry`, not `song`, but the per-track shape is identical.
     /// Playlists have no release year, so no metadata wrapper needed.
     pub fn get_playlist_songs(&self, playlist_id: &str) -> anyhow::Result<Vec<Song>> {
-        let v = self.get("getPlaylist", &[("id", playlist_id)])?;
+        let v = self.get_cached("getPlaylist", &[("id", playlist_id)])?;
         Ok(parse_song_array(
             v.get("playlist").and_then(|p| p.get("entry")),
         ))
@@ -338,6 +490,7 @@ impl Client {
                     .collect()
             })
             .unwrap_or_default();
+        self.invalidate_on_catalog_change("getPlaylists", list.iter().map(|p| &p.id));
         Ok(list)
     }
 
@@ -349,6 +502,7 @@ impl Client {
     pub fn all_artists(&self) -> anyhow::Result<Vec<Artist>> {
         let v = self.get("getArtists", &[])?;
         let artists = parse_artists_index(&v);
+        self.invalidate_on_catalog_change("getArtists", artists.iter().map(|a| &a.id));
         Ok(artists)
     }
 
@@ -368,6 +522,12 @@ impl Client {
     /// end of the catalog (one short of a full wave, worst case),
     /// which answer empty; only libraries over one page pay it at all.
     pub fn all_albums(&self) -> anyhow::Result<Vec<Album>> {
+        let albums = self.all_album_pages()?;
+        self.invalidate_on_catalog_change("getAlbumList2", albums.iter().map(|a| &a.id));
+        Ok(albums)
+    }
+
+    fn all_album_pages(&self) -> anyhow::Result<Vec<Album>> {
         let mut albums = self.album_page(0)?;
         if albums.len() < ALBUM_PAGE_SIZE {
             return Ok(albums);
@@ -626,7 +786,7 @@ impl Client {
     /// artist you love that you have never played" suggestion, which
     /// plain play-coverage can't rank on its own.
     pub fn get_top_songs(&self, artist_name: &str, count: usize) -> anyhow::Result<Vec<Song>> {
-        let v = self.get(
+        let v = self.get_cached(
             "getTopSongs",
             &[("artist", artist_name), ("count", &count.to_string())],
         )?;
@@ -984,6 +1144,13 @@ mod tests {
         fn with_catalog_albums(self, total: usize) -> MockServer {
             self.catalog.albums.store(total, Ordering::Relaxed);
             self
+        }
+
+        /// Same album count, different ids: a catalog that changed
+        /// under the client, which is what has to drop cached
+        /// tracklists.
+        fn replace_catalog(&self) {
+            self.catalog.rev.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1547,6 +1714,105 @@ mod tests {
         );
         assert_eq!(serial, waved);
         assert!(waved_elapsed * 2 < serial_elapsed);
+    }
+
+    #[test]
+    fn opening_the_same_album_twice_costs_one_request() {
+        let server = MockServer::start(2, 3, Duration::ZERO);
+        let client = server.client();
+        let first = client.get_album("al-0").unwrap();
+        let second = client.get_album("al-0").unwrap();
+        assert_eq!(first.songs.len(), second.songs.len());
+        assert_eq!(first.year, second.year);
+        assert_eq!(server.requests(), 1, "the second open must be served warm");
+
+        client.get_album("al-1").unwrap();
+        assert_eq!(server.requests(), 2, "a different album is its own key");
+    }
+
+    /// Opening an artist, then one of their albums, used to re-ask for
+    /// a tracklist the artist fetch had already read.
+    #[test]
+    fn an_artist_page_reopened_costs_nothing() {
+        let server = MockServer::start(6, 4, Duration::ZERO);
+        let client = server.client();
+        assert_eq!(client.artist_albums_with_tracks("ar-1").unwrap().len(), 6);
+        assert_eq!(server.requests(), 7); // getArtist + one per album
+        assert_eq!(client.artist_albums_with_tracks("ar-1").unwrap().len(), 6);
+        client.get_album("al-3").unwrap();
+        assert_eq!(
+            server.requests(),
+            7,
+            "reopening an artist within the ttl must not re-ask for anything"
+        );
+    }
+
+    /// The invalidation path: the background catalog sync is what
+    /// notices a server's catalog moved, and every cached tracklist
+    /// for it has to go at that point rather than waiting out its ttl.
+    #[test]
+    fn a_changed_catalog_drops_cached_tracklists() {
+        let server = MockServer::start(2, 3, Duration::ZERO).with_catalog_albums(10);
+        // the sync client and the client the corpus hands the ui are
+        // different instances for the same server, exactly as in the
+        // app; they share one cache.
+        let syncing = server.client();
+        let browsing = server.client();
+
+        syncing.all_albums().unwrap(); // first fingerprint
+        browsing.get_album("al-0").unwrap();
+        browsing.get_album("al-0").unwrap();
+        let before = server.requests();
+
+        syncing.all_albums().unwrap(); // unchanged: nothing dropped
+        browsing.get_album("al-0").unwrap();
+        assert_eq!(
+            server.requests(),
+            before + 1,
+            "an unchanged catalog must not throw the cache away"
+        );
+
+        server.replace_catalog();
+        syncing.all_albums().unwrap();
+        let after_sync = server.requests();
+        browsing.get_album("al-0").unwrap();
+        assert_eq!(
+            server.requests(),
+            after_sync + 1,
+            "a changed catalog must force the next open to refetch"
+        );
+    }
+
+    #[test]
+    fn a_cached_answer_past_its_ttl_is_not_served() {
+        let mut cache = NavCache::default();
+        let key = "getAlbum\u{1f}id=al-1".to_string();
+        cache.put(key.clone(), serde_json::json!({"album": {}}));
+        assert!(cache.get(&key).is_some());
+        // backdate past the ttl rather than sleeping through it
+        if let Some(entry) = cache.entries.get_mut(&key) {
+            entry.at = Instant::now() - NAV_CACHE_TTL - Duration::from_secs(1);
+        }
+        assert!(
+            cache.get(&key).is_none(),
+            "nothing may be served for longer than one sync interval"
+        );
+    }
+
+    #[test]
+    fn the_response_cache_stays_bounded() {
+        let mut cache = NavCache::default();
+        for i in 0..NAV_CACHE_CAPACITY + 50 {
+            cache.put(format!("getAlbum\u{1f}id=al-{i}"), serde_json::json!(i));
+        }
+        assert_eq!(cache.entries.len(), NAV_CACHE_CAPACITY);
+        assert_eq!(cache.order.len(), NAV_CACHE_CAPACITY);
+        assert!(
+            cache.get("getAlbum\u{1f}id=al-0").is_none(),
+            "the oldest entry is the one that goes"
+        );
+        let newest = format!("getAlbum\u{1f}id=al-{}", NAV_CACHE_CAPACITY + 49);
+        assert!(cache.get(&newest).is_some());
     }
 
     /// Serial-vs-parallel numbers for the artist page against the mock
