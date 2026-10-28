@@ -9,10 +9,11 @@ screen; you type calls into it.
 : repeat(3, skip())
 : dry(queue_aa([crest]))
 : moveto(1m20s)
-: show(queue)
+: view(q, bladee)
+: view(queue)
 ```
 
-implemented in `src/shellsong.rs` (language, pure) and
+implemented in `src/shellsong.rs` (language and completion, pure) and
 `src/ui/shellsong.rs` (the overlay, pure render).
 
 ## consistency rules
@@ -44,8 +45,16 @@ should be added that breaks one.
   tell you which one you meant.
 - **r9. nothing is silent.** every call reports one line into the
   scrollback, including no-ops.
-- **r10. one name, one meaning.** no arity overloading; introspection
-  lives in `show()` rather than in a bare call to something else.
+- **r10. one name, one meaning.** no arity overloading, and no second
+  name for something a first name already does. every screen is a
+  `view` target rather than its own verb.
+- **r11. omitting the terms means the current selection.** uniformly,
+  for every command that takes them: `star()` stars what is
+  highlighted, `star(flatline)` stars what that finds. one meaning
+  ("operate on terms, defaulting to the selection"), one code path.
+- **r12. completion is driven by the declared parameter type.** a
+  parameter either has a candidate list worth inserting or it has none
+  and gets a hint. nothing is ever guessed.
 
 ## grammar
 
@@ -65,36 +74,41 @@ comment    := '#' ... end of line
 - a call may span lines; splitting is nesting-aware.
 - a trailing comma is allowed in a list and in an argument list.
 - quotes are only needed for an item containing a literal comma.
-- `q` is deliberately not an alias for anything: it is ambiguous
-  between `queue` and `quit`, so neither claims it.
+- `q` is deliberately not an alias for anything at statement level: it
+  is ambiguous between `queue` and `quit`, so neither claims it. it
+  *is* the keyword that switches `view` into its search form, where
+  there is nothing to be ambiguous with.
 
 ## parameter types
 
 each command declares its parameters by type, and the parser validates
 against that. this is what tells `front` from a search term in
-`add_to_queue(front, flatline)`, and it is where the arity and type
-error messages come from.
+`add_to_queue(front, flatline)`, where the arity and type error
+messages come from, and (r12) what completion offers.
 
-| type | accepts |
-| --- | --- |
-| `terms` | a term, or `[a, b, c]` (r4, r5) |
-| `name` | free text: a query, a playlist name, a command name |
-| `pos` | an unsigned time literal (absolute position) |
-| `offset` | a signed time literal (relative) |
-| `level` | a percent, absolute (`50%`) or signed (`+10%`) |
-| `count` | a whole number, 1 to 256 |
-| `index` | a 1-based queue position |
-| `indices` | one or more queue positions |
-| `speed` | a multiplier 0.25-3, or `up` / `down` / `reset` |
-| `duration` | a time literal, or `off` |
-| `call` | a nested call |
-| keyword sets | one of an enumerated list (`front|back`, `one|all|off`, ...) |
+| type | accepts | completes from |
+| --- | --- | --- |
+| `terms` | a term, or `[a, b, c]` (r4, r5) | the local corpus |
+| `query` | free text to search for | the local corpus |
+| `new_name` | a name you are inventing | nothing; hint only |
+| `saved_name` | the name of a saved queue | the saved queues |
+| `command_name` | a command name | the command table |
+| `call` | a nested call | the command table |
+| keyword sets | one of an enumerated list | that list |
+| `pos` | an unsigned time literal (absolute) | nothing; hint only |
+| `offset` | a signed time literal (relative) | nothing; hint only |
+| `level` | a percent, absolute or signed | nothing; hint only |
+| `count` | a whole number, 1 to 256 | nothing; hint only |
+| `index` | a 1-based queue position | nothing; hint only |
+| `indices` | one or more queue positions | nothing; hint only |
+| `speed` | a multiplier 0.25-3, or `up` / `down` / `reset` | nothing; hint only |
+| `duration` | a time literal, or `off` | nothing; hint only |
 
 a parameter marked `?` in a signature is optional. when you pass
 exactly as many arguments as there are parameters they match strictly
 in order; when you pass fewer, an optional parameter whose value does
-not typecheck is skipped, which is how `add_to_queue(flatline)`
-defaults its position to `back`.
+not typecheck is skipped, which is how `star(flatline)` gets its term
+into the right slot.
 
 ## time literals
 
@@ -126,6 +140,20 @@ moveto(+30s)   error: moveto is absolute
 seek(+50%)     error: relative seek takes a time, not a percent
 ```
 
+## volume
+
+```
+volume(50%)    set it to 50
+volume(50)     the same; a bare number is a percent
+volume(+10%)   10 points louder than it is now
+volume(-10%)   10 points quieter
+```
+
+an absolute level above 100 is refused at parse time, and a nudge is
+applied to mpv's current volume and then clamped to 0-100. the ceiling
+is real rather than conservative: above 100 mpv applies digital gain,
+which clips. ask for `volume(100%)` if you want the top.
+
 ## kinds and ambiguity
 
 searching "crest" can match a song *and* an album. a kind preference
@@ -138,16 +166,18 @@ resolution, not filtering (r7).
 | `play` | song, album |
 | `queue` | song |
 | `queue_aa` | song, album |
-| `queue_ar` | song, album, artist |
 | `star`, `unstar`, `download` | song, album |
+| `view(q, ...)` | artist, album, playlist, song |
 
-`play` being wider than `queue` is deliberate and intentional: playing
-an album is an ordinary thing to want, building a *queue* out of albums
-is not. do not "fix" the asymmetry.
+`play` being wider than `queue` is deliberate: playing an album is an
+ordinary thing to want, building a *queue* out of albums is not. do not
+"fix" the asymmetry.
 
-artists never expand by default. a `queue_ar` queueing an artist hands
-the whole artist to the host's existing expansion, which is almost
-never what you meant; it exists for completeness, not for daily use.
+`view` is wider still and in a different order, because it opens pages
+and an artist is the thing that most has one. being a different order
+rather than a wider one is also why `kind=` and the suffixes do not
+apply to it: the ladder below widens *from songs*, and `view` does not
+start there.
 
 an album accepted by `_aa` expands to its tracks, the same way enter on
 an album does.
@@ -157,18 +187,23 @@ an album does.
 suffixes are sugar (r6) for the `kind=` ladder. each rung only widens
 the one before it.
 
-| suffix | means |
-| --- | --- |
-| `_aa` | `kind=album` ("allow album") |
-| `_ar` | `kind=artist` |
-| `_any` | `kind=any` (also playlists and local video) |
+| suffix | means | accepts |
+| --- | --- | --- |
+| none | `kind=song` | songs (remote and local music) |
+| `_aa` | `kind=album` | songs, albums ("allow album") |
+| `_any` | `kind=any` | songs, albums, artists, playlists, local video |
 
 ```
 : dry(queue_aa([crest]))
 would run: queue(crest, kind=album)
 ```
 
-`kind=` is refused on a command that does not search.
+there is deliberately **no artist rung** (no `_ar`, no `kind=artist`).
+an artist expands to an entire discography, which is never a queue
+anyone asked for. `kind=any` remains as the explicit "i really do mean
+anything" escape hatch, and it is spelled that way on purpose.
+
+`kind=` is refused on a command that does not search, and on `view`.
 
 ### a term that matches nothing
 
@@ -180,6 +215,63 @@ a queue build. a multi-term call also reports a tally at the end.
 no song match for 'xyzzy'
 queued 2 of 3
 ```
+
+## view
+
+`view` is the one and only screen-opening command. every menu, page and
+listing is a target of it rather than its own verb (r10). `show` and
+`ls` are aliases of it, not separate commands.
+
+```
+view(target)       put a screen or listing up
+view(q, terms)     search, and open the best match's page
+```
+
+### targets
+
+| target | what it opens | also accepts |
+| --- | --- | --- |
+| `queue` | the queue, listed | |
+| `now` | the full player screen | `player` |
+| `suggestions` | the suggestions menu | `suggestion`, `suggest` |
+| `settings` | the settings menu | |
+| `keybinds` | the keybind menu | `keybind` |
+| `lyrics` | lyrics for what is playing | |
+| `starred` | the starred songs view | `favorites` |
+| `index` | the corpus breakdown, listed | |
+| `history` | past shellsong commands, listed | |
+| `playlists` | saved queues, listed | |
+| `eq` | the eq menu | `equalizer` |
+| `help` | the command listing | |
+
+an unknown target is matched against this list and suggests the closest
+real one; `view()` with nothing at all lists them.
+
+the screens take over the display and close the console behind them;
+the four listings (`queue`, `index`, `history`, `playlists`) and `help`
+print into the scrollback and leave it open. `view` means "put this on
+screen" either way, and a listing satisfies that; there is deliberately
+no second verb for the distinction.
+
+`help` is the one target generated here rather than read from the app,
+so `view(help)` and `help()` print exactly the same lines.
+
+### the query form
+
+```
+: view(q, bladee)
+: view(query, 4 star crest)
+```
+
+searches, then opens the best match's page: an artist or album opens
+its own view. **a song opens the page it belongs to rather than
+playing**, because the verb is `view`, not `play`. that is intentional;
+`play(hex)` is how you play something.
+
+the query form searches, so it goes through the same await/resume path
+`play` and `queue` do. `q` requires terms (there is no "view the
+selection" reading of "search for this"), which is the one documented
+exception to r11.
 
 ## commands
 
@@ -194,13 +286,10 @@ skip()                  next track                      [next, forward, fwd]
 back()                  previous track                  [prev, previous]
 moveto(pos)             seek to an absolute position    [move]
 seek(offset)            seek by a signed offset
-volume(level)           set or nudge the volume, clamped to 100%   [vol]
+volume(level)           set or nudge the volume         [vol]
 mute()                  mute
 unmute()                unmute
 ```
-
-volume above 100 is digital gain in mpv and clips, so it is clamped;
-ask for `volume(100%)` if you want the ceiling.
 
 ### modes
 
@@ -209,7 +298,7 @@ loop(mode?)             cycle loop mode, or set one/all/off   [repeat_mode]
 shuffle(state?)         toggle shuffle mode, or set on/off    [random, randomize, shuf]
 shuffle_queue()         reorder the queue now, without touching shuffle mode
 speed(speed)            1.5, or up / down / reset             [tempo]
-eq(preset?)             open the eq menu, or apply a preset   [equalizer]
+eq(preset)              apply a preset; view(eq) opens the menu  [equalizer]
 crossfade()             toggle crossfade                      [xfade]
 ```
 
@@ -219,23 +308,29 @@ exactly the confusion two names avoid.
 
 ### search and playback
 
+every command here takes its terms optionally; without them it acts on
+whatever is highlighted (r11).
+
 ```
 search(query)           run a search and leave the results up  [find, grep]
-play(terms)             play the first term, queue the rest
-queue(terms)            append each term to the queue          [enqueue]
-add_to_queue(position?, terms)   front inserts next, back appends (default)
+play(terms?)            play the first term, queue the rest
+queue(terms?)           append each term to the queue          [enqueue]
+add_to_queue(position, terms?)   front inserts next, back appends
 clear_queue()           empty the queue                        [clear, flush]
 remove(indices)         drop queue entries by position
 goto(index)             jump to a queue position
 save_queue(name)        save the queue as a local playlist
 load_queue(name)        replace the queue with a saved playlist
-star(terms?)            star the selection, or what each term finds  [favorite, fav, like]
+star(terms?)            star what each term finds              [favorite, fav, like]
 unstar(terms?)          the inverse                            [unfavorite, unfav, unlike]
 download(terms?)        download for offline playback          [dl, offline, cache]
 ```
 
-the zero-argument forms of `star`, `unstar` and `download` act on
-whatever is currently highlighted, matching the `*` and `o` keybinds.
+`add_to_queue`'s position is **required**. with it optional,
+`add_to_queue(back, x)` was just another spelling of `queue(x)`, which
+r10 does not allow; `front` is the capability `queue` genuinely lacks,
+so that is all the command is for. `add_to_queue(flatline)` is an error
+pointing at `queue(flatline)` or at a position.
 
 ### selection
 
@@ -247,27 +342,25 @@ top()                   select the first result
 bottom()                select the last result
 ```
 
-`go()` is no longer a composition primitive (`play()` does the whole
-search-and-play in one call), but it is still how you drive the ui from
-the console.
+`go()` means "what enter does", and what enter does depends on which
+pane owns the keyboard, so it resolves against the focus: a focused
+browse view claims it, then the bottom bar's focused field, otherwise
+the selected search result. that mirrors the app's own enter precedence
+exactly, which is the point.
 
-### introspection and overlays
+### everything else
 
 ```
-show(target)            queue / now / history / index / playlists   [ls]
-lyrics()                open lyrics for what is playing
-starred()               open the starred songs view
-settings()              open the settings menu
-keybinds()              open the keybind menu
+view(target)            see above                              [show, ls]
 rescan()                re-walk the local library
 sleep(after)            fade out and pause after a delay; sleep(off) cancels
 fade(direction, over?)  fade the volume in or out
 help(name?)             list every command, or one command's signature
-quit()                  quit wim                                    [exit]
+quit()                  quit wim                               [exit]
 ```
 
 `sleep` reuses the crossfade volume ramp rather than cutting the audio
-dead; remaining time shows in `show(now)`.
+dead; remaining time shows in `view(now)`.
 
 ### higher-order
 
@@ -289,10 +382,8 @@ desugaring. they nest: `dry(repeat(2, seek(+10s)))`.
 - `up` / `down` recall history, persisted to
   `$XDG_STATE_HOME/wim/shellsong_history`. the half-typed line comes
   back when you walk forward past the newest entry.
-- `tab` completes: command names at statement level, and the enclosing
-  parameter's keyword set inside a call (`eq(ro<tab>` becomes
-  `eq(rock)`). a unique command name gets its parens too.
-- `home` / `end` / `left` / `right` / `delete` do the obvious things.
+- `home` / `end` / `left` / `right` / `delete` do the obvious things,
+  except that `right` at the end of the line accepts a suggestion.
 
 ### auto-pairing
 
@@ -303,6 +394,116 @@ desugaring. they nest: `dry(repeat(2, seek(+10s)))`.
 - none of this applies inside a quoted string, where brackets are
   literal text.
 - a bracketed paste goes in literally, with no pairing.
+
+## completion
+
+### the one rule
+
+what a parameter completes to is decided by its declared type (r12),
+nothing else. types fall into two classes and are treated completely
+differently:
+
+- **enumerable** types have a candidate list: command names, corpus
+  names, a keyword set, the saved queues. these produce an insertable
+  suggestion.
+- **value** types have no sane candidate list, so they produce a
+  **hint** instead, which is never insertable and which no key
+  accepts. completing `volume(5` to `50%` is absurd and so it does not
+  happen.
+
+the hints:
+
+```
+volume(     0-100, or +N% / -N%
+seek(       +30s / -10s (sign required)
+moveto(     10% / 90 / 1m20s
+speed(      0.25-3.0, or up / down / reset
+sleep(      30m / off
+repeat(     how many times, 1-256
+goto(       a queue position, 1 or higher
+remove(     1, or [1, 3, 5]
+save_queue( a name to save it under
+```
+
+alongside the hint, the signature of the call you are inside shows with
+the active parameter picked out: `volume(<level>)`. a new parameter type
+has to declare candidates or a hint; declaring neither fails a test
+rather than silently completing nothing.
+
+the `up` / `down` / `reset` and `off` keywords live in those hint
+strings rather than being insertable candidates. that is the price of
+one simple rule, and it is a small one: the parameter is fundamentally
+a value, and the keywords are short enough to type.
+
+### never overwriting what you typed
+
+the corpus search is fuzzy, so subsequence and typo matches surface
+things a prefix scan would miss. candidates are then filtered to the
+ones your typed token is a case-insensitive prefix of, because
+inserting anything else would have to replace characters you typed.
+
+a fuzzy hit that is not a prefix extension is excluded from both the
+ghost and the tab cycle. accepting appends only the candidate's
+remaining characters, so your prefix survives byte for byte including
+its casing: `fl` plus `atline`, never `Flatline`. search is
+case-insensitive, so the result still resolves.
+
+the token being completed is the argument slice back to the last `(`,
+`[`, `,` or `;`, not the last word, so an item with spaces still
+completes: `queue([4 star cre` completes `4 star crest`, and
+`queue([a, fl` completes `fl` rather than the whole list.
+
+### two sources, and which wins
+
+1. **a whole past command line**, the way zsh-autosuggestions does it:
+   if everything you have typed is a prefix of a line you have run, the
+   rest of that line is ghosted. only with the cursor at the end of the
+   input, where the rest of the line is genuinely what comes next.
+2. **the token under the cursor**, from the type-driven candidates
+   above.
+
+the ghost shows the history suggestion when there is one, otherwise the
+best token candidate. **tab always cycles token candidates**, never the
+history line; the two are reached by different keys on purpose.
+
+### keys
+
+| key | does |
+| --- | --- |
+| `tab` | open the candidate menu, then step forward through it |
+| `shift+tab` | step backward |
+| `right` | accept, but only at the end of the line |
+| `ctrl+f` | accept, wherever the cursor is |
+| typing, `esc` | cancel an open menu |
+
+with exactly one candidate, `tab` just takes it. while cycling, the
+candidates are listed under the input with the current one in brackets
+and a `2/3` position indicator, so cycling is not blind. accepting a
+command name adds its parens and lands the cursor inside them, so `qu`
+plus `right` gives you `queue()` ready for arguments.
+
+### learning from use
+
+running a line and accepting a completion are both recorded in a small
+frequency/recency store next to the history file
+(`$XDG_STATE_HOME/wim/shellsong_ranks`; its own file, since history is
+a plain line list and this is a scored map). candidates are ordered by
+frequency, with recency breaking frequency ties.
+
+anything unranked keeps the order it arrived in, which matters: that is
+relevance order for corpus hits and alphabetical for names, both better
+than a reshuffle. the sort is stable, so the whole thing is
+deterministic.
+
+### performance
+
+completion runs on every keystroke, so it uses the **local corpus
+only** and never triggers a remote search; typing would otherwise spam
+the server. candidates are capped at 50 and the existing optimised
+`Corpus::search` does the scoring rather than a second scorer. the host
+supplies the corpus behind a small provider trait, which is also what
+lets the completer be tested with no corpus, no network and no
+terminal.
 
 ## non-goals
 
