@@ -563,10 +563,20 @@ run that edits these files will collide.
       columns and reintroduced the sections-falling-off-the-bottom
       failure. 38 is the widest line that table actually produces, and
       the regression test still passes at 80x24.
-- [ ] **`notify.rs` still has a per-char text loop** (around line 63),
-      the last writer outside `ui::draw`. Notification bodies include
-      track labels, so a wide-char title there overdraws exactly as
-      the migrated widgets used to.
+- [x] **`notify.rs` goes through `ui::draw`**, the last per-char text
+      writer in the app. Three width bugs, and the interesting one was
+      not the draw loop: the box sized its interior with
+      `chars().count()`, so a cjk track label in a message got a box
+      too narrow for it, and because the text writer budgets correctly
+      the symptom was not an overrun but a **silently truncated
+      message** with plenty of terminal left. The footer (the
+      countdown baked into the bottom border) was also interleaved per
+      cell with the border dashes, which a multi-cell glyph would
+      desync; it is drawn as a full rule and overwritten now. The box
+      also clears its own three rows, since it is painted over the
+      sidebar and main content and an interior cell left unwritten
+      showed through (the box can be wider than its text, see the
+      `max(4)`).
 - [ ] **decompose main.rs** (~3.9k lines). a reviewed, ordered plan
       exists: extract focus/InputMode, then the playback free functions,
       then the sync/channel plumbing, then a `struct Ui` for the ~35

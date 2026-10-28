@@ -4,7 +4,8 @@ use ratatui::widgets::Widget;
 
 use crate::notify::{Notification, Severity};
 use crate::theme::{shade, BRIGHT, MID, WHITE};
-use crate::ui::textfit::truncate_with_ellipsis;
+use crate::ui::draw;
+use crate::ui::textfit::{truncate_with_ellipsis, width as text_width};
 
 /// Bordered boxes stacked in the top-right corner, newest on top,
 /// rendered last so they sit over everything else (sidebar, main
@@ -25,7 +26,11 @@ impl Widget for NotificationOverlay<'_> {
             let text = format!("[{}] {}", n.severity.icon(), n.message);
             let max_inner = (area.width as usize).saturating_sub(4);
             let text = truncate_with_ellipsis(&text, max_inner.max(1));
-            let inner_width = (text.chars().count() as u16).max(4);
+            // cells, not chars: a cjk or emoji track label in the
+            // message measures wider than its char count, and sizing
+            // the box by chars left the text overrunning its own right
+            // border.
+            let inner_width = (text_width(&text) as u16).max(4);
             let box_width = inner_width + 2;
             let start_x = area.x + area.width.saturating_sub(box_width);
 
@@ -52,37 +57,143 @@ fn draw_box(
     footer: &str,
     color: ratatui::style::Color,
 ) {
+    if width < 2 {
+        return;
+    }
+    // own every cell of the box: these sit over the sidebar and the
+    // main content, so an interior cell left unwritten shows whatever
+    // was painted underneath (the box can be wider than its text, see
+    // the `max(4)` on `inner_width`).
+    draw::clear(buf, Rect::new(x, y, width, 3));
+
+    let right = x + width - 1;
+    let inner = (width - 2) as usize;
+
     put(buf, x, y, '┌', color);
-    put(buf, x + width - 1, y, '┐', color);
+    put(buf, right, y, '┐', color);
     for col in 1..width - 1 {
         put(buf, x + col, y, '─', color);
     }
 
     put(buf, x, y + 1, '│', color);
-    put(buf, x + width - 1, y + 1, '│', color);
-    for (i, ch) in text.chars().enumerate() {
-        put(buf, x + 1 + i as u16, y + 1, ch, color);
-    }
+    put(buf, right, y + 1, '│', color);
+    // the writer advances by display width and blanks the trailing
+    // cell of a wide glyph; a per-char `x + 1 + i` put every glyph
+    // after a wide one a cell left of where it belonged.
+    draw::at(buf, x + 1, y + 1, text, color, inner);
 
     // the countdown (or, for a download in progress, a live percentage)
     // lives in the bottom-right corner of the border itself, not a
     // separate line, so the box stays exactly 3 rows regardless of how
-    // much time is left / how far along the download is.
+    // much time is left / how far along the download is. drawn as a
+    // full rule first and then overwritten, rather than interleaved
+    // per cell, so a multi-cell glyph in the footer cannot desync the
+    // dashes around it.
     put(buf, x, y + 2, '└', color);
-    put(buf, x + width - 1, y + 2, '┘', color);
-    let footer_width = footer.chars().count() as u16;
-    let footer_start = (width - 1).saturating_sub(footer_width);
+    put(buf, right, y + 2, '┘', color);
     for col in 1..width - 1 {
-        let in_footer = col >= footer_start && col - footer_start < footer_width;
-        let ch = if in_footer {
-            footer.chars().nth((col - footer_start) as usize).unwrap()
-        } else {
-            '─'
-        };
-        put(buf, x + col, y + 2, ch, color);
+        put(buf, x + col, y + 2, '─', color);
+    }
+    let footer = truncate_with_ellipsis(footer, inner);
+    let footer_cells = text_width(&footer) as u16;
+    if footer_cells > 0 {
+        draw::at(
+            buf,
+            right.saturating_sub(footer_cells),
+            y + 2,
+            &footer,
+            color,
+            footer_cells as usize,
+        );
     }
 }
 
 fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: ratatui::style::Color) {
     crate::ui::draw::put(buf, x, y, ch, color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notify::{Notifications, Severity};
+    use crate::ui::testbuf::{buffer, char_at, grid, plated_buffer};
+
+    fn one(severity: Severity, message: &str) -> Notifications {
+        let mut n = Notifications::default();
+        n.push(severity, message);
+        n
+    }
+
+    fn render(n: &Notifications, w: u16, h: u16) -> Buffer {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = buffer(w, h);
+        NotificationOverlay { items: n.visible() }.render(area, &mut buf);
+        buf
+    }
+
+    #[test]
+    fn the_box_is_three_rows_with_a_closed_border() {
+        let n = one(Severity::Info, "queued 3 tracks");
+        let buf = render(&n, 40, 8);
+        let g = grid(&buf);
+        assert!(g.contains('┌') && g.contains('┐'), "{g}");
+        assert!(g.contains('└') && g.contains('┘'), "{g}");
+        assert!(g.contains("queued 3 tracks"), "{g}");
+    }
+
+    #[test]
+    fn a_wide_character_message_is_not_silently_clipped() {
+        // the box is sized in cells now. sizing it by char count made
+        // it too narrow for a cjk title, and since the text writer
+        // budgets correctly the symptom was not an overrun but a
+        // silently truncated message: the box simply cut the title off
+        // with plenty of terminal left.
+        let n = one(Severity::Info, "queued: 日本語のタイトル");
+        let buf = render(&n, 60, 8);
+        let g = grid(&buf);
+        // asserted on the last glyph rather than the whole string:
+        // `grid` reads one char per cell and a wide glyph owns two, so
+        // the rendered row carries a blank after each one.
+        assert!(
+            g.contains('ル'),
+            "the title's last glyph was clipped by an undersized box:\n{g}"
+        );
+    }
+
+    #[test]
+    fn the_countdown_sits_in_the_bottom_border() {
+        let n = one(Severity::Error, "error loading file");
+        let buf = render(&n, 40, 8);
+        let bottom = grid(&buf).lines().nth(2).unwrap().to_string();
+        assert!(bottom.contains('s'), "a countdown belongs here: {bottom:?}");
+        assert!(bottom.starts_with(|c: char| c == ' ' || c == '└') || bottom.contains('└'));
+    }
+
+    #[test]
+    fn the_box_covers_everything_underneath_it() {
+        // these sit over the sidebar and main content, so an interior
+        // cell left unwritten shows whatever was painted there.
+        let n = one(Severity::Info, "ok");
+        let area = Rect::new(0, 0, 40, 8);
+        let mut buf = plated_buffer(40, 8);
+        NotificationOverlay { items: n.visible() }.render(area, &mut buf);
+        // find the box's left edge on its middle row
+        let left = (0..40)
+            .find(|x| char_at(&buf, *x, 1) == '│')
+            .expect("a left border");
+        for x in left..40 {
+            let c = char_at(&buf, x, 1);
+            assert_ne!(c, '¤', "bleed-through at x={x} on the box's row");
+        }
+    }
+
+    #[test]
+    fn renders_at_degenerate_sizes_without_panicking() {
+        let n = one(Severity::Alert, "something happened");
+        for (w, h) in [(1, 1), (2, 3), (0, 8), (40, 0), (5, 2), (6, 3)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = buffer(w.max(1), h.max(1));
+            NotificationOverlay { items: n.visible() }.render(area, &mut buf);
+        }
+    }
 }
