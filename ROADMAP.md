@@ -552,24 +552,19 @@ docs rather than forcing one of them.
       rate.** `selection_pulsing` only counted the browse view for
       `Focus::Workspace`, so both of those idled at the 100ms poll and
       animated their selection plate at a tenth of the display rate.
-- [ ] **the navidrome step has no progress rail.** steps 1, 2, 4, 5
-      and 6 show it; step 3 does not, because that screen is
-      `ui::login::LoginView`, shared with the standalone "reopen
-      navidrome setup" path where a "step 3 of 6" rail would be a lie.
-      it needs an optional progress field set only from the onboarding
-      render site. left out rather than hacked: an inconsistent rail is
-      worse than a missing one only on the screen that cannot honestly
-      carry it, and this needs one more call-site field.
-- [x] **help.rs pads its key column by char count.** fixed: the 13-cell
-      column is now padded by `textfit::width` from the resolved label,
-      as a named `KEY_COLUMN` const (kept fixed rather than derived from
-      the widest label, since one long rebind would otherwise shift
-      every description in the table, and `MIN_COLUMN_WIDTH` is computed
-      from it). verified by reverting just the padding: the wide-char
-      row's description sat at cell 19 against every other row's 18.
-      note for the next person writing one of these tests: `str::find`
-      returns a BYTE offset, so a three-byte two-cell glyph makes it
-      compare the wrong thing; count chars over the prefix instead.
+- [x] **the navidrome step has no progress rail.** done, and it was
+      more than the rail: step 3 is `ui::login::LoginView`, which drew
+      top-aligned behind a `draw_header` with no frame, so the flow
+      visibly changed shape in the middle. the chrome is extracted out
+      of `Screen::render` into `ui::onboarding::chrome(buf, area, step)`
+      and login borrows it, which also removes the duplicate rail math.
+      `LoginView::step` is `Option<usize>`: `Some` only from the
+      onboarding render site (via `NAVIDROME_STEP`), `None` from the
+      profile manager's add form and the standalone reopen, where
+      "step 3 of 6" would be a lie. both are pinned by tests, the
+      standalone one asserting the absence of a frame and rail so the
+      shared path cannot be changed by accident.
+
 - [ ] **shellsong's `eq(<preset>)` cannot reach saved curves.** it
       resolves names through `eq::index_of`, which is built-ins only.
       `eq::resolve(name, &cfg.eq_custom_presets)` already returns
