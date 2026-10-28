@@ -428,13 +428,40 @@ impl Corpus {
     /// order so nucleo alone would miss it). An item counts as a match if
     /// *either* signal fires, so a typo never silently returns nothing.
     pub fn search(&self, query: &str) -> Vec<SearchItem> {
+        self.ranked(query).into_iter().cloned().collect()
+    }
+
+    /// The primary names of the best matches, deduped and capped at
+    /// `cap`. Exactly `search`'s ranking and order, since it reads the
+    /// same `ranked` list; it just stops at `cap` names and clones a
+    /// name rather than a whole `SearchItem` per match, which is what
+    /// shellsong's completion wants on every keystroke.
+    pub fn search_names(&self, query: &str, cap: usize) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for item in self.ranked(query) {
+            let name = item.primary_name();
+            if name.is_empty() || !seen.insert(name) {
+                continue;
+            }
+            names.push(name.to_string());
+            if names.len() >= cap {
+                break;
+            }
+        }
+        names
+    }
+
+    /// Ranked matches, borrowed: scoring, the relative cutoff and the
+    /// category grouping, which is everything both public search
+    /// entry points share. One code path, so they cannot rank
+    /// differently.
+    fn ranked(&self, query: &str) -> Vec<&SearchItem> {
         if query.trim().is_empty() {
             return Vec::new();
         }
-        let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
         let query_lower = query.to_lowercase();
-        let query_len = query_lower.chars().count();
-        let typo_budget = edit_distance_budget(query_len);
+        let needle = Needle::new(query, &query_lower);
 
         let mut scored: Vec<(u32, &SearchItem)> = if self.items.len() >= PARALLEL_SCORING_FLOOR {
             // chunks are joined back in corpus order, so the stable
@@ -448,14 +475,7 @@ impl Corpus {
                     .map(|part| {
                         scope.spawn(|| {
                             let mut scratch = Scratch::default();
-                            score_chunk(
-                                part,
-                                &pattern,
-                                &query_lower,
-                                query_len,
-                                typo_budget,
-                                &mut scratch,
-                            )
+                            score_chunk(part, &needle, &mut scratch)
                         })
                     })
                     .collect::<Vec<_>>()
@@ -466,14 +486,7 @@ impl Corpus {
             parts.concat()
         } else {
             let mut scratch = self.scratch.borrow_mut();
-            score_chunk(
-                &self.items,
-                &pattern,
-                &query_lower,
-                query_len,
-                typo_budget,
-                &mut scratch,
-            )
+            score_chunk(&self.items, &needle, &mut scratch)
         };
 
         scored.sort_by_key(|a| std::cmp::Reverse(a.0));
@@ -508,56 +521,111 @@ impl Corpus {
         // searching "bladee" with a 100% artist match still puts
         // Artists first even though a song titled "Rewind feat.
         // Bladee" might outscore the rest of that artist's own songs.
+        // one pass into per-category buckets, rather than one pass over
+        // every match per category.
         let mut group_order: Vec<Category> = Vec::new();
+        let mut buckets: Vec<Vec<&SearchItem>> = Vec::new();
         for (_, item) in &scored {
             let cat = item.category();
-            if !group_order.contains(&cat) {
-                group_order.push(cat);
-            }
+            let at = match group_order.iter().position(|c| *c == cat) {
+                Some(at) => at,
+                None => {
+                    group_order.push(cat);
+                    buckets.push(Vec::new());
+                    buckets.len() - 1
+                }
+            };
+            buckets[at].push(item);
         }
-        group_order
-            .into_iter()
-            .flat_map(|cat| {
-                scored
-                    .iter()
-                    .filter(move |(_, item)| item.category() == cat)
-                    .map(|(_, item)| (*item).clone())
-            })
-            .collect()
+        buckets.concat()
     }
 }
 
-/// Scores one slice of the corpus against `pattern`, reusing a single
+/// Everything the per-item scorer needs to know about the query, worked
+/// out once per search instead of once per item.
+struct Needle<'a> {
+    pattern: Pattern,
+    lower: &'a str,
+    len: usize,
+    typo_budget: usize,
+    /// byte set of `lower`, for the cheap skip in `worth_measuring`;
+    /// `None` when the query is not ascii, which turns that skip off.
+    mask: Option<u64>,
+}
+
+impl<'a> Needle<'a> {
+    fn new(query: &str, lower: &'a str) -> Needle<'a> {
+        let len = lower.chars().count();
+        Needle {
+            pattern: Pattern::parse(query, CaseMatching::Smart, Normalization::Smart),
+            lower,
+            len,
+            typo_budget: edit_distance_budget(len),
+            mask: ascii_mask(lower),
+        }
+    }
+
+    /// Whether `word` could possibly come in under the typo budget, from
+    /// the two character sets alone. A single edit brings at most one
+    /// absent character into place (a transposition brings none), so a
+    /// word missing more of the query's characters than the budget
+    /// allows cannot be within it. Skipping on that is exact: it only
+    /// ever drops words `damerau_levenshtein` would have scored out of
+    /// budget anyway, and the measured distances are untouched.
+    fn worth_measuring(&self, word: &str) -> bool {
+        let (Some(query), Some(word)) = (self.mask, ascii_mask(word)) else {
+            return true;
+        };
+        let absent = (query & !word)
+            .count_ones()
+            .max((word & !query).count_ones());
+        absent as usize <= self.typo_budget
+    }
+}
+
+/// The set of bytes in `s`, one bit each, or `None` when `s` is not
+/// ascii. Bytes 64 apart share a bit, which can only make a set
+/// difference smaller, so the bound built on it stays a lower bound.
+fn ascii_mask(s: &str) -> Option<u64> {
+    if !s.is_ascii() {
+        return None;
+    }
+    let mut mask = 0u64;
+    for b in s.bytes() {
+        mask |= 1u64 << (b & 63);
+    }
+    Some(mask)
+}
+
+/// Scores one slice of the corpus against `needle`, reusing a single
 /// `Scratch` for every item; the whole per-item hot path lives here so
 /// the threaded and single-threaded paths can't score differently.
 /// Keeps corpus order, which the caller's stable sort relies on.
 fn score_chunk<'a>(
     entries: &'a [Entry],
-    pattern: &Pattern,
-    query_lower: &str,
-    query_len: usize,
-    typo_budget: usize,
+    needle: &Needle<'_>,
     scratch: &mut Scratch,
 ) -> Vec<(u32, &'a SearchItem)> {
     let Scratch { matcher, buf } = scratch;
     let mut scored = Vec::new();
     for entry in entries {
         let utf32 = Utf32Str::new(&entry.haystack, buf);
-        let fuzzy_score = pattern.score(utf32, matcher);
+        let fuzzy_score = needle.pattern.score(utf32, matcher);
 
-        // two free skips of the edit-distance pass, both no-ops on the
-        // final score: a typo can never beat `typo_score(0)`, and edit
-        // distance is at least the length difference, so a word that
-        // far off can't come in under budget.
+        // three free skips of the edit-distance pass, all no-ops on the
+        // final score: a typo can never beat `typo_score(0)`, edit
+        // distance is at least the length difference, and it is at
+        // least the number of characters one side is missing.
         let typo_score = if fuzzy_score.is_some_and(|s| s >= typo_score(0)) {
             None
         } else {
             entry
                 .haystack_lower
                 .split_whitespace()
-                .filter(|word| char_count(word).abs_diff(query_len) <= typo_budget)
-                .map(|word| strsim::damerau_levenshtein(query_lower, word))
-                .filter(|&dist| dist <= typo_budget)
+                .filter(|word| char_count(word).abs_diff(needle.len) <= needle.typo_budget)
+                .filter(|word| needle.worth_measuring(word))
+                .map(|word| strsim::damerau_levenshtein(needle.lower, word))
+                .filter(|&dist| dist <= needle.typo_budget)
                 .map(typo_score)
                 .max()
         };
@@ -932,6 +1000,76 @@ mod tests {
             kind: MediaKind::Music,
         }));
         c
+    }
+
+    /// The cheap character-set skip must only ever drop words the real
+    /// edit distance would have rejected anyway; if it ever drops one
+    /// that was in budget, `search` silently stops recovering a typo.
+    /// Checked over every word of a real-shaped corpus plus a spread of
+    /// generated strings, against `strsim` itself.
+    #[test]
+    fn the_character_set_skip_only_drops_words_already_out_of_budget() {
+        let alphabet: Vec<char> = "abcdehilmnorstuy 2k!\u{e9}".chars().collect();
+        let corpus = synthetic_corpus(400);
+        let mut words: Vec<String> = corpus
+            .items
+            .iter()
+            .flat_map(|e| e.haystack_lower.split_whitespace())
+            .map(|w| w.to_string())
+            .collect();
+        // a deterministic spread of short strings on top, so near
+        // misses and non-ascii are both covered rather than hoped for.
+        let mut seed = 0x2545f4914f6cdd1du64;
+        for _ in 0..4_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let len = 1 + (seed % 9) as usize;
+            let mut s = String::new();
+            let mut bits = seed >> 4;
+            for _ in 0..len {
+                s.push(alphabet[(bits % alphabet.len() as u64) as usize]);
+                bits /= alphabet.len() as u64;
+            }
+            words.push(s);
+        }
+        let queries = [
+            "b",
+            "bl",
+            "bla",
+            "blade",
+            "lesna",
+            "selena",
+            "crst",
+            "obedeint",
+            "icedanver",
+            "brainmir",
+            "blade runner",
+            "\u{e9}cco",
+            "2k",
+            "!",
+            "aphex twin",
+        ];
+        let mut dropped = 0usize;
+        for query in queries {
+            let lower = query.to_lowercase();
+            let needle = Needle::new(query, &lower);
+            for word in &words {
+                if needle.worth_measuring(word) {
+                    continue;
+                }
+                dropped += 1;
+                let dist = strsim::damerau_levenshtein(&lower, word);
+                assert!(
+                    dist > needle.typo_budget,
+                    "{query:?} vs {word:?}: skipped but distance {dist} is within budget {}",
+                    needle.typo_budget
+                );
+            }
+        }
+        // the skip has to actually fire, or the assertion above is
+        // vacuous and the optimisation is doing nothing.
+        assert!(dropped > 10_000, "the skip barely fired: {dropped}");
     }
 
     /// Not an assertion: prints per-query wall time, since absolute
