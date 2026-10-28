@@ -117,17 +117,92 @@ impl Widget for EqMenu<'_> {
 }
 
 fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
-    if y >= area.y + area.height {
-        return;
-    }
-    for (col, ch) in text.chars().enumerate() {
-        let x = area.x + col as u16;
-        if x >= area.x + area.width {
-            break;
+    crate::ui::draw::line(buf, area, y, text, color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::testbuf::{buffer, grid};
+
+    fn render(area: Rect, buf: &mut Buffer, selected: usize) {
+        EqMenu {
+            gains: &[0.0; 10],
+            custom: false,
+            active_preset: 0,
+            selected,
         }
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_fg(color);
+        .render(area, buf);
+    }
+
+    /// Nothing here is user-supplied (preset names and band labels are
+    /// both consts), so the snapshot is the regression guard and the
+    /// clipping tests below are what pin the route through `draw`.
+    #[test]
+    fn renders_the_preset_list_the_band_rows_and_the_state_line() {
+        let area = Rect::new(0, 0, 50, 25);
+        let mut buf = buffer(50, 25);
+        render(area, &mut buf, 0);
+        assert_eq!(
+            grid(&buf),
+            [
+                "eq │ enter: apply preset, h/l: nudge band, esc: c…",
+                "───┴──────────────────────────────────────────────",
+                "..................................................",
+                "presets...........................................",
+                "> flat  (active)..................................",
+                "  bass boost......................................",
+                "  vocal boost.....................................",
+                "  treble boost....................................",
+                "  rock............................................",
+                "  classical.......................................",
+                "..................................................",
+                "bands (h/l adjust by 1 dB, -12..12)...............",
+                "  31 Hz     +0.0 dB...............................",
+                "  62 Hz     +0.0 dB...............................",
+                "  125 Hz    +0.0 dB...............................",
+                "  250 Hz    +0.0 dB...............................",
+                "  500 Hz    +0.0 dB...............................",
+                "  1000 Hz   +0.0 dB...............................",
+                "  2000 Hz   +0.0 dB...............................",
+                "  4000 Hz   +0.0 dB...............................",
+                "  8000 Hz   +0.0 dB...............................",
+                "  16000 Hz  +0.0 dB...............................",
+                "..................................................",
+                "j/k select, h/l adjust band.......................",
+                "state: preset.....................................",
+            ]
+            .join("\n")
+        );
+    }
+
+    /// The menu is drawn into a rect that is not the whole buffer, so
+    /// an unguarded writer shows up as ink outside it.
+    #[test]
+    fn nothing_is_drawn_outside_the_rect() {
+        let mut buf = buffer(40, 12);
+        let area = Rect::new(2, 1, 20, 8);
+        render(area, &mut buf, 0);
+        for y in 0..12u16 {
+            for x in 0..40u16 {
+                let inside = x >= 2 && x < 22 && y >= 1 && y < 9;
+                if !inside {
+                    assert_eq!(
+                        crate::ui::testbuf::char_at(&buf, x, y),
+                        '.',
+                        "wrote outside its rect at ({x}, {y}):\n{}",
+                        grid(&buf)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn degenerate_sizes_do_not_panic() {
+        for (w, h) in [(1, 1), (1, 40), (2, 1), (40, 0), (0, 0), (3, 2)] {
+            let mut buf = buffer(w.max(1), h.max(1));
+            render(Rect::new(0, 0, w, h), &mut buf, ROW_COUNT - 1);
         }
     }
 }
