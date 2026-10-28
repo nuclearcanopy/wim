@@ -509,63 +509,27 @@ run that edits these files will collide.
       80-column terminal minus the sidebar is ~50-60 cells and
       all-or-nothing words would have lost the names in the common
       case.
-- [ ] **now-playing cover art for tracks not in an open browse view.**
-      the player takes its art from `browse_view.art`, but only when
-      the playing track is actually in that view's list (compared by
-      `SearchItem::identity`), so open album then play then maximize
-      works with no new fetch. a track played from search, or from a
-      view since closed, shows no art rather than the wrong album's.
-      needs a `getCoverArt` keyed on the playing song's own id, cached
-      by track identity, off the draw path, plus a protocol rebuild for
-      `ArtMode::Real`.
-
-## open sub-tasks discovered during the review pass
-
-- [x] **queue view** (`src/ui/queue.rs`, `Q`): three labelled runs in
-      play order (now playing / up next / played, the last one
-      newest-first), the current track marked structurally with `▌`
-      rather than by brightness alone so selection and now-playing stay
-      readable on the same row, played entries sunk to NEAR_BLACK, an
-      index gutter sized to the widest number actually on screen, and a
-      real empty state instead of a blank pane. enter writes
-      `playlist-pos` to jump (no reload, so `entries` stays aligned with
-      mpv), esc closes. reads `PlayQueue::entries`/`pos`, so it shows
-      mpv's actual playlist rather than a mirror.
-- [x] **queue view: remove and reorder.** `d` drops an entry, `J`/`K`
-      move one. `PlayQueue::remove`/`move_entry` carry `pos` with the
-      *track* rather than the index, so the entry list stays aligned
-      with mpv's playlist through every edit; the observed
-      `playlist-pos` still corrects anything that drifts. reorder is
-      deliberately upcoming-only: moving a played entry does nothing
-      useful, and in the played run the display is reversed so `J`
-      would visibly move a row the wrong way. found and fixed a latent
-      bug while here: `Mpv::playlist_move` passed the destination
-      straight through as mpv's displaced-entry index, which is only
-      correct when moving upwards (its doc admitted as much); it now
-      converts, so downward moves land where asked. the old single
-      caller only moved upwards, so it is unaffected.
-- [x] **queue view: the ops shellsong will need.** `remove(n)`,
-      `goto(n)` and `shuffle_queue()` are wired, reusing
-      `PlayQueue::remove`/`move_entry`, `Mpv::playlist_remove` and the
-      `playlist-pos` write the view's own keys already use.
-      `clear_queue()` goes through mpv's `playlist-clear`, which keeps
-      the playing file and drops the rest, plus
-      `PlayQueue::replace_upcoming` to mirror it.
-- [x] **wide characters overlapping their neighbour.** `src/ui/draw.rs`
-      is now the one place text reaches a `Buffer`: it advances by
-      `char_cells` and blanks the trailing cell of a wide glyph, so a
-      CJK or emoji title no longer shifts everything after it one cell
-      left and overruns the row. every widget that renders
-      *user-supplied* text delegates to it (results_list, browse,
-      queue, player, miniplayer, notify, header, lyrics_view,
-      searchbox), which also deleted eight near-identical `draw_line`
-      copies and fixed two latent bugs found on the way: `help.rs`'s
-      copy was missing the bottom-bounds guard the other seven had, and
-      `player.rs` centred by char count so a wide-char title drifted
-      right by its own overhang. the search box's cursor position now
-      comes from the writer's returned x rather than a char count, so
-      typing wide characters no longer parks the block inside the last
-      glyph.
+- [x] **now-playing cover art for tracks outside an open browse view**
+      (`src/coverart.rs`). fetched on its own thread and handed back
+      over a channel, so nothing on the render or input path blocks on
+      the network. keyed per *album* rather than per track, since every
+      track on one album shares a cover; ten tracks were otherwise ten
+      round trips for one image. `getCoverArt` takes a song id, so this
+      needed no album id and sidesteps the name-based-identity item
+      below entirely for the fetch. negative answers are cached, so a
+      cover the server does not have is not re-requested every frame
+      for as long as the track plays, and the cache is bounded at 24
+      decoded images (a few MB each) evicting oldest-first. the open
+      view's own art still wins when the playing track belongs to it:
+      no fetch needed and it is already decoded at the right size.
+      eleven tests over the key derivation, in-flight dedup, negative
+      caching and the bound.
+- [ ] **cover art in `ArtMode::Real`.** the above feeds the ascii path
+      (the default). real sixel/kitty/iterm2 art goes through
+      `real_art_protocol`, which is still built only from a browse
+      view's image, so a search-played track shows ascii art even with
+      a graphics protocol configured. needs a protocol rebuilt from the
+      fetched image when it lands.
 - [ ] **migrate the remaining chrome widgets to `ui::draw`**: eq_menu,
       keybinds_menu, settings_menu, subtitle_menu, nav_manager, login,
       onboarding, banner's menu row. (helpbox done, help still has its
