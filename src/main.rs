@@ -3548,6 +3548,7 @@ fn main() -> anyhow::Result<()> {
                             LoginView {
                                 form: &ob.login,
                                 message: &ob.login_message,
+                                step: Some(ui::onboarding::NAVIDROME_STEP),
                             },
                             area,
                         );
@@ -3601,6 +3602,7 @@ fn main() -> anyhow::Result<()> {
                             LoginView {
                                 form,
                                 message: &nm.message,
+                                step: None,
                             },
                             area,
                         );

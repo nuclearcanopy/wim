@@ -65,10 +65,24 @@ impl Default for LoginForm {
 pub struct LoginView<'a> {
     pub form: &'a LoginForm,
     pub message: &'a str,
+    /// `Some(step)` while this is part of first-run onboarding, which
+    /// wraps it in that flow's frame and step rail so it does not read
+    /// as a different screen mid-flow. `None` when reopened standalone
+    /// (the navidrome key, or the profile manager's add form), where
+    /// there is no flow for it to be a step of.
+    pub step: Option<usize>,
 }
 
 impl Widget for LoginView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let area = match self.step {
+            Some(step) => crate::ui::onboarding::chrome(buf, area, step),
+            None => area,
+        };
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
         let masked_password: String = "*".repeat(self.form.password.chars().count());
         let rows: [(&str, &str); 3] = [
             ("server", &self.form.url),
@@ -187,7 +201,12 @@ mod tests {
     }
 
     fn render(area: Rect, buf: &mut Buffer, form: &LoginForm, message: &str) {
-        LoginView { form, message }.render(area, buf);
+        LoginView {
+            form,
+            message,
+            step: None,
+        }
+        .render(area, buf);
     }
 
     #[test]
@@ -269,6 +288,68 @@ mod tests {
         for (w, h) in [(1, 1), (1, 40), (2, 1), (40, 0), (0, 0), (3, 2)] {
             let mut buf = buffer(w.max(1), h.max(1));
             render(Rect::new(0, 0, w, h), &mut buf, &f, "日本語");
+        }
+    }
+
+    /// Step 3 of onboarding used to be the one screen with no frame
+    /// and no rail, so the flow visibly changed shape in the middle.
+    #[test]
+    fn the_onboarding_step_carries_the_flows_chrome() {
+        let mut buf = buffer(60, 16);
+        LoginView {
+            form: &form("", "ana", "", 0),
+            message: "",
+            step: Some(crate::ui::onboarding::NAVIDROME_STEP),
+        }
+        .render(Rect::new(0, 0, 60, 16), &mut buf);
+        let g = grid(&buf);
+        let first = g.lines().next().unwrap();
+        assert!(
+            first.starts_with('\u{250c}') && first.ends_with('\u{2510}'),
+            "no frame:\n{g}"
+        );
+        assert!(g.contains("step 3 of 6"), "no rail:\n{g}");
+        assert!(g.contains("navidrome setup"), "content gone:\n{g}");
+        assert!(g.contains("username: ana"), "fields gone:\n{g}");
+    }
+
+    /// Reopened standalone there is no flow, so claiming "step 3 of 6"
+    /// would be a lie; it must look exactly as it always has.
+    #[test]
+    fn the_standalone_form_has_no_frame_or_rail() {
+        let mut buf = buffer(60, 16);
+        render(
+            Rect::new(0, 0, 60, 16),
+            &mut buf,
+            &form("", "ana", "", 0),
+            "",
+        );
+        let g = grid(&buf);
+        assert!(!g.contains("step 3 of 6"), "{g}");
+        assert!(!g.contains('\u{250c}'), "{g}");
+        assert!(g.contains("navidrome setup"), "{g}");
+    }
+
+    #[test]
+    fn the_chromed_form_stays_inside_its_rect_and_survives_tiny_sizes() {
+        let rect = Rect::new(2, 1, 30, 10);
+        let mut buf = buffer(40, 14);
+        LoginView {
+            form: &form("\u{65e5}\u{672c}\u{8a9e}", "\u{65e5}\u{672c}", "pw", 0),
+            message: "\u{65e5}\u{672c}\u{8a9e}",
+            step: Some(3),
+        }
+        .render(rect, &mut buf);
+        assert_outside_untouched(&buf, rect);
+
+        for (w, h) in [(1, 1), (2, 1), (5, 3), (6, 4), (40, 0), (0, 0)] {
+            let mut buf = buffer(w.max(1), h.max(1));
+            LoginView {
+                form: &form("\u{65e5}", "a", "pw", 0),
+                message: "m",
+                step: Some(3),
+            }
+            .render(Rect::new(0, 0, w, h), &mut buf);
         }
     }
 }
