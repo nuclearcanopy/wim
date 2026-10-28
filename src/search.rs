@@ -234,22 +234,36 @@ struct Entry {
     /// would reject accented haystacks it shouldn't; `MAX` opts those
     /// out of both prefilters instead of guessing.
     mask: u64,
+    /// Bit `n` set when some word of the haystack is `n` chars long,
+    /// anything from 31 up sharing bit 31. The typo pass needs a word
+    /// within the budget of the query's length, so one and-test
+    /// retires an entry whose words are all the wrong size.
+    word_lens: u32,
+    /// Whether the haystack is ascii, letting the typo pass split on
+    /// bytes and take `len()` as the char count. Unicode whitespace
+    /// outside ascii splits into different words, so this is a real
+    /// precondition rather than only a fast path.
+    ascii: bool,
 }
 
 impl Entry {
     fn new(item: SearchItem) -> Self {
         let haystack = item.haystack();
         let haystack_lower = haystack.to_lowercase();
-        let mask = if haystack_lower.is_ascii() {
-            char_mask(haystack_lower.chars())
-        } else {
-            u64::MAX
-        };
+        let ascii = haystack_lower.is_ascii();
         Self {
+            mask: if ascii {
+                char_mask(haystack_lower.chars())
+            } else {
+                u64::MAX
+            },
+            word_lens: haystack_lower
+                .split_whitespace()
+                .fold(0u32, |bits, word| bits | 1 << char_count(word).min(31)),
+            ascii,
             item,
             haystack,
             haystack_lower,
-            mask,
         }
     }
 }
@@ -284,6 +298,9 @@ struct Needle {
     fuzzy_mask: u64,
     /// Chars of the whole query, for the edit-distance lower bound.
     typo_mask: u64,
+    /// Word lengths that could come in under budget, in `Entry`'s
+    /// `word_lens` encoding.
+    length_window: u32,
 }
 
 impl Needle {
@@ -295,11 +312,13 @@ impl Needle {
         // alphanumeric query is guaranteed to be literal text that a
         // match has to actually contain.
         let literal = lower.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ');
+        let budget = edit_distance_budget(len);
         Self {
             pattern: Pattern::parse(query, CaseMatching::Smart, Normalization::Smart),
             ascii: lower.is_ascii(),
             len,
-            budget: edit_distance_budget(len),
+            budget,
+            length_window: length_window(len, budget),
             fuzzy_mask: if literal {
                 char_mask(lower.chars().filter(|c| *c != ' '))
             } else {
@@ -316,6 +335,16 @@ impl Needle {
     fn missing_from(&self, mask: u64) -> usize {
         (self.typo_mask & !mask).count_ones() as usize
     }
+}
+
+/// Every word length within `budget` of `len`, in `Entry::word_lens`'s
+/// encoding. Lengths from 31 up all share bit 31, which only ever
+/// widens the window (a 40-char word still tests as a candidate for a
+/// 33-char query), so the exact per-word length check still has to run.
+fn length_window(len: usize, budget: usize) -> u32 {
+    let lo = len.saturating_sub(budget).min(31) as u32;
+    let hi = (len + budget).min(31) as u32;
+    (!0u32 >> (31 - (hi - lo))) << lo
 }
 
 /// Scoring scratch, reused instead of reallocated per item: nucleo's
@@ -650,12 +679,14 @@ fn score_chunk<'a>(
             needle.pattern.score(utf32, matcher)
         };
 
-        // three free skips of the edit-distance pass, none of which can
+        // four free skips of the edit-distance pass, none of which can
         // change the final score: a typo can never beat
-        // `typo_score(0)`; the distance is at least the number of query
-        // chars the whole haystack lacks; and, per word, at least the
-        // length difference.
+        // `typo_score(0)`; the distance is at least the length
+        // difference, so a haystack with no word anywhere near the
+        // query's length is out; and it is at least the number of
+        // query chars the haystack lacks entirely.
         let typo = if fuzzy_score.is_some_and(|s| s >= typo_score(0))
+            || entry.word_lens & needle.length_window == 0
             || needle.missing_from(entry.mask) > needle.budget
         {
             None
@@ -675,11 +706,12 @@ fn score_chunk<'a>(
 /// `None` if no word comes in under budget.
 fn best_typo_score(entry: &Entry, needle: &Needle) -> Option<u32> {
     let mut best: Option<usize> = None;
-    for word in entry.haystack_lower.split_whitespace() {
-        if char_count(word).abs_diff(needle.len) > needle.budget {
-            continue;
+    // `true` to stop: distance 0 is the best score there is.
+    let mut consider = |word: &str, len: usize| {
+        if len.abs_diff(needle.len) > needle.budget {
+            return false;
         }
-        let dist = if needle.budget == 1 && needle.ascii && word.is_ascii() {
+        let dist = if needle.budget == 1 && needle.ascii && entry.ascii {
             distance_at_most_one(needle.lower.as_bytes(), word.as_bytes())
         } else if word_is_reachable(word, needle) {
             let dist = strsim::damerau_levenshtein(&needle.lower, word);
@@ -687,12 +719,27 @@ fn best_typo_score(entry: &Entry, needle: &Needle) -> Option<u32> {
         } else {
             None
         };
-        if let Some(dist) = dist {
-            if best.is_none_or(|b| dist < b) {
+        match dist {
+            Some(dist) if best.is_none_or(|b| dist < b) => {
                 best = Some(dist);
-                if dist == 0 {
-                    break;
-                }
+                dist == 0
+            }
+            _ => false,
+        }
+    };
+    // an ascii haystack has no unicode whitespace to split on, so the
+    // byte-wise split sees exactly the same words for a fraction of
+    // the work, and the word length is just its byte length.
+    if entry.ascii {
+        for word in entry.haystack_lower.split_ascii_whitespace() {
+            if consider(word, word.len()) {
+                break;
+            }
+        }
+    } else {
+        for word in entry.haystack_lower.split_whitespace() {
+            if consider(word, word.chars().count()) {
+                break;
             }
         }
     }
@@ -980,6 +1027,37 @@ mod tests {
                 .any(|i| matches!(i, SearchItem::Artist { name, .. } if name == "Branimir")),
             "a 9-char query has a 2-edit budget and must still match"
         );
+    }
+
+    /// The word-length window has to keep every length the budget can
+    /// actually reach (a dropped length silently loses typo matches)
+    /// and, below the saturating 31-char bucket, nothing else. Checked
+    /// white-box because at the window's top edge the two signals
+    /// overlap: a word longer than the query by the whole budget is
+    /// only reachable by insertions, which makes the query a
+    /// subsequence of it, so the fuzzy pass hides the bug from any
+    /// end-to-end membership check.
+    #[test]
+    fn length_window_covers_exactly_the_reachable_word_lengths() {
+        for len in 0..40usize {
+            for budget in 0..4usize {
+                let window = length_window(len, budget);
+                for word_len in 0..60usize {
+                    let kept = window & (1 << word_len.min(31)) != 0;
+                    if word_len.abs_diff(len) <= budget {
+                        assert!(
+                            kept,
+                            "len {len} budget {budget} drops {word_len}-char words"
+                        );
+                    } else if word_len < 31 && len + budget < 31 {
+                        assert!(
+                            !kept,
+                            "len {len} budget {budget} keeps {word_len}-char words"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Exhaustive proof of the fast distance's equivalence to strsim
@@ -1295,7 +1373,18 @@ mod tests {
     /// non-ascii, and the characters nucleo's own pattern parser
     /// treats as operators (`^ $ ! ' \ |`), which any prefilter must
     /// not assume are literal haystack text.
-    const GUARD_QUERIES: [&str; 35] = [
+    const GUARD_QUERIES: [&str; 38] = [
+        // one char short of the 5-char word it matches, i.e. a word
+        // sitting on the top edge of the length window, where the
+        // typo score (85) beats what nucleo gives a gappy match
+        "blde",
+        // the long word again with two letters transposed, so it is
+        // reachable only through the edit-distance pass: proves the
+        // word-length bucket saturates instead of wrapping
+        "averyveryverylongsinglewordtitlethatoverflowsthebukcet",
+        // longer than the 31-char word-length bucket, so the length
+        // window saturates at its top bit
+        "averyveryverylongsinglewordtitlethatoverflowsthebucket",
         // two substitutions over a word whose substituted letters are
         // unique to it, so both directions of the char-mask lower
         // bound sit exactly on a 2-edit budget: "midnight" and
@@ -1372,7 +1461,10 @@ mod tests {
     /// deliberate. Regenerate by running the test and pasting the table
     /// it prints.
     #[rustfmt::skip]
-    const PINNED: [(&str, usize, u64); 35] = [
+    const PINNED: [(&str, usize, u64); 38] = [
+        ("blde", 485, 0xda38_f4b1_7cf9_c977),
+        ("averyveryverylongsinglewordtitlethatoverflowsthebukcet", 0, 0xcbf2_9ce4_8422_2325),
+        ("averyveryverylongsinglewordtitlethatoverflowsthebucket", 0, 0xcbf2_9ce4_8422_2325),
         ("xidnighy", 354, 0x304c_09f0_ed6e_ea13),
         ("obedixnz", 315, 0xdfad_bcd4_8e6c_8b68),
         ("balde", 387, 0x385d_1bdd_4dd7_c7df),
@@ -1472,9 +1564,37 @@ mod tests {
     /// reference does: same match/no-match decision, same score. This
     /// is the guard that catches a prefilter that rejects something it
     /// should have kept (verified by deliberately breaking one).
+    /// Items built to break the prefilters: accented text nucleo
+    /// matches an ascii pattern against anyway, unicode whitespace
+    /// that splits into different words than ascii whitespace does, a
+    /// word past the 31-char length bucket, and a bare digit.
+    fn hostile_items(c: &mut Corpus) {
+        for (i, title) in [
+            "Blàdé Rünner Blües",
+            "blade\u{a0}runner\u{3000}blues",
+            "averyveryverylongsinglewordtitlethatoverflowsthebucket blade",
+            "7",
+            "BLADE RUNNER",
+            "bladé",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            c.add_local_tracks([LocalTrack {
+                path: PathBuf::from(format!("/music/hostile{i}.flac")),
+                title: title.to_string(),
+                artist: None,
+                album: None,
+                duration_secs: None,
+                kind: MediaKind::Music,
+            }]);
+        }
+    }
+
     #[test]
     fn scorers_agree_on_every_query_shape() {
-        let c = varied_corpus(4_000);
+        let mut c = varied_corpus(4_000);
+        hostile_items(&mut c);
         let mut matcher = Matcher::default();
         for query in GUARD_QUERIES {
             let needle = Needle::new(query);
@@ -1581,6 +1701,53 @@ mod tests {
         (best, last)
     }
 
+    /// Cpu time, not wall time: this machine's other cores are busy
+    /// during a bench run, so wall clock varies 2-3x between runs
+    /// while the work done does not. Paired with `parallel = false` it
+    /// is the one number that can be compared across commits.
+    fn cpu_now() -> std::time::Duration {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime only writes the timespec we hand it.
+        unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+        std::time::Duration::new(
+            u64::try_from(ts.tv_sec).unwrap_or(0),
+            u32::try_from(ts.tv_nsec).unwrap_or(0),
+        )
+    }
+
+    fn bench_cpu<T>(iters: u32, mut f: impl FnMut() -> T) -> (std::time::Duration, T) {
+        let mut best = std::time::Duration::MAX;
+        let mut last = f();
+        for _ in 0..iters {
+            let start = cpu_now();
+            last = f();
+            best = best.min(cpu_now().saturating_sub(start));
+        }
+        (best, last)
+    }
+
+    /// The whole of `search`, scored on one thread, in cpu time. The
+    /// comparable-across-commits number; the threaded wall clock is in
+    /// `bench_search`.
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_cpu_search() {
+        for (label, c) in [
+            ("narrow-vocab 40k", synthetic_corpus(40_000)),
+            ("varied 40k", varied_corpus(40_000)),
+            ("varied 150k", varied_corpus(150_000)),
+        ] {
+            for query in BENCH_QUERIES {
+                let (cpu, out) =
+                    bench_cpu(8, || rank(c.score_all_maybe_parallel(query, false)).len());
+                println!("{label:<18} {query:<14} cpu {cpu:>11.3?}  ({out} hits)");
+            }
+        }
+    }
+
     const BENCH_QUERIES: [&str; 7] = [
         "b",
         "bla",
@@ -1624,11 +1791,21 @@ mod tests {
             for query in BENCH_QUERIES {
                 let (par, cand) = bench(12, || c.score_all(query).len());
                 let (seq, _) = bench(6, || c.score_all_maybe_parallel(query, false).len());
-                let (rank_t, out) = bench(12, || rank(c.score_all(query)).len());
+                // ranking is timed on its own, with the scoring it
+                // needs as input left outside the clock; subtracting
+                // two independently-taken minima is not a measurement.
+                let mut rank_t = std::time::Duration::MAX;
+                let mut out = 0;
+                for _ in 0..12 {
+                    let scored = c.score_all(query);
+                    let start = std::time::Instant::now();
+                    let ranked = rank(scored);
+                    rank_t = rank_t.min(start.elapsed());
+                    out = ranked.len();
+                }
                 println!(
                     "{label:<18} {query:<14} score {par:>10.3?} (1 thread {seq:>10.3?})  \
-                     +rank {:>10.3?}   cand {cand:>6} out {out:>6}",
-                    rank_t.saturating_sub(par),
+                     rank {rank_t:>10.3?}   cand {cand:>6} out {out:>6}"
                 );
             }
         }
