@@ -248,13 +248,18 @@ an unknown target is matched against this list and suggests the closest
 real one; `view()` with nothing at all lists them.
 
 the screens take over the display and close the console behind them;
-the four listings (`queue`, `index`, `history`, `playlists`) and `help`
+the five listings (`queue`, `index`, `history`, `playlists`, `help`)
 print into the scrollback and leave it open. `view` means "put this on
 screen" either way, and a listing satisfies that; there is deliberately
 no second verb for the distinction.
 
-`help` is the one target generated here rather than read from the app,
-so `view(help)` and `help()` print exactly the same lines.
+`help` is the one target whose lines the language generates itself,
+from the same command table `help()` reads, so `view(help)` and
+`help()` can never print different things. it is still an ordinary
+target otherwise: every spelling in the table lowers to one
+`Op::View(target)` and the host prints it, so no target is reachable
+only through the console's scrollback and no host has an arm for an op
+that cannot arrive.
 
 ### the query form
 

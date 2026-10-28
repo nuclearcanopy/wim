@@ -191,10 +191,11 @@ pub enum ViewTarget {
     History,
     Playlists,
     Eq,
-    /// The command listing. Unlike every other target this is generated
-    /// here rather than read from the app, so it lowers to the same
-    /// notes `help()` produces instead of to an op; `view` still means
-    /// "put this on screen" either way.
+    /// The command listing: the one target whose content is generated
+    /// by the language itself (`help_lines`, off `COMMANDS`) rather than
+    /// read from the app, so `view(help)` and `help()` cannot drift. It
+    /// still lowers to this op like every other target; the host prints
+    /// the lines, same as it does for the other listings.
     Help,
 }
 
@@ -1469,14 +1470,9 @@ impl Lowering {
         let Some(target) = call.keyword(Words::ViewTarget).and_then(view_target) else {
             return;
         };
-        // the command listing is generated here, not read from the app,
-        // so it lands in the scrollback exactly as `help()` does.
-        if target == ViewTarget::Help {
-            for line in help_lines() {
-                self.nodes.push(Node::Note(line));
-            }
-            return;
-        }
+        // every target lowers the same way, `help` included: it reads
+        // its lines from `help_lines()` rather than from the app, but
+        // that is the host's business, not a second lowering.
         self.nodes.push(Node::Emit(Op::View(target)));
     }
 
@@ -3359,12 +3355,82 @@ mod tests {
         assert!(out[0].starts_with("shuffle(state?)"), "{out:?}");
     }
 
-    /// `view(help)` and `help()` are the same listing; `view` means
-    /// "put this on screen" and a scrollback listing satisfies that.
+    /// `view(help)` is an op like every other target (it used to lower
+    /// to notes, which made `ViewTarget::Help` unconstructable and the
+    /// host's arm for it dead code). The listing itself still comes from
+    /// `help_lines()`, which is what keeps it identical to `help()`.
     #[test]
-    fn view_help_is_the_same_listing_help_prints() {
-        assert_eq!(notes("view(help)"), notes("help()"));
-        assert_eq!(notes("view(help)").len(), COMMANDS.len());
+    fn view_help_is_an_op_like_every_other_target() {
+        assert_eq!(ops("view(help)"), vec![Op::View(ViewTarget::Help)]);
+        assert!(notes("view(help)").is_empty());
+        assert_eq!(notes("help()"), help_lines());
+        assert_eq!(help_lines().len(), COMMANDS.len());
+        // and `dry` reports the plan rather than dumping the listing,
+        // which is what it does for every other view target.
+        assert_eq!(notes("dry(view(help))").len(), 2);
+    }
+
+    /// `help` is a listing, so the console stays open and the lines land
+    /// in its scrollback; it is not a screen that would cover the
+    /// console it was typed into.
+    #[test]
+    fn view_help_is_a_listing_not_a_screen() {
+        assert!(!ViewTarget::Help.is_screen());
+        assert!(!Op::View(ViewTarget::Help).closes_console());
+    }
+
+    /// No `ViewTarget` may be unreachable: `view(help)` lowering to
+    /// notes instead of an op is exactly how `Help` became a variant no
+    /// parser could construct, leaving every host with an arm for an op
+    /// that never arrives. The match is exhaustive, so a new target has
+    /// to name its spelling here, and the count check makes it have one
+    /// in `VIEW_NAMES`.
+    #[test]
+    fn every_view_target_is_constructible_by_the_parser() {
+        const ALL: &[ViewTarget] = &[
+            ViewTarget::Queue,
+            ViewTarget::Now,
+            ViewTarget::Suggestions,
+            ViewTarget::Settings,
+            ViewTarget::Keybinds,
+            ViewTarget::Lyrics,
+            ViewTarget::Starred,
+            ViewTarget::Index,
+            ViewTarget::History,
+            ViewTarget::Playlists,
+            ViewTarget::Eq,
+            ViewTarget::Help,
+        ];
+        fn spelling(t: ViewTarget) -> &'static str {
+            match t {
+                ViewTarget::Queue => "queue",
+                ViewTarget::Now => "now",
+                ViewTarget::Suggestions => "suggestions",
+                ViewTarget::Settings => "settings",
+                ViewTarget::Keybinds => "keybinds",
+                ViewTarget::Lyrics => "lyrics",
+                ViewTarget::Starred => "starred",
+                ViewTarget::Index => "index",
+                ViewTarget::History => "history",
+                ViewTarget::Playlists => "playlists",
+                ViewTarget::Eq => "eq",
+                ViewTarget::Help => "help",
+            }
+        }
+        assert_eq!(
+            ALL.len(),
+            VIEW_NAMES.iter().filter(|v| v.canonical).count(),
+            "a target is missing from ALL or from VIEW_NAMES"
+        );
+        for t in ALL {
+            assert_eq!(view_name(*t), spelling(*t));
+            assert_eq!(
+                ops(&format!("view({})", spelling(*t))),
+                vec![Op::View(*t)],
+                "view({})",
+                spelling(*t)
+            );
+        }
     }
 
     // ---------------------------------------------------- bare words
@@ -3459,9 +3525,6 @@ mod tests {
     #[test]
     fn every_view_spelling_resolves_to_its_target() {
         for v in VIEW_NAMES {
-            if v.target == ViewTarget::Help {
-                continue; // a listing, asserted separately
-            }
             assert_eq!(
                 ops(&format!("view({})", v.word)),
                 vec![Op::View(v.target)],
@@ -4287,6 +4350,7 @@ mod tests {
         assert!(Op::Quit.closes_console());
         assert!(!Op::View(ViewTarget::Queue).closes_console());
         assert!(!Op::View(ViewTarget::History).closes_console());
+        assert!(!Op::View(ViewTarget::Help).closes_console());
         assert!(!Op::TogglePause.closes_console());
     }
 
