@@ -21,6 +21,11 @@ pub struct KeybindsMenu<'a> {
 
 impl Widget for KeybindsMenu<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // takes over a rect that already has other content drawn
+        // into it, so it has to own every cell: without the clear,
+        // whatever this menu did not write still showed through.
+        let area = crate::ui::draw::overlay(buf, area);
+
         let mut y = draw_header(
             buf,
             area,
@@ -90,7 +95,15 @@ fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
+    use crate::ui::testbuf::{
+        assert_no_bleed_through, assert_outside_untouched, buffer, grid, plated_buffer,
+    };
+
+    /// Rows from the rect's top: the frame's top edge, the header
+    /// title, the header rule, a blank, then the action rows.
+    const FIRST_ROW: usize = 4;
+    /// Frame edge plus its one column of padding.
+    const FIRST_COL: usize = 2;
 
     fn keys() -> Vec<String> {
         ALL_ACTIONS.iter().map(|_| "x".to_string()).collect()
@@ -106,29 +119,37 @@ mod tests {
         .render(area, buf);
     }
 
+    fn action_rows(g: &str) -> Vec<Vec<char>> {
+        g.lines()
+            .skip(FIRST_ROW)
+            .take(ALL_ACTIONS.len())
+            .map(|r| r.chars().collect())
+            .collect()
+    }
+
     #[test]
     fn every_action_gets_a_row_with_its_key_in_an_aligned_column() {
-        let area = Rect::new(0, 0, 44, 5 + ALL_ACTIONS.len() as u16);
+        let area = Rect::new(0, 0, 48, 8 + ALL_ACTIONS.len() as u16);
         let mut buf = buffer(area.width, area.height);
         render(area, &mut buf, &keys(), None);
         let g = grid(&buf);
-        let rows: Vec<&str> = g.lines().skip(3).take(ALL_ACTIONS.len()).collect();
+        let rows = action_rows(&g);
         assert_eq!(rows.len(), ALL_ACTIONS.len());
-        let key_col = rows[0].find("  x").expect("a key column") + 2;
+        let key_col = rows[0]
+            .iter()
+            .rposition(|c| *c == 'x')
+            .expect("a key column");
         for (row, action) in rows.iter().zip(ALL_ACTIONS.iter()) {
-            assert!(row.contains(action.label()), "missing label:\n{g}");
-            assert_eq!(
-                row.chars().nth(key_col),
-                Some('x'),
-                "key column is jagged:\n{g}"
-            );
+            let text: String = row.iter().collect();
+            assert!(text.contains(action.label()), "missing label:\n{g}");
+            assert_eq!(row[key_col], 'x', "key column is jagged:\n{g}");
         }
         assert!(g.contains("j/k select, r rebind selected"), "{g}");
     }
 
     #[test]
     fn the_conflict_notice_quotes_the_action_already_holding_the_key() {
-        let area = Rect::new(0, 0, 60, 6 + ALL_ACTIONS.len() as u16);
+        let area = Rect::new(0, 0, 64, 9 + ALL_ACTIONS.len() as u16);
         let mut buf = buffer(area.width, area.height);
         render(area, &mut buf, &keys(), Some("quit"));
         assert!(
@@ -142,21 +163,24 @@ mod tests {
     /// rest of its own row, or the rows after it, off their columns.
     #[test]
     fn a_wide_key_label_does_not_shift_the_rows_after_it() {
-        let area = Rect::new(0, 0, 44, 4 + ALL_ACTIONS.len() as u16);
+        let area = Rect::new(0, 0, 48, 8 + ALL_ACTIONS.len() as u16);
         let mut wide = keys();
         wide[0] = "日".to_string();
         let mut buf = buffer(area.width, area.height);
         render(area, &mut buf, &wide, None);
         let g = grid(&buf);
-        let rows: Vec<&str> = g.lines().skip(3).take(ALL_ACTIONS.len()).collect();
+        let rows = action_rows(&g);
         // the wide glyph owns two cells, so the cell after it is the
         // blank the writer laid down, not the next character of text.
-        let col = rows[0].find('日').expect("the wide key");
-        assert_eq!(rows[0].chars().nth(col + 1), Some(' '), "{g}");
+        let col = rows[0]
+            .iter()
+            .position(|c| *c == '日')
+            .expect("the wide key");
+        assert_eq!(rows[0][col + 1], ' ', "{g}");
         // every later row still carries its own key at the same column
         // the first row's key starts at.
         for row in &rows[1..] {
-            assert_eq!(row.chars().nth(col), Some('x'), "key column drifted:\n{g}");
+            assert_eq!(row[col], 'x', "key column drifted:\n{g}");
         }
     }
 
@@ -170,6 +194,33 @@ mod tests {
         }
         render(area, &mut buf, &wide, Some("日本語"));
         assert_outside_untouched(&buf, area);
+    }
+
+    #[test]
+    fn the_overlay_covers_every_cell_of_its_rect() {
+        let mut buf = plated_buffer(40, 16);
+        let area = Rect::new(2, 1, 30, 13);
+        render(area, &mut buf, &keys(), Some("quit"));
+        assert_no_bleed_through(&buf, area);
+    }
+
+    #[test]
+    fn the_frame_closes_all_four_corners() {
+        let mut buf = buffer(40, 16);
+        let area = Rect::new(2, 1, 30, 13);
+        render(area, &mut buf, &keys(), None);
+        let g = grid(&buf);
+        let rows: Vec<Vec<char>> = g.lines().map(|r| r.chars().collect()).collect();
+        assert_eq!(
+            (rows[1][2], rows[1][31], rows[13][2], rows[13][31]),
+            ('┌', '┐', '└', '┘')
+        );
+        // the content starts one row and two columns inside it
+        assert_eq!(
+            rows[2][area.x as usize + FIRST_COL],
+            'k',
+            "the title sits inside the frame"
+        );
     }
 
     #[test]
