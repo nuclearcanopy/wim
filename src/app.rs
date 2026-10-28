@@ -70,19 +70,28 @@ pub struct App {
     pub loop_mode: LoopMode,
     pub shuffle: bool,
     pub speed: f64,
-    /// index into `eq::PRESETS`; meaningful only while `eq_custom` is
-    /// false (see `eq_custom`'s own doc).
+    /// Where the `CycleEq` key's cycle currently sits in
+    /// `eq::PRESETS`; `eq_source` is what the live gains actually
+    /// came from, which may be a saved preset instead.
     pub eq_preset: usize,
+    /// Which named curve `eq_gains` came from, a built-in or one of
+    /// `config::Config::eq_custom_presets`, or `None` for a
+    /// hand-tuned curve that never had a name. Kept across a band
+    /// nudge, so the eq menu and the bottom bar can say "rock
+    /// (modified)" instead of losing the name to an anonymous
+    /// "custom".
+    pub eq_source: Option<eq::Source>,
     /// True once any individual band has been hand-adjusted (via the
-    /// eq menu) away from whatever named preset was active; the
-    /// bottom bar/player view show "custom" instead of a preset name
-    /// while this is set, rather than keeping credit on a preset that
-    /// no longer matches `eq_gains`.
+    /// eq menu) away from `eq_source`'s curve, i.e. the gains no
+    /// longer match the name they came from; the third applied state,
+    /// see `eq::applied_label`.
     pub eq_custom: bool,
-    /// The actual gains currently applied to mpv's `af` filter: either
-    /// a copy of `eq::PRESETS[eq_preset].gains`, or a hand-tuned set
-    /// once `eq_custom` is true. Always kept in sync with what's
-    /// actually audible, so callers never have to re-derive it.
+    /// The actual gains currently applied to mpv's `af` filter: a
+    /// copy of `eq_source`'s curve, or a hand-tuned set once
+    /// `eq_custom` is true. The *requested* gains, never the
+    /// compensated ones (see `eq::compensated_gains`). Always kept in
+    /// sync with what's actually audible, so callers never have to
+    /// re-derive it.
     pub eq_gains: [f64; 10],
     /// Whether the corpus is still being filled from the background
     /// library scan / the first navidrome sync; purely so an empty
@@ -107,6 +116,7 @@ impl App {
             shuffle: false,
             speed: 1.0,
             eq_preset: 0,
+            eq_source: Some(eq::Source::Builtin(0)),
             eq_custom: false,
             eq_gains: eq::PRESETS[0].gains,
             scanning_library: false,
@@ -232,6 +242,7 @@ impl App {
             return Action::SetSpeed(self.bump_speed(-1.0));
         } else if key == keymap.get(KeyAction::CycleEq) {
             self.eq_preset = (self.eq_preset + 1) % eq::PRESETS.len();
+            self.eq_source = Some(eq::Source::Builtin(self.eq_preset));
             self.eq_custom = false;
             let preset = &eq::PRESETS[self.eq_preset];
             self.eq_gains = preset.gains;
