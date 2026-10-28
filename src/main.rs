@@ -53,7 +53,9 @@ use theme::{shade, NEAR_BLACK};
 use ui::albumart::AsciiArt;
 use ui::banner::Banner;
 use ui::browse::BrowseListView;
-use ui::controlsbar::{ControlsBar, Field, Scrub, SCRUB_STEP, SCRUB_STEP_COARSE};
+use ui::controlsbar::{
+    self, ControlsBar, Field, Nav, NavKeys, Scrub, SCRUB_STEP, SCRUB_STEP_COARSE,
+};
 use ui::divider::{HorizontalRule, VerticalRule};
 use ui::login::{LoginForm, LoginView};
 use ui::lyrics_view::LyricsView;
@@ -2045,6 +2047,11 @@ fn main() -> anyhow::Result<()> {
     // `flash`, a steady cursor position rather than a transient
     // acknowledgment, but both feed `ControlsBar`'s rendering.
     let mut bottombar_selected = Field::Pause;
+    // the maximized player's own cursor over the same `Field` set: one
+    // alphabet, one enter dispatch, one scrub for both surfaces, but a
+    // position each so moving focus doesn't drag the other's cursor
+    // along with it.
+    let mut player_selected = Field::Pause;
     // `Some` while enter-on-the-scrubber holds a drag open: arrows
     // move `Scrub::target_secs` locally and the absolute seek is
     // coalesced behind it, so holding one down can't spend an ipc
@@ -2392,23 +2399,63 @@ fn main() -> anyhow::Result<()> {
                 let item = now_playing.as_ref().expect("show_full_player implies Some");
                 let previous_label = previous_track.as_ref().map(label);
                 let next_label = play_queue.peek_next().map(label);
+                let aspect = cell_aspect();
+                // the cover for what is *playing*: an open browse view's
+                // art is only that when the queue is playing out of that
+                // same view (the view outlives maximizing the player, so
+                // that is the common case). a track from search, or from
+                // a view since closed, needs its own getCoverArt fetch
+                // keyed on the song's own id; until that lands those
+                // tracks show no art rather than the wrong one.
+                let playing_art = browse_view
+                    .as_ref()
+                    .filter(|bv| {
+                        let id = item.identity();
+                        bv.tracks.iter().any(|t| t.identity() == id)
+                    })
+                    .and_then(|bv| bv.art.as_ref());
+                let has_context = previous_label.is_some() || next_label.is_some();
                 f.render_widget(
                     PlayerView {
                         title: &label(item),
-                        elapsed_secs,
+                        art: playing_art,
+                        art_mode,
+                        cell_aspect: aspect,
+                        // mid-drag the screen draws the pending target,
+                        // not mpv's position, same as the bottom bar.
+                        elapsed_secs: scrub.map(|s| s.target_secs).or(elapsed_secs),
                         duration_secs,
                         paused,
-                        loop_label: app.loop_mode.label(),
+                        loop_mode: app.loop_mode,
                         shuffle_on: app.shuffle,
                         speed: app.speed,
                         eq_preset: eq_label(&app),
                         crossfade_on: crossfade_enabled,
                         previous: previous_label.as_deref(),
                         next: next_label.as_deref(),
+                        selected: (focus == Focus::Workspace).then_some(player_selected),
+                        scrubbing: scrub.is_some(),
                         keymap: &keymap,
                     },
                     main_content,
                 );
+                if art_mode == browse::ArtMode::Real {
+                    // same contract as the browse view: the widget drew
+                    // no ascii art, the real image goes on the exact
+                    // rect its own layout picked.
+                    if let (Some(protocol), Some(art_rect)) = (
+                        &mut real_art_protocol,
+                        ui::player::layout(
+                            main_content,
+                            playing_art.is_some(),
+                            has_context,
+                            aspect,
+                        )
+                        .and_then(|l| l.art),
+                    ) {
+                        f.render_stateful_widget(StatefulImage::default(), art_rect, protocol);
+                    }
+                }
 
                 level_history.push(audio_level(&player, frame_elapsed));
                 let max_history = main_content.width.max(1) as usize;
@@ -3755,32 +3802,38 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // pane-local navigation for the bottom bar, same
-                // "only the arrows and enter care which pane has
-                // focus" rule as the browse view further down: global
-                // playback controls (space/f/b/c/etc.) fall through
-                // untouched below regardless of focus, only these keys
-                // are intercepted here.
-                if focus == Focus::BottomBar {
-                    match key.code {
-                        // left/right, not j/k: the bar is a horizontal
-                        // strip and its elements sit beside each other,
-                        // so the cursor moves the way the row reads.
-                        KeyCode::Char('l') | KeyCode::Right => {
-                            bottombar_selected = bottombar_selected.next();
+                // pane-local navigation for whichever surface is
+                // showing the transport: the bottom bar, or the
+                // maximized player, which draws the same `Field` set
+                // bigger. Same "only the arrows and enter care which
+                // pane has focus" rule as the browse view further
+                // down: global playback controls (space/f/b/c/etc.)
+                // fall through untouched below regardless of focus,
+                // only these keys are intercepted here. The cursor
+                // differs per pane, the dispatch below does not; see
+                // `controlsbar::nav` for why only the bar gets h/l.
+                let player_transport = now_playing.is_some()
+                    && !player_minimized
+                    && !now_playing_is_video(&now_playing)
+                    && focus == Focus::Workspace;
+                let transport = match focus {
+                    Focus::BottomBar => Some((&mut bottombar_selected, NavKeys::BarStrip)),
+                    _ if player_transport => Some((&mut player_selected, NavKeys::ArrowsOnly)),
+                    _ => None,
+                };
+                if let Some((cursor, nav_keys)) = transport {
+                    match controlsbar::nav(key.code, nav_keys) {
+                        Some(Nav::Next) => {
+                            *cursor = cursor.next();
                             continue;
                         }
-                        KeyCode::Char('h') | KeyCode::Left => {
-                            bottombar_selected = bottombar_selected.prev();
+                        Some(Nav::Prev) => {
+                            *cursor = cursor.prev();
                             continue;
                         }
-                        // inert rather than falling through: up/down
-                        // have nothing to mean on a one-row strip, and
-                        // letting them through would scroll the result
-                        // list in the pane that doesn't have focus.
-                        KeyCode::Up | KeyCode::Down => continue,
-                        KeyCode::Enter => {
-                            match bottombar_selected {
+                        Some(Nav::Inert) => continue,
+                        Some(Nav::Activate) => {
+                            match *cursor {
                                 Field::Pause => match player.toggle_pause() {
                                     Ok(()) => flash = Some((Field::Pause, Instant::now())),
                                     Err(e) => notifications
@@ -3864,7 +3917,7 @@ fn main() -> anyhow::Result<()> {
                             }
                             continue;
                         }
-                        _ => {}
+                        None => {}
                     }
                 }
 
