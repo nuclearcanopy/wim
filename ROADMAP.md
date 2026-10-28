@@ -471,16 +471,19 @@ run that edits these files will collide.
       `view(q, ...)` landing on a song whose album is not in the corpus
       (`SearchItem::Song` carries its album's name, not its id). see
       docs/shellsong.md's host section.
-- [ ] **`Console::paste`'s documented signature is wrong.** the API
-      summary says `paste(&str)`; it is really
-      `paste(&mut self, &str, &dyn Candidates)` because it refreshes
-      the suggestion. harmless, but the published list misleads the
-      next caller.
-- [ ] **`ViewTarget::Help` is unreachable.** lowering turns
-      `view(help)` into notes, so the variant exists only to make the
-      enum match the documented target list, and every host must write
-      an arm for something that can never arrive. either lower it like
-      the others or drop the variant.
+- [x] **the published console api.** there was no api summary behind
+      the claim that one said `paste(&str)`; docs/shellsong.md now has
+      the real surface (`paste(&mut self, &str, &dyn Candidates)`, which
+      takes the provider because it refreshes the suggestion), and a
+      test calls every documented form so a signature cannot change
+      without failing the build.
+- [x] **`ViewTarget::Help` is reachable.** `view(help)` lowers to
+      `Op::View(ViewTarget::Help)` like every other target instead of to
+      console notes, so the host's arm is live rather than dead code and
+      no target is special-cased in lowering. the listing still comes
+      from `help_lines()`, which is what keeps it identical to `help()`.
+      `dry(view(help))` now reports the plan instead of dumping the
+      whole listing.
 - [ ] **album/artist identity is name-based.** `SearchItem` carries no
       `album_id`/`artist_id`, so the suggestion catalog joins on
       trimmed-lowercased names. two same-named albums by one artist
