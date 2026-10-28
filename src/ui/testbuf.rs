@@ -36,3 +36,24 @@ pub fn char_at(buf: &Buffer, x: u16, y: u16) -> char {
         .and_then(|c| c.symbol().chars().next())
         .unwrap_or(' ')
 }
+
+/// Every cell outside `rect` still holds the fill char `buffer()` laid
+/// down, i.e. the widget stayed inside the rect it was given. The
+/// usual failure is a writer with no bounds guard, or one advancing a
+/// cell per char through wide glyphs and running past the right edge.
+pub fn assert_outside_untouched(buf: &Buffer, rect: Rect) {
+    for y in buf.area.y..buf.area.y + buf.area.height {
+        for x in buf.area.x..buf.area.x + buf.area.width {
+            let inside = (rect.x..rect.x + rect.width).contains(&x)
+                && (rect.y..rect.y + rect.height).contains(&y);
+            if !inside {
+                assert_eq!(
+                    char_at(buf, x, y),
+                    '.',
+                    "wrote outside its rect at ({x}, {y}):\n{}",
+                    grid(buf)
+                );
+            }
+        }
+    }
+}

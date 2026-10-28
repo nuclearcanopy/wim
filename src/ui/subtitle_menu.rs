@@ -139,7 +139,7 @@ fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: ratatui::style::Color)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::testbuf::{buffer, char_at, grid};
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
     use crossterm::event::KeyCode;
 
     fn render(area: Rect, buf: &mut Buffer, values: [&str; FIELD_COUNT]) {
@@ -196,27 +196,17 @@ mod tests {
     #[test]
     fn nothing_is_drawn_outside_the_box() {
         let mut buf = buffer(40, 16);
-        let area = Rect::new(0, 0, 40, 16);
         let long = "日本語テスト曲日本語テスト曲日本語テスト曲";
-        render(area, &mut buf, [long; FIELD_COUNT]);
-        // the box is centred in `area`; everything outside it stays as
-        // the overlay found it.
-        let x0 = (40 - WIDTH) / 2;
-        let y0 = (16 - (FIELD_COUNT as u16 + 4)) / 2;
-        for y in 0..16u16 {
-            for x in 0..40u16 {
-                let inside =
-                    x >= x0 && x < x0 + WIDTH && y >= y0 && y < y0 + FIELD_COUNT as u16 + 4;
-                if !inside {
-                    assert_eq!(
-                        char_at(&buf, x, y),
-                        '.',
-                        "wrote outside its box at ({x}, {y}):\n{}",
-                        grid(&buf)
-                    );
-                }
-            }
-        }
+        render(Rect::new(0, 0, 40, 16), &mut buf, [long; FIELD_COUNT]);
+        // the box is centred in the area; everything outside it stays
+        // as the overlay found it.
+        let box_rect = Rect::new(
+            (40 - WIDTH) / 2,
+            (16 - (FIELD_COUNT as u16 + 4)) / 2,
+            WIDTH,
+            FIELD_COUNT as u16 + 4,
+        );
+        assert_outside_untouched(&buf, box_rect);
     }
 
     #[test]
