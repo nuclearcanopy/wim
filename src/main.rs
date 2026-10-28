@@ -2726,6 +2726,12 @@ fn main() -> anyhow::Result<()> {
     // covers for tracks the open browse view does not have art for;
     // fetched on its own thread, see `coverart`.
     let mut cover_art = coverart::Cache::default();
+    // the player's own image protocol, separate from the browse
+    // view's: they can be showing different albums at once, and
+    // sharing one protocol made the player draw whatever album a view
+    // had last opened. keyed so it rebuilds only when the cover
+    // actually changes, since a protocol holds resize state.
+    let mut player_art_protocol: Option<(String, StatefulProtocol)> = None;
     // whatever was playing right before `now_playing` last changed;
     // purely for the player view's "previous: ..." line.
     let mut previous_track: Option<SearchItem> = None;
@@ -3074,6 +3080,36 @@ fn main() -> anyhow::Result<()> {
         if let Some(item) = &now_playing {
             cover_art.request(item);
         }
+        // which cover the player would draw: the open view's when the
+        // playing track is one of its own (already decoded at the
+        // right size), else whatever the background fetch has.
+        let playing_art: Option<&image::DynamicImage> = now_playing.as_ref().and_then(|item| {
+            browse_view
+                .as_ref()
+                .filter(|bv| {
+                    let id = item.identity();
+                    bv.tracks.iter().any(|t| t.identity() == id)
+                })
+                .and_then(|bv| bv.art.as_ref())
+                .or_else(|| cover_art.get(item))
+        });
+        // rebuild the player's protocol only when the cover changes;
+        // every frame would throw away the resize state a protocol
+        // exists to hold.
+        match (&now_playing, playing_art) {
+            (Some(item), Some(img)) => {
+                let key = coverart::art_key(item);
+                let stale = player_art_protocol
+                    .as_ref()
+                    .is_none_or(|(have, _)| *have != key);
+                if stale {
+                    player_art_protocol = picker
+                        .as_mut()
+                        .map(|p| (key, p.new_resize_protocol(img.clone())));
+                }
+            }
+            _ => player_art_protocol = None,
+        }
         if let Ok(detected) = frame_rx.try_recv() {
             frame = detected;
         }
@@ -3357,18 +3393,6 @@ fn main() -> anyhow::Result<()> {
                 // a view since closed, needs its own getCoverArt fetch
                 // keyed on the song's own id; until that lands those
                 // tracks show no art rather than the wrong one.
-                // the open view's art when the playing track is one of
-                // its own (no fetch needed, and it is already decoded
-                // at the right size), otherwise whatever the
-                // background fetch has for that album.
-                let playing_art = browse_view
-                    .as_ref()
-                    .filter(|bv| {
-                        let id = item.identity();
-                        bv.tracks.iter().any(|t| t.identity() == id)
-                    })
-                    .and_then(|bv| bv.art.as_ref())
-                    .or_else(|| cover_art.get(item));
                 let has_context = previous_label.is_some() || next_label.is_some();
                 f.render_widget(
                     PlayerView {
@@ -3398,8 +3422,8 @@ fn main() -> anyhow::Result<()> {
                     // same contract as the browse view: the widget drew
                     // no ascii art, the real image goes on the exact
                     // rect its own layout picked.
-                    if let (Some(protocol), Some(art_rect)) = (
-                        &mut real_art_protocol,
+                    if let (Some((_, protocol)), Some(art_rect)) = (
+                        &mut player_art_protocol,
                         ui::player::layout(
                             main_content,
                             playing_art.is_some(),
