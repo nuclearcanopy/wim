@@ -2066,27 +2066,18 @@ fn trigger_downloads(
     }
 }
 
-/// Current output level, 0..1, for the now-playing level meter.
-/// Best-effort: reads the `astats` tap `build_af_filter` (eq.rs) adds
-/// to the end of the af chain, via mpv's `af-metadata/<label>/...`
-/// property. If that property path doesn't resolve the way expected
-/// (wrong mpv version, filter not actually in the graph yet, af-
-/// metadata represented differently than guessed), this falls back to
-/// a calm idle breathe instead of silently showing a dead meter,
-/// driven off `elapsed` (time since app start) like every other
+/// Current output level, 0..1, for the now-playing level meter. Reads
+/// the `astats` tap `build_af_filter` (eq.rs) puts at the end of the af
+/// chain, which mpv pushes (`mpv::PROP_LEVEL_RMS`) rather than being
+/// asked for: this used to be a blocking IPC round trip per frame. No
+/// fresh reading (paused, stopped, or an mpv that doesn't resolve the
+/// property) falls back to a calm idle breathe instead of silently
+/// showing a dead meter, driven off `elapsed` like every other
 /// animation.
-fn audio_level(player: &mpv::Mpv, elapsed: Duration) -> f32 {
-    let key = format!(
-        "af-metadata/{}/lavfi.astats.Overall.RMS_level",
-        eq::LEVEL_METADATA_LABEL
-    );
-    if let Some(db) = player.get_property(&key).ok().and_then(|v| v.as_f64()) {
-        // RMS level is dBFS, roughly -60 (near silent) to 0 (full
-        // scale); map that range to 0..1 rather than guessing a
-        // narrower one that'd clip real audio's dynamic range.
-        return ((db as f32 + 60.0) / 60.0).clamp(0.0, 1.0);
-    }
-    (anim::pulse(elapsed, anim::LEVEL_FALLBACK_PERIOD) * 0.6 + 0.05).clamp(0.0, 1.0)
+fn audio_level(playback: &mpv::Playback, elapsed: Duration) -> f32 {
+    playback.level().unwrap_or_else(|| {
+        (anim::pulse(elapsed, anim::LEVEL_FALLBACK_PERIOD) * 0.6 + 0.05).clamp(0.0, 1.0)
+    })
 }
 
 /// How often the background thread (see `spawn_background_sync`)
@@ -3854,7 +3845,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                level_history.push(audio_level(&player, frame_elapsed));
+                level_history.push(audio_level(&playback, frame_elapsed));
                 let max_history = main_content.width.max(1) as usize;
                 if level_history.len() > max_history {
                     level_history.drain(..level_history.len() - max_history);
@@ -4286,7 +4277,9 @@ fn main() -> anyhow::Result<()> {
         if crossfade_enabled && now_playing.is_some() {
             if let Some(started) = fade_in_started_at {
                 let t = (started.elapsed().as_secs_f64() / cfg.crossfade_seconds).clamp(0.0, 1.0);
-                let _ = player.set_volume(base_volume * t);
+                // a ramp step per frame, so it is sent without waiting
+                // for mpv's reply; see `mpv::set_volume_nowait`.
+                let _ = player.set_volume_nowait(base_volume * t);
                 if t >= 1.0 {
                     fade_in_started_at = None;
                 }
@@ -4297,7 +4290,7 @@ fn main() -> anyhow::Result<()> {
                     let remaining = duration - elapsed;
                     if remaining <= cfg.crossfade_seconds {
                         let t = (remaining / cfg.crossfade_seconds).clamp(0.0, 1.0);
-                        let _ = player.set_volume(base_volume * t);
+                        let _ = player.set_volume_nowait(base_volume * t);
                     }
                 }
             }
@@ -4592,7 +4585,7 @@ fn main() -> anyhow::Result<()> {
         // fade whether or not the console is still on screen.
         let shellsong_now = start.elapsed();
         if let Some(ramp) = shellsong_fade {
-            let _ = player.set_volume(ramp.level_at(shellsong_now));
+            let _ = player.set_volume_nowait(ramp.level_at(shellsong_now));
             if ramp.finished(shellsong_now) {
                 shellsong_fade = None;
             }
