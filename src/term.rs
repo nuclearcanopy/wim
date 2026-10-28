@@ -1,4 +1,4 @@
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -30,6 +30,14 @@ impl TerminalGuard {
         execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
         if mouse {
             execute!(stdout, EnableMouseCapture)?;
+            // crossterm's EnableMouseCapture also turns on any-event
+            // tracking (?1003), which reports every pointer motion
+            // across the terminal and would cost a full redraw per
+            // event, idle or not. ?1002 stays on, which is the motion
+            // actually wanted: motion while a button is held, i.e. a
+            // drag on the scrubber.
+            write!(stdout, "\x1b[?1003l")?;
+            stdout.flush()?;
         }
 
         let default_hook = std::panic::take_hook();
