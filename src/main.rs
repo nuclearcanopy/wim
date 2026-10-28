@@ -2727,6 +2727,11 @@ fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatal
             playlists.join().unwrap_or_default(),
         )
     });
+    // persisted here, not where it gets merged: every caller of this
+    // is already off the main thread (or already blocking on the
+    // network), and serializing a catalog is not something to spend a
+    // frame on. best-effort, and a no-op when nothing changed.
+    let _ = cache::save_catalog(&client, &artists, &albums, &playlists);
     Ok(FetchedCatalog {
         client: Arc::new(client),
         artists,
@@ -2740,15 +2745,14 @@ fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatal
 /// (startup, manual reconnect, add-profile, background auto-sync) gets
 /// it for free instead of having to remember it.
 fn merge_catalog_into_app(app: &mut app::App, catalog: FetchedCatalog) {
-    app.corpus.add_subsonic_search_result(
-        subsonic::SearchResult {
+    app.corpus.reconcile_server(
+        cache::ServerCatalog {
             artists: catalog.artists,
             albums: catalog.albums,
-            songs: Vec::new(),
+            playlists: catalog.playlists,
         },
         &catalog.client,
     );
-    app.corpus.add_playlists(catalog.playlists, &catalog.client);
     app.resync_results();
 }
 
@@ -3064,7 +3068,11 @@ fn main() -> anyhow::Result<()> {
     // (universal navigation primitives, applied the same way
     // everywhere rather than individually named commands).
     let mut keymap = Keymap::from_overrides(&cfg.keybinds);
-    let mut app = app::App::new(search::Corpus::new());
+    // every configured server's catalog as of its last session, read
+    // straight off the disk so the first frame has a full library;
+    // the background sync below reconciles it against what each
+    // server really has. see `Corpus::warm_from_cache`.
+    let mut app = app::App::new(search::Corpus::warm_from_cache(&cfg.navidrome_servers));
     // so the first frame says "scanning" rather than "no local music
     // found"; cleared when the scan thread drops its sender. the
     // server equivalent is set below.
