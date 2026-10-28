@@ -2599,11 +2599,7 @@ fn main() -> anyhow::Result<()> {
                 f.render_widget(
                     MiniPlayerBar {
                         title: &label(item),
-                        elapsed_secs,
-                        duration_secs,
                         paused,
-                        loop_label: app.loop_mode.label(),
-                        shuffle_on: app.shuffle,
                         keymap: &keymap,
                     },
                     // same y/height as the row carved out above, but
