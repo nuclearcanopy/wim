@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
@@ -809,6 +809,41 @@ fn go_to_previous(
         *previous_track = Some(prev);
     }
     status
+}
+
+/// Finishes an open drag: one absolute seek to the target the bar has
+/// been drawing, then the drag closes. Shared by the keyboard's
+/// enter/esc and the mouse's button release, so "committed" means the
+/// same thing however the drag was being held.
+fn commit_scrub(
+    target: Scrub,
+    player: &mpv::Mpv,
+    notifications: &mut Notifications,
+    scrub: &mut Option<Scrub>,
+    scrub_pending: &mut bool,
+    scrub_sent_at: &mut Option<Instant>,
+) {
+    if let Err(e) = player.seek(target.target_secs, false) {
+        notifications.push(Severity::Error, format!("error seeking: {e}"));
+    }
+    *scrub = None;
+    *scrub_pending = false;
+    *scrub_sent_at = None;
+}
+
+/// Crossterm's mouse event, reduced to what `hit::act` decides from.
+/// Only the left button is wired up: no other button means anything
+/// anywhere in this app, and a terminal reporting one should not be
+/// able to press a control by accident.
+fn mouse_kind(kind: MouseEventKind) -> hit::Kind {
+    match kind {
+        MouseEventKind::Down(MouseButton::Left) => hit::Kind::Down,
+        MouseEventKind::Drag(MouseButton::Left) => hit::Kind::Drag,
+        MouseEventKind::Up(MouseButton::Left) => hit::Kind::Up,
+        MouseEventKind::ScrollUp => hit::Kind::WheelUp,
+        MouseEventKind::ScrollDown => hit::Kind::WheelDown,
+        _ => hit::Kind::Other,
+    }
 }
 
 /// Where enter (or a click) on the scrubber opens its drag: at the
@@ -3367,6 +3402,13 @@ fn main() -> anyhow::Result<()> {
     // therefore how far they can scroll) depends on it, and only the
     // draw pass knows it.
     let mut lyrics_width: u16 = 0;
+    // where the last frame put everything, filled in by the draw pass
+    // below and read by the next mouse event; same reason
+    // `lyrics_width` is written from in there, taken all the way.
+    // Declared without a value because every iteration replaces it
+    // before anything reads it. See `hit` and
+    // docs/input-precedence.md.
+    let mut hits: hit::HitMap;
     // opened via enter on an album/playlist; takes over main_content
     // until esc, same modal-ish precedence as lyrics but independent
     // of it (browsing doesn't require anything to already be playing).
@@ -3647,6 +3689,26 @@ fn main() -> anyhow::Result<()> {
         // sampled once per frame rather than per widget, so everything
         // on screen animates off the same instant.
         let frame_elapsed = start.elapsed();
+        // cleared here and refilled by the draw below, so a mouse
+        // event is always answered by the frame the user clicked on.
+        // `hit::front` resolves the tier from the key cascade's own
+        // order; these are the flags that cascade tests, read in one
+        // place rather than re-tested per hit.
+        hits = hit::HitMap {
+            modal: hit::front(hit::Tiers {
+                onboarding: onboarding.is_some(),
+                nav_manager: nav_manager.is_some(),
+                help: help_open,
+                console: console_open,
+                editing_query: app.editing_query,
+                browse_filter: browse_view.as_ref().is_some_and(|bv| bv.filtering),
+                subtitle_menu: subtitle_menu_open,
+                settings_menu: settings_menu_open,
+                eq_menu: eq_menu_open,
+                keybinds_menu: keybinds_menu_open,
+            }),
+            ..Default::default()
+        };
         guard.terminal.draw(|f| {
             let area = f.area();
 
@@ -3729,7 +3791,13 @@ fn main() -> anyhow::Result<()> {
             }
 
             if help_open {
-                f.render_widget(ui::help::HelpOverlay { keymap: &keymap }, area);
+                f.render_widget(
+                    ui::help::HelpOverlay {
+                        keymap: &keymap,
+                        mouse: cfg.mouse,
+                    },
+                    area,
+                );
                 return;
             }
 
@@ -3769,6 +3837,12 @@ fn main() -> anyhow::Result<()> {
             let sidebar = cols[0];
             let vdivider = cols[1];
             let main_content = cols[2];
+            // the divider column belongs to neither pane, so a click
+            // on it resolves to nothing rather than to whichever side
+            // a guess would round it to.
+            hits.sidebar = Some(sidebar);
+            hits.workspace = Some(main_content);
+            hits.bottom = Some(bottom);
 
             // only resize mode highlights a divider, and only the one
             // it has selected. highlighting on navigation focus was
@@ -3798,6 +3872,7 @@ fn main() -> anyhow::Result<()> {
             .split(sidebar);
             let search_rect = sidebar_rows[0];
             let results_rect = sidebar_rows[2];
+            hits.boxes.push((hit::TextBox::Query, search_rect));
             // which rules reach this divider from the right depends on
             // what main content shows: the browse view's header rules,
             // the mini player's strip, nothing at all from the player,
@@ -3886,6 +3961,12 @@ fn main() -> anyhow::Result<()> {
                 },
                 search_rect,
             );
+            hits.lists.push(hit::List {
+                which: hit::Scrollable::SidebarResults,
+                rect: results_rect,
+                rows: ui::results_list::row_items(&app.results, app.selected, results_rect),
+                len: app.results.len(),
+            });
             f.render_widget(
                 ResultsList {
                     items: &app.results,
@@ -3925,30 +4006,39 @@ fn main() -> anyhow::Result<()> {
                 // keyed on the song's own id; until that lands those
                 // tracks show no art rather than the wrong one.
                 let has_context = previous_label.is_some() || next_label.is_some();
-                f.render_widget(
-                    PlayerView {
-                        title: &label(item),
-                        art: playing_art,
-                        art_mode,
-                        cell_aspect: aspect,
-                        // mid-drag the screen draws the pending target,
-                        // not mpv's position, same as the bottom bar.
-                        elapsed_secs: scrub.map(|s| s.target_secs).or(elapsed_secs),
-                        duration_secs,
-                        paused,
-                        loop_mode: app.loop_mode,
-                        shuffle_on: app.shuffle,
-                        speed: app.speed,
-                        eq_preset: &eq_label(&app, &cfg),
-                        crossfade_on: crossfade_enabled,
-                        previous: previous_label.as_deref(),
-                        next: next_label.as_deref(),
-                        selected: (focus == Focus::Workspace).then_some(player_selected),
-                        scrubbing: scrub.is_some(),
-                        keymap: &keymap,
-                    },
-                    main_content,
-                );
+                let player_view = PlayerView {
+                    title: &label(item),
+                    art: playing_art,
+                    art_mode,
+                    cell_aspect: aspect,
+                    // mid-drag the screen draws the pending target,
+                    // not mpv's position, same as the bottom bar.
+                    elapsed_secs: scrub.map(|s| s.target_secs).or(elapsed_secs),
+                    duration_secs,
+                    paused,
+                    loop_mode: app.loop_mode,
+                    shuffle_on: app.shuffle,
+                    speed: app.speed,
+                    eq_preset: &eq_label(&app, &cfg),
+                    crossfade_on: crossfade_enabled,
+                    previous: previous_label.as_deref(),
+                    next: next_label.as_deref(),
+                    selected: (focus == Focus::Workspace).then_some(player_selected),
+                    scrubbing: scrub.is_some(),
+                    keymap: &keymap,
+                };
+                let transport = player_view.transport(main_content);
+                for (field, rect) in transport.controls {
+                    hits.controls.push(hit::Control {
+                        transport: hit::Transport::Player,
+                        field,
+                        rect,
+                    });
+                }
+                if let Some(rect) = transport.track {
+                    hits.tracks.push((hit::Transport::Player, rect));
+                }
+                f.render_widget(player_view, main_content);
                 if art_mode == browse::ArtMode::Real {
                     // same contract as the browse view: the widget drew
                     // no ascii art, the real image goes on the exact
@@ -3986,6 +4076,37 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
             } else if let Some(bv) = &browse_view {
+                let rows = ui::browse::rows(main_content, bv, art_mode, aspect);
+                if rows.albums.is_some() {
+                    // only the artist profile draws a filter box, and
+                    // only it has an albums column; one condition.
+                    let (_, list_area) = browse::layout(
+                        main_content,
+                        bv.art.is_some() && art_mode != browse::ArtMode::Off,
+                        bv.bio.is_some(),
+                        bv.is_artist,
+                        aspect,
+                    );
+                    hits.boxes.push((
+                        hit::TextBox::BrowseFilter,
+                        ui::browse::artist_columns(list_area).filter,
+                    ));
+                }
+                if let Some((rect, rows)) = rows.albums {
+                    hits.lists.push(hit::List {
+                        which: hit::Scrollable::BrowseAlbums,
+                        rect,
+                        rows,
+                        len: bv.albums.len(),
+                    });
+                }
+                let (rect, rows) = rows.tracks;
+                hits.lists.push(hit::List {
+                    which: hit::Scrollable::BrowseTracks,
+                    rect,
+                    rows,
+                    len: bv.tracks.len(),
+                });
                 f.render_widget(
                     BrowseListView {
                         view: bv,
@@ -4014,6 +4135,12 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             } else if let Some(sug) = &suggestions {
+                hits.lists.push(hit::List {
+                    which: hit::Scrollable::Suggestions,
+                    rect: ui::suggestions::body_rect(main_content),
+                    rows: ui::suggestions::row_items(sug, suggestions_selected, main_content),
+                    len: ui::suggestions::count(sug),
+                });
                 f.render_widget(
                     ui::suggestions::SuggestionsView {
                         suggestions: sug,
@@ -4027,6 +4154,17 @@ fn main() -> anyhow::Result<()> {
                     main_content,
                 );
             } else if queue_view_open {
+                hits.lists.push(hit::List {
+                    which: hit::Scrollable::Queue,
+                    rect: ui::queue::body_rect(main_content),
+                    rows: ui::queue::row_items(
+                        play_queue.entries(),
+                        play_queue.pos(),
+                        queue_selected,
+                        main_content,
+                    ),
+                    len: play_queue.entries().len(),
+                });
                 f.render_widget(
                     ui::queue::QueueView {
                         entries: play_queue.entries(),
@@ -4040,6 +4178,17 @@ fn main() -> anyhow::Result<()> {
             } else if let Some(lines) = &lyrics_lines {
                 lyrics_width = main_content.width;
                 let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+                // no rows: nothing here is selectable, so the wheel
+                // moves the content offset `j`/`k` already move.
+                hits.lists.push(hit::List {
+                    which: hit::Scrollable::Lyrics,
+                    rect: ui::header::body(main_content),
+                    rows: Vec::new(),
+                    len: ui::lyrics_view::wrapped_len(
+                        &borrowed,
+                        main_content.width.max(1) as usize,
+                    ),
+                });
                 f.render_widget(
                     LyricsView {
                         lines: &borrowed,
@@ -4073,6 +4222,12 @@ fn main() -> anyhow::Result<()> {
                     },
                     top,
                 );
+                // the picture covers the sidebar and the lists in it,
+                // so a click up here is a click on the video, not on
+                // a row nothing on screen shows.
+                hits.sidebar = None;
+                hits.workspace = Some(top);
+                hits.lists.retain(|l| !top.intersects(l.rect));
             }
 
             // 'u': settings, over the whole workspace (sidebar
@@ -4183,43 +4338,53 @@ fn main() -> anyhow::Result<()> {
                 .then_some("resize mode: a=sidebar s=bottom bar, arrows stretch, r/esc exit");
             let flash_level =
                 flash.map(|(field, at)| (field, anim::decay(at.elapsed(), FLASH_DURATION)));
-            f.render_widget(
-                ControlsBar {
-                    move_mode: input_mode == InputMode::Move,
-                    focus_label: match focus {
-                        Focus::Sidebar => "sidebar",
-                        Focus::Workspace => "workspace",
-                        Focus::BottomBar => "bottom bar",
-                    },
-                    focused: focus == Focus::BottomBar,
-                    queue_len: play_queue.upcoming_len(),
-                    loop_mode: app.loop_mode,
-                    shuffle_on: app.shuffle,
-                    speed: app.speed,
-                    // the curve's name lives in the eq menu now; the
-                    // bar only answers "is the eq doing anything",
-                    // which is a question about the gains rather than
-                    // about what the curve is called.
-                    eq_active: !eq::is_flat(&app.eq_gains),
-                    crossfade_on: crossfade_enabled,
-                    paused,
-                    // mid-drag the bar draws the pending target, not
-                    // mpv's position: the seek is throttled, the
-                    // keypress shouldn't look like it was.
-                    elapsed_secs: scrub.map(|s| s.target_secs).or(elapsed_secs),
-                    duration_secs,
-                    flash: flash_level,
-                    selected: (focus == Focus::BottomBar).then_some(bottombar_selected),
-                    scrubbing: scrub.is_some(),
-                    resize_hint,
+            let controls_rect = Rect {
+                y: bottom.y + 1,
+                width: bottom.width.saturating_sub(help_box_width),
+                height: bottom.height.saturating_sub(1),
+                ..bottom
+            };
+            let controls_bar = ControlsBar {
+                move_mode: input_mode == InputMode::Move,
+                focus_label: match focus {
+                    Focus::Sidebar => "sidebar",
+                    Focus::Workspace => "workspace",
+                    Focus::BottomBar => "bottom bar",
                 },
-                Rect {
-                    y: bottom.y + 1,
-                    width: bottom.width.saturating_sub(help_box_width),
-                    height: bottom.height.saturating_sub(1),
-                    ..bottom
-                },
-            );
+                focused: focus == Focus::BottomBar,
+                queue_len: play_queue.upcoming_len(),
+                loop_mode: app.loop_mode,
+                shuffle_on: app.shuffle,
+                speed: app.speed,
+                // the curve's name lives in the eq menu now; the
+                // bar only answers "is the eq doing anything",
+                // which is a question about the gains rather than
+                // about what the curve is called.
+                eq_active: !eq::is_flat(&app.eq_gains),
+                crossfade_on: crossfade_enabled,
+                paused,
+                // mid-drag the bar draws the pending target, not
+                // mpv's position: the seek is throttled, the
+                // keypress shouldn't look like it was.
+                elapsed_secs: scrub.map(|s| s.target_secs).or(elapsed_secs),
+                duration_secs,
+                flash: flash_level,
+                selected: (focus == Focus::BottomBar).then_some(bottombar_selected),
+                scrubbing: scrub.is_some(),
+                resize_hint,
+            };
+            let bar = controls_bar.layout(controls_rect);
+            for (field, rect) in bar.controls {
+                hits.controls.push(hit::Control {
+                    transport: hit::Transport::Bar,
+                    field,
+                    rect,
+                });
+            }
+            if let Some(rect) = bar.track {
+                hits.tracks.push((hit::Transport::Bar, rect));
+            }
+            f.render_widget(controls_bar, controls_rect);
             f.render_widget(
                 ui::helpbox::HelpBox { label: &help_label },
                 Rect {
@@ -4925,6 +5090,212 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // the mouse, answered against the map the draw above
+            // recorded: `hit::act` is given the frame the user was
+            // actually looking at and decides everything, and this
+            // only applies the answer. a drag belongs to the focused
+            // surface's scrubber, which is the only one it can have
+            // been opened on (the keyboard opens one on the focused
+            // pane, and a click sets focus to whatever it hit).
+            if let Event::Mouse(m) = &ev {
+                let dragging = scrub.is_some().then_some(match focus {
+                    Focus::BottomBar => hit::Transport::Bar,
+                    _ => hit::Transport::Player,
+                });
+                let click = hit::Click {
+                    kind: mouse_kind(m.kind),
+                    col: m.column,
+                    row: m.row,
+                };
+                let act = hit::act(&hits, click, dragging);
+                // a click lands somewhere specific, so unlike a key it
+                // cannot leak into a text box; what it does instead is
+                // take the keyboard out of one, the way clicking away
+                // from a field does anywhere else. The screen-covering
+                // tiers never get here at all (`Act::Swallowed`).
+                if matches!(
+                    act,
+                    hit::Act::Focus(_) | hit::Act::Select(..) | hit::Act::Press(..)
+                ) {
+                    app.editing_query = false;
+                    if let Some(bv) = &mut browse_view {
+                        bv.filtering = false;
+                    }
+                }
+                match act {
+                    hit::Act::Nothing | hit::Act::Swallowed(_) => {}
+                    hit::Act::Focus(pane) => focus = pane,
+                    hit::Act::Edit(which) => match which {
+                        hit::TextBox::Query => {
+                            focus = Focus::Sidebar;
+                            app.editing_query = true;
+                        }
+                        hit::TextBox::BrowseFilter => {
+                            focus = Focus::Workspace;
+                            if let Some(bv) = &mut browse_view {
+                                bv.filtering = true;
+                            }
+                        }
+                    },
+                    hit::Act::Select(which, item) => {
+                        focus = which.pane();
+                        match which {
+                            hit::Scrollable::SidebarResults => {
+                                // through the one selection primitive
+                                // j/k and shellsong's up()/down() use,
+                                // rather than a second clamp here.
+                                app.move_selection(item as isize - app.selected as isize);
+                            }
+                            hit::Scrollable::BrowseAlbums => {
+                                if let Some(bv) = &mut browse_view {
+                                    bv.albums_selected = item;
+                                    bv.albums_focused = true;
+                                }
+                            }
+                            hit::Scrollable::BrowseTracks => {
+                                if let Some(bv) = &mut browse_view {
+                                    bv.selected = item;
+                                    bv.albums_focused = false;
+                                    bv.clamp_selection();
+                                }
+                            }
+                            hit::Scrollable::Queue => queue_selected = item,
+                            hit::Scrollable::Suggestions => suggestions_selected = item,
+                            // nothing in there to select; see the
+                            // wheel arm below.
+                            hit::Scrollable::Lyrics => {}
+                        }
+                    }
+                    hit::Act::Press(transport, field, frac) => {
+                        // the cursor moves onto what was clicked and
+                        // then the one activation path runs, so a
+                        // click and enter on the same glyph are the
+                        // same operation (`activate_transport`).
+                        let at = match frac {
+                            Some(frac) => ScrubAt::Fraction(frac),
+                            None => ScrubAt::Position,
+                        };
+                        match transport {
+                            hit::Transport::Bar => {
+                                focus = Focus::BottomBar;
+                                bottombar_selected = field;
+                            }
+                            hit::Transport::Player => {
+                                focus = Focus::Workspace;
+                                player_selected = field;
+                            }
+                        }
+                        activate_transport(
+                            field,
+                            at,
+                            &mut TransportCtx {
+                                cfg: &cfg,
+                                player: &player,
+                                app: &mut app,
+                                notifications: &mut notifications,
+                                play_queue: &mut play_queue,
+                                cache_index: &cache_index,
+                                flash: &mut flash,
+                                eq_menu_open: &mut eq_menu_open,
+                                eq_menu_selected: &mut eq_menu_selected,
+                                eq_menu: &mut eq_menu,
+                                crossfade_enabled: &mut crossfade_enabled,
+                                fade_in_started_at: &mut fade_in_started_at,
+                                base_volume,
+                                scrub: &mut scrub,
+                                scrub_pending: &mut scrub_pending,
+                                scrub_sent_at: &mut scrub_sent_at,
+                                elapsed_secs: playback.elapsed_secs,
+                                duration_secs: playback.duration_secs,
+                            },
+                        );
+                    }
+                    // the drag redraws from the pending target and the
+                    // seek stays coalesced behind it, exactly as a
+                    // held arrow key does.
+                    hit::Act::ScrubTo(frac) => {
+                        if let Some(s) = scrub {
+                            scrub = Some(s.at_fraction(frac));
+                            scrub_pending = true;
+                        }
+                    }
+                    hit::Act::ScrubCommit(frac) => {
+                        if let Some(s) = scrub {
+                            commit_scrub(
+                                s.at_fraction(frac),
+                                &player,
+                                &mut notifications,
+                                &mut scrub,
+                                &mut scrub_pending,
+                                &mut scrub_sent_at,
+                            );
+                        }
+                    }
+                    // the wheel moves the selection, not a viewport of
+                    // its own: one notch is then the same operation as
+                    // one `j`, `ui::scroll`'s clamp-to-selection rule
+                    // keeps the selection on screen for free, and
+                    // there is no second scroll offset for the
+                    // keyboard to disagree with. It does not take
+                    // focus; scrolling a list is not a commitment to
+                    // acting on it. See docs/input-precedence.md.
+                    hit::Act::Wheel(which, down) => {
+                        let len = hits
+                            .lists
+                            .iter()
+                            .find(|l| l.which == which)
+                            .map_or(0, |l| l.len);
+                        match which {
+                            hit::Scrollable::SidebarResults => {
+                                let to = hit::wheel_select(app.selected, len, down);
+                                app.move_selection(to as isize - app.selected as isize);
+                            }
+                            hit::Scrollable::BrowseAlbums => {
+                                if let Some(bv) = &mut browse_view {
+                                    bv.albums_selected =
+                                        hit::wheel_select(bv.albums_selected, len, down);
+                                }
+                            }
+                            hit::Scrollable::BrowseTracks => {
+                                // the filter sits between a row and a
+                                // track index, so the notch steps
+                                // through the visible rows and reads
+                                // the track back off them.
+                                if let Some(bv) = &mut browse_view {
+                                    let visible = bv.visible_track_indices();
+                                    let at =
+                                        visible.iter().position(|i| *i == bv.selected).unwrap_or(0);
+                                    let to = hit::wheel_select(at, visible.len(), down);
+                                    if let Some(idx) = visible.get(to) {
+                                        bv.selected = *idx;
+                                    }
+                                }
+                            }
+                            // same display order the queue view's own
+                            // j/k walks, history reversed and all.
+                            hit::Scrollable::Queue => {
+                                let order =
+                                    ui::queue::selectable(play_queue.entries(), play_queue.pos());
+                                let at =
+                                    order.iter().position(|i| *i == queue_selected).unwrap_or(0);
+                                let to = hit::wheel_select(at, order.len(), down);
+                                if let Some(idx) = order.get(to) {
+                                    queue_selected = *idx;
+                                }
+                            }
+                            hit::Scrollable::Suggestions => {
+                                suggestions_selected =
+                                    hit::wheel_select(suggestions_selected, len, down);
+                            }
+                            hit::Scrollable::Lyrics => {
+                                lyrics_scroll = hit::wheel_scroll(lyrics_scroll, len, down);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
             if let Event::Key(key) = ev {
                 // the one unconditional quit, regardless of what
                 // modal/menu is open; 'q' still works too but only
@@ -5151,6 +5522,10 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                // the tier order below is also `hit::TIERS`, which
+                // is how a mouse click decides which surface owns a
+                // cell; adding a tier here means adding it there too
+                // (see docs/input-precedence.md).
                 // every block below intercepts specific keys and
                 // unconditionally `continue`s even on a non-match
                 // (browse_view/lyrics/the subtitle+settings menus
@@ -5676,14 +6051,14 @@ fn main() -> anyhow::Result<()> {
                         // on the way there, so there's nothing esc
                         // could roll back to that wouldn't itself be
                         // another seek the user didn't ask for.
-                        KeyCode::Enter | KeyCode::Esc => {
-                            if let Err(e) = player.seek(s.target_secs, false) {
-                                notifications.push(Severity::Error, format!("error seeking: {e}"));
-                            }
-                            scrub = None;
-                            scrub_pending = false;
-                            scrub_sent_at = None;
-                        }
+                        KeyCode::Enter | KeyCode::Esc => commit_scrub(
+                            s,
+                            &player,
+                            &mut notifications,
+                            &mut scrub,
+                            &mut scrub_pending,
+                            &mut scrub_sent_at,
+                        ),
                         _ => {}
                     }
                     continue;
