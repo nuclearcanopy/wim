@@ -10,12 +10,13 @@
 // which lands separately. this allow goes away with it.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::LoopMode;
 use crate::eq;
@@ -84,7 +85,6 @@ impl Kind {
 const KIND_LADDER: &[(&str, &[Kind])] = &[
     ("song", &[Kind::Song]),
     ("album", &[Kind::Song, Kind::Album]),
-    ("artist", &[Kind::Song, Kind::Album, Kind::Artist]),
     (
         "any",
         &[
@@ -99,8 +99,11 @@ const KIND_LADDER: &[(&str, &[Kind])] = &[
 
 /// Name suffixes, pure sugar for a `kind=` argument and nothing else
 /// (docs/shellsong.md R6): `queue_aa([x])` *is* `queue([x], kind=album)`,
-/// which `dry()` reports. One line per suffix.
-const KIND_SUFFIXES: &[(&str, &str)] = &[("_aa", "album"), ("_ar", "artist"), ("_any", "any")];
+/// which `dry()` reports. One line per suffix. There is deliberately no
+/// artist rung: an artist expands to a whole discography, which is
+/// never a queue anyone asked for (`kind=any` is the explicit escape
+/// hatch). See docs/shellsong.md.
+const KIND_SUFFIXES: &[(&str, &str)] = &[("_aa", "album"), ("_any", "any")];
 
 fn ladder(name: &str) -> Option<&'static [Kind]> {
     KIND_LADDER
@@ -120,30 +123,144 @@ pub enum Pos {
     Seconds(f64),
 }
 
-/// A volume request: an absolute level or a nudge, both in percent.
+/// A volume request, in percent. `Absolute` is refused above 100 at
+/// parse time; `Delta` applies to mpv's current volume and the host
+/// clamps the result to 0-100. The ceiling is real: above 100 mpv
+/// applies digital gain, which clips.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Level {
     Absolute(f64),
     Delta(f64),
 }
 
-/// What `show(target)` asks for.
+/// What a term-taking command acts on. Omitting the terms means "the
+/// current selection", uniformly across every such command, which is
+/// what keeps one name to one meaning (docs/shellsong.md R11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShowTarget {
-    Queue,
-    Now,
-    History,
-    Index,
-    Playlists,
+pub enum Target {
+    /// index into `Env::results`, resolved by the executor from a term.
+    Index(usize),
+    /// whatever is highlighted right now.
+    Selection,
 }
 
-const SHOW_TARGETS: &[(&str, ShowTarget)] = &[
-    ("queue", ShowTarget::Queue),
-    ("now", ShowTarget::Now),
-    ("history", ShowTarget::History),
-    ("index", ShowTarget::Index),
-    ("playlists", ShowTarget::Playlists),
+/// Which pane owns the keyboard. `go()` means "what enter does", and
+/// what enter does depends on this, so the executor resolves it rather
+/// than making the host re-derive it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Focus {
+    #[default]
+    Sidebar,
+    Workspace,
+    BottomBar,
+}
+
+/// The resolved meaning of `go()`, mirroring the host's own enter
+/// precedence: a focused browse view claims enter, then the bottom
+/// bar's focused field, otherwise the sidebar's selected result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoTarget {
+    /// enter on the selected search result.
+    Result,
+    /// enter inside the open browse view.
+    BrowseRow,
+    /// enter on the focused bottom-bar field.
+    BottomBarField,
+}
+
+/// What `view(target)` puts on screen. `view` is the one and only
+/// screen-opening verb; every menu and listing is a target here rather
+/// than its own command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewTarget {
+    Queue,
+    Now,
+    Suggestions,
+    Settings,
+    Keybinds,
+    Lyrics,
+    Starred,
+    Index,
+    History,
+    Playlists,
+    Eq,
+    /// The command listing. Unlike every other target this is generated
+    /// here rather than read from the app, so it lowers to the same
+    /// notes `help()` produces instead of to an op; `view` still means
+    /// "put this on screen" either way.
+    Help,
+}
+
+impl ViewTarget {
+    /// True for the targets that take over the screen, as opposed to
+    /// printing a listing into the scrollback. The console closes for
+    /// the former, since it would sit on top of what just opened.
+    pub fn is_screen(self) -> bool {
+        !matches!(
+            self,
+            ViewTarget::Queue
+                | ViewTarget::Index
+                | ViewTarget::History
+                | ViewTarget::Playlists
+                | ViewTarget::Help
+        )
+    }
+}
+
+/// The literal that switches `view` into its search form, plus its
+/// alias. Not a target, so it lives beside them rather than in
+/// `ViewTarget`.
+const VIEW_QUERY_WORDS: &[&str] = &["q", "query"];
+
+/// Every spelling `view` accepts. `canonical` is what completion and
+/// `help()` offer; the parser takes every row, which is how
+/// `suggest` / `suggestion` / `suggestions` all land on one target.
+struct ViewName {
+    word: &'static str,
+    target: ViewTarget,
+    canonical: bool,
+}
+
+const fn view(word: &'static str, target: ViewTarget, canonical: bool) -> ViewName {
+    ViewName {
+        word,
+        target,
+        canonical,
+    }
+}
+
+const VIEW_NAMES: &[ViewName] = &[
+    view("queue", ViewTarget::Queue, true),
+    view("now", ViewTarget::Now, true),
+    view("player", ViewTarget::Now, false),
+    view("suggestions", ViewTarget::Suggestions, true),
+    view("suggestion", ViewTarget::Suggestions, false),
+    view("suggest", ViewTarget::Suggestions, false),
+    view("settings", ViewTarget::Settings, true),
+    view("keybinds", ViewTarget::Keybinds, true),
+    view("keybind", ViewTarget::Keybinds, false),
+    view("lyrics", ViewTarget::Lyrics, true),
+    view("starred", ViewTarget::Starred, true),
+    view("favorites", ViewTarget::Starred, false),
+    view("index", ViewTarget::Index, true),
+    view("history", ViewTarget::History, true),
+    view("playlists", ViewTarget::Playlists, true),
+    view("eq", ViewTarget::Eq, true),
+    view("equalizer", ViewTarget::Eq, false),
+    view("help", ViewTarget::Help, true),
 ];
+
+fn view_target(word: &str) -> Option<ViewTarget> {
+    VIEW_NAMES.iter().find(|v| v.word == word).map(|v| v.target)
+}
+
+fn view_name(target: ViewTarget) -> &'static str {
+    VIEW_NAMES
+        .iter()
+        .find(|v| v.target == target && v.canonical)
+        .map(|v| v.word)
+        .unwrap_or("?")
+}
 
 // ------------------------------------------------------------------- op
 
@@ -166,7 +283,6 @@ pub enum Op {
     SetSpeed(f64),
     SpeedUp,
     SpeedDown,
-    OpenEqMenu,
     /// index into `eq::PRESETS`.
     SetEqPreset(usize),
     ToggleCrossfade,
@@ -175,22 +291,21 @@ pub enum Op {
     MoveSelection(i32),
     SelectTop,
     SelectBottom,
-    /// whatever enter would do on the current selection.
-    Go,
-    /// act on `Env::results[index]`, resolved by the executor.
-    PlayIndex(usize),
-    EnqueueIndex {
-        index: usize,
+    /// whatever enter would do, already resolved against the focus.
+    Go(GoTarget),
+    Play(Target),
+    Enqueue {
+        target: Target,
         front: bool,
     },
-    StarIndex {
-        index: usize,
+    Star {
+        target: Target,
         on: bool,
     },
-    DownloadIndex(usize),
-    /// zero-argument forms, acting on whatever is highlighted.
-    StarSelection(bool),
-    DownloadSelection,
+    Download(Target),
+    /// open the page a result belongs to (an artist's or album's own
+    /// view); `view(q, ...)` resolves to this.
+    OpenPage(Target),
     ClearQueue,
     /// 1-based queue positions, descending so the host can remove in
     /// order without reindexing.
@@ -199,11 +314,9 @@ pub enum Op {
     ShuffleQueue,
     SaveQueue(String),
     LoadQueue(String),
-    Show(ShowTarget),
-    OpenLyrics,
-    OpenStarred,
-    OpenSettings,
-    OpenKeybinds,
+    /// the one screen-opening op; `ViewTarget::is_screen` says whether
+    /// it takes over the screen or prints a listing.
+    View(ViewTarget),
     Rescan,
     /// seconds until fade-out + pause; `None` cancels.
     Sleep(Option<f64>),
@@ -238,7 +351,6 @@ impl Op {
             Op::SetSpeed(s) => format!("speed: {s}x"),
             Op::SpeedUp => "speed up".into(),
             Op::SpeedDown => "speed down".into(),
-            Op::OpenEqMenu => "eq menu".into(),
             Op::SetEqPreset(i) => {
                 format!("eq: {}", eq::PRESETS.get(*i).map(|p| p.name).unwrap_or("?"))
             }
@@ -248,24 +360,23 @@ impl Op {
             Op::MoveSelection(_) => "down".into(),
             Op::SelectTop => "top".into(),
             Op::SelectBottom => "bottom".into(),
-            Op::Go => "opened selection".into(),
-            Op::PlayIndex(_) => "playing".into(),
-            Op::EnqueueIndex { front: true, .. } => "queued next".into(),
-            Op::EnqueueIndex { front: false, .. } => "queued".into(),
-            Op::StarIndex { on: true, .. } | Op::StarSelection(true) => "starred".into(),
-            Op::StarIndex { on: false, .. } | Op::StarSelection(false) => "unstarred".into(),
-            Op::DownloadIndex(_) | Op::DownloadSelection => "downloading".into(),
+            Op::Go(GoTarget::Result) => "opened the selected result".into(),
+            Op::Go(GoTarget::BrowseRow) => "played from the selected row".into(),
+            Op::Go(GoTarget::BottomBarField) => "tweaked the focused field".into(),
+            Op::Play(_) => "playing".into(),
+            Op::Enqueue { front: true, .. } => "queued next".into(),
+            Op::Enqueue { front: false, .. } => "queued".into(),
+            Op::Star { on: true, .. } => "starred".into(),
+            Op::Star { on: false, .. } => "unstarred".into(),
+            Op::Download(_) => "downloading".into(),
+            Op::OpenPage(_) => "opened its page".into(),
             Op::ClearQueue => "queue cleared".into(),
             Op::RemoveFromQueue(v) => format!("removed {} from the queue", v.len()),
             Op::GotoQueue(n) => format!("jumped to queue {n}"),
             Op::ShuffleQueue => "queue shuffled".into(),
             Op::SaveQueue(n) => format!("saved queue as '{n}'"),
             Op::LoadQueue(n) => format!("loaded queue '{n}'"),
-            Op::Show(t) => format!("show {}", show_name(*t)),
-            Op::OpenLyrics => "lyrics".into(),
-            Op::OpenStarred => "starred songs".into(),
-            Op::OpenSettings => "settings".into(),
-            Op::OpenKeybinds => "keybinds".into(),
+            Op::View(t) => format!("viewing {}", view_name(*t)),
             Op::Rescan => "rescanning the library".into(),
             Op::Sleep(Some(s)) => format!("sleep in {s}s"),
             Op::Sleep(None) => "sleep cancelled".into(),
@@ -274,14 +385,20 @@ impl Op {
             Op::Quit => "bye".into(),
         }
     }
-}
 
-fn show_name(target: ShowTarget) -> &'static str {
-    SHOW_TARGETS
-        .iter()
-        .find(|(_, t)| *t == target)
-        .map(|(n, _)| *n)
-        .unwrap_or("?")
+    /// True for ops that put a view on screen. The console is a centred
+    /// overlay, so it has to get out of the way before one is applied
+    /// or it covers whatever was just opened; this is the one place
+    /// that decides, rather than each view-opener remembering to.
+    pub fn closes_console(&self) -> bool {
+        match self {
+            Op::View(t) => t.is_screen(),
+            // opening a page replaces the workspace behind the console,
+            // which is the point of asking for it.
+            Op::OpenPage(_) | Op::Quit => true,
+            _ => false,
+        }
+    }
 }
 
 // ------------------------------------------------------------ signatures
@@ -294,8 +411,16 @@ pub enum Ty {
     /// one or more search terms; a single value is accepted anywhere a
     /// list is (docs/shellsong.md R5).
     Terms,
-    /// free text (a query, a playlist name, a command name).
-    Name,
+    /// free text to search for; completes from the local corpus.
+    Query,
+    /// a name the user is inventing (a queue to save); nothing to
+    /// complete from, by definition.
+    NewName,
+    /// the name of something already saved; completes from the host's
+    /// saved queues.
+    SavedName,
+    /// the name of a command, for `help`.
+    CommandName,
     /// unsigned time literal: absolute position.
     Pos,
     /// signed time literal: a relative offset.
@@ -326,26 +451,96 @@ pub enum Words {
     LoopMode,
     Switch,
     EqPreset,
-    Show,
+    /// every `view` target plus the `q` literal that switches it into
+    /// its search form.
+    ViewTarget,
     FadeDir,
 }
 
 impl Words {
+    /// What completion offers and `help()` prints: canonical spellings
+    /// only, so the list stays readable even where the parser accepts
+    /// several words for one thing.
     pub fn options(self) -> Vec<&'static str> {
         match self {
             Words::Position => vec!["front", "back"],
             Words::LoopMode => vec!["one", "all", "off"],
             Words::Switch => vec!["on", "off"],
             Words::EqPreset => eq::PRESETS.iter().map(|p| p.name).collect(),
-            Words::Show => SHOW_TARGETS.iter().map(|(n, _)| *n).collect(),
+            Words::ViewTarget => VIEW_QUERY_WORDS[..1]
+                .iter()
+                .copied()
+                .chain(VIEW_NAMES.iter().filter(|v| v.canonical).map(|v| v.word))
+                .collect(),
             Words::FadeDir => vec!["in", "out"],
+        }
+    }
+
+    /// Every spelling the parser accepts, which is a superset of
+    /// `options`; validation reads this so an alias still parses even
+    /// though completion does not advertise it.
+    fn accepts(self) -> Vec<&'static str> {
+        match self {
+            Words::ViewTarget => VIEW_QUERY_WORDS
+                .iter()
+                .copied()
+                .chain(VIEW_NAMES.iter().map(|v| v.word))
+                .collect(),
+            other => other.options(),
         }
     }
 }
 
+/// How a parameter completes. Every `Ty` resolves to exactly one of
+/// these: either there is a candidate list worth inserting, or there is
+/// not and the user gets a hint instead. Guessing `volume(5` into
+/// `50%` is the absurdity this split exists to prevent; there is no
+/// sane candidate list for a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Completes {
+    /// a fixed keyword set, from `COMMANDS` itself.
+    Words(Words),
+    /// names from the host's local corpus.
+    CorpusTerms,
+    /// command names.
+    CommandNames,
+    /// the host's saved queue names.
+    SavedQueues,
+    /// nothing insertable; show this instead, and never accept it.
+    Hint(&'static str),
+}
+
+impl Completes {
+    /// True for the classes that produce text the user can accept.
+    pub fn insertable(self) -> bool {
+        !matches!(self, Completes::Hint(_))
+    }
+}
+
 impl Ty {
-    /// Keywords this type accepts, for completion and for error
-    /// messages; empty for the free-form types.
+    /// The single source of truth for what this type completes to. A
+    /// new `Ty` must land in exactly one class here; the coverage test
+    /// fails otherwise rather than silently completing nothing.
+    pub fn completes(self) -> Completes {
+        match self {
+            Ty::Terms | Ty::Query => Completes::CorpusTerms,
+            Ty::SavedName => Completes::SavedQueues,
+            Ty::CommandName | Ty::Call => Completes::CommandNames,
+            Ty::Words(w) => Completes::Words(w),
+            Ty::NewName => Completes::Hint("a name to save it under"),
+            Ty::Pos => Completes::Hint("10% / 90 / 1m20s"),
+            Ty::Offset => Completes::Hint("+30s / -10s (sign required)"),
+            Ty::Level => Completes::Hint("0-100, or +N% / -N%"),
+            Ty::Count => Completes::Hint("how many times, 1-256"),
+            Ty::Index => Completes::Hint("a queue position, 1 or higher"),
+            Ty::Indices => Completes::Hint("1, or [1, 3, 5]"),
+            Ty::Speed => Completes::Hint("0.25-3.0, or up / down / reset"),
+            Ty::Duration => Completes::Hint("30m / off"),
+        }
+    }
+
+    /// Keywords this type accepts, for error messages; the completion
+    /// path goes through `completes` instead.
     pub fn options(self) -> Vec<&'static str> {
         match self {
             Ty::Words(w) => w.options(),
@@ -358,7 +553,10 @@ impl Ty {
     fn describe(self) -> String {
         match self {
             Ty::Terms => "a term or [list of terms]".into(),
-            Ty::Name => "a name".into(),
+            Ty::Query => "something to search for".into(),
+            Ty::NewName => "a name".into(),
+            Ty::SavedName => "the name of a saved queue".into(),
+            Ty::CommandName => "a command name".into(),
             Ty::Pos => "an unsigned position like 30s, 1m20s or 50%".into(),
             Ty::Offset => "a signed offset like +30s or -10s".into(),
             Ty::Level => "a percent like 50% or +10%".into(),
@@ -367,7 +565,15 @@ impl Ty {
             Ty::Indices => "one or more queue positions".into(),
             Ty::Speed => "a multiplier like 1.5, or up / down / reset".into(),
             Ty::Duration => "a duration like 30m, or off".into(),
-            Ty::Words(w) => w.options().join(" or "),
+            Ty::Words(w) => {
+                let options = w.options();
+                // two reads as a choice, more reads as a list.
+                if options.len() <= 2 {
+                    options.join(" or ")
+                } else {
+                    format!("one of: {}", options.join(", "))
+                }
+            }
             Ty::Call => "a call like skip()".into(),
         }
     }
@@ -378,6 +584,10 @@ pub struct Param {
     pub name: &'static str,
     pub ty: Ty,
     pub required: bool,
+    /// Appended to the "missing argument" message when the type alone
+    /// does not explain which call the user probably wanted; empty for
+    /// most parameters.
+    pub hint: &'static str,
 }
 
 const fn req(name: &'static str, ty: Ty) -> Param {
@@ -385,6 +595,16 @@ const fn req(name: &'static str, ty: Ty) -> Param {
         name,
         ty,
         required: true,
+        hint: "",
+    }
+}
+
+const fn req_hint(name: &'static str, ty: Ty, hint: &'static str) -> Param {
+    Param {
+        name,
+        ty,
+        required: true,
+        hint,
     }
 }
 
@@ -393,6 +613,7 @@ const fn opt(name: &'static str, ty: Ty) -> Param {
         name,
         ty,
         required: false,
+        hint: "",
     }
 }
 
@@ -433,6 +654,9 @@ impl Command {
 const NONE: &[Param] = &[];
 const SONG: &[Kind] = &[Kind::Song];
 const SONG_ALBUM: &[Kind] = &[Kind::Song, Kind::Album];
+/// `view(q, ...)` wants the page a term belongs to, so it prefers the
+/// kinds that *have* pages and takes a song last.
+const VIEW: &[Kind] = &[Kind::Artist, Kind::Album, Kind::Playlist, Kind::Song];
 
 const fn cmd(
     name: &'static str,
@@ -516,30 +740,30 @@ pub const COMMANDS: &[Command] = &[
     cmd(
         "eq",
         &["equalizer"],
-        &[opt("preset", Ty::Words(Words::EqPreset))],
+        &[req("preset", Ty::Words(Words::EqPreset))],
         &[],
-        "open the eq menu, or apply a preset",
+        "apply an eq preset; view(eq) opens the menu",
     ),
     cmd("crossfade", &["xfade"], NONE, &[], "toggle crossfade"),
     // search and playback
     cmd(
         "search",
         &["find", "grep"],
-        &[req("query", Ty::Name)],
+        &[req("query", Ty::Query)],
         &[],
         "run a search and leave the results up",
     ),
     cmd(
         "play",
         &[],
-        &[req("terms", Ty::Terms)],
+        &[opt("terms", Ty::Terms)],
         SONG_ALBUM,
         "play the first term, queue the rest",
     ),
     cmd(
         "queue",
         &["enqueue"],
-        &[req("terms", Ty::Terms)],
+        &[opt("terms", Ty::Terms)],
         SONG,
         "append each term to the queue",
     ),
@@ -547,11 +771,15 @@ pub const COMMANDS: &[Command] = &[
         "add_to_queue",
         &[],
         &[
-            opt("position", Ty::Words(Words::Position)),
-            req("terms", Ty::Terms),
+            req_hint(
+                "position",
+                Ty::Words(Words::Position),
+                "front inserts next; queue(...) is how you append",
+            ),
+            opt("terms", Ty::Terms),
         ],
         SONG,
-        "queue at the front or the back (default back)",
+        "insert next (front) or append (back)",
     ),
     cmd(
         "clear_queue",
@@ -577,14 +805,14 @@ pub const COMMANDS: &[Command] = &[
     cmd(
         "save_queue",
         &[],
-        &[req("name", Ty::Name)],
+        &[req("name", Ty::NewName)],
         &[],
         "save the queue as a local playlist",
     ),
     cmd(
         "load_queue",
         &[],
-        &[req("name", Ty::Name)],
+        &[req("name", Ty::SavedName)],
         &[],
         "replace the queue with a saved playlist",
     ),
@@ -593,14 +821,14 @@ pub const COMMANDS: &[Command] = &[
         &["favorite", "fav", "like"],
         &[opt("terms", Ty::Terms)],
         SONG_ALBUM,
-        "star the selection, or whatever each term finds",
+        "star what each term finds",
     ),
     cmd(
         "unstar",
         &["unfavorite", "unfav", "unlike"],
         &[opt("terms", Ty::Terms)],
         SONG_ALBUM,
-        "unstar the selection, or whatever each term finds",
+        "unstar what each term finds",
     ),
     cmd(
         "download",
@@ -623,16 +851,19 @@ pub const COMMANDS: &[Command] = &[
     cmd("bottom", &[], NONE, &[], "select the last result"),
     // introspection and overlays
     cmd(
-        "show",
-        &["ls"],
-        &[req("target", Ty::Words(Words::Show))],
-        &[],
-        "show queue / now / history / index / playlists",
+        "view",
+        &["show", "ls"],
+        &[
+            req_hint(
+                "target",
+                Ty::Words(Words::ViewTarget),
+                "or view(q, terms) to search and open the best match",
+            ),
+            opt("terms", Ty::Terms),
+        ],
+        VIEW,
+        "put something on screen; the only screen-opening command",
     ),
-    cmd("lyrics", &[], NONE, &[], "open lyrics for what is playing"),
-    cmd("starred", &[], NONE, &[], "open the starred songs view"),
-    cmd("settings", &[], NONE, &[], "open the settings menu"),
-    cmd("keybinds", &[], NONE, &[], "open the keybind menu"),
     cmd("rescan", &[], NONE, &[], "re-walk the local library"),
     cmd(
         "sleep",
@@ -654,7 +885,7 @@ pub const COMMANDS: &[Command] = &[
     cmd(
         "help",
         &[],
-        &[opt("name", Ty::Name)],
+        &[opt("name", Ty::CommandName)],
         &[],
         "list every command, or one command's signature",
     ),
@@ -693,12 +924,20 @@ fn lookup(name: &str) -> Option<(&'static Command, Option<&'static str>)> {
             .iter()
             .find(|c| c.name == stem || c.aliases.contains(&stem))
         {
-            if !c.prefs.is_empty() {
+            if widenable(c) {
                 return Some((c, Some(kind)));
             }
         }
     }
     None
+}
+
+/// The `kind=` ladder widens *from songs*, so only a song-rooted
+/// command can take it. `view` prefers artists and albums by design,
+/// which is a different order rather than a narrower one, so neither
+/// `kind=` nor a suffix applies to it.
+fn widenable(c: &Command) -> bool {
+    c.prefs.first() == Some(&Kind::Song)
 }
 
 /// Every written name the parser accepts, canonical and alias alike;
@@ -714,16 +953,28 @@ pub fn every_name() -> Vec<&'static str> {
     names
 }
 
-/// Closest known name to `name`, for "did you mean"; `strsim` is
-/// already how search.rs recovers typos, so the same metric is used.
+/// Closest known name to `name`, for "did you mean".
 fn did_you_mean(name: &str) -> Option<&'static str> {
-    let budget = 2.max(name.chars().count() / 3);
-    every_name()
-        .into_iter()
-        .map(|c| (strsim::damerau_levenshtein(name, c), c))
-        .filter(|(d, _)| *d <= budget)
-        .min_by_key(|(d, c)| (*d, c.len()))
-        .map(|(_, c)| c)
+    closest(name, &every_name())
+}
+
+/// `strsim`, same dependency search.rs recovers typos with, but
+/// Jaro-Winkler rather than a plain edit distance: a candidate is often
+/// much longer than what was typed ("suggst" against "suggestions"),
+/// where an edit-distance budget scaled to the typed length refuses
+/// every real answer. Prefix weighting also suits a half-typed name.
+const SUGGEST_FLOOR: u32 = 820;
+
+fn closest(name: &str, among: &[&'static str]) -> Option<&'static str> {
+    let mut hits: Vec<(u32, &'static str)> = among
+        .iter()
+        .map(|c| ((strsim::jaro_winkler(name, c) * 1000.0) as u32, *c))
+        .filter(|(score, _)| *score >= SUGGEST_FLOOR)
+        .collect();
+    // closest, then shortest, then alphabetical: deterministic all the
+    // way down.
+    hits.sort_by_key(|(score, c)| (std::cmp::Reverse(*score), c.len(), *c));
+    hits.first().map(|(_, c)| *c)
 }
 
 /// `help()` output, generated from `COMMANDS`; canonical names only,
@@ -769,6 +1020,8 @@ pub struct Env {
     pub queue_len: usize,
     /// a browse view (album/artist/playlist/starred) is open.
     pub browsing: bool,
+    /// which pane owns the keyboard; `go()` resolves against it.
+    pub focus: Focus,
 }
 
 // --------------------------------------------------------------- errors
@@ -829,15 +1082,17 @@ enum TermAction {
     Enqueue { front: bool },
     Star(bool),
     Download,
+    OpenPage,
 }
 
 impl TermAction {
-    fn op(self, index: usize) -> Op {
+    fn op(self, target: Target) -> Op {
         match self {
-            TermAction::Play => Op::PlayIndex(index),
-            TermAction::Enqueue { front } => Op::EnqueueIndex { index, front },
-            TermAction::Star(on) => Op::StarIndex { index, on },
-            TermAction::Download => Op::DownloadIndex(index),
+            TermAction::Play => Op::Play(target),
+            TermAction::Enqueue { front } => Op::Enqueue { target, front },
+            TermAction::Star(on) => Op::Star { target, on },
+            TermAction::Download => Op::Download(target),
+            TermAction::OpenPage => Op::OpenPage(target),
         }
     }
 
@@ -848,6 +1103,7 @@ impl TermAction {
             TermAction::Star(true) => "starred",
             TermAction::Star(false) => "unstarred",
             TermAction::Download => "downloading",
+            TermAction::OpenPage => "opened",
         }
     }
 }
@@ -859,6 +1115,9 @@ impl TermAction {
 enum Node {
     Emit(Op),
     Note(String),
+    /// `go()`: resolved against `Env::focus` at run time, since what
+    /// enter does depends on which pane owns the keyboard.
+    Go,
     /// emit a search and arm the await that the following `Resolve`
     /// blocks on.
     Search(String),
@@ -956,6 +1215,21 @@ impl Program {
                 self.pc += 1;
                 Step::Note(text)
             }
+            Node::Go => {
+                self.pc += 1;
+                // the host's own enter precedence: a focused browse
+                // view claims it, then the bottom bar's field,
+                // otherwise the selected search result.
+                let target = match env.focus {
+                    Focus::Workspace if env.browsing => GoTarget::BrowseRow,
+                    Focus::BottomBar => GoTarget::BottomBarField,
+                    _ => GoTarget::Result,
+                };
+                if target == GoTarget::Result && env.results.is_empty() {
+                    return self.fail(RuntimeError::NothingSelected);
+                }
+                Step::Emit(Op::Go(target))
+            }
             Node::Search(query) => {
                 self.pc += 1;
                 self.pending = Some(Pending {
@@ -982,7 +1256,21 @@ impl Program {
     /// to apply them; everything else is unconditional.
     fn guard(&mut self, env: &Env, op: Op) -> Step {
         let bad = match &op {
-            Op::Go if env.results.is_empty() && !env.browsing => {
+            // the zero-terms forms all act on the highlighted row, so
+            // there has to be one.
+            Op::Play(Target::Selection)
+            | Op::Enqueue {
+                target: Target::Selection,
+                ..
+            }
+            | Op::Star {
+                target: Target::Selection,
+                ..
+            }
+            | Op::Download(Target::Selection)
+            | Op::OpenPage(Target::Selection)
+                if env.results.is_empty() && !env.browsing =>
+            {
                 Some(RuntimeError::NothingSelected)
             }
             Op::GotoQueue(n) if *n == 0 || *n > env.queue_len => Some(RuntimeError::OutOfRange {
@@ -1036,7 +1324,7 @@ impl Program {
                 if let Some(g) = self.groups.get_mut(group) {
                     g.ok += 1;
                 }
-                Step::Emit(action.op(index))
+                Step::Emit(action.op(Target::Index(index)))
             }
             None => Step::Note(format!(
                 "no {} match for '{term}'",
@@ -1150,32 +1438,51 @@ impl Lowering {
         }
     }
 
+    /// The uniform rule (docs/shellsong.md R11): with terms, search for
+    /// each and act on what it finds; without, act on the selection.
+    /// One meaning, so the same code path serves both.
+    fn lower_targeted(&mut self, call: &Call, action: TermAction) {
+        match call.terms() {
+            Some(terms) => self.lower_terms(call, terms, action),
+            None => self.nodes.push(Node::Emit(action.op(Target::Selection))),
+        }
+    }
+
+    fn lower_view(&mut self, call: &Call) {
+        let querying =
+            matches!(call.args.first(), Some(Arg::Word(w)) if VIEW_QUERY_WORDS.contains(w));
+        if querying {
+            self.lower_targeted(call, TermAction::OpenPage);
+            return;
+        }
+        let Some(target) = call.keyword(Words::ViewTarget).and_then(view_target) else {
+            return;
+        };
+        // the command listing is generated here, not read from the app,
+        // so it lands in the scrollback exactly as `help()` does.
+        if target == ViewTarget::Help {
+            for line in help_lines() {
+                self.nodes.push(Node::Note(line));
+            }
+            return;
+        }
+        self.nodes.push(Node::Emit(Op::View(target)));
+    }
+
     fn lower_plain(&mut self, call: &Call) {
         let name = call.command.name;
-        let terms = call.terms();
         match name {
-            "play" => {
-                if let Some(t) = terms {
-                    self.lower_terms(call, t, TermAction::Play);
-                }
-            }
+            "play" => self.lower_targeted(call, TermAction::Play),
             "queue" | "add_to_queue" => {
                 let front = call.keyword(Words::Position) == Some("front");
-                if let Some(t) = terms {
-                    self.lower_terms(call, t, TermAction::Enqueue { front });
-                }
+                self.lower_targeted(call, TermAction::Enqueue { front });
             }
             "star" | "unstar" => {
-                let on = name == "star";
-                match terms {
-                    Some(t) => self.lower_terms(call, t, TermAction::Star(on)),
-                    None => self.nodes.push(Node::Emit(Op::StarSelection(on))),
-                }
+                self.lower_targeted(call, TermAction::Star(name == "star"));
             }
-            "download" => match terms {
-                Some(t) => self.lower_terms(call, t, TermAction::Download),
-                None => self.nodes.push(Node::Emit(Op::DownloadSelection)),
-            },
+            "download" => self.lower_targeted(call, TermAction::Download),
+            "view" => self.lower_view(call),
+            "go" => self.nodes.push(Node::Go),
             _ => {
                 if let Some(op) = call.simple_op() {
                     self.nodes.push(Node::Emit(op));
@@ -1191,6 +1498,7 @@ fn describe_node(node: &Node) -> Option<String> {
     match node {
         Node::Emit(op) => Some(format!("  {}", op.describe())),
         Node::Note(text) => Some(format!("  {text}")),
+        Node::Go => Some("  do what enter would do here".to_string()),
         Node::Search(q) => Some(format!("  search '{q}'")),
         Node::Resolve {
             term,
@@ -1309,9 +1617,9 @@ impl Call {
     }
 
     fn keyword(&self, set: Words) -> Option<&'static str> {
-        let options = set.options();
+        let accepted = set.accepts();
         self.args.iter().find_map(|a| match a {
-            Arg::Word(w) if options.contains(w) => Some(*w),
+            Arg::Word(w) if accepted.contains(w) => Some(*w),
             _ => None,
         })
     }
@@ -1357,10 +1665,7 @@ impl Call {
                 Some(Arg::Speed(SpeedArg::Reset)) => Op::SetSpeed(1.0),
                 _ => return None,
             },
-            "eq" => match self.keyword(Words::EqPreset).and_then(eq::index_of) {
-                Some(i) => Op::SetEqPreset(i),
-                None => Op::OpenEqMenu,
-            },
+            "eq" => Op::SetEqPreset(self.keyword(Words::EqPreset).and_then(eq::index_of)?),
             "crossfade" => Op::ToggleCrossfade,
             "search" => match first {
                 Some(Arg::Name(q)) => Op::Search(q.clone()),
@@ -1390,20 +1695,10 @@ impl Call {
                 Some(Arg::Name(n)) => Op::LoadQueue(n.clone()),
                 _ => return None,
             },
-            "go" => Op::Go,
             "up" => Op::MoveSelection(-1),
             "down" => Op::MoveSelection(1),
             "top" => Op::SelectTop,
             "bottom" => Op::SelectBottom,
-            "show" => {
-                let name = self.keyword(Words::Show)?;
-                let target = SHOW_TARGETS.iter().find(|(n, _)| *n == name)?.1;
-                Op::Show(target)
-            }
-            "lyrics" => Op::OpenLyrics,
-            "starred" => Op::OpenStarred,
-            "settings" => Op::OpenSettings,
-            "keybinds" => Op::OpenKeybinds,
             "rescan" => Op::Rescan,
             "sleep" => match first {
                 Some(Arg::Duration(d)) => Op::Sleep(*d),
@@ -1612,13 +1907,13 @@ fn parse_call(input: &str, offset: usize, text: &str) -> Result<Call, ParseError
     for (off, piece) in raw {
         match kwarg(piece) {
             Some(("kind", value)) => {
-                if command.prefs.is_empty() {
-                    return Err(err(
-                        input,
-                        off,
-                        piece,
-                        format!("{name} does not search, so kind= means nothing here"),
-                    ));
+                if !widenable(command) {
+                    let why = if command.prefs.is_empty() {
+                        format!("{name} does not search, so kind= means nothing here")
+                    } else {
+                        format!("{name} has its own preference order and does not take kind=")
+                    };
+                    return Err(err(input, off, piece, why));
                 }
                 let Some(_) = ladder(value) else {
                     return Err(err(
@@ -1650,11 +1945,56 @@ fn parse_call(input: &str, offset: usize, text: &str) -> Result<Call, ParseError
     }
 
     let args = bind(input, command, &positional)?;
+    if command.name == "view" {
+        check_view(input, &args, &positional)?;
+    }
     Ok(Call {
         command,
         args,
         kind,
     })
+}
+
+/// `view` is the one command whose two parameters constrain each other:
+/// `q` is the search form and needs terms, every other target is a
+/// screen and takes none. Checked here rather than in `bind`, which
+/// only ever sees one parameter at a time.
+fn check_view(input: &str, args: &[Arg], positional: &[(usize, &str)]) -> Result<(), ParseError> {
+    let querying = matches!(args.first(), Some(Arg::Word(w)) if VIEW_QUERY_WORDS.contains(w));
+    let terms = args.iter().any(|a| matches!(a, Arg::Terms(_)));
+    let at = |i: usize| positional.get(i).map(|(o, _)| *o).unwrap_or(0);
+    match (querying, terms) {
+        (true, false) => Err(err(
+            input,
+            at(0),
+            "q",
+            "view(q, ...) needs something to search for",
+        )),
+        (false, true) => Err(err(
+            input,
+            at(1),
+            positional.get(1).map(|(_, t)| *t).unwrap_or(""),
+            "view(<target>) takes no terms; write view(q, terms) to search",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The "you left out a required argument" message. Carries the
+/// parameter's own hint when the type alone would not tell the user
+/// which call they actually wanted.
+fn missing(command: &Command, param: &Param) -> String {
+    let base = format!(
+        "{}: missing {} ({})",
+        command.name,
+        param.name,
+        param.ty.describe()
+    );
+    if param.hint.is_empty() {
+        base
+    } else {
+        format!("{base}; {}", param.hint)
+    }
 }
 
 fn ladder_name(value: &str) -> &'static str {
@@ -1701,12 +2041,7 @@ fn bind(
                     input,
                     given.last().map(|(o, _)| *o).unwrap_or(0),
                     "",
-                    format!(
-                        "{}: missing {} ({})",
-                        command.name,
-                        param.name,
-                        param.ty.describe()
-                    ),
+                    missing(command, param),
                 ));
             }
             continue;
@@ -1716,8 +2051,14 @@ fn bind(
                 args.push(arg);
                 next += 1;
             }
-            Err(e) => {
+            Err(mut e) => {
                 if param.required || strict {
+                    // the hint explains which call they probably wanted,
+                    // which matters just as much for a value that does
+                    // not typecheck as for one left out entirely.
+                    if !param.hint.is_empty() {
+                        e.message = format!("{}; {}", e.message, param.hint);
+                    }
                     return Err(e);
                 }
                 // an optional parameter whose slot does not typecheck
@@ -1767,7 +2108,9 @@ fn coerce(
             }
             Ok(Arg::Terms(items))
         }
-        Ty::Name => {
+        // every free-text type parses identically; they differ only in
+        // what they complete from (see `Ty::completes`).
+        Ty::Query | Ty::NewName | Ty::SavedName | Ty::CommandName => {
             if text.starts_with('[') {
                 return Err(expected());
             }
@@ -1846,12 +2189,24 @@ fn coerce(
                 Err(why) => Err(bad(format!("{}: {why}", command.name))),
             }
         }
-        Ty::Words(set) => set
-            .options()
-            .into_iter()
-            .find(|o| *o == text)
-            .map(Arg::Word)
-            .ok_or_else(expected),
+        // every accepted spelling parses, but an unrecognised one is
+        // measured against the *canonical* list so the suggestion is
+        // something worth typing.
+        Ty::Words(set) => match set.accepts().into_iter().find(|o| *o == text) {
+            Some(word) => Ok(Arg::Word(word)),
+            None => Err(bad(match closest(text, &set.options()) {
+                Some(near) => format!(
+                    "{}: unknown {} '{text}'; did you mean '{near}'?",
+                    command.name, param.name
+                ),
+                None => format!(
+                    "{}: {} is one of: {}",
+                    command.name,
+                    param.name,
+                    set.options().join(", ")
+                ),
+            })),
+        },
         Ty::Call => {
             if !text.contains('(') {
                 return Err(expected());
@@ -2019,9 +2374,69 @@ pub enum ConsoleAction {
 
 const MAX_SCROLLBACK: usize = 200;
 const MAX_HISTORY: usize = 200;
+/// Completion runs on every keystroke, so the candidate list is capped
+/// rather than however many a wide query matches.
+const MAX_CANDIDATES: usize = 50;
 
-/// Console state: the input line being edited, the scrollback, and the
-/// persisted command history. Rendering lives in `ui::shellsong`.
+/// What completion may ask the host about the world, behind a trait so
+/// the completer itself stays pure: tests supply a fake, the host
+/// supplies the real corpus.
+///
+/// Both methods are called per keystroke and must therefore be local
+/// only. `corpus` must never trigger a remote search: typing would
+/// spam the server.
+pub trait Candidates {
+    /// Primary names (song title, album name, artist name) of local
+    /// corpus matches for `token`, best first and deduped. The host
+    /// passes `Corpus::search`, which is local by construction.
+    fn corpus(&self, token: &str) -> Vec<String>;
+
+    /// Names of the saved queues `load_queue` could take.
+    fn saved_queues(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// A provider that knows nothing: for a host that has not supplied one
+/// yet, and for the tests that do not care.
+pub struct NoCandidates;
+
+impl Candidates for NoCandidates {
+    fn corpus(&self, _token: &str) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// The live suggestion for the current input, recomputed on every
+/// keystroke; the overlay renders straight off this.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Suggestion {
+    /// Insertable text, drawn greyed out after the cursor. Always a
+    /// pure extension of what was typed, never a replacement.
+    pub ghost: String,
+    /// Not insertable: the expected shape of a value. Rendered away
+    /// from the input line precisely because it cannot be accepted.
+    pub hint: Option<&'static str>,
+    /// `name(a, b)` of the enclosing call plus the active parameter
+    /// index, for the context line.
+    pub signature: Option<(String, usize)>,
+    /// `ghost` is the tail of a whole past command line rather than a
+    /// token completion; only precedence and ranking care.
+    pub from_history: bool,
+}
+
+/// An open tab cycle. Every item is a prefix-extension of `typed`, so
+/// no amount of cycling can overwrite what was typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cycle {
+    pub items: Vec<String>,
+    pub at: usize,
+    typed: String,
+}
+
+/// Console state: the input line being edited, the scrollback, the
+/// persisted history and the completion state. Rendering lives in
+/// `ui::shellsong`.
 #[derive(Debug, Clone, Default)]
 pub struct Console {
     pub input: String,
@@ -2029,7 +2444,10 @@ pub struct Console {
     pub cursor: usize,
     pub lines: Vec<Line>,
     pub error: Option<String>,
+    pub suggestion: Suggestion,
+    cycle: Option<Cycle>,
     history: Vec<String>,
+    ranks: Ranker,
     /// position in `history` while recalling; `None` while editing a
     /// fresh line.
     recall: Option<usize>,
@@ -2038,10 +2456,11 @@ pub struct Console {
 }
 
 impl Console {
-    /// Loads the persisted history; the only I/O in this module.
+    /// Loads the persisted history and ranking; the only I/O here.
     pub fn new() -> Console {
         Console {
             history: load_history(),
+            ranks: Ranker::load(),
             ..Console::default()
         }
     }
@@ -2049,6 +2468,12 @@ impl Console {
     /// No-I/O constructor, for tests.
     pub fn empty() -> Console {
         Console::default()
+    }
+
+    /// The open tab cycle, for the overlay to draw with its position
+    /// indicator.
+    pub fn cycle(&self) -> Option<&Cycle> {
+        self.cycle.as_ref()
     }
 
     pub fn push(&mut self, kind: LineKind, text: impl Into<String>) {
@@ -2075,38 +2500,78 @@ impl Console {
         &self.history
     }
 
-    pub fn handle_key(&mut self, key: KeyCode) -> ConsoleAction {
-        match key {
-            KeyCode::Esc => return ConsoleAction::Close,
+    pub fn handle_key(&mut self, key: KeyEvent, cand: &dyn Candidates) -> ConsoleAction {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                // an open cycle swallows the first esc: cancelling the
+                // menu is what you meant, not closing the console.
+                if self.cycle.take().is_some() {
+                    self.refresh(cand);
+                } else {
+                    return ConsoleAction::Close;
+                }
+            }
             KeyCode::Enter => return self.submit(),
+            // ctrl+f accepts wherever the cursor is, which is what
+            // makes it the unambiguous accept key.
+            KeyCode::Char('f') if ctrl => self.accept(cand),
+            KeyCode::Char(_) if ctrl => {}
             KeyCode::Char(c) => {
                 self.error = None;
+                self.cycle = None;
                 edit_insert(&mut self.input, &mut self.cursor, c);
+                self.refresh(cand);
             }
             KeyCode::Backspace => {
                 self.error = None;
+                self.cycle = None;
                 edit_backspace(&mut self.input, &mut self.cursor);
+                self.refresh(cand);
             }
             KeyCode::Delete => {
+                self.cycle = None;
                 if let Some(next) = next_boundary(&self.input, self.cursor) {
                     self.input.replace_range(self.cursor..next, "");
                 }
+                self.refresh(cand);
             }
             KeyCode::Left => {
                 if let Some(prev) = prev_boundary(&self.input, self.cursor) {
                     self.cursor = prev;
                 }
+                self.refresh(cand);
             }
+            // right accepts only at the end of the line, so it keeps
+            // working as plain cursor movement mid-line.
             KeyCode::Right => {
-                if let Some(next) = next_boundary(&self.input, self.cursor) {
-                    self.cursor = next;
+                if self.cursor == self.input.len() && !self.suggestion.ghost.is_empty() {
+                    self.accept(cand);
+                } else {
+                    if let Some(next) = next_boundary(&self.input, self.cursor) {
+                        self.cursor = next;
+                    }
+                    self.refresh(cand);
                 }
             }
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.input.len(),
-            KeyCode::Up => self.recall_back(),
-            KeyCode::Down => self.recall_forward(),
-            KeyCode::Tab => self.complete(),
+            KeyCode::Home => {
+                self.cursor = 0;
+                self.refresh(cand);
+            }
+            KeyCode::End => {
+                self.cursor = self.input.len();
+                self.refresh(cand);
+            }
+            KeyCode::Up => {
+                self.recall_back();
+                self.refresh(cand);
+            }
+            KeyCode::Down => {
+                self.recall_forward();
+                self.refresh(cand);
+            }
+            KeyCode::Tab => self.spin(cand, 1),
+            KeyCode::BackTab => self.spin(cand, -1),
             _ => {}
         }
         ConsoleAction::None
@@ -2114,13 +2579,17 @@ impl Console {
 
     /// Bracketed paste; goes in literally, with no auto-pairing (a
     /// pasted `[` already has its own `]`).
-    pub fn paste(&mut self, text: &str) {
+    pub fn paste(&mut self, text: &str, cand: &dyn Candidates) {
         let text: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        self.cycle = None;
         self.input.insert_str(self.cursor, &text);
         self.cursor += text.len();
+        self.refresh(cand);
     }
 
     fn submit(&mut self) -> ConsoleAction {
+        self.cycle = None;
+        self.suggestion = Suggestion::default();
         let line = self.input.trim().to_string();
         if line.is_empty() {
             return ConsoleAction::Close;
@@ -2146,6 +2615,11 @@ impl Console {
     fn remember(&mut self, line: String) {
         self.recall = None;
         self.draft.clear();
+        // a line that was actually run is the strongest signal there
+        // is, so it counts even when it repeats the previous one (which
+        // the history list itself collapses).
+        self.ranks.bump(&line);
+        self.ranks.save();
         if self.history.last() == Some(&line) {
             return;
         }
@@ -2186,114 +2660,403 @@ impl Console {
         self.cursor = self.input.len();
     }
 
-    /// Completes the token under the cursor: command names outside
-    /// parens, and whatever keyword set the enclosing command's
-    /// parameter declares inside them. Both come from `COMMANDS`, so a
-    /// completion that appears always parses.
-    fn complete(&mut self) {
-        let (start, prefix) = token_at(&self.input, self.cursor);
-        let candidates = self.candidates(start, &prefix);
-        let hits: Vec<&str> = candidates
-            .into_iter()
-            .filter(|c| c.starts_with(&prefix))
-            .collect();
-        if hits.is_empty() {
+    /// Recomputes the ghost, the hint and the context line for wherever
+    /// the cursor now is. Cheap enough to run per keystroke: at worst
+    /// one local corpus search, capped at `MAX_CANDIDATES`.
+    fn refresh(&mut self, cand: &dyn Candidates) {
+        let here = site(&self.input, self.cursor);
+        let mut next = Suggestion {
+            signature: here.signature.clone(),
+            ..Suggestion::default()
+        };
+        // a value parameter gets a hint and nothing acceptable: there
+        // is no sane candidate list for a number, and guessing one
+        // (`volume(5` into `50%`) is worse than saying nothing.
+        if let Completes::Hint(text) = here.completes {
+            next.hint = Some(text);
+            self.suggestion = next;
             return;
         }
-        let common = longest_common_prefix(&hits);
-        if common.len() > prefix.len() {
-            let insert = &common[prefix.len()..];
-            self.input.insert_str(self.cursor, insert);
-            self.cursor += insert.len();
+        // a whole past command line wins over a token completion, but
+        // only with the cursor at the end, where the rest of the line
+        // is genuinely what comes next.
+        if self.cursor == self.input.len() && !self.input.is_empty() {
+            if let Some(rest) = self.history_extension() {
+                next.ghost = rest;
+                next.from_history = true;
+                self.suggestion = next;
+                return;
+            }
         }
-        if hits.len() > 1 {
-            self.note(hits.join("  "));
-        } else if !self.input[self.cursor..].starts_with('(')
-            && !self.input[..self.cursor].contains('(')
-        {
-            // a unique command name gets its parens, since every
-            // command needs them.
-            edit_insert(&mut self.input, &mut self.cursor, '(');
-        }
+        next.ghost = self
+            .candidates_at(&here, cand)
+            .first()
+            .map(|c| remainder(&here.token, c))
+            .unwrap_or_default();
+        self.suggestion = next;
     }
 
-    fn candidates(&self, start: usize, prefix: &str) -> Vec<&'static str> {
-        match enclosing(&self.input, start) {
-            None => every_name(),
-            Some((name, arg)) => match lookup(name) {
-                Some((c, _)) => c
-                    .params
-                    .get(arg)
-                    .map(|p| p.ty.options())
-                    .unwrap_or_default(),
-                // a nested call argument completes command names.
-                None if prefix.is_empty() => Vec::new(),
-                None => every_name(),
+    /// Ranked, prefix-only candidates for the token under the cursor.
+    fn candidates_at(&self, here: &Site, cand: &dyn Candidates) -> Vec<String> {
+        let found: Vec<String> = match here.completes {
+            Completes::Hint(_) => return Vec::new(),
+            Completes::Words(set) => set.options().iter().map(|s| s.to_string()).collect(),
+            Completes::CommandNames => every_name().iter().map(|s| s.to_string()).collect(),
+            // fuzzy discovery, so a subsequence or typo match surfaces
+            // things a prefix scan would miss; the prefix filter below
+            // then drops whatever could not be inserted without
+            // overwriting what was typed.
+            Completes::CorpusTerms => cand.corpus(&here.token),
+            Completes::SavedQueues => cand.saved_queues(),
+        };
+        let mut seen: Vec<String> = Vec::new();
+        for c in found {
+            if extend(&here.token, &c).is_some() && !seen.contains(&c) {
+                seen.push(c);
+                if seen.len() >= MAX_CANDIDATES {
+                    break;
+                }
+            }
+        }
+        self.ranks.order(&mut seen);
+        seen
+    }
+
+    /// The best past command line the whole input is a prefix of, as
+    /// zsh-autosuggestions does it.
+    fn history_extension(&self) -> Option<String> {
+        let mut hits: Vec<String> = Vec::new();
+        // newest first, so recency is the order anything unranked
+        // falls back to.
+        for past in self.history.iter().rev() {
+            if extend(&self.input, past).is_some() && !hits.contains(past) {
+                hits.push(past.clone());
+            }
+        }
+        self.ranks.order(&mut hits);
+        hits.first().map(|h| remainder(&self.input, h))
+    }
+
+    /// Inserts the current ghost. Only ever appends the candidate's
+    /// remaining characters, so the typed prefix survives byte for
+    /// byte, casing included.
+    fn accept(&mut self, cand: &dyn Candidates) {
+        if self.suggestion.ghost.is_empty() {
+            return;
+        }
+        let ghost = std::mem::take(&mut self.suggestion.ghost);
+        let from_history = self.suggestion.from_history;
+        let before = site(&self.input, self.cursor);
+        self.cycle = None;
+        self.input.insert_str(self.cursor, &ghost);
+        self.cursor += ghost.len();
+        if from_history {
+            let line = self.input.clone();
+            self.ranks.bump(&line);
+        } else {
+            self.ranks.bump(&format!("{}{ghost}", before.token));
+            // every command needs parens, so a completed command name
+            // gets them and lands the cursor inside, reusing the same
+            // auto-pairing an explicitly typed '(' goes through.
+            if before.completes == Completes::CommandNames
+                && !self.input[self.cursor..].starts_with('(')
+            {
+                edit_insert(&mut self.input, &mut self.cursor, '(');
+            }
+        }
+        self.refresh(cand);
+    }
+
+    /// Tab (`dir` 1) and shift+tab (`dir` -1). Always cycles token
+    /// candidates, never the history line: the two sources are
+    /// reachable by different keys on purpose.
+    fn spin(&mut self, cand: &dyn Candidates, dir: i32) {
+        if self.cycle.is_none() {
+            let here = site(&self.input, self.cursor);
+            if !here.completes.insertable() {
+                return;
+            }
+            let items = self.candidates_at(&here, cand);
+            match items.len() {
+                0 => return,
+                // nothing to choose between, so tab just takes it.
+                1 => {
+                    self.suggestion.ghost = remainder(&here.token, &items[0]);
+                    self.suggestion.from_history = false;
+                    self.accept(cand);
+                    return;
+                }
+                _ => {
+                    self.cycle = Some(Cycle {
+                        items,
+                        at: 0,
+                        typed: here.token,
+                    });
+                }
+            }
+        } else if let Some(cycle) = &mut self.cycle {
+            let n = cycle.items.len() as i32;
+            cycle.at = (((cycle.at as i32 + dir) % n + n) % n) as usize;
+        }
+        if let Some(cycle) = &self.cycle {
+            self.suggestion.ghost = remainder(&cycle.typed, &cycle.items[cycle.at]);
+            self.suggestion.from_history = false;
+            self.suggestion.hint = None;
+        }
+    }
+}
+
+// ----------------------------------------------------------- completion
+
+/// Where the cursor is and what the parameter there expects. Derived
+/// entirely from `COMMANDS`, so a completion that appears always
+/// parses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Site {
+    /// byte offset the token starts at.
+    pub start: usize,
+    pub token: String,
+    pub completes: Completes,
+    /// `name(a, b)` of the enclosing call plus the active parameter
+    /// index; `None` at statement level.
+    pub signature: Option<(String, usize)>,
+}
+
+/// Classifies the cursor position: which call it is inside, which
+/// parameter of it, and therefore what may be completed there.
+pub fn site(input: &str, cursor: usize) -> Site {
+    let (completes, signature) = match enclosing(input, cursor) {
+        None => (Completes::CommandNames, None),
+        Some((name, arg)) => match lookup(name) {
+            Some((command, _)) => match command.params.get(arg) {
+                Some(param) => (param.ty.completes(), Some((command.signature(), arg))),
+                // past the last parameter: nothing left to offer, but
+                // still show the signature so the arity is visible.
+                None => (
+                    Completes::Hint("no more arguments"),
+                    Some((command.signature(), arg)),
+                ),
             },
-        }
+            // the enclosing name is not (yet) a command, so whatever is
+            // being typed inside it is most likely a nested call.
+            None => (Completes::CommandNames, None),
+        },
+    };
+    let (start, token) = token_bounds(input, cursor);
+    Site {
+        start,
+        token,
+        completes,
+        signature,
     }
 }
 
-/// `(start, text)` of the word the cursor sits in; words break on
-/// anything that is not a name character.
-fn token_at(input: &str, cursor: usize) -> (usize, String) {
+/// `(start, text)` of the argument slice the cursor sits in: back to
+/// the nearest unquoted `(`, `[`, `,` or `;`, then forward past the
+/// whitespace. Slice-shaped rather than word-shaped because a term and
+/// several keywords ("bass boost", "4 star crest") contain spaces, and
+/// a word-shaped token could not complete them. This is also why
+/// `queue([a, fl` completes `fl` and not the whole list.
+fn token_bounds(input: &str, cursor: usize) -> (usize, String) {
     let upto = &input[..cursor.min(input.len())];
-    let start = upto
-        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    (start, upto[start..].to_string())
+    let mut start = 0usize;
+    let mut quoted = false;
+    for (i, c) in upto.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '(' | '[' | ',' | ';' if !quoted => start = i + c.len_utf8(),
+            _ => {}
+        }
+    }
+    let slice = &upto[start..];
+    let lead = slice.len() - slice.trim_start().len();
+    (start + lead, slice.trim_start().to_string())
 }
 
-/// `(command name, argument index)` of the call the position `at` sits
-/// inside, or `None` when it is at statement level.
+/// One open bracket's worth of context while scanning.
+enum Frame {
+    /// a call's `(`, with the name before it and how many top-level
+    /// commas have been seen inside it.
+    Call { name: (usize, usize), commas: usize },
+    /// a list's `[`; commas inside it separate items, not arguments,
+    /// which is why it needs its own frame.
+    List,
+}
+
+/// `(command name, argument index)` of the innermost call `at` sits
+/// inside, or `None` at statement level. A stack rather than a depth
+/// counter so `dry(queue([fl` reports `queue`, not `dry`.
 fn enclosing(input: &str, at: usize) -> Option<(&str, usize)> {
     let before = &input[..at.min(input.len())];
-    let mut depth = 0i32;
-    let mut open: Option<usize> = None;
-    let mut commas = 0usize;
+    let mut stack: Vec<Frame> = Vec::new();
     let mut quoted = false;
     for (i, c) in before.char_indices() {
         match c {
             '"' => quoted = !quoted,
-            '(' if !quoted => {
-                depth += 1;
-                if depth == 1 {
-                    open = Some(i);
-                    commas = 0;
+            _ if quoted => {}
+            '(' => {
+                let end = i;
+                let start = before[..end]
+                    .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .map(|j| j + 1)
+                    .unwrap_or(0);
+                stack.push(Frame::Call {
+                    name: (start, end),
+                    commas: 0,
+                });
+            }
+            '[' => stack.push(Frame::List),
+            ')' | ']' => {
+                stack.pop();
+            }
+            ',' => {
+                if let Some(Frame::Call { commas, .. }) = stack.last_mut() {
+                    *commas += 1;
                 }
             }
-            ')' if !quoted => depth -= 1,
-            ',' if !quoted && depth == 1 => commas += 1,
             _ => {}
         }
     }
-    if depth < 1 {
-        return None;
-    }
-    let lp = open?;
-    let name_start = before[..lp]
-        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    Some((&before[name_start..lp], commas))
+    stack.iter().rev().find_map(|f| match f {
+        Frame::Call { name, commas } => Some((&before[name.0..name.1], *commas)),
+        Frame::List => None,
+    })
 }
 
-fn longest_common_prefix(items: &[&str]) -> String {
-    let Some(first) = items.first() else {
-        return String::new();
-    };
-    let mut len = first.len();
-    for item in &items[1..] {
-        len = len.min(
-            first
-                .bytes()
-                .zip(item.bytes())
-                .take_while(|(a, b)| a == b)
-                .count(),
-        );
+/// `Some(remainder)` when `candidate` extends `token` case-
+/// insensitively. The remainder is all that ever gets inserted, so the
+/// typed prefix survives byte for byte including its casing (`fl` plus
+/// `atline`, never `Flatline`); search is case-insensitive, so the
+/// resulting term still resolves. A fuzzy hit that is not a prefix
+/// extension returns `None` and is dropped: inserting it would replace
+/// characters the user typed, which completion must never do.
+fn extend(token: &str, candidate: &str) -> Option<String> {
+    let keep = token.chars().count();
+    let head: String = candidate.chars().take(keep).collect();
+    if head.chars().count() < keep || head.to_lowercase() != token.to_lowercase() {
+        return None;
     }
-    first[..len].to_string()
+    let rest: String = candidate.chars().skip(keep).collect();
+    (!rest.is_empty()).then_some(rest)
+}
+
+fn remainder(token: &str, candidate: &str) -> String {
+    extend(token, candidate).unwrap_or_default()
+}
+
+// -------------------------------------------------------------- ranking
+
+/// How many ranked entries to keep; past this the least recently used
+/// go, since an entry nobody has touched in hundreds of commands is
+/// not what anyone is reaching for.
+const MAX_RANKS: usize = 500;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Stat {
+    uses: u32,
+    last: u64,
+}
+
+/// Recency-weighted frequency over the lines actually run and the
+/// completions actually accepted, so what gets used floats to the top.
+/// Frequency leads and recency breaks its ties; anything unseen keeps
+/// whatever order it arrived in (relevance for corpus hits, alphabetical
+/// for names), which is what keeps the result deterministic.
+#[derive(Debug, Clone, Default)]
+pub struct Ranker {
+    entries: HashMap<String, Stat>,
+    /// Stands in for a clock: the newest use simply has the highest
+    /// tick, which is all recency needs to be, and it survives a
+    /// restart without depending on the system time.
+    tick: u64,
+}
+
+impl Ranker {
+    fn bump(&mut self, what: &str) {
+        if what.is_empty() {
+            return;
+        }
+        self.tick += 1;
+        let tick = self.tick;
+        let entry = self.entries.entry(what.to_string()).or_default();
+        entry.uses = entry.uses.saturating_add(1);
+        entry.last = tick;
+        if self.entries.len() > MAX_RANKS {
+            self.prune();
+        }
+    }
+
+    fn stat(&self, what: &str) -> Stat {
+        self.entries.get(what).copied().unwrap_or_default()
+    }
+
+    /// Stable, which is the whole trick: unseen entries come out in
+    /// the order they went in rather than reshuffled.
+    fn order(&self, items: &mut [String]) {
+        items.sort_by_key(|item| {
+            let stat = self.stat(item);
+            (std::cmp::Reverse(stat.uses), std::cmp::Reverse(stat.last))
+        });
+    }
+
+    fn prune(&mut self) {
+        let mut by_age: Vec<(String, u64)> = self
+            .entries
+            .iter()
+            .map(|(k, v)| (k.clone(), v.last))
+            .collect();
+        by_age.sort_by_key(|(_, last)| *last);
+        for (key, _) in by_age.iter().take(self.entries.len() - MAX_RANKS * 3 / 4) {
+            self.entries.remove(key);
+        }
+    }
+
+    /// Its own file beside the plain history list: this is a scored
+    /// map, that is a line list, and nothing else parses either.
+    fn load() -> Ranker {
+        let Some(path) = state_path("shellsong_ranks") else {
+            return Ranker::default();
+        };
+        let Ok(raw) = fs::read_to_string(path) else {
+            return Ranker::default();
+        };
+        let mut ranker = Ranker::default();
+        for line in raw.lines() {
+            // `uses \t last \t name`; the name goes last because it is
+            // the only field that can contain anything.
+            let mut parts = line.splitn(3, '\t');
+            let (Some(uses), Some(last), Some(name)) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let (Ok(uses), Ok(last)) = (uses.parse::<u32>(), last.parse::<u64>()) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            ranker.tick = ranker.tick.max(last);
+            ranker.entries.insert(name.to_string(), Stat { uses, last });
+        }
+        ranker
+    }
+
+    /// Best-effort, same leniency as every other state file here.
+    fn save(&self) {
+        let Some(path) = state_path("shellsong_ranks") else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let body: String = self
+            .entries
+            .iter()
+            .map(|(name, s)| format!("{}\t{}\t{}", s.uses, s.last, name))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = fs::write(path, body);
+    }
 }
 
 // --------------------------------------------------------- editor pairs
@@ -2376,13 +3139,13 @@ fn next_boundary(buf: &str, cursor: usize) -> Option<usize> {
 /// Alongside `persistence.rs`'s state file, but a plain newline-
 /// delimited list rather than toml: it is a shell history, appended to
 /// and read back in order, and nothing else needs to parse it.
-fn history_path() -> Option<PathBuf> {
+fn state_path(file: &str) -> Option<PathBuf> {
     let dir = dirs::state_dir().or_else(dirs::data_dir)?;
-    Some(dir.join("wim").join("shellsong_history"))
+    Some(dir.join("wim").join(file))
 }
 
 fn load_history() -> Vec<String> {
-    let Some(path) = history_path() else {
+    let Some(path) = state_path("shellsong_history") else {
         return Vec::new();
     };
     fs::read_to_string(path)
@@ -2399,7 +3162,9 @@ fn load_history() -> Vec<String> {
 /// Best-effort, same leniency as every other state file here: a
 /// read-only state dir costs you history, not your session.
 fn save_history(history: &[String]) {
-    let Some(path) = history_path() else { return };
+    let Some(path) = state_path("shellsong_history") else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -2410,17 +3175,24 @@ fn save_history(history: &[String]) {
 mod tests {
     use super::*;
 
+    const SETTLED: Env = Env {
+        now: Duration::ZERO,
+        query: String::new(),
+        results: Vec::new(),
+        search_settled: true,
+        queue_len: 10,
+        browsing: true,
+        focus: Focus::Sidebar,
+    };
+
     /// Runs a program to completion against a fake world, standing in
     /// for the host: a search is "applied" by mirroring the query back
     /// into `Env`, and results are whatever the test says they are.
     fn drive(input: &str, results: Vec<Kind>) -> (Vec<Op>, Vec<String>) {
         let mut program = Program::parse(input).expect("should parse");
         let mut env = Env {
-            search_settled: true,
-            browsing: true,
-            queue_len: 10,
             results,
-            ..Env::default()
+            ..SETTLED.clone()
         };
         let mut ops = Vec::new();
         let mut notes = Vec::new();
@@ -2461,6 +3233,26 @@ mod tests {
         Program::parse(input).expect_err("should not parse")
     }
 
+    /// The search terms a program lowered to, in order.
+    fn terms_of(input: &str) -> Vec<String> {
+        Program::parse(input)
+            .unwrap()
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                Node::Search(q) => Some(q.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn queued(index: usize) -> Op {
+        Op::Enqueue {
+            target: Target::Index(index),
+            front: false,
+        }
+    }
+
     // ------------------------------------------------------- the table
 
     /// Drives straight off `COMMANDS`, so a command added without a
@@ -2487,7 +3279,7 @@ mod tests {
         for c in COMMANDS {
             let input = sample_call(c);
             let program =
-                Program::parse(&input).unwrap_or_else(|e| panic!("{} did not parse: {e}", input));
+                Program::parse(&input).unwrap_or_else(|e| panic!("{input} did not parse: {e}"));
             assert!(
                 !program.nodes.is_empty(),
                 "{input} parsed but lowered to nothing"
@@ -2509,8 +3301,12 @@ mod tests {
 
     fn sample_arg(ty: Ty) -> String {
         match ty {
+            // a real target, not the `q` literal, which would need a
+            // term alongside it (see `check_view`).
+            Ty::Words(Words::ViewTarget) => "queue".into(),
             Ty::Terms => "crest".into(),
-            Ty::Name => "crest".into(),
+            Ty::Query | Ty::NewName | Ty::SavedName => "crest".into(),
+            Ty::CommandName => "pause".into(),
             Ty::Pos => "30s".into(),
             Ty::Offset => "+30s".into(),
             Ty::Level => "50%".into(),
@@ -2549,6 +3345,14 @@ mod tests {
         assert!(out[0].starts_with("shuffle(state?)"), "{out:?}");
     }
 
+    /// `view(help)` and `help()` are the same listing; `view` means
+    /// "put this on screen" and a scrollback listing satisfies that.
+    #[test]
+    fn view_help_is_the_same_listing_help_prints() {
+        assert_eq!(notes("view(help)"), notes("help()"));
+        assert_eq!(notes("view(help)").len(), COMMANDS.len());
+    }
+
     // ---------------------------------------------------- bare words
 
     #[test]
@@ -2560,12 +3364,6 @@ mod tests {
             e.message
         );
         assert_eq!(e.column, 1);
-    }
-
-    #[test]
-    fn the_old_bareword_chain_is_no_longer_a_program() {
-        assert!(Program::parse("search crest go go").is_err());
-        assert!(Program::parse("forward2").is_err());
     }
 
     #[test]
@@ -2609,24 +3407,6 @@ mod tests {
     }
 
     #[test]
-    fn the_whole_favourites_synonym_set_collapses_to_two_ops() {
-        for name in ["star", "favorite", "fav", "like"] {
-            assert_eq!(
-                ops(&format!("{name}()")),
-                vec![Op::StarSelection(true)],
-                "{name}"
-            );
-        }
-        for name in ["unstar", "unfavorite", "unfav", "unlike"] {
-            assert_eq!(
-                ops(&format!("{name}()")),
-                vec![Op::StarSelection(false)],
-                "{name}"
-            );
-        }
-    }
-
-    #[test]
     fn modes_cycle_bare_and_set_with_a_keyword() {
         assert_eq!(ops("loop()"), vec![Op::CycleLoop]);
         assert_eq!(ops("loop(one)"), vec![Op::SetLoop(LoopMode::One)]);
@@ -2640,14 +3420,152 @@ mod tests {
         assert_eq!(ops("speed(reset)"), vec![Op::SetSpeed(1.0)]);
     }
 
+    /// `eq` only ever applies a preset now; the menu is `view(eq)`,
+    /// which is what removes the old arity overload.
     #[test]
-    fn eq_opens_the_menu_bare_and_applies_a_named_preset() {
-        assert_eq!(ops("eq()"), vec![Op::OpenEqMenu]);
-        assert_eq!(ops("equalizer()"), vec![Op::OpenEqMenu]);
+    fn eq_applies_a_preset_and_the_menu_moved_to_view() {
         let rock = eq::index_of("rock").unwrap();
         assert_eq!(ops("eq(rock)"), vec![Op::SetEqPreset(rock)]);
         assert_eq!(ops("eq(flat)"), vec![Op::SetEqPreset(0)]);
-        assert!(error("eq(disco)").message.contains("flat"));
+        assert_eq!(ops("view(eq)"), vec![Op::View(ViewTarget::Eq)]);
+        assert_eq!(ops("view(equalizer)"), vec![Op::View(ViewTarget::Eq)]);
+        let e = error("eq()");
+        assert!(e.message.contains("missing preset"), "{}", e.message);
+        // nothing near "disco", so it lists what there is rather than
+        // inventing a suggestion.
+        let e = error("eq(disco)");
+        assert!(e.message.contains("bass boost"), "{}", e.message);
+        assert!(error("eq(rok)").message.contains("did you mean 'rock'"));
+    }
+
+    // ------------------------------------------------------------ view
+
+    /// Every spelling in the table resolves, including the plural and
+    /// singular forms the maintainer asked for.
+    #[test]
+    fn every_view_spelling_resolves_to_its_target() {
+        for v in VIEW_NAMES {
+            if v.target == ViewTarget::Help {
+                continue; // a listing, asserted separately
+            }
+            assert_eq!(
+                ops(&format!("view({})", v.word)),
+                vec![Op::View(v.target)],
+                "view({})",
+                v.word
+            );
+        }
+        for word in ["suggest", "suggestion", "suggestions"] {
+            assert_eq!(
+                ops(&format!("view({word})")),
+                vec![Op::View(ViewTarget::Suggestions)],
+                "{word}"
+            );
+        }
+    }
+
+    /// `show` is an alias of `view`, not a second verb with its own
+    /// meaning (R10).
+    #[test]
+    fn show_and_ls_are_true_aliases_of_view() {
+        for name in ["view", "show", "ls"] {
+            assert_eq!(
+                ops(&format!("{name}(queue)")),
+                vec![Op::View(ViewTarget::Queue)],
+                "{name}"
+            );
+        }
+        assert!(COMMANDS.iter().all(|c| c.name != "show"));
+    }
+
+    /// The verbs that used to exist for one screen each are gone; the
+    /// did-you-mean points at `view`.
+    #[test]
+    fn the_old_screen_opening_verbs_are_gone() {
+        for name in ["settings", "keybinds", "lyrics", "starred", "suggest"] {
+            let e = error(&format!("{name}()"));
+            assert!(
+                e.message.contains("unknown command"),
+                "{name}() still parses: {}",
+                e.message
+            );
+        }
+        assert_eq!(ops("view(settings)"), vec![Op::View(ViewTarget::Settings)]);
+        assert_eq!(ops("view(keybinds)"), vec![Op::View(ViewTarget::Keybinds)]);
+        assert_eq!(ops("view(lyrics)"), vec![Op::View(ViewTarget::Lyrics)]);
+        assert_eq!(ops("view(starred)"), vec![Op::View(ViewTarget::Starred)]);
+    }
+
+    #[test]
+    fn an_unknown_view_target_suggests_a_real_one() {
+        let e = error("view(suggst)");
+        assert!(
+            e.message.contains("did you mean 'suggestions'"),
+            "{}",
+            e.message
+        );
+        let e = error("view(setings)");
+        assert!(
+            e.message.contains("did you mean 'settings'"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn view_with_no_argument_lists_the_targets() {
+        let e = error("view()");
+        assert!(e.message.contains("missing target"), "{}", e.message);
+        assert!(e.message.contains("queue"), "{}", e.message);
+        assert!(e.message.contains("settings"), "{}", e.message);
+        // and it points at the other form too
+        assert!(e.message.contains("view(q, terms)"), "{}", e.message);
+    }
+
+    /// `view(q, bladee)` goes through the same search path `play` and
+    /// `queue` use, and prefers the kinds that have pages.
+    #[test]
+    fn view_q_searches_and_opens_the_best_page() {
+        assert_eq!(terms_of("view(q, bladee)"), ["bladee"]);
+        assert_eq!(
+            resolve_with("view(q, bladee)", vec![Kind::Song, Kind::Artist]),
+            vec![Op::OpenPage(Target::Index(1))],
+            "an artist outranks a song for view"
+        );
+        assert_eq!(
+            resolve_with("view(q, crest)", vec![Kind::Song, Kind::Album]),
+            vec![Op::OpenPage(Target::Index(1))],
+            "an album outranks a song for view"
+        );
+        // a song still works: it opens the page it belongs to rather
+        // than playing, because the verb is view.
+        assert_eq!(
+            resolve_with("view(q, hex)", vec![Kind::Song]),
+            vec![Op::OpenPage(Target::Index(0))]
+        );
+        assert_eq!(ops("view(query, bladee)"), ops("view(q, bladee)"));
+    }
+
+    #[test]
+    fn views_two_forms_cannot_be_mixed_up() {
+        let e = error("view(q)");
+        assert!(
+            e.message.contains("needs something to search"),
+            "{}",
+            e.message
+        );
+        let e = error("view(settings, bladee)");
+        assert!(e.message.contains("takes no terms"), "{}", e.message);
+        assert!(e.message.contains("view(q, terms)"), "{}", e.message);
+    }
+
+    /// `view` prefers artists, which is a different order rather than a
+    /// narrower one, so the song-rooted `kind=` ladder does not apply.
+    #[test]
+    fn view_does_not_take_the_kind_ladder() {
+        assert!(Program::parse("view_aa(q, crest)").is_err());
+        let e = error("view(q, crest, kind=album)");
+        assert!(e.message.contains("does not take kind="), "{}", e.message);
     }
 
     // ------------------------------------------------------ statements
@@ -2669,19 +3587,6 @@ mod tests {
     #[test]
     fn a_call_may_span_lines_because_splitting_is_depth_aware() {
         assert_eq!(terms_of("queue([hex,\n  crest])"), ["hex", "crest"]);
-    }
-
-    /// The search terms a program lowered to, in order.
-    fn terms_of(input: &str) -> Vec<String> {
-        Program::parse(input)
-            .unwrap()
-            .nodes
-            .iter()
-            .filter_map(|n| match n {
-                Node::Search(q) => Some(q.clone()),
-                _ => None,
-            })
-            .collect()
     }
 
     // ----------------------------------------------------- higher order
@@ -2740,6 +3645,20 @@ mod tests {
         let explicit = notes("dry(queue([crest], kind=album))");
         assert_eq!(suffixed, explicit);
         assert_eq!(suffixed[0], "would run: queue(crest, kind=album)");
+    }
+
+    /// Deleted on purpose: an artist expands to a whole discography,
+    /// which is never a queue anyone wanted.
+    #[test]
+    fn there_is_no_artist_rung_on_the_ladder() {
+        assert!(Program::parse("queue_ar([crest])").is_err());
+        assert!(error("queue([x], kind=artist)")
+            .message
+            .contains("kind= expects"));
+        assert_eq!(
+            KIND_SUFFIXES.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec!["_aa", "_any"]
+        );
     }
 
     #[test]
@@ -2803,15 +3722,129 @@ mod tests {
         assert_eq!(e.column, 11, "column should point at the offending name");
     }
 
+    // --------------------------------------------- the selection rule
+
+    /// R11: omitting the terms means "the current selection", the same
+    /// way for every command that takes them. One meaning, so one code
+    /// path and one op shape.
+    #[test]
+    fn omitting_the_terms_means_the_selection_everywhere() {
+        assert_eq!(ops("play()"), vec![Op::Play(Target::Selection)]);
+        assert_eq!(
+            ops("queue()"),
+            vec![Op::Enqueue {
+                target: Target::Selection,
+                front: false
+            }]
+        );
+        assert_eq!(
+            ops("add_to_queue(front)"),
+            vec![Op::Enqueue {
+                target: Target::Selection,
+                front: true
+            }]
+        );
+        assert_eq!(
+            ops("star()"),
+            vec![Op::Star {
+                target: Target::Selection,
+                on: true
+            }]
+        );
+        assert_eq!(
+            ops("unstar()"),
+            vec![Op::Star {
+                target: Target::Selection,
+                on: false
+            }]
+        );
+        assert_eq!(ops("download()"), vec![Op::Download(Target::Selection)]);
+    }
+
+    /// Driven off the table: every command with a `terms` parameter has
+    /// to accept being called without it, or the rule is not uniform.
+    #[test]
+    fn every_terms_taking_command_accepts_no_terms_at_all() {
+        for c in COMMANDS {
+            let Some(terms) = c.params.iter().find(|p| p.ty == Ty::Terms) else {
+                continue;
+            };
+            // the one documented exception: view's terms belong to its
+            // `q` form rather than being an operand, and `q` means
+            // "search for this", which has no selection reading.
+            if c.name == "view" {
+                continue;
+            }
+            assert!(
+                !terms.required,
+                "{}'s terms are required, so it cannot mean the selection",
+                c.name
+            );
+            // build the call with every *other* required argument
+            let args: Vec<String> = c
+                .params
+                .iter()
+                .filter(|p| p.required && p.ty != Ty::Terms)
+                .map(|p| sample_arg(p.ty))
+                .collect();
+            let call = format!("{}({})", c.name, args.join(", "));
+            assert!(
+                Program::parse(&call).is_ok(),
+                "{call} should mean 'act on the selection'"
+            );
+        }
+    }
+
+    #[test]
+    fn a_selection_form_with_nothing_selected_fails_rather_than_emitting() {
+        let empty = Env {
+            browsing: false,
+            ..SETTLED.clone()
+        };
+        for input in ["play()", "queue()", "star()", "download()"] {
+            assert_eq!(
+                Program::parse(input).unwrap().step(&empty),
+                Step::Failed(RuntimeError::NothingSelected),
+                "{input}"
+            );
+        }
+    }
+
     // --------------------------------------------------- arity + types
+
+    /// `add_to_queue(back, x)` was just another spelling of `queue(x)`,
+    /// so the position is required and the error points at the command
+    /// that actually appends.
+    #[test]
+    fn add_to_queue_requires_its_position() {
+        // whether the position is wrong or absent, the message names it
+        // and points at the command that actually appends.
+        for bad in ["add_to_queue(flatline)", "add_to_queue()"] {
+            let e = error(bad);
+            assert!(e.message.contains("position"), "{bad}: {}", e.message);
+            assert!(e.message.contains("queue(...)"), "{bad}: {}", e.message);
+        }
+        assert_eq!(
+            Program::parse("add_to_queue(back, flatline)")
+                .unwrap()
+                .nodes,
+            Program::parse("queue(flatline)").unwrap().nodes,
+            "back is still the same thing queue does"
+        );
+        assert_ne!(
+            Program::parse("add_to_queue(front, flatline)")
+                .unwrap()
+                .nodes,
+            Program::parse("queue(flatline)").unwrap().nodes
+        );
+    }
 
     #[test]
     fn a_missing_required_argument_names_the_command_and_the_type() {
-        let e = error("add_to_queue()");
-        assert!(e.message.contains("add_to_queue"), "{}", e.message);
-        assert!(e.message.contains("terms"), "{}", e.message);
         let e = error("moveto()");
         assert!(e.message.contains("30s"), "{}", e.message);
+        let e = error("save_queue()");
+        assert!(e.message.contains("save_queue"), "{}", e.message);
     }
 
     #[test]
@@ -2823,16 +3856,7 @@ mod tests {
     #[test]
     fn an_unknown_position_keyword_names_the_set_it_expected() {
         let e = error("add_to_queue(sideways, flatline)");
-        assert!(e.message.contains("front or back"), "{}", e.message);
-    }
-
-    #[test]
-    fn an_omitted_optional_position_falls_back_to_the_default() {
-        let back = Program::parse("add_to_queue(flatline)").unwrap();
-        let explicit = Program::parse("add_to_queue(back, flatline)").unwrap();
-        assert_eq!(back.nodes, explicit.nodes);
-        let front = Program::parse("add_to_queue(front, flatline)").unwrap();
-        assert_ne!(front.nodes, back.nodes);
+        assert!(e.message.contains("front"), "{}", e.message);
     }
 
     #[test]
@@ -2856,19 +3880,10 @@ mod tests {
     #[test]
     fn queue_prefers_a_song_when_a_term_matches_both_a_song_and_an_album() {
         let both = vec![Kind::Album, Kind::Song];
-        assert_eq!(
-            resolve_with("queue(crest)", both.clone()),
-            vec![Op::EnqueueIndex {
-                index: 1,
-                front: false
-            }]
-        );
+        assert_eq!(resolve_with("queue(crest)", both.clone()), vec![queued(1)]);
         assert_eq!(
             resolve_with("queue_aa(crest)", both),
-            vec![Op::EnqueueIndex {
-                index: 1,
-                front: false
-            }],
+            vec![queued(1)],
             "a song is still the best match even with albums allowed"
         );
     }
@@ -2881,23 +3896,17 @@ mod tests {
             "a plain queue must not build itself out of albums"
         );
         assert_eq!(
-            resolve_with("queue_aa(crest)", albums_only.clone()),
-            vec![Op::EnqueueIndex {
-                index: 0,
-                front: false
-            }]
+            resolve_with("queue_aa(crest)", albums_only),
+            vec![queued(0)]
         );
         assert!(
             resolve_with("queue_aa(crest)", vec![Kind::Artist]).is_empty(),
-            "_aa widens to albums, not to artists"
+            "_aa widens to albums, and stops there"
         );
         assert_eq!(
-            resolve_with("queue_ar(crest)", vec![Kind::Artist]),
-            vec![Op::EnqueueIndex {
-                index: 0,
-                front: false
-            }],
-            "_ar is the rung that allows artists"
+            resolve_with("queue_any(crest)", vec![Kind::Artist]),
+            vec![queued(0)],
+            "_any is the only rung that reaches an artist"
         );
     }
 
@@ -2906,11 +3915,11 @@ mod tests {
     fn play_accepts_an_album_where_queue_would_not() {
         assert_eq!(
             resolve_with("play(crest)", vec![Kind::Album]),
-            vec![Op::PlayIndex(0)]
+            vec![Op::Play(Target::Index(0))]
         );
         assert_eq!(
             resolve_with("play(crest)", vec![Kind::Song, Kind::Album]),
-            vec![Op::PlayIndex(0)]
+            vec![Op::Play(Target::Index(0))]
         );
         assert!(resolve_with("play(crest)", vec![Kind::Artist]).is_empty());
     }
@@ -2919,17 +3928,7 @@ mod tests {
     fn play_with_several_terms_plays_the_first_and_queues_the_rest() {
         assert_eq!(
             resolve_with("play([a, b, c])", vec![Kind::Song]),
-            vec![
-                Op::PlayIndex(0),
-                Op::EnqueueIndex {
-                    index: 0,
-                    front: false
-                },
-                Op::EnqueueIndex {
-                    index: 0,
-                    front: false
-                }
-            ]
+            vec![Op::Play(Target::Index(0)), queued(0), queued(0)]
         );
     }
 
@@ -2944,14 +3943,13 @@ mod tests {
         let mut query = String::new();
         for _ in 0..64 {
             let env = Env {
-                search_settled: true,
                 query: query.clone(),
                 results: if term == 2 {
                     vec![Kind::Song]
                 } else {
                     vec![Kind::Artist]
                 },
-                ..Env::default()
+                ..SETTLED.clone()
             };
             match program.step(&env) {
                 Step::Emit(Op::Search(q)) => {
@@ -3000,13 +3998,7 @@ mod tests {
         );
         // settled: now it resolves
         env.search_settled = true;
-        assert_eq!(
-            program.step(&env),
-            Step::Emit(Op::EnqueueIndex {
-                index: 0,
-                front: false
-            })
-        );
+        assert_eq!(program.step(&env), Step::Emit(queued(0)));
         assert_eq!(program.step(&env), Step::Done);
         assert!(program.is_done());
     }
@@ -3040,46 +4032,84 @@ mod tests {
         env.query = "crest".to_string();
         env.results = vec![Kind::Album];
         env.search_settled = true;
-        assert_eq!(program.step(&env), Step::Emit(Op::PlayIndex(0)));
+        assert_eq!(program.step(&env), Step::Emit(Op::Play(Target::Index(0))));
+    }
+
+    // -------------------------------------------------------- go/focus
+
+    /// `go()` means "what enter does", and what enter does depends on
+    /// which pane owns the keyboard, so it resolves against the focus
+    /// rather than making the host re-derive it.
+    #[test]
+    fn go_resolves_against_the_focus() {
+        let base = Env {
+            results: vec![Kind::Song],
+            browsing: true,
+            ..SETTLED.clone()
+        };
+        let cases = [
+            (Focus::Sidebar, GoTarget::Result),
+            (Focus::Workspace, GoTarget::BrowseRow),
+            (Focus::BottomBar, GoTarget::BottomBarField),
+        ];
+        for (focus, want) in cases {
+            let env = Env {
+                focus,
+                ..base.clone()
+            };
+            assert_eq!(
+                Program::parse("go()").unwrap().step(&env),
+                Step::Emit(Op::Go(want)),
+                "{focus:?}"
+            );
+        }
+    }
+
+    /// Workspace focus with nothing open falls back to the sidebar's
+    /// result, exactly as the host's own enter handling does.
+    #[test]
+    fn workspace_focus_with_no_browse_view_still_acts_on_the_result() {
+        let env = Env {
+            results: vec![Kind::Song],
+            browsing: false,
+            focus: Focus::Workspace,
+            ..SETTLED.clone()
+        };
+        assert_eq!(
+            Program::parse("open()").unwrap().step(&env),
+            Step::Emit(Op::Go(GoTarget::Result))
+        );
+    }
+
+    #[test]
+    fn go_with_nothing_to_act_on_fails_rather_than_emitting() {
+        let env = Env {
+            browsing: false,
+            ..SETTLED.clone()
+        };
+        assert_eq!(
+            Program::parse("go()").unwrap().step(&env),
+            Step::Failed(RuntimeError::NothingSelected)
+        );
+        // but the bottom bar always has a field to tweak
+        let bar = Env {
+            browsing: false,
+            focus: Focus::BottomBar,
+            ..SETTLED.clone()
+        };
+        assert_eq!(
+            Program::parse("go()").unwrap().step(&bar),
+            Step::Emit(Op::Go(GoTarget::BottomBarField))
+        );
     }
 
     // -------------------------------------------------------- guards
 
     #[test]
-    fn go_with_nothing_to_act_on_fails_rather_than_emitting() {
-        let mut program = Program::parse("go()").unwrap();
-        let env = Env::default();
-        assert_eq!(
-            program.step(&env),
-            Step::Failed(RuntimeError::NothingSelected)
-        );
-    }
-
-    #[test]
-    fn go_is_fine_whenever_there_is_a_selection_or_a_browse_view() {
-        let env = Env {
-            results: vec![Kind::Song],
-            ..Env::default()
-        };
-        assert_eq!(
-            Program::parse("go()").unwrap().step(&env),
-            Step::Emit(Op::Go)
-        );
-        let browsing = Env {
-            browsing: true,
-            ..Env::default()
-        };
-        assert_eq!(
-            Program::parse("enter()").unwrap().step(&browsing),
-            Step::Emit(Op::Go)
-        );
-    }
-
-    #[test]
     fn queue_positions_are_checked_against_the_real_queue() {
         let env = Env {
             queue_len: 3,
-            ..Env::default()
+            ..SETTLED.clone()
         };
         assert_eq!(
             Program::parse("goto(4)").unwrap().step(&env),
@@ -3100,7 +4130,7 @@ mod tests {
     fn remove_hands_back_descending_deduped_positions() {
         let env = Env {
             queue_len: 9,
-            ..Env::default()
+            ..SETTLED.clone()
         };
         assert_eq!(
             Program::parse("remove([2, 5, 2])").unwrap().step(&env),
@@ -3176,6 +4206,9 @@ mod tests {
         assert!(error("seek(+50%)").message.contains("not a percent"));
     }
 
+    /// An absolute level is capped at parse time; a delta is relative
+    /// to mpv's current volume and the host clamps the result, which is
+    /// why only one of the two is refused here.
     #[test]
     fn volume_takes_an_absolute_level_or_a_nudge() {
         assert_eq!(
@@ -3193,6 +4226,10 @@ mod tests {
         );
         assert_eq!(ops("vol(0%)"), vec![Op::SetVolume(Level::Absolute(0.0))]);
         assert!(error("volume(101%)").message.contains("outside 0-100"));
+        assert!(
+            error("volume(+200%)").message.contains("outside 0-100"),
+            "a nudge bigger than the whole range is nonsense too"
+        );
     }
 
     #[test]
@@ -3216,23 +4253,27 @@ mod tests {
     }
 
     #[test]
-    fn show_targets_come_from_the_same_table_completion_offers() {
-        assert_eq!(ops("show(queue)"), vec![Op::Show(ShowTarget::Queue)]);
-        assert_eq!(ops("ls(now)"), vec![Op::Show(ShowTarget::Now)]);
-        for (name, target) in SHOW_TARGETS {
-            assert_eq!(ops(&format!("show({name})")), vec![Op::Show(*target)]);
-        }
-        assert!(error("show(everything)").message.contains("queue or now"));
-    }
-
-    #[test]
     fn every_op_describes_itself_for_the_scrollback() {
         // R9: nothing is silent, so no op may describe itself as "".
         for c in COMMANDS {
             for op in ops(&sample_call(c)) {
-                assert!(!op.describe().is_empty(), "{:?} has no description", op);
+                assert!(!op.describe().is_empty(), "{op:?} has no description");
             }
         }
+    }
+
+    /// The console is a centred overlay, so anything that puts a view
+    /// on screen has to move it out of the way first.
+    #[test]
+    fn screen_opening_ops_close_the_console_and_listings_do_not() {
+        assert!(Op::View(ViewTarget::Settings).closes_console());
+        assert!(Op::View(ViewTarget::Suggestions).closes_console());
+        assert!(Op::View(ViewTarget::Eq).closes_console());
+        assert!(Op::OpenPage(Target::Selection).closes_console());
+        assert!(Op::Quit.closes_console());
+        assert!(!Op::View(ViewTarget::Queue).closes_console());
+        assert!(!Op::View(ViewTarget::History).closes_console());
+        assert!(!Op::TogglePause.closes_console());
     }
 
     // ---------------------------------------------------- editor pairs
@@ -3302,101 +4343,661 @@ mod tests {
         assert_eq!(buf, "queue([日])");
     }
 
-    // -------------------------------------------------------- console
+    // ------------------------------------------------------- the site
 
-    fn console_with(input: &str) -> Console {
-        let mut c = Console::empty();
-        for ch in input.chars() {
-            c.handle_key(KeyCode::Char(ch));
+    /// Every parameter type is covered by exactly one of the two
+    /// classes: a candidate list, or a hint. A new `Ty` that declares
+    /// neither cannot reach this assertion without failing it.
+    #[test]
+    fn every_parameter_type_offers_candidates_xor_a_hint() {
+        let every: Vec<Ty> = vec![
+            Ty::Terms,
+            Ty::Query,
+            Ty::NewName,
+            Ty::SavedName,
+            Ty::CommandName,
+            Ty::Pos,
+            Ty::Offset,
+            Ty::Level,
+            Ty::Count,
+            Ty::Index,
+            Ty::Indices,
+            Ty::Speed,
+            Ty::Duration,
+            Ty::Call,
+            Ty::Words(Words::Position),
+            Ty::Words(Words::LoopMode),
+            Ty::Words(Words::Switch),
+            Ty::Words(Words::EqPreset),
+            Ty::Words(Words::ViewTarget),
+            Ty::Words(Words::FadeDir),
+        ];
+        for ty in &every {
+            match ty.completes() {
+                Completes::Hint(text) => {
+                    assert!(!text.is_empty(), "{ty:?} declares an empty hint");
+                    assert!(!ty.completes().insertable());
+                }
+                other => assert!(
+                    other.insertable(),
+                    "{ty:?} is neither insertable nor a hint"
+                ),
+            }
         }
-        c
+        // and the table only ever uses types this test knows about, so
+        // a new one cannot slip past unlisted.
+        for c in COMMANDS {
+            for p in c.params {
+                assert!(
+                    every.contains(&p.ty),
+                    "{}'s {} has type {:?}, which this test does not cover",
+                    c.name,
+                    p.name,
+                    p.ty
+                );
+            }
+        }
     }
 
     #[test]
-    fn submitting_a_good_line_clears_the_input_and_returns_a_program() {
-        let mut c = console_with("pause()");
-        // the auto-paired ')' was stepped over, so the buffer is exact
+    fn a_keyword_set_only_ever_offers_something_that_parses() {
+        for c in COMMANDS {
+            for (i, p) in c.params.iter().enumerate() {
+                let Completes::Words(set) = p.ty.completes() else {
+                    continue;
+                };
+                for option in set.options() {
+                    // every offered keyword has to coerce; the only
+                    // exception is view's `q`, which needs a term too.
+                    let extra = if c.name == "view" && option == "q" {
+                        ", crest"
+                    } else {
+                        ""
+                    };
+                    let mut args: Vec<String> =
+                        c.params.iter().take(i).map(|p| sample_arg(p.ty)).collect();
+                    args.push(option.to_string());
+                    let call = format!("{}({}{extra})", c.name, args.join(", "));
+                    assert!(
+                        Program::parse(&call).is_ok(),
+                        "completion would offer {call}, which does not parse"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_site_knows_which_parameter_the_cursor_is_in() {
+        let here = site("volume(", 7);
+        assert_eq!(here.completes, Completes::Hint("0-100, or +N% / -N%"));
+        assert_eq!(here.signature, Some(("volume(level)".to_string(), 0)));
+
+        let here = site("queue(fl", 8);
+        assert_eq!(here.completes, Completes::CorpusTerms);
+        assert_eq!(here.token, "fl");
+
+        let here = site("qu", 2);
+        assert_eq!(here.completes, Completes::CommandNames);
+        assert_eq!(here.signature, None);
+
+        // a nested call completes command names, from the inner call
+        let here = site("dry(sk", 6);
+        assert_eq!(here.completes, Completes::CommandNames);
+        assert_eq!(here.token, "sk");
+    }
+
+    /// The token is the argument slice, not the word, so an item with
+    /// spaces can still be completed; and a list completes the item
+    /// after the last comma rather than the whole list.
+    #[test]
+    fn the_token_is_the_argument_slice_after_the_last_separator() {
+        assert_eq!(site("queue([a, fl", 12).token, "fl");
+        assert_eq!(site("queue([4 star cre", 17).token, "4 star cre");
+        assert_eq!(site("eq(bass bo", 10).token, "bass bo");
+        assert_eq!(site("pause(); qu", 11).token, "qu");
+        assert_eq!(site("add_to_queue(front, fl", 22).token, "fl");
+    }
+
+    /// A stack, not a depth counter: the innermost call is what the
+    /// cursor is actually in.
+    #[test]
+    fn the_enclosing_call_is_the_innermost_one() {
+        assert_eq!(enclosing("dry(queue([fl", 13), Some(("queue", 0)));
+        assert_eq!(enclosing("repeat(2, skip(", 15), Some(("skip", 0)));
+        // commas inside a list separate items, not arguments
+        assert_eq!(enclosing("queue([a, b], ", 14), Some(("queue", 1)));
+        assert_eq!(enclosing("queue([a, b", 11), Some(("queue", 0)));
+        assert_eq!(enclosing("pause()", 7), None);
+    }
+
+    // --------------------------------------------------- completion
+
+    /// A fake corpus. `corpus` deliberately returns fuzzy-style hits
+    /// that are *not* all prefix extensions, which is what the prefix
+    /// filter has to deal with.
+    struct Fake {
+        names: Vec<&'static str>,
+        queues: Vec<&'static str>,
+    }
+
+    impl Fake {
+        fn new(names: &[&'static str]) -> Fake {
+            Fake {
+                names: names.to_vec(),
+                queues: Vec::new(),
+            }
+        }
+    }
+
+    impl Candidates for Fake {
+        fn corpus(&self, _token: &str) -> Vec<String> {
+            self.names.iter().map(|s| s.to_string()).collect()
+        }
+        fn saved_queues(&self) -> Vec<String> {
+            self.queues.iter().map(|s| s.to_string()).collect()
+        }
+    }
+
+    fn press(console: &mut Console, cand: &dyn Candidates, code: KeyCode) -> ConsoleAction {
+        console.handle_key(KeyEvent::new(code, KeyModifiers::NONE), cand)
+    }
+
+    fn ctrl(console: &mut Console, cand: &dyn Candidates, c: char) {
+        console.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL), cand);
+    }
+
+    fn type_in(console: &mut Console, cand: &dyn Candidates, text: &str) {
+        for ch in text.chars() {
+            press(console, cand, KeyCode::Char(ch));
+        }
+    }
+
+    fn console_with(cand: &dyn Candidates, text: &str) -> Console {
+        let mut c = Console::empty();
+        type_in(&mut c, cand, text);
+        c
+    }
+
+    /// The maintainer's example: `queue(fl` ghosts `atline`.
+    #[test]
+    fn a_corpus_term_ghosts_the_rest_of_the_match() {
+        let fake = Fake::new(&["flatline", "floor"]);
+        let c = console_with(&fake, "queue(fl");
+        assert_eq!(c.suggestion.ghost, "atline");
+        assert!(!c.suggestion.from_history);
+        assert_eq!(c.suggestion.hint, None);
+    }
+
+    /// Fuzzy search *finds* candidates; only prefix extensions can be
+    /// inserted, because anything else would replace typed characters.
+    #[test]
+    fn a_fuzzy_hit_that_is_not_a_prefix_extension_is_excluded() {
+        // "sulfur" is a plausible fuzzy hit for "fl" (subsequence
+        // f...l), and "fl" itself is an exact match with nothing left
+        // to add; neither may be offered.
+        let fake = Fake::new(&["sulfur surfer", "fl", "flatline"]);
+        let c = console_with(&fake, "queue(fl");
+        let here = site(&c.input, c.cursor);
+        let hits = c.candidates_at(&here, &fake);
+        assert_eq!(hits, vec!["flatline".to_string()]);
+        assert_eq!(c.suggestion.ghost, "atline");
+    }
+
+    /// Accepting keeps the typed prefix byte for byte, casing included.
+    #[test]
+    fn accepting_never_rewrites_what_was_typed() {
+        let fake = Fake::new(&["Flatline"]);
+        let mut c = console_with(&fake, "queue(fl");
+        assert_eq!(c.suggestion.ghost, "atline");
+        ctrl(&mut c, &fake, 'f');
+        assert_eq!(c.input, "queue(fl".to_string() + "atline)");
+        assert!(c.input.contains("fl"), "the typed casing survived");
+        assert!(!c.input.contains("Fl"));
+    }
+
+    #[test]
+    fn tab_cycling_only_ever_extends_the_typed_prefix() {
+        let fake = Fake::new(&["flatline", "floor", "flowers", "sulfur"]);
+        let mut c = console_with(&fake, "queue(fl");
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            press(&mut c, &fake, KeyCode::Tab);
+            let cycle = c.cycle().expect("a cycle should be open");
+            seen.push(cycle.items[cycle.at].clone());
+            // every item, not just the current one, has to be an
+            // extension of what was typed.
+            for item in &cycle.items {
+                assert!(
+                    item.to_lowercase().starts_with("fl"),
+                    "{item} would overwrite what was typed"
+                );
+            }
+        }
+        assert!(seen.contains(&"flatline".to_string()));
+        assert!(seen.contains(&"floor".to_string()));
+        assert!(seen.contains(&"flowers".to_string()));
+        assert!(!seen.contains(&"sulfur".to_string()));
+        // and it wraps rather than running off the end
+        assert_eq!(c.cycle().unwrap().items.len(), 3);
+    }
+
+    #[test]
+    fn shift_tab_cycles_backwards_and_esc_cancels_the_cycle() {
+        let fake = Fake::new(&["flatline", "floor", "flowers"]);
+        let mut c = console_with(&fake, "queue(fl");
+        press(&mut c, &fake, KeyCode::Tab);
+        assert_eq!(c.cycle().unwrap().at, 0);
+        press(&mut c, &fake, KeyCode::BackTab);
+        assert_eq!(c.cycle().unwrap().at, 2, "wraps to the end");
+        // esc closes the menu, not the console
+        assert!(matches!(
+            press(&mut c, &fake, KeyCode::Esc),
+            ConsoleAction::None
+        ));
+        assert!(c.cycle().is_none());
+        // a second esc does close it
+        assert!(matches!(
+            press(&mut c, &fake, KeyCode::Esc),
+            ConsoleAction::Close
+        ));
+    }
+
+    #[test]
+    fn typing_cancels_an_open_cycle() {
+        let fake = Fake::new(&["flatline", "floor"]);
+        let mut c = console_with(&fake, "queue(fl");
+        press(&mut c, &fake, KeyCode::Tab);
+        assert!(c.cycle().is_some());
+        press(&mut c, &fake, KeyCode::Char('a'));
+        assert!(c.cycle().is_none());
+        assert_eq!(c.input, "queue(fla)");
+    }
+
+    #[test]
+    fn tab_takes_a_lone_candidate_outright() {
+        let fake = Fake::new(&["flatline"]);
+        let mut c = console_with(&fake, "queue(fl");
+        press(&mut c, &fake, KeyCode::Tab);
+        assert!(c.cycle().is_none(), "nothing to choose between");
+        assert_eq!(c.input, "queue(flatline)");
+    }
+
+    /// `qu` plus accept lands inside the parens, ready for arguments.
+    #[test]
+    fn accepting_a_command_name_inserts_its_parens_and_lands_inside() {
+        let fake = Fake::new(&[]);
+        let mut c = console_with(&fake, "qu");
+        assert_eq!(c.suggestion.ghost, "eue");
+        ctrl(&mut c, &fake, 'f');
+        assert_eq!(c.input, "queue()");
+        assert_eq!(c.cursor, 6, "the cursor sits between the parens");
+    }
+
+    #[test]
+    fn a_zero_parameter_command_still_lands_inside_empty_parens() {
+        let fake = Fake::new(&[]);
+        let mut c = console_with(&fake, "crossf");
+        ctrl(&mut c, &fake, 'f');
+        assert_eq!(c.input, "crossfade()");
+        assert_eq!(c.cursor, 10);
+    }
+
+    #[test]
+    fn right_accepts_at_the_end_of_the_line_and_moves_the_cursor_inside_it() {
+        let fake = Fake::new(&[]);
+        let mut c = console_with(&fake, "qu");
+        press(&mut c, &fake, KeyCode::Right);
+        assert_eq!(c.input, "queue()", "right accepts at end of input");
+
+        // mid-line, right is plain cursor movement
+        let mut c = console_with(&fake, "pause()");
+        c.cursor = 0;
+        c.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &fake);
+        let before = c.input.clone();
+        press(&mut c, &fake, KeyCode::Right);
+        assert_eq!(c.input, before, "mid-line right must not insert anything");
+        assert_eq!(c.cursor, 1);
+    }
+
+    #[test]
+    fn ctrl_f_accepts_mid_line_where_right_would_not() {
+        let fake = Fake::new(&["flatline"]);
+        let mut c = console_with(&fake, "queue(fl)");
+        // step back so the cursor is inside the parens with text after
+        c.cursor = 8;
+        c.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &fake);
+        assert_eq!(c.cursor, 7);
+        c.cursor = 8;
+        c.suggestion.ghost = "atline".to_string();
+        ctrl(&mut c, &fake, 'f');
+        assert_eq!(c.input, "queue(flatline)");
+    }
+
+    // ------------------------------------------------- value hints
+
+    /// The absurdity this exists to prevent: completing `volume(5` to
+    /// `50%`.
+    #[test]
+    fn a_value_parameter_offers_no_completion_only_a_hint() {
+        let fake = Fake::new(&["50%", "50", "5 star crest"]);
+        let c = console_with(&fake, "volume(5");
+        assert_eq!(c.suggestion.ghost, "", "a number must not be guessed at");
+        assert_eq!(c.suggestion.hint, Some("0-100, or +N% / -N%"));
+
+        let c = console_with(&fake, "volume(");
+        assert_eq!(c.suggestion.ghost, "");
+        assert_eq!(c.suggestion.hint, Some("0-100, or +N% / -N%"));
+        assert_eq!(
+            c.suggestion.signature,
+            Some(("volume(level)".to_string(), 0))
+        );
+    }
+
+    #[test]
+    fn tab_does_nothing_at_all_on_a_value_parameter() {
+        let fake = Fake::new(&["50%", "flatline"]);
+        let mut c = console_with(&fake, "volume(5");
+        press(&mut c, &fake, KeyCode::Tab);
+        assert!(c.cycle().is_none());
+        assert_eq!(c.input, "volume(5)", "tab inserted nothing");
+        assert_eq!(c.suggestion.ghost, "");
+    }
+
+    #[test]
+    fn every_value_parameter_has_its_own_hint() {
+        let cases = [
+            ("seek(", "+30s / -10s (sign required)"),
+            ("moveto(", "10% / 90 / 1m20s"),
+            ("volume(", "0-100, or +N% / -N%"),
+            ("speed(", "0.25-3.0, or up / down / reset"),
+            ("sleep(", "30m / off"),
+            ("repeat(", "how many times, 1-256"),
+            ("goto(", "a queue position, 1 or higher"),
+            ("remove(", "1, or [1, 3, 5]"),
+            ("save_queue(", "a name to save it under"),
+        ];
+        let fake = Fake::new(&[]);
+        for (input, want) in cases {
+            let c = console_with(&fake, input);
+            assert_eq!(c.suggestion.hint, Some(want), "{input}");
+            assert_eq!(c.suggestion.ghost, "", "{input} should not ghost anything");
+        }
+    }
+
+    #[test]
+    fn a_keyword_parameter_completes_from_the_table() {
+        let fake = Fake::new(&[]);
+        let mut c = console_with(&fake, "view(sugg");
+        assert_eq!(c.suggestion.ghost, "estions");
+        ctrl(&mut c, &fake, 'f');
+        assert_eq!(c.input, "view(suggestions)");
+
+        let c = console_with(&fake, "eq(ro");
+        assert_eq!(c.suggestion.ghost, "ck");
+
+        let c = console_with(&fake, "loop(al");
+        assert_eq!(c.suggestion.ghost, "l");
+    }
+
+    #[test]
+    fn a_saved_name_completes_from_the_hosts_saved_queues() {
+        let fake = Fake {
+            names: vec!["flatline"],
+            queues: vec!["gym", "gym 2024", "sleep"],
+        };
+        let c = console_with(&fake, "load_queue(gym ");
+        assert_eq!(c.suggestion.ghost, "2024");
+        // and a new name has nothing to complete from, by definition
+        let c = console_with(&fake, "save_queue(gym");
+        assert_eq!(c.suggestion.ghost, "");
+        assert!(c.suggestion.hint.is_some());
+    }
+
+    // ------------------------------------------------ history source
+
+    #[test]
+    fn a_whole_past_line_is_suggested_once_the_input_is_its_prefix() {
+        let fake = Fake::new(&[]);
+        let mut c = Console::empty();
+        c.history = vec!["queue([hex, crest])".into()];
+        type_in(&mut c, &fake, "queue(");
+        // the auto-paired ')' means the input is "queue()", which is
+        // not a prefix of the past line, so step over it first
+        c.cursor = c.input.len();
+        c.input = "queue(".to_string();
+        c.cursor = c.input.len();
+        c.refresh(&fake);
+        assert!(c.suggestion.from_history);
+        assert_eq!(c.suggestion.ghost, "[hex, crest])");
+        press(&mut c, &fake, KeyCode::Right);
+        assert_eq!(c.input, "queue([hex, crest])");
+    }
+
+    /// Tab is for tokens and only tokens; the history line is reached
+    /// with right arrow or ctrl+f.
+    #[test]
+    fn tab_cycles_tokens_rather_than_the_history_line() {
+        let fake = Fake::new(&["flatline", "floor", "flowers"]);
+        let mut c = Console::empty();
+        c.history = vec!["queue(fl is a whole past line)".into()];
+        c.input = "queue(fl".to_string();
+        c.cursor = c.input.len();
+        c.refresh(&fake);
+        assert!(c.suggestion.from_history, "history wins the ghost");
+
+        press(&mut c, &fake, KeyCode::Tab);
+        let cycle = c.cycle().expect("tab opens a token cycle");
+        assert!(
+            cycle
+                .items
+                .iter()
+                .all(|i| i.to_lowercase().starts_with("fl")),
+            "{:?}",
+            cycle.items
+        );
+        assert!(
+            !cycle.items.iter().any(|i| i.contains("whole past line")),
+            "tab must not cycle the history line"
+        );
+        assert!(!c.suggestion.from_history);
+    }
+
+    #[test]
+    fn the_history_ghost_only_shows_with_the_cursor_at_the_end() {
+        let fake = Fake::new(&[]);
+        let mut c = Console::empty();
+        c.history = vec!["pause(); skip()".into()];
+        c.input = "pause()".to_string();
+        c.cursor = c.input.len();
+        c.refresh(&fake);
+        assert!(c.suggestion.from_history);
+        c.cursor = 3;
+        c.refresh(&fake);
+        assert!(
+            !c.suggestion.from_history,
+            "mid-line, the rest of a past line is not what comes next"
+        );
+    }
+
+    #[test]
+    fn up_and_down_walk_the_history_and_restore_the_draft() {
+        let fake = Fake::new(&[]);
+        let mut c = Console::empty();
+        c.history = vec!["pause()".into(), "skip()".into()];
+        c.input = "half".to_string();
+        c.cursor = 4;
+        press(&mut c, &fake, KeyCode::Up);
+        assert_eq!(c.input, "skip()");
+        press(&mut c, &fake, KeyCode::Up);
         assert_eq!(c.input, "pause()");
-        match c.handle_key(KeyCode::Enter) {
+        press(&mut c, &fake, KeyCode::Up);
+        assert_eq!(c.input, "pause()", "clamps at the oldest entry");
+        press(&mut c, &fake, KeyCode::Down);
+        assert_eq!(c.input, "skip()");
+        press(&mut c, &fake, KeyCode::Down);
+        assert_eq!(c.input, "half", "the half-typed line comes back");
+    }
+
+    // ---------------------------------------------------- ranking
+
+    #[test]
+    fn frequency_beats_alphabetical_and_recency_breaks_ties() {
+        let mut ranks = Ranker::default();
+        // "floor" used twice, "flowers" once, "flatline" never
+        ranks.bump("flowers");
+        ranks.bump("floor");
+        ranks.bump("floor");
+        let mut items = vec![
+            "flatline".to_string(),
+            "floor".to_string(),
+            "flowers".to_string(),
+        ];
+        ranks.order(&mut items);
+        assert_eq!(items, vec!["floor", "flowers", "flatline"]);
+
+        // equal frequency: the more recent one leads
+        let mut ranks = Ranker::default();
+        ranks.bump("flowers");
+        ranks.bump("floor");
+        let mut items = vec!["flowers".to_string(), "floor".to_string()];
+        ranks.order(&mut items);
+        assert_eq!(items, vec!["floor", "flowers"]);
+    }
+
+    #[test]
+    fn anything_unranked_keeps_the_order_it_arrived_in() {
+        let ranks = Ranker::default();
+        let original = vec!["zzz".to_string(), "aaa".to_string(), "mmm".to_string()];
+        let mut items = original.clone();
+        ranks.order(&mut items);
+        assert_eq!(
+            items, original,
+            "relevance order from the corpus must survive"
+        );
+    }
+
+    #[test]
+    fn ranking_is_deterministic_across_repeat_runs() {
+        let build = || {
+            let mut ranks = Ranker::default();
+            ranks.bump("floor");
+            ranks.bump("flowers");
+            ranks.bump("floor");
+            ranks
+        };
+        let order = |ranks: &Ranker| {
+            let mut items = vec![
+                "flatline".to_string(),
+                "floor".to_string(),
+                "flowers".to_string(),
+            ];
+            ranks.order(&mut items);
+            items
+        };
+        assert_eq!(order(&build()), order(&build()));
+    }
+
+    /// A line that was run outranks one that was not, so the whole-line
+    /// suggestion learns from use rather than just recency.
+    #[test]
+    fn the_history_suggestion_follows_the_ranking() {
+        let fake = Fake::new(&[]);
+        let mut c = Console::empty();
+        c.history = vec!["queue(hex)".into(), "queue(crest)".into()];
+        // "queue(hex)" is older but used more
+        c.ranks.bump("queue(hex)");
+        c.ranks.bump("queue(hex)");
+        c.ranks.bump("queue(crest)");
+        c.input = "queue(".to_string();
+        c.cursor = c.input.len();
+        c.refresh(&fake);
+        assert_eq!(c.suggestion.ghost, "hex)");
+    }
+
+    #[test]
+    fn running_a_line_records_it_for_ranking() {
+        let fake = Fake::new(&[]);
+        let mut c = Console::empty();
+        c.input = "pause()".to_string();
+        c.cursor = c.input.len();
+        assert!(matches!(
+            press(&mut c, &fake, KeyCode::Enter),
+            ConsoleAction::Run(_)
+        ));
+        assert_eq!(c.ranks.stat("pause()").uses, 1);
+    }
+
+    #[test]
+    fn accepting_a_completion_records_the_word_not_the_line() {
+        let fake = Fake::new(&["flatline"]);
+        let mut c = console_with(&fake, "queue(fl");
+        ctrl(&mut c, &fake, 'f');
+        assert_eq!(c.ranks.stat("flatline").uses, 1);
+        assert_eq!(c.ranks.stat("queue(flatline)").uses, 0);
+    }
+
+    #[test]
+    fn the_rank_store_prunes_rather_than_growing_without_bound() {
+        let mut ranks = Ranker::default();
+        for i in 0..(MAX_RANKS + 40) {
+            ranks.bump(&format!("entry {i}"));
+        }
+        assert!(
+            ranks.entries.len() <= MAX_RANKS,
+            "grew to {}",
+            ranks.entries.len()
+        );
+        // the newest survive
+        assert_eq!(ranks.stat(&format!("entry {}", MAX_RANKS + 39)).uses, 1);
+    }
+
+    // -------------------------------------------------------- console
+
+    #[test]
+    fn submitting_a_good_line_clears_the_input_and_returns_a_program() {
+        let fake = Fake::new(&[]);
+        let mut c = console_with(&fake, "pause()");
+        assert_eq!(c.input, "pause()");
+        match press(&mut c, &fake, KeyCode::Enter) {
             ConsoleAction::Run(_) => {}
             other => panic!("expected a program, got {other:?}"),
         }
         assert!(c.input.is_empty());
         assert!(c.error.is_none());
         assert_eq!(c.history(), ["pause()"]);
+        assert_eq!(c.suggestion, Suggestion::default());
     }
 
     #[test]
     fn submitting_a_bad_line_keeps_it_and_shows_the_error() {
-        let mut c = console_with("shufle()");
-        assert!(matches!(c.handle_key(KeyCode::Enter), ConsoleAction::None));
+        let fake = Fake::new(&[]);
+        let mut c = console_with(&fake, "shufle()");
+        assert!(matches!(
+            press(&mut c, &fake, KeyCode::Enter),
+            ConsoleAction::None
+        ));
         assert_eq!(c.input, "shufle()", "a bad line stays so it can be fixed");
         let error = c.error.clone().expect("an error should be shown");
         assert!(error.contains("did you mean 'shuffle'"), "{error}");
         assert!(error.starts_with("col 1:"), "{error}");
         assert!(c.history().is_empty(), "a bad line is not remembered");
-        // the next keystroke clears the error so it does not linger
-        c.handle_key(KeyCode::Backspace);
+        press(&mut c, &fake, KeyCode::Backspace);
         assert!(c.error.is_none());
     }
 
     #[test]
     fn esc_closes_and_so_does_enter_on_an_empty_line() {
+        let fake = Fake::new(&[]);
         let mut c = Console::empty();
-        assert!(matches!(c.handle_key(KeyCode::Esc), ConsoleAction::Close));
-        assert!(matches!(c.handle_key(KeyCode::Enter), ConsoleAction::Close));
-    }
-
-    #[test]
-    fn up_and_down_walk_the_history_and_restore_the_draft() {
-        let mut c = Console::empty();
-        c.history = vec!["pause()".into(), "skip()".into()];
-        for ch in "half".chars() {
-            c.handle_key(KeyCode::Char(ch));
-        }
-        c.handle_key(KeyCode::Up);
-        assert_eq!(c.input, "skip()");
-        c.handle_key(KeyCode::Up);
-        assert_eq!(c.input, "pause()");
-        c.handle_key(KeyCode::Up);
-        assert_eq!(c.input, "pause()", "clamps at the oldest entry");
-        c.handle_key(KeyCode::Down);
-        assert_eq!(c.input, "skip()");
-        c.handle_key(KeyCode::Down);
-        assert_eq!(c.input, "half", "the half-typed line comes back");
-    }
-
-    #[test]
-    fn tab_completes_a_unique_command_and_adds_its_parens() {
-        let mut c = console_with("crossf");
-        c.handle_key(KeyCode::Tab);
-        assert_eq!(c.input, "crossfade()");
-        assert_eq!(c.cursor, 10);
-    }
-
-    #[test]
-    fn tab_on_an_ambiguous_prefix_fills_the_common_part_and_lists() {
-        let mut c = console_with("s");
-        c.handle_key(KeyCode::Tab);
-        // every s-name shares nothing past "s", so the listing is the
-        // useful part
-        assert!(c
-            .lines
-            .last()
-            .is_some_and(|l| l.text.contains("skip") && l.text.contains("star")));
-    }
-
-    #[test]
-    fn tab_inside_a_call_completes_that_parameters_keyword_set() {
-        let mut c = console_with("eq(ro");
-        c.handle_key(KeyCode::Tab);
-        assert_eq!(c.input, "eq(rock)");
-        let mut c = console_with("show(q");
-        c.handle_key(KeyCode::Tab);
-        assert_eq!(c.input, "show(queue)");
-        let mut c = console_with("loop(o");
-        c.handle_key(KeyCode::Tab);
-        assert!(c.lines.last().is_some_and(|l| l.text.contains("one")));
+        assert!(matches!(
+            press(&mut c, &fake, KeyCode::Esc),
+            ConsoleAction::Close
+        ));
+        assert!(matches!(
+            press(&mut c, &fake, KeyCode::Enter),
+            ConsoleAction::Close
+        ));
     }
 
     #[test]
@@ -3414,9 +5015,18 @@ mod tests {
 
     #[test]
     fn paste_goes_in_literally_without_pairing_or_newlines() {
+        let fake = Fake::new(&[]);
         let mut c = Console::empty();
-        c.paste("queue([a, b])\n");
+        c.paste("queue([a, b])\n", &fake);
         assert_eq!(c.input, "queue([a, b])");
         assert_eq!(c.cursor, c.input.len());
+    }
+
+    #[test]
+    fn a_control_chord_we_do_not_handle_inserts_nothing() {
+        let fake = Fake::new(&[]);
+        let mut c = Console::empty();
+        ctrl(&mut c, &fake, 'x');
+        assert!(c.input.is_empty(), "ctrl+x typed an 'x'");
     }
 }
