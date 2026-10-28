@@ -264,31 +264,76 @@ pub fn scan(paths: &[String]) -> Vec<LocalTrack> {
     rx.into_iter().flatten().collect()
 }
 
+/// One file the walk found: its path, kind, and the mtime from the
+/// same `stat` the walk already did.
+type FoundMedia = (PathBuf, MediaKind, Option<u64>);
+
 /// Every music/video file under `paths`, with the mtime from the same
 /// `stat` the walk already did (`None` when it couldn't be read, which
-/// just means the file is never tag-cached).
-fn walk_media(paths: &[String]) -> Vec<(PathBuf, MediaKind, Option<u64>)> {
-    let mut found = Vec::new();
-    for root in paths {
-        for entry in WalkDir::new(root)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if !entry.file_type().is_file() {
-                continue;
+/// just means the file is never tag-cached). Roots are independent
+/// trees, so they walk concurrently (the usual `~/Music` + `~/Videos`
+/// pair is two stat storms that have nothing to say to each other);
+/// results stay in root order, which keeps a scan's batches
+/// reproducible.
+fn walk_media(paths: &[String]) -> Vec<FoundMedia> {
+    match paths {
+        [] => Vec::new(),
+        [root] => walk_root(root),
+        roots => {
+            let workers = thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(roots.len());
+            let next = AtomicUsize::new(0);
+            let mut walked: Vec<Vec<FoundMedia>> = roots.iter().map(|_| Vec::new()).collect();
+            let done: Vec<Vec<(usize, Vec<FoundMedia>)>> = thread::scope(|scope| {
+                (0..workers)
+                    .map(|_| {
+                        let next = &next;
+                        scope.spawn(move || {
+                            let mut mine = Vec::new();
+                            loop {
+                                let i = next.fetch_add(1, Ordering::Relaxed);
+                                let Some(root) = roots.get(i) else {
+                                    return mine;
+                                };
+                                mine.push((i, walk_root(root)));
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap_or_default())
+                    .collect()
+            });
+            for (i, found) in done.into_iter().flatten() {
+                walked[i] = found;
             }
-            let Some(kind) = entry
-                .path()
-                .extension()
-                .and_then(|e| e.to_str())
-                .and_then(classify)
-            else {
-                continue;
-            };
-            let mtime = entry.metadata().ok().as_ref().and_then(mtime_nanos);
-            found.push((entry.path().to_path_buf(), kind, mtime));
+            walked.into_iter().flatten().collect()
         }
+    }
+}
+
+fn walk_root(root: &str) -> Vec<FoundMedia> {
+    let mut found = Vec::new();
+    for entry in WalkDir::new(root)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Some(kind) = entry
+            .path()
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(classify)
+        else {
+            continue;
+        };
+        let mtime = entry.metadata().ok().as_ref().and_then(mtime_nanos);
+        found.push((entry.path().to_path_buf(), kind, mtime));
     }
     found
 }
@@ -306,12 +351,18 @@ fn scan_into(paths: &[String], tx: &mpsc::Sender<ScanBatch>) {
         paths
     };
 
-    let found = walk_media(paths);
+    // the walk is a stat storm and the index is a multi-megabyte json
+    // parse; neither needs the other, so they overlap instead of
+    // costing their sum before the first track can be answered.
+    let (found, mut index) = thread::scope(|scope| {
+        let index = scope.spawn(TagIndex::load);
+        let found = walk_media(paths);
+        (found, index.join().unwrap_or_default())
+    });
     let seen: HashSet<String> = found
         .iter()
         .map(|(p, _, _)| p.to_string_lossy().into_owned())
         .collect();
-    let mut index = TagIndex::load();
     trace::mark("library scan: walked");
 
     let mut known = Vec::new();
