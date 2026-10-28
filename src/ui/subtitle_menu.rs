@@ -4,6 +4,7 @@ use ratatui::widgets::Widget;
 
 use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
+use crate::ui::textfit::width;
 
 /// One adjustable row: label plus the already-formatted current
 /// value, so this widget stays pure rendering and knows nothing about
@@ -52,12 +53,20 @@ impl Widget for SubtitleMenu<'_> {
         let close = key_label(self.keymap.get(KeyAction::OpenSubtitleMenu));
         draw_text(
             buf,
+            rect,
             x + 2,
             y,
             &format!("subtitles ({close} to close)"),
             shade(NEAR_WHITE),
         );
-        draw_text(buf, x + 2, y + 1, "j/k select, h/l adjust", shade(DIM));
+        draw_text(
+            buf,
+            rect,
+            x + 2,
+            y + 1,
+            "j/k select, h/l adjust",
+            shade(DIM),
+        );
 
         for (i, (label, value)) in FIELD_LABELS.iter().zip(self.values.iter()).enumerate() {
             let row_y = y + 3 + i as u16;
@@ -67,9 +76,16 @@ impl Widget for SubtitleMenu<'_> {
                 shade(DIM)
             };
             let marker = if i == self.selected { '>' } else { ' ' };
-            draw_text(buf, x + 2, row_y, &format!("{marker} {label}"), color);
-            let value_x = x + WIDTH - 2 - value.chars().count() as u16;
-            draw_text(buf, value_x, row_y, value, color);
+            draw_text(buf, rect, x + 2, row_y, &format!("{marker} {label}"), color);
+            // right-aligned by display width: a char count parks a
+            // wide-char value one cell per wide glyph past the edge.
+            // clamped to the label column so a value wider than the
+            // box is clipped by the right border rather than starting
+            // outside the left one.
+            let value_x = (x + WIDTH - 2)
+                .saturating_sub(width(value) as u16)
+                .max(x + 2);
+            draw_text(buf, rect, value_x, row_y, value, color);
         }
     }
 }
@@ -98,23 +114,124 @@ fn draw_box(buf: &mut Buffer, rect: Rect, color: ratatui::style::Color) {
     }
 }
 
-fn draw_text(buf: &mut Buffer, x: u16, y: u16, text: &str, color: ratatui::style::Color) {
-    for (i, ch) in text.chars().enumerate() {
-        put(buf, x + i as u16, y, ch, color);
+/// Clipped to `rect`, the box this menu owns; the old copy had no
+/// bounds guard at all and ran to the buffer's own edge, over whatever
+/// the overlay is sitting on top of.
+fn draw_text(
+    buf: &mut Buffer,
+    rect: Rect,
+    x: u16,
+    y: u16,
+    text: &str,
+    color: ratatui::style::Color,
+) {
+    if y < rect.y || y >= rect.y + rect.height {
+        return;
     }
+    let right = rect.x + rect.width;
+    crate::ui::draw::at(buf, x, y, text, color, right.saturating_sub(x) as usize);
 }
 
 fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: ratatui::style::Color) {
-    if let Some(cell) = buf.cell_mut((x, y)) {
-        cell.set_char(ch);
-        cell.set_fg(color);
-    }
+    crate::ui::draw::put(buf, x, y, ch, color);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::testbuf::{buffer, char_at, grid};
     use crossterm::event::KeyCode;
+
+    fn render(area: Rect, buf: &mut Buffer, values: [&str; FIELD_COUNT]) {
+        SubtitleMenu {
+            values,
+            selected: 0,
+            keymap: &Keymap::default(),
+        }
+        .render(area, buf);
+    }
+
+    #[test]
+    fn the_box_holds_a_labelled_row_per_field_with_its_value_right_aligned() {
+        let area = Rect::new(0, 0, 32, 11);
+        let mut buf = buffer(32, 11);
+        render(
+            area,
+            &mut buf,
+            ["0.0s", "48", "100", "2", "0.5", "0.2", "white"],
+        );
+        assert_eq!(
+            grid(&buf),
+            [
+                "┌─subtitles (t to close)───────┐",
+                "│ j/k select, h/l adjust       │",
+                "│                              │",
+                "│ > delay                 0.0s │",
+                "│   font size               48 │",
+                "│   position               100 │",
+                "│   outline                  2 │",
+                "│   background             0.5 │",
+                "│   blur                   0.2 │",
+                "│   color                white │",
+                "└──────────────────────────────┘",
+            ]
+            .join("\n")
+        );
+    }
+
+    /// The value column is right-aligned; measured in chars it parks a
+    /// wide value one cell per wide glyph past the box's right border.
+    #[test]
+    fn a_wide_value_is_right_aligned_by_cells_and_keeps_the_border() {
+        let area = Rect::new(0, 0, 32, 11);
+        let mut buf = buffer(32, 11);
+        render(area, &mut buf, ["日本", "", "", "", "", "", ""]);
+        let row: Vec<char> = grid(&buf).lines().nth(3).unwrap().chars().collect();
+        assert_eq!(row[31], '│', "value overran the border");
+        // four cells for two wide chars, ending one cell in from the
+        // border exactly like the ascii values above.
+        assert_eq!((row[26], row[27], row[28], row[29]), ('日', ' ', '本', ' '));
+    }
+
+    #[test]
+    fn nothing_is_drawn_outside_the_box() {
+        let mut buf = buffer(40, 16);
+        let area = Rect::new(0, 0, 40, 16);
+        let long = "日本語テスト曲日本語テスト曲日本語テスト曲";
+        render(area, &mut buf, [long; FIELD_COUNT]);
+        // the box is centred in `area`; everything outside it stays as
+        // the overlay found it.
+        let x0 = (40 - WIDTH) / 2;
+        let y0 = (16 - (FIELD_COUNT as u16 + 4)) / 2;
+        for y in 0..16u16 {
+            for x in 0..40u16 {
+                let inside =
+                    x >= x0 && x < x0 + WIDTH && y >= y0 && y < y0 + FIELD_COUNT as u16 + 4;
+                if !inside {
+                    assert_eq!(
+                        char_at(&buf, x, y),
+                        '.',
+                        "wrote outside its box at ({x}, {y}):\n{}",
+                        grid(&buf)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn degenerate_sizes_draw_nothing_instead_of_panicking() {
+        for (w, h) in [(1, 1), (1, 40), (2, 1), (40, 0), (0, 0), (31, 11)] {
+            let mut buf = buffer(w.max(1), h.max(1));
+            render(Rect::new(0, 0, w, h), &mut buf, ["日本語"; FIELD_COUNT]);
+            if w > 0 && h > 0 {
+                assert!(
+                    !grid(&buf).contains('┌'),
+                    "too small for the box, so it must not draw one"
+                );
+            }
+        }
+    }
 
     #[test]
     fn the_close_hint_follows_the_live_keymap() {
