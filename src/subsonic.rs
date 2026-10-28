@@ -1849,12 +1849,29 @@ mod tests {
         eprintln!(
             "serial:   {serial} songs, {serial_requests} requests, {serial_connections} connections, {serial_elapsed:?}"
         );
+        // a second open of the same artist, which is what going back
+        // to the sidebar and in again costs.
+        let started = Instant::now();
+        let reopened: usize = client
+            .artist_albums_with_tracks("ar-1")
+            .unwrap()
+            .iter()
+            .map(|t| t.songs.len())
+            .sum();
+        let reopened_elapsed = started.elapsed();
+
         eprintln!(
             "parallel: {parallel} songs, {} requests, {} connections, {parallel_elapsed:?}",
             server.requests(),
             server.connections()
         );
+        eprintln!(
+            "reopened: {reopened} songs, {} requests total, {reopened_elapsed:?}",
+            server.requests()
+        );
         assert_eq!(serial, parallel);
+        assert_eq!(serial, reopened);
         assert!(parallel_elapsed * 2 < serial_elapsed);
+        assert!(reopened_elapsed * 10 < parallel_elapsed);
     }
 }
