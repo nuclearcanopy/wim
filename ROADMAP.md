@@ -524,12 +524,17 @@ run that edits these files will collide.
       no fetch needed and it is already decoded at the right size.
       eleven tests over the key derivation, in-flight dedup, negative
       caching and the bound.
-- [ ] **cover art in `ArtMode::Real`.** the above feeds the ascii path
-      (the default). real sixel/kitty/iterm2 art goes through
-      `real_art_protocol`, which is still built only from a browse
-      view's image, so a search-played track shows ascii art even with
-      a graphics protocol configured. needs a protocol rebuilt from the
-      fetched image when it lands.
+- [x] **cover art in `ArtMode::Real`.** the player has its own
+      `StatefulProtocol` now, keyed by `coverart::art_key` so it is
+      rebuilt only when the cover actually changes (a protocol holds
+      resize state; rebuilding per frame would throw it away). this
+      was not merely missing: the player was reaching for
+      `real_art_protocol`, which is built *only* from a browse view's
+      image, so with a graphics protocol configured a search-played
+      track drew nothing, and if a view had been open earlier it drew
+      **that** album's cover instead. the resolution of which image to
+      draw also moved out of the draw closure, so the ascii widget and
+      the real overlay are guaranteed to be handed the same one.
 - [ ] **migrate the remaining chrome widgets to `ui::draw`**: eq_menu,
       keybinds_menu, settings_menu, subtitle_menu, nav_manager, login,
       onboarding, banner's menu row. (helpbox done, help still has its
