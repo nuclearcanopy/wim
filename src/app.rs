@@ -269,6 +269,15 @@ impl App {
         self.selected = self.results.len().saturating_sub(1);
     }
 
+    /// Replaces the query wholesale and re-filters, exactly as typing
+    /// it would; backs `shellsong`'s `search(...)`. The caller still
+    /// has to kick the debounced remote search (`notify_query_changed`),
+    /// same as every other path that changes the query.
+    pub fn set_query(&mut self, query: &str) {
+        self.query = query.to_string();
+        self.refresh_results();
+    }
+
     /// Re-filters for a query the user just changed, which genuinely
     /// should jump back to the best match; anything that re-filters
     /// *under* an unchanged query goes through `resync_results`

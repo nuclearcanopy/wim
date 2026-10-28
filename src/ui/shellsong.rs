@@ -1,7 +1,3 @@
-// not drawn by the main loop yet; the host renders this once it owns an
-// open console (see shellsong.rs's own note).
-#![allow(dead_code)]
-
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;

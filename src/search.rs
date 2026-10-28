@@ -163,6 +163,22 @@ impl SearchItem {
         }
     }
 
+    /// The item's own name with no metadata decoration: a song's
+    /// title, an album's or artist's name. `results_list::label` is
+    /// the decorated form, for display; this is the bare one, for
+    /// anything that has to put the name back as text (shellsong's
+    /// completion candidates, which are inserted into a command line).
+    pub fn primary_name(&self) -> &str {
+        match self {
+            SearchItem::LocalMusic { title, .. }
+            | SearchItem::LocalVideo { title, .. }
+            | SearchItem::Song { title, .. } => title,
+            SearchItem::Artist { name, .. }
+            | SearchItem::Album { name, .. }
+            | SearchItem::Playlist { name, .. } => name,
+        }
+    }
+
     /// The results-list section this item groups under; local music
     /// and remote songs share one "songs" section rather than
     /// splitting local-vs-remote further, since that distinction
@@ -342,6 +358,16 @@ impl Corpus {
 
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+
+    /// Drops every local file entry, keeping everything indexed from a
+    /// server. A rescan re-walks the library from scratch (local items
+    /// have no `remote_key`, so `add_local_tracks` would otherwise
+    /// append a second copy of every file), and dropping only the
+    /// local half means a rescan does not also wipe the navidrome
+    /// catalog until the next 45s sync lands.
+    pub fn drop_local(&mut self) {
+        self.items.retain(|e| e.item.source().is_some());
     }
 
     /// Every indexed item, in insertion order. Read-only whole-corpus
