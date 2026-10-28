@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -469,32 +470,41 @@ pub enum Words {
 impl Words {
     /// What completion offers and `help()` prints: canonical spellings
     /// only, so the list stays readable even where the parser accepts
-    /// several words for one thing.
-    pub fn options(self) -> Vec<&'static str> {
-        match self {
-            Words::Position => vec!["front", "back"],
-            Words::LoopMode => vec!["one", "all", "off"],
-            Words::Switch => vec!["on", "off"],
-            Words::EqPreset => eq::PRESETS.iter().map(|p| p.name).collect(),
-            Words::ViewTarget => VIEW_QUERY_WORDS[..1]
+    /// several words for one thing. Borrowed rather than built, because
+    /// completion asks for a set on every keystroke.
+    pub fn options(self) -> &'static [&'static str] {
+        static EQ_PRESETS: LazyLock<Vec<&'static str>> =
+            LazyLock::new(|| eq::PRESETS.iter().map(|p| p.name).collect());
+        static VIEW_TARGETS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+            VIEW_QUERY_WORDS[..1]
                 .iter()
                 .copied()
                 .chain(VIEW_NAMES.iter().filter(|v| v.canonical).map(|v| v.word))
-                .collect(),
-            Words::FadeDir => vec!["in", "out"],
+                .collect()
+        });
+        match self {
+            Words::Position => &["front", "back"],
+            Words::LoopMode => &["one", "all", "off"],
+            Words::Switch => &["on", "off"],
+            Words::EqPreset => &EQ_PRESETS,
+            Words::ViewTarget => &VIEW_TARGETS,
+            Words::FadeDir => &["in", "out"],
         }
     }
 
     /// Every spelling the parser accepts, which is a superset of
     /// `options`; validation reads this so an alias still parses even
     /// though completion does not advertise it.
-    fn accepts(self) -> Vec<&'static str> {
-        match self {
-            Words::ViewTarget => VIEW_QUERY_WORDS
+    fn accepts(self) -> &'static [&'static str] {
+        static VIEW_ACCEPTS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+            VIEW_QUERY_WORDS
                 .iter()
                 .copied()
                 .chain(VIEW_NAMES.iter().map(|v| v.word))
-                .collect(),
+                .collect()
+        });
+        match self {
+            Words::ViewTarget => &VIEW_ACCEPTS,
             other => other.options(),
         }
     }
@@ -554,12 +564,12 @@ impl Ty {
     /// a type that accepts keywords without a way to list them is the
     /// surprising half of the pair.
     #[allow(dead_code)]
-    pub fn options(self) -> Vec<&'static str> {
+    pub fn options(self) -> &'static [&'static str] {
         match self {
             Ty::Words(w) => w.options(),
-            Ty::Speed => vec!["up", "down", "reset"],
-            Ty::Duration => vec!["off"],
-            _ => Vec::new(),
+            Ty::Speed => &["up", "down", "reset"],
+            Ty::Duration => &["off"],
+            _ => &[],
         }
     }
 
@@ -927,29 +937,40 @@ pub const COMMANDS: &[Command] = &[
     ),
 ];
 
-/// Resolves a written name to a command plus the `kind=` value its
-/// suffix desugars to, if any.
-fn lookup(name: &str) -> Option<(&'static Command, Option<&'static str>)> {
-    if let Some(c) = COMMANDS
-        .iter()
-        .find(|c| c.name == name || c.aliases.contains(&name))
-    {
-        return Some((c, None));
-    }
-    for (suffix, kind) in KIND_SUFFIXES {
-        let Some(stem) = name.strip_suffix(suffix) else {
-            continue;
-        };
-        if let Some(c) = COMMANDS
-            .iter()
-            .find(|c| c.name == stem || c.aliases.contains(&stem))
-        {
-            if widenable(c) {
-                return Some((c, Some(kind)));
+/// Every written name, suffixed spellings included, to the command it
+/// resolves to and the `kind=` value the suffix desugars to. Built once:
+/// `site` resolves the enclosing name on every keystroke, and a linear
+/// scan of the table plus its alias lists was that whole cost.
+///
+/// A plain spelling is inserted before any suffixed one, so a direct
+/// name still wins over a collision the way the scan it replaced did.
+type Resolved = (&'static Command, Option<&'static str>);
+
+fn by_name() -> &'static HashMap<String, Resolved> {
+    static BY_NAME: LazyLock<HashMap<String, Resolved>> = LazyLock::new(|| {
+        let mut map: HashMap<String, Resolved> = HashMap::new();
+        for c in COMMANDS {
+            for name in std::iter::once(&c.name).chain(c.aliases) {
+                map.entry((*name).to_string()).or_insert((c, None));
             }
         }
-    }
-    None
+        for c in COMMANDS.iter().filter(|c| widenable(c)) {
+            for name in std::iter::once(&c.name).chain(c.aliases) {
+                for (suffix, kind) in KIND_SUFFIXES {
+                    map.entry(format!("{name}{suffix}"))
+                        .or_insert((c, Some(*kind)));
+                }
+            }
+        }
+        map
+    });
+    &BY_NAME
+}
+
+/// Resolves a written name to a command plus the `kind=` value its
+/// suffix desugars to, if any.
+fn lookup(name: &str) -> Option<Resolved> {
+    by_name().get(name).copied()
 }
 
 /// The `kind=` ladder widens *from songs*, so only a song-rooted
@@ -963,19 +984,22 @@ fn widenable(c: &Command) -> bool {
 /// Every written name the parser accepts, canonical and alias alike;
 /// what tab completion offers and what the did-you-mean suggestion
 /// searches.
-pub fn every_name() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = Vec::new();
-    for c in COMMANDS {
-        names.push(c.name);
-        names.extend_from_slice(c.aliases);
-    }
-    names.sort_unstable();
-    names
+pub fn every_name() -> &'static [&'static str] {
+    static NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+        let mut names: Vec<&'static str> = Vec::new();
+        for c in COMMANDS {
+            names.push(c.name);
+            names.extend_from_slice(c.aliases);
+        }
+        names.sort_unstable();
+        names
+    });
+    &NAMES
 }
 
 /// Closest known name to `name`, for "did you mean".
 fn did_you_mean(name: &str) -> Option<&'static str> {
-    closest(name, &every_name())
+    closest(name, every_name())
 }
 
 /// `strsim`, same dependency search.rs recovers typos with, but
@@ -995,6 +1019,15 @@ fn closest(name: &str, among: &[&'static str]) -> Option<&'static str> {
     // way down.
     hits.sort_by_key(|(score, c)| (std::cmp::Reverse(*score), c.len(), *c));
     hits.first().map(|(_, c)| *c)
+}
+
+/// `name(a, b)` off the cache rather than rebuilt: `site` wants the
+/// enclosing call's signature on every keystroke, and `signature`
+/// formats and joins to produce it.
+fn signature_of(c: &Command) -> String {
+    static SIGS: LazyLock<HashMap<&'static str, String>> =
+        LazyLock::new(|| COMMANDS.iter().map(|c| (c.name, c.signature())).collect());
+    SIGS.get(c.name).cloned().unwrap_or_else(|| c.signature())
 }
 
 /// `help()` output, generated from `COMMANDS`; canonical names only,
@@ -2208,9 +2241,9 @@ fn coerce(
         // every accepted spelling parses, but an unrecognised one is
         // measured against the *canonical* list so the suggestion is
         // something worth typing.
-        Ty::Words(set) => match set.accepts().into_iter().find(|o| *o == text) {
+        Ty::Words(set) => match set.accepts().iter().copied().find(|o| *o == text) {
             Some(word) => Ok(Arg::Word(word)),
-            None => Err(bad(match closest(text, &set.options()) {
+            None => Err(bad(match closest(text, set.options()) {
                 Some(near) => format!(
                     "{}: unknown {} '{text}'; did you mean '{near}'?",
                     command.name, param.name
@@ -2717,26 +2750,29 @@ impl Console {
 
     /// Ranked, prefix-only candidates for the token under the cursor.
     fn candidates_at(&self, here: &Site, cand: &dyn Candidates) -> Vec<String> {
-        let found: Vec<String> = match here.completes {
+        let mut seen = match here.completes {
             Completes::Hint(_) => return Vec::new(),
-            Completes::Words(set) => set.options().iter().map(|s| s.to_string()).collect(),
-            Completes::CommandNames => every_name().iter().map(|s| s.to_string()).collect(),
+            Completes::Words(set) => {
+                keep_extensions(&here.token, set.options().iter().copied(), MAX_CANDIDATES)
+            }
+            Completes::CommandNames => {
+                keep_extensions(&here.token, every_name().iter().copied(), MAX_CANDIDATES)
+            }
             // fuzzy discovery, so a subsequence or typo match surfaces
             // things a prefix scan would miss; the prefix filter below
             // then drops whatever could not be inserted without
             // overwriting what was typed.
-            Completes::CorpusTerms => cand.corpus(&here.token),
-            Completes::SavedQueues => cand.saved_queues(),
+            Completes::CorpusTerms => keep_extensions(
+                &here.token,
+                cand.corpus(&here.token).iter().map(String::as_str),
+                MAX_CANDIDATES,
+            ),
+            Completes::SavedQueues => keep_extensions(
+                &here.token,
+                cand.saved_queues().iter().map(String::as_str),
+                MAX_CANDIDATES,
+            ),
         };
-        let mut seen: Vec<String> = Vec::new();
-        for c in found {
-            if extend(&here.token, &c).is_some() && !seen.contains(&c) {
-                seen.push(c);
-                if seen.len() >= MAX_CANDIDATES {
-                    break;
-                }
-            }
-        }
         self.ranks.order(&mut seen);
         seen
     }
@@ -2744,14 +2780,15 @@ impl Console {
     /// The best past command line the whole input is a prefix of, as
     /// zsh-autosuggestions does it.
     fn history_extension(&self) -> Option<String> {
-        let mut hits: Vec<String> = Vec::new();
         // newest first, so recency is the order anything unranked
         // falls back to.
-        for past in self.history.iter().rev() {
-            if extend(&self.input, past).is_some() && !hits.contains(past) {
-                hits.push(past.clone());
-            }
-        }
+        // uncapped on purpose: the ranker picks the winner out of the
+        // whole matching history, not out of the newest `n` of it.
+        let mut hits = keep_extensions(
+            &self.input,
+            self.history.iter().rev().map(String::as_str),
+            usize::MAX,
+        );
         self.ranks.order(&mut hits);
         hits.first().map(|h| remainder(&self.input, h))
     }
@@ -2848,12 +2885,12 @@ pub fn site(input: &str, cursor: usize) -> Site {
         None => (Completes::CommandNames, None),
         Some((name, arg)) => match lookup(name) {
             Some((command, _)) => match command.params.get(arg) {
-                Some(param) => (param.ty.completes(), Some((command.signature(), arg))),
+                Some(param) => (param.ty.completes(), Some((signature_of(command), arg))),
                 // past the last parameter: nothing left to offer, but
                 // still show the signature so the arity is visible.
                 None => (
                     Completes::Hint("no more arguments"),
-                    Some((command.signature(), arg)),
+                    Some((signature_of(command), arg)),
                 ),
             },
             // the enclosing name is not (yet) a command, so whatever is
@@ -2949,18 +2986,62 @@ fn enclosing(input: &str, at: usize) -> Option<(&str, usize)> {
 /// resulting term still resolves. A fuzzy hit that is not a prefix
 /// extension returns `None` and is dropped: inserting it would replace
 /// characters the user typed, which completion must never do.
-fn extend(token: &str, candidate: &str) -> Option<String> {
-    let keep = token.chars().count();
-    let head: String = candidate.chars().take(keep).collect();
-    if head.chars().count() < keep || head.to_lowercase() != token.to_lowercase() {
-        return None;
+///
+/// Borrowed, and on an ascii token (every real one) decided on bytes
+/// with nothing allocated: this runs once per candidate per keystroke.
+fn extension<'a>(token: &str, candidate: &'a str) -> Option<&'a str> {
+    if token.is_ascii() {
+        let keep = token.len();
+        let bytes = candidate.as_bytes();
+        // a candidate of at most `keep` bytes has at most `keep` chars,
+        // so it is either too short or has no remainder to offer.
+        if bytes.len() <= keep {
+            return None;
+        }
+        // all-ascii up to `keep` makes `keep` a char boundary, and
+        // makes the ascii comparison the same answer `to_lowercase`
+        // would have given on both sides.
+        if bytes[..keep].is_ascii() {
+            return candidate[..keep]
+                .eq_ignore_ascii_case(token)
+                .then(|| &candidate[keep..]);
+        }
     }
-    let rest: String = candidate.chars().skip(keep).collect();
-    (!rest.is_empty()).then_some(rest)
+    let keep = token.chars().count();
+    // `nth(keep)` landing means the head is exactly `keep` chars and
+    // the remainder is not empty; missing means one or the other fails.
+    let (at, _) = candidate.char_indices().nth(keep)?;
+    (candidate[..at].to_lowercase() == token.to_lowercase()).then(|| &candidate[at..])
+}
+
+fn extends(token: &str, candidate: &str) -> bool {
+    extension(token, candidate).is_some()
+}
+
+/// The candidates that extend `token`, in arrival order, deduped, up to
+/// `cap`. Only a kept candidate is ever allocated, which is the whole
+/// point: the lists coming in are static names or a corpus page, and
+/// most of a long one is dropped by the prefix filter.
+fn keep_extensions<'a>(
+    token: &str,
+    from: impl Iterator<Item = &'a str>,
+    cap: usize,
+) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for candidate in from {
+        if !extends(token, candidate) || kept.iter().any(|k| k == candidate) {
+            continue;
+        }
+        kept.push(candidate.to_string());
+        if kept.len() >= cap {
+            break;
+        }
+    }
+    kept
 }
 
 fn remainder(token: &str, candidate: &str) -> String {
-    extend(token, candidate).unwrap_or_default()
+    extension(token, candidate).unwrap_or_default().to_string()
 }
 
 // -------------------------------------------------------------- ranking
@@ -4524,7 +4605,7 @@ mod tests {
                 let Completes::Words(set) = p.ty.completes() else {
                     continue;
                 };
-                for option in set.options() {
+                for option in set.options().iter().copied() {
                     // every offered keyword has to coerce; the only
                     // exception is view's `q`, which needs a term too.
                     let extra = if c.name == "view" && option == "q" {
@@ -5212,16 +5293,20 @@ mod tests {
 
     // --------------------------------------------- pinned completion
 
-    /// The corpus the pinned table below completes against. Deliberately
-    /// mixed case and full of non-prefix fuzzy hits, since `Fake::corpus`
-    /// ignores the token and hands back the lot: the prefix filter is
-    /// what has to earn every line of the table.
+    /// The corpus the pinned table below completes against.
+    /// Deliberately mixed case and full of non-prefix fuzzy hits, since
+    /// `Fake::corpus` ignores the token and hands back the lot: the
+    /// prefix filter is what has to earn every line of the table. The
+    /// repeated names are there so the dedup is load-bearing too; two
+    /// albums really can share a track title.
     const PINNED_CORPUS: &[&str] = &[
         "flatline",
         "Flatline (Remix)",
         "floor",
+        "flatline",
         "sulfur surfer",
         "4 star crest",
+        "crest",
         "crest",
         "hex",
         "Icedancer",
