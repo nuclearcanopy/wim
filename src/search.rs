@@ -337,6 +337,31 @@ impl Needle {
     }
 }
 
+/// Smallest length difference between `len` and any word the haystack
+/// has, read straight off `Entry::word_lens`. A lower bound on the best
+/// edit distance the typo pass could possibly report, and so (through
+/// `typo_score`) an upper bound on the score it could add: when the
+/// fuzzy score already beats that, the pass cannot change the answer
+/// and is skipped. The saturating 31-char bucket makes this an
+/// underestimate for very long words, which only ever means running a
+/// pass that could have been skipped.
+fn min_length_gap(word_lens: u32, len: usize) -> usize {
+    if word_lens == 0 {
+        // no words at all: 32 is past every bucket, and scores as 0,
+        // so a haystack like this never reaches the typo pass.
+        return 32;
+    }
+    let target = len.min(31) as u32;
+    let at_or_below = word_lens & (!0u32 >> (31 - target));
+    let down = if at_or_below == 0 {
+        u32::MAX
+    } else {
+        target - (31 - at_or_below.leading_zeros())
+    };
+    let up = (word_lens >> target).trailing_zeros();
+    down.min(up) as usize
+}
+
 /// Every word length within `budget` of `len`, in `Entry::word_lens`'s
 /// encoding. Lengths from 31 up all share bit 31, which only ever
 /// widens the window (a 40-char word still tests as a candidate for a
@@ -680,13 +705,16 @@ fn score_chunk<'a>(
         };
 
         // four free skips of the edit-distance pass, none of which can
-        // change the final score: a typo can never beat
-        // `typo_score(0)`; the distance is at least the length
+        // change the final score: the distance is at least the length
         // difference, so a haystack with no word anywhere near the
-        // query's length is out; and it is at least the number of
-        // query chars the haystack lacks entirely.
-        let typo = if fuzzy_score.is_some_and(|s| s >= typo_score(0))
-            || entry.word_lens & needle.length_window == 0
+        // query's length is out, and where the closest-length word
+        // still bounds the best typo score below what the fuzzy pass
+        // already scored, the pass cannot win; and the distance is
+        // also at least the number of query chars the haystack lacks
+        // entirely.
+        let typo = if entry.word_lens & needle.length_window == 0
+            || fuzzy_score
+                .is_some_and(|s| s >= typo_score(min_length_gap(entry.word_lens, needle.len)))
             || needle.missing_from(entry.mask) > needle.budget
         {
             None
@@ -1027,6 +1055,32 @@ mod tests {
                 .any(|i| matches!(i, SearchItem::Artist { name, .. } if name == "Branimir")),
             "a 9-char query has a 2-edit budget and must still match"
         );
+    }
+
+    /// `min_length_gap` has to agree with the obvious loop over the
+    /// set bits, for every single- and two-word length mask.
+    #[test]
+    fn min_length_gap_finds_the_nearest_word_length() {
+        let expected = |mask: u32, len: usize| -> usize {
+            let target = len.min(31);
+            (0..32)
+                .filter(|bit| mask & (1 << bit) != 0)
+                .map(|bit: usize| bit.abs_diff(target))
+                .min()
+                .unwrap_or(32)
+        };
+        let masks = (0..32u32)
+            .flat_map(|a| (0..32u32).map(move |b| (1 << a) | (1 << b)))
+            .chain([0, !0]);
+        for mask in masks {
+            for len in 0..40usize {
+                assert_eq!(
+                    min_length_gap(mask, len),
+                    expected(mask, len),
+                    "mask {mask:#034b} len {len}"
+                );
+            }
+        }
     }
 
     /// The word-length window has to keep every length the budget can
