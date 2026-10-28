@@ -4,6 +4,7 @@
 //! owning it directly is simpler than fighting someone else's types.
 
 use std::io::Read;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use md5::{Digest, Md5};
@@ -27,6 +28,15 @@ const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 16;
 /// `artist_albums_with_tracks`), so it is one request per album; 8
 /// hides nearly all the latency without opening a socket per album.
 const ALBUM_FETCH_CONCURRENCY: usize = 8;
+
+/// `getAlbumList2`'s per-page cap per the subsonic spec.
+const ALBUM_PAGE_SIZE: usize = 500;
+
+/// How many catalog pages `all_albums` has in flight at once. Lower
+/// than `ALBUM_FETCH_CONCURRENCY` because each page is 500 albums of
+/// json, and because every launch pays this against every configured
+/// server at the same time.
+const ALBUM_PAGE_CONCURRENCY: usize = 4;
 
 /// Cheap to clone (ureq's `Agent` is `Arc`-backed internally); every
 /// remote `SearchItem` carries an `Arc<Client>` so playback can later
@@ -313,7 +323,7 @@ impl Client {
 
     pub fn playlists(&self) -> anyhow::Result<Vec<Playlist>> {
         let v = self.get("getPlaylists", &[])?;
-        let list = v
+        let list: Vec<Playlist> = v
             .get("playlists")
             .and_then(|p| p.get("playlist"))
             .and_then(|p| p.as_array())
@@ -338,39 +348,70 @@ impl Client {
     /// index's `artist` array into one flat list.
     pub fn all_artists(&self) -> anyhow::Result<Vec<Artist>> {
         let v = self.get("getArtists", &[])?;
-        Ok(parse_artists_index(&v))
+        let artists = parse_artists_index(&v);
+        Ok(artists)
     }
 
     /// The entire album catalog, paginated via `getAlbumList2`
     /// (`offset`/`size`); unlike artists, album listing has no
-    /// single-call "everything" mode, so this loops until a page
+    /// single-call "everything" mode, so this runs until a page
     /// returns fewer than requested (the standard termination
     /// condition; Navidrome also reports `x-total-count` but that
     /// requires reading response headers, which ureq's `into_json()`
     /// convenience here doesn't expose; the fewer-than-requested check
     /// is sufficient and matches what the spec guarantees).
+    ///
+    /// Pages after the first are independent requests at known
+    /// offsets, so they go out `ALBUM_PAGE_CONCURRENCY` at a time
+    /// instead of one round trip per page: a 5k-album library was 11
+    /// stacked round trips. The cost is a handful of requests past the
+    /// end of the catalog (one short of a full wave, worst case),
+    /// which answer empty; only libraries over one page pay it at all.
     pub fn all_albums(&self) -> anyhow::Result<Vec<Album>> {
-        const PAGE_SIZE: usize = 500;
-        let mut albums = Vec::new();
-        let mut offset = 0usize;
-        loop {
-            let v = self.get(
-                "getAlbumList2",
-                &[
-                    ("type", "alphabeticalByName"),
-                    ("size", &PAGE_SIZE.to_string()),
-                    ("offset", &offset.to_string()),
-                ],
-            )?;
-            let page = parse_album_list2_page(&v);
-            let got = page.len();
-            albums.extend(page);
-            if got < PAGE_SIZE {
-                break;
-            }
-            offset += PAGE_SIZE;
+        let mut albums = self.album_page(0)?;
+        if albums.len() < ALBUM_PAGE_SIZE {
+            return Ok(albums);
         }
-        Ok(albums)
+        let mut offset = ALBUM_PAGE_SIZE;
+        loop {
+            let wave: Vec<anyhow::Result<Vec<Album>>> = thread::scope(|scope| {
+                (0..ALBUM_PAGE_CONCURRENCY)
+                    .map(|i| scope.spawn(move || self.album_page(offset + i * ALBUM_PAGE_SIZE)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .unwrap_or_else(|_| anyhow::bail!("panicked fetching an album page"))
+                    })
+                    .collect()
+            });
+            for page in wave {
+                let page = page?;
+                let got = page.len();
+                albums.extend(page);
+                // a short page is the end of the catalog, so every
+                // later offset in this wave is past it; whatever they
+                // answered is dropped rather than appended out of
+                // order (the next sync picks up anything added since).
+                if got < ALBUM_PAGE_SIZE {
+                    return Ok(albums);
+                }
+            }
+            offset += ALBUM_PAGE_SIZE * ALBUM_PAGE_CONCURRENCY;
+        }
+    }
+
+    fn album_page(&self, offset: usize) -> anyhow::Result<Vec<Album>> {
+        let v = self.get(
+            "getAlbumList2",
+            &[
+                ("type", "alphabeticalByName"),
+                ("size", &ALBUM_PAGE_SIZE.to_string()),
+                ("offset", &offset.to_string()),
+            ],
+        )?;
+        Ok(parse_album_list2_page(&v))
     }
 
     /// Stream url for a song id. Asks for `format=raw` (the subsonic
@@ -465,22 +506,52 @@ impl Client {
         artist_id: &str,
     ) -> anyhow::Result<Vec<ArtistAlbumTracks>> {
         let albums = self.artist_albums_chronological(artist_id)?;
-        let workers = ALBUM_FETCH_CONCURRENCY.min(albums.len());
+        let ids: Vec<&str> = albums.iter().map(|a| a.id.as_str()).collect();
+        Ok(self
+            .album_details(&ids)
+            .into_iter()
+            .zip(albums)
+            .enumerate()
+            .filter_map(|(index, (details, album))| {
+                Some(ArtistAlbumTracks {
+                    index,
+                    album,
+                    songs: details?.songs,
+                })
+            })
+            .collect())
+    }
+
+    /// `getAlbum` for many album ids at once, answers in the same
+    /// order as `album_ids` (`None` where that album's fetch failed;
+    /// one unreadable album shouldn't take down a whole artist page).
+    ///
+    /// The one bounded fan-out for album fetches: a worker per slot
+    /// would be a socket per album, which against a real Navidrome
+    /// instance means an artist with 60 releases opening 60
+    /// connections. Workers pull from a shared counter rather than
+    /// striping a fixed slice each, since album sizes vary a lot.
+    pub fn album_details(&self, album_ids: &[&str]) -> Vec<Option<AlbumDetails>> {
+        let workers = ALBUM_FETCH_CONCURRENCY.min(album_ids.len());
         if workers == 0 {
-            return Ok(Vec::new());
+            return Vec::new();
         }
-        let albums = &albums;
-        let batches: Vec<Vec<ArtistAlbumTracks>> = thread::scope(|scope| {
+        let next = AtomicUsize::new(0);
+        let done: Vec<Vec<(usize, AlbumDetails)>> = thread::scope(|scope| {
             (0..workers)
-                .map(|worker| {
+                .map(|_| {
+                    let next = &next;
                     scope.spawn(move || {
-                        albums
-                            .iter()
-                            .enumerate()
-                            .skip(worker)
-                            .step_by(workers)
-                            .filter_map(|(index, album)| self.album_tracks(index, album))
-                            .collect::<Vec<_>>()
+                        let mut mine = Vec::new();
+                        loop {
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(id) = album_ids.get(index) else {
+                                return mine;
+                            };
+                            if let Ok(details) = self.get_album(id) {
+                                mine.push((index, details));
+                            }
+                        }
                     })
                 })
                 .collect::<Vec<_>>()
@@ -488,9 +559,13 @@ impl Client {
                 .map(|handle| handle.join().unwrap_or_default())
                 .collect()
         });
-        let mut tracks: Vec<ArtistAlbumTracks> = batches.into_iter().flatten().collect();
-        tracks.sort_by_key(|t| t.index);
-        Ok(tracks)
+        let mut slots: Vec<Option<AlbumDetails>> = (0..album_ids.len()).map(|_| None).collect();
+        for (index, details) in done.into_iter().flatten() {
+            if let Some(slot) = slots.get_mut(index) {
+                *slot = Some(details);
+            }
+        }
+        slots
     }
 
     /// Non-blocking counterpart for the artist view: one `getArtist`
@@ -820,6 +895,24 @@ mod tests {
     use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
 
+    /// What the mock's catalog endpoints answer, mutable so a test can
+    /// change a server's catalog under a client that's already running
+    /// (which is what the background sync sees on a real server).
+    struct MockCatalog {
+        albums: AtomicUsize,
+        rev: AtomicUsize,
+    }
+
+    /// Everything one mock server answers from, shared with each
+    /// connection handler.
+    struct MockFixture {
+        albums: usize,
+        songs_per_album: usize,
+        latency: Duration,
+        requests: Arc<AtomicUsize>,
+        catalog: Arc<MockCatalog>,
+    }
+
     /// Minimal http/1.1 server for the fetch-path tests: canned
     /// subsonic json, an optional per-request delay standing in for
     /// network latency, and counters for requests and accepted
@@ -828,6 +921,7 @@ mod tests {
         url: String,
         requests: Arc<AtomicUsize>,
         connections: Arc<AtomicUsize>,
+        catalog: Arc<MockCatalog>,
     }
 
     impl MockServer {
@@ -836,14 +930,25 @@ mod tests {
             let url = format!("http://{}", listener.local_addr().unwrap());
             let requests = Arc::new(AtomicUsize::new(0));
             let connections = Arc::new(AtomicUsize::new(0));
-            let (req, conn) = (requests.clone(), connections.clone());
+            let catalog = Arc::new(MockCatalog {
+                albums: AtomicUsize::new(0),
+                rev: AtomicUsize::new(0),
+            });
+            let fixture = Arc::new(MockFixture {
+                albums,
+                songs_per_album,
+                latency,
+                requests: requests.clone(),
+                catalog: catalog.clone(),
+            });
+            let conn = connections.clone();
             // detached: the test binary exits without waiting on it
             thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
                     conn.fetch_add(1, Ordering::Relaxed);
-                    let req = req.clone();
+                    let fixture = fixture.clone();
                     thread::spawn(move || {
-                        serve(stream, albums, songs_per_album, latency, &req);
+                        serve(stream, &fixture);
                     });
                 }
             });
@@ -851,6 +956,7 @@ mod tests {
                 url,
                 requests,
                 connections,
+                catalog,
             }
         }
 
@@ -873,16 +979,16 @@ mod tests {
         fn connections(&self) -> usize {
             self.connections.load(Ordering::Relaxed)
         }
+
+        /// How many albums `getAlbumList2` has to page through.
+        fn with_catalog_albums(self, total: usize) -> MockServer {
+            self.catalog.albums.store(total, Ordering::Relaxed);
+            self
+        }
     }
 
     /// One keep-alive connection: requests until the client hangs up.
-    fn serve(
-        stream: TcpStream,
-        albums: usize,
-        songs_per_album: usize,
-        latency: Duration,
-        requests: &AtomicUsize,
-    ) {
+    fn serve(stream: TcpStream, fixture: &MockFixture) {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         loop {
@@ -899,9 +1005,9 @@ mod tests {
                     Err(_) => return,
                 }
             }
-            requests.fetch_add(1, Ordering::Relaxed);
-            thread::sleep(latency);
-            let body = mock_body(&request_line, albums, songs_per_album);
+            fixture.requests.fetch_add(1, Ordering::Relaxed);
+            thread::sleep(fixture.latency);
+            let body = mock_body(&request_line, fixture);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
@@ -913,9 +1019,36 @@ mod tests {
         }
     }
 
+    /// One query parameter off a request line, or `None`.
+    fn query_param(request_line: &str, key: &str) -> Option<usize> {
+        request_line
+            .split(&format!("{key}="))
+            .nth(1)?
+            .split(['&', ' '])
+            .next()?
+            .parse()
+            .ok()
+    }
+
     /// Years descend with album position, so the returned order is the
     /// reverse of the chronological one every caller sorts into.
-    fn mock_body(request_line: &str, albums: usize, songs_per_album: usize) -> String {
+    fn mock_body(request_line: &str, fixture: &MockFixture) -> String {
+        let (albums, songs_per_album) = (fixture.albums, fixture.songs_per_album);
+        if request_line.contains("/rest/getAlbumList2") {
+            let total = fixture.catalog.albums.load(Ordering::Relaxed);
+            let rev = fixture.catalog.rev.load(Ordering::Relaxed);
+            let offset = query_param(request_line, "offset").unwrap_or(0);
+            let size = query_param(request_line, "size").unwrap_or(ALBUM_PAGE_SIZE);
+            let page: Vec<String> = (offset..total.min(offset + size))
+                .map(|i| {
+                    format!(r#"{{"id":"cat{rev}-{i}","name":"catalog {i}","artist":"artist"}}"#)
+                })
+                .collect();
+            return format!(
+                r#"{{"subsonic-response":{{"status":"ok","albumList2":{{"album":[{}]}}}}}}"#,
+                page.join(",")
+            );
+        }
         if request_line.contains("/rest/getArtistInfo2") {
             return r#"{"subsonic-response":{"status":"ok","artistInfo2":{"biography":"mock bio"}}}"#
                 .to_string();
@@ -1348,6 +1481,72 @@ mod tests {
             "kept fetching after the receiver was dropped: {} requests",
             server.requests()
         );
+    }
+
+    #[test]
+    fn the_whole_album_catalog_comes_back_across_pages() {
+        let server = MockServer::start(0, 0, Duration::ZERO).with_catalog_albums(1_200);
+        let albums = server.client().all_albums().unwrap();
+        assert_eq!(albums.len(), 1_200);
+        assert_eq!(albums[0].id, "cat0-0");
+        assert_eq!(albums[1_199].id, "cat0-1199");
+        let distinct: std::collections::HashSet<&str> =
+            albums.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(distinct.len(), 1_200, "no page was fetched twice");
+        // page 0, then one wave of four: 500 + 500 + 200 is the whole
+        // catalog, and the two offsets past the end answer empty.
+        assert_eq!(server.requests(), 5);
+    }
+
+    #[test]
+    fn a_catalog_inside_one_page_is_a_single_request() {
+        let server = MockServer::start(0, 0, Duration::ZERO).with_catalog_albums(120);
+        assert_eq!(server.client().all_albums().unwrap().len(), 120);
+        assert_eq!(
+            server.requests(),
+            1,
+            "a library under one page must not pay for a wave"
+        );
+    }
+
+    /// Catalog pages are independent round trips at known offsets, so
+    /// they overlap; serial pagination cost one latency per page.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn album_pagination_timing_serial_vs_waved() {
+        const LATENCY: Duration = Duration::from_millis(120);
+        let server = MockServer::start(0, 0, LATENCY).with_catalog_albums(5_000);
+        let client = server.client();
+
+        let started = Instant::now();
+        let mut serial = 0usize;
+        let mut offset = 0usize;
+        loop {
+            let page = client.album_page(offset).unwrap();
+            let got = page.len();
+            serial += got;
+            if got < ALBUM_PAGE_SIZE {
+                break;
+            }
+            offset += ALBUM_PAGE_SIZE;
+        }
+        let serial_elapsed = started.elapsed();
+        let serial_requests = server.requests();
+
+        let server = MockServer::start(0, 0, LATENCY).with_catalog_albums(5_000);
+        let client = server.client();
+        let started = Instant::now();
+        let waved = client.all_albums().unwrap().len();
+        let waved_elapsed = started.elapsed();
+
+        eprintln!(
+            "5000 albums @ {LATENCY:?} latency:\n  \
+             serial: {serial} albums, {serial_requests} requests, {serial_elapsed:?}\n  \
+             waved:  {waved} albums, {} requests, {waved_elapsed:?}",
+            server.requests(),
+        );
+        assert_eq!(serial, waved);
+        assert!(waved_elapsed * 2 < serial_elapsed);
     }
 
     /// Serial-vs-parallel numbers for the artist page against the mock

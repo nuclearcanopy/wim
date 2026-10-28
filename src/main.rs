@@ -156,19 +156,11 @@ fn artist_tracks(
     // one getAlbum round-trip per album, done one at a time, was the
     // whole reason opening a prolific artist's profile felt so slow
     // (dozens of sequential network calls, each paying its own
-    // latency); they're entirely independent requests, so fetch them
-    // all in parallel instead. `Client` wraps a `ureq::Agent`, which
-    // is explicitly safe to share and use concurrently across
-    // threads for exactly this.
-    let details: Vec<Option<subsonic::AlbumDetails>> = thread::scope(|scope| {
-        artist_albums
-            .iter()
-            .map(|album| scope.spawn(|| client.get_album(&album.id).ok()))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|handle| handle.join().unwrap_or(None))
-            .collect()
-    });
+    // latency); they're independent requests, so they go through
+    // `album_details`'s bounded pool instead (a thread per album was
+    // a socket per album against a real navidrome instance).
+    let ids: Vec<&str> = artist_albums.iter().map(|a| a.id.as_str()).collect();
+    let details = client.album_details(&ids);
 
     let mut tracks = Vec::new();
     let mut albums = Vec::new();
