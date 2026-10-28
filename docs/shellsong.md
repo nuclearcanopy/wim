@@ -551,6 +551,48 @@ the event loop (all pure, all tested): the completion provider, the
 volume clamp and the fade/sleep ramps. `queues.rs` is the named-queue
 store behind `save_queue`/`load_queue`.
 
+### the api a host calls
+
+the whole surface, copied from the real signatures and pinned by a
+test that calls every one of these forms, so the list cannot drift
+without failing the build.
+
+```rust
+const OPEN_KEY: KeyCode                 // ':', also reserved in keymap
+
+Console::new() -> Console               // loads history + ranks; the only i/o
+Console::handle_key(&mut self, key: KeyEvent, cand: &dyn Candidates)
+    -> ConsoleAction                    // None | Close | Run(Box<Program>)
+Console::paste(&mut self, text: &str, cand: &dyn Candidates)
+Console::note(&mut self, text: impl Into<String>)
+Console::fail(&mut self, text: impl Into<String>)
+Console::push(&mut self, kind: LineKind, text: impl Into<String>)
+Console::history(&self) -> &[String]
+Console::cycle(&self) -> Option<&Cycle>
+// read by the overlay: input, cursor (byte index), lines, error,
+// suggestion.
+
+Program::parse(input: &str) -> Result<Program, ParseError>
+Program::step(&mut self, env: &Env) -> Step
+Program::is_done(&self) -> bool
+
+Op::describe(&self) -> String           // the one scrollback line (r9)
+Op::closes_console(&self) -> bool
+ViewTarget::is_screen(self) -> bool
+Kind::of(item: &SearchItem) -> Kind      // for Env::results
+help_lines() -> Vec<String>              // what view(help) prints
+
+trait Candidates {
+    fn corpus(&self, token: &str) -> Vec<String>;
+    fn saved_queues(&self) -> Vec<String> { Vec::new() }
+}
+```
+
+both `handle_key` and `paste` take the candidate provider because both
+edit the line and therefore have to recompute the suggestion; a paste
+that left a stale ghost up would be the same bug as a keystroke that
+did.
+
 ## pinned behaviours
 
 these were all ambiguous until the host was written, and a reader (or a
