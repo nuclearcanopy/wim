@@ -214,7 +214,7 @@ layout. the actual design:
       boost/treble boost/rock/classical), `e` cycles. applied via
       chained lavfi `equalizer` filters on mpv's `af` property. preset
       gain values are heuristic starting points, not acoustically
-      tuned; a "custom" user-editable preset is still open.
+      tuned.
 - [x] now-playing audio level meter (`src/ui/visualizer.rs`): a
       labeled `astats` lavfi tap on the af chain exposes RMS level via
       mpv's `af-metadata` property, rendered as a scrolling unicode-
@@ -600,7 +600,18 @@ run that edits these files will collide.
       died with it. one footgun recorded inline: pdeathsig fires on
       the parent *thread* exiting, so the spawn must stay on the main
       thread.
-- [ ] **custom user-editable eq preset** (noted long ago, still open).
+- [x] **custom user-editable eq presets.** the eq menu now saves the
+      live curve under a name ('s'), lists saved curves in their own
+      group next to the built-ins, loads one with enter, renames ('r')
+      and deletes ('d d', confirmed on a second press); overwriting an
+      existing name takes a second enter the same way. stored in
+      config.toml as `eq_custom_presets` (requested gains, never the
+      compensated ones) with a matching `eqCustomPresets` home-manager
+      option. the applied state is now three states rather than two:
+      a named curve, that curve nudged since ("modified"), or a
+      nameless one, tagged on the row that owns it. the ten gains are
+      drawn as a vertical-bar plot, since ten `+3.0 dB` strings do not
+      read as a curve.
 - [ ] **decompose main.rs** (~3.9k lines). a reviewed, ordered plan
       exists: extract focus/InputMode, then the playback free functions,
       then the sync/channel plumbing, then a `struct Ui` for the ~35
