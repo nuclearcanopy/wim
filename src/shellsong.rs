@@ -27,6 +27,10 @@ pub const OPEN_KEY: KeyCode = KeyCode::Char(':');
 /// giving up. Comfortably past the host's 300ms remote-search debounce
 /// plus a slow round trip; a wedged search subsystem reports instead of
 /// hanging the program forever.
+/// Backstop for a host whose searches never settle. Unreachable
+/// against the current one, which settles within 1.2s (and instantly
+/// with no indexed server), so this exists for a future host with a
+/// slower rule rather than for anything live today.
 const AWAIT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Upper bound on `repeat(n, ...)`; the expansion is static, so an
@@ -131,6 +135,17 @@ pub enum Level {
 /// What a term-taking command acts on. Omitting the terms means "the
 /// current selection", uniformly across every such command, which is
 /// what keeps one name to one meaning (docs/shellsong.md R11).
+///
+/// **Load-bearing host contract, do not break:** `Index` is an index
+/// into `Env::results`, and `App::resync_results` reorders that list
+/// every time a remote search outcome lands. The index is therefore
+/// only valid until the next frame boundary. It is safe solely because
+/// the host applies each `Step::Emit` synchronously before calling
+/// `step` again, so nothing can reorder the list between resolving an
+/// index and using it. A host that queued emitted ops to apply later,
+/// or stepped once per frame while holding a resolved index, would act
+/// on the wrong track intermittently. Surfaced by the wiring work;
+/// nothing enforces it at the type level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     /// index into `Env::results`, resolved by the executor from a term.
