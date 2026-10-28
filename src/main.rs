@@ -2719,15 +2719,6 @@ fn main() -> anyhow::Result<()> {
     // a side effect of some other key.
     let mut focus = Focus::Sidebar;
     let mut input_mode = InputMode::Interact;
-    // sidebar_selected/bottom_selected (below) stay bright for this
-    // long right after *leaving* move mode, then fall back to their
-    // normal dark level. during move mode itself they're bright the
-    // whole time, which is the real "where am I" answer; this is just
-    // the tail end of it, so the landing is still visible for a beat
-    // after the mode drops.
-    let mut focus_flash_until = Instant::now();
-    const FOCUS_FLASH_DURATION: Duration = Duration::from_millis(700);
-
     let mut favorites = favorites::load();
     // song ids this session knows are starred, across every configured
     // server; arrives with each background sync result and is kept
@@ -3198,31 +3189,21 @@ fn main() -> anyhow::Result<()> {
             let vdivider = cols[1];
             let main_content = cols[2];
 
-            // resize mode's own panel pick highlights these the same
-            // way it always has; a *permanent* highlight tied to
-            // plain navigation focus was tried and reverted earlier
-            // this session (it made the plain '│' segments a visibly
-            // different, permanently-DIM shade from the section-
-            // header junctions right next to them, which always
-            // stayed NEAR_BLACK). A brief pulse right when focus
-            // actually changes, decaying back to that same dark level
-            // within FOCUS_FLASH_DURATION, doesn't have that problem:
-            // it's indistinguishable from the resting state the rest
-            // of the time, but still answers "where am I" exactly
-            // when that's actually in question.
-            // bright for the whole time move mode is active (that's
-            // the point: you can see where the next move starts from
-            // before pressing anything), plus a short decaying tail
-            // after it drops so the landing stays visible for a beat.
-            let focus_lit = input_mode == InputMode::Move || Instant::now() < focus_flash_until;
-            let sidebar_selected = (panels.resize_mode
-                && panels.resize_selected == ResizePanel::Sidebar)
-                || (!panels.resize_mode
-                    && focus_lit
-                    && matches!(focus, Focus::Sidebar | Focus::Workspace));
-            let bottom_selected = (panels.resize_mode
-                && panels.resize_selected == ResizePanel::BottomBar)
-                || (!panels.resize_mode && focus_lit && focus == Focus::BottomBar);
+            // only resize mode highlights a divider, and only the one
+            // it has selected. highlighting on navigation focus was
+            // tried twice and is gone for good: these rules are made
+            // of plain '│' segments sitting right next to junction
+            // glyphs that stay NEAR_BLACK, so lifting the segments to
+            // DIM made one half of a continuous line a different
+            // shade from the other and read as damage rather than as
+            // emphasis. resize mode gets away with it because there
+            // you are acting on the divider itself. focus is answered
+            // instead by the bottom bar naming the pane outright and
+            // by the focused pane's own row pulsing.
+            let sidebar_selected =
+                panels.resize_mode && panels.resize_selected == ResizePanel::Sidebar;
+            let bottom_selected =
+                panels.resize_mode && panels.resize_selected == ResizePanel::BottomBar;
 
             // search box, one blank gap row, then the results list.
             // that gap row used to be a horizontal rule, which stacked
@@ -4210,7 +4191,6 @@ fn main() -> anyhow::Result<()> {
                 || (now_playing.is_some() && !player_minimized)
                 || scrub.is_some()
                 || input_mode == InputMode::Move
-                || Instant::now() < focus_flash_until
                 || flash.is_some_and(|(_, at)| at.elapsed() < FLASH_DURATION));
         let timeout = if animating {
             frame.interval()
@@ -4871,11 +4851,6 @@ fn main() -> anyhow::Result<()> {
                     match key.code {
                         KeyCode::Tab | KeyCode::Enter | KeyCode::Esc => {
                             input_mode = InputMode::Interact;
-                            // one last pulse on the pane just landed
-                            // in, so leaving move mode still answers
-                            // "where am I now" for a moment after the
-                            // permanent move-mode highlight drops.
-                            focus_flash_until = Instant::now() + FOCUS_FLASH_DURATION;
                         }
                         code => {
                             if let Some(dir) = focus_direction_key(code) {
