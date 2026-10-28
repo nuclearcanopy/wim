@@ -138,3 +138,13 @@ is `perf/art`'s lane. Flagged because it is the next bottleneck: a
 1080p frame into any pane is ~2.07M `get_pixel` calls on the render
 thread per frame. `perf/art`'s new O(output) rasterizer supersedes
 this; reconcile the two at merge.
+
+## parallel scoring floor (perf/search)
+
+`PARALLEL_SCORING_FLOOR` = 16_000 items before search fans out across
+threads, up from 2_000. Measured on 8 cores under load ~10, where
+sequential won at 4k for every query shape and at 8k for all but one;
+on an idle machine threads would likely win somewhat earlier. Chosen to
+avoid paying 0.4ms of spawn/join on small libraries, where the whole
+sequential search is ~2ms worst case. Re-run `bench_parallel_floor` to
+retune.
