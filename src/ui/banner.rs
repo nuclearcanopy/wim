@@ -8,6 +8,7 @@ use crate::anim;
 use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::theme::{lerp, shade, BRIGHT, DIM, NEAR_WHITE, WHITE};
 use crate::ui::logos::LOGOS;
+use crate::ui::textfit::width;
 
 /// `figlet -f "ANSI Shadow" WIM`; the same font LazyVim's own
 /// snacks.nvim dashboard header uses (confirmed against LazyVim's
@@ -160,12 +161,22 @@ impl Widget for Banner<'_> {
             .iter()
             .map(|(action, desc)| (key_label(self.keymap.get(*action)), *desc))
             .collect();
-        let key_width = menu.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
+        // padded by display width, by hand: `{key:<n$}` counts chars
+        // and `key.len()` counts bytes, and a key bound to a wide or
+        // multi-byte char is neither, which left the description
+        // column jagged for exactly the reason f5 once did.
+        let key_width = menu.iter().map(|(key, _)| width(key)).max().unwrap_or(0);
         let lines: Vec<String> = menu
             .iter()
-            .map(|(key, desc)| format!("{key:<key_width$}  {desc}"))
+            .map(|(key, desc)| {
+                let pad = " ".repeat(key_width - width(key));
+                format!("{key}{pad}  {desc}")
+            })
             .collect();
-        let block_width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+        // display width, not char count: a key bound to a wide char
+        // makes its row two cells wider than it counts, which would
+        // centre the whole block left by that overhang.
+        let block_width = lines.iter().map(|l| width(l)).max().unwrap_or(0) as u16;
         let block_start_x = area.x + area.width.saturating_sub(block_width) / 2;
         for (i, line) in lines.iter().enumerate() {
             draw_left(
@@ -181,12 +192,11 @@ impl Widget for Banner<'_> {
 }
 
 fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: ratatui::style::Color) {
-    if let Some(cell) = buf.cell_mut((x, y)) {
-        cell.set_char(ch);
-        cell.set_fg(color);
-    }
+    crate::ui::draw::put(buf, x, y, ch, color);
 }
 
+/// Menu rows only. The logo grid above keeps its own loop on purpose:
+/// it is figlet art, one cell per char by construction.
 fn draw_left(
     buf: &mut Buffer,
     area: Rect,
@@ -195,19 +205,18 @@ fn draw_left(
     text: &str,
     color: ratatui::style::Color,
 ) {
-    if y >= area.y + area.height {
+    if y < area.y || y >= area.y + area.height {
         return;
     }
-    for (i, ch) in text.chars().enumerate() {
-        let x = start_x + i as u16;
-        if x >= area.x + area.width {
-            break;
-        }
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_fg(color);
-        }
-    }
+    let right = area.x + area.width;
+    crate::ui::draw::at(
+        buf,
+        start_x,
+        y,
+        text,
+        color,
+        right.saturating_sub(start_x) as usize,
+    );
 }
 
 #[cfg(test)]
@@ -255,5 +264,109 @@ mod tests {
         let out = render_to_string(&keymap);
         assert!(out.contains("f5  quit"), "got:\n{out}");
         assert!(out.contains("/   search"), "got:\n{out}");
+    }
+
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
+
+    fn render(area: Rect, buf: &mut Buffer, keymap: &Keymap) {
+        Banner {
+            elapsed: Duration::ZERO,
+            logo_index: 0,
+            keymap,
+        }
+        .render(area, buf);
+    }
+
+    /// Whole-screen snapshot, logo included: the figlet grid keeps its
+    /// own one-cell-per-char loop on purpose, so this also pins that
+    /// nothing about it moved.
+    #[test]
+    fn the_default_banner_renders_logo_arrows_and_menu() {
+        let mut buf = buffer(44, 18);
+        render(Rect::new(0, 0, 44, 18), &mut buf, &Keymap::default());
+        assert_eq!(
+            grid(&buf),
+            [
+                "............................................",
+                "..........██╗....██╗██╗███╗...███╗..........",
+                "..........██║....██║██║████╗.████║..........",
+                "..........██║.█╗.██║██║██╔████╔██║..........",
+                "........<.██║███╗██║██║██║╚██╔╝██║.>........",
+                "..........╚███╔███╔╝██║██║.╚═╝.██║..........",
+                "...........╚══╝╚══╝.╚═╝╚═╝.....╚═╝..........",
+                "............................................",
+                "............................................",
+                ".........../  search........................",
+                "...........n  navidrome profiles............",
+                "...........S  starred songs.................",
+                "...........I  index breakdown...............",
+                "...........u  settings......................",
+                "...........?  help..........................",
+                "...........q  quit..........................",
+                "............................................",
+                "............................................",
+            ]
+            .join("\n")
+        );
+    }
+
+    /// The menu block is centred and left-aligned as one block, with
+    /// every row starting at the same column.
+    #[test]
+    fn the_menu_block_is_one_left_aligned_column() {
+        let mut buf = buffer(60, 24);
+        render(Rect::new(0, 0, 60, 24), &mut buf, &Keymap::default());
+        let g = grid(&buf);
+        let rows: Vec<&str> = g
+            .lines()
+            .filter(|r| MENU.iter().any(|(_, desc)| r.contains(desc)))
+            .collect();
+        assert_eq!(rows.len(), MENU.len(), "one row per menu item:\n{g}");
+        let first = rows[0].find(|c: char| c != '.').unwrap();
+        for row in &rows {
+            assert_eq!(
+                row.find(|c: char| c != '.'),
+                Some(first),
+                "menu rows are not aligned:\n{g}"
+            );
+        }
+    }
+
+    /// A key bound to a wide char is two cells; its row has to advance
+    /// by two, and the block has to stay centred by cells.
+    #[test]
+    fn a_wide_key_label_does_not_shift_its_own_description() {
+        let mut keymap = Keymap::default();
+        keymap.set(KeyAction::StartSearch, KeyCode::Char('日'));
+        let mut buf = buffer(60, 24);
+        render(Rect::new(0, 0, 60, 24), &mut buf, &keymap);
+        let g = grid(&buf);
+        let row = g.lines().find(|r| r.contains("search")).unwrap();
+        let col = row.find('日').expect("the wide key");
+        // the wide glyph owns the cell after it, then the two-space
+        // gutter, then the description.
+        assert_eq!(row.chars().nth(col + 1), Some(' '), "{row}");
+        assert_eq!(
+            &row[row.char_indices().nth(col + 2).unwrap().0..][..8],
+            "  search"
+        );
+    }
+
+    #[test]
+    fn the_menu_stays_inside_the_rect() {
+        let mut buf = buffer(60, 30);
+        let area = Rect::new(4, 2, 50, 26);
+        let mut keymap = Keymap::default();
+        keymap.set(KeyAction::StartSearch, KeyCode::Char('日'));
+        render(area, &mut buf, &keymap);
+        assert_outside_untouched(&buf, area);
+    }
+
+    #[test]
+    fn degenerate_sizes_do_not_panic() {
+        for (w, h) in [(1, 1), (1, 40), (2, 1), (40, 0), (0, 0), (3, 2), (26, 4)] {
+            let mut buf = buffer(w.max(1), h.max(1));
+            render(Rect::new(0, 0, w, h), &mut buf, &Keymap::default());
+        }
     }
 }
