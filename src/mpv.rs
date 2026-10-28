@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -150,6 +151,7 @@ struct Pending {
 /// matches how mpv is normally driven by external controllers.
 pub struct Mpv {
     child: Child,
+    sock_path: PathBuf,
     sock: Mutex<UnixStream>,
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, Pending>>>,
@@ -189,9 +191,20 @@ fn reap_with_parent(cmd: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 fn reap_with_parent(_cmd: &mut Command) {}
 
+/// Distinguishes two `Mpv`s spawned by the same process. The app only
+/// ever spawns one, but naming the socket by pid alone meant a second
+/// spawn deleted the first one's socket and both mpvs then answered on
+/// the same path, which is two hours of a test suite hanging on replies
+/// from the wrong process.
+static SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
+
 impl Mpv {
     pub fn spawn() -> Result<Self> {
-        let sock_path = std::env::temp_dir().join(format!("wim-mpv-{}.sock", std::process::id()));
+        let sock_path = std::env::temp_dir().join(format!(
+            "wim-mpv-{}-{}.sock",
+            std::process::id(),
+            SPAWN_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
         let _ = std::fs::remove_file(&sock_path);
 
         let mut cmd = Command::new("mpv");
@@ -301,6 +314,7 @@ impl Mpv {
 
         Ok(Mpv {
             child,
+            sock_path,
             sock: Mutex::new(sock),
             next_id: AtomicU64::new(1),
             pending,
@@ -671,9 +685,10 @@ impl Drop for Mpv {
     fn drop(&mut self) {
         let _ = self.command(&[json!("quit")]);
         let _ = self.child.wait();
+        // mpv does not unlink it on exit, so every run left one behind.
+        let _ = std::fs::remove_file(&self.sock_path);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
