@@ -428,6 +428,21 @@ impl Corpus {
     /// order so nucleo alone would miss it). An item counts as a match if
     /// *either* signal fires, so a typo never silently returns nothing.
     pub fn search(&self, query: &str) -> Vec<SearchItem> {
+        let scored = self.score_all(query);
+        rank(scored)
+    }
+
+    /// Phase one of `search`: every item that either signal fired on,
+    /// with its score, in corpus order. Split out from the ranking so
+    /// the two can be benchmarked separately.
+    fn score_all(&self, query: &str) -> Vec<(u32, &SearchItem)> {
+        self.score_all_maybe_parallel(query, self.items.len() >= PARALLEL_SCORING_FLOOR)
+    }
+
+    /// `score_all` with the fan-out decision forced, so a benchmark can
+    /// measure the per-item cost single-threaded (immune to whatever
+    /// else is loading the machine) as well as end to end.
+    fn score_all_maybe_parallel(&self, query: &str, parallel: bool) -> Vec<(u32, &SearchItem)> {
         if query.trim().is_empty() {
             return Vec::new();
         }
@@ -436,7 +451,7 @@ impl Corpus {
         let query_len = query_lower.chars().count();
         let typo_budget = edit_distance_budget(query_len);
 
-        let mut scored: Vec<(u32, &SearchItem)> = if self.items.len() >= PARALLEL_SCORING_FLOOR {
+        if parallel {
             // chunks are joined back in corpus order, so the stable
             // sort below still breaks ties exactly as it does
             // single-threaded; each thread needs its own scratch.
@@ -474,57 +489,62 @@ impl Corpus {
                 typo_budget,
                 &mut scratch,
             )
-        };
-
-        scored.sort_by_key(|a| std::cmp::Reverse(a.0));
-
-        // relative score cutoff: nucleo's own subsequence matcher will
-        // happily return *some* nonzero score for almost any haystack
-        // against a short query (e.g. "crest" is a valid, if scattered,
-        // subsequence of "Cigarettes After Sex"), and with no floor at
-        // all every one of those sparse, low-quality matches rendered
-        // right alongside a genuine exact title hit. Anything scoring
-        // under `WEAK_MATCH_CUTOFF_FRACTION` of the *best* match in
-        // this search is almost certainly that kind of noise rather
-        // than something the user meant, so drop it. This is
-        // self-limiting rather than needing a separate "don't leave it
-        // empty" guard: the top result's score always clears its own
-        // threshold, so the list can never be pruned to nothing, and
-        // when every candidate is in the same (even if low) ballpark
-        // (no single standout match), they're all close enough to the
-        // top score to clear the cutoff together, so weak guesses
-        // still show exactly when there's nothing better on offer.
-        if let Some(&(top_score, _)) = scored.first() {
-            let threshold = (top_score as f64 * WEAK_MATCH_CUTOFF_FRACTION).round() as u32;
-            scored.retain(|(s, _)| *s >= threshold);
         }
-
-        // group same-category items together (section headers in the
-        // results list), but order the groups themselves by each
-        // one's single best match rather than a fixed kind ordering:
-        // the first item of a category in this already best-first
-        // list *is* that category's best score, so the order
-        // categories are first seen in is already "best match leads".
-        // searching "bladee" with a 100% artist match still puts
-        // Artists first even though a song titled "Rewind feat.
-        // Bladee" might outscore the rest of that artist's own songs.
-        let mut group_order: Vec<Category> = Vec::new();
-        for (_, item) in &scored {
-            let cat = item.category();
-            if !group_order.contains(&cat) {
-                group_order.push(cat);
-            }
-        }
-        group_order
-            .into_iter()
-            .flat_map(|cat| {
-                scored
-                    .iter()
-                    .filter(move |(_, item)| item.category() == cat)
-                    .map(|(_, item)| (*item).clone())
-            })
-            .collect()
     }
+}
+
+/// Phase two of `search`: sort, cut weak matches, group by category,
+/// materialize. Takes the scored candidates in corpus order, which the
+/// stable sort relies on for tie-breaking.
+fn rank(mut scored: Vec<(u32, &SearchItem)>) -> Vec<SearchItem> {
+    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
+
+    // relative score cutoff: nucleo's own subsequence matcher will
+    // happily return *some* nonzero score for almost any haystack
+    // against a short query (e.g. "crest" is a valid, if scattered,
+    // subsequence of "Cigarettes After Sex"), and with no floor at
+    // all every one of those sparse, low-quality matches rendered
+    // right alongside a genuine exact title hit. Anything scoring
+    // under `WEAK_MATCH_CUTOFF_FRACTION` of the *best* match in
+    // this search is almost certainly that kind of noise rather
+    // than something the user meant, so drop it. This is
+    // self-limiting rather than needing a separate "don't leave it
+    // empty" guard: the top result's score always clears its own
+    // threshold, so the list can never be pruned to nothing, and
+    // when every candidate is in the same (even if low) ballpark
+    // (no single standout match), they're all close enough to the
+    // top score to clear the cutoff together, so weak guesses
+    // still show exactly when there's nothing better on offer.
+    if let Some(&(top_score, _)) = scored.first() {
+        let threshold = (top_score as f64 * WEAK_MATCH_CUTOFF_FRACTION).round() as u32;
+        scored.retain(|(s, _)| *s >= threshold);
+    }
+
+    // group same-category items together (section headers in the
+    // results list), but order the groups themselves by each
+    // one's single best match rather than a fixed kind ordering:
+    // the first item of a category in this already best-first
+    // list *is* that category's best score, so the order
+    // categories are first seen in is already "best match leads".
+    // searching "bladee" with a 100% artist match still puts
+    // Artists first even though a song titled "Rewind feat.
+    // Bladee" might outscore the rest of that artist's own songs.
+    let mut group_order: Vec<Category> = Vec::new();
+    for (_, item) in &scored {
+        let cat = item.category();
+        if !group_order.contains(&cat) {
+            group_order.push(cat);
+        }
+    }
+    group_order
+        .into_iter()
+        .flat_map(|cat| {
+            scored
+                .iter()
+                .filter(move |(_, item)| item.category() == cat)
+                .map(|(_, item)| (*item).clone())
+        })
+        .collect()
 }
 
 /// Scores one slice of the corpus against `pattern`, reusing a single
@@ -934,31 +954,509 @@ mod tests {
         c
     }
 
+    /// Second synthetic corpus, same generator shape but a *wide*
+    /// vocabulary and all five item kinds, so match counts and word
+    /// shapes look like a real 40k library rather than 12 artists
+    /// repeated 3000 times each. `synthetic_corpus` is the worst case
+    /// for result-set size; this one is the realistic case.
+    fn varied_corpus(n: usize) -> Corpus {
+        const WORDS: [&str; 48] = [
+            "blade", "runner", "blues", "cold", "visions", "crest", "icedancer", "eversince",
+            "obedient", "rewind", "decay", "drownin", "sunset", "mall", "western", "union",
+            "hotel", "breakfast", "into", "dust", "tears", "joy", "paranoid", "blackout",
+            "selected", "ambient", "works", "music", "right", "children", "lift", "skinny",
+            "fists", "college", "dropout", "justice", "metal", "essentials", "midnight", "city",
+            "velvet", "mirror", "static", "garden", "ghost", "parade", "winter", "signal",
+        ];
+        // deterministic lcg; a real library's vocabulary is wide and
+        // its distribution lumpy, and a fixed stride would correlate
+        // every field of an item with every other.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |m: usize| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % m
+        };
+        let mut words = move |k: usize| {
+            (0..k)
+                .map(|_| WORDS[next(WORDS.len())])
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let client = test_client();
+        let mut c = Corpus::new();
+        // same mix a real library has: mostly songs, then albums,
+        // artists, a few playlists and videos.
+        let songs = n * 80 / 100;
+        let albums = n * 12 / 100;
+        let artists = n * 6 / 100;
+        c.add_local_tracks((0..songs / 2).map(|i| LocalTrack {
+            path: PathBuf::from(format!("/music/{i:06}.flac")),
+            title: words(2),
+            artist: Some(words(2)),
+            album: Some(words(2)),
+            duration_secs: None,
+            kind: MediaKind::Music,
+        }));
+        c.add_local_tracks((0..n / 100).map(|i| LocalTrack {
+            path: PathBuf::from(format!("/video/{i:06}.mkv")),
+            title: words(3),
+            artist: None,
+            album: None,
+            kind: MediaKind::Video,
+            duration_secs: None,
+        }));
+        c.add_subsonic_search_result(
+            SubsonicSearchResult {
+                artists: (0..artists)
+                    .map(|i| Artist {
+                        id: format!("ar{i}"),
+                        name: words(2),
+                    })
+                    .collect(),
+                albums: (0..albums)
+                    .map(|i| Album {
+                        id: format!("al{i}"),
+                        name: words(2),
+                        artist: words(2),
+                    })
+                    .collect(),
+                songs: (0..songs / 2)
+                    .map(|i| Song {
+                        id: format!("s{i}"),
+                        title: words(2),
+                        artist: words(2),
+                        album: words(2),
+                        duration: None,
+                        genres: Vec::new(),
+                    })
+                    .collect(),
+            },
+            &client,
+        );
+        c.add_playlists(
+            (0..n / 200).map(|i| Playlist {
+                id: format!("p{i}"),
+                name: words(2),
+            }),
+            &client,
+        );
+        c
+    }
+
+    /// Every query shape the correctness guards sweep: short/broad
+    /// prefixes, exact hits, multi-word, typos, no-match, mixed case,
+    /// non-ascii, and the characters nucleo's own pattern parser
+    /// treats as operators (`^ $ ! ' \ |`), which any prefilter must
+    /// not assume are literal haystack text.
+    const GUARD_QUERIES: [&str; 29] = [
+        "b",
+        "bl",
+        "bla",
+        "blad",
+        "blade",
+        "bladee",
+        "blade runner",
+        "blade runner blues",
+        "cold visions",
+        "crest",
+        "icedancer",
+        "obedient",
+        "ob",
+        "obe",
+        "god",
+        "gods",
+        "brainm",
+        "brainmi",
+        "brainmir",
+        "qqqxzz",
+        "BLADE",
+        "Blade Runner",
+        "mIdNiGhT",
+        "^blade",
+        "blade$",
+        "'blade",
+        "!blade",
+        "blade|runner",
+        "blàdé",
+    ];
+
+    /// Order-and-membership fingerprint of a result list: fnv-1a over
+    /// every item's identity in order. Pinned per query by
+    /// `search_results_are_unchanged`, so any reordering, addition or
+    /// removal shows up as a failure rather than as a "faster" search.
+    fn fingerprint(items: &[SearchItem]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut eat = |bytes: &[u8]| {
+            for b in bytes {
+                hash ^= u64::from(*b);
+                hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        for item in items {
+            let (tag, key) = item.identity();
+            eat(&[tag]);
+            eat(key.as_bytes());
+            eat(b"\x1f");
+        }
+        hash
+    }
+
+    /// `(query, result count, fingerprint)` for `varied_corpus(3_000)`,
+    /// blessed from the pre-optimization implementation. Any change to
+    /// what search returns, or to the order it returns it in, breaks
+    /// this; reranking is a product decision, so re-blessing has to be
+    /// deliberate. Regenerate by running the test and pasting the table
+    /// it prints.
+    #[rustfmt::skip]
+    const PINNED: [(&str, usize, u64); 29] = [
+        ("b", 1094, 0xb7e9_d075_2c60_f452),
+        ("bl", 867, 0xba5b_70fc_7a23_c14b),
+        ("bla", 717, 0x2eda_b913_f7b3_caf4),
+        ("blad", 501, 0xf650_49a4_b2d9_cccf),
+        ("blade", 447, 0x162c_be8f_180a_1ccd),
+        ("bladee", 271, 0xebb4_3859_f29c_f61c),
+        ("blade runner", 45, 0x6ca9_aefc_081d_eb25),
+        ("blade runner blues", 17, 0xce83_cec8_ffab_bee6),
+        ("cold visions", 72, 0xad50_0026_04f9_a4a2),
+        ("crest", 460, 0x7bc1_6525_b793_7c6d),
+        ("icedancer", 333, 0x0ee3_890c_975c_e108),
+        ("obedient", 315, 0xdfad_bcd4_8e6c_8b68),
+        ("ob", 315, 0xdfad_bcd4_8e6c_8b68),
+        ("obe", 316, 0xb7fa_9087_3781_aa47),
+        ("god", 211, 0xde03_7bfb_b2cc_a968),
+        ("gods", 82, 0xddec_aa68_23ad_5921),
+        ("brainm", 30, 0xce74_4cdb_c837_b406),
+        ("brainmi", 27, 0x2e81_9569_db6b_55c3),
+        ("brainmir", 12, 0xf9e9_71d8_1237_8cc6),
+        ("qqqxzz", 0, 0xcbf2_9ce4_8422_2325),
+        ("BLADE", 307, 0xf8a9_24ad_cde1_23c5),
+        ("Blade Runner", 0, 0xcbf2_9ce4_8422_2325),
+        ("mIdNiGhT", 354, 0x304c_09f0_ed6e_ea13),
+        ("^blade", 63, 0x27a1_0f63_2322_5e0b),
+        ("blade$", 68, 0x3877_9407_b137_8259),
+        ("'blade", 307, 0xf8a9_24ad_cde1_23c5),
+        ("!blade", 307, 0xf8a9_24ad_cde1_23c5),
+        ("blade|runner", 0, 0xcbf2_9ce4_8422_2325),
+        ("bl\u{e0}d\u{e9}", 0, 0xcbf2_9ce4_8422_2325),
+    ];
+
+    /// Membership and order are the product; speed is not allowed to
+    /// change either. See `PINNED`.
+    #[test]
+    fn search_results_are_unchanged() {
+        let c = varied_corpus(3_000);
+        let actual: Vec<(&str, usize, u64)> = GUARD_QUERIES
+            .iter()
+            .map(|q| {
+                let r = c.search(q);
+                (*q, r.len(), fingerprint(&r))
+            })
+            .collect();
+        if actual.as_slice() != PINNED.as_slice() {
+            let table: String = actual
+                .iter()
+                .map(|(q, n, h)| {
+                    let (a, b, c, d) = (h >> 48, (h >> 32) & 0xffff, (h >> 16) & 0xffff, h & 0xffff);
+                    format!("        ({q:?}, {n}, 0x{a:04x}_{b:04x}_{c:04x}_{d:04x}),\n")
+                })
+                .collect();
+            panic!("search results changed; fresh table:\n{table}");
+        }
+    }
+
+    /// The pre-optimization scorer, kept verbatim as the oracle every
+    /// prefilter and fast path has to agree with: no char-mask
+    /// prefilters, always the full `strsim` distance. Deliberately
+    /// naive; `scorers_agree_on_every_query_shape` compares the real
+    /// hot path against it item by item.
+    fn reference_score(
+        entry: &Entry,
+        pattern: &Pattern,
+        query_lower: &str,
+        query_len: usize,
+        typo_budget: usize,
+        matcher: &mut Matcher,
+    ) -> Option<u32> {
+        let mut buf = Vec::new();
+        let fuzzy_score = pattern.score(Utf32Str::new(&entry.haystack, &mut buf), matcher);
+        let typo_score_val = if fuzzy_score.is_some_and(|s| s >= typo_score(0)) {
+            None
+        } else {
+            entry
+                .haystack_lower
+                .split_whitespace()
+                .filter(|word| word.chars().count().abs_diff(query_len) <= typo_budget)
+                .map(|word| strsim::damerau_levenshtein(query_lower, word))
+                .filter(|&dist| dist <= typo_budget)
+                .map(typo_score)
+                .max()
+        };
+        match (fuzzy_score, typo_score_val) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0).max(b.unwrap_or(0))),
+        }
+    }
+
+    /// The real hot path must score every item exactly as the naive
+    /// reference does: same match/no-match decision, same score. This
+    /// is the guard that catches a prefilter that rejects something it
+    /// should have kept (verified by deliberately breaking one).
+    #[test]
+    fn scorers_agree_on_every_query_shape() {
+        let c = varied_corpus(4_000);
+        let mut matcher = Matcher::default();
+        for query in GUARD_QUERIES {
+            let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+            let query_lower = query.to_lowercase();
+            let query_len = query_lower.chars().count();
+            let budget = edit_distance_budget(query_len);
+            let mut scratch = Scratch::default();
+            let fast = score_chunk(
+                &c.items,
+                &pattern,
+                &query_lower,
+                query_len,
+                budget,
+                &mut scratch,
+            );
+            let expected: Vec<(u32, &SearchItem)> = c
+                .items
+                .iter()
+                .filter_map(|e| {
+                    reference_score(
+                        e,
+                        &pattern,
+                        &query_lower,
+                        query_len,
+                        budget,
+                        &mut matcher,
+                    )
+                    .map(|s| (s, &e.item))
+                })
+                .collect();
+            assert_eq!(
+                fast.len(),
+                expected.len(),
+                "{query:?}: candidate count differs from the reference scorer"
+            );
+            for (i, ((fs, fi), (es, ei))) in fast.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(
+                    (fs, fi.identity()),
+                    (es, ei.identity()),
+                    "{query:?}: candidate {i} differs from the reference scorer"
+                );
+            }
+        }
+    }
+
+    /// Fanning the scoring out across threads must not change a single
+    /// result: chunks are rejoined in corpus order precisely so the
+    /// stable sort breaks ties the same way at any thread count.
+    #[test]
+    fn threaded_and_sequential_scoring_agree() {
+        let c = varied_corpus(5_000);
+        assert!(c.items.len() >= PARALLEL_SCORING_FLOOR);
+        for query in GUARD_QUERIES {
+            let par = rank(c.score_all_maybe_parallel(query, true));
+            let seq = rank(c.score_all_maybe_parallel(query, false));
+            assert_eq!(
+                fingerprint(&par),
+                fingerprint(&seq),
+                "{query:?}: threaded scoring changed the result list"
+            );
+        }
+    }
+
+    /// Appending a character can *add* candidates, so a type-ahead
+    /// optimization must not narrow the previous result set: the typo
+    /// fallback's budget grows with query length, and a longer query
+    /// can land inside a word's edit distance that a shorter one
+    /// missed. Pinned as a test because the "just narrow the previous
+    /// hits" shortcut is otherwise extremely tempting; see
+    /// docs/search-performance.md.
+    #[test]
+    fn appending_a_char_can_add_candidates() {
+        let mut c = Corpus::new();
+        c.add_subsonic_search_result(
+            SubsonicSearchResult {
+                artists: vec![Artist {
+                    id: "a1".into(),
+                    name: "Branimir".into(),
+                }],
+                albums: vec![],
+                songs: vec![],
+            },
+            &test_client(),
+        );
+        // "brainm" is 3 edits from "branimir" (budget 1 at that
+        // length), "brainmir" is 1 (budget 2): the superset is the
+        // longer query, not the shorter one.
+        assert!(
+            c.search("brainm").is_empty(),
+            "precondition: the shorter query must miss"
+        );
+        assert!(
+            !c.search("brainmir").is_empty(),
+            "appending chars turned a miss into a hit; narrowing the \
+             previous result set would have lost this match"
+        );
+    }
+
+    /// Minimum of `iters` runs, plus the last run's value. The *minimum*
+    /// rather than the mean on purpose: this machine's other cores are
+    /// not idle during a bench run (parallel builds), and only the
+    /// minimum is close to the uncontended cost.
+    fn bench<T>(iters: u32, mut f: impl FnMut() -> T) -> (std::time::Duration, T) {
+        let mut best = std::time::Duration::MAX;
+        let mut last = f();
+        for _ in 0..iters {
+            let start = std::time::Instant::now();
+            last = f();
+            best = best.min(start.elapsed());
+        }
+        (best, last)
+    }
+
+    const BENCH_QUERIES: [&str; 7] = [
+        "b",
+        "bla",
+        "blade",
+        "bladee",
+        "blade runner",
+        "brainmir",
+        "qqqxzz",
+    ];
+
     /// Not an assertion: prints per-query wall time, since absolute
     /// numbers are machine-dependent. Run with
     /// `cargo test --release -- --ignored --nocapture bench_search`.
     /// "b" is the worst case for match count, "brainmir" for the
-    /// edit-distance fallback.
+    /// edit-distance fallback, "qqqxzz" for pure rejection cost.
     #[test]
     #[ignore = "timing benchmark, run manually"]
     fn bench_search() {
-        for size in [10_000usize, 100_000] {
-            let c = synthetic_corpus(size);
-            for query in ["b", "bla", "blade", "blade runner", "brainmir"] {
-                let iters: u32 = if size >= 100_000 { 5 } else { 20 };
-                let mut hits = 0usize;
-                let start = std::time::Instant::now();
-                for _ in 0..iters {
-                    hits += c.search(query).len();
-                }
-                let per = start.elapsed() / iters;
+        for (label, c) in [
+            ("narrow-vocab 40k", synthetic_corpus(40_000)),
+            ("varied 40k", varied_corpus(40_000)),
+            ("varied 150k", varied_corpus(150_000)),
+        ] {
+            for query in BENCH_QUERIES {
+                let (per, hits) = bench(12, || c.search(query).len());
+                println!("{label:<18} {query:<14} {per:>12.3?}  ({hits} hits)");
+            }
+        }
+    }
+
+    /// Where the time goes: scoring (fanned out, and forced
+    /// single-threaded so the number is noise-immune) vs ranking
+    /// (sort + weak-match cutoff + grouping + materializing).
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_phases() {
+        for (label, c) in [
+            ("narrow-vocab 40k", synthetic_corpus(40_000)),
+            ("varied 40k", varied_corpus(40_000)),
+        ] {
+            for query in BENCH_QUERIES {
+                let (par, cand) = bench(12, || c.score_all(query).len());
+                let (seq, _) = bench(6, || c.score_all_maybe_parallel(query, false).len());
+                let (rank_t, out) = bench(12, || rank(c.score_all(query)).len());
                 println!(
-                    "{size:>7} items  {:<14} {per:>12.3?}  ({} hits)",
-                    query,
-                    hits / iters as usize
+                    "{label:<18} {query:<14} score {par:>10.3?} (1 thread {seq:>10.3?})  \
+                     +rank {:>10.3?}   cand {cand:>6} out {out:>6}",
+                    rank_t.saturating_sub(par),
                 );
             }
         }
+    }
+
+    /// The shape that actually matters: one keystroke at a time, each
+    /// re-searching with one more char. Prints the per-keystroke cost
+    /// (min over replays of the whole sequence).
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_typeahead() {
+        for (label, c) in [
+            ("narrow-vocab 40k", synthetic_corpus(40_000)),
+            ("varied 40k", varied_corpus(40_000)),
+        ] {
+            for typed in ["bladee", "blade runner", "qqqxzz"] {
+                let chars: Vec<char> = typed.chars().collect();
+                let mut best = vec![std::time::Duration::MAX; chars.len()];
+                let mut hits = vec![0usize; chars.len()];
+                for _ in 0..6 {
+                    for (i, _) in chars.iter().enumerate() {
+                        let prefix: String = chars[..=i].iter().collect();
+                        let start = std::time::Instant::now();
+                        let out = c.search(&prefix);
+                        best[i] = best[i].min(start.elapsed());
+                        hits[i] = out.len();
+                    }
+                }
+                let total: std::time::Duration = best.iter().sum();
+                println!("{label:<18} typing {typed:?}: total {total:>10.3?}");
+                for (i, t) in best.iter().enumerate() {
+                    let prefix: String = chars[..=i].iter().collect();
+                    println!("    {:<14} {t:>10.3?}  ({} hits)", prefix, hits[i]);
+                }
+            }
+        }
+    }
+
+    /// Throwaway probe: is the *candidate* set (pre-cutoff) monotone
+    /// shrinking as a query grows by one char? Prints counterexamples.
+    #[test]
+    #[ignore = "diagnostic probe, run manually"]
+    fn probe_monotonicity() {
+        let c = synthetic_corpus(20_000);
+        let words = [
+            "blade runner blues",
+            "bladee",
+            "brainmir",
+            "branimir stulic",
+            "cigarettes",
+            "icedancer",
+            "selena gomez",
+            "godspeed",
+            "obedient",
+            "zzyzx",
+            "lesna",
+            "crest",
+            "music has the right",
+        ];
+        let mut breaks = 0usize;
+        for w in words {
+            let chars: Vec<char> = w.chars().collect();
+            for len in 1..chars.len() {
+                let short: String = chars[..len].iter().collect();
+                let long: String = chars[..len + 1].iter().collect();
+                let a: HashSet<(u8, String)> = c
+                    .score_all(&short)
+                    .into_iter()
+                    .map(|(_, i)| {
+                        let (t, k) = i.identity();
+                        (t, k.into_owned())
+                    })
+                    .collect();
+                let mut escaped = Vec::new();
+                for (_, item) in c.score_all(&long) {
+                    let (t, k) = item.identity();
+                    let key = (t, k.into_owned());
+                    if !a.contains(&key) {
+                        escaped.push((key, item.haystack()));
+                    }
+                }
+                if !escaped.is_empty() {
+                    breaks += 1;
+                    println!(
+                        "NOT MONOTONE: {short:?} -> {long:?}: {} new candidates, e.g. {:?}",
+                        escaped.len(),
+                        &escaped[..escaped.len().min(3)]
+                    );
+                }
+            }
+        }
+        println!("{breaks} non-monotone steps");
     }
 
     /// Mirror of the above: when nothing in the corpus is a strong
