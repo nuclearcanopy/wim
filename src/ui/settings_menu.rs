@@ -90,25 +90,98 @@ impl Widget for SettingsMenu<'_> {
 }
 
 fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
-    if y >= area.y + area.height {
-        return;
-    }
-    for (col, ch) in text.chars().enumerate() {
-        let x = area.x + col as u16;
-        if x >= area.x + area.width {
-            break;
-        }
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_fg(color);
-        }
-    }
+    crate::ui::draw::line(buf, area, y, text, color);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::testbuf::{buffer, char_at, grid};
     use crossterm::event::KeyCode;
+
+    fn render(area: Rect, buf: &mut Buffer, values: [&str; FIELD_COUNT]) {
+        SettingsMenu {
+            values,
+            selected: 0,
+            keymap: &Keymap::default(),
+        }
+        .render(area, buf);
+    }
+
+    #[test]
+    fn every_field_gets_a_row_with_its_value_in_an_aligned_column() {
+        let area = Rect::new(0, 0, 80, 14);
+        let mut buf = buffer(80, 14);
+        render(
+            area,
+            &mut buf,
+            ["on", "off", "3", "7", "30", "50", "240", "set"],
+        );
+        assert_eq!(
+            grid(&buf),
+            [
+                "settings │ u or esc to close....................................................",
+                "─────────┴──────────────────────────────────────────────────────────────────────",
+                "................................................................................",
+                "> album art                   on................................................",
+                "  crossfade                   off...............................................",
+                "  crossfade seconds           3.................................................",
+                "  cache after days played     7.................................................",
+                "  cache eviction days         30................................................",
+                "  scrobble % threshold        50................................................",
+                "  scrobble seconds threshold  240...............................................",
+                "  listenbrainz token          set...............................................",
+                "................................................................................",
+                "j/k select, h/l adjust, enter on 'listenbrainz token' to set/change it..........",
+                "other settings: '?' keybinds, 't' subtitles, left/right on the home screen logo.",
+            ]
+            .join("\n")
+        );
+    }
+
+    /// `values` is the user's own config (a listenbrainz token, a path
+    /// label); a wide char in one must not shove the rest of its row.
+    #[test]
+    fn a_wide_value_does_not_shift_the_glyphs_after_it() {
+        let area = Rect::new(0, 0, 60, 14);
+        let mut buf = buffer(60, 14);
+        render(area, &mut buf, ["日本x", "", "", "", "", "", "", ""]);
+        let row = grid(&buf).lines().nth(3).unwrap().to_string();
+        let col = row.find('日').expect("the wide value");
+        // two cells each, so 'x' lands four columns on, not two.
+        assert_eq!(row.chars().nth(col + 1), Some(' '), "{row}");
+        assert_eq!(row.chars().nth(col + 2), Some('本'), "{row}");
+        assert_eq!(row.chars().nth(col + 4), Some('x'), "{row}");
+    }
+
+    #[test]
+    fn a_wide_value_stays_inside_the_rect() {
+        let mut buf = buffer(40, 14);
+        let area = Rect::new(2, 1, 24, 11);
+        let long = "日本語テスト曲日本語テスト曲日本語テスト曲";
+        render(area, &mut buf, [long; FIELD_COUNT]);
+        for y in 0..14u16 {
+            for x in 0..40u16 {
+                let inside = x >= 2 && x < 26 && y >= 1 && y < 12;
+                if !inside {
+                    assert_eq!(
+                        char_at(&buf, x, y),
+                        '.',
+                        "wrote outside its rect at ({x}, {y}):\n{}",
+                        grid(&buf)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn degenerate_sizes_do_not_panic() {
+        for (w, h) in [(1, 1), (1, 40), (2, 1), (40, 0), (0, 0), (3, 2)] {
+            let mut buf = buffer(w.max(1), h.max(1));
+            render(Rect::new(0, 0, w, h), &mut buf, ["日本語"; FIELD_COUNT]);
+        }
+    }
 
     #[test]
     fn the_hints_follow_the_live_keymap_but_keep_the_fixed_keys() {
