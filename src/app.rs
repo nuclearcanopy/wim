@@ -196,7 +196,7 @@ impl App {
             }
             KeyCode::Char('g') => {
                 if self.pending == Some('g') {
-                    self.selected = 0;
+                    self.select_top();
                     self.pending = None;
                 } else {
                     self.pending = Some('g');
@@ -204,7 +204,7 @@ impl App {
                 return Action::None;
             }
             KeyCode::Char('G') => {
-                self.selected = self.results.len().saturating_sub(1);
+                self.select_bottom();
                 return Action::None;
             }
             KeyCode::Enter => {
@@ -247,7 +247,11 @@ impl App {
         Action::None
     }
 
-    fn move_selection(&mut self, delta: isize) {
+    /// The three selection primitives j/k and gg/G go through, public
+    /// so shellsong's `up()`/`down()`/`top()`/`bottom()` move the
+    /// selection by the exact same mutation the keyboard does rather
+    /// than a second copy of the clamping.
+    pub fn move_selection(&mut self, delta: isize) {
         if self.results.is_empty() {
             self.selected = 0;
             return;
@@ -255,6 +259,23 @@ impl App {
         let len = self.results.len() as isize;
         let new = (self.selected as isize + delta).clamp(0, len - 1);
         self.selected = new as usize;
+    }
+
+    pub fn select_top(&mut self) {
+        self.selected = 0;
+    }
+
+    pub fn select_bottom(&mut self) {
+        self.selected = self.results.len().saturating_sub(1);
+    }
+
+    /// Replaces the query wholesale and re-filters, exactly as typing
+    /// it would; backs `shellsong`'s `search(...)`. The caller still
+    /// has to kick the debounced remote search (`notify_query_changed`),
+    /// same as every other path that changes the query.
+    pub fn set_query(&mut self, query: &str) {
+        self.query = query.to_string();
+        self.refresh_results();
     }
 
     /// Re-filters for a query the user just changed, which genuinely
