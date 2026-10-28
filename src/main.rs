@@ -811,6 +811,125 @@ fn go_to_previous(
     status
 }
 
+/// Where enter (or a click) on the scrubber opens its drag: at the
+/// current position, which is the only place a key could mean, or at a
+/// fraction of the duration, which is where a pointer landed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ScrubAt {
+    Position,
+    Fraction(f64),
+}
+
+/// Everything activating a transport control can touch, bundled into
+/// one argument the way `ActionCtx` is and for the same reason.
+struct TransportCtx<'a> {
+    cfg: &'a config::Config,
+    player: &'a mpv::Mpv,
+    app: &'a mut app::App,
+    notifications: &'a mut Notifications,
+    play_queue: &'a mut PlayQueue,
+    cache_index: &'a Arc<Mutex<CacheIndex>>,
+    flash: &'a mut Option<(Field, Instant)>,
+    eq_menu_open: &'a mut bool,
+    eq_menu_selected: &'a mut usize,
+    eq_menu: &'a mut ui::eq_menu::EqMenuState,
+    crossfade_enabled: &'a mut bool,
+    fade_in_started_at: &'a mut Option<Instant>,
+    base_volume: f64,
+    scrub: &'a mut Option<Scrub>,
+    scrub_pending: &'a mut bool,
+    scrub_sent_at: &'a mut Option<Instant>,
+    /// mpv's last reported position and duration, sampled once per
+    /// frame by the loop rather than asked for again here.
+    elapsed_secs: Option<f64>,
+    duration_secs: Option<f64>,
+}
+
+/// The one place a transport control is acted on. Enter on the bottom
+/// bar, enter on the maximized player and a mouse click all land here,
+/// so the three can never drift into doing different things to the
+/// same glyph; `controlsbar::Field` is the whole alphabet.
+fn activate_transport(field: Field, at: ScrubAt, ctx: &mut TransportCtx) {
+    match field {
+        Field::Pause => match ctx.player.toggle_pause() {
+            Ok(()) => *ctx.flash = Some((Field::Pause, Instant::now())),
+            Err(e) => ctx
+                .notifications
+                .push(Severity::Error, format!("error pausing: {e}")),
+        },
+        Field::Loop => {
+            let mode = ctx.app.cycle_loop();
+            let mpv_loop = if mode == LoopMode::One { "inf" } else { "no" };
+            match ctx.player.set_loop_file(mpv_loop) {
+                Ok(()) => *ctx.flash = Some((Field::Loop, Instant::now())),
+                Err(e) => ctx
+                    .notifications
+                    .push(Severity::Error, format!("error setting loop: {e}")),
+            }
+        }
+        Field::Shuffle => {
+            // same semantics as the 's' key
+            // (`Action::ShuffleToggled`):
+            // turning it on reshuffles what's
+            // upcoming, turning it off leaves
+            // the order alone.
+            let mut msg = String::new();
+            if ctx.app.toggle_shuffle() {
+                let shuffled = ctx.play_queue.shuffled_upcoming();
+                msg = resync_upcoming(ctx.player, ctx.cache_index, ctx.play_queue, shuffled);
+            }
+            if msg.starts_with("error") {
+                ctx.notifications.push(Severity::Error, msg);
+            } else {
+                *ctx.flash = Some((Field::Shuffle, Instant::now()));
+            }
+        }
+        Field::Speed => {
+            let speed = ctx.app.bump_speed(1.0);
+            match ctx.player.set_speed(speed) {
+                Ok(()) => *ctx.flash = Some((Field::Speed, Instant::now())),
+                Err(e) => ctx
+                    .notifications
+                    .push(Severity::Error, format!("error setting speed: {e}")),
+            }
+        }
+        Field::Eq => {
+            *ctx.eq_menu_open = true;
+            *ctx.eq_menu = ui::eq_menu::EqMenuState::default();
+            *ctx.eq_menu_selected =
+                ui::eq_menu::opening_selection(ctx.app.eq_source, ctx.cfg.eq_custom_presets.len());
+        }
+        Field::Crossfade => {
+            *ctx.crossfade_enabled = !*ctx.crossfade_enabled;
+            if !*ctx.crossfade_enabled {
+                *ctx.fade_in_started_at = None;
+                let _ = ctx.player.set_volume(ctx.base_volume);
+            }
+            *ctx.flash = Some((Field::Crossfade, Instant::now()));
+        }
+        Field::Progress => {
+            // duration is captured here, once, so each step can clamp
+            // without asking mpv again; nothing loaded means nothing
+            // to scrub, so the drag just doesn't open.
+            if let Some(elapsed) = ctx.elapsed_secs {
+                let open = Scrub {
+                    target_secs: elapsed,
+                    duration_secs: ctx.duration_secs,
+                };
+                // opening where it already is has nothing to seek to;
+                // opening where a pointer landed does, so only that
+                // one leaves a target for the coalescer to send.
+                *ctx.scrub = Some(match at {
+                    ScrubAt::Position => open,
+                    ScrubAt::Fraction(frac) => open.at_fraction(frac),
+                });
+                *ctx.scrub_pending = matches!(at, ScrubAt::Fraction(_));
+                *ctx.scrub_sent_at = None;
+            }
+        }
+    }
+}
+
 /// What the main loop should do once an action has been handled.
 /// `Action::Quit` has to break that loop, which a called function
 /// can't do for its caller, so it reports back instead.
@@ -5601,89 +5720,31 @@ fn main() -> anyhow::Result<()> {
                         }
                         Some(Nav::Inert) => continue,
                         Some(Nav::Activate) => {
-                            match *cursor {
-                                Field::Pause => match player.toggle_pause() {
-                                    Ok(()) => flash = Some((Field::Pause, Instant::now())),
-                                    Err(e) => notifications
-                                        .push(Severity::Error, format!("error pausing: {e}")),
+                            let field = *cursor;
+                            activate_transport(
+                                field,
+                                ScrubAt::Position,
+                                &mut TransportCtx {
+                                    cfg: &cfg,
+                                    player: &player,
+                                    app: &mut app,
+                                    notifications: &mut notifications,
+                                    play_queue: &mut play_queue,
+                                    cache_index: &cache_index,
+                                    flash: &mut flash,
+                                    eq_menu_open: &mut eq_menu_open,
+                                    eq_menu_selected: &mut eq_menu_selected,
+                                    eq_menu: &mut eq_menu,
+                                    crossfade_enabled: &mut crossfade_enabled,
+                                    fade_in_started_at: &mut fade_in_started_at,
+                                    base_volume,
+                                    scrub: &mut scrub,
+                                    scrub_pending: &mut scrub_pending,
+                                    scrub_sent_at: &mut scrub_sent_at,
+                                    elapsed_secs: playback.elapsed_secs,
+                                    duration_secs: playback.duration_secs,
                                 },
-                                Field::Loop => {
-                                    let mode = app.cycle_loop();
-                                    let mpv_loop = if mode == LoopMode::One { "inf" } else { "no" };
-                                    match player.set_loop_file(mpv_loop) {
-                                        Ok(()) => flash = Some((Field::Loop, Instant::now())),
-                                        Err(e) => notifications.push(
-                                            Severity::Error,
-                                            format!("error setting loop: {e}"),
-                                        ),
-                                    }
-                                }
-                                Field::Shuffle => {
-                                    // same semantics as the 's' key
-                                    // (`Action::ShuffleToggled`):
-                                    // turning it on reshuffles what's
-                                    // upcoming, turning it off leaves
-                                    // the order alone.
-                                    let mut msg = String::new();
-                                    if app.toggle_shuffle() {
-                                        let shuffled = play_queue.shuffled_upcoming();
-                                        msg = resync_upcoming(
-                                            &player,
-                                            &cache_index,
-                                            &mut play_queue,
-                                            shuffled,
-                                        );
-                                    }
-                                    if msg.starts_with("error") {
-                                        notifications.push(Severity::Error, msg);
-                                    } else {
-                                        flash = Some((Field::Shuffle, Instant::now()));
-                                    }
-                                }
-                                Field::Speed => {
-                                    let speed = app.bump_speed(1.0);
-                                    match player.set_speed(speed) {
-                                        Ok(()) => flash = Some((Field::Speed, Instant::now())),
-                                        Err(e) => notifications.push(
-                                            Severity::Error,
-                                            format!("error setting speed: {e}"),
-                                        ),
-                                    }
-                                }
-                                Field::Eq => {
-                                    eq_menu_open = true;
-                                    eq_menu = ui::eq_menu::EqMenuState::default();
-                                    eq_menu_selected = ui::eq_menu::opening_selection(
-                                        app.eq_source,
-                                        cfg.eq_custom_presets.len(),
-                                    );
-                                }
-                                Field::Crossfade => {
-                                    crossfade_enabled = !crossfade_enabled;
-                                    if !crossfade_enabled {
-                                        fade_in_started_at = None;
-                                        let _ = player.set_volume(base_volume);
-                                    }
-                                    flash = Some((Field::Crossfade, Instant::now()));
-                                }
-                                Field::Progress => {
-                                    // duration is captured here, once,
-                                    // so each arrow key can clamp
-                                    // without asking mpv again; nothing
-                                    // loaded means nothing to scrub, so
-                                    // the drag just doesn't open.
-                                    let (elapsed, duration) =
-                                        (playback.elapsed_secs, playback.duration_secs);
-                                    if let Some(at) = elapsed {
-                                        scrub = Some(Scrub {
-                                            target_secs: at,
-                                            duration_secs: duration,
-                                        });
-                                        scrub_pending = false;
-                                        scrub_sent_at = None;
-                                    }
-                                }
-                            }
+                            );
                             continue;
                         }
                         None => {}
