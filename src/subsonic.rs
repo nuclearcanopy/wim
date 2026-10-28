@@ -541,6 +541,22 @@ impl Client {
         Ok(albums)
     }
 
+    /// `getTopSongs`: the artist's most-played tracks per last.fm,
+    /// resolved by the server to tracks it actually has, ranked
+    /// most-popular-first. Keyed by artist *name*, not id, because
+    /// that is what the endpoint takes. Powers the "famous track by an
+    /// artist you love that you have never played" suggestion, which
+    /// plain play-coverage can't rank on its own.
+    pub fn get_top_songs(&self, artist_name: &str, count: usize) -> anyhow::Result<Vec<Song>> {
+        let v = self.get(
+            "getTopSongs",
+            &[("artist", artist_name), ("count", &count.to_string())],
+        )?;
+        Ok(parse_song_array(
+            v.get("topSongs").and_then(|t| t.get("song")),
+        ))
+    }
+
     /// Chronological, not whatever order `getArtist` returned
     /// (alphabetical); unknown-year albums sort last rather than first.
     fn artist_albums_chronological(&self, artist_id: &str) -> anyhow::Result<Vec<ArtistAlbum>> {
@@ -1182,6 +1198,21 @@ mod tests {
         assert_eq!(songs[0].genres, vec!["Metal"]);
         assert!(songs[1].genres.is_empty());
         assert!(songs[2].genres.is_empty(), "empty tags are not a genre");
+    }
+
+    #[test]
+    fn parses_top_songs_in_the_servers_popularity_order() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"topSongs": {"song": [
+                {"id": "s1", "title": "Be Nice 2 Me", "artist": "Bladee", "album": "Eversince", "genre": "Cloud Rap"},
+                {"id": "s2", "title": "Obedient", "artist": "Bladee", "album": "Eversince"}
+            ]}}"#,
+        )
+        .unwrap();
+        let songs = parse_song_array(v.get("topSongs").and_then(|t| t.get("song")));
+        let titles: Vec<&str> = songs.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, vec!["Be Nice 2 Me", "Obedient"]);
+        assert_eq!(songs[0].genres, vec!["Cloud Rap"]);
     }
 
     #[test]
