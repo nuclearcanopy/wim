@@ -3045,6 +3045,13 @@ fn main() -> anyhow::Result<()> {
     // channel can never be reused.
     let (scan_tx, mut scan_rx) = mpsc::channel::<library::ScanBatch>();
     library::spawn_scan(cfg.library_paths.clone(), scan_tx);
+    // every configured server's catalog as of its last session, read
+    // straight off the disk so the first frame has a full library
+    // rather than "connecting to navidrome..."; started here so the
+    // read overlaps mpv's spawn below, taken where `app` is built.
+    // the background sync reconciles it against what each server
+    // really has. see `search::spawn_warm_from_cache`.
+    let warming_corpus = search::spawn_warm_from_cache(&cfg.navidrome_servers);
 
     let player = mpv::Mpv::spawn()?;
     trace::mark("mpv spawned");
@@ -3060,11 +3067,7 @@ fn main() -> anyhow::Result<()> {
     // (universal navigation primitives, applied the same way
     // everywhere rather than individually named commands).
     let mut keymap = Keymap::from_overrides(&cfg.keybinds);
-    // every configured server's catalog as of its last session, read
-    // straight off the disk so the first frame has a full library;
-    // the background sync below reconciles it against what each
-    // server really has. see `Corpus::warm_from_cache`.
-    let mut app = app::App::new(search::Corpus::warm_from_cache(&cfg.navidrome_servers));
+    let mut app = app::App::new(warming_corpus.take());
     // so the first frame says "scanning" rather than "no local music
     // found"; cleared when the scan thread drops its sender. the
     // server equivalent is set below.
