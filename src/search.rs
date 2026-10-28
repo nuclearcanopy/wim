@@ -348,8 +348,6 @@ impl Corpus {
     /// access for things that aren't a keyword search at all; the
     /// suggestion engine builds its catalog off this (see
     /// `suggest::Catalog::ingest_corpus`).
-    // drop the allow once the suggestions menu is wired up.
-    #[allow(dead_code)]
     pub fn items(&self) -> impl Iterator<Item = &SearchItem> {
         self.items.iter().map(|e| &e.item)
     }

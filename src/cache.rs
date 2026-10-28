@@ -186,8 +186,6 @@ impl CacheIndex {
     /// above answer one question each; the suggestion engine needs
     /// frequency, distinct days, and recency together for every track
     /// it scores, so it reads the record instead of three lookups.
-    // read by `suggest`; drop the allow once the menu is wired up.
-    #[allow(dead_code)]
     pub fn entry(&self, id: &str) -> Option<&CacheEntry> {
         self.entries.get(id)
     }

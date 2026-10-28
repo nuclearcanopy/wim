@@ -90,8 +90,6 @@ pub struct Song {
     /// `genre` string and a multi-valued `genres` array; see
     /// `parse_genres`. The only genre source the suggestion engine
     /// has, so it is as good as the server's tags and no better.
-    // read by `suggest`; drop the allow once the menu is wired up.
-    #[allow(dead_code)]
     pub genres: Vec<String>,
 }
 
@@ -152,8 +150,6 @@ pub struct ArtistInfo {
     /// doesn't have in the library come back with no usable id (or
     /// `"-1"`), so consumers match on `name` and intersect against
     /// what is actually indexed rather than trusting the id.
-    // read by `suggest`; drop the allow once the menu is wired up.
-    #[allow(dead_code)]
     pub similar_artists: Vec<Artist>,
 }
 
