@@ -2327,8 +2327,14 @@ fn main() -> anyhow::Result<()> {
             // rule above it, same reasoning as every other junction
             // this session: two lines meant to meet don't, unless
             // something tells them to.
-            const HELP_BOX_WIDTH: u16 = 10;
-            let help_box_x = bottom.x + bottom.width.saturating_sub(HELP_BOX_WIDTH);
+            // sized from the resolved label, since a rebound help key
+            // can be wider than any constant guessed here.
+            let help_label = format!(
+                "{} help",
+                keymap::key_label(keymap.get(KeyAction::OpenHelp))
+            );
+            let help_box_width = ui::helpbox::width_for(&help_label).min(bottom.width);
+            let help_box_x = bottom.x + bottom.width.saturating_sub(help_box_width);
             f.render_widget(
                 HorizontalRule {
                     highlighted: bottom_selected,
@@ -2648,22 +2654,17 @@ fn main() -> anyhow::Result<()> {
                 },
                 Rect {
                     y: bottom.y + 1,
-                    width: bottom.width.saturating_sub(HELP_BOX_WIDTH),
+                    width: bottom.width.saturating_sub(help_box_width),
                     height: bottom.height.saturating_sub(1),
                     ..bottom
                 },
             );
             f.render_widget(
-                ui::helpbox::HelpBox {
-                    label: &format!(
-                        "{} help",
-                        keymap::key_label(keymap.get(KeyAction::OpenHelp))
-                    ),
-                },
+                ui::helpbox::HelpBox { label: &help_label },
                 Rect {
                     x: help_box_x,
                     y: bottom.y + 1,
-                    width: HELP_BOX_WIDTH,
+                    width: help_box_width,
                     height: bottom.height.saturating_sub(1),
                 },
             );

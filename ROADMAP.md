@@ -513,19 +513,25 @@ run that edits these files will collide.
       typing wide characters no longer parks the block inside the last
       glyph.
 - [ ] **migrate the remaining chrome widgets to `ui::draw`**: eq_menu,
-      keybinds_menu, settings_menu, subtitle_menu, helpbox, help,
-      nav_manager, login, onboarding, banner's menu row. all draw
+      keybinds_menu, settings_menu, subtitle_menu, nav_manager, login,
+      onboarding, banner's menu row. (helpbox done, help still has its
+      own `draw_line`.) all draw
       static mostly-ascii labels, so they are correctness-neutral
       today; worth doing for the dedup and so a translated or
       user-supplied string cannot reintroduce the bug. `banner.rs`'s
       logo grid is deliberately excluded (figlet art, one cell per
       char by construction).
-- [ ] **`help.rs` still mislabels four remappable actions as fixed**:
-      `Key::Fixed("[ / ]")` and `Key::Fixed(", / .")` cover SpeedUp/
-      SpeedDown and SubtitleDelayUp/Down, which are rebindable, so
-      those two rows go stale after a remap.
-- [ ] **`HELP_BOX_WIDTH` is 10**, so a help key rebound to `space`
-      renders clipped ("space hel"). widen it or shorten the label.
+- [x] **help.rs no longer mislabels remappable actions as fixed.** new
+      `Key::Pair(a, b)` renders two rebindable actions as one row from
+      the live keymap, so the speed and subtitle-delay rows follow a
+      remap instead of showing the baked-in `[ / ]` and `, / .`
+      forever. spelling a pair as `Fixed` is exactly how the text got
+      frozen, so the variant exists to make that mistake unavailable.
+- [x] **the help box sizes itself from its label.** `helpbox::width_for`
+      replaces the hardcoded 10 columns, which fit "? help" and cut
+      "space help" to "space hel" the moment the help key was rebound
+      to anything longer than one character. also centres on display
+      width through `ui::draw` rather than char count.
 - [ ] **mpv survives an unclean wim exit.** `PR_SET_PDEATHSIG` would
       close it with the parent; `Mpv::spawn` also passes no
       `--no-config`, so a user mpv.conf silently alters playback.
