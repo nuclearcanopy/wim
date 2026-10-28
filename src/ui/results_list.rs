@@ -70,6 +70,24 @@ pub fn header_rows(items: &[SearchItem], selected: usize, area: Rect) -> Vec<u16
         .collect()
 }
 
+/// Item index per visible row of `area`, `None` where `render` drew a
+/// section header or ran out of list. Same `layout` call the render
+/// itself uses, so a click resolves to the row the user saw rather
+/// than to a second guess at where it landed (see `hit::List`).
+pub fn row_items(items: &[SearchItem], selected: usize, area: Rect) -> Vec<Option<usize>> {
+    if items.is_empty() || area.height == 0 {
+        return Vec::new();
+    }
+    let visible_rows = area.height as usize;
+    let (rows, scroll_offset) = layout(items, selected, visible_rows);
+    (0..visible_rows)
+        .map(|row| match rows.get(scroll_offset + row) {
+            Some(DisplayRow::Item(idx)) => Some(*idx),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Plain ASCII, not unicode pictographs: even nominally "geometric,
 /// not emoji" symbols (e.g. the bullseye tried earlier for albums)
 /// can still be flagged emoji-presentation in some fonts/terminals, or
@@ -310,6 +328,66 @@ mod tests {
     /// Row 0 is the category header `layout` inserts, so the items
     /// start at row 1.
     const FIRST_ITEM_ROW: u16 = 1;
+
+    /// The row map a click resolves against has to name the rows the
+    /// render painted, including at a scroll offset and across the
+    /// headers `layout` interleaves.
+    #[test]
+    fn the_recorded_row_map_matches_the_rows_that_were_drawn() {
+        let all = items(40);
+        for (height, selected) in [(5u16, 0usize), (5, 39), (12, 20), (40, 3)] {
+            let area = Rect::new(2, 3, 24, height);
+            let mut buf = buffer(area.x + area.width, area.y + area.height);
+            ResultsList {
+                items: &all,
+                selected,
+                empty_message: "",
+                favorites: &Favorites::default(),
+                remote_starred: &HashSet::new(),
+                focused: true,
+                elapsed: Duration::ZERO,
+            }
+            .render(area, &mut buf);
+
+            let map = row_items(&all, selected, area);
+            assert_eq!(map.len(), height as usize);
+            assert!(
+                map.contains(&Some(selected)),
+                "the selection has to be on screen: {map:?}"
+            );
+            for (row, idx) in map.iter().enumerate() {
+                let y = area.y + row as u16;
+                let text: String = (area.x..area.x + area.width)
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .unwrap()
+                            .symbol()
+                            .chars()
+                            .next()
+                            .unwrap_or(' ')
+                    })
+                    .collect();
+                match idx {
+                    Some(i) => assert!(
+                        text.contains(&format!("track {i}")),
+                        "row {row} maps to {i} but reads {text:?}"
+                    ),
+                    // a header, or past the end: either way nothing a
+                    // selection may move to.
+                    None => assert!(
+                        !text.contains("track "),
+                        "row {row} maps to nothing but reads {text:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_or_flat_list_has_no_rows_to_click() {
+        assert!(row_items(&[], 0, Rect::new(0, 0, 20, 5)).is_empty());
+        assert!(row_items(&items(3), 0, Rect::new(0, 0, 20, 0)).is_empty());
+    }
 
     #[test]
     fn the_selected_row_carries_a_background_across_its_full_width() {

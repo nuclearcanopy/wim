@@ -3,6 +3,23 @@ use ratatui::layout::Rect;
 
 use crate::ui::textfit::truncate_with_ellipsis;
 
+/// Rows `draw_header` occupies: the title line and its rule. The
+/// widgets it heads need that number outside their own render too (to
+/// name the rect their rows landed in, for the host's hit map), and
+/// `draw_header`'s return value is only ever visible inside one.
+pub const ROWS: u16 = 2;
+
+/// The rows below a header, which is where a headed widget draws its
+/// body. Checked against `draw_header`'s own return value in the tests
+/// below, so the constant cannot drift from the drawing.
+pub fn body(area: Rect) -> Rect {
+    Rect {
+        y: area.y + ROWS,
+        height: area.height.saturating_sub(ROWS),
+        ..area
+    }
+}
+
 /// Draws a "title │ instructions" header line followed by a horizontal
 /// rule with a T-junction (┬) directly below the │ separator, so the
 /// divider molds around the actual text instead of being a generic
@@ -78,4 +95,46 @@ pub fn draw_header(
     }
 
     rule_y + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::{shade, DIM, NEAR_BLACK};
+    use crate::ui::testbuf::buffer;
+
+    /// `ROWS` and `body` are the constant form of what `draw_header`
+    /// returns; a header that grew a row would otherwise leave every
+    /// hit-tested list a row out.
+    #[test]
+    fn the_body_starts_where_draw_header_says_the_next_free_row_is() {
+        for area in [
+            Rect::new(0, 0, 40, 10),
+            Rect::new(3, 7, 40, 10),
+            Rect::new(0, 0, 8, 10),
+        ] {
+            let mut buf = buffer(area.x + area.width, area.y + area.height);
+            let next = draw_header(
+                &mut buf,
+                area,
+                area.y,
+                "a title",
+                "some keys",
+                shade(DIM),
+                shade(NEAR_BLACK),
+            );
+            assert_eq!(next, area.y + ROWS, "{area:?}");
+            let body = body(area);
+            assert_eq!(body.y, next, "{area:?}");
+            assert_eq!(body.y + body.height, area.y + area.height, "{area:?}");
+        }
+    }
+
+    #[test]
+    fn a_pane_shorter_than_the_header_has_no_body() {
+        for height in 0..=ROWS {
+            let body = body(Rect::new(0, 5, 40, height));
+            assert_eq!(body.height, 0, "height {height}");
+        }
+    }
 }
