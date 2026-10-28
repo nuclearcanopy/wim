@@ -67,6 +67,13 @@ library paths, or manage the same file declaratively via the
 home-manager module instead. `library_paths` defaults to `~/Music` and
 `~/Videos` (whichever exist) when left empty.
 
+`mouse = true` (the default) captures the mouse: click a pane to focus
+it, click a row to select it, click a control on the bottom bar, drag
+the scrubber to seek, wheel over any list to scroll it. capture takes
+the terminal's own click-drag text selection away from the terminal;
+hold `shift` while dragging to get it back (works in most terminals),
+or set `mouse = false` to give it back for good.
+
 ## keybindings
 
 press `?` in the app for the full list. it resolves every key from the

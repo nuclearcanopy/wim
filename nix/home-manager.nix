@@ -295,6 +295,19 @@ in
         itself is kept). Also tweakable in the settings menu.
       '';
     };
+
+    mouse = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Click to focus a pane or press a bottom-bar control, drag the
+        scrubber to seek, wheel to scroll whichever list is under the
+        pointer. On by default. Mouse capture takes over the
+        terminal's own click-drag text selection; most terminals still
+        let you hold shift to select and copy normally, and setting
+        this false gives selection back unconditionally.
+      '';
+    };
   };
 
   config = mkIf cfg.enable {
@@ -344,6 +357,7 @@ in
       bottom_bar_height = cfg.bottomBarHeight;
       cache_days_threshold = cfg.cacheDaysThreshold;
       cache_eviction_days = cfg.cacheEvictionDays;
+      mouse = cfg.mouse;
       scrobble = {
         threshold_percent = cfg.scrobble.thresholdPercent;
         threshold_seconds = cfg.scrobble.thresholdSeconds;
