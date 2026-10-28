@@ -294,8 +294,47 @@ fetches the host owns:
   `EnrichmentCache::add_top_songs`: enables `PopularUnplayed`.
 
 `suggest::enrichment_targets` returns which artists are worth fetching,
-top-affinity first, so the host does not have to guess; `EnrichmentCache`
-remembers what has already been fetched (`needs_similar`,
-`needs_top_songs`), including the negative answer. nothing blocks:
-whatever has not arrived yet simply means those two generators do not
-fire this time.
+top-affinity first, and `suggest::album_targets` the albums, so the host
+does not have to guess; `EnrichmentCache` remembers what has already
+been fetched (`needs_similar`, `needs_top_songs`), including the
+negative answer. nothing blocks: whatever has not arrived yet simply
+means those two generators do not fire this time.
+
+### what the host actually does
+
+`main.rs`'s `spawn_background_enrichment` is the fetcher, shaped like
+`spawn_background_sync` and `spawn_background_search`: jobs out over one
+channel, answers back over another, no network call anywhere near the
+render or input path. the main thread picks the targets (it owns the
+catalog and the play history) and folds each answer back in, then
+re-runs the engine **once per batch of arrivals**, never per frame.
+
+the work is bounded by construction rather than by a timer:
+
+- one job is in flight at a time, and the next is only picked once the
+  last reported `JobDone`, so one keypress costs one job.
+- a job is at most `ENRICH_ARTIST_TARGETS` (8) artists, which is
+  `similar_seed_artists` plus headroom for the ranking shifting, times
+  at most two calls each, and `ENRICH_ALBUMS_PER_JOB` (12) albums.
+- `album_targets` only offers albums the user has actually played
+  something from and whose tracklist is still unknown. that is the real
+  bound on a large library: the rest is `AlbumGap`'s job and needs no
+  fetch at all.
+- warming happens only while the menu is open. these are network calls
+  for one feature; nobody who never presses `R` should pay for them.
+
+`EnrichmentCache` persists to `~/.cache/wim/enrichment.toml` (cache dir,
+not state: reconstructable server output, same reasoning as `cache.rs`),
+so the two artist-level generators are warm from the first open of the
+next session. the album tracklists are deliberately *not* persisted;
+they are bulky, they are re-derivable in a bounded number of calls, and
+the host instead keeps one long-lived `Catalog` across menu opens so a
+session never re-fetches what it already has. an album is asked about at
+most once per session either way, which is what stops a failed fetch (or
+a compilation whose songs are credited to a different artist than the
+album is) from being retried in a loop.
+
+while a job is in flight the menu titles itself "N so far" rather than
+"N" (`ui::suggestions::SuggestionsView::enriching`), because a thin list
+that looks final is worse than a thin list that says it is still
+filling.
