@@ -3,6 +3,12 @@
 //! the single most-emphasized requirement in the spec; searching "bla"
 //! should surface matching artists, albums, songs, playlists, and local
 //! files together, ranked by actual relevance, not just substring hits.
+//!
+//! This runs on every keystroke over the whole library, so the hot
+//! path carries several exact short circuits plus a load-bearing
+//! reason *not* to narrow the previous result set; read
+//! docs/search-performance.md before adding a short circuit, a cache,
+//! or a cap here.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
