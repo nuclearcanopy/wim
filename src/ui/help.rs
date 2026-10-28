@@ -65,6 +65,7 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Bound(KeyAction::OpenNavManager), "navidrome profiles"),
             (Key::Bound(KeyAction::OpenStarredView), "starred songs"),
             (Key::Bound(KeyAction::OpenQueueView), "the queue"),
+            (Key::Bound(KeyAction::OpenSuggestions), "suggestions"),
             (Key::Bound(KeyAction::IndexBreakdown), "index breakdown"),
             (Key::Bound(KeyAction::ToggleStar), "star / unstar"),
             (

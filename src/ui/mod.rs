@@ -26,6 +26,7 @@ pub mod searchbox;
 pub mod settings_menu;
 pub mod shellsong;
 pub mod subtitle_menu;
+pub mod suggestions;
 #[cfg(test)]
 pub mod testbuf;
 pub mod textfit;
