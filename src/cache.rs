@@ -149,14 +149,15 @@ impl ServerCatalog {
     }
 }
 
-/// First line of a catalog file. `key` is stored in full so a digest
-/// collision in the filename can never serve one server's catalog as
-/// another's, and `sum` lets a sync whose catalog hasn't changed skip
-/// rewriting the whole file.
+/// First line of a catalog file. `id` is a second, independently
+/// salted digest of the server key, so a digest collision in the
+/// filename still can't serve one server's catalog as another's
+/// without putting the url or username in the file; `sum` lets a sync
+/// whose catalog hasn't changed skip rewriting the whole thing.
 #[derive(Debug, Serialize, Deserialize)]
 struct CatalogHeader {
     v: u32,
-    key: String,
+    id: String,
     sum: String,
     at: u64,
 }
@@ -207,6 +208,14 @@ fn catalog_path(dir: &Path, key: &str) -> PathBuf {
     dir.join(format!("{}.ndjson", digest_hex(key)))
 }
 
+/// The header's own check digest. Salted differently from the
+/// filename's so the two can't collide together, and a digest rather
+/// than the key itself because a cache file has no business holding a
+/// server url and username in cleartext.
+fn catalog_id(key: &str) -> String {
+    digest_hex(&format!("wim-catalog-id\n{key}"))
+}
+
 /// The body half of a catalog file, one json row per line. Artists
 /// first, then albums, then playlists; the order is just the write
 /// order, nothing reading it depends on it.
@@ -248,7 +257,9 @@ fn stored_sum(path: &Path) -> Option<String> {
 }
 
 /// Persists one server's catalog under the XDG cache dir; see
-/// `save_catalog_in` for what the write itself guarantees.
+/// `save_catalog_in` for what the write itself guarantees. Nothing
+/// identifying goes in the file: no url, no username, and obviously no
+/// password, just the library rows and a check digest.
 pub fn save_catalog(
     client: &Client,
     artists: &[Artist],
@@ -320,7 +331,7 @@ fn save_catalog_in(
     restrict_dir_to_owner(dir)?;
     let header = serde_json::to_string(&CatalogHeader {
         v: CATALOG_FORMAT,
-        key: key.to_string(),
+        id: catalog_id(key),
         sum,
         at: now_secs(),
     })?;
@@ -335,7 +346,7 @@ fn load_catalog_in(dir: &Path, key: &str) -> Option<ServerCatalog> {
     let raw = fs::read_to_string(catalog_path(dir, key)).ok()?;
     let mut lines = raw.lines();
     let header: CatalogHeader = serde_json::from_str(lines.next()?).ok()?;
-    if header.v != CATALOG_FORMAT || header.key != key {
+    if header.v != CATALOG_FORMAT || header.id != catalog_id(key) {
         return None;
     }
     let mut catalog = ServerCatalog::default();
@@ -831,7 +842,11 @@ mod tests {
 
         let path = catalog_path(&dir, "a@https://one.invalid");
         let raw = fs::read_to_string(&path).unwrap();
-        let tampered = raw.replacen("a@https://one.invalid", "b@https://two.invalid", 1);
+        let tampered = raw.replacen(
+            &catalog_id("a@https://one.invalid"),
+            &catalog_id("b@https://two.invalid"),
+            1,
+        );
         fs::write(&path, tampered).unwrap();
         assert!(
             load_catalog_in(&dir, "a@https://one.invalid").is_none(),
@@ -845,7 +860,7 @@ mod tests {
         let dir = scratch_dir("version");
         fs::write(
             catalog_path(&dir, "k"),
-            "{\"v\":0,\"key\":\"k\",\"sum\":\"x\",\"at\":1}\n{\"k\":\"artist\",\"id\":\"a\",\"name\":\"n\"}\n",
+            "{\"v\":0,\"id\":\"x\",\"sum\":\"x\",\"at\":1}\n{\"k\":\"artist\",\"id\":\"a\",\"name\":\"n\"}\n",
         )
         .unwrap();
         assert!(load_catalog_in(&dir, "k").is_none());
