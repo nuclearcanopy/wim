@@ -70,6 +70,21 @@ pub fn fetch_plan(item: &SearchItem) -> Option<(Key, String)> {
     }
 }
 
+/// A stable string naming whatever cover belongs to `item`, for
+/// deciding when a cached `ratatui-image` protocol has gone stale.
+/// Same album means same cover means no rebuild.
+pub fn art_key(item: &SearchItem) -> String {
+    match fetch_plan(item) {
+        Some((Key::Album { artist, album }, _)) => format!("a:{artist}\u{1}{album}"),
+        // a track with no album to group under, or no fetchable cover
+        // at all, is its own key.
+        _ => {
+            let (kind, id) = item.identity();
+            format!("t:{kind}:{id}")
+        }
+    }
+}
+
 struct Fetched {
     key: Key,
     image: Option<DynamicImage>,
@@ -306,5 +321,37 @@ mod tests {
             .unwrap();
         assert!(cache.poll());
         assert!(cache.get(&song("1", "Bladee", "Crest")).is_some());
+    }
+
+    #[test]
+    fn art_key_is_shared_across_an_albums_tracks() {
+        assert_eq!(
+            art_key(&song("1", "Bladee", "Crest")),
+            art_key(&song("2", "Bladee", "Crest")),
+            "a protocol must not be rebuilt moving between tracks of one album"
+        );
+    }
+
+    #[test]
+    fn art_key_changes_with_the_album() {
+        assert_ne!(
+            art_key(&song("1", "Bladee", "Crest")),
+            art_key(&song("1", "Bladee", "Icedancer"))
+        );
+    }
+
+    #[test]
+    fn art_key_separates_an_album_from_a_track_of_the_same_name() {
+        // "a:" and "t:" prefixes, so an untagged track whose identity
+        // happens to read like an album key cannot collide with it.
+        let untagged = art_key(&song("x", "", ""));
+        assert!(untagged.starts_with("t:"));
+        assert!(art_key(&song("x", "A", "B")).starts_with("a:"));
+    }
+
+    #[test]
+    fn art_key_falls_back_for_items_with_no_cover_to_fetch() {
+        let k = art_key(&local("song"));
+        assert!(k.starts_with("t:"), "local files still need a stable key");
     }
 }
