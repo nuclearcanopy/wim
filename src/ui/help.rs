@@ -117,6 +117,11 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
 
 impl Widget for HelpOverlay<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // takes over a rect that already has other content drawn
+        // into it, so it has to own every cell: without the clear,
+        // whatever this menu did not write still showed through.
+        let area = crate::ui::draw::overlay(buf, area);
+
         let top = draw_header(
             buf,
             area,
@@ -150,7 +155,7 @@ impl Widget for HelpOverlay<'_> {
                 if y >= area.y + area.height {
                     break;
                 }
-                draw_line(buf, x, col_width, y, &line.text, shade(line.level));
+                draw_line(buf, area, x, col_width, y, &line.text, shade(line.level));
             }
         }
     }
@@ -203,8 +208,12 @@ impl HelpOverlay<'_> {
 
 /// Minimum usable width for one column; below two of these the layout
 /// stays single-column and scrolls off as before, which is still
-/// better than two columns of truncated nonsense.
-const MIN_COLUMN_WIDTH: usize = 40;
+/// better than two columns of truncated nonsense. 38 is the widest
+/// line this table actually produces ("  " + a 13-cell key column +
+/// " " + the longest description), not a round number: the frame added
+/// around this overlay costs four columns, and a 40 here turned 120
+/// cells into two columns, which is how sections fell off the bottom.
+const MIN_COLUMN_WIDTH: usize = 38;
 
 /// Packs whole sections into columns, never splitting a section across
 /// a column boundary. First-fit rather than "fill one column then move
@@ -247,22 +256,30 @@ fn split_into_columns(
     columns
 }
 
-fn draw_line(buf: &mut Buffer, x0: u16, max_width: usize, y: u16, text: &str, color: Color) {
-    for (col, ch) in text.chars().enumerate() {
-        if col >= max_width {
-            break;
-        }
-        if let Some(cell) = buf.cell_mut((x0 + col as u16, y)) {
-            cell.set_char(ch);
-            cell.set_fg(color);
-        }
+/// One column's row: `x0`/`max_width` pick the column out of `area`.
+/// This copy was the one missing the vertical guard the other eight
+/// had, so it could draw outside its own rect.
+fn draw_line(
+    buf: &mut Buffer,
+    area: Rect,
+    x0: u16,
+    max_width: usize,
+    y: u16,
+    text: &str,
+    color: Color,
+) {
+    if y < area.y || y >= area.y + area.height {
+        return;
     }
+    let budget = max_width.min((area.x + area.width).saturating_sub(x0) as usize);
+    crate::ui::draw::at(buf, x0, y, text, color, budget);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::keymap::Keymap;
+    use crate::ui::testbuf::{assert_no_bleed_through, buffer, grid, plated_buffer};
 
     fn render_to_lines(width: u16, height: u16) -> Vec<String> {
         let keymap = Keymap::default();
@@ -276,6 +293,29 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn the_overlay_covers_every_cell_of_its_rect() {
+        let keymap = Keymap::default();
+        let mut buf = plated_buffer(80, 24);
+        let area = Rect::new(2, 1, 76, 22);
+        HelpOverlay { keymap: &keymap }.render(area, &mut buf);
+        assert_no_bleed_through(&buf, area);
+    }
+
+    #[test]
+    fn the_frame_closes_all_four_corners() {
+        let keymap = Keymap::default();
+        let mut buf = buffer(80, 24);
+        let area = Rect::new(2, 1, 76, 22);
+        HelpOverlay { keymap: &keymap }.render(area, &mut buf);
+        let g = grid(&buf);
+        let rows: Vec<Vec<char>> = g.lines().map(|r| r.chars().collect()).collect();
+        assert_eq!(
+            (rows[1][2], rows[1][77], rows[22][2], rows[22][77]),
+            ('┌', '┐', '└', '┘')
+        );
     }
 
     #[test]
@@ -335,8 +375,9 @@ mod tests {
         let area = Rect::new(0, 0, 120, 24);
         let mut buf = Buffer::empty(area);
         HelpOverlay { keymap: &keymap }.render(area, &mut buf);
+        // row 0 is the frame's top edge now; the title is one inside.
         let top: String = (0..area.width)
-            .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
+            .map(|x| buf.cell((x, 1)).unwrap().symbol().to_string())
             .collect();
         assert!(top.contains("y or esc to close"), "got:\n{top}");
         assert!(!top.contains("? or esc to close"), "stale default:\n{top}");

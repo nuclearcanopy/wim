@@ -553,6 +553,10 @@ impl Widget for EqMenu<'_> {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        // takes over a rect that already has other content drawn
+        // into it, so it has to own every cell: without the clear,
+        // whatever this menu did not write still showed through.
+        let area = crate::ui::draw::overlay(buf, area);
         let keys = |key| key_label(key);
         let instructions = match self.state.editor {
             Some(_) => "enter: save the name, esc: cancel",
@@ -724,10 +728,14 @@ mod tests {
         }
     }
 
+    /// Rows whose whole *content* span is plated. The frame columns
+    /// are glyphs with no background, so including them would match
+    /// nothing at all.
     fn plated_rows(buf: &Buffer) -> Vec<u16> {
+        let right = buf.area.width.saturating_sub(INSET);
         (0..buf.area.height)
             .filter(|y| {
-                (0..buf.area.width).all(|x| buf.cell((x, *y)).is_some_and(|c| c.bg != Color::Reset))
+                (INSET..right).all(|x| buf.cell((x, *y)).is_some_and(|c| c.bg != Color::Reset))
             })
             .collect()
     }
@@ -736,14 +744,23 @@ mod tests {
     /// that also mentions it.
     fn preset_row<'a>(out: &'a str, name: &str) -> &'a str {
         out.lines()
-            .find(|l| l.contains(name) && !l.starts_with("applied:"))
+            .find(|l| l.contains(name) && !l.contains("applied:"))
             .unwrap_or_else(|| panic!("no list row for {name}:\n{out}"))
     }
 
+    /// The menu is an overlay, so `draw::overlay` frames it and hands
+    /// back the rect inside. `draw::framed_inner` insets x by two (the
+    /// frame plus a padding column) and y by one. Tests read content
+    /// coordinates, so the offset lives here rather than in every
+    /// assertion.
+    const INSET: u16 = 2;
+
     fn row_text(buf: &Buffer, y: u16) -> String {
-        (0..buf.area.width)
+        (INSET..buf.area.width.saturating_sub(INSET))
             .map(|x| crate::ui::testbuf::char_at(buf, x, y))
-            .collect()
+            .collect::<String>()
+            .trim_end()
+            .to_string()
     }
 
     #[test]
@@ -789,14 +806,17 @@ mod tests {
         let zero_row = (0..H)
             .find(|y| row_text(&buf, *y).starts_with("    0 ┼"))
             .expect("the plot's zero line");
-        let col = |band: usize| (AXIS_WIDTH + band * SLOT) as u16;
+        let col = |band: usize| INSET + (AXIS_WIDTH + band * SLOT) as u16;
 
         // a full boost reaches the top row, a half boost does not.
+        // "nothing here" is a space, not the buffer's fill char: this
+        // is an overlay, so `draw::clear` has already blanked every
+        // cell of the rect before any bar was drawn.
         let top = zero_row - PLOT_HALF as u16;
         assert_eq!(crate::ui::testbuf::char_at(&buf, col(0), top), '█');
         assert_eq!(
             crate::ui::testbuf::char_at(&buf, col(1), top),
-            '.',
+            ' ',
             "half the gain must not reach the top:\n{}",
             grid(&buf)
         );
@@ -810,9 +830,9 @@ mod tests {
             crate::ui::testbuf::char_at(&buf, col(2), zero_row + PLOT_HALF as u16),
             '█'
         );
-        assert_eq!(crate::ui::testbuf::char_at(&buf, col(2), top), '.');
+        assert_eq!(crate::ui::testbuf::char_at(&buf, col(2), top), ' ');
         // an untouched band is just the axis.
-        assert_eq!(crate::ui::testbuf::char_at(&buf, col(3), top), '.');
+        assert_eq!(crate::ui::testbuf::char_at(&buf, col(3), top), ' ');
         assert_eq!(crate::ui::testbuf::char_at(&buf, col(3), zero_row), '─');
     }
 
@@ -953,9 +973,11 @@ mod tests {
         }
         .render(area, &mut peak);
         let y = plated_rows(&trough)[0];
+        // sampled inside the frame: x=0 is the frame glyph, which
+        // carries no background at either phase.
         assert_ne!(
-            trough.cell((0, y)).unwrap().bg,
-            peak.cell((0, y)).unwrap().bg
+            trough.cell((INSET, y)).unwrap().bg,
+            peak.cell((INSET, y)).unwrap().bg
         );
     }
 

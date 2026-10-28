@@ -538,52 +538,35 @@ run that edits these files will collide.
       **that** album's cover instead. the resolution of which image to
       draw also moved out of the draw closure, so the ascii widget and
       the real overlay are guaranteed to be handed the same one.
-- [ ] **migrate the remaining chrome widgets to `ui::draw`**: eq_menu,
-      keybinds_menu, settings_menu, subtitle_menu, nav_manager, login,
-      onboarding, banner's menu row. (helpbox done, help still has its
-      own `draw_line`.) all draw
-      static mostly-ascii labels, so they are correctness-neutral
-      today; worth doing for the dedup and so a translated or
-      user-supplied string cannot reintroduce the bug. `banner.rs`'s
-      logo grid is deliberately excluded (figlet art, one cell per
-      char by construction).
-- [x] **help.rs no longer mislabels remappable actions as fixed.** new
-      `Key::Pair(a, b)` renders two rebindable actions as one row from
-      the live keymap, so the speed and subtitle-delay rows follow a
-      remap instead of showing the baked-in `[ / ]` and `, / .`
-      forever. spelling a pair as `Fixed` is exactly how the text got
-      frozen, so the variant exists to make that mistake unavailable.
-- [x] **the help box sizes itself from its label.** `helpbox::width_for`
-      replaces the hardcoded 10 columns, which fit "? help" and cut
-      "space help" to "space hel" the moment the help key was rebound
-      to anything longer than one character. also centres on display
-      width through `ui::draw` rather than char count.
-- [x] **mpv no longer survives an unclean wim exit**, and no longer
-      reads the user's mpv.conf. `PR_SET_PDEATHSIG` is set from
-      `pre_exec` in the child (linux only; `prctl` is not portable),
-      so a SIGKILL or abort that skips `Drop` still takes mpv with it
-      instead of leaving it headless, holding the audio device and
-      answering on a socket nothing owns. `--no-config` pins playback
-      to what this app sets: a user af chain, volume or replaygain
-      applied on top is indistinguishable from a wim bug, and ruling
-      that out already cost hours during the "horrible bass"
-      investigation. verified end to end rather than asserted: spawned
-      the real binary under a pty, SIGKILLed it, confirmed its mpv
-      died with it. one footgun recorded inline: pdeathsig fires on
-      the parent *thread* exiting, so the spawn must stay on the main
-      thread.
-- [x] **custom user-editable eq presets.** the eq menu now saves the
-      live curve under a name ('s'), lists saved curves in their own
-      group next to the built-ins, loads one with enter, renames ('r')
-      and deletes ('d d', confirmed on a second press); overwriting an
-      existing name takes a second enter the same way. stored in
-      config.toml as `eq_custom_presets` (requested gains, never the
-      compensated ones) with a matching `eqCustomPresets` home-manager
-      option. the applied state is now three states rather than two:
-      a named curve, that curve nudged since ("modified"), or a
-      nameless one, tagged on the row that owns it. the ten gains are
-      drawn as a vertical-bar plot, since ten `+3.0 dB` strings do not
-      read as a curve.
+- [x] **the chrome widgets go through `ui::draw`**, and the overlays
+      own their rect. eight widgets migrated (eq_menu, keybinds_menu,
+      settings_menu, nav_manager, login, onboarding, subtitle_menu,
+      banner's menu row; the figlet logo grid stays per-char by
+      construction). five latent bugs fell out: a **missing top-edge
+      bounds guard** in eq_menu/keybinds_menu/settings_menu/
+      nav_manager/banner (only the bottom was checked), char-count
+      centring in onboarding and banner, char-count-derived x offsets
+      in login's three-colour url row, banner's key column padded by
+      `len()` (bytes) inside a char-width format spec, and
+      subtitle_menu having **no bounds guard at all**, running to the
+      buffer edge over whatever the popup sat on, plus a char-count
+      right-alignment that underflowed for an over-long value.
+      Separately, the maintainer's "the settings menu has no border
+      and its fucky" turned out to be systemic: five of six overlays
+      never cleared their rect, so every cell they did not write still
+      held the sidebar or browse list underneath. `draw::clear`,
+      `frame`, `framed_inner` and `overlay` fix that in one place;
+      each overlay gets a bleed-through test that lays down a sentinel
+      char *and* background and proves neither survives.
+      `help.rs`'s `MIN_COLUMN_WIDTH` went 40 to 38: the frame costs
+      four columns, which dropped a 120-cell terminal to two help
+      columns and reintroduced the sections-falling-off-the-bottom
+      failure. 38 is the widest line that table actually produces, and
+      the regression test still passes at 80x24.
+- [ ] **`notify.rs` still has a per-char text loop** (around line 63),
+      the last writer outside `ui::draw`. Notification bodies include
+      track labels, so a wide-char title there overdraws exactly as
+      the migrated widgets used to.
 - [ ] **decompose main.rs** (~3.9k lines). a reviewed, ordered plan
       exists: extract focus/InputMode, then the playback free functions,
       then the sync/channel plumbing, then a `struct Ui` for the ~35
