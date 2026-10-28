@@ -141,6 +141,22 @@ pub enum ArtistLoad {
     Album(ArtistAlbumTracks),
 }
 
+/// `getArtistInfo2`, both halves. The `similarArtist` list is
+/// last.fm's own similarity graph proxied by the server, which is the
+/// only cross-artist signal available without any collaborative data
+/// of our own; see docs/suggestions.md.
+#[derive(Debug, Default, Clone)]
+pub struct ArtistInfo {
+    pub biography: Option<String>,
+    /// Ranked most-similar-first by last.fm. Entries the server
+    /// doesn't have in the library come back with no usable id (or
+    /// `"-1"`), so consumers match on `name` and intersect against
+    /// what is actually indexed rather than trusting the id.
+    // read by `suggest`; drop the allow once the menu is wired up.
+    #[allow(dead_code)]
+    pub similar_artists: Vec<Artist>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SearchResult {
     pub artists: Vec<Artist>,
@@ -245,17 +261,20 @@ impl Client {
         Ok(parse_artist_albums(&v))
     }
 
-    /// Navidrome's own `getArtistInfo2` already proxies a biography
-    /// from last.fm, no separate api key needed; `None` if the server
-    /// has nothing (unknown artist, no internet metadata lookup
-    /// configured, etc.), not an error.
-    pub fn get_artist_bio(&self, artist_id: &str) -> anyhow::Result<Option<String>> {
+    /// Navidrome's own `getArtistInfo2` already proxies last.fm, no
+    /// separate api key needed: one call carries both the biography and
+    /// a ranked `similarArtist` list. Empty fields rather than an error
+    /// when the server has nothing (unknown artist, no internet
+    /// metadata lookup configured, etc.).
+    pub fn get_artist_info(&self, artist_id: &str) -> anyhow::Result<ArtistInfo> {
         let v = self.get("getArtistInfo2", &[("id", artist_id)])?;
-        Ok(v.get("artistInfo2")
-            .and_then(|a| a.get("biography"))
-            .and_then(|b| b.as_str())
-            .map(str::to_string)
-            .filter(|s| !s.is_empty()))
+        Ok(parse_artist_info(&v))
+    }
+
+    /// Just the biography half of `get_artist_info`, for the artist
+    /// page's bio pane.
+    pub fn get_artist_bio(&self, artist_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.get_artist_info(artist_id)?.biography)
     }
 
     /// Same idea for playlists: `getPlaylist`'s tracks live under
@@ -628,6 +647,39 @@ fn parse_song_array(arr: Option<&serde_json::Value>) -> Vec<Song> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Pure parsing for `getArtistInfo2`. `similarArtist` entries that
+/// aren't in the library carry `"-1"` (the subsonic "no such id"
+/// convention) or no id at all; those are kept with an empty id since
+/// the name alone is still enough to intersect against the corpus.
+fn parse_artist_info(v: &serde_json::Value) -> ArtistInfo {
+    let info = v.get("artistInfo2");
+    ArtistInfo {
+        biography: info
+            .and_then(|a| a.get("biography"))
+            .and_then(|b| b.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty()),
+        similar_artists: info
+            .and_then(|a| a.get("similarArtist"))
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| {
+                        let name = a.get("name")?.as_str()?.to_string();
+                        let id = a
+                            .get("id")
+                            .and_then(|i| i.as_str())
+                            .filter(|i| *i != "-1")
+                            .unwrap_or_default()
+                            .to_string();
+                        (!name.is_empty()).then_some(Artist { id, name })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
 }
 
 /// Genre tags off one song object. Navidrome serves both shapes: the
@@ -1058,6 +1110,46 @@ mod tests {
         assert!(parse_artists_index(&v).is_empty());
         assert!(parse_album_list2_page(&v).is_empty());
         assert!(parse_song_array(None).is_empty());
+        let info = parse_artist_info(&v);
+        assert!(info.biography.is_none());
+        assert!(info.similar_artists.is_empty());
+    }
+
+    /// The whole point of re-parsing `getArtistInfo2`: this list was
+    /// being thrown away, and it is the only cross-artist similarity
+    /// signal available without collaborative data.
+    #[test]
+    fn parses_similar_artists_alongside_the_biography() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"artistInfo2": {
+                "biography": "swedish artist",
+                "similarArtist": [
+                    {"id": "ar-7", "name": "Ecco2k", "albumCount": 2},
+                    {"id": "-1", "name": "Thaiboy Digital", "albumCount": 0},
+                    {"name": "Yung Lean"},
+                    {"id": "ar-9", "name": ""}
+                ]
+            }}"#,
+        )
+        .unwrap();
+        let info = parse_artist_info(&v);
+        assert_eq!(info.biography.as_deref(), Some("swedish artist"));
+        let names: Vec<&str> = info
+            .similar_artists
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Ecco2k", "Thaiboy Digital", "Yung Lean"],
+            "nameless entries drop, id-less ones stay: the name is what gets intersected"
+        );
+        assert_eq!(info.similar_artists[0].id, "ar-7");
+        assert_eq!(
+            info.similar_artists[1].id, "",
+            "\"-1\" means not in this library, so it is not a usable id"
+        );
+        assert_eq!(info.similar_artists[2].id, "");
     }
 
     /// Navidrome serves the multi-valued `genres` array alongside the
