@@ -23,14 +23,11 @@ use crate::ui::textfit;
 /// and then silently shadowed by this.
 pub const OPEN_KEY: KeyCode = KeyCode::Char(':');
 
-/// How long a `Resolve` will wait for the search it follows before
-/// giving up. Comfortably past the host's 300ms remote-search debounce
-/// plus a slow round trip; a wedged search subsystem reports instead of
-/// hanging the program forever.
-/// Backstop for a host whose searches never settle. Unreachable
-/// against the current one, which settles within 1.2s (and instantly
-/// with no indexed server), so this exists for a future host with a
-/// slower rule rather than for anything live today.
+/// How long a `Resolve` waits for the search it follows before giving
+/// up: a backstop for a host whose searches never settle, so a wedged
+/// search subsystem reports instead of hanging the program forever.
+/// Unreachable against the current host, which settles within 1.2s and
+/// instantly with no indexed server.
 const AWAIT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Upper bound on `repeat(n, ...)`; the expansion is static, so an
