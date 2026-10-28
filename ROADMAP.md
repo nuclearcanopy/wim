@@ -468,6 +468,36 @@ run that edits these files will collide.
       site, so it was left alone deliberately; revisit if the menu's
       suggestions look wrong in practice.
 
+- [x] **maximized player: cover art and an arrow-selectable transport.**
+      `ui::player::layout` is a `browse::layout`-shaped free function
+      returning the art rect plus a row per element, so main.rs can
+      overlay a real image on exactly the rect the widget used. art is
+      square-first (height always re-derived from the surviving width),
+      centred above the title, dropped entirely below 6 rows or 14
+      cols, and the whole stack degrades through seven row tiers down
+      to title-only. the layout also stops above the level meter's two
+      rows, which the old view could draw underneath.
+      selection reuses `controlsbar::Field`/`Scrub`/the glyph
+      alphabet rather than copying them, and the pure key-to-cursor
+      state machine (`nav`, `NavKeys`) lives in `controlsbar.rs`
+      because both surfaces call it; a copy in `player.rs` would have
+      been the second selection model. one deliberate divergence: the
+      bar owns h/l and swallows up/down, the player is arrows-only so
+      `l` still reaches cycle-loop. labels come in three width tiers
+      (glyph + name + value, glyph + name, bare glyph) because an
+      80-column terminal minus the sidebar is ~50-60 cells and
+      all-or-nothing words would have lost the names in the common
+      case.
+- [ ] **now-playing cover art for tracks not in an open browse view.**
+      the player takes its art from `browse_view.art`, but only when
+      the playing track is actually in that view's list (compared by
+      `SearchItem::identity`), so open album then play then maximize
+      works with no new fetch. a track played from search, or from a
+      view since closed, shows no art rather than the wrong album's.
+      needs a `getCoverArt` keyed on the playing song's own id, cached
+      by track identity, off the draw path, plus a protocol rebuild for
+      `ArtMode::Real`.
+
 ## open sub-tasks discovered during the review pass
 
 - [x] **queue view** (`src/ui/queue.rs`, `Q`): three labelled runs in
