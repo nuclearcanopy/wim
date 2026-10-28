@@ -471,6 +471,16 @@ run that edits these files will collide.
       `view(q, ...)` landing on a song whose album is not in the corpus
       (`SearchItem::Song` carries its album's name, not its id). see
       docs/shellsong.md's host section.
+- [ ] **`Console::paste`'s documented signature is wrong.** the API
+      summary says `paste(&str)`; it is really
+      `paste(&mut self, &str, &dyn Candidates)` because it refreshes
+      the suggestion. harmless, but the published list misleads the
+      next caller.
+- [ ] **`ViewTarget::Help` is unreachable.** lowering turns
+      `view(help)` into notes, so the variant exists only to make the
+      enum match the documented target list, and every host must write
+      an arm for something that can never arrive. either lower it like
+      the others or drop the variant.
 - [ ] **album/artist identity is name-based.** `SearchItem` carries no
       `album_id`/`artist_id`, so the suggestion catalog joins on
       trimmed-lowercased names. two same-named albums by one artist

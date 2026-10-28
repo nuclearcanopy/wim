@@ -316,7 +316,7 @@ search(query)           run a search and leave the results up  [find, grep]
 play(terms?)            play the first term, queue the rest
 queue(terms?)           append each term to the queue          [enqueue]
 add_to_queue(position, terms?)   front inserts next, back appends
-clear_queue()           empty the queue                        [clear, flush]
+clear_queue()           drop everything upcoming, keep playing  [clear, flush]
 remove(indices)         drop queue entries by position
 goto(index)             jump to a queue position
 save_queue(name)        save the queue as a local playlist
@@ -545,6 +545,29 @@ the event loop (all pure, all tested): the completion provider, the
 `search_settled` state machine, percent-to-seconds resolution, the
 volume clamp and the fade/sleep ramps. `queues.rs` is the named-queue
 store behind `save_queue`/`load_queue`.
+
+## pinned behaviours
+
+these were all ambiguous until the host was written, and a reader (or a
+future host) would have had to guess. they are decisions, not accidents:
+
+- `clear_queue()` drops everything upcoming and **keeps the current
+  track playing**, matching mpv's own `playlist-clear`. it is not a
+  stop.
+- `load_queue(name)` **starts playing**, consistent with what
+  `play(...)` on an album does. it does not merely stage the queue.
+- `goto(index)` and `remove(indices)` are 1-based positions in the
+  **whole playlist, including already-played entries**, because that is
+  what the queue view numbers on screen and therefore what a user reads
+  off it. `Env::queue_len` matches.
+- `view(now)` can only unminimize the player; the host has no separate
+  "player screen" state, so it fails when nothing is playing.
+- `view(q, ...)` landing on a song can only open a page for an album
+  already indexed, since `SearchItem::Song` carries its album's name
+  and not an id. local files have no page.
+- `go()` on the bottom bar's progress field refuses: enter there is a
+  keyboard scrub drag, and an open console claims every key, so the
+  drag could never receive them. use `moveto(...)` or `seek(...)`.
 
 ### routing
 
