@@ -182,3 +182,13 @@ practically: raw-mode rendering can't be exercised headlessly (no real
 tty in this build/test/loop context), but all the *logic*; selection
 movement and clamping, the `gg`/`G` vim-style pending-key handling,
 query editing, what "enter" does; is fully unit-tested without one.
+
+## the mouse resolves against the frame it was aimed at
+
+every rect is computed inside the draw closure, so the input handler
+cannot locate anything. the draw pass records a `hit::HitMap` as it
+goes and the next mouse event resolves against that one, which makes
+resolution a pure function of a recorded map and therefore testable
+without a terminal, same reason `App::handle_key` is. the mouse's
+precedence is the keyboard's own tier order read from one list rather
+than a second cascade. see `docs/input-precedence.md`.
