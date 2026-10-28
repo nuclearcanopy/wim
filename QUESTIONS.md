@@ -74,3 +74,35 @@ indistinguishable from a bug in wim, which is exactly what happened
 once already. If someone genuinely wants their mpv.conf honoured, that
 wants an explicit opt-out config field rather than the current silent
 inheritance.
+
+## video pane aspect ratio (perf/art, awaiting confirmation)
+
+`Fit::Contain` is now the default for the art and video rasterizer,
+which makes the **video pane aspect-correct with bars instead of
+stretched to fill**. For album art it is a no-op (the layouts already
+size the rect square against the same `cell_aspect`). Defaulted to
+Contain on the reading that a stretched video was a bug rather than a
+choice, and because the maintainer asked for real video in the
+workspace; it is a visible change on the first video played.
+`Fit::Stretch` restores the old behaviour exactly, one argument away.
+
+## mouse: text-entry tiers do not swallow clicks (feat/mouse)
+
+Eight of the ten input tiers swallow a click aimed elsewhere; the two
+text-entry ones (`editing_query`, `bv.filtering`) deliberately do not.
+The reasoning: a keystroke has no location, so a text box must claim
+every key or lose some, which is the bug the cascade's comment is
+about; a click names its target and cannot leak that way. So the
+swallow set is exactly the keyboard tiers that paint over the panes. A
+click elsewhere takes the keyboard out of the box; a click into a box
+claims it, since otherwise clicking a visible search box would read as
+a click on the pane around it and close it. Flagged because it is the
+one place pointer precedence intentionally differs from the keyboard's.
+
+## decoded cover resolution ceiling (perf/art)
+
+`MAX_DECODED_EDGE = 640`, which covers the half-block grid with margin
+(400x200 cells samples 400x400) and the `ratatui-image` path at a
+~1920px-wide terminal. On a 4K display with a very large art panel the
+real-art path may look slightly soft. 1024 would cost 71MB for 24
+cached covers instead of 28MB.

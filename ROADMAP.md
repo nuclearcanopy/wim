@@ -421,50 +421,105 @@ accident.
 
 ## in flight (branches, NOT merged; do not start work that touches these)
 
-**this section goes stale fast and a stale version is worse than none:
-it reads as "these files are free" when they are not. verify against
-`git worktree list` and `git branch --no-merged master` before trusting
-it, and update it when you merge something.** the four branches listed
-here previously (feat/shellsong, feat/pulse-animations,
-fix/nowplaying-queue, feat/controls-bar-icons) were all merged and
-deleted long ago; the list sat unchanged while six new branches went
-live, which is exactly the trap.
+**verify against `git worktree list` and `git log --oneline master..<branch>`
+before trusting this; a stale version reads as "these files are free"
+when they are not.** as of 2026-10-28 all six worktrees have commits
+and none are merged. three have reported in full, three had committed
+work but had not reported when this was written.
 
-as of 2026-10-28 six worktrees are live, one feature and five
-performance. the file ownership matters more than the branch names: a
-loop run that edits an owned file will collide with an agent mid-edit.
+merge order matters: `feat/mouse`, `perf/art` and `perf/startup` all
+touch `main.rs`, and mouse rewrote the region the other two touch in
+4 hunks each. merge mouse first, then re-apply the small footprints on
+top; do not merge art or startup into a tree that has not taken mouse
+yet.
 
-- `feat/mouse` + `wim-wt-mouse`: mouse support, click to move focus and
-  press buttons. owns `src/main.rs`, `src/ui/controlsbar.rs`,
-  `src/ui/player.rs`, `src/term.rs`, `src/config.rs`, and the list
-  widgets (`src/ui/results_list.rs`, `browse.rs`, `queue.rs`,
-  `suggestions.rs`, `lyrics_view.rs`).
-- `perf/mpv` + `wim-wt-mpv`: owns `src/mpv.rs`. kills the last
-  per-frame blocking ipc round trip (`audio_level` sampling the astats
-  tap) and moves video frame decode off the render thread. also exposes
-  a cheap non-blocking "latest decoded frame" api for the future ascii
-  video renderer.
-- `perf/search` + `wim-wt-search`: owns `src/search.rs`, `src/app.rs`.
-  stops cloning the whole retained result set per keystroke and narrows
-  the previous result set instead of rescanning the corpus.
-- `perf/art` + `wim-wt-art`: owns `src/ui/albumart.rs`,
-  `src/coverart.rs`, and a new shared rasterizer module. extracts
-  image-to-cells (half-block) rasterization for reuse by ascii video,
-  plus a disk cache for cover bytes.
-- `perf/startup` + `wim-wt-startup`: owns `src/subsonic.rs`,
-  `src/library.rs`, `src/cache.rs`, `src/browse.rs`. persistent library
-  cache so startup paints from disk, bounded-concurrency fetches
-  instead of serial round trips.
-- `perf/shell` + `wim-wt-shell`: owns `src/shellsong.rs`,
-  `src/shellsong_host.rs`, `src/suggest.rs`. per-keystroke lex/parse/
-  complete cost and the recommender's scoring passes.
+- `feat/mouse` (12 commits, REPORTED, all four gates clean, 690 tests).
+  click to focus and to press buttons, wheel moves the selection, drag
+  on the progress bar scrubs. new `src/hit.rs` holds a per-frame
+  `HitMap` the draw closure fills as it computes each rect, so a
+  frame's map is by construction a description of what is on screen.
+  widgets hand over their own geometry (`ControlsBar::layout`,
+  `PlayerView::transport`, `row_items`/`rows` on the four lists) rather
+  than being guessed at; `hit::TIERS` writes the precedence order down
+  once as data so adding a tier fails to compile until every place
+  names it. **nobody has actually clicked it**: under a bare pty the
+  ratatui-image graphics probe goes unanswered and then eats stdin, so
+  raw-mode input is not exercisable headlessly. needs one human pass.
+- `perf/art` (5 commits, REPORTED, all gates clean). the per-frame
+  resampling claim was real: `AsciiArt::render` resampled the full
+  source through `get_pixel` every frame, cost scaling with the source
+  rather than the output (a 1500px cover cost 37ms per frame for a
+  40x20 panel). new `src/ui/raster.rs` is O(output) half-block
+  rasterization with reused scratch buffers, plus a `Memo` keyed on
+  (key, size, cell_aspect, fit): 7.0ms -> 0.015ms for a real art panel,
+  35.9ms -> 1.6ms for a 1080p frame at 400x200 cells. decoded covers
+  bounded to 640px, so 24 of them is a flat 28MB instead of 154-617MB.
+  disk store for cover bytes under `cache_dir()/covers`.
+- `perf/startup` (6 commits, REPORTED, tree clean). persistent NDJSON
+  catalog per server loaded before the first frame, so a warm start has
+  the library on screen AT the first frame (81.9ms) instead of 8.1s.
+  `Corpus::reconcile_server` makes sync drop what a server no longer
+  lists, which a persisted catalog makes mandatory. `artist_tracks` was
+  spawning a thread and socket PER ALBUM (60 connections for a
+  60-release artist); now a bounded pool of 8, and an artist page goes
+  1937ms -> 361ms cold -> 0.46ms reopened. new artifact is 0600 inside
+  a 0700 dir, holds no credentials, salted digest instead of the url.
+- `perf/mpv` (6 commits, had NOT reported). owns `src/mpv.rs`; killing
+  the last per-frame blocking ipc round trip (`audio_level`) and moving
+  video frame decode off the render thread.
+- `perf/search` (4 commits, had NOT reported). owns `src/search.rs`,
+  `src/app.rs`. note: `/tmp/sabotage*.py` are this agent's mutation
+  harness (inject a known bug, confirm the suite catches it, restore),
+  not an attack; they are benign and that is the right way to prove a
+  guard has teeth.
+- `perf/shell` (3 commits, had NOT reported). owns `src/shellsong.rs`,
+  `src/shellsong_host.rs`, `src/suggest.rs`.
 
-consequence worth stating plainly: **every currently unchecked roadmap
-item below touches an owned file**, so there is no unblocked item right
-now. the video items additionally depend on two of those branches
-landing first (the rasterizer from `perf/art`, the frame api from
-`perf/mpv`). a loop run arriving here should do uncontested polish or
-docs rather than forcing one of them.
+### found by the agents, not yet fixed (all in files they own)
+
+- [ ] **nobody has clicked the mouse support.** see `feat/mouse` above;
+      the hit resolution is well covered as pure functions but no real
+      click has been driven end to end. a human pass is the only way.
+- [ ] **the paste handler's tier chain diverges from the key cascade.**
+      `Event::Paste` checks `settings_token_editing` before
+      `console_open` (keys do the reverse) and has no `editing_query`
+      guard at all, so a paste reaches `app.query` whether or not the
+      box holds the keyboard. harmless only because those states cannot
+      currently coexist, which is the kind of thing that stops being
+      true silently.
+- [ ] **`InputMode`'s doc claims `focus` is only ever changed from
+      `InputMode::Move`, never as a side effect.** already untrue
+      (`dispatch_action` and several pane tiers change it) and clicks
+      make it more so. the comment is load-bearing elsewhere, so it
+      wants a careful reword rather than a delete. also `main.rs:2870`
+      has the `focus_in_direction` doc block attached to `enum
+      InputMode` by mistake.
+- [ ] **`suggestions::render` has a `flat.get(idx)` -> `continue`
+      fallback that cannot fire**, and `row_items` does not mirror it;
+      that is the one place the hit map could formally name a row the
+      render skipped.
+- [ ] **`fetch_navidrome_catalog` pings before fetching, serially.**
+      every sync pass pays an extra round trip, roughly 80 wasted
+      requests per hour per server. `all_artists()` failing would be
+      just as informative; left alone because it is error-reporting
+      semantics in a contested file.
+- [ ] **fresh `Client` per call in `open_starred_view`,
+      `test_navidrome_connectivity` and every 45s sync pass**, each
+      re-reading `password_file` and starting with a cold pool. a
+      shared client per server fixes it but must not park the password
+      in a static, which would break the zeroize-on-drop guarantee.
+- [ ] **the first open of an album or artist still blocks the main
+      thread.** `open_browse_view`/`open_artist_view` are synchronous;
+      the response cache makes repeats free and the pool makes a cold
+      open 5x faster, but truly non-blocking needs the currently unused
+      `stream_artist_tracks` wired into the ui.
+- [ ] **the browse view's own cover fetch bypasses the new disk
+      store** (it is keyed by album id, the store by artist/album
+      name), so reopening an album still re-fetches. unifying the two
+      keyspaces is the same blocker as the name-based-identity item.
+- [ ] **catalog parse beyond ~100k rows** would start outgrowing mpv's
+      spawn and resurface on the first frame; parallelize the row parse
+      if that ever shows up.
 
 ## shellsong and suggestions (engines merged, hosts not wired)
 
