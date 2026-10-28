@@ -254,6 +254,27 @@ struct Scratch {
     buf: Vec<char>,
 }
 
+/// A persisted-catalog load running on its own thread. Started before
+/// the first blocking thing `main` does and `take`n where the corpus is
+/// actually needed, so the disk read overlaps the mpv spawn instead of
+/// landing on top of it.
+pub struct WarmingCorpus(thread::JoinHandle<Corpus>);
+
+impl WarmingCorpus {
+    /// Blocks until the load finishes; an empty corpus if its thread
+    /// panicked, same best-effort stance as every other cache read.
+    pub fn take(self) -> Corpus {
+        self.0.join().unwrap_or_default()
+    }
+}
+
+/// Reads every configured server's persisted catalog in the
+/// background; see `Corpus::warm_from_cache` for what it builds.
+pub fn spawn_warm_from_cache(servers: &[NavidromeConfig]) -> WarmingCorpus {
+    let servers = servers.to_vec();
+    WarmingCorpus(thread::spawn(move || Corpus::warm_from_cache(&servers)))
+}
+
 /// The merged corpus to search over, built once per library scan /
 /// Navidrome sync and re-searched on every keystroke.
 #[derive(Debug, Clone, Default)]
@@ -287,7 +308,12 @@ impl Corpus {
     /// Also drops catalogs for servers no longer configured; this runs
     /// exactly once per launch and is the one place holding the live
     /// server list.
-    pub fn warm_from_cache(servers: &[NavidromeConfig]) -> Corpus {
+    ///
+    /// Call it through `spawn_warm_from_cache` rather than directly:
+    /// tens of thousands of rows is tens of milliseconds, which the
+    /// first frame shouldn't wait for when there is an mpv process
+    /// being spawned anyway.
+    fn warm_from_cache(servers: &[NavidromeConfig]) -> Corpus {
         let mut corpus = Corpus::new();
         for nav in servers {
             let Some(catalog) = cache::load_catalog(nav) else {
