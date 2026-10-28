@@ -391,6 +391,27 @@ real video is the DEFAULT and stays the default. the ascii path is a
 thing the user turns on deliberately, never something they land in by
 accident.
 
+- [ ] **BLOCKER: there is no working way to get frames out of mpv.**
+      found by `perf/mpv` and it gates every item below. `screenshot-raw`
+      **cannot work over json ipc at all**: mpv's own manual says it is
+      client-api/script only, and over ipc it replies with a `data`
+      field containing nothing after it (the value is an
+      `MPV_FORMAT_BYTE_ARRAY` and mpv's json writer has no encoding for
+      one), so **the reply line is not valid json**. the old reader
+      skipped the unparseable line, the pending request was never
+      answered, and the main loop sat in a 10 second `recv_timeout`;
+      **the whole ui froze in 10 second blocks for as long as a local
+      video played.** verified on a real h264 file and a lavfi source,
+      with and without `--vo=null`, at every `flags` value. the pump
+      now recognises the reply as `Unsupported`, stops asking and
+      notifies once, so the freeze is gone, but no frames arrive.
+      measured alternatives, none free: `screenshot-to-file` plus
+      read-back is 202ms at 480p and 530ms at 1080p per frame on mpv's
+      side (2-5fps, and 1080p jpg failed outright); an mpv lua script
+      using `mp.command_native`; or `--vo=image`. each is a new
+      subsystem, so none were built. `FramePump`'s public surface does
+      not change under any replacement source, so this is a swap of the
+      source only. see QUESTIONS.md.
 - [ ] **video plays as real video in the workspace.** confirm the
       maximized-song path actually shows a real video surface for a
       video file, not the album-art fallback and not ascii.
@@ -464,9 +485,21 @@ yet.
   60-release artist); now a bounded pool of 8, and an artist page goes
   1937ms -> 361ms cold -> 0.46ms reopened. new artifact is 0600 inside
   a 0700 dir, holds no credentials, salted digest instead of the url.
-- `perf/mpv` (6 commits, had NOT reported). owns `src/mpv.rs`; killing
-  the last per-frame blocking ipc round trip (`audio_level`) and moving
-  video frame decode off the render thread.
+- `perf/mpv` (6 commits, REPORTED, all gates clean, 668 tests). the
+  level meter read went 144us mean / 1204us worst per frame (blocking,
+  and returning `None` every time) to 0.040us returning a real value;
+  subtitle style per keypress 1592us to 605us by pipelining 7 round
+  trips into one batch; bgr0->rgb conversion 13.4ms to 3.6ms at 1080p.
+  found three bugs doing it: the af-metadata property path resolved
+  against the lavfi graph's inner label instead of mpv's own filter
+  label so it never resolved; mpv hands af-metadata through as strings
+  so `as_f64()` read every value as absent; and a `property-change`
+  for a vanished property carries no `data` key at all (not
+  `data: null`), so the reader dropped exactly the event meaning "this
+  reading is gone" and the last one stood forever. also fixed a latent
+  socket-naming bug: `Mpv::spawn` named the socket by pid alone, so a
+  second `Mpv` in one process deleted the first's socket and both
+  mpvs answered on the same path.
 - `perf/search` (4 commits, had NOT reported). owns `src/search.rs`,
   `src/app.rs`. note: `/tmp/sabotage*.py` are this agent's mutation
   harness (inject a known bug, confirm the suite catches it, restore),
@@ -740,3 +773,11 @@ yet.
       directly, because it runs once per command and must resolve
       against the duration as of now rather than the last pushed
       change.
+      **correction (perf/mpv):** the claim above that `audio_level` is
+      "inherently a per-frame sample" was wrong. `af-metadata` IS
+      observable (measured at 20 pushes/s with real data), so it is an
+      observed property now like the rest. worse, the old per-frame
+      round trip bought nothing at all: it asked for a property path
+      that does not resolve, and mpv hands af-metadata through as
+      strings so `as_f64()` would have read every reading as absent
+      anyway. the level meter had never worked.

@@ -106,3 +106,35 @@ one place pointer precedence intentionally differs from the keyboard's.
 ~1920px-wide terminal. On a 4K display with a very large art panel the
 real-art path may look slightly soft. 1024 would cost 71MB for 24
 cached covers instead of 28MB.
+
+## where video frames come from (perf/mpv, BLOCKING the video items)
+
+`screenshot-raw` is unusable over json ipc (see ROADMAP's blocker
+entry: mpv emits an unparseable reply, which used to freeze the ui in
+10 second blocks). No default was picked because all three
+alternatives are a new subsystem rather than a config flag, and the
+choice determines the achievable frame rate:
+
+- `screenshot-to-file` + read-back: simplest, no new dependency, but
+  measured 202ms per frame at 480p and 530ms at 1080p on mpv's side,
+  so 2-5fps. 1080p jpg failed outright. Probably fine for ascii video,
+  visibly bad for anything else.
+- an mpv lua script using `mp.command_native`: `screenshot-raw` works
+  from a script, so this is the only route to the original design.
+  Costs shipping and loading a lua script alongside the binary.
+- `--vo=image`: mpv writes every frame itself; no round trip per frame
+  at all, but it writes to disk continuously and the frame rate is
+  mpv's, not ours.
+
+`FramePump`'s public api does not change under any of them, so this is
+a source swap. Needs the maintainer's call.
+
+## frame downscale ceiling (perf/mpv)
+
+`VIDEO_FRAME_MAX_EDGE = None`: the knob exists but is defaulted off,
+because `ui::albumart::sample_luma` box-averages over every source
+pixel per cell, so downscaling changes drawn output and that renderer
+is `perf/art`'s lane. Flagged because it is the next bottleneck: a
+1080p frame into any pane is ~2.07M `get_pixel` calls on the render
+thread per frame. `perf/art`'s new O(output) rasterizer supersedes
+this; reconcile the two at merge.
