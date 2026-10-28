@@ -5,11 +5,6 @@
 //! asynchronous, so `Program` is a resumable state machine rather than
 //! a loop. the full language reference is docs/shellsong.md.
 
-// nothing calls into this module yet: opening the console on ':' and
-// draining `Program::step` in the input loop is the host's wiring step,
-// which lands separately. this allow goes away with it.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
@@ -539,8 +534,12 @@ impl Ty {
         }
     }
 
-    /// Keywords this type accepts, for error messages; the completion
-    /// path goes through `completes` instead.
+    /// Keywords this type accepts. Unused: the parser's own error path
+    /// reaches `Words::options` directly, and completion goes through
+    /// `completes`. Kept because every other `Ty` accessor is here and
+    /// a type that accepts keywords without a way to list them is the
+    /// surprising half of the pair.
+    #[allow(dead_code)]
     pub fn options(self) -> Vec<&'static str> {
         match self {
             Ty::Words(w) => w.options(),
@@ -2397,8 +2396,10 @@ pub trait Candidates {
     }
 }
 
-/// A provider that knows nothing: for a host that has not supplied one
-/// yet, and for the tests that do not care.
+/// A provider that knows nothing: for the tests that do not care and
+/// for the overlay's own render tests. The real host supplies
+/// `shellsong_host::CorpusCandidates`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct NoCandidates;
 
 impl Candidates for NoCandidates {
@@ -2466,6 +2467,7 @@ impl Console {
     }
 
     /// No-I/O constructor, for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn empty() -> Console {
         Console::default()
     }

@@ -18,8 +18,10 @@ mod onboarding;
 mod opensubtitles;
 mod persistence;
 mod playqueue;
+mod queues;
 mod search;
 mod shellsong;
+mod shellsong_host;
 mod subsonic;
 mod suggest;
 mod term;
@@ -49,6 +51,8 @@ use notify::{Notifications, Severity};
 use onboarding::{Onboarding, Step};
 use playqueue::{PlayQueue, PosChange};
 use search::SearchItem;
+use shellsong::{Console, ConsoleAction, GoTarget, Op, Target, ViewTarget};
+use shellsong_host::{CorpusCandidates, Ramp, SearchSettle, SleepStep};
 use theme::{shade, NEAR_BLACK};
 use ui::albumart::AsciiArt;
 use ui::banner::Banner;
@@ -64,6 +68,7 @@ use ui::onboarding::{ControlsView, DoneView, LibraryPathsView, ListenBrainzView,
 use ui::player::PlayerView;
 use ui::results_list::{label, ResultsList};
 use ui::searchbox::SearchBox;
+use ui::shellsong::ShellsongConsole;
 use ui::visualizer::LevelMeter;
 
 /// Local items resolve straight to a file path mpv can load. A remote
@@ -984,6 +989,919 @@ fn dispatch_action(action: Action, ctx: &mut ActionCtx) -> Dispatch {
     Dispatch::Continue
 }
 
+// ------------------------------------------------------ shellsong
+
+/// The tracks enter on a browse row plays: the selected one through
+/// the end of what the filter actually shows, not of the whole list (a
+/// filtered artist page used to play the unfiltered tail). Shared by
+/// the browse view's own enter and shellsong's `go()`, so the two
+/// cannot pick different tracks.
+fn browse_session(bv: &browse::BrowseView) -> Vec<SearchItem> {
+    let visible = bv.visible_track_indices();
+    let from = visible.iter().position(|&i| i == bv.selected).unwrap_or(0);
+    visible[from..]
+        .iter()
+        .filter_map(|&i| bv.tracks.get(i).cloned())
+        .collect()
+}
+
+/// Starts a freshly built session: mpv's playlist is replaced and
+/// every "a track just started" hook fires for the first track, the
+/// same set `Action::Play` fires. One place, so a shellsong-built
+/// session can't quietly skip a hook the keyboard runs.
+fn start_session(
+    items: Vec<SearchItem>,
+    minimize: bool,
+    ctx: &mut ActionCtx,
+) -> Result<String, String> {
+    let Some(first) = items.first().cloned() else {
+        return Err("nothing to play".to_string());
+    };
+    let interrupted = ctx.queue.current().cloned();
+    let (status, played) =
+        load_playlist(ctx.player, ctx.cache, ctx.queue, items, SessionStart::New);
+    if !played {
+        return Err(status);
+    }
+    fire_subtitle_fetch(ctx.cfg, ctx.subtitle_tx, &first);
+    let mut dctx = DownloadCtx {
+        cache: ctx.cache,
+        download_tx: ctx.download_tx,
+        downloading: ctx.downloading,
+        day_threshold: ctx.cfg.cache_days_threshold,
+    };
+    note_playback_started(&first, &mut dctx, ctx.notifications);
+    start_tracking_playback(ctx.cfg, &first, ctx.scrobble);
+    *ctx.previous_track = interrupted;
+    *ctx.player_minimized = minimize;
+    Ok(status)
+}
+
+/// `main::Focus` is the host's, `shellsong::Focus` the language's
+/// mirror of it (kept separate so the language depends on nothing in
+/// the ui). One to one.
+fn shellsong_focus(focus: Focus) -> shellsong::Focus {
+    match focus {
+        Focus::Sidebar => shellsong::Focus::Sidebar,
+        Focus::Workspace => shellsong::Focus::Workspace,
+        Focus::BottomBar => shellsong::Focus::BottomBar,
+    }
+}
+
+/// Everything a running program knows about the world, rebuilt from
+/// live state before every `step`. `queue_len` counts the whole
+/// playlist, played prefix included, because that is what the queue
+/// view numbers and therefore what `goto(n)`/`remove(n)` mean.
+fn shellsong_env(
+    app: &app::App,
+    queue: &PlayQueue,
+    browse_view: &Option<browse::BrowseView>,
+    focus: Focus,
+    settled: bool,
+    now: Duration,
+) -> shellsong::Env {
+    shellsong::Env {
+        now,
+        query: app.query.clone(),
+        results: app.results.iter().map(shellsong::Kind::of).collect(),
+        search_settled: settled,
+        queue_len: queue.entries().len(),
+        browsing: browse_view.is_some(),
+        focus: shellsong_focus(focus),
+    }
+}
+
+/// mpv's current volume, which `volume(+10%)` nudges from and a fade
+/// ramps away from. `None` only if the ipc read fails.
+fn current_volume(player: &mpv::Mpv) -> Option<f64> {
+    player.get_property("volume").ok().and_then(|v| v.as_f64())
+}
+
+/// Whether `item` is starred right now, so `star()`/`unstar()` can set
+/// a state rather than flip one (`toggle_star` only flips).
+fn is_starred(
+    item: &SearchItem,
+    favorites: &favorites::Favorites,
+    remote_starred: &HashSet<String>,
+) -> bool {
+    match item {
+        SearchItem::LocalMusic { path, .. } | SearchItem::LocalVideo { path, .. } => {
+            favorites.is_starred(&path.to_string_lossy())
+        }
+        SearchItem::Song { id, .. } => remote_starred.contains(id),
+        SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => false,
+    }
+}
+
+/// The album page a song belongs to. A `Song` carries its album's
+/// *name*, not its id, so this can only find an album the corpus has
+/// already indexed; `view(q, ...)` landing on the album itself is the
+/// direct route.
+fn album_page(
+    corpus: &search::Corpus,
+    album: &str,
+    client: &Arc<subsonic::Client>,
+) -> Option<SearchItem> {
+    corpus
+        .items()
+        .find(|item| match item {
+            SearchItem::Album {
+                name, client: from, ..
+            } => name == album && from.base_url() == client.base_url(),
+            _ => false,
+        })
+        .cloned()
+}
+
+/// `add_to_queue(front, ...)`: append, then move the new entry in
+/// right behind what is playing. `enqueue_track` still writes both
+/// sides (mpv's playlist and the index map); this only reorders, with
+/// the same `move_entry` + `playlist_move` pairing the queue view's
+/// reorder uses. Appended unshuffled on purpose: `front` means front.
+fn enqueue_next(item: &SearchItem, ctx: &mut ActionCtx) -> Result<(), String> {
+    let status = enqueue_track(ctx.player, item, ctx.cache, ctx.queue, false);
+    if status.starts_with("error") || status.starts_with("not ") {
+        return Err(status);
+    }
+    let from = ctx.queue.entries().len().saturating_sub(1);
+    let to = ctx.queue.pos().map_or(0, |p| p + 1);
+    if to < from && ctx.queue.move_entry(from, to) {
+        if let Err(e) = ctx.player.playlist_move(from, to) {
+            return Err(format!("error moving: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// What one op reported into the scrollback. `Described` takes
+/// `Op::describe()`, which is usually the right line; the host
+/// overrides with `Note` when it knows a better one (a track title, a
+/// count) and with `Failed` when the op could not be applied. Every op
+/// produces exactly one of these: nothing in shellsong is silent
+/// (docs/shellsong.md R9).
+enum Report {
+    Described,
+    Note(String),
+    Failed(String),
+}
+
+fn op_done() -> (Dispatch, Report) {
+    (Dispatch::Continue, Report::Described)
+}
+
+fn op_note(text: impl Into<String>) -> (Dispatch, Report) {
+    (Dispatch::Continue, Report::Note(text.into()))
+}
+
+fn op_fail(text: impl Into<String>) -> (Dispatch, Report) {
+    (Dispatch::Continue, Report::Failed(text.into()))
+}
+
+/// One ipc write, reported either way; mpv failing is the one thing
+/// most of the transport ops can do wrong.
+fn op_ipc(result: anyhow::Result<()>) -> (Dispatch, Report) {
+    match result {
+        Ok(()) => op_done(),
+        Err(e) => op_fail(e.to_string()),
+    }
+}
+
+/// Which way a selection op moves. `up()`/`down()` carry a delta,
+/// `top()`/`bottom()` are ends.
+enum SelectStep {
+    By(i32),
+    Top,
+    Bottom,
+}
+
+/// Every bit of main-loop state a shellsong `Op` can touch that an
+/// `Action` cannot, bundled into one argument the way `ActionCtx` and
+/// `DownloadCtx` are. `actx` is held rather than copied so every op
+/// with an `Action` behind it goes through `dispatch_action`, which is
+/// what keeps a shellsong command and a keypress from drifting apart.
+struct ShellsongCtx<'a, 'b> {
+    actx: &'a mut ActionCtx<'b>,
+    console: &'a mut Console,
+    /// Cleared by anything `Op::closes_console` says takes over the
+    /// screen; the console is a centred overlay and would sit on top
+    /// of whatever just opened.
+    console_open: &'a mut bool,
+    /// The same monotonic reading `Env::now` carries this frame, so a
+    /// ramp started by an op and ticked next frame share one clock.
+    now: Duration,
+    now_playing: &'a Option<SearchItem>,
+    favorites: &'a mut favorites::Favorites,
+    remote_starred: &'a mut HashSet<String>,
+    // `view(...)` targets: each one is the same main-loop local its
+    // keybind already writes, never a parallel copy.
+    queue_view_open: &'a mut bool,
+    queue_selected: &'a mut usize,
+    suggestions: &'a mut Option<suggest::Suggestions>,
+    suggestions_selected: &'a mut usize,
+    settings_menu_open: &'a mut bool,
+    keybinds_menu_open: &'a mut bool,
+    keybinds_menu_selected: &'a mut usize,
+    eq_menu_open: &'a mut bool,
+    eq_menu_selected: &'a mut usize,
+    lyrics_lines: &'a mut Option<Vec<String>>,
+    lyrics_track: &'a mut String,
+    lyrics_scroll: &'a mut usize,
+    lyrics_client: &'a lyrics::Client,
+    // volume, and everything that ramps it.
+    base_volume: &'a mut f64,
+    crossfade_enabled: &'a mut bool,
+    fade_in_started_at: &'a mut Option<Instant>,
+    /// `fade(in|out)`'s ramp; `sleep_due` is its deadline-driven
+    /// cousin. Both reuse the crossfade ramp's shape rather than
+    /// cutting the audio dead.
+    fade: &'a mut Option<Ramp>,
+    sleep_due: &'a mut Option<Duration>,
+    bottombar_selected: Field,
+    /// Replaced wholesale by `rescan()`, which needs a fresh channel:
+    /// the scan thread signs off by dropping its sender.
+    scan_rx: &'a mut mpsc::Receiver<library::ScanBatch>,
+    remote_search_tx: &'a mpsc::Sender<RemoteSearchQuery>,
+    settle: &'a mut SearchSettle,
+    /// Snapshot behind `load_queue`'s completion; refreshed on open
+    /// and after a save rather than read off disk per keystroke.
+    saved_queues: &'a mut Vec<String>,
+}
+
+/// What a term-taking op acts on. `Index` is a row of the results
+/// list; `Selection` is whatever is highlighted, resolved exactly the
+/// way the keyboard's star/download keys resolve it (a focused browse
+/// view owns the highlight, otherwise the sidebar does).
+fn shellsong_item(target: Target, ctx: &ShellsongCtx) -> Option<SearchItem> {
+    match target {
+        Target::Index(i) => ctx.actx.app.results.get(i).cloned(),
+        Target::Selection => {
+            if let (Some(bv), Focus::Workspace) = (ctx.actx.browse_view.as_ref(), *ctx.actx.focus) {
+                return if bv.albums_focused {
+                    bv.albums.get(bv.albums_selected).cloned()
+                } else {
+                    bv.tracks.get(bv.selected).cloned()
+                };
+            }
+            ctx.actx.app.results.get(ctx.actx.app.selected).cloned()
+        }
+    }
+}
+
+/// The selection `up()`/`down()`/`top()`/`bottom()` move is whichever
+/// pane owns the keyboard, exactly as j/k and gg/G do: a focused
+/// browse view, suggestions menu or queue view owns its own cursor,
+/// otherwise it is the sidebar's results list.
+fn move_shellsong_selection(step: SelectStep, ctx: &mut ShellsongCtx) -> (Dispatch, Report) {
+    if *ctx.actx.focus == Focus::Workspace {
+        if let Some(bv) = ctx.actx.browse_view.as_mut() {
+            match step {
+                SelectStep::By(d) => {
+                    for _ in 0..d.unsigned_abs() {
+                        if d < 0 {
+                            bv.prev();
+                        } else {
+                            bv.next();
+                        }
+                    }
+                }
+                SelectStep::Top if bv.albums_focused => bv.albums_selected = 0,
+                SelectStep::Bottom if bv.albums_focused => {
+                    bv.albums_selected = bv.albums.len().saturating_sub(1);
+                }
+                SelectStep::Top => {
+                    bv.selected = bv.visible_track_indices().first().copied().unwrap_or(0);
+                }
+                SelectStep::Bottom => {
+                    bv.selected = bv.visible_track_indices().last().copied().unwrap_or(0);
+                }
+            }
+            return op_done();
+        }
+        if let Some(sug) = ctx.suggestions.as_ref() {
+            let last = ui::suggestions::count(sug).saturating_sub(1) as i64;
+            let at = *ctx.suggestions_selected as i64;
+            let to = match step {
+                SelectStep::By(d) => (at + i64::from(d)).clamp(0, last),
+                SelectStep::Top => 0,
+                SelectStep::Bottom => last,
+            };
+            *ctx.suggestions_selected = to as usize;
+            return op_done();
+        }
+        if *ctx.queue_view_open {
+            let order = ui::queue::selectable(ctx.actx.queue.entries(), ctx.actx.queue.pos());
+            if order.is_empty() {
+                return op_fail("the queue is empty");
+            }
+            let at = order
+                .iter()
+                .position(|i| *i == *ctx.queue_selected)
+                .unwrap_or(0) as i64;
+            let last = order.len() as i64 - 1;
+            let to = match step {
+                SelectStep::By(d) => (at + i64::from(d)).clamp(0, last),
+                SelectStep::Top => 0,
+                SelectStep::Bottom => last,
+            };
+            *ctx.queue_selected = order[to as usize];
+            return op_done();
+        }
+    }
+    match step {
+        SelectStep::By(d) => ctx.actx.app.move_selection(d as isize),
+        SelectStep::Top => ctx.actx.app.select_top(),
+        SelectStep::Bottom => ctx.actx.app.select_bottom(),
+    }
+    op_done()
+}
+
+/// `view(target)`: the one screen-opening op. Every target writes the
+/// same state its own keybind writes; the four listings and `help`
+/// print into the scrollback instead and leave the console up (see
+/// `ViewTarget::is_screen`).
+fn open_shellsong_view(target: ViewTarget, ctx: &mut ShellsongCtx) -> (Dispatch, Report) {
+    match target {
+        ViewTarget::Now => {
+            if ctx.now_playing.is_none() {
+                return op_fail("nothing is playing");
+            }
+            *ctx.actx.player_minimized = false;
+            op_done()
+        }
+        ViewTarget::Suggestions => {
+            let starred = suggestion_starred_keys(ctx.remote_starred, ctx.favorites);
+            let catalog = suggest::Catalog::from_corpus(&ctx.actx.app.corpus);
+            let guard = ctx.actx.cache.lock().expect("cache mutex poisoned");
+            let suggestions = suggest::suggest(&suggest::Request::new(
+                &catalog,
+                &guard,
+                &starred,
+                cache::now_secs(),
+            ));
+            drop(guard);
+            let total = ui::suggestions::count(&suggestions);
+            *ctx.suggestions = Some(suggestions);
+            *ctx.suggestions_selected = 0;
+            *ctx.actx.focus = Focus::Workspace;
+            op_note(format!("{total} suggestions"))
+        }
+        ViewTarget::Settings => {
+            *ctx.settings_menu_open = true;
+            op_done()
+        }
+        ViewTarget::Keybinds => {
+            *ctx.keybinds_menu_open = true;
+            *ctx.keybinds_menu_selected = 0;
+            op_done()
+        }
+        ViewTarget::Eq => {
+            *ctx.eq_menu_open = true;
+            *ctx.eq_menu_selected = if ctx.actx.app.eq_custom {
+                ui::eq_menu::PRESET_COUNT
+            } else {
+                ctx.actx.app.eq_preset
+            };
+            op_done()
+        }
+        ViewTarget::Lyrics => open_shellsong_lyrics(ctx),
+        ViewTarget::Starred => {
+            let bv = open_starred_view(&ctx.actx.cfg.navidrome_servers, ctx.favorites);
+            let count = bv.tracks.len();
+            *ctx.actx.real_art_protocol = ctx
+                .actx
+                .picker
+                .as_mut()
+                .and_then(|p| bv.art.clone().map(|img| p.new_resize_protocol(img)));
+            *ctx.actx.browse_view = Some(bv);
+            // same as opening an album: the listing draws its own
+            // cursor, so j/k have to move it rather than the hidden
+            // sidebar behind it.
+            *ctx.actx.focus = Focus::Workspace;
+            op_note(format!("{count} starred"))
+        }
+        ViewTarget::Queue => {
+            let pos = ctx.actx.queue.pos();
+            let lines: Vec<String> = ctx
+                .actx
+                .queue
+                .entries()
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let here = if Some(i) == pos { '>' } else { ' ' };
+                    format!("{here}{:>3}. {}", i + 1, label(item))
+                })
+                .collect();
+            if lines.is_empty() {
+                return op_note("the queue is empty");
+            }
+            let count = lines.len();
+            for line in lines {
+                ctx.console.note(line);
+            }
+            op_note(format!("{count} in the queue"))
+        }
+        ViewTarget::Index => {
+            let rows = ctx.actx.app.corpus.breakdown();
+            for (source, count) in &rows {
+                ctx.console.note(format!("{source}: {count}"));
+            }
+            op_note(format!("{} sources indexed", rows.len()))
+        }
+        ViewTarget::History => {
+            // cloned first: the scrollback is being pushed into, and
+            // the history lives on the same `Console`.
+            let lines: Vec<String> = ctx.console.history().to_vec();
+            if lines.is_empty() {
+                return op_note("no history yet");
+            }
+            let count = lines.len();
+            for line in lines {
+                ctx.console.note(format!(": {line}"));
+            }
+            op_note(format!("{count} past commands"))
+        }
+        ViewTarget::Playlists => {
+            *ctx.saved_queues = queues::list();
+            if ctx.saved_queues.is_empty() {
+                return op_note("no saved queues; save_queue(name) makes one");
+            }
+            let names = ctx.saved_queues.clone();
+            let count = names.len();
+            for name in names {
+                ctx.console.note(name);
+            }
+            op_note(format!("{count} saved queues"))
+        }
+        // generated by the language itself (so `help()` and
+        // `view(help)` can't drift), lowered to notes rather than to
+        // an op; handled anyway rather than left to a wildcard.
+        ViewTarget::Help => {
+            for line in shellsong::help_lines() {
+                ctx.console.note(line);
+            }
+            op_done()
+        }
+    }
+}
+
+/// `view(lyrics)`: the same blocking lookup the lyrics keybind does,
+/// reporting into the console instead of a toast.
+fn open_shellsong_lyrics(ctx: &mut ShellsongCtx) -> (Dispatch, Report) {
+    let Some(item) = ctx.now_playing.clone() else {
+        return op_fail("nothing is playing");
+    };
+    let Some((artist, title, album)) = lyrics_query(&item) else {
+        return op_fail("no lyrics for this item");
+    };
+    match ctx.lyrics_client.lookup(&artist, &title, &album, None) {
+        Ok(Some(l)) => {
+            // the api's own `instrumental` flag, not "both fields
+            // happened to be empty".
+            let text = if l.instrumental {
+                "(instrumental, no lyrics)".to_string()
+            } else {
+                l.plain
+                    .or(l.synced)
+                    .unwrap_or_else(|| "(no lyrics text available)".to_string())
+            };
+            *ctx.lyrics_lines = Some(text.lines().map(str::to_string).collect());
+            *ctx.lyrics_track = label(&item);
+            *ctx.lyrics_scroll = 0;
+            op_done()
+        }
+        Ok(None) => op_fail("no lyrics found"),
+        Err(e) => op_fail(format!("lyrics lookup failed: {e}")),
+    }
+}
+
+/// Applies one op and reports exactly one line into the scrollback.
+/// The report is `Op::describe()` unless the host knew something
+/// better; `Op::closes_console` is consulted here, in one place,
+/// rather than by each view-opener remembering to.
+fn apply_shellsong_op(op: Op, ctx: &mut ShellsongCtx) -> Dispatch {
+    let described = op.describe();
+    let closes = op.closes_console();
+    let (dispatch, report) = run_shellsong_op(op, ctx);
+    // only on success: closing the console to make room for a screen
+    // that then failed to open would take the error message with it.
+    if closes && !matches!(report, Report::Failed(_)) {
+        *ctx.console_open = false;
+    }
+    match report {
+        Report::Described => ctx.console.note(described),
+        Report::Note(text) => ctx.console.note(text),
+        Report::Failed(text) => ctx.console.fail(text),
+    }
+    dispatch
+}
+
+/// The `Op` -> host table. Every arm goes through the call the matching
+/// keypress already makes (`dispatch_action` wherever an `Action`
+/// exists), so a shellsong command and a keybind can never diverge in
+/// behaviour; see docs/shellsong.md.
+fn run_shellsong_op(op: Op, ctx: &mut ShellsongCtx) -> (Dispatch, Report) {
+    match op {
+        Op::TogglePause => {
+            if ctx.now_playing.is_none() {
+                return op_fail("nothing is playing");
+            }
+            op_ipc(ctx.actx.player.toggle_pause())
+        }
+        Op::SkipNext => {
+            if ctx.now_playing.is_none() {
+                return op_fail("nothing is playing");
+            }
+            op_ipc(ctx.actx.player.playlist_next())
+        }
+        Op::SkipBack => {
+            if ctx.actx.previous_track.is_none() {
+                return op_fail("no previous track");
+            }
+            let mut dctx = DownloadCtx {
+                cache: ctx.actx.cache,
+                download_tx: ctx.actx.download_tx,
+                downloading: ctx.actx.downloading,
+                day_threshold: ctx.actx.cfg.cache_days_threshold,
+            };
+            let mut hooks = TrackChangeCtx {
+                dctx: &mut dctx,
+                scrobble: ctx.actx.scrobble,
+                subtitle_tx: ctx.actx.subtitle_tx,
+            };
+            let status = go_to_previous(
+                ctx.actx.cfg,
+                ctx.actx.player,
+                ctx.actx.notifications,
+                ctx.actx.previous_track,
+                ctx.actx.queue,
+                &mut hooks,
+            );
+            op_note(status)
+        }
+        Op::SeekAbsolute(pos) => {
+            let (_, duration, _) = playback_info(ctx.actx.player);
+            match shellsong_host::seek_target(pos, duration) {
+                Ok(secs) => match ctx.actx.player.seek(secs, false) {
+                    Ok(()) => op_note(format!("moved to {secs:.0}s")),
+                    Err(e) => op_fail(e.to_string()),
+                },
+                Err(why) => op_fail(why),
+            }
+        }
+        Op::SeekRelative(delta) => op_ipc(ctx.actx.player.seek(delta, true)),
+        Op::SetVolume(level) => {
+            let current = current_volume(ctx.actx.player).unwrap_or(*ctx.base_volume);
+            let target = shellsong_host::volume_target(level, current);
+            match ctx.actx.player.set_volume(target) {
+                // the new level becomes the ceiling the crossfade and
+                // fade ramps scale against, or the next fade-in would
+                // snap the volume back to whatever it was at startup.
+                Ok(()) => {
+                    *ctx.base_volume = target;
+                    op_note(format!("volume: {target:.0}%"))
+                }
+                Err(e) => op_fail(format!("error setting volume: {e}")),
+            }
+        }
+        // mpv's own `mute`, not volume 0: it is reversible without
+        // having to remember the level, and `volume(...)` stays the one
+        // thing that moves the level.
+        Op::Mute(on) => op_ipc(ctx.actx.player.set_property("mute", serde_json::json!(on))),
+        Op::CycleLoop => {
+            let mode = ctx.actx.app.cycle_loop();
+            let dispatch = dispatch_action(Action::SetLoop(mode), ctx.actx);
+            (dispatch, Report::Note(format!("loop: {}", mode.label())))
+        }
+        Op::SetLoop(mode) => {
+            ctx.actx.app.loop_mode = mode;
+            let dispatch = dispatch_action(Action::SetLoop(mode), ctx.actx);
+            (dispatch, Report::Described)
+        }
+        Op::ToggleShuffle => {
+            let on = ctx.actx.app.toggle_shuffle();
+            let dispatch = dispatch_action(Action::ShuffleToggled(on), ctx.actx);
+            (
+                dispatch,
+                Report::Note(format!("shuffle: {}", if on { "on" } else { "off" })),
+            )
+        }
+        Op::SetShuffle(want) => {
+            if ctx.actx.app.shuffle == want {
+                return op_note(format!(
+                    "shuffle is already {}",
+                    if want { "on" } else { "off" }
+                ));
+            }
+            let on = ctx.actx.app.toggle_shuffle();
+            let dispatch = dispatch_action(Action::ShuffleToggled(on), ctx.actx);
+            (dispatch, Report::Described)
+        }
+        Op::SetSpeed(speed) => {
+            ctx.actx.app.speed = speed;
+            let dispatch = dispatch_action(Action::SetSpeed(speed), ctx.actx);
+            (dispatch, Report::Described)
+        }
+        Op::SpeedUp | Op::SpeedDown => {
+            let dir = if matches!(op, Op::SpeedUp) { 1.0 } else { -1.0 };
+            let speed = ctx.actx.app.bump_speed(dir);
+            let dispatch = dispatch_action(Action::SetSpeed(speed), ctx.actx);
+            (dispatch, Report::Note(format!("speed: {speed}x")))
+        }
+        Op::SetEqPreset(index) => {
+            // `apply_eq_preset_row` takes an eq-menu row, and rows
+            // below `PRESET_COUNT` are exactly the presets in order.
+            if index >= ui::eq_menu::PRESET_COUNT {
+                return op_fail(format!("no eq preset {index}"));
+            }
+            apply_eq_preset_row(ctx.actx.app, ctx.actx.player, ctx.actx.notifications, index);
+            op_done()
+        }
+        Op::ToggleCrossfade => {
+            *ctx.crossfade_enabled = !*ctx.crossfade_enabled;
+            if !*ctx.crossfade_enabled {
+                *ctx.fade_in_started_at = None;
+                let _ = ctx.actx.player.set_volume(*ctx.base_volume);
+            }
+            *ctx.actx.flash = Some((Field::Crossfade, Instant::now()));
+            op_note(format!(
+                "crossfade: {}",
+                if *ctx.crossfade_enabled { "on" } else { "off" }
+            ))
+        }
+        Op::Search(query) => {
+            ctx.actx.app.set_query(&query);
+            let fired = notify_query_changed(ctx.actx.app, ctx.remote_search_tx);
+            ctx.settle.notified(fired, ctx.now);
+            op_note(format!(
+                "search: {query} ({} results so far)",
+                ctx.actx.app.results.len()
+            ))
+        }
+        Op::MoveSelection(delta) => move_shellsong_selection(SelectStep::By(delta), ctx),
+        Op::SelectTop => move_shellsong_selection(SelectStep::Top, ctx),
+        Op::SelectBottom => move_shellsong_selection(SelectStep::Bottom, ctx),
+        Op::Go(GoTarget::Result) => {
+            let Some(item) = ctx.actx.app.results.get(ctx.actx.app.selected).cloned() else {
+                return op_fail("nothing is selected");
+            };
+            let name = label(&item);
+            let dispatch = dispatch_action(Action::Play(item), ctx.actx);
+            (dispatch, Report::Note(format!("enter on {name}")))
+        }
+        Op::Go(GoTarget::BrowseRow) => {
+            let session = ctx
+                .actx
+                .browse_view
+                .as_ref()
+                .map(browse_session)
+                .unwrap_or_default();
+            match start_session(session, true, ctx.actx) {
+                Ok(status) => op_note(status),
+                Err(why) => op_fail(why),
+            }
+        }
+        Op::Go(GoTarget::BottomBarField) => {
+            // enter on the bottom bar tweaks whichever field is
+            // selected, and every one of those fields already has its
+            // own command; reuse them rather than keeping a second
+            // copy of the bar's own match.
+            let field_op = match ctx.bottombar_selected {
+                Field::Pause => Op::TogglePause,
+                Field::Loop => Op::CycleLoop,
+                Field::Shuffle => Op::ToggleShuffle,
+                Field::Speed => Op::SpeedUp,
+                Field::Eq => Op::View(ViewTarget::Eq),
+                Field::Crossfade => Op::ToggleCrossfade,
+                // enter on the scrubber opens a keyboard drag, which
+                // the open console would swallow every key of; the
+                // language has real seek commands instead.
+                Field::Progress => {
+                    return op_fail("use moveto(1m20s) or seek(+30s) to scrub from here")
+                }
+            };
+            let closes = field_op.closes_console();
+            let result = run_shellsong_op(field_op, ctx);
+            if closes && !matches!(result.1, Report::Failed(_)) {
+                *ctx.console_open = false;
+            }
+            result
+        }
+        Op::Play(target) => {
+            // `go()`'s browse-row reading, for the same reason: with a
+            // browse view focused, the selection *is* a row of it, and
+            // playing one plays through to the end of the listing.
+            if target == Target::Selection
+                && *ctx.actx.focus == Focus::Workspace
+                && ctx.actx.browse_view.is_some()
+            {
+                return run_shellsong_op(Op::Go(GoTarget::BrowseRow), ctx);
+            }
+            let Some(item) = shellsong_item(target, ctx) else {
+                return op_fail("nothing is selected");
+            };
+            let name = label(&item);
+            let dispatch = dispatch_action(Action::Play(item), ctx.actx);
+            (dispatch, Report::Note(format!("playing: {name}")))
+        }
+        Op::Enqueue { target, front } => {
+            let Some(item) = shellsong_item(target, ctx) else {
+                return op_fail("nothing is selected");
+            };
+            if !front {
+                // `Action::Queued` expands an album/playlist itself and
+                // reports its own count; resolving here as well would
+                // cost a second fetch of the very same track list.
+                let dispatch = dispatch_action(Action::Queued(item), ctx.actx);
+                return (dispatch, Report::Described);
+            }
+            let tracks = match resolve_tracks(&item) {
+                Ok(tracks) => tracks,
+                Err(why) => return op_fail(why),
+            };
+            if tracks.is_empty() {
+                return op_fail("nothing to queue (empty album or playlist)");
+            }
+            // reversed so the batch keeps its own order: each one is
+            // inserted directly behind what is playing.
+            for track in tracks.iter().rev() {
+                if let Err(why) = enqueue_next(track, ctx.actx) {
+                    return op_fail(why);
+                }
+            }
+            op_note(format!("queued {} tracks next", tracks.len()))
+        }
+        Op::Star { target, on } => {
+            let Some(item) = shellsong_item(target, ctx) else {
+                return op_fail("nothing is selected");
+            };
+            let verb = if on { "starred" } else { "unstarred" };
+            if is_starred(&item, ctx.favorites, ctx.remote_starred) == on {
+                return op_note(format!("'{}' is already {verb}", item.primary_name()));
+            }
+            match toggle_star(&item, ctx.favorites, ctx.remote_starred) {
+                Ok(_) => op_note(format!("{verb} '{}'", item.primary_name())),
+                Err(why) => op_fail(why),
+            }
+        }
+        Op::Download(target) => {
+            let Some(item) = shellsong_item(target, ctx) else {
+                return op_fail("nothing is selected");
+            };
+            let mut dctx = DownloadCtx {
+                cache: ctx.actx.cache,
+                download_tx: ctx.actx.download_tx,
+                downloading: ctx.actx.downloading,
+                day_threshold: ctx.actx.cfg.cache_days_threshold,
+            };
+            let status = trigger_downloads(&item, &mut dctx, ctx.actx.notifications);
+            op_note(status)
+        }
+        Op::OpenPage(target) => {
+            let Some(item) = shellsong_item(target, ctx) else {
+                return op_fail("nothing is selected");
+            };
+            // an album/artist/playlist *is* a page, and
+            // `Action::Play` on one opens it rather than playing it; a
+            // song has no page of its own, so the page it belongs to
+            // is its album's. A local file has neither.
+            let page = match &item {
+                SearchItem::Album { .. }
+                | SearchItem::Artist { .. }
+                | SearchItem::Playlist { .. } => Some(item.clone()),
+                SearchItem::Song { album, client, .. } => {
+                    album_page(&ctx.actx.app.corpus, album, client)
+                }
+                SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => None,
+            };
+            match page {
+                Some(page) => {
+                    let name = label(&page);
+                    let dispatch = dispatch_action(Action::Play(page), ctx.actx);
+                    (dispatch, Report::Note(format!("opened {name}")))
+                }
+                None => op_fail(format!("no page for '{}'", item.primary_name())),
+            }
+        }
+        Op::ClearQueue => {
+            // mpv's own `playlist-clear` keeps the file that is
+            // playing and drops the rest, which is exactly what
+            // clearing the queue means; `entries` only mirrors it.
+            match ctx.actx.player.playlist_clear() {
+                Ok(()) => {
+                    ctx.actx.queue.replace_upcoming(Vec::new());
+                    *ctx.queue_selected = 0;
+                    op_done()
+                }
+                Err(e) => op_fail(format!("error clearing the queue: {e}")),
+            }
+        }
+        Op::RemoveFromQueue(positions) => {
+            // 1-based and descending, so removing one can't reindex
+            // the next; the same `remove` + `playlist_remove` pairing
+            // the queue view's 'd' uses.
+            let mut removed = 0;
+            for position in &positions {
+                let index = position.saturating_sub(1);
+                if ctx.actx.queue.remove(index) {
+                    if let Err(e) = ctx.actx.player.playlist_remove(index) {
+                        return op_fail(format!("error removing: {e}"));
+                    }
+                    removed += 1;
+                }
+            }
+            let left = ctx.actx.queue.entries().len();
+            *ctx.queue_selected = (*ctx.queue_selected).min(left.saturating_sub(1));
+            op_note(format!("removed {removed} from the queue"))
+        }
+        Op::GotoQueue(position) => {
+            // a `playlist-pos` write, not a reload: mpv keeps the same
+            // playlist so `entries` stays index-aligned with it (same
+            // as enter in the queue view).
+            op_ipc(ctx.actx.player.set_property(
+                "playlist-pos",
+                serde_json::json!(position.saturating_sub(1)),
+            ))
+        }
+        Op::ShuffleQueue => {
+            let shuffled = ctx.actx.queue.shuffled_upcoming();
+            let count = shuffled.len();
+            let status = resync_upcoming(ctx.actx.player, ctx.actx.cache, ctx.actx.queue, shuffled);
+            if status.starts_with("error") {
+                return op_fail(status);
+            }
+            op_note(format!("shuffled {count} upcoming"))
+        }
+        Op::SaveQueue(name) => match queues::save(&name, ctx.actx.queue.entries()) {
+            Ok(0) => op_fail("nothing in the queue to save"),
+            Ok(count) => {
+                *ctx.saved_queues = queues::list();
+                op_note(format!("saved {count} tracks as '{}'", queues::slug(&name)))
+            }
+            Err(e) => op_fail(format!("couldn't save '{name}': {e}")),
+        },
+        Op::LoadQueue(name) => {
+            let clients = shellsong_host::clients_of(&ctx.actx.app.corpus);
+            match queues::load(&name, &clients) {
+                None => op_fail(format!("no saved queue called '{name}'")),
+                Some(items) if items.is_empty() => {
+                    op_fail(format!("nothing in '{name}' could be found any more"))
+                }
+                Some(items) => {
+                    let count = items.len();
+                    match start_session(items, false, ctx.actx) {
+                        Ok(_) => op_note(format!("loaded '{name}': {count} tracks")),
+                        Err(why) => op_fail(why),
+                    }
+                }
+            }
+        }
+        Op::View(target) => open_shellsong_view(target, ctx),
+        Op::Rescan => {
+            // a fresh channel and thread, same as startup: the scan
+            // signs off by dropping its sender, so the old receiver
+            // can't be reused. Only the local half of the corpus is
+            // dropped, or a rescan would also wipe the navidrome
+            // catalog until the next sync landed.
+            let (tx, rx) = mpsc::channel::<library::ScanBatch>();
+            library::spawn_scan(ctx.actx.cfg.library_paths.clone(), tx);
+            *ctx.scan_rx = rx;
+            ctx.actx.app.corpus.drop_local();
+            ctx.actx.app.scanning_library = true;
+            ctx.actx.app.resync_results();
+            op_done()
+        }
+        Op::Sleep(Some(secs)) => {
+            *ctx.sleep_due = Some(ctx.now + Duration::from_secs_f64(secs.max(0.0)));
+            op_done()
+        }
+        Op::Sleep(None) => {
+            let was_set = ctx.sleep_due.take().is_some();
+            if !was_set {
+                return op_note("no sleep timer was set");
+            }
+            // the ramp may already have taken the volume down.
+            let _ = ctx.actx.player.set_volume(*ctx.base_volume);
+            op_done()
+        }
+        Op::Fade { into, secs } => {
+            let from = current_volume(ctx.actx.player).unwrap_or(*ctx.base_volume);
+            let to = if into { *ctx.base_volume } else { 0.0 };
+            *ctx.fade = Some(Ramp::new(
+                from,
+                to,
+                ctx.now,
+                Duration::from_secs_f64(secs.max(0.0)),
+            ));
+            op_done()
+        }
+        Op::Quit => {
+            let dispatch = dispatch_action(Action::Quit, ctx.actx);
+            (dispatch, Report::Described)
+        }
+    }
+}
+
 /// Whether a play that just happened should kick off a background
 /// download. Pure, and kept apart from the clock and the cache file so
 /// the policy itself is testable: `days_played` is the number of
@@ -1457,18 +2375,28 @@ fn spawn_background_sync(
 /// yet, same as the background thread's own guard, just avoiding the
 /// channel send entirely in the common "nothing to search remotely"
 /// case.
-fn notify_query_changed(app: &app::App, remote_search_tx: &mpsc::Sender<RemoteSearchQuery>) {
+///
+/// Reports whether a request actually went out, which is exactly what
+/// `SearchSettle` needs: with nothing fired there is nothing to wait
+/// for, so the results for the new query are already as complete as
+/// they will get.
+fn notify_query_changed(
+    app: &app::App,
+    remote_search_tx: &mpsc::Sender<RemoteSearchQuery>,
+) -> bool {
     if app.query.trim().is_empty() {
-        return;
+        return false;
     }
     let clients = app.corpus.remote_clients();
     if clients.is_empty() {
-        return;
+        return false;
     }
-    let _ = remote_search_tx.send(RemoteSearchQuery {
-        query: app.query.clone(),
-        clients,
-    });
+    remote_search_tx
+        .send(RemoteSearchQuery {
+            query: app.query.clone(),
+            clients,
+        })
+        .is_ok()
 }
 
 /// The catalog shape fetched over the wire, kept separate from `App` so
@@ -1739,7 +2667,10 @@ fn main() -> anyhow::Result<()> {
     // thread while the ui is already up, drained next to `sync_rx` in
     // the main loop. nothing between here and the first frame waits on
     // it. see docs/architecture.md.
-    let (scan_tx, scan_rx) = mpsc::channel::<library::ScanBatch>();
+    // `mut` because `rescan()` replaces it with a fresh channel: the
+    // scan thread signs off by dropping its sender, so a finished
+    // channel can never be reused.
+    let (scan_tx, mut scan_rx) = mpsc::channel::<library::ScanBatch>();
     library::spawn_scan(cfg.library_paths.clone(), scan_tx);
 
     let player = mpv::Mpv::spawn()?;
@@ -1886,6 +2817,23 @@ fn main() -> anyhow::Result<()> {
     // doesn't kick off a duplicate transfer of the same file.
     let mut downloading: HashSet<String> = HashSet::new();
     let lyrics_client = lyrics::Client::new();
+    // the shellsong console: ':' opens it, and while it is open it
+    // claims every key and every paste (see its input tier, which sits
+    // at the same tier `editing_query` does and for the same reason).
+    // Built once rather than per open, so the scrollback, the history
+    // and the completion ranking all survive closing it; `Console::new`
+    // is also the only thing here that touches the disk.
+    let mut console = Console::new();
+    let mut console_open = false;
+    // the program a submitted line parsed into, held across frames:
+    // a command that searches blocks on `AwaitResults` until the host
+    // says the results settled, so it cannot run in one pass.
+    let mut shellsong_program: Option<Box<shellsong::Program>> = None;
+    // `load_queue`'s completion candidates, snapshotted rather than
+    // read off the disk on every keystroke.
+    let mut saved_queues: Vec<String> = Vec::new();
+    // backs `Env::search_settled`; see `shellsong_host::SearchSettle`.
+    let mut settle = SearchSettle::default();
     // the queue view owns main_content like the browse/lyrics views do;
     // its cursor is separate from playback, so scrolling it never moves
     // what mpv is playing.
@@ -2024,8 +2972,10 @@ fn main() -> anyhow::Result<()> {
 
     // the ceiling crossfade's fade-out/fade-in ramps scale against;
     // read back rather than assuming 100, since persistence may have
-    // just restored something else above.
-    let base_volume = player
+    // just restored something else above. `mut` because shellsong's
+    // `volume(...)` moves the ceiling itself, or the next fade-in
+    // would snap back to whatever it was at startup.
+    let mut base_volume = player
         .get_property("volume")
         .ok()
         .and_then(|v| v.as_f64())
@@ -2035,6 +2985,12 @@ fn main() -> anyhow::Result<()> {
     // no notion of this, so it's tracked entirely on our side and
     // cleared once the fade finishes.
     let mut fade_in_started_at: Option<Instant> = None;
+    // shellsong's `fade(in|out)` ramp and `sleep(...)` deadline, both
+    // off the same `start.elapsed()` clock `Env::now` carries so an op
+    // and the tick that finishes it agree about the time. They reuse
+    // the crossfade ramp's shape rather than cutting the audio dead.
+    let mut shellsong_fade: Option<Ramp> = None;
+    let mut sleep_due: Option<Duration> = None;
     // Which ControlsBar control most recently changed, and when;
     // render computes a decaying brightness from the elapsed time
     // rather than a one-off status sentence, so a toggle just lights
@@ -2701,6 +3657,20 @@ fn main() -> anyhow::Result<()> {
                     area,
                 );
             }
+
+            // the console goes on absolutely last: it is a centred box
+            // over everything else (same class as the subtitle menu),
+            // and it claims every key while it is up, so nothing may
+            // ever be drawn on top of it. It centres itself in `area`.
+            if console_open {
+                f.render_widget(
+                    ShellsongConsole {
+                        console: &console,
+                        cursor_visible,
+                    },
+                    area,
+                );
+            }
         })?;
 
         // the ui is on screen; now hand mpv the restored queue, which
@@ -2966,6 +3936,9 @@ fn main() -> anyhow::Result<()> {
             app.corpus
                 .add_subsonic_search_result(outcome.result, &outcome.client);
             app.resync_results();
+            // an answer is in, so the results for whatever is typed are
+            // as complete as a shellsong program should wait for.
+            settle.answered();
         }
 
         if last_cache_sweep.elapsed() >= CACHE_SWEEP_INTERVAL {
@@ -3021,6 +3994,144 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        // shellsong's own volume ramps, ticked unconditionally like the
+        // crossfade ramp above and for the same reason: volume should
+        // fade whether or not the console is still on screen.
+        let shellsong_now = start.elapsed();
+        if let Some(ramp) = shellsong_fade {
+            let _ = player.set_volume(ramp.level_at(shellsong_now));
+            if ramp.finished(shellsong_now) {
+                shellsong_fade = None;
+            }
+        }
+        if let Some(due) = sleep_due {
+            let fade_over = Duration::from_secs_f64(cfg.crossfade_seconds);
+            match shellsong_host::sleep_step(due, fade_over, base_volume, shellsong_now) {
+                SleepStep::Waiting => {}
+                SleepStep::Fading(level) => {
+                    let _ = player.set_volume(level);
+                }
+                SleepStep::Expired => {
+                    sleep_due = None;
+                    if !paused {
+                        let _ = player.toggle_pause();
+                    }
+                    // back up to the ceiling, or unpausing later would
+                    // start silent.
+                    let _ = player.set_volume(base_volume);
+                    notifications.push(Severity::Info, "sleep timer: paused");
+                    console.note("slept");
+                }
+            }
+        }
+
+        // drive whatever shellsong program is running: step in a loop,
+        // applying each `Emit` before the next `step`, and stop for
+        // this frame on `AwaitResults` or `Done`. Never blocks; a
+        // command that searches resumes on a later frame, once the
+        // results for its query have settled.
+        let mut shellsong_quit = false;
+        while let Some(program) = shellsong_program.as_mut() {
+            // recomputed every step, not once per frame: `search(...)`
+            // makes the query unsettled again, and a `Resolve` reading
+            // a stale `true` would act on the previous query's results,
+            // which is the exact bug `search_settled` exists to stop.
+            let settled = settle.settled(shellsong_now);
+            let env = shellsong_env(
+                &app,
+                &play_queue,
+                &browse_view,
+                focus,
+                settled,
+                shellsong_now,
+            );
+            match program.step(&env) {
+                shellsong::Step::Emit(op) => {
+                    let mut actx = ActionCtx {
+                        cfg: &cfg,
+                        player: &player,
+                        app: &mut app,
+                        notifications: &mut notifications,
+                        queue: &mut play_queue,
+                        previous_track: &mut previous_track,
+                        player_minimized: &mut player_minimized,
+                        browse_view: &mut browse_view,
+                        real_art_protocol: &mut real_art_protocol,
+                        picker: &mut picker,
+                        focus: &mut focus,
+                        flash: &mut flash,
+                        cache: &cache_index,
+                        download_tx: &download_tx,
+                        downloading: &mut downloading,
+                        scrobble: &mut scrobble,
+                        subtitle_tx: &subtitle_tx,
+                    };
+                    let dispatch = apply_shellsong_op(
+                        op,
+                        &mut ShellsongCtx {
+                            actx: &mut actx,
+                            console: &mut console,
+                            console_open: &mut console_open,
+                            now: shellsong_now,
+                            now_playing: &now_playing,
+                            favorites: &mut favorites,
+                            remote_starred: &mut remote_starred,
+                            queue_view_open: &mut queue_view_open,
+                            queue_selected: &mut queue_selected,
+                            suggestions: &mut suggestions,
+                            suggestions_selected: &mut suggestions_selected,
+                            settings_menu_open: &mut settings_menu_open,
+                            keybinds_menu_open: &mut keybinds_menu_open,
+                            keybinds_menu_selected: &mut keybinds_menu_selected,
+                            eq_menu_open: &mut eq_menu_open,
+                            eq_menu_selected: &mut eq_menu_selected,
+                            lyrics_lines: &mut lyrics_lines,
+                            lyrics_track: &mut lyrics_track,
+                            lyrics_scroll: &mut lyrics_scroll,
+                            lyrics_client: &lyrics_client,
+                            base_volume: &mut base_volume,
+                            crossfade_enabled: &mut crossfade_enabled,
+                            fade_in_started_at: &mut fade_in_started_at,
+                            fade: &mut shellsong_fade,
+                            sleep_due: &mut sleep_due,
+                            bottombar_selected,
+                            scan_rx: &mut scan_rx,
+                            remote_search_tx: &remote_search_tx,
+                            settle: &mut settle,
+                            saved_queues: &mut saved_queues,
+                        },
+                    );
+                    if dispatch == Dispatch::Quit {
+                        shellsong_quit = true;
+                        shellsong_program = None;
+                        break;
+                    }
+                    // the last op of the last statement: drop it now
+                    // rather than spending another step to be told.
+                    if shellsong_program.as_ref().is_some_and(|p| p.is_done()) {
+                        shellsong_program = None;
+                        break;
+                    }
+                }
+                shellsong::Step::Note(text) => console.note(text),
+                // the results this is waiting on are not in yet; resume
+                // next frame rather than spinning or blocking.
+                shellsong::Step::AwaitResults { .. } => break,
+                shellsong::Step::Failed(e) => {
+                    console.fail(e.to_string());
+                    shellsong_program = None;
+                    break;
+                }
+                shellsong::Step::Done => {
+                    shellsong_program = None;
+                    break;
+                }
+            }
+        }
+        if shellsong_quit {
+            break;
+        }
+
         // whichever animations are actually live this frame set the
         // poll timeout: the display's frame budget while something is
         // moving, a long idle sleep otherwise. a static screen (no
@@ -3043,6 +4154,10 @@ fn main() -> anyhow::Result<()> {
             && (selection_pulsing
                 || banner_showing
                 || app.editing_query
+                || console_open
+                // a program resumes a frame at a time, so dropping to
+                // the idle poll would make an awaited search crawl.
+                || shellsong_program.is_some()
                 || browse_view.as_ref().is_some_and(|bv| bv.filtering)
                 || (now_playing.is_some() && !player_minimized)
                 || scrub.is_some()
@@ -3080,11 +4195,23 @@ fn main() -> anyhow::Result<()> {
                     // long random tokens are exactly the kind of thing
                     // worth pasting rather than typing by hand.
                     settings_token_input.push_str(text);
+                } else if console_open {
+                    // a bracketed paste goes into the console line
+                    // literally, with no auto-pairing; same claim over
+                    // paste the console has over keys.
+                    console.paste(
+                        text,
+                        &CorpusCandidates {
+                            corpus: &app.corpus,
+                            saved: &saved_queues,
+                        },
+                    );
                 } else if !help_open {
                     let before = app.query.clone();
                     app.paste_into_query(text);
                     if app.query != before {
-                        notify_query_changed(&app, &remote_search_tx);
+                        let fired = notify_query_changed(&app, &remote_search_tx);
+                        settle.notified(fired, start.elapsed());
                     }
                 }
             }
@@ -3288,6 +4415,33 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                // the console claims every key while it is open, at
+                // the same tier the query box below does and for
+                // exactly the same reason: a text input that lets keys
+                // past it is how '?'/'t'/'u' ended up firing commands
+                // instead of landing in the box, twice. Above
+                // `editing_query` rather than below it only because
+                // the two can never both be open (':' can't be pressed
+                // while the query box has the keyboard).
+                if console_open {
+                    let cand = CorpusCandidates {
+                        corpus: &app.corpus,
+                        saved: &saved_queues,
+                    };
+                    // the whole `KeyEvent`, not just `key.code`: the
+                    // console reads ctrl for its accept key, which no
+                    // other tier in this file needs.
+                    match console.handle_key(key, &cand) {
+                        ConsoleAction::None => {}
+                        ConsoleAction::Close => console_open = false,
+                        // a submitted line is held and stepped from the
+                        // loop body, not run here: a command that
+                        // searches cannot finish in one pass.
+                        ConsoleAction::Run(program) => shellsong_program = Some(program),
+                    }
+                    continue;
+                }
+
                 // every block below intercepts specific keys and
                 // unconditionally `continue`s even on a non-match
                 // (browse_view/lyrics/the subtitle+settings menus
@@ -3302,7 +4456,8 @@ fn main() -> anyhow::Result<()> {
                     let before = app.query.clone();
                     let action = app.handle_key(key.code, &keymap);
                     if app.query != before {
-                        notify_query_changed(&app, &remote_search_tx);
+                        let fired = notify_query_changed(&app, &remote_search_tx);
+                        settle.notified(fired, start.elapsed());
                     }
                     // enter while typing commits the selection, so the
                     // action has to run through the same dispatch the
@@ -3343,6 +4498,19 @@ fn main() -> anyhow::Result<()> {
                 // text box at all.
                 if key.code == keymap.get(KeyAction::OpenHelp) {
                     help_open = true;
+                    continue;
+                }
+
+                // same reasoning, same tier: ':' is an ordinary
+                // character to type into a search. Hardcoded rather
+                // than remappable, and listed in
+                // `keymap::reserved_key_purpose` so no action can be
+                // bound onto it and then silently shadowed by this.
+                if key.code == shellsong::OPEN_KEY {
+                    console_open = true;
+                    // one disk read per open, so completion itself
+                    // never touches it.
+                    saved_queues = queues::list();
                     continue;
                 }
 
@@ -3962,12 +5130,7 @@ fn main() -> anyhow::Result<()> {
                             // what's actually visible, not of the
                             // whole list: a filtered artist page used
                             // to play the unfiltered tail instead.
-                            let visible = bv.visible_track_indices();
-                            let from = visible.iter().position(|&i| i == bv.selected).unwrap_or(0);
-                            let session: Vec<SearchItem> = visible[from..]
-                                .iter()
-                                .map(|&i| bv.tracks[i].clone())
-                                .collect();
+                            let session = browse_session(bv);
                             if let Some(first) = session.first().cloned() {
                                 let interrupted = play_queue.current().cloned();
                                 let (s, played) = load_playlist(
@@ -4577,6 +5740,176 @@ mod download_policy_tests {
         assert_eq!(cfg.cache_days_threshold, 4);
         let cfg: config::Config = toml::from_str("").expect("an empty config is all defaults");
         assert_eq!(cfg.cache_days_threshold, 2);
+    }
+}
+
+#[cfg(test)]
+mod shellsong_wiring_tests {
+    use super::*;
+    use crate::browse::tests::{test_client, test_songs, test_view};
+    use crate::library::{LocalTrack, MediaKind};
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_browse_session_runs_from_the_selected_row_to_the_end() {
+        let mut bv = test_view(test_songs(5));
+        bv.selected = 2;
+        let session = browse_session(&bv);
+        assert_eq!(session.len(), 3);
+        assert_eq!(session[0].primary_name(), "song 2");
+        assert_eq!(session[2].primary_name(), "song 4");
+    }
+
+    #[test]
+    fn a_browse_session_only_takes_the_rows_the_filter_shows() {
+        // a filtered artist page used to play the *unfiltered* tail;
+        // the keyboard and `go()` share this function so neither can
+        // regress to that on its own.
+        let mut bv = test_view(test_songs(5));
+        bv.filter_query = "song 3".to_string();
+        bv.clamp_selection();
+        let session = browse_session(&bv);
+        assert_eq!(session.len(), 1);
+        assert_eq!(session[0].primary_name(), "song 3");
+    }
+
+    #[test]
+    fn an_empty_browse_view_yields_no_session() {
+        assert!(browse_session(&test_view(Vec::new())).is_empty());
+    }
+
+    fn app_with(titles: &[&str]) -> app::App {
+        let mut corpus = search::Corpus::new();
+        corpus.add_local_tracks(titles.iter().map(|t| LocalTrack {
+            path: PathBuf::from(format!("/music/{t}.flac")),
+            title: (*t).to_string(),
+            artist: None,
+            album: None,
+            duration_secs: None,
+            kind: MediaKind::Music,
+        }));
+        app::App::new(corpus)
+    }
+
+    #[test]
+    fn the_env_mirrors_the_results_the_queue_and_the_focus() {
+        let mut app = app_with(&["flatline", "hex"]);
+        app.set_query("flatline");
+        let mut queue = PlayQueue::default();
+        queue.reset(test_songs(3));
+        let env = shellsong_env(
+            &app,
+            &queue,
+            &None,
+            Focus::BottomBar,
+            true,
+            Duration::from_secs(7),
+        );
+        assert_eq!(env.query, "flatline");
+        assert_eq!(env.results, vec![shellsong::Kind::Song]);
+        // the whole playlist, played prefix included: that is what the
+        // queue view numbers, so it is what `goto(n)` means.
+        assert_eq!(env.queue_len, 3);
+        assert!(!env.browsing);
+        assert_eq!(env.focus, shellsong::Focus::BottomBar);
+        assert_eq!(env.now, Duration::from_secs(7));
+        assert!(env.search_settled);
+    }
+
+    #[test]
+    fn the_env_reports_an_open_browse_view_as_browsing() {
+        let app = app_with(&["flatline"]);
+        let browsing = Some(test_view(test_songs(2)));
+        let env = shellsong_env(
+            &app,
+            &PlayQueue::default(),
+            &browsing,
+            Focus::Workspace,
+            false,
+            Duration::ZERO,
+        );
+        assert!(env.browsing);
+        assert!(!env.search_settled);
+    }
+
+    #[test]
+    fn every_focus_maps_one_to_one() {
+        assert_eq!(shellsong_focus(Focus::Sidebar), shellsong::Focus::Sidebar);
+        assert_eq!(
+            shellsong_focus(Focus::Workspace),
+            shellsong::Focus::Workspace
+        );
+        assert_eq!(
+            shellsong_focus(Focus::BottomBar),
+            shellsong::Focus::BottomBar
+        );
+    }
+
+    #[test]
+    fn starred_state_is_read_from_whichever_store_owns_the_item() {
+        // `star()`/`unstar()` set a state, but `toggle_star` only
+        // flips one, so the current state has to be readable first or
+        // `unstar(x)` on something unstarred would star it.
+        let mut favorites = favorites::Favorites::default();
+        favorites.toggle("/music/hex.flac");
+        let local = SearchItem::LocalMusic {
+            path: PathBuf::from("/music/hex.flac"),
+            title: "hex".into(),
+            artist: None,
+            album: None,
+        };
+        let other = SearchItem::LocalMusic {
+            path: PathBuf::from("/music/crest.flac"),
+            title: "crest".into(),
+            artist: None,
+            album: None,
+        };
+        let remote_starred: HashSet<String> = ["song-1".to_string()].into_iter().collect();
+        assert!(is_starred(&local, &favorites, &remote_starred));
+        assert!(!is_starred(&other, &favorites, &remote_starred));
+
+        let songs = test_songs(3);
+        assert!(is_starred(&songs[1], &favorites, &remote_starred));
+        assert!(!is_starred(&songs[0], &favorites, &remote_starred));
+    }
+
+    #[test]
+    fn an_album_is_never_starrable_so_it_never_reads_as_starred() {
+        let album = SearchItem::Album {
+            id: "a1".into(),
+            name: "album".into(),
+            artist: "artist".into(),
+            client: test_client(),
+        };
+        assert!(!is_starred(
+            &album,
+            &favorites::Favorites::default(),
+            &HashSet::new()
+        ));
+    }
+
+    #[test]
+    fn a_songs_page_is_its_album_when_the_corpus_knows_that_album() {
+        let client = test_client();
+        let mut corpus = search::Corpus::new();
+        corpus.add_subsonic_search_result(
+            subsonic::SearchResult {
+                artists: Vec::new(),
+                albums: vec![subsonic::Album {
+                    id: "al-1".into(),
+                    name: "album".into(),
+                    artist: "artist".into(),
+                }],
+                songs: Vec::new(),
+            },
+            &client,
+        );
+        let page = album_page(&corpus, "album", &client);
+        assert!(matches!(page, Some(SearchItem::Album { .. })));
+        // a song whose album was never indexed has no page to open,
+        // which is reported rather than faked: a `Song` carries its
+        // album's name, not its id.
+        assert!(album_page(&corpus, "some other album", &client).is_none());
     }
 }
 
