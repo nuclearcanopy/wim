@@ -19,9 +19,14 @@
 #![allow(dead_code)] // consumed by the suggestions menu; ui wiring lands separately
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::cache::CacheIndex;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::cache::{self, CacheIndex};
 use crate::search::{Corpus, SearchItem};
 use crate::subsonic::{ArtistInfo, Client, Song};
 
@@ -297,16 +302,52 @@ pub struct NoEnrichment;
 impl Enrichment for NoEnrichment {}
 
 /// What the host accumulates in the background and keeps across menu
-/// opens. Keyed exactly as `Enrichment` reads it.
-#[derive(Debug, Default, Clone)]
+/// opens. Keyed exactly as `Enrichment` reads it, and persisted: this
+/// is `getArtistInfo2`/`getTopSongs` output, which changes about as
+/// often as last.fm's similarity graph does, so paying for it again on
+/// every launch would be latency for nothing.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct EnrichmentCache {
+    /// Artist id to similar artist names, most similar first.
+    #[serde(default)]
     similar: HashMap<String, Vec<String>>,
+    /// Normalised artist name to popular track ids, most popular first.
+    #[serde(default)]
     top: HashMap<String, Vec<String>>,
+}
+
+/// Next to the play-history index under the cache dir, not the state
+/// dir: this is reconstructable server output with nothing of the
+/// user's own in it, which is exactly what `cache.rs` reserves
+/// `dirs::cache_dir()` for.
+fn enrichment_path() -> Result<PathBuf> {
+    Ok(cache::cache_dir()?.join("enrichment.toml"))
 }
 
 impl EnrichmentCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Best-effort, same leniency as `cache::CacheIndex::load`: a
+    /// missing or corrupt file just means nothing fetched yet, which
+    /// the two network-fed generators already treat as normal.
+    pub fn load() -> Self {
+        enrichment_path()
+            .ok()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|raw| toml::from_str(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = enrichment_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let toml = toml::to_string_pretty(self)?;
+        fs::write(&path, toml).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
     }
 
     /// Records one `getArtistInfo2` response. Stored even when empty,
@@ -627,6 +668,18 @@ impl Catalog {
         });
         self.by_album.insert(key, slot);
         slot
+    }
+
+    /// Which server to ask about this artist. `ArtistTarget` carries
+    /// only an id and a name, and a corpus spanning several navidrome
+    /// servers has more than one place that id could come from, so the
+    /// host resolves the client back through the catalog.
+    pub fn artist_client(&self, name: &str) -> Option<Arc<Client>> {
+        let slot = *self.by_artist.get(&norm(name))?;
+        match self.artists[slot].item.as_ref()? {
+            SearchItem::Artist { client, .. } => Some(client.clone()),
+            _ => None,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1050,6 +1103,62 @@ pub fn enrichment_targets(req: &Request<'_>, limit: usize) -> Vec<ArtistTarget> 
 pub struct ArtistTarget {
     pub id: String,
     pub name: String,
+}
+
+/// Albums worth one `getAlbum` round trip, highest album affinity
+/// first. An album is only a target if the user has played something
+/// from it and we do not know its real tracklist yet: without a track
+/// total `TrackGap` cannot tell a glaring hole from a thin index, and
+/// without track order `AlbumNeighbour` cannot fire at all.
+///
+/// The "has a play" filter is also what bounds a warm-up on a large
+/// library: you have only ever played from a fraction of it, and the
+/// rest is already covered by `AlbumGap`, which needs no fetch.
+pub fn album_targets(req: &Request<'_>, limit: usize) -> Vec<AlbumTarget> {
+    let model = Model::build(req);
+    let mut slots: Vec<usize> = (0..model.catalog.albums.len())
+        .filter(|&slot| {
+            let album = &model.catalog.albums[slot];
+            album.track_total.is_none()
+                && album.item.is_some()
+                && model.albums[slot].played_tracks > 0
+        })
+        .collect();
+    slots.sort_by(|&a, &b| {
+        model.albums[b]
+            .score
+            .total_cmp(&model.albums[a].score)
+            .then_with(|| {
+                model.catalog.albums[a]
+                    .key
+                    .cmp(&model.catalog.albums[b].key)
+            })
+    });
+    slots.truncate(limit);
+    slots
+        .into_iter()
+        .filter_map(|slot| {
+            let album = &model.catalog.albums[slot];
+            match album.item.as_ref()? {
+                SearchItem::Album { id, client, .. } => Some(AlbumTarget {
+                    id: id.clone(),
+                    name: album.name.clone(),
+                    client: client.clone(),
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct AlbumTarget {
+    pub id: String,
+    /// The name the album is already known by, which is the one
+    /// `Catalog::ingest_album` must be fed so the fetched tracklist
+    /// lands on the existing album rather than beside it.
+    pub name: String,
+    pub client: Arc<Client>,
 }
 
 /// Artist slots by decayed affinity, best first, ties broken on the
@@ -2625,6 +2734,155 @@ mod tests {
                     name: "Burial".into()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn an_empty_enrichment_answer_still_counts_as_answered() {
+        // a server with no last.fm metadata behind it answers with
+        // nothing; asking it again on every menu open would be an
+        // unbounded cost for a permanently empty result.
+        let mut enrichment = EnrichmentCache::new();
+        assert!(enrichment.needs_similar("ar-1"));
+        assert!(enrichment.needs_top_songs("Bladee"));
+        enrichment.add_artist_info("ar-1", &ArtistInfo::default());
+        enrichment.add_top_songs("Bladee", &[]);
+        assert!(!enrichment.needs_similar("ar-1"));
+        assert!(!enrichment.needs_top_songs("Bladee"));
+        // and top songs are keyed by normalised name, so a differently
+        // cased spelling of the same artist is not a second question.
+        assert!(!enrichment.needs_top_songs("  bladee "));
+    }
+
+    #[test]
+    fn the_enrichment_cache_round_trips_through_toml() {
+        let mut enrichment = EnrichmentCache::new();
+        enrichment.add_artist_info(
+            "ar-1",
+            &ArtistInfo {
+                biography: Some("not persisted; the bio pane fetches its own".into()),
+                similar_artists: vec![
+                    crate::subsonic::Artist {
+                        id: "ar-2".into(),
+                        name: "Ecco2k".into(),
+                    },
+                    crate::subsonic::Artist {
+                        id: "-1".into(),
+                        name: "Thaiboy Digital".into(),
+                    },
+                ],
+            },
+        );
+        enrichment.add_artist_info("ar-9", &ArtistInfo::default());
+        enrichment.add_top_songs(
+            "Bladee",
+            &[
+                song("s1", "Be Nice 2 Me", "Bladee", "Eversince", &[]),
+                song("s2", "Rosier", "Bladee", "Eversince", &[]),
+            ],
+        );
+
+        let raw = toml::to_string_pretty(&enrichment).expect("serialisable");
+        let back: EnrichmentCache = toml::from_str(&raw).expect("deserialisable");
+        let similar: Vec<&str> = back
+            .similar_artists("ar-1")
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            similar,
+            ["Ecco2k", "Thaiboy Digital"],
+            "rank order is the signal"
+        );
+        let top: Vec<&str> = back
+            .top_songs("Bladee")
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(top, ["s1", "s2"]);
+        assert!(
+            !back.needs_similar("ar-9"),
+            "the negative answer has to survive a restart too"
+        );
+    }
+
+    #[test]
+    fn album_targets_are_the_played_albums_with_no_tracklist_yet() {
+        let client = client();
+        let mut catalog = Catalog::new();
+        catalog.ingest_item(&album_item("al-1", "Icedancer", "Bladee"));
+        catalog.ingest_item(&album_item("al-2", "Eversince", "Bladee"));
+        catalog.ingest_item(&album_item("al-3", "Untrue", "Burial"));
+        catalog.ingest_item(&album_item("al-4", "Crest", "Bladee"));
+        catalog.ingest_songs(
+            &[
+                song("i1", "Decay", "Bladee", "Icedancer", &[]),
+                song("e1", "Rosier", "Bladee", "Eversince", &[]),
+                song("u1", "Archangel", "Burial", "Untrue", &[]),
+                song("c1", "Hahah", "Bladee", "Crest", &[]),
+            ],
+            &client,
+        );
+        // Eversince has already been fetched whole, so there is
+        // nothing left to learn about it.
+        catalog.ingest_album(
+            "Eversince",
+            &[song("e1", "Rosier", "Bladee", "Eversince", &[])],
+            &client,
+        );
+        let cache = History::new()
+            // Crest is deliberately absent: an album with no plays is
+            // AlbumGap's job and needs no round trip.
+            .played("i1", 20, 10, 1)
+            .played("u1", 3, 2, 1)
+            .played("e1", 40, 20, 1)
+            .build();
+        let starred = HashSet::new();
+        let request = Request::new(&catalog, &cache, &starred, NOW);
+
+        let targets = album_targets(&request, 10);
+        let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Icedancer", "Untrue"],
+            "highest album affinity first, and only albums we have played from"
+        );
+        assert_eq!(targets[0].id, "al-1", "the id getAlbum needs comes along");
+
+        assert_eq!(
+            album_targets(&request, 1)
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Icedancer"],
+            "the cap is what bounds a warm-up on a large library"
+        );
+    }
+
+    #[test]
+    fn an_album_with_no_row_of_its_own_is_never_a_fetch_target() {
+        // an album known only as a track's album name has no id to
+        // call getAlbum with.
+        let client = client();
+        let mut catalog = Catalog::new();
+        catalog.ingest_songs(
+            &[song("s1", "Obedient", "Bladee", "Working on Dying", &[])],
+            &client,
+        );
+        let cache = History::new().played("s1", 9, 4, 1).build();
+        let starred = HashSet::new();
+        let targets = album_targets(&Request::new(&catalog, &cache, &starred, NOW), 10);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn artist_client_resolves_the_server_an_artist_came_from() {
+        let mut catalog = Catalog::new();
+        catalog.ingest_item(&artist_item("ar-1", "Bladee"));
+        assert!(catalog.artist_client("bladee").is_some(), "joined on name");
+        assert!(
+            catalog.artist_client("Nobody").is_none(),
+            "an artist with no indexed row has no server to ask"
         );
     }
 
