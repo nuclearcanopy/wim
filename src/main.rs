@@ -3542,7 +3542,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(ob) = &onboarding {
                 match ob.step {
                     Step::Welcome => f.render_widget(WelcomeView, area),
-                    Step::Controls => f.render_widget(ControlsView, area),
+                    Step::Controls => f.render_widget(ControlsView { keymap: &keymap }, area),
                     Step::Navidrome => {
                         f.render_widget(
                             LoginView {
