@@ -338,11 +338,16 @@ pub struct Corpus {
     /// key. Kept for the corpus's whole life rather than recomputed
     /// per incoming batch, which cloned every indexed id every time.
     remote_keys: [HashSet<String>; 4],
+    /// One scratch per scoring thread (index 0 doubles as the
+    /// single-threaded one), kept for the corpus's whole life: a fresh
+    /// `Matcher` per fan-out thread per keystroke meant allocating and
+    /// touching ~1mb of dp matrices on every typed character.
+    ///
     /// `search` takes `&self` (it is called on shared corpus bindings,
-    /// and only ever from the input thread), so the scratch lives
-    /// behind a `RefCell` instead of forcing `&mut` on every caller;
-    /// `search` is not reentrant, so the borrow can't conflict.
-    scratch: RefCell<Scratch>,
+    /// and only ever from the input thread), so these live behind a
+    /// `RefCell` instead of forcing `&mut` on every caller; `search`
+    /// is not reentrant, so the borrow can't conflict.
+    scratches: RefCell<Vec<Scratch>>,
 }
 
 impl Corpus {
@@ -524,21 +529,22 @@ impl Corpus {
             return Vec::new();
         }
         let needle = Needle::new(query);
+        let mut scratches = self.scratches.borrow_mut();
+        if scratches.is_empty() {
+            scratches.resize_with(thread_count().max(1), Scratch::default);
+        }
 
         if parallel {
             // chunks are joined back in corpus order, so the stable
             // sort below still breaks ties exactly as it does
-            // single-threaded; each thread needs its own scratch.
-            let chunk = self.items.len().div_ceil(thread_count());
+            // single-threaded; each thread takes one of the corpus's
+            // own scratches rather than building its own.
+            let chunk = self.items.len().div_ceil(scratches.len());
             let parts: Vec<Vec<(u32, &SearchItem)>> = thread::scope(|scope| {
                 self.items
                     .chunks(chunk)
-                    .map(|part| {
-                        scope.spawn(|| {
-                            let mut scratch = Scratch::default();
-                            score_chunk(part, &needle, &mut scratch)
-                        })
-                    })
+                    .zip(scratches.iter_mut())
+                    .map(|(part, scratch)| scope.spawn(|| score_chunk(part, &needle, scratch)))
                     .collect::<Vec<_>>()
                     .into_iter()
                     .map(|handle| handle.join().unwrap_or_default())
@@ -546,8 +552,7 @@ impl Corpus {
             });
             parts.concat()
         } else {
-            let mut scratch = self.scratch.borrow_mut();
-            score_chunk(&self.items, &needle, &mut scratch)
+            score_chunk(&self.items, &needle, &mut scratches[0])
         }
     }
 }
@@ -748,11 +753,15 @@ fn char_count(s: &str) -> usize {
 }
 
 /// Corpus size at which `search` fans per-item scoring out across
-/// threads. Below it the fixed cost of the fan-out (spawn/join plus a
-/// fresh ~135kb matcher per thread, measured at ~0.8ms on 8 cores)
-/// dominates: at 100 items it made every query ~8x slower, at 500 it
-/// broke even, and from ~2k up it's a consistent ~2x win.
-const PARALLEL_SCORING_FLOOR: usize = 2_000;
+/// threads. Below it the fixed ~0.4ms of spawn/join dominates, and the
+/// char-mask prefilters cut the per-item cost enough that the floor had
+/// to move up an order of magnitude: measured on 8 cores
+/// (`bench_parallel_floor`), sequential wins at 4k for every query
+/// shape and at 8k for all but one, threads win at 16k and up for
+/// everything except a query that matches nothing at all, which is so
+/// cheap that no corpus size pays back the fan-out. Below the floor,
+/// scoring a whole 8k corpus sequentially is still only ~2ms.
+const PARALLEL_SCORING_FLOOR: usize = 16_000;
 
 /// Below this fraction of the best match's score in a given search, a
 /// result is treated as noise rather than a real candidate; see the
@@ -1507,7 +1516,10 @@ mod tests {
     #[test]
     fn threaded_and_sequential_scoring_agree() {
         let c = varied_corpus(5_000);
-        assert!(c.items.len() >= PARALLEL_SCORING_FLOOR);
+        assert!(
+            c.items.len() > thread_count(),
+            "needs more items than threads, or there is only one chunk to compare"
+        );
         for query in GUARD_QUERIES {
             let par = rank(c.score_all_maybe_parallel(query, true));
             let seq = rank(c.score_all_maybe_parallel(query, false));
@@ -1617,6 +1629,29 @@ mod tests {
                     "{label:<18} {query:<14} score {par:>10.3?} (1 thread {seq:>10.3?})  \
                      +rank {:>10.3?}   cand {cand:>6} out {out:>6}",
                     rank_t.saturating_sub(par),
+                );
+            }
+        }
+    }
+
+    /// Where fanning the scoring out across threads starts paying for
+    /// its own spawn/join cost; sets `PARALLEL_SCORING_FLOOR`.
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_parallel_floor() {
+        for size in [500usize, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000] {
+            let c = varied_corpus(size);
+            for query in ["b", "bladee", "brainmir", "qqqxzz"] {
+                let (seq, _) = bench(20, || c.score_all_maybe_parallel(query, false).len());
+                let (par, _) = bench(20, || c.score_all_maybe_parallel(query, true).len());
+                let verdict = if par < seq {
+                    "threads win"
+                } else {
+                    "sequential wins"
+                };
+                println!(
+                    "{:>6} items  {query:<10} seq {seq:>10.3?}  par {par:>10.3?}  {verdict}",
+                    c.items.len()
                 );
             }
         }
