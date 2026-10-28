@@ -639,6 +639,7 @@ mod tests {
                     artist: "Someone Else".into(),
                     album: "Other Album".into(),
                     duration: None,
+                    genres: Vec::new(),
                 }],
             },
             &client,
