@@ -79,18 +79,17 @@ impl Widget for SearchBox<'_> {
         } else {
             (tail_fit(self.query, inner_width), shade(NEAR_WHITE))
         };
-        for (col, ch) in text.chars().enumerate() {
-            if col >= inner_width {
-                break;
-            }
-            put(buf, area.x + 1 + col as u16, area.y + 1, ch, color);
-        }
+        // the writer returns where it stopped, which is exactly where
+        // the cursor belongs; deriving it from a char count instead put
+        // the block inside the last glyph for any wide character.
+        let text_end = crate::ui::draw::at(buf, area.x + 1, area.y + 1, &text, color, inner_width);
 
         if self.editing {
             // never fully invisible: it dims on the off phase instead
             // of disappearing, so "is this box focused" is answerable
             // from any single frame.
-            let cursor_col = text.chars().count().min(inner_width.saturating_sub(1));
+            let cursor_col =
+                (text_end.saturating_sub(area.x + 1) as usize).min(inner_width.saturating_sub(1));
             let level = if self.cursor_visible { 1.0 } else { 0.45 };
             put(
                 buf,
@@ -138,10 +137,7 @@ fn draw_border_label(
 }
 
 fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: ratatui::style::Color) {
-    if let Some(cell) = buf.cell_mut((x, y)) {
-        cell.set_char(ch);
-        cell.set_fg(color);
-    }
+    crate::ui::draw::put(buf, x, y, ch, color);
 }
 
 #[cfg(test)]

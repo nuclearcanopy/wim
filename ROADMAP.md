@@ -440,16 +440,29 @@ run that edits these files will collide.
       `goto(n)`/`shuffle_queue()` from the shellsong branch can now
       reuse `PlayQueue::remove`/`move_entry` plus the mpv commands
       added here, but still need the `Op` -> host wiring.
-- [ ] **wide characters still overlap their neighbour.** `textfit` is
-      `unicode_width`-aware now, but the hand-rolled
-      `for (col, ch) in text.chars().enumerate()` draw loops advance one
-      cell per char regardless of width, so CJK/emoji still overdraw.
-      the measurement is fixed; the drawing is not.
-- [ ] **migrate the remaining width-measurement call sites to textfit**:
-      banner.rs, helpbox.rs, login.rs, eq_menu.rs, onboarding.rs,
-      subtitle_menu.rs, notify.rs, player.rs, results_list.rs header
-      centering, controlsbar.rs, searchbox.rs, settings_menu.rs,
-      keybinds_menu.rs.
+- [x] **wide characters overlapping their neighbour.** `src/ui/draw.rs`
+      is now the one place text reaches a `Buffer`: it advances by
+      `char_cells` and blanks the trailing cell of a wide glyph, so a
+      CJK or emoji title no longer shifts everything after it one cell
+      left and overruns the row. every widget that renders
+      *user-supplied* text delegates to it (results_list, browse,
+      queue, player, miniplayer, notify, header, lyrics_view,
+      searchbox), which also deleted eight near-identical `draw_line`
+      copies and fixed two latent bugs found on the way: `help.rs`'s
+      copy was missing the bottom-bounds guard the other seven had, and
+      `player.rs` centred by char count so a wide-char title drifted
+      right by its own overhang. the search box's cursor position now
+      comes from the writer's returned x rather than a char count, so
+      typing wide characters no longer parks the block inside the last
+      glyph.
+- [ ] **migrate the remaining chrome widgets to `ui::draw`**: eq_menu,
+      keybinds_menu, settings_menu, subtitle_menu, helpbox, help,
+      nav_manager, login, onboarding, banner's menu row. all draw
+      static mostly-ascii labels, so they are correctness-neutral
+      today; worth doing for the dedup and so a translated or
+      user-supplied string cannot reintroduce the bug. `banner.rs`'s
+      logo grid is deliberately excluded (figlet art, one cell per
+      char by construction).
 - [ ] **`help.rs` still mislabels four remappable actions as fixed**:
       `Key::Fixed("[ / ]")` and `Key::Fixed(", / .")` cover SpeedUp/
       SpeedDown and SubtitleDelayUp/Down, which are rebindable, so

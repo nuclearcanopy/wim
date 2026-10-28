@@ -29,16 +29,24 @@ pub fn draw_header(
     // text. mixing brightness along what's meant to read as one
     // continuous line is exactly what looked wrong both times before.
     if y < area.y + area.height {
-        for (col, ch) in fitted.chars().enumerate() {
-            let x = area.x + col as u16;
-            if x >= area.x + area.width {
+        // written a glyph at a time because the │ takes rule_color
+        // while the text around it does not, but the cursor still
+        // advances by display width rather than by char.
+        let mut x = area.x;
+        let right = area.x + area.width;
+        for ch in fitted.chars() {
+            if x >= right {
                 break;
             }
             let color = if ch == '│' { rule_color } else { text_color };
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_char(ch);
-                cell.set_fg(color);
-            }
+            x = crate::ui::draw::at(
+                buf,
+                x,
+                y,
+                &ch.to_string(),
+                color,
+                right.saturating_sub(x) as usize,
+            );
         }
     }
 
