@@ -309,6 +309,11 @@ pub enum Op {
     /// open the page a result belongs to (an artist's or album's own
     /// view); `view(q, ...)` resolves to this.
     OpenPage(Target),
+    /// Wipes the console's own scrollback. Console-local: the host
+    /// clears `Console::lines` and nothing else moves, which is why it
+    /// is an op rather than something the parser handles, so it still
+    /// shows up in `dry` like every other command.
+    ClearConsole,
     ClearQueue,
     /// 1-based queue positions, descending so the host can remove in
     /// order without reindexing.
@@ -373,6 +378,7 @@ impl Op {
             Op::Star { on: false, .. } => "unstarred".into(),
             Op::Download(_) => "downloading".into(),
             Op::OpenPage(_) => "opened its page".into(),
+            Op::ClearConsole => "scrollback cleared".into(),
             Op::ClearQueue => "queue cleared".into(),
             Op::RemoveFromQueue(v) => format!("removed {} from the queue", v.len()),
             Op::GotoQueue(n) => format!("jumped to queue {n}"),
@@ -789,8 +795,15 @@ pub const COMMANDS: &[Command] = &[
         "insert next (front) or append (back)",
     ),
     cmd(
+        "clear",
+        &["cls"],
+        NONE,
+        &[],
+        "clear this console's scrollback",
+    ),
+    cmd(
         "clear_queue",
-        &["clear", "flush"],
+        &["qclear", "flush"],
         NONE,
         &[],
         "empty the queue",
@@ -1673,6 +1686,7 @@ impl Call {
                 Some(Arg::Name(q)) => Op::Search(q.clone()),
                 _ => return None,
             },
+            "clear" => Op::ClearConsole,
             "clear_queue" => Op::ClearQueue,
             "remove" => match first {
                 Some(Arg::Indices(v)) => {
@@ -5177,5 +5191,21 @@ mod tests {
 
         let _: Vec<String> = Candidates::corpus(&fake, "fl");
         let _: Vec<String> = Candidates::saved_queues(&fake);
+    }
+
+    #[test]
+    fn clear_is_the_console_and_clear_queue_is_the_queue() {
+        assert_eq!(ops("clear()"), vec![Op::ClearConsole]);
+        assert_eq!(ops("cls()"), vec![Op::ClearConsole]);
+        assert_eq!(ops("clear_queue()"), vec![Op::ClearQueue]);
+        assert_eq!(ops("qclear()"), vec![Op::ClearQueue]);
+        assert_eq!(ops("flush()"), vec![Op::ClearQueue]);
+    }
+
+    #[test]
+    fn clear_no_longer_empties_the_queue() {
+        // it used to be an alias of clear_queue; anyone typing clear()
+        // expecting the terminal behaviour would have wiped the queue.
+        assert_ne!(ops("clear()"), vec![Op::ClearQueue]);
     }
 }

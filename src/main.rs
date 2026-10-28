@@ -1804,6 +1804,13 @@ fn run_shellsong_op(op: Op, ctx: &mut ShellsongCtx) -> (Dispatch, Report) {
                 None => op_fail(format!("no page for '{}'", item.primary_name())),
             }
         }
+        Op::ClearConsole => {
+            // the report line is pushed after this returns, so the
+            // console ends up holding exactly one line saying what
+            // happened rather than looking like it crashed.
+            ctx.console.lines.clear();
+            op_done()
+        }
         Op::ClearQueue => {
             // mpv's own `playlist-clear` keeps the file that is
             // playing and drops the rest, which is exactly what
