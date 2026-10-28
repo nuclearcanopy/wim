@@ -15,6 +15,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
+use crate::theme::{shade, NEAR_BLACK};
 use crate::ui::textfit::{char_cells, truncate_to_width, width};
 
 /// One cell, bounds-checked by `Buffer` itself.
@@ -142,6 +143,15 @@ pub fn framed_inner(area: Rect) -> Rect {
     }
 }
 
+/// What every full-screen takeover does first: own the whole rect,
+/// frame it so it reads as a surface rather than text floating over
+/// the layout, and hand back the content rect inside the frame.
+pub fn overlay(buf: &mut Buffer, area: Rect) -> Rect {
+    clear(buf, area);
+    frame(buf, area, shade(NEAR_BLACK));
+    framed_inner(area)
+}
+
 /// Centred by *display* width, so a wide-char title still sits in the
 /// middle rather than drifting right by its own overhang.
 pub fn centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: Color) {
@@ -163,7 +173,7 @@ pub fn centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: Color) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::{shade, NEAR_BLACK, NEAR_WHITE};
+    use crate::theme::NEAR_WHITE;
     use crate::ui::testbuf::{buffer, grid};
 
     fn row(buf: &Buffer, y: u16, w: u16) -> String {
