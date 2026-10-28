@@ -6,6 +6,7 @@ use ratatui::widgets::Widget;
 use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
+use crate::ui::textfit::width;
 
 /// Full keybind reference, opened with `?` (hinted by `HelpBox` in the
 /// bottom-right corner); takes over the whole screen the same way
@@ -204,8 +205,14 @@ impl HelpOverlay<'_> {
                 }];
                 for (key, desc) in *binds {
                     let key_text = key.label(self.keymap);
+                    // padded by display width, by hand: `{key:<13}`
+                    // counts chars, so a key bound to a wide char was
+                    // one cell wider than it counted and pushed its own
+                    // description a cell right of the column. same fix
+                    // banner.rs records for its menu.
+                    let pad = " ".repeat(KEY_COLUMN.saturating_sub(width(&key_text)));
                     block.push(Line {
-                        text: format!("  {key_text:<13} {desc}"),
+                        text: format!("  {key_text}{pad} {desc}"),
                         level: DIM,
                     });
                 }
@@ -218,6 +225,13 @@ impl HelpOverlay<'_> {
             .collect()
     }
 }
+
+/// Cells reserved for the key column, so every description in every
+/// section starts at the same offset. Fixed rather than derived from
+/// the widest resolved label on purpose: a single long rebind ("f12")
+/// would otherwise shift every description in the table, and
+/// `MIN_COLUMN_WIDTH` below is computed from this number.
+const KEY_COLUMN: usize = 13;
 
 /// Minimum usable width for one column; below two of these the layout
 /// stays single-column and scrolls off as before, which is still
@@ -430,6 +444,33 @@ mod tests {
         assert!(
             !rendered.contains("[ / ]"),
             "and must not still show the baked-in default"
+        );
+    }
+
+    /// A key can be rebound to a wide char, which owns two cells while
+    /// `{:<13}` counted it as one; that pushed its own description a
+    /// cell right of every other row's.
+    #[test]
+    fn a_wide_key_label_does_not_shift_its_own_description() {
+        use crossterm::event::KeyCode;
+        let mut keymap = Keymap::default();
+        keymap.set(KeyAction::CycleEq, KeyCode::Char('\u{65e5}'));
+        let mut buf = buffer(120, 40);
+        HelpOverlay { keymap: &keymap }.render(Rect::new(0, 0, 120, 40), &mut buf);
+        let g = grid(&buf);
+        let eq = g.lines().find(|l| l.contains("cycle eq preset")).unwrap();
+        let shuffle = g.lines().find(|l| l.contains("shuffle")).unwrap();
+        // cell columns, not byte offsets: the wide key is three bytes
+        // and two cells, so `find` alone would compare the wrong thing
+        // (which is how this test first "failed" against a correct fix).
+        let col = |line: &str, needle: &str| {
+            let byte = line.find(needle).unwrap();
+            line[..byte].chars().count()
+        };
+        assert_eq!(
+            col(eq, "cycle eq preset"),
+            col(shuffle, "shuffle"),
+            "the wide key pushed its description out of the column:\n{eq}\n{shuffle}"
         );
     }
 }
