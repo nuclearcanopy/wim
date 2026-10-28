@@ -182,6 +182,16 @@ impl CacheIndex {
             .unwrap_or(0)
     }
 
+    /// The whole entry for `id`, read-only. The per-field getters
+    /// above answer one question each; the suggestion engine needs
+    /// frequency, distinct days, and recency together for every track
+    /// it scores, so it reads the record instead of three lookups.
+    // read by `suggest`; drop the allow once the menu is wired up.
+    #[allow(dead_code)]
+    pub fn entry(&self, id: &str) -> Option<&CacheEntry> {
+        self.entries.get(id)
+    }
+
     // not read anywhere outside this module's own tests yet; kept as
     // part of the public read API for whatever UI surface later wants
     // to show "played N times" (same documented gap as
