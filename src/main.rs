@@ -2431,6 +2431,11 @@ enum EnrichmentEvent {
     /// `getAlbum`: a real track total and real track order, which is
     /// all `TrackGap` and `AlbumNeighbour` were ever missing.
     Album {
+        /// The album's *credited* artist, carried through from the
+        /// target so the tracklist lands on the catalog slot it was
+        /// fetched for. A compilation's track one has a different
+        /// artist, which used to file it somewhere nothing read.
+        artist: String,
         name: String,
         songs: Vec<subsonic::Song>,
         client: Arc<subsonic::Client>,
@@ -2500,10 +2505,13 @@ impl EnrichmentJob {
     }
 }
 
-/// `None` on any failure: one unreachable artist or album must not
-/// cost the rest of the batch, and the main thread's own
-/// already-asked bookkeeping is what stops a failure being retried
-/// all session.
+/// `None` on any failure for the artist fetches, whose
+/// already-asked state the `EnrichmentCache` records on receipt.
+///
+/// An album fetch always reports, with an empty `songs` on failure:
+/// the catalog's own `asked` flag is set from this event, so a silent
+/// `None` would leave the album looking never-asked and re-offer it
+/// every cycle.
 fn run_enrichment_fetch(fetch: &Fetch) -> Option<EnrichmentEvent> {
     match fetch {
         Fetch::Similar { id, client } => Some(EnrichmentEvent::ArtistInfo {
@@ -2516,8 +2524,13 @@ fn run_enrichment_fetch(fetch: &Fetch) -> Option<EnrichmentEvent> {
             client: client.clone(),
         }),
         Fetch::Album(target) => Some(EnrichmentEvent::Album {
+            artist: target.artist.clone(),
             name: target.name.clone(),
-            songs: target.client.get_album(&target.id).ok()?.songs,
+            songs: target
+                .client
+                .get_album(&target.id)
+                .map(|a| a.songs)
+                .unwrap_or_default(),
             client: target.client.clone(),
         }),
     }
@@ -2570,23 +2583,23 @@ fn spawn_background_enrichment(
 /// for. Pure, so the selection and ordering are testable without a
 /// server.
 ///
-/// `asked_albums` is session-scoped on purpose. The tracklists
-/// themselves are not persisted, and an album whose fetch failed (or
-/// whose songs are credited to a different artist than the album is,
-/// so the ingest landed on a neighbouring row and left this one with
-/// no track total) must not be asked about again in a loop.
+/// What stops an album being asked about in a loop is the catalog's
+/// own `asked` flag, set on every reply including the empty ones, so
+/// a failed fetch is remembered rather than retried.
 fn next_enrichment_job(
     catalog: &suggest::Catalog,
     cache: &CacheIndex,
     starred: &HashSet<String>,
     enrichment: &suggest::EnrichmentCache,
-    asked_albums: &HashSet<String>,
 ) -> EnrichmentJob {
     let request = suggest::Request {
         enrichment,
         ..suggest::Request::new(catalog, cache, starred, cache::now_secs())
     };
-    let artists = suggest::enrichment_targets(&request, ENRICH_ARTIST_TARGETS)
+    // one model build for both halves, not two.
+    let plan = suggest::enrichment_plan(&request, ENRICH_ARTIST_TARGETS, ENRICH_ALBUMS_PER_JOB);
+    let artists = plan
+        .artists
         .into_iter()
         .filter_map(|target| {
             let similar = enrichment.needs_similar(&target.id);
@@ -2603,15 +2616,12 @@ fn next_enrichment_job(
             })
         })
         .collect();
-    // asked-but-still-untotalled albums are filtered after the engine
-    // ranked them, so a handful of stuck ones cannot starve the batch;
-    // ask deeper than the cap and keep the first unasked ones.
-    let albums = suggest::album_targets(&request, ENRICH_ALBUMS_PER_JOB * 4)
-        .into_iter()
-        .filter(|target| !asked_albums.contains(&target.id))
-        .take(ENRICH_ALBUMS_PER_JOB)
-        .collect();
-    EnrichmentJob { artists, albums }
+    // no over-asking and trimming any more: the engine excludes
+    // already-asked albums itself, so the cap is just the cap.
+    EnrichmentJob {
+        artists,
+        albums: plan.albums,
+    }
 }
 
 /// Rebuilds the menu from everything known right now. The catalog is
@@ -3220,7 +3230,6 @@ fn main() -> anyhow::Result<()> {
     let mut enrichment = suggest::EnrichmentCache::load();
     // album ids already asked about this session; see
     // `next_enrichment_job` for why this is not persisted.
-    let mut asked_albums: HashSet<String> = HashSet::new();
     let mut suggestions_open_last_frame = false;
     // an answer landed, so the menu owes exactly one re-run.
     let mut suggestions_stale = false;
@@ -4452,16 +4461,19 @@ fn main() -> anyhow::Result<()> {
                     suggestions_stale = true;
                 }
                 EnrichmentEvent::Album {
+                    artist,
                     name,
                     songs,
                     client,
                 } => {
-                    // an empty tracklist would record a track total of
-                    // zero and permanently blind both coverage
-                    // generators to the album; `asked_albums` already
-                    // stops it being re-requested.
-                    if !songs.is_empty() {
-                        suggest_catalog.ingest_album(&name, &songs, &client);
+                    // an empty tracklist means the fetch failed or the
+                    // album really has no songs; recording a total of
+                    // zero would blind both coverage generators to it,
+                    // so mark it asked and leave the total unknown.
+                    if songs.is_empty() {
+                        suggest_catalog.mark_album_asked(&artist, &name);
+                    } else {
+                        suggest_catalog.ingest_album(&artist, &name, &songs, &client);
                         suggestions_stale = true;
                     }
                 }
@@ -4507,16 +4519,9 @@ fn main() -> anyhow::Result<()> {
             if suggestions.is_some() {
                 let starred = suggestion_starred_keys(&remote_starred, &favorites);
                 let guard = cache_index.lock().expect("cache mutex poisoned");
-                let job = next_enrichment_job(
-                    &suggest_catalog,
-                    &guard,
-                    &starred,
-                    &enrichment,
-                    &asked_albums,
-                );
+                let job = next_enrichment_job(&suggest_catalog, &guard, &starred, &enrichment);
                 drop(guard);
                 if !job.is_empty() {
-                    asked_albums.extend(job.albums.iter().map(|a| a.id.clone()));
                     enrich_job_in_flight = enrich_job_tx.send(job).is_ok();
                 }
             }
@@ -4726,7 +4731,11 @@ fn main() -> anyhow::Result<()> {
             || eq_menu_open;
         let selection_pulsing = match focus {
             Focus::Sidebar => !app.results.is_empty(),
-            Focus::Workspace => browse_view.is_some(),
+            // every list the workspace can hold, not just the browse
+            // view: the suggestions menu and the queue view both plate
+            // a selected row, and leaving them out dropped their pulse
+            // to the 100ms idle poll, a tenth of the display rate.
+            Focus::Workspace => browse_view.is_some() || suggestions.is_some() || queue_view_open,
             Focus::BottomBar => false,
         };
         let banner_showing =
@@ -6831,9 +6840,8 @@ mod enrichment_plumbing_tests {
         catalog: &suggest::Catalog,
         cache: &CacheIndex,
         enrichment: &suggest::EnrichmentCache,
-        asked_albums: &HashSet<String>,
     ) -> EnrichmentJob {
-        next_enrichment_job(catalog, cache, &HashSet::new(), enrichment, asked_albums)
+        next_enrichment_job(catalog, cache, &HashSet::new(), enrichment)
     }
 
     #[test]
@@ -6842,12 +6850,7 @@ mod enrichment_plumbing_tests {
         let mut cache = CacheIndex::default();
         play(&mut cache, "b1", 5);
         play(&mut cache, "u1", 2);
-        let job = job(
-            &catalog,
-            &cache,
-            &suggest::EnrichmentCache::new(),
-            &HashSet::new(),
-        );
+        let job = job(&catalog, &cache, &suggest::EnrichmentCache::new());
         let names: Vec<&str> = job.artists.iter().map(|a| a.target.name.as_str()).collect();
         assert_eq!(names, ["Bladee", "Burial"]);
         assert!(
@@ -6869,7 +6872,7 @@ mod enrichment_plumbing_tests {
         // and one half answered for the other artist.
         enrichment.add_top_songs("Burial", &[song("x", "Burial", "Untrue")]);
 
-        let job = job(&catalog, &cache, &enrichment, &HashSet::new());
+        let job = job(&catalog, &cache, &enrichment);
         let names: Vec<&str> = job.artists.iter().map(|a| a.target.name.as_str()).collect();
         assert_eq!(
             names,
@@ -6887,7 +6890,7 @@ mod enrichment_plumbing_tests {
 
     #[test]
     fn the_album_cap_holds_and_asked_albums_drop_out() {
-        let catalog = many_albums(ENRICH_ALBUMS_PER_JOB * 2);
+        let mut catalog = many_albums(ENRICH_ALBUMS_PER_JOB * 2);
         let mut cache = CacheIndex::default();
         // later albums are played on more days, so affinity order is
         // the reverse of the id order and a plain "first n" would fail.
@@ -6895,7 +6898,7 @@ mod enrichment_plumbing_tests {
             play(&mut cache, &format!("s{i}"), i as u64 + 1);
         }
         let enrichment = suggest::EnrichmentCache::new();
-        let first = job(&catalog, &cache, &enrichment, &HashSet::new());
+        let first = job(&catalog, &cache, &enrichment);
         assert_eq!(first.albums.len(), ENRICH_ALBUMS_PER_JOB);
         let names: Vec<&str> = first.albums.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(
@@ -6904,20 +6907,24 @@ mod enrichment_plumbing_tests {
             "highest affinity first: {names:?}"
         );
 
-        let asked: HashSet<String> = first.albums.iter().map(|a| a.id.clone()).collect();
-        let second = job(&catalog, &cache, &enrichment, &asked);
+        // marking them asked on the catalog is what a reply does, and
+        // is the only thing that stops a re-ask now.
+        let asked: Vec<String> = first.albums.iter().map(|a| a.name.clone()).collect();
+        for album in &first.albums {
+            catalog.mark_album_asked(&album.artist, &album.name);
+        }
+        let second = job(&catalog, &cache, &enrichment);
         assert_eq!(second.albums.len(), ENRICH_ALBUMS_PER_JOB);
         assert!(
-            second.albums.iter().all(|a| !asked.contains(&a.id)),
+            second.albums.iter().all(|a| !asked.contains(&a.name)),
             "a batch never re-asks what the last one already asked"
         );
 
-        let everything: HashSet<String> = asked
-            .into_iter()
-            .chain(second.albums.iter().map(|a| a.id.clone()))
-            .collect();
+        for album in &second.albums {
+            catalog.mark_album_asked(&album.artist, &album.name);
+        }
         assert!(
-            job(&catalog, &cache, &enrichment, &everything).is_empty(),
+            job(&catalog, &cache, &enrichment).is_empty(),
             "nothing left to ask means no job at all, not an empty one fired forever"
         );
     }
@@ -6940,13 +6947,7 @@ mod enrichment_plumbing_tests {
         );
         let mut cache = CacheIndex::default();
         play(&mut cache, "b1", 4);
-        let fetches = job(
-            &catalog,
-            &cache,
-            &suggest::EnrichmentCache::new(),
-            &HashSet::new(),
-        )
-        .fetches();
+        let fetches = job(&catalog, &cache, &suggest::EnrichmentCache::new()).fetches();
         assert!(matches!(fetches[0], Fetch::Similar { .. }));
         assert!(matches!(fetches[1], Fetch::Top { .. }));
         assert!(matches!(fetches[2], Fetch::Album(_)));
