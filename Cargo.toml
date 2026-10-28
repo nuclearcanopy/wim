@@ -30,6 +30,7 @@ lofty = "0.22"
 strsim = "0.11"
 base64 = "0.22"
 zeroize = { version = "1.9.1", features = ["derive"] }
+libc = "0.2.191"
 
 [profile.release]
 lto = false

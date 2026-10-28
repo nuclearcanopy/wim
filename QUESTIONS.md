@@ -64,3 +64,13 @@ That was deliberate rather than blocking the whole menu on network
 plumbing: the history-driven sections are the ones that work with no
 server at all, and the view already carries an `enriching` flag so a
 thin list says "so far" instead of presenting itself as complete.
+
+## mpv --no-config
+
+Pinned unconditionally rather than made configurable. wim drives mpv as
+a backend and sets its own af chain, replaygain, volume and vo; a user
+`~/.config/mpv/mpv.conf` layering on top of that produces symptoms
+indistinguishable from a bug in wim, which is exactly what happened
+once already. If someone genuinely wants their mpv.conf honoured, that
+wants an explicit opt-out config field rather than the current silent
+inheritance.

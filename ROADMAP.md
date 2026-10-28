@@ -532,9 +532,20 @@ run that edits these files will collide.
       "space help" to "space hel" the moment the help key was rebound
       to anything longer than one character. also centres on display
       width through `ui::draw` rather than char count.
-- [ ] **mpv survives an unclean wim exit.** `PR_SET_PDEATHSIG` would
-      close it with the parent; `Mpv::spawn` also passes no
-      `--no-config`, so a user mpv.conf silently alters playback.
+- [x] **mpv no longer survives an unclean wim exit**, and no longer
+      reads the user's mpv.conf. `PR_SET_PDEATHSIG` is set from
+      `pre_exec` in the child (linux only; `prctl` is not portable),
+      so a SIGKILL or abort that skips `Drop` still takes mpv with it
+      instead of leaving it headless, holding the audio device and
+      answering on a socket nothing owns. `--no-config` pins playback
+      to what this app sets: a user af chain, volume or replaygain
+      applied on top is indistinguishable from a wim bug, and ruling
+      that out already cost hours during the "horrible bass"
+      investigation. verified end to end rather than asserted: spawned
+      the real binary under a pty, SIGKILLed it, confirmed its mpv
+      died with it. one footgun recorded inline: pdeathsig fires on
+      the parent *thread* exiting, so the spawn must stay on the main
+      thread.
 - [ ] **custom user-editable eq preset** (noted long ago, still open).
 - [ ] **decompose main.rs** (~3.9k lines). a reviewed, ordered plan
       exists: extract focus/InputMode, then the playback free functions,
