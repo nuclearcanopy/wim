@@ -167,6 +167,13 @@ impl Client {
         &self.base_url
     }
 
+    /// Half of the identity of a persisted catalog (`cache.rs`): two
+    /// accounts on one server don't see the same playlists, so the
+    /// username is part of which catalog is whose.
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
     pub fn new(cfg: &NavidromeConfig) -> anyhow::Result<Self> {
         Ok(Client {
             base_url: normalize_url(&cfg.url),
@@ -597,7 +604,7 @@ struct SubsonicError {
 /// actually works instead of silently failing to connect; defaults to
 /// https, since that's the sane assumption for anything reachable from
 /// outside localhost. Trailing slashes are trimmed either way.
-fn normalize_url(url: &str) -> String {
+pub(crate) fn normalize_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         trimmed.to_string()

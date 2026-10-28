@@ -10,14 +10,23 @@
 //! `Arc<Mutex<CacheIndex>>`; every lock held here is brief (in-memory
 //! map lookups plus an occasional small file write), never held across
 //! network I/O.
+//!
+//! The second thing cached here is each server's indexed catalog
+//! (`ServerCatalog`), so a cold start paints the whole library off the
+//! disk instead of waiting on the network; see docs/startup-cache.md.
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
+
+use crate::config::NavidromeConfig;
+use crate::subsonic::{self, Album, Artist, Client, Playlist};
 
 /// How many distinct play days are kept per track. Only the count
 /// matters, but keeping the days themselves means raising the
@@ -117,6 +126,281 @@ fn index_path() -> Result<PathBuf> {
 /// given extension (no leading dot).
 pub fn track_path(id: &str, ext: &str) -> Result<PathBuf> {
     Ok(tracks_dir()?.join(format!("{id}.{ext}")))
+}
+
+/// Bumped whenever the row shapes below change; a catalog written by
+/// an older wim is dropped whole rather than half-parsed.
+const CATALOG_FORMAT: u32 = 1;
+
+/// One server's eagerly indexed catalog, exactly what `getArtists`,
+/// `getAlbumList2` and `getPlaylists` last answered. Songs are
+/// deliberately absent: nothing indexes them up front (see
+/// `subsonic::search3`), so there is no authoritative list to persist.
+#[derive(Debug, Default, Clone)]
+pub struct ServerCatalog {
+    pub artists: Vec<Artist>,
+    pub albums: Vec<Album>,
+    pub playlists: Vec<Playlist>,
+}
+
+impl ServerCatalog {
+    pub fn is_empty(&self) -> bool {
+        self.artists.is_empty() && self.albums.is_empty() && self.playlists.is_empty()
+    }
+}
+
+/// First line of a catalog file. `key` is stored in full so a digest
+/// collision in the filename can never serve one server's catalog as
+/// another's, and `sum` lets a sync whose catalog hasn't changed skip
+/// rewriting the whole file.
+#[derive(Debug, Serialize, Deserialize)]
+struct CatalogHeader {
+    v: u32,
+    key: String,
+    sum: String,
+    at: u64,
+}
+
+/// One catalog row. Newline-delimited json rather than one json
+/// document: it parses a line at a time with no whole-file value tree,
+/// a single corrupt line costs one entry instead of the catalog, and
+/// it stays greppable. See docs/startup-cache.md for the format
+/// comparison that picked it.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "k", rename_all = "lowercase")]
+enum CatalogRow {
+    Artist {
+        id: String,
+        name: String,
+    },
+    Album {
+        id: String,
+        name: String,
+        artist: String,
+    },
+    Playlist {
+        id: String,
+        name: String,
+    },
+}
+
+fn catalogs_dir() -> Result<PathBuf> {
+    Ok(cache_dir()?.join("catalogs"))
+}
+
+/// Which server a catalog belongs to: normalized base url plus
+/// username, since two accounts on one server see different playlists.
+fn catalog_key(base_url: &str, username: &str) -> String {
+    format!("{username}@{base_url}")
+}
+
+/// Hex md5, used only to turn a server key into a fixed-length
+/// filesystem-safe name; nothing here depends on it being a secure
+/// digest (the key itself is stored in the file's header).
+fn digest_hex(data: &str) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(data.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn catalog_path(dir: &Path, key: &str) -> PathBuf {
+    dir.join(format!("{}.ndjson", digest_hex(key)))
+}
+
+/// The body half of a catalog file, one json row per line. Artists
+/// first, then albums, then playlists; the order is just the write
+/// order, nothing reading it depends on it.
+fn catalog_body(artists: &[Artist], albums: &[Album], playlists: &[Playlist]) -> String {
+    let rows = artists
+        .iter()
+        .map(|a| CatalogRow::Artist {
+            id: a.id.clone(),
+            name: a.name.clone(),
+        })
+        .chain(albums.iter().map(|a| CatalogRow::Album {
+            id: a.id.clone(),
+            name: a.name.clone(),
+            artist: a.artist.clone(),
+        }))
+        .chain(playlists.iter().map(|p| CatalogRow::Playlist {
+            id: p.id.clone(),
+            name: p.name.clone(),
+        }));
+    let mut body = String::new();
+    for row in rows {
+        if let Ok(line) = serde_json::to_string(&row) {
+            body.push_str(&line);
+            body.push('\n');
+        }
+    }
+    body
+}
+
+/// The `sum` an existing catalog file was written with, reading only
+/// its first line; what makes "the catalog hasn't changed" cost one
+/// small read instead of a multi-megabyte rewrite every sync.
+fn stored_sum(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut line = String::new();
+    BufReader::new(file).read_line(&mut line).ok()?;
+    let header: CatalogHeader = serde_json::from_str(line.trim_end()).ok()?;
+    (header.v == CATALOG_FORMAT).then_some(header.sum)
+}
+
+/// Persists one server's catalog under the XDG cache dir; see
+/// `save_catalog_in` for what the write itself guarantees.
+pub fn save_catalog(
+    client: &Client,
+    artists: &[Artist],
+    albums: &[Album],
+    playlists: &[Playlist],
+) -> Result<()> {
+    save_catalog_in(
+        &catalogs_dir()?,
+        &catalog_key(client.base_url(), client.username()),
+        artists,
+        albums,
+        playlists,
+    )?;
+    Ok(())
+}
+
+/// Best-effort load for one configured server, same leniency as
+/// `CacheIndex::load`: a missing, truncated, foreign or outdated file
+/// just means this server starts cold and the first background sync
+/// fills it in.
+pub fn load_catalog(nav: &NavidromeConfig) -> Option<ServerCatalog> {
+    load_catalog_in(&catalogs_dir().ok()?, &server_key(nav))
+}
+
+/// Deletes every persisted catalog that doesn't belong to one of
+/// `active`, which is how a removed server's (or a renamed url's)
+/// catalog stops taking up disk. Deliberately not age-based: a
+/// configured server's catalog is exactly what makes a cold start
+/// instant, including after a week offline. Returns how many files
+/// went.
+pub fn sweep_foreign_catalogs(active: &[NavidromeConfig]) -> usize {
+    let keep: Vec<String> = active
+        .iter()
+        .map(|nav| digest_hex(&server_key(nav)))
+        .collect();
+    catalogs_dir()
+        .map(|dir| sweep_foreign_catalogs_in(&dir, &keep))
+        .unwrap_or(0)
+}
+
+/// The catalog key for a configured server. Goes through
+/// `subsonic::normalize_url` so the key a load computes from config
+/// matches the one a save computed from the live client's base url.
+fn server_key(nav: &NavidromeConfig) -> String {
+    catalog_key(&subsonic::normalize_url(&nav.url), &nav.username)
+}
+
+/// Skips the write entirely when what's on disk already matches
+/// (reported as `false`): an auto-sync whose catalog is identical,
+/// which is almost all of them, would otherwise rewrite megabytes
+/// every 45 seconds. Written to a temp file and renamed, so an
+/// interrupted write can't leave a truncated catalog behind, and
+/// created 0600: it holds no credentials, but it does map out the
+/// user's library and which server it came from.
+fn save_catalog_in(
+    dir: &Path,
+    key: &str,
+    artists: &[Artist],
+    albums: &[Album],
+    playlists: &[Playlist],
+) -> Result<bool> {
+    let path = catalog_path(dir, key);
+    let body = catalog_body(artists, albums, playlists);
+    let sum = digest_hex(&body);
+    if stored_sum(&path).as_deref() == Some(sum.as_str()) {
+        return Ok(false);
+    }
+    fs::create_dir_all(dir)?;
+    restrict_dir_to_owner(dir)?;
+    let header = serde_json::to_string(&CatalogHeader {
+        v: CATALOG_FORMAT,
+        key: key.to_string(),
+        sum,
+        at: now_secs(),
+    })?;
+    let tmp = path.with_extension("tmp");
+    write_owner_only(&tmp, &format!("{header}\n{body}"))
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(true)
+}
+
+fn load_catalog_in(dir: &Path, key: &str) -> Option<ServerCatalog> {
+    let raw = fs::read_to_string(catalog_path(dir, key)).ok()?;
+    let mut lines = raw.lines();
+    let header: CatalogHeader = serde_json::from_str(lines.next()?).ok()?;
+    if header.v != CATALOG_FORMAT || header.key != key {
+        return None;
+    }
+    let mut catalog = ServerCatalog::default();
+    for row in lines.filter_map(|line| serde_json::from_str(line).ok()) {
+        match row {
+            CatalogRow::Artist { id, name } => catalog.artists.push(Artist { id, name }),
+            CatalogRow::Album { id, name, artist } => {
+                catalog.albums.push(Album { id, name, artist })
+            }
+            CatalogRow::Playlist { id, name } => catalog.playlists.push(Playlist { id, name }),
+        }
+    }
+    Some(catalog)
+}
+
+fn sweep_foreign_catalogs_in(dir: &Path, keep: &[String]) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+        if stem.is_some_and(|stem| keep.contains(&stem)) {
+            continue;
+        }
+        if fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 0600 from the moment the file exists, rather than writing it world-
+/// readable and tightening afterwards.
+#[cfg(unix)]
+fn write_owner_only(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_owner_only(path: &Path, contents: &str) -> Result<()> {
+    fs::write(path, contents)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_dir_to_owner(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_dir_to_owner(_dir: &Path) -> Result<()> {
+    Ok(())
 }
 
 impl CacheIndex {
@@ -403,6 +687,250 @@ mod tests {
             2,
             "play history must survive eviction, only the file goes"
         );
+    }
+
+    /// Its own temp dir per test, so nothing here ever reads or
+    /// writes the real `~/.cache/wim`.
+    fn scratch_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("wim-catalog-{label}-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `save_catalog_in` for a whole `ServerCatalog`; the real caller
+    /// passes the three slices separately so persisting a fetch costs
+    /// no clone of it.
+    fn save(dir: &Path, key: &str, catalog: &ServerCatalog) -> Result<bool> {
+        save_catalog_in(
+            dir,
+            key,
+            &catalog.artists,
+            &catalog.albums,
+            &catalog.playlists,
+        )
+    }
+
+    fn sample_catalog(artists: usize, albums: usize, playlists: usize) -> ServerCatalog {
+        ServerCatalog {
+            artists: (0..artists)
+                .map(|i| Artist {
+                    id: format!("ar-{i}"),
+                    name: format!("artist {i}"),
+                })
+                .collect(),
+            albums: (0..albums)
+                .map(|i| Album {
+                    id: format!("al-{i}"),
+                    name: format!("album {i}"),
+                    artist: format!("artist {}", i % artists.max(1)),
+                })
+                .collect(),
+            playlists: (0..playlists)
+                .map(|i| Playlist {
+                    id: format!("pl-{i}"),
+                    name: format!("playlist {i}"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_catalog_survives_a_round_trip_through_the_disk() {
+        let dir = scratch_dir("roundtrip");
+        let catalog = sample_catalog(3, 5, 2);
+        assert!(save_catalog_in(
+            &dir,
+            "u@https://example.invalid",
+            &catalog.artists,
+            &catalog.albums,
+            &catalog.playlists
+        )
+        .unwrap());
+
+        let back = load_catalog_in(&dir, "u@https://example.invalid").expect("must load back");
+        assert_eq!(back.artists.len(), 3);
+        assert_eq!(back.albums.len(), 5);
+        assert_eq!(back.playlists.len(), 2);
+        assert_eq!(back.artists[1].name, "artist 1");
+        assert_eq!(back.albums[2].artist, "artist 2");
+        assert_eq!(back.playlists[0].id, "pl-0");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// No credentials in it, but it is a map of someone's library and
+    /// which server it came from; 0600 regardless, from the moment the
+    /// file exists.
+    #[cfg(unix)]
+    #[test]
+    fn a_persisted_catalog_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("perms");
+        let one = sample_catalog(1, 1, 1);
+        save_catalog_in(
+            &dir,
+            "u@https://example.invalid",
+            &one.artists,
+            &one.albums,
+            &one.playlists,
+        )
+        .unwrap();
+
+        let path = catalog_path(&dir, "u@https://example.invalid");
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "catalog maps out a private library");
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert!(
+            !dir.join("README").exists(),
+            "no temp file should be left behind"
+        );
+        let leftovers: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "left a temp file: {leftovers:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unchanged_catalog_is_not_rewritten() {
+        let dir = scratch_dir("skip");
+        let catalog = sample_catalog(2, 4, 1);
+        assert!(save(&dir, "k", &catalog).unwrap(), "first write");
+        assert!(
+            !save(&dir, "k", &catalog).unwrap(),
+            "an auto-sync that found the same catalog must not rewrite it"
+        );
+        let mut grown = catalog.clone();
+        grown.albums.push(Album {
+            id: "al-new".into(),
+            name: "new".into(),
+            artist: "artist 0".into(),
+        });
+        assert!(
+            save(&dir, "k", &grown).unwrap(),
+            "a real change must be written"
+        );
+        assert_eq!(load_catalog_in(&dir, "k").unwrap().albums.len(), 5);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_catalog_written_for_another_server_is_not_loaded() {
+        let dir = scratch_dir("foreign");
+        save(&dir, "a@https://one.invalid", &sample_catalog(1, 1, 0)).unwrap();
+        // same directory, different key: a different file, and even a
+        // digest collision would be caught by the stored key.
+        assert!(load_catalog_in(&dir, "b@https://two.invalid").is_none());
+
+        let path = catalog_path(&dir, "a@https://one.invalid");
+        let raw = fs::read_to_string(&path).unwrap();
+        let tampered = raw.replacen("a@https://one.invalid", "b@https://two.invalid", 1);
+        fs::write(&path, tampered).unwrap();
+        assert!(
+            load_catalog_in(&dir, "a@https://one.invalid").is_none(),
+            "a header naming another server must not be served as this one's"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_catalog_from_an_older_format_is_ignored_rather_than_half_parsed() {
+        let dir = scratch_dir("version");
+        fs::write(
+            catalog_path(&dir, "k"),
+            "{\"v\":0,\"key\":\"k\",\"sum\":\"x\",\"at\":1}\n{\"k\":\"artist\",\"id\":\"a\",\"name\":\"n\"}\n",
+        )
+        .unwrap();
+        assert!(load_catalog_in(&dir, "k").is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The reason for newline-delimited rows: one bad line costs one
+    /// entry, not the whole library.
+    #[test]
+    fn a_corrupt_row_costs_one_entry_not_the_catalog() {
+        let dir = scratch_dir("corrupt");
+        save(&dir, "k", &sample_catalog(3, 0, 0)).unwrap();
+        let path = catalog_path(&dir, "k");
+        let mut lines: Vec<String> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        lines[2] = "{\"k\":\"artist\",\"id\":".to_string(); // truncated mid-row
+        fs::write(&path, lines.join("\n")).unwrap();
+
+        let back = load_catalog_in(&dir, "k").expect("the rest must still load");
+        assert_eq!(back.artists.len(), 2);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sweeping_drops_catalogs_for_servers_that_are_gone() {
+        let dir = scratch_dir("sweep");
+        save(&dir, "keep", &sample_catalog(1, 1, 0)).unwrap();
+        save(&dir, "drop", &sample_catalog(1, 1, 0)).unwrap();
+
+        let keep = vec![digest_hex("keep")];
+        assert_eq!(sweep_foreign_catalogs_in(&dir, &keep), 1);
+        assert!(load_catalog_in(&dir, "keep").is_some());
+        assert!(load_catalog_in(&dir, "drop").is_none());
+        assert_eq!(
+            sweep_foreign_catalogs_in(&dir, &keep),
+            0,
+            "nothing left to sweep"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Why newline-delimited json and not `toml::to_string_pretty`
+    /// (what `index.toml` uses) or pretty json: at catalog scale the
+    /// format is most of the file. Prints the comparison; run with
+    /// `cargo test -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement, run explicitly"]
+    fn catalog_format_size_and_load_time() {
+        use std::time::Instant;
+        let dir = scratch_dir("bench");
+        let catalog = sample_catalog(4_000, 30_000, 120);
+
+        let started = Instant::now();
+        save(&dir, "k", &catalog).unwrap();
+        let write = started.elapsed();
+        let path = catalog_path(&dir, "k");
+        let ndjson_bytes = fs::metadata(&path).unwrap().len();
+
+        let started = Instant::now();
+        let back = load_catalog_in(&dir, "k").unwrap();
+        let read = started.elapsed();
+        assert_eq!(back.albums.len(), 30_000);
+
+        // same rows as one pretty json document, for scale
+        let rows: Vec<CatalogRow> = catalog
+            .albums
+            .iter()
+            .map(|a| CatalogRow::Album {
+                id: a.id.clone(),
+                name: a.name.clone(),
+                artist: a.artist.clone(),
+            })
+            .collect();
+        let pretty = serde_json::to_string_pretty(&rows).unwrap().len();
+        let compact = serde_json::to_string(&rows).unwrap().len();
+
+        eprintln!(
+            "catalog 4000 artists + 30000 albums + 120 playlists:\n  \
+             ndjson {ndjson_bytes} bytes, write {write:?}, load {read:?}\n  \
+             albums alone: compact json array {compact} bytes, pretty {pretty} bytes"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
