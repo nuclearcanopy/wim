@@ -167,6 +167,17 @@ pub struct Config {
     /// space. Also tweakable in the settings menu.
     #[serde(default = "default_cache_eviction_days")]
     pub cache_eviction_days: u64,
+    /// Click to focus a pane or press a control, drag the scrubber,
+    /// wheel to scroll a list. On by default, but still a switch:
+    /// capture hands the terminal's own click-drag text selection to
+    /// the app, so copying out of it then needs the shift bypass most
+    /// terminals offer (see the README's config section).
+    #[serde(default = "default_mouse")]
+    pub mouse: bool,
+}
+
+fn default_mouse() -> bool {
+    true
 }
 
 fn default_subtitle_language() -> String {
@@ -325,6 +336,7 @@ impl Default for Config {
             keybinds: HashMap::new(),
             cache_days_threshold: default_cache_days_threshold(),
             cache_eviction_days: default_cache_eviction_days(),
+            mouse: default_mouse(),
         }
     }
 }
@@ -420,6 +432,19 @@ mod tests {
         let cfg: Config = toml::from_str("album_art = \"auto\"\n").expect("parsing");
         assert!(cfg.eq_custom_presets.is_empty());
         assert_eq!(cfg.eq_gains, None);
+    }
+
+    /// A config written before mouse support existed has to come back
+    /// with it on, not off: the field defaulting to `false` through
+    /// `#[serde(default)]` is the easy way to ship a feature nobody
+    /// gets until they edit a file.
+    #[test]
+    fn mouse_support_is_on_unless_a_config_turns_it_off() {
+        assert!(Config::default().mouse);
+        let old: Config = toml::from_str("album_art = \"auto\"\n").expect("parsing");
+        assert!(old.mouse);
+        let off: Config = toml::from_str("mouse = false\n").expect("parsing");
+        assert!(!off.mouse);
     }
 
     /// Verbatim shape `nix/home-manager.nix` generates for a declared
