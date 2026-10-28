@@ -25,6 +25,11 @@ pub struct HelpOverlay<'a> {
 enum Key {
     Fixed(&'static str),
     Bound(KeyAction),
+    /// Two remappable actions that read as one row ("speed down /
+    /// speed up"). Spelling such a pair as `Fixed("[ / ]")` is how
+    /// this table ended up lying about four rebindable keys: the text
+    /// was baked in, so a remap left the help showing the old pair.
+    Pair(KeyAction, KeyAction),
 }
 
 const SECTIONS: &[(&str, &[(Key, &str)])] = &[
@@ -52,10 +57,16 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Bound(KeyAction::SkipBack), "back to previous"),
             (Key::Bound(KeyAction::CycleLoop), "cycle loop"),
             (Key::Bound(KeyAction::ToggleShuffle), "shuffle"),
-            (Key::Fixed("[ / ]"), "speed"),
+            (
+                Key::Pair(KeyAction::SpeedDown, KeyAction::SpeedUp),
+                "speed down / up",
+            ),
             (Key::Bound(KeyAction::CycleEq), "cycle eq preset"),
             (Key::Bound(KeyAction::ToggleCrossfade), "toggle crossfade"),
-            (Key::Fixed(", / ."), "subtitle delay -/+ 0.5s"),
+            (
+                Key::Pair(KeyAction::SubtitleDelayDown, KeyAction::SubtitleDelayUp),
+                "subtitle delay -/+ 0.5s",
+            ),
             (Key::Bound(KeyAction::OpenSubtitleMenu), "subtitle settings"),
         ],
     ),
@@ -169,6 +180,11 @@ impl HelpOverlay<'_> {
                     let key_text = match key {
                         Key::Fixed(s) => (*s).to_string(),
                         Key::Bound(action) => key_label(self.keymap.get(*action)),
+                        Key::Pair(a, b) => format!(
+                            "{} / {}",
+                            key_label(self.keymap.get(*a)),
+                            key_label(self.keymap.get(*b))
+                        ),
                     };
                     block.push(Line {
                         text: format!("  {key_text:<13} {desc}"),
@@ -334,5 +350,32 @@ mod tests {
             let keymap = Keymap::default();
             HelpOverlay { keymap: &keymap }.render(area, &mut buf);
         }
+    }
+
+    #[test]
+    fn a_paired_row_follows_both_of_its_rebound_keys() {
+        use crossterm::event::KeyCode;
+        let mut keymap = Keymap::default();
+        keymap.set(KeyAction::SpeedDown, KeyCode::Char('x'));
+        keymap.set(KeyAction::SpeedUp, KeyCode::Char('y'));
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        HelpOverlay { keymap: &keymap }.render(area, &mut buf);
+        let rendered: String = (0..30)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("x / y"),
+            "the speed row must read the live keymap:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("[ / ]"),
+            "and must not still show the baked-in default"
+        );
     }
 }
