@@ -471,6 +471,12 @@ run that edits these files will collide.
       `Focus::Workspace`, so with nothing playing the menu idles at the
       100ms poll and its selection plate animates at a tenth of the
       display rate. one condition, in the per-frame pacing block.
+- [ ] **shellsong's `eq(<preset>)` cannot reach saved curves.** it
+      resolves names through `eq::index_of`, which is built-ins only.
+      `eq::resolve(name, &cfg.eq_custom_presets)` already returns
+      `(Source, gains)` for both, so `Op::SetEqPreset` needs to carry
+      a `Source` rather than a bare index, and `Words::EqPreset`
+      completion wants the saved names too.
 - [ ] **album/artist identity is name-based.** `SearchItem` carries no
       `album_id`/`artist_id`, so the suggestion catalog joins on
       trimmed-lowercased names. two same-named albums by one artist
