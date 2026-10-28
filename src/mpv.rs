@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -322,6 +322,15 @@ impl Mpv {
         })
     }
 
+    /// A second, independent ipc connection that pulls video frames on
+    /// its own thread; see `FramePump`. Separate connection on purpose:
+    /// a frame reply is megabytes of json, and sharing the control
+    /// connection would put that parse in front of the `time-pos`
+    /// events the render path reads.
+    pub fn frame_pump(&self) -> Result<FramePump> {
+        FramePump::spawn(&self.sock_path)
+    }
+
     pub fn events(&self) -> &Receiver<Event> {
         &self.events
     }
@@ -610,34 +619,6 @@ impl Mpv {
         self.command(&[json!("seek"), json!(seconds), json!(flag)])?;
         Ok(())
     }
-
-    /// One video frame as raw `bgr0` pixels, for embedding video in
-    /// the workspace (see `main::VideoPane`/`main::capture_video_frame`)
-    /// instead of leaving it to mpv's own native window. Round-trips
-    /// over the same IPC socket as every other command, so calling
-    /// this on every render tick would stall the UI on each reply;
-    /// callers are expected to throttle.
-    pub fn screenshot_raw(&self) -> Result<RawFrame> {
-        let v = self.command(&[json!("screenshot-raw")])?;
-        let width = v.get("w").and_then(Value::as_u64).context("missing w")? as u32;
-        let height = v.get("h").and_then(Value::as_u64).context("missing h")? as u32;
-        let stride = v
-            .get("stride")
-            .and_then(Value::as_u64)
-            .context("missing stride")? as u32;
-        let data_b64 = v
-            .get("data")
-            .and_then(Value::as_str)
-            .context("missing data")?;
-        let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_b64)
-            .context("decoding screenshot-raw's base64 data")?;
-        Ok(RawFrame {
-            width,
-            height,
-            stride,
-            data,
-        })
-    }
 }
 
 /// `bgr0` (4 bytes/pixel, blue/green/red/unused) raw frame as returned
@@ -656,20 +637,342 @@ impl RawFrame {
     /// swapping channel order; `None` if the dimensions mpv reported
     /// don't actually fit the data it sent (never expected, but a
     /// malformed frame should just get skipped, not panic the UI).
-    pub fn into_image(self) -> Option<image::RgbImage> {
-        let mut rgb = Vec::with_capacity((self.width * self.height * 3) as usize);
-        for row in 0..self.height {
-            let row_start = (row * self.stride) as usize;
-            for col in 0..self.width {
-                let px = row_start + (col * 4) as usize;
-                let pixel = self.data.get(px..px + 3)?;
-                rgb.push(pixel[2]); // r
-                rgb.push(pixel[1]); // g
-                rgb.push(pixel[0]); // b
+    ///
+    /// One bounds check per row rather than one per pixel: at 1080p
+    /// that is 1080 instead of 2 million, and the output buffer is
+    /// sized once instead of growing under three `push`es per pixel.
+    pub fn to_image(&self) -> Option<image::RgbImage> {
+        let (w, h, stride) = (
+            self.width as usize,
+            self.height as usize,
+            self.stride as usize,
+        );
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let mut rgb = vec![0u8; w.checked_mul(h)?.checked_mul(3)?];
+        for (row, out_row) in rgb.chunks_exact_mut(w * 3).enumerate() {
+            let start = row.checked_mul(stride)?;
+            let src = self.data.get(start..start.checked_add(w * 4)?)?;
+            // fixed-size chunks: the compiler knows each `px`/`out` is
+            // in bounds, so the inner loop carries no checks at all.
+            let (pixels, _) = src.as_chunks::<4>();
+            let (outs, _) = out_row.as_chunks_mut::<3>();
+            for (px, out) in pixels.iter().zip(outs.iter_mut()) {
+                out[0] = px[2]; // r
+                out[1] = px[1]; // g
+                out[2] = px[0]; // b
             }
         }
         image::RgbImage::from_raw(self.width, self.height, rgb)
     }
+}
+
+/// What the frame pump should be doing. `interval` decouples the
+/// capture rate from the display refresh rate; `max_edge` box-scales
+/// each frame down to at most that many pixels on its longer side, so
+/// a per-cell renderer's sampling cost tracks the cell grid rather than
+/// the source resolution. Both are the pump's cost knobs, deliberately
+/// parameters rather than constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capture {
+    pub on: bool,
+    pub interval: Duration,
+    pub max_edge: Option<u32>,
+}
+
+impl Capture {
+    pub fn off() -> Self {
+        Capture {
+            on: false,
+            interval: Duration::from_millis(150),
+            max_edge: None,
+        }
+    }
+}
+
+/// The most recent decoded video frame. `image` is shared, so handing
+/// it to a renderer is a refcount bump and never a copy.
+#[derive(Clone)]
+pub struct Frame {
+    pub image: Arc<image::DynamicImage>,
+    /// Counts published frames. A per-frame renderer can hold the last
+    /// value it drew and skip re-rasterizing an unchanged frame; not
+    /// read yet, which is why it is allowed to look dead.
+    #[allow(dead_code)]
+    pub seq: u64,
+}
+
+/// Whether the pump has a working frame source. `Unsupported` is not
+/// a transient failure: mpv's own manual says `screenshot-raw` "can be
+/// used only through the client API", and over json ipc mpv answers it
+/// with a byte array it has no json representation for, emitting a
+/// reply that does not parse. See docs/architecture.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpState {
+    Idle,
+    Capturing,
+    Unsupported,
+}
+
+/// Pulls video frames from mpv on its own thread and its own ipc
+/// connection, keeping exactly the newest decoded frame. The render
+/// path only ever reads `latest`, so neither the ipc round trip nor the
+/// base64/json decode nor the bgr0 conversion is ever on it, and a
+/// decode slower than `interval` drops frames instead of queueing them.
+pub struct FramePump {
+    latest: Arc<Mutex<Option<Frame>>>,
+    state: Arc<Mutex<PumpState>>,
+    want: Mutex<Capture>,
+    ctl: Sender<Capture>,
+    stop: Arc<AtomicBool>,
+}
+
+impl FramePump {
+    fn spawn(sock_path: &Path) -> Result<Self> {
+        let sock = UnixStream::connect(sock_path).context("second mpv ipc connection")?;
+        let latest: Arc<Mutex<Option<Frame>>> = Arc::new(Mutex::new(None));
+        let state = Arc::new(Mutex::new(PumpState::Idle));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ctl, ctl_rx) = mpsc::channel();
+
+        let worker = PumpWorker {
+            latest: latest.clone(),
+            state: state.clone(),
+            stop: stop.clone(),
+        };
+        thread::spawn(move || worker.run(sock, ctl_rx));
+
+        Ok(FramePump {
+            latest,
+            state,
+            want: Mutex::new(Capture::off()),
+            ctl,
+            stop,
+        })
+    }
+
+    /// The newest decoded frame, or `None` if none has landed since
+    /// capture was last turned on. Never blocks on mpv or on a decode:
+    /// a short lock and an `Arc` clone, nothing else. This is the whole
+    /// surface a per-frame renderer needs.
+    pub fn latest(&self) -> Option<Frame> {
+        self.latest.lock().ok()?.clone()
+    }
+
+    /// Turns capture on or off and sets its cost knobs. Cheap and
+    /// idempotent, so it is fine to call every frame: a request equal
+    /// to the standing one sends nothing. Turning it off clears the
+    /// held frame synchronously, so `latest` cannot hand back a frame
+    /// from the file that stopped playing.
+    pub fn set_capture(&self, want: Capture) {
+        let Ok(mut standing) = self.want.lock() else {
+            return;
+        };
+        if *standing == want {
+            return;
+        }
+        *standing = want;
+        if !want.on {
+            if let Ok(mut held) = self.latest.lock() {
+                *held = None;
+            }
+        }
+        let _ = self.ctl.send(want);
+    }
+
+    pub fn state(&self) -> PumpState {
+        self.state.lock().map(|s| *s).unwrap_or(PumpState::Idle)
+    }
+}
+
+impl Drop for FramePump {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+struct PumpWorker {
+    latest: Arc<Mutex<Option<Frame>>>,
+    state: Arc<Mutex<PumpState>>,
+    stop: Arc<AtomicBool>,
+}
+
+/// How long the idle pump blocks on its control channel before
+/// re-checking the stop flag.
+const PUMP_IDLE_WAIT: Duration = Duration::from_millis(250);
+
+impl PumpWorker {
+    fn set_state(&self, state: PumpState) {
+        if let Ok(mut s) = self.state.lock() {
+            *s = state;
+        }
+    }
+
+    fn run(self, sock: UnixStream, ctl: Receiver<Capture>) {
+        let Ok(write_sock) = sock.try_clone() else {
+            return;
+        };
+        let mut writer = write_sock;
+        let mut reader = BufReader::new(sock);
+        let mut next_id = 0u64;
+        // this connection carries nothing but our own replies, so the
+        // reply to a request is simply the next line; that is what
+        // lets a reply mpv could not serialize be recognised at all.
+        if request(
+            &mut writer,
+            &mut reader,
+            &mut next_id,
+            &[json!("disable_event"), json!("all")],
+        )
+        .is_none()
+        {
+            return;
+        }
+
+        let mut want = Capture::off();
+        let mut seq = 0u64;
+        loop {
+            if self.stop.load(Ordering::SeqCst) {
+                return;
+            }
+            if !want.on {
+                match ctl.recv_timeout(PUMP_IDLE_WAIT) {
+                    Ok(next) => want = next,
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+                continue;
+            }
+
+            let started = Instant::now();
+            match self.capture(&mut writer, &mut reader, &mut next_id, want.max_edge) {
+                Capture_::Published(image) => {
+                    seq += 1;
+                    if let Ok(mut held) = self.latest.lock() {
+                        *held = Some(Frame { image, seq });
+                    }
+                    self.set_state(PumpState::Capturing);
+                }
+                // no video track, mpv busy: try again next tick.
+                Capture_::Skip => self.set_state(PumpState::Capturing),
+                Capture_::Unsupported => {
+                    self.set_state(PumpState::Unsupported);
+                    want.on = false;
+                }
+                Capture_::Dead => return,
+            }
+
+            let rest = want.interval.saturating_sub(started.elapsed());
+            match ctl.recv_timeout(rest) {
+                Ok(next) => want = next,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            // a backlog of control messages only has one meaning: the
+            // last one.
+            while let Ok(next) = ctl.try_recv() {
+                want = next;
+            }
+        }
+    }
+
+    fn capture(
+        &self,
+        writer: &mut UnixStream,
+        reader: &mut BufReader<UnixStream>,
+        next_id: &mut u64,
+        max_edge: Option<u32>,
+    ) -> Capture_ {
+        match request(writer, reader, next_id, &[json!("screenshot-raw")]) {
+            None => Capture_::Dead,
+            Some(Reply::Unparseable) => Capture_::Unsupported,
+            Some(Reply::Error) => Capture_::Skip,
+            Some(Reply::Data(v)) => {
+                let Some(frame) = parse_raw_frame(&v) else {
+                    return Capture_::Skip;
+                };
+                let Some(rgb) = frame.to_image() else {
+                    return Capture_::Skip;
+                };
+                let mut img = image::DynamicImage::ImageRgb8(rgb);
+                if let Some(edge) = max_edge {
+                    let (w, h) = (img.width(), img.height());
+                    if w.max(h) > edge {
+                        img = img.resize(edge, edge, image::imageops::FilterType::Triangle);
+                    }
+                }
+                Capture_::Published(Arc::new(img))
+            }
+        }
+    }
+}
+
+/// Outcome of one capture attempt; `Dead` means the ipc connection is
+/// gone and the pump should stop.
+enum Capture_ {
+    Published(Arc<image::DynamicImage>),
+    Skip,
+    Unsupported,
+    Dead,
+}
+
+enum Reply {
+    Data(Value),
+    /// mpv refused the command: no video track yet, or it is busy.
+    /// Which error it was doesn't change what the pump does (skip this
+    /// tick), so it isn't carried.
+    Error,
+    /// mpv wrote a line that is not json. For `screenshot-raw` that is
+    /// mpv emitting `"data":` with nothing after it, because the value
+    /// is a byte array and json ipc has no encoding for one.
+    Unparseable,
+}
+
+/// One request on the pump's own connection, where the next line is by
+/// construction the reply. `None` means the connection is unusable.
+fn request(
+    writer: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    next_id: &mut u64,
+    args: &[Value],
+) -> Option<Reply> {
+    *next_id += 1;
+    let payload = json!({ "command": args, "request_id": *next_id });
+    let mut line = serde_json::to_vec(&payload).ok()?;
+    line.push(b'\n');
+    writer.write_all(&line).ok()?;
+
+    let mut buf = String::new();
+    if reader.read_line(&mut buf).ok()? == 0 {
+        return None;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(buf.trim()) else {
+        return Some(Reply::Unparseable);
+    };
+    match v.get("error").and_then(Value::as_str) {
+        Some("success") | None => Some(Reply::Data(v.get("data").cloned().unwrap_or(Value::Null))),
+        Some(_) => Some(Reply::Error),
+    }
+}
+
+/// `screenshot-raw`'s reply map -> `RawFrame`; `None` if any field mpv
+/// is supposed to set is missing or the wrong shape.
+fn parse_raw_frame(v: &Value) -> Option<RawFrame> {
+    let width = u32::try_from(v.get("w")?.as_u64()?).ok()?;
+    let height = u32::try_from(v.get("h")?.as_u64()?).ok()?;
+    let stride = u32::try_from(v.get("stride")?.as_u64()?).ok()?;
+    let data = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        v.get("data")?.as_str()?,
+    )
+    .ok()?;
+    Some(RawFrame {
+        width,
+        height,
+        stride,
+        data,
+    })
 }
 
 /// `#AARRGGBB`, mpv's own color option format; `level` (0..1) sets R,
@@ -718,7 +1021,7 @@ mod tests {
                 0, 0, 0, 0, // row padding, must be ignored
             ],
         };
-        let img = frame.into_image().expect("valid frame");
+        let img = frame.to_image().expect("valid frame");
         assert_eq!(img.get_pixel(0, 0).0, [30, 20, 10]);
         assert_eq!(img.get_pixel(1, 0).0, [60, 50, 40]);
     }
@@ -731,7 +1034,7 @@ mod tests {
             stride: 16,
             data: vec![0; 4],
         };
-        assert!(frame.into_image().is_none());
+        assert!(frame.to_image().is_none());
     }
 
     #[test]
@@ -840,4 +1143,33 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn a_zero_sized_frame_is_rejected_rather_than_panicking() {
+        let frame = RawFrame {
+            width: 0,
+            height: 4,
+            stride: 0,
+            data: vec![],
+        };
+        assert!(frame.to_image().is_none());
+    }
+
+    #[test]
+    fn a_screenshot_reply_without_the_fields_mpv_promises_is_rejected() {
+        assert!(parse_raw_frame(&json!({"w": 2, "h": 1, "stride": 8})).is_none());
+        assert!(parse_raw_frame(&json!(null)).is_none());
+        // what mpv 0.41 actually sends over json ipc, once the
+        // unparseable line is coerced: a map with no `data` at all.
+        assert!(
+            parse_raw_frame(&json!({"w": 640, "h": 480, "stride": 2560, "format": "bgr0"}))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn capture_off_is_off() {
+        let off = Capture::off();
+        assert!(!off.on);
+        assert_eq!(off.max_edge, None);
+    }
 }
