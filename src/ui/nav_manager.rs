@@ -20,6 +20,11 @@ pub struct NavManagerListView<'a> {
 
 impl Widget for NavManagerListView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // takes over a rect that already has other content drawn
+        // into it, so it has to own every cell: without the clear,
+        // whatever this menu did not write still showed through.
+        let area = crate::ui::draw::overlay(buf, area);
+
         let width = area.width as usize;
         let mut y = draw_header(
             buf,
@@ -94,7 +99,9 @@ fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
+    use crate::ui::testbuf::{
+        assert_no_bleed_through, assert_outside_untouched, buffer, grid, plated_buffer,
+    };
 
     fn server(url: &str, username: &str) -> NavidromeConfig {
         NavidromeConfig {
@@ -125,29 +132,29 @@ mod tests {
 
     #[test]
     fn an_empty_list_offers_only_the_add_row() {
-        let area = Rect::new(0, 0, 50, 8);
-        let mut buf = buffer(50, 8);
+        let area = Rect::new(0, 0, 54, 10);
+        let mut buf = buffer(54, 10);
         render(area, &mut buf, &[], &[], 0);
-        assert_eq!(
-            grid(&buf),
-            [
-                "navidrome profiles │ enter: reconnect/add, d d: r…",
-                "───────────────────┴──────────────────────────────",
-                "..................................................",
-                "(no profiles yet).................................",
-                "> [ add new profile ].............................",
-                "..................................................",
-                "..................................................",
-                "..................................................",
-            ]
-            .join("\n")
-        );
+        assert_eq!(grid(&buf), SNAPSHOT.join("\n"));
     }
+
+    const SNAPSHOT: [&str; 10] = [
+        "┌────────────────────────────────────────────────────┐",
+        "│ navidrome profiles │ enter: reconnect/add, d d: r… │",
+        "│ ───────────────────┴────────────────────────────── │",
+        "│                                                    │",
+        "│ (no profiles yet)                                  │",
+        "│ > [ add new profile ]                              │",
+        "│                                                    │",
+        "│                                                    │",
+        "│                                                    │",
+        "└────────────────────────────────────────────────────┘",
+    ];
 
     #[test]
     fn each_profile_row_carries_its_url_username_and_connection_mark() {
-        let area = Rect::new(0, 0, 50, 8);
-        let mut buf = buffer(50, 8);
+        let area = Rect::new(0, 0, 54, 10);
+        let mut buf = buffer(54, 10);
         let servers = [
             server("https://a.example", "ana"),
             server("https://b.example", "bob"),
@@ -164,16 +171,29 @@ mod tests {
     /// much further right rather than a cell per wide char too few.
     #[test]
     fn a_wide_url_does_not_shift_the_username_after_it() {
-        let area = Rect::new(0, 0, 50, 8);
-        let mut buf = buffer(50, 8);
+        let area = Rect::new(0, 0, 54, 10);
+        let mut buf = buffer(54, 10);
         let servers = [server("日本", "ana")];
         render(area, &mut buf, &servers, &[None], 0);
-        let row = grid(&buf).lines().nth(3).unwrap().to_string();
-        let col = row.find('日').expect("the wide url");
-        assert_eq!(row.chars().nth(col + 1), Some(' '), "{row}");
-        assert_eq!(row.chars().nth(col + 2), Some('本'), "{row}");
-        assert_eq!(row.chars().nth(col + 4), Some(' '), "{row}");
-        assert_eq!(row.chars().nth(col + 5), Some('('), "{row}");
+        let g = grid(&buf);
+        let row: Vec<char> = g
+            .lines()
+            .find(|r| r.contains('日'))
+            .unwrap()
+            .chars()
+            .collect();
+        let col = row.iter().position(|c| *c == '日').expect("the wide url");
+        assert_eq!(
+            (
+                row[col],
+                row[col + 1],
+                row[col + 2],
+                row[col + 3],
+                row[col + 4],
+                row[col + 5]
+            ),
+            ('日', ' ', '本', ' ', ' ', '(')
+        );
     }
 
     #[test]
@@ -183,6 +203,28 @@ mod tests {
         let servers = [server("日本語テスト曲日本語テスト曲", "日本語")];
         render(area, &mut buf, &servers, &[Some(true)], 0);
         assert_outside_untouched(&buf, area);
+    }
+
+    #[test]
+    fn the_overlay_covers_every_cell_of_its_rect() {
+        let mut buf = plated_buffer(44, 14);
+        let area = Rect::new(2, 1, 40, 12);
+        let servers = [server("https://a.example", "ana")];
+        render(area, &mut buf, &servers, &[Some(true)], 0);
+        assert_no_bleed_through(&buf, area);
+    }
+
+    #[test]
+    fn the_frame_closes_all_four_corners() {
+        let mut buf = buffer(44, 14);
+        let area = Rect::new(2, 1, 40, 12);
+        render(area, &mut buf, &[], &[], 0);
+        let g = grid(&buf);
+        let rows: Vec<Vec<char>> = g.lines().map(|r| r.chars().collect()).collect();
+        assert_eq!(
+            (rows[1][2], rows[1][41], rows[12][2], rows[12][41]),
+            ('┌', '┐', '└', '┘')
+        );
     }
 
     #[test]
