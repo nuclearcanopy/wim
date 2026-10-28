@@ -4,7 +4,7 @@ use ratatui::widgets::Widget;
 
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
-use crate::ui::textfit::{tail_fit, truncate_with_ellipsis};
+use crate::ui::textfit::{tail_fit, truncate_with_ellipsis, width};
 
 /// Interactive Navidrome setup, shown on first run instead of requiring
 /// a hand-edited config.toml before the app is even usable. Esc skips
@@ -76,7 +76,7 @@ impl Widget for LoginView<'_> {
             ("password", &masked_password),
         ];
 
-        let width = area.width as usize;
+        let area_width = area.width as usize;
         let mut y = draw_header(
             buf,
             area,
@@ -106,32 +106,22 @@ impl Widget for LoginView<'_> {
                 let has_own_scheme = value.to_ascii_lowercase().starts_with("http://")
                     || value.to_ascii_lowercase().starts_with("https://");
                 let ghost = if has_own_scheme { "" } else { "https://" };
-                let prefix_width = prefix.chars().count() + ghost.chars().count();
-                let value_width = width.saturating_sub(prefix_width);
+                let prefix_width = width(&prefix) + width(ghost);
+                let value_width = area_width.saturating_sub(prefix_width);
                 let fitted_value = tail_fit(value, value_width);
 
-                draw_line(buf, area, y, &prefix, active_color);
-                draw_line_at(
-                    buf,
-                    area,
-                    prefix.chars().count() as u16,
-                    y,
-                    ghost,
-                    shade(DIM),
-                );
-                draw_line_at(
-                    buf,
-                    area,
-                    (prefix.chars().count() + ghost.chars().count()) as u16,
-                    y,
-                    &fitted_value,
-                    active_color,
-                );
+                // three runs in two brightness levels on one row, so
+                // each starts where the previous writer stopped; a char
+                // count would land the url inside the ghost's last
+                // glyph for any wide character.
+                let after_prefix = draw_run(buf, area, area.x, y, &prefix, active_color);
+                let after_ghost = draw_run(buf, area, after_prefix, y, ghost, shade(DIM));
+                draw_run(buf, area, after_ghost, y, &fitted_value, active_color);
             } else {
                 // the value is what's actively being typed; keep its
                 // tail (cursor end) visible rather than truncating it
                 // away, same as the search query in the status bar.
-                let value_width = width.saturating_sub(prefix.chars().count());
+                let value_width = area_width.saturating_sub(width(&prefix));
                 let line = format!("{prefix}{}", tail_fit(value, value_width));
                 draw_line(buf, area, y, &line, active_color);
             }
@@ -155,35 +145,130 @@ impl Widget for LoginView<'_> {
             buf,
             area,
             y,
-            &truncate_with_ellipsis(self.message, width),
+            &truncate_with_ellipsis(self.message, area_width),
             shade(DIM),
         );
     }
 }
 
 fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
-    draw_line_at(buf, area, 0, y, text, color);
+    crate::ui::draw::line(buf, area, y, text, color);
 }
 
-fn draw_line_at(
+/// One run of a multi-brightness row, returning the x it stopped at so
+/// the next run starts on a cell boundary rather than a char count.
+fn draw_run(
     buf: &mut Buffer,
     area: Rect,
-    x_offset: u16,
+    x: u16,
     y: u16,
     text: &str,
     color: ratatui::style::Color,
-) {
-    if y >= area.y + area.height {
-        return;
+) -> u16 {
+    if y < area.y || y >= area.y + area.height {
+        return x;
     }
-    for (col, ch) in text.chars().enumerate() {
-        let x = area.x + x_offset + col as u16;
-        if x >= area.x + area.width {
-            break;
+    let right = area.x + area.width;
+    crate::ui::draw::at(buf, x, y, text, color, right.saturating_sub(x) as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
+
+    fn form(url: &str, username: &str, password: &str, field: usize) -> LoginForm {
+        LoginForm {
+            url: url.to_string(),
+            username: username.to_string(),
+            password: password.to_string(),
+            field,
         }
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_fg(color);
+    }
+
+    fn render(area: Rect, buf: &mut Buffer, form: &LoginForm, message: &str) {
+        LoginView { form, message }.render(area, buf);
+    }
+
+    #[test]
+    fn the_three_fields_render_with_the_ghost_scheme_and_a_masked_password() {
+        let area = Rect::new(0, 0, 54, 9);
+        let mut buf = buffer(54, 9);
+        render(area, &mut buf, &form("", "ana", "hunter2", 0), "nope");
+        assert_eq!(
+            grid(&buf),
+            [
+                "navidrome setup │ enter to advance, esc to skip (loca…",
+                "────────────────┴─────────────────────────────────────",
+                "......................................................",
+                "> server: https://....................................",
+                "  username: ana.......................................",
+                "  password: *******...................................",
+                "......................................................",
+                "paste with your terminal's shortcut (often ctrl+shift+",
+                "nope..................................................",
+            ]
+            .join("\n")
+        );
+    }
+
+    /// Typing a scheme drops the ghost rather than doubling it up.
+    #[test]
+    fn a_typed_scheme_replaces_the_ghost_instead_of_stacking_on_it() {
+        let area = Rect::new(0, 0, 54, 9);
+        let mut buf = buffer(54, 9);
+        render(area, &mut buf, &form("https://a.example", "", "", 0), "");
+        let row = grid(&buf).lines().nth(3).unwrap().to_string();
+        assert!(row.starts_with("> server: https://a.example"), "{row}");
+        assert!(!row.contains("https://https://"), "{row}");
+    }
+
+    /// The url is typed, so it can be non-ascii; it is written as a
+    /// third run after the ghost, and must start where the ghost's last
+    /// cell actually ended.
+    #[test]
+    fn a_wide_url_starts_after_the_ghost_and_does_not_shift_itself() {
+        let area = Rect::new(0, 0, 54, 9);
+        let mut buf = buffer(54, 9);
+        render(area, &mut buf, &form("日本x", "", "", 0), "");
+        let row: Vec<char> = grid(&buf).lines().nth(3).unwrap().chars().collect();
+        // "> server: " is 10 cells, "https://" another 8.
+        let start = 18;
+        assert_eq!(
+            (row[start], row[start + 1], row[start + 2], row[start + 3]),
+            ('日', ' ', '本', ' ')
+        );
+        assert_eq!(row[start + 4], 'x');
+    }
+
+    /// A non-ascii username lives on a single-run row, so this covers
+    /// the plain `draw::line` path alongside the ghost-prefixed one.
+    #[test]
+    fn a_wide_username_does_not_shift_the_glyphs_after_it() {
+        let area = Rect::new(0, 0, 54, 9);
+        let mut buf = buffer(54, 9);
+        render(area, &mut buf, &form("", "日本x", "", 1), "");
+        let row: Vec<char> = grid(&buf).lines().nth(4).unwrap().chars().collect();
+        let start = 12; // "> username: "
+        assert_eq!((row[start], row[start + 1]), ('日', ' '));
+        assert_eq!(row[start + 4], 'x');
+    }
+
+    #[test]
+    fn a_wide_url_stays_inside_the_rect() {
+        let mut buf = buffer(40, 12);
+        let area = Rect::new(2, 1, 20, 8);
+        let f = form("日本語テスト曲日本語テスト曲", "日本語", "日本語", 0);
+        render(area, &mut buf, &f, "日本語テスト曲日本語テスト曲");
+        assert_outside_untouched(&buf, area);
+    }
+
+    #[test]
+    fn degenerate_sizes_do_not_panic() {
+        let f = form("日本語", "日本", "pw", 0);
+        for (w, h) in [(1, 1), (1, 40), (2, 1), (40, 0), (0, 0), (3, 2)] {
+            let mut buf = buffer(w.max(1), h.max(1));
+            render(Rect::new(0, 0, w, h), &mut buf, &f, "日本語");
         }
     }
 }

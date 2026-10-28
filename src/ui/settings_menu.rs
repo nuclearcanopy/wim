@@ -31,6 +31,12 @@ pub struct SettingsMenu<'a> {
 
 impl Widget for SettingsMenu<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // this takes over a rect that already has a sidebar, a track
+        // list or the banner drawn into it, so it has to own every
+        // cell: without the clear, whatever the menu did not write
+        // still showed through between its rows.
+        let area = crate::ui::draw::overlay(buf, area);
+
         // only the remappable keys come from the keymap; j/k, h/l,
         // enter, esc and the arrows are the fixed conventions
         // reserved in keymap.rs, so they stay literal.
@@ -90,25 +96,126 @@ impl Widget for SettingsMenu<'_> {
 }
 
 fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
-    if y >= area.y + area.height {
-        return;
-    }
-    for (col, ch) in text.chars().enumerate() {
-        let x = area.x + col as u16;
-        if x >= area.x + area.width {
-            break;
-        }
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_fg(color);
-        }
-    }
+    crate::ui::draw::line(buf, area, y, text, color);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::testbuf::{
+        assert_no_bleed_through, assert_outside_untouched, buffer, grid, plated_buffer,
+    };
     use crossterm::event::KeyCode;
+
+    fn render(area: Rect, buf: &mut Buffer, values: [&str; FIELD_COUNT]) {
+        SettingsMenu {
+            values,
+            selected: 0,
+            keymap: &Keymap::default(),
+        }
+        .render(area, buf);
+    }
+
+    #[test]
+    fn every_field_gets_a_row_with_its_value_in_an_aligned_column() {
+        let area = Rect::new(0, 0, 80, 17);
+        let mut buf = buffer(80, 17);
+        render(
+            area,
+            &mut buf,
+            ["on", "off", "3", "7", "30", "50", "240", "set"],
+        );
+        assert_eq!(grid(&buf), SNAPSHOT.join("\n"));
+    }
+
+    const SNAPSHOT: [&str; 17] = [
+        "┌──────────────────────────────────────────────────────────────────────────────┐",
+        "│ settings │ u or esc to close                                                 │",
+        "│ ─────────┴────────────────────────────────────────────────────────────────── │",
+        "│                                                                              │",
+        "│ > album art                   on                                             │",
+        "│   crossfade                   off                                            │",
+        "│   crossfade seconds           3                                              │",
+        "│   cache after days played     7                                              │",
+        "│   cache eviction days         30                                             │",
+        "│   scrobble % threshold        50                                             │",
+        "│   scrobble seconds threshold  240                                            │",
+        "│   listenbrainz token          set                                            │",
+        "│                                                                              │",
+        "│ j/k select, h/l adjust, enter on 'listenbrainz token' to set/change it       │",
+        "│ other settings: '?' keybinds, 't' subtitles, left/right on the home screen l │",
+        "│                                                                              │",
+        "└──────────────────────────────────────────────────────────────────────────────┘",
+    ];
+
+    /// `values` is the user's own config (a listenbrainz token, a path
+    /// label); a wide char in one must not shove the rest of its row.
+    #[test]
+    fn a_wide_value_does_not_shift_the_glyphs_after_it() {
+        let area = Rect::new(0, 0, 60, 17);
+        let mut buf = buffer(60, 17);
+        render(area, &mut buf, ["日本x", "", "", "", "", "", "", ""]);
+        let g = grid(&buf);
+        let row: Vec<char> = g
+            .lines()
+            .find(|r| r.contains('日'))
+            .unwrap()
+            .chars()
+            .collect();
+        let col = row.iter().position(|c| *c == '日').expect("the wide value");
+        // two cells each, so 'x' lands four columns on, not two.
+        assert_eq!(
+            (
+                row[col],
+                row[col + 1],
+                row[col + 2],
+                row[col + 3],
+                row[col + 4]
+            ),
+            ('日', ' ', '本', ' ', 'x')
+        );
+    }
+
+    #[test]
+    fn a_wide_value_stays_inside_the_rect() {
+        let mut buf = buffer(40, 16);
+        let area = Rect::new(2, 1, 24, 13);
+        let long = "日本語テスト曲日本語テスト曲日本語テスト曲";
+        render(area, &mut buf, [long; FIELD_COUNT]);
+        assert_outside_untouched(&buf, area);
+    }
+
+    /// The reported bug: the menu drew its rows and nothing else, so
+    /// the sidebar and track list underneath showed through between
+    /// them.
+    #[test]
+    fn the_overlay_covers_every_cell_of_its_rect() {
+        let mut buf = plated_buffer(40, 16);
+        let area = Rect::new(2, 1, 30, 13);
+        render(area, &mut buf, ["on"; FIELD_COUNT]);
+        assert_no_bleed_through(&buf, area);
+    }
+
+    #[test]
+    fn the_frame_closes_all_four_corners() {
+        let mut buf = buffer(40, 16);
+        let area = Rect::new(2, 1, 30, 13);
+        render(area, &mut buf, ["on"; FIELD_COUNT]);
+        let g = grid(&buf);
+        let rows: Vec<&str> = g.lines().collect();
+        assert_eq!(rows[1].chars().nth(2), Some('┌'));
+        assert_eq!(rows[1].chars().nth(31), Some('┐'));
+        assert_eq!(rows[13].chars().nth(2), Some('└'));
+        assert_eq!(rows[13].chars().nth(31), Some('┘'));
+    }
+
+    #[test]
+    fn degenerate_sizes_do_not_panic() {
+        for (w, h) in [(1, 1), (1, 40), (2, 1), (40, 0), (0, 0), (3, 2)] {
+            let mut buf = buffer(w.max(1), h.max(1));
+            render(Rect::new(0, 0, w, h), &mut buf, ["日本語"; FIELD_COUNT]);
+        }
+    }
 
     #[test]
     fn the_hints_follow_the_live_keymap_but_keep_the_fixed_keys() {
