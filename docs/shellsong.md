@@ -321,7 +321,8 @@ search(query)           run a search and leave the results up  [find, grep]
 play(terms?)            play the first term, queue the rest
 queue(terms?)           append each term to the queue          [enqueue]
 add_to_queue(position, terms?)   front inserts next, back appends
-clear_queue()           drop everything upcoming, keep playing  [clear, flush]
+clear()                 clear this console's scrollback         [cls]
+clear_queue()           drop everything upcoming, keep playing  [qclear, flush]
 remove(indices)         drop queue entries by position
 goto(index)             jump to a queue position
 save_queue(name)        save the queue as a local playlist
@@ -638,6 +639,11 @@ outcome, so the contract is written down here instead.
 these were all ambiguous until the host was written, and a reader (or a
 future host) would have had to guess. they are decisions, not accidents:
 
+- `clear()` clears the console's own scrollback and touches nothing
+  else. It was an alias of `clear_queue` until the maintainer pointed
+  out that `clear` reads as the terminal sense everywhere else, which
+  made the old binding a way to wipe your queue by reflex;
+  `clear_queue` took `qclear` in exchange.
 - `clear_queue()` drops everything upcoming and **keeps the current
   track playing**, matching mpv's own `playlist-clear`. it is not a
   stop.
