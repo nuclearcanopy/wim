@@ -52,14 +52,54 @@ pub struct Mpv {
     events: Receiver<Event>,
 }
 
+/// Asks the kernel to SIGTERM mpv if this process dies without
+/// getting to clean up. `Drop` already sends `quit` on an orderly
+/// exit, but a SIGKILL or an abort skips destructors entirely and left
+/// mpv running headless forever, holding the audio device and still
+/// answering on a socket nothing owns.
+///
+/// Linux only (`prctl` is not portable, and the BSD equivalent differs
+/// enough to be its own job). Deliberately set from `pre_exec` in the
+/// child rather than anywhere in the parent: the flag belongs to the
+/// child process.
+///
+/// One real footgun worth stating: `PR_SET_PDEATHSIG` fires when the
+/// parent *thread* exits, not the parent process. `Mpv::spawn` is
+/// called from `main` on the main thread, which lives as long as the
+/// program, so this is correct here; moving the spawn onto a worker
+/// thread would kill mpv the moment that worker finished.
+#[cfg(target_os = "linux")]
+fn reap_with_parent(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // safety: `pre_exec` runs between fork and exec, so the closure
+    // must be async-signal-safe. one `prctl` syscall and nothing else
+    // qualifies; it allocates nothing and takes no locks.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reap_with_parent(_cmd: &mut Command) {}
+
 impl Mpv {
     pub fn spawn() -> Result<Self> {
         let sock_path = std::env::temp_dir().join(format!("wim-mpv-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock_path);
 
-        let child = Command::new("mpv")
-            .arg("--idle=yes")
+        let mut cmd = Command::new("mpv");
+        cmd.arg("--idle=yes")
             .arg("--no-terminal")
+            // mpv is a backend here, not the user's player: a
+            // ~/.config/mpv/mpv.conf would silently apply its own af
+            // chain, volume or replaygain on top of everything this
+            // app sets, and the result is indistinguishable from a bug
+            // in wim. a "why does this sound wrong" investigation
+            // already burned hours ruling that out, so pin it.
+            .arg("--no-config")
             // this is the actual fix for mpv opening its own native
             // window: `vid` (which track to decode, toggled per-item
             // in set_vid_for_item) and `vo` (where a decoded frame
@@ -78,7 +118,9 @@ impl Mpv {
             .arg(format!("--input-ipc-server={}", sock_path.display()))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        reap_with_parent(&mut cmd);
+        let child = cmd
             .spawn()
             .context("spawning mpv; is it installed and on PATH?")?;
 
