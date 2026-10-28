@@ -560,13 +560,16 @@ docs rather than forcing one of them.
       render site. left out rather than hacked: an inconsistent rail is
       worse than a missing one only on the screen that cannot honestly
       carry it, and this needs one more call-site field.
-- [ ] **help.rs pads its key column by char count.** the row format is
-      `format!("  {key_text:<13} {desc}")`; `{:<13}` counts chars, so a
-      key bound to a wide or multi-byte char leaves the description
-      column jagged. `banner.rs` records fixing exactly this in its own
-      menu (pad by `textfit::width` from the resolved labels, by hand);
-      onboarding's new controls column does it that way too. help.rs is
-      the last one still counting chars.
+- [x] **help.rs pads its key column by char count.** fixed: the 13-cell
+      column is now padded by `textfit::width` from the resolved label,
+      as a named `KEY_COLUMN` const (kept fixed rather than derived from
+      the widest label, since one long rebind would otherwise shift
+      every description in the table, and `MIN_COLUMN_WIDTH` is computed
+      from it). verified by reverting just the padding: the wide-char
+      row's description sat at cell 19 against every other row's 18.
+      note for the next person writing one of these tests: `str::find`
+      returns a BYTE offset, so a three-byte two-cell glyph makes it
+      compare the wrong thing; count chars over the prefix instead.
 - [ ] **shellsong's `eq(<preset>)` cannot reach saved curves.** it
       resolves names through `eq::index_of`, which is built-ins only.
       `eq::resolve(name, &cfg.eq_custom_presets)` already returns
