@@ -16,6 +16,11 @@ use crate::ui::header::draw_header;
 /// go stale the moment anything got rebound via 'K'.
 pub struct HelpOverlay<'a> {
     pub keymap: &'a Keymap,
+    /// Whether mouse capture is on (`config::Config::mouse`); the
+    /// mouse section is dropped when it isn't, since a reference that
+    /// lists input the app is not accepting is worse than one that
+    /// says nothing.
+    pub mouse: bool,
 }
 
 /// `Fixed` for universal navigation primitives and modal-internal
@@ -104,6 +109,16 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
         ],
     ),
     (
+        "mouse",
+        &[
+            (Key::Fixed("click"), "focus pane / row"),
+            (Key::Fixed("click"), "press a bottom-bar control"),
+            (Key::Fixed("drag"), "scrub the progress bar"),
+            (Key::Fixed("wheel"), "scroll the list under it"),
+            (Key::Fixed("shift+drag"), "select text (bypass capture)"),
+        ],
+    ),
+    (
         "other",
         &[
             (Key::Bound(KeyAction::OpenSettingsMenu), "settings"),
@@ -176,6 +191,7 @@ impl HelpOverlay<'_> {
     fn rendered_blocks(&self) -> Vec<Vec<Line>> {
         SECTIONS
             .iter()
+            .filter(|(section, _)| self.mouse || *section != MOUSE_SECTION)
             .map(|(section, binds)| {
                 let mut block = vec![Line {
                     text: (*section).to_string(),
@@ -205,6 +221,10 @@ impl HelpOverlay<'_> {
             .collect()
     }
 }
+
+/// The one section that is conditional, named rather than matched by
+/// index so reordering `SECTIONS` cannot drop the wrong one.
+const MOUSE_SECTION: &str = "mouse";
 
 /// Minimum usable width for one column; below two of these the layout
 /// stays single-column and scrolls off as before, which is still
@@ -285,7 +305,11 @@ mod tests {
         let keymap = Keymap::default();
         let area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(area);
-        HelpOverlay { keymap: &keymap }.render(area, &mut buf);
+        HelpOverlay {
+            keymap: &keymap,
+            mouse: true,
+        }
+        .render(area, &mut buf);
         (0..height)
             .map(|y| {
                 (0..width)
@@ -300,7 +324,11 @@ mod tests {
         let keymap = Keymap::default();
         let mut buf = plated_buffer(80, 24);
         let area = Rect::new(2, 1, 76, 22);
-        HelpOverlay { keymap: &keymap }.render(area, &mut buf);
+        HelpOverlay {
+            keymap: &keymap,
+            mouse: true,
+        }
+        .render(area, &mut buf);
         assert_no_bleed_through(&buf, area);
     }
 
@@ -309,7 +337,11 @@ mod tests {
         let keymap = Keymap::default();
         let mut buf = buffer(80, 24);
         let area = Rect::new(2, 1, 76, 22);
-        HelpOverlay { keymap: &keymap }.render(area, &mut buf);
+        HelpOverlay {
+            keymap: &keymap,
+            mouse: true,
+        }
+        .render(area, &mut buf);
         let g = grid(&buf);
         let rows: Vec<Vec<char>> = g.lines().map(|r| r.chars().collect()).collect();
         assert_eq!(
@@ -332,6 +364,30 @@ mod tests {
         }
     }
 
+    /// The reference must not advertise input the app is not
+    /// accepting, and must advertise it when it is: a feature nobody
+    /// can find out about is only half shipped.
+    #[test]
+    fn the_mouse_section_follows_whether_capture_is_on() {
+        let keymap = Keymap::default();
+        let headings = |mouse| -> Vec<String> {
+            HelpOverlay {
+                keymap: &keymap,
+                mouse,
+            }
+            .rendered_blocks()
+            .iter()
+            .filter_map(|b| b.first().map(|l| l.text.clone()))
+            .collect()
+        };
+        assert!(headings(true).contains(&MOUSE_SECTION.to_string()));
+        assert!(!headings(false).contains(&MOUSE_SECTION.to_string()));
+        // and nothing else moved: only that one section is
+        // conditional.
+        assert_eq!(headings(true).len(), headings(false).len() + 1);
+        assert_eq!(headings(true).len(), SECTIONS.len());
+    }
+
     #[test]
     fn how_to_quit_is_always_reachable() {
         let rendered = render_to_lines(120, 24).join("\n");
@@ -342,7 +398,11 @@ mod tests {
     fn a_narrow_terminal_falls_back_to_one_column() {
         let blocks_owner = {
             let keymap = Keymap::default();
-            HelpOverlay { keymap: &keymap }.rendered_blocks()
+            HelpOverlay {
+                keymap: &keymap,
+                mouse: true,
+            }
+            .rendered_blocks()
         };
         let cols = split_into_columns(&blocks_owner, 24, 50);
         assert_eq!(cols.len(), 1, "50 cols can't hold two readable columns");
@@ -351,7 +411,11 @@ mod tests {
     #[test]
     fn a_section_is_never_split_across_columns() {
         let keymap = Keymap::default();
-        let blocks = HelpOverlay { keymap: &keymap }.rendered_blocks();
+        let blocks = HelpOverlay {
+            keymap: &keymap,
+            mouse: true,
+        }
+        .rendered_blocks();
         let cols = split_into_columns(&blocks, 12, 160);
         // each section's heading must be followed by its own binds in
         // the same column, so count headings per column and make sure
@@ -374,7 +438,11 @@ mod tests {
         keymap.set(KeyAction::OpenHelp, KeyCode::Char('y'));
         let area = Rect::new(0, 0, 120, 24);
         let mut buf = Buffer::empty(area);
-        HelpOverlay { keymap: &keymap }.render(area, &mut buf);
+        HelpOverlay {
+            keymap: &keymap,
+            mouse: true,
+        }
+        .render(area, &mut buf);
         // row 0 is the frame's top edge now; the title is one inside.
         let top: String = (0..area.width)
             .map(|x| buf.cell((x, 1)).unwrap().symbol().to_string())
@@ -389,7 +457,11 @@ mod tests {
             let area = Rect::new(0, 0, w, h);
             let mut buf = Buffer::empty(area);
             let keymap = Keymap::default();
-            HelpOverlay { keymap: &keymap }.render(area, &mut buf);
+            HelpOverlay {
+                keymap: &keymap,
+                mouse: true,
+            }
+            .render(area, &mut buf);
         }
     }
 
@@ -401,7 +473,11 @@ mod tests {
         keymap.set(KeyAction::SpeedUp, KeyCode::Char('y'));
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
-        HelpOverlay { keymap: &keymap }.render(area, &mut buf);
+        HelpOverlay {
+            keymap: &keymap,
+            mouse: true,
+        }
+        .render(area, &mut buf);
         let rendered: String = (0..30)
             .map(|y| {
                 (0..120)
