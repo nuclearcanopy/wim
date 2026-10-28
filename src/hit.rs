@@ -129,6 +129,17 @@ pub enum Transport {
     Player,
 }
 
+/// A text box drawn inside a visible pane, rather than over it; the
+/// two tiers of `Modal` that do not swallow a click, named again here
+/// because a click *in* one of them is how it gets the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextBox {
+    /// The sidebar's search box.
+    Query,
+    /// The artist profile's song filter.
+    BrowseFilter,
+}
+
 /// A surface the wheel can scroll and a click can pick a row in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scrollable {
@@ -189,10 +200,17 @@ pub struct HitMap {
     pub bottom: Option<Rect>,
     pub lists: Vec<List>,
     pub controls: Vec<Control>,
-    /// The scrubber's track cells, which is what an x offset is a
-    /// fraction of; the time readouts either side are part of the
-    /// element but are not positions on the track.
-    pub track: Option<(Transport, Rect)>,
+    /// Text boxes and the rect each was drawn in; clicking one puts
+    /// the keyboard in it, the way clicking a field does anywhere
+    /// else, instead of the surrounding pane taking the click and
+    /// closing it.
+    pub boxes: Vec<(TextBox, Rect)>,
+    /// The scrubber's track cells, per surface that drew one; both are
+    /// on screen while the player is maximized. This, not the whole
+    /// progress element, is what an x offset is a fraction of: the time
+    /// readouts either side are part of the element but are not
+    /// positions on the track.
+    pub tracks: Vec<(Transport, Rect)>,
 }
 
 /// A mouse event reduced to the parts a decision needs. Raw-mode input
@@ -229,12 +247,15 @@ pub enum Act {
     /// here rather than reaching whatever is underneath.
     Swallowed(Modal),
     Focus(Focus),
+    /// Focus this text box's pane and put the keyboard in the box.
+    Edit(TextBox),
     /// Focus `which.pane()` and put its selection on this item.
     Select(Scrollable, usize),
-    /// Do exactly what enter on this control does.
-    Activate(Transport, Field),
-    /// Open a drag at this fraction of the duration and seek there.
-    ScrubOpen(Transport, f64),
+    /// Do exactly what enter on this control does. The fraction is
+    /// `Some` only for a press on the scrubber's track, and says where
+    /// the drag opens, which is the one thing a pointer knows about a
+    /// control and a key does not.
+    Press(Transport, Field, Option<f64>),
     ScrubTo(f64),
     ScrubCommit(f64),
     /// One notch over the list under the pointer, whether or not it has
@@ -258,22 +279,22 @@ fn inside(rect: Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
 
-/// The whole decision. `scrubbing` is whether a drag is already open,
-/// which is the one thing a click's meaning depends on beyond where it
-/// landed: a release has to reach the scrubber even when the pointer
-/// wandered off it first.
-pub fn act(map: &HitMap, click: Click, scrubbing: bool) -> Act {
+/// The whole decision. `dragging` names the surface whose scrubber has
+/// a drag open, which is the one thing a click's meaning depends on
+/// beyond where it landed: a release has to reach that scrubber even
+/// when the pointer wandered off it first.
+pub fn act(map: &HitMap, click: Click, dragging: Option<Transport>) -> Act {
     let Click { kind, col, row } = click;
 
     // an open drag keeps the pointer regardless of where it goes, the
     // same way the keyboard's scrub tier sits above the bar's own
     // selection keys: nothing may move the cursor out from under a
     // seek that has not been committed.
-    if scrubbing {
-        if let Some((_, track)) = map.track {
+    if let Some(surface) = dragging {
+        if let Some((_, track)) = map.tracks.iter().find(|(t, _)| *t == surface) {
             match kind {
-                Kind::Drag => return Act::ScrubTo(frac_at(track, col)),
-                Kind::Up => return Act::ScrubCommit(frac_at(track, col)),
+                Kind::Drag => return Act::ScrubTo(frac_at(*track, col)),
+                Kind::Up => return Act::ScrubCommit(frac_at(*track, col)),
                 _ => {}
             }
         }
@@ -301,13 +322,20 @@ pub fn act(map: &HitMap, click: Click, scrubbing: bool) -> Act {
     // that contains them or the pane would answer for them.
     if let Some(control) = map.controls.iter().rev().find(|c| inside(c.rect, col, row)) {
         if control.field == Field::Progress {
-            if let Some((transport, track)) = map.track {
-                if transport == control.transport && inside(track, col, row) {
-                    return Act::ScrubOpen(transport, frac_at(track, col));
-                }
+            let own = map
+                .tracks
+                .iter()
+                .find(|(t, _)| *t == control.transport)
+                .filter(|(_, track)| inside(*track, col, row));
+            if let Some((transport, track)) = own {
+                return Act::Press(*transport, Field::Progress, Some(frac_at(*track, col)));
             }
         }
-        return Act::Activate(control.transport, control.field);
+        return Act::Press(control.transport, control.field, None);
+    }
+
+    if let Some((which, _)) = map.boxes.iter().find(|(_, r)| inside(*r, col, row)) {
+        return Act::Edit(*which);
     }
 
     if let Some(list) = map.lists.iter().rev().find(|l| inside(l.rect, col, row)) {
@@ -396,19 +424,19 @@ mod tests {
     #[test]
     fn a_click_in_a_pane_focuses_that_pane() {
         let m = map();
-        assert_eq!(act(&m, down(5, 5), false), Act::Focus(Focus::Sidebar));
-        assert_eq!(act(&m, down(30, 5), false), Act::Focus(Focus::Workspace));
-        assert_eq!(act(&m, down(30, 19), false), Act::Focus(Focus::BottomBar));
+        assert_eq!(act(&m, down(5, 5), None), Act::Focus(Focus::Sidebar));
+        assert_eq!(act(&m, down(30, 5), None), Act::Focus(Focus::Workspace));
+        assert_eq!(act(&m, down(30, 19), None), Act::Focus(Focus::BottomBar));
     }
 
     #[test]
     fn a_click_on_nothing_resolves_to_nothing_not_to_the_nearest_thing() {
         let m = map();
         // the divider column between the two panes belongs to neither.
-        assert_eq!(act(&m, down(20, 5), false), Act::Nothing);
+        assert_eq!(act(&m, down(20, 5), None), Act::Nothing);
         // and past the frame entirely.
-        assert_eq!(act(&m, down(200, 5), false), Act::Nothing);
-        assert_eq!(act(&m, down(5, 90), false), Act::Nothing);
+        assert_eq!(act(&m, down(200, 5), None), Act::Nothing);
+        assert_eq!(act(&m, down(5, 90), None), Act::Nothing);
     }
 
     #[test]
@@ -434,13 +462,13 @@ mod tests {
             (Field::Crossfade, 22),
         ] {
             assert_eq!(
-                act(&m, down(x, 19), false),
-                Act::Activate(Transport::Bar, field),
+                act(&m, down(x, 19), None),
+                Act::Press(Transport::Bar, field, None),
                 "{field:?} at column {x}"
             );
         }
         // the gaps between controls are still the bar, not a control.
-        assert_eq!(act(&m, down(6, 19), false), Act::Focus(Focus::BottomBar));
+        assert_eq!(act(&m, down(6, 19), None), Act::Focus(Focus::BottomBar));
     }
 
     #[test]
@@ -451,12 +479,12 @@ mod tests {
         // they would have occupied are plain bottom bar.
         bar(&mut m, &[(Field::Pause, 4, 1), (Field::Loop, 7, 1)]);
         assert_eq!(
-            act(&m, down(4, 19), false),
-            Act::Activate(Transport::Bar, Field::Pause)
+            act(&m, down(4, 19), None),
+            Act::Press(Transport::Bar, Field::Pause, None)
         );
         for x in [10, 13, 16, 21] {
             assert_eq!(
-                act(&m, down(x, 19), false),
+                act(&m, down(x, 19), None),
                 Act::Focus(Focus::BottomBar),
                 "column {x} was a dropped control"
             );
@@ -474,10 +502,10 @@ mod tests {
             field: Field::Progress,
             rect: Rect::new(24, 19, 24, 1),
         }];
-        m.track = Some((Transport::Bar, track));
+        m.tracks = vec![(Transport::Bar, track)];
 
-        let frac = |col| match act(&m, down(col, 19), false) {
-            Act::ScrubOpen(Transport::Bar, f) => f,
+        let frac = |col| match act(&m, down(col, 19), None) {
+            Act::Press(Transport::Bar, Field::Progress, Some(f)) => f,
             other => panic!("column {col} gave {other:?}"),
         };
         assert_eq!(frac(30), 0.0);
@@ -489,22 +517,22 @@ mod tests {
         // (exactly what enter does) rather than a seek to an end the
         // user did not click on.
         assert_eq!(
-            act(&m, down(29, 19), false),
-            Act::Activate(Transport::Bar, Field::Progress)
+            act(&m, down(29, 19), None),
+            Act::Press(Transport::Bar, Field::Progress, None)
         );
         assert_eq!(
-            act(&m, down(41, 19), false),
-            Act::Activate(Transport::Bar, Field::Progress)
+            act(&m, down(41, 19), None),
+            Act::Press(Transport::Bar, Field::Progress, None)
         );
         // past the element too, and it is just the bar again.
-        assert_eq!(act(&m, down(50, 19), false), Act::Focus(Focus::BottomBar));
+        assert_eq!(act(&m, down(50, 19), None), Act::Focus(Focus::BottomBar));
     }
 
     #[test]
     fn a_drag_clamps_to_the_track_wherever_the_pointer_wandered() {
         let mut m = map();
-        m.track = Some((Transport::Bar, Rect::new(30, 19, 11, 1)));
-        let at = |kind, col| act(&m, Click { kind, col, row: 3 }, true);
+        m.tracks = vec![(Transport::Bar, Rect::new(30, 19, 11, 1))];
+        let at = |kind, col| act(&m, Click { kind, col, row: 3 }, Some(Transport::Bar));
         assert_eq!(at(Kind::Drag, 35), Act::ScrubTo(0.5));
         // dragged off the left end, and off the right, and onto a row
         // the track is not even on: an open drag owns the pointer.
@@ -520,7 +548,7 @@ mod tests {
                     col: 35,
                     row: 3
                 },
-                false
+                None
             ),
             Act::Nothing
         );
@@ -534,9 +562,9 @@ mod tests {
             m.modal = Some(modal);
             // the sidebar, the workspace and a live bottom-bar control
             // the menu does not even paint over: all swallowed.
-            assert_eq!(act(&m, down(5, 5), false), Act::Swallowed(modal));
-            assert_eq!(act(&m, down(30, 5), false), Act::Swallowed(modal));
-            assert_eq!(act(&m, down(4, 19), false), Act::Swallowed(modal));
+            assert_eq!(act(&m, down(5, 5), None), Act::Swallowed(modal));
+            assert_eq!(act(&m, down(30, 5), None), Act::Swallowed(modal));
+            assert_eq!(act(&m, down(4, 19), None), Act::Swallowed(modal));
             assert_eq!(
                 act(
                     &m,
@@ -545,7 +573,7 @@ mod tests {
                         col: 5,
                         row: 5
                     },
-                    false
+                    None
                 ),
                 Act::Swallowed(modal)
             );
@@ -557,8 +585,36 @@ mod tests {
         let mut m = map();
         for modal in [Modal::EditingQuery, Modal::BrowseFilter] {
             m.modal = Some(modal);
-            assert_eq!(act(&m, down(30, 5), false), Act::Focus(Focus::Workspace));
+            assert_eq!(act(&m, down(30, 5), None), Act::Focus(Focus::Workspace));
         }
+    }
+
+    /// Clicking the box puts the keyboard in it. Without this a click
+    /// on a visible search box would be a click on the pane around it,
+    /// which takes the keyboard *out*: the exact opposite.
+    #[test]
+    fn a_click_on_a_text_box_claims_the_keyboard_for_it() {
+        let mut m = map();
+        m.boxes = vec![
+            (TextBox::Query, Rect::new(0, 0, 20, 3)),
+            (TextBox::BrowseFilter, Rect::new(35, 2, 25, 3)),
+        ];
+        m.lists = vec![List {
+            which: Scrollable::SidebarResults,
+            rect: Rect::new(0, 4, 20, 5),
+            rows: vec![Some(0); 5],
+            len: 5,
+        }];
+        assert_eq!(act(&m, down(5, 1), None), Act::Edit(TextBox::Query));
+        assert_eq!(act(&m, down(40, 3), None), Act::Edit(TextBox::BrowseFilter));
+        // one row below the box is the list again, not the box.
+        assert_eq!(
+            act(&m, down(5, 4), None),
+            Act::Select(Scrollable::SidebarResults, 0)
+        );
+        // and an overlay still swallows a click on a box underneath.
+        m.modal = Some(Modal::Help);
+        assert_eq!(act(&m, down(5, 1), None), Act::Swallowed(Modal::Help));
     }
 
     #[test]
@@ -614,18 +670,18 @@ mod tests {
             len: 10,
         }];
         assert_eq!(
-            act(&m, down(5, 5), false),
+            act(&m, down(5, 5), None),
             Act::Select(Scrollable::SidebarResults, 7)
         );
         assert_eq!(
-            act(&m, down(5, 7), false),
+            act(&m, down(5, 7), None),
             Act::Select(Scrollable::SidebarResults, 9)
         );
         // the header row and the blank below the last result are the
         // pane, not an item: no selection moves to a row that is not
         // one.
-        assert_eq!(act(&m, down(5, 4), false), Act::Focus(Focus::Sidebar));
-        assert_eq!(act(&m, down(5, 8), false), Act::Focus(Focus::Sidebar));
+        assert_eq!(act(&m, down(5, 4), None), Act::Focus(Focus::Sidebar));
+        assert_eq!(act(&m, down(5, 8), None), Act::Focus(Focus::Sidebar));
     }
 
     #[test]
@@ -645,7 +701,7 @@ mod tests {
                 len: 40,
             },
         ];
-        let wheel = |col, row, kind| act(&m, Click { kind, col, row }, false);
+        let wheel = |col, row, kind| act(&m, Click { kind, col, row }, None);
         assert_eq!(
             wheel(5, 5, Kind::WheelDown),
             Act::Wheel(Scrollable::SidebarResults, true)
@@ -695,7 +751,7 @@ mod tests {
                         col: 5,
                         row: 5
                     },
-                    false
+                    None
                 ),
                 Act::Nothing
             );
@@ -711,10 +767,10 @@ mod tests {
             rect: Rect::new(30, 9, 12, 1),
         }];
         assert_eq!(
-            act(&m, down(33, 9), false),
-            Act::Activate(Transport::Player, Field::Shuffle)
+            act(&m, down(33, 9), None),
+            Act::Press(Transport::Player, Field::Shuffle, None)
         );
         // one row off it is the workspace the player is drawn in.
-        assert_eq!(act(&m, down(33, 10), false), Act::Focus(Focus::Workspace));
+        assert_eq!(act(&m, down(33, 10), None), Act::Focus(Focus::Workspace));
     }
 }
