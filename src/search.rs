@@ -344,6 +344,16 @@ impl Corpus {
         self.items.is_empty()
     }
 
+    /// Every indexed item, in insertion order. Read-only whole-corpus
+    /// access for things that aren't a keyword search at all; the
+    /// suggestion engine builds its catalog off this (see
+    /// `suggest::Catalog::ingest_corpus`).
+    // drop the allow once the suggestions menu is wired up.
+    #[allow(dead_code)]
+    pub fn items(&self) -> impl Iterator<Item = &SearchItem> {
+        self.items.iter().map(|e| &e.item)
+    }
+
     /// Every distinct navidrome server already represented in the
     /// corpus (deduped by base url), for firing a live `search3`
     /// request against; a server only shows up here once something
@@ -639,6 +649,7 @@ mod tests {
                     artist: "Someone Else".into(),
                     album: "Other Album".into(),
                     duration: None,
+                    genres: Vec::new(),
                 }],
             },
             &client,
