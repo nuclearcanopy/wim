@@ -7,6 +7,7 @@ mod coverart;
 mod download;
 mod eq;
 mod favorites;
+mod hit;
 mod keymap;
 mod layout;
 mod library;
@@ -2861,7 +2862,7 @@ fn rebuild_corpus(cfg: &config::Config) -> search::Corpus {
 /// Which pane plain navigation (j/k/arrows/enter) currently targets.
 /// See where `focus` is declared in `main` for the full reasoning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Focus {
+pub(crate) enum Focus {
     Sidebar,
     Workspace,
     BottomBar,
@@ -3429,7 +3430,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut panels = PanelLayout::from_sizes(cfg.sidebar_width, cfg.bottom_bar_height);
     let start = Instant::now();
-    let mut guard = term::TerminalGuard::new()?;
+    let mut guard = term::TerminalGuard::new(cfg.mouse)?;
     // queries the terminal over stdio for font-cell size and graphics
     // protocol support; best-effort, 'i' (real image mode) just stays
     // unavailable if this fails rather than erroring the whole app.
