@@ -1359,11 +1359,10 @@ fn open_shellsong_view(target: ViewTarget, ctx: &mut ShellsongCtx) -> (Dispatch,
         }
         ViewTarget::Eq => {
             *ctx.eq_menu_open = true;
-            *ctx.eq_menu_selected = if ctx.actx.app.eq_custom {
-                ui::eq_menu::PRESET_COUNT
-            } else {
-                ctx.actx.app.eq_preset
-            };
+            *ctx.eq_menu_selected = ui::eq_menu::opening_selection(
+                ctx.actx.app.eq_source,
+                ctx.actx.cfg.eq_custom_presets.len(),
+            );
             op_done()
         }
         ViewTarget::Lyrics => open_shellsong_lyrics(ctx),
@@ -1623,12 +1622,20 @@ fn run_shellsong_op(op: Op, ctx: &mut ShellsongCtx) -> (Dispatch, Report) {
             (dispatch, Report::Note(format!("speed: {speed}x")))
         }
         Op::SetEqPreset(index) => {
-            // `apply_eq_preset_row` takes an eq-menu row, and rows
-            // below `PRESET_COUNT` are exactly the presets in order.
+            // `apply_eq_row` takes an eq-menu row, and the rows below
+            // `PRESET_COUNT` are exactly the built-in presets in
+            // order; the saved ones sit after them and are not
+            // addressable from shellsong yet.
             if index >= ui::eq_menu::PRESET_COUNT {
                 return op_fail(format!("no eq preset {index}"));
             }
-            apply_eq_preset_row(ctx.actx.app, ctx.actx.player, ctx.actx.notifications, index);
+            apply_eq_row(
+                ctx.actx.app,
+                ctx.actx.player,
+                ctx.actx.notifications,
+                &ctx.actx.cfg.eq_custom_presets,
+                index,
+            );
             op_done()
         }
         Op::ToggleCrossfade => {
@@ -2150,24 +2157,34 @@ fn save_config(cfg: &config::Config, notifications: &mut Notifications) {
     }
 }
 
-/// Enter on a preset row of the eq menu applies it, same effect as
-/// pressing the bare `CycleEq` key would have for that one preset; a
-/// no-op when `row` is a band row instead, since adjusting those is
-/// `adjust_eq_band`'s job. Deliberately not wired to j/k: this
-/// overwrites all ten gains, which is not something plain navigation
-/// should ever do.
-fn apply_eq_preset_row(
+/// Enter on a preset row of the eq menu applies it, built-in or
+/// saved; a no-op when `row` is a band row instead, since adjusting
+/// those is `adjust_eq_band`'s job. Deliberately not wired to j/k:
+/// this overwrites all ten gains, which is not something plain
+/// navigation should ever do.
+fn apply_eq_row(
     app: &mut app::App,
     player: &mpv::Mpv,
     notifications: &mut Notifications,
+    saved: &eq::CustomPresets,
     row: usize,
 ) {
-    if row >= eq::PRESETS.len() {
-        return;
-    }
-    app.eq_preset = row;
+    let (source, gains) = match ui::eq_menu::cursor(row, saved.len()) {
+        ui::eq_menu::Cursor::Builtin(i) => {
+            // keep the `CycleEq` key's cycle where the menu left it,
+            // so 'e' carries on from the preset you just picked.
+            app.eq_preset = i;
+            (eq::Source::Builtin(i), eq::PRESETS[i].gains)
+        }
+        ui::eq_menu::Cursor::Saved(i) => match saved.get(i) {
+            Some(preset) => (eq::Source::Saved(i), eq::clamp_gains(preset.gains)),
+            None => return,
+        },
+        ui::eq_menu::Cursor::Band(_) => return,
+    };
+    app.eq_source = Some(source);
     app.eq_custom = false;
-    app.eq_gains = eq::PRESETS[row].gains;
+    app.eq_gains = gains;
     apply_eq_gains(app, player, notifications);
 }
 
@@ -2182,8 +2199,10 @@ fn apply_eq_gains(app: &app::App, player: &mpv::Mpv, notifications: &mut Notific
 }
 
 /// One h/l nudge (`dir`: -1.0 or 1.0) on band `band`, 1 dB per step,
-/// clamped to a sane range; touching any band diverges from whatever
-/// named preset was active into a "custom" setting.
+/// clamped to `eq::GAIN_LIMIT`; touching any band diverges from
+/// whatever named curve was active, which keeps its name but reads as
+/// modified from here on (`app.eq_source` is deliberately not
+/// cleared, so the menu can still say which curve this came from).
 fn adjust_eq_band(
     app: &mut app::App,
     player: &mpv::Mpv,
@@ -2191,7 +2210,7 @@ fn adjust_eq_band(
     band: usize,
     dir: f64,
 ) {
-    app.eq_gains[band] = (app.eq_gains[band] + dir).clamp(-12.0, 12.0);
+    app.eq_gains[band] = (app.eq_gains[band] + dir).clamp(-eq::GAIN_LIMIT, eq::GAIN_LIMIT);
     app.eq_custom = true;
     apply_eq_gains(app, player, notifications);
 }
@@ -2891,15 +2910,110 @@ fn focus_in_direction(current: Focus, direction: KeyCode) -> Focus {
     }
 }
 
-/// "flat"/a preset name, or "custom" once any band's been hand-tuned
-/// away from whatever preset was last applied; shared by the player
-/// view and the bottom bar so neither keeps crediting a preset that
-/// no longer matches `app.eq_gains`.
-fn eq_label(app: &app::App) -> &'static str {
-    if app.eq_custom {
-        "custom"
+/// A built-in or saved curve's name, that name plus "(modified)" once
+/// a band's been nudged off it, or "custom" for a curve that never
+/// had one; shared by the player view and the bottom bar so neither
+/// keeps crediting a curve that no longer matches `app.eq_gains`.
+fn eq_label(app: &app::App, cfg: &config::Config) -> String {
+    eq::applied_label(app.eq_source, app.eq_custom, &cfg.eq_custom_presets)
+}
+
+/// Writes the live eq state back to config.toml. Called on every
+/// structural change (a save, rename or delete) as well as on closing
+/// the menu, so a curve you deliberately named is on disk before
+/// anything else can go wrong rather than only at esc.
+fn persist_eq(cfg: &mut config::Config, app: &app::App, notifications: &mut Notifications) {
+    let (preset, gains) = eq::persisted(app.eq_source, app.eq_gains, &cfg.eq_custom_presets);
+    cfg.eq_preset = preset;
+    cfg.eq_gains = gains;
+    save_config(cfg, notifications);
+}
+
+/// Why rename/delete did nothing: with nothing saved at all, the
+/// useful answer is how to get there, not that the cursor is on the
+/// wrong kind of row.
+fn eq_saved_row_hint(cfg: &config::Config, verb: &str) -> String {
+    if cfg.eq_custom_presets.is_empty() {
+        format!(
+            "nothing saved yet; {} saves the live curve under a name",
+            keymap::key_label(ui::eq_menu::SAVE_KEY)
+        )
     } else {
-        eq::PRESETS[app.eq_preset].name
+        format!("{verb} works on a row under 'saved'")
+    }
+}
+
+/// One keypress while the eq menu's name editor is up. The editor
+/// owns every key while it is open, so a letter types rather than
+/// firing a menu action; split out because the validation branches
+/// all have to write the menu's own message line. Returns which edit
+/// committed, if any: the store changed, so config.toml needs
+/// rewriting and the caller has to put the cursor back on the row
+/// that now holds the curve (a new preset shifts every band row down
+/// one).
+fn eq_menu_editor_key(
+    key: KeyCode,
+    menu: &mut ui::eq_menu::EqMenuState,
+    saved: &mut eq::CustomPresets,
+    app: &mut app::App,
+) -> Option<ui::eq_menu::EditorMode> {
+    // taken rather than borrowed: dropping it on the floor is how the
+    // editor closes, and putting it back is how it stays open.
+    let mut editor = menu.editor.take()?;
+    match key {
+        KeyCode::Esc => {
+            menu.message.clear();
+            return None;
+        }
+        KeyCode::Backspace => editor.pop(),
+        KeyCode::Char(c) => editor.push(c),
+        KeyCode::Enter => {
+            let name = editor.text.trim().to_string();
+            match saved.check_name(&name, editor.rename_target()) {
+                eq::NameCheck::Empty => menu.message = "give it a name first".to_string(),
+                eq::NameCheck::TooLong => {
+                    menu.message = format!("names are capped at {} characters", eq::MAX_NAME_LEN);
+                }
+                eq::NameCheck::Builtin => {
+                    menu.message = format!("'{name}' is a built-in preset already");
+                }
+                // overwriting a saved curve destroys it, so it takes
+                // a second enter, same gate as a delete.
+                eq::NameCheck::Taken(i) if !editor.overwrite.press(i) => {
+                    menu.message = format!("'{name}' exists; enter again to overwrite it");
+                }
+                _ => {
+                    menu.message = eq_commit_name(editor.mode, &name, saved, app);
+                    return Some(editor.mode);
+                }
+            }
+        }
+        _ => {}
+    }
+    menu.editor = Some(editor);
+    None
+}
+
+/// Commits an accepted (or confirmed) name: a rename leaves the curve
+/// alone, a save stores the live one, which makes the live gains that
+/// saved preset exactly rather than a nameless curve.
+fn eq_commit_name(
+    mode: ui::eq_menu::EditorMode,
+    name: &str,
+    saved: &mut eq::CustomPresets,
+    app: &mut app::App,
+) -> String {
+    match mode {
+        ui::eq_menu::EditorMode::Rename(i) => {
+            saved.rename(i, name);
+            format!("renamed to '{name}'")
+        }
+        ui::eq_menu::EditorMode::Save => {
+            let index = saved.insert(name, app.eq_gains);
+            app.eq_source = Some(eq::Source::Saved(index));
+            app.eq_custom = false;
+            format!("saved as '{name}'")
+        }
     }
 }
 
@@ -2938,22 +3052,24 @@ fn main() -> anyhow::Result<()> {
     // found"; cleared when the scan thread drops its sender. the
     // server equivalent is set below.
     app.scanning_library = true;
-    // restores whichever eq state was last active (a named preset, or
-    // a hand-tuned custom set) by name rather than a raw index, same
+    // restores whichever eq state was last active (a built-in, one of
+    // the user's saved curves, either of those nudged since, or a
+    // nameless hand-tuned set) by name rather than a raw index, same
     // reasoning as `logo_style`; applied to mpv immediately so a
     // persisted eq (and the level meter's `astats` tap, see
     // `audio_level`) is live from the first frame, not only after the
-    // first manual 'e' press.
-    match cfg.eq_preset.as_deref().and_then(eq::index_of) {
-        Some(idx) => {
-            app.eq_preset = idx;
-            app.eq_custom = false;
-            app.eq_gains = eq::PRESETS[idx].gains;
-        }
-        None => {
-            app.eq_custom = true;
-            app.eq_gains = cfg.eq_gains;
-        }
+    // first manual 'e' press. the three-state resolution itself is
+    // `eq::restore`, which is pure and unit-tested.
+    let restored = eq::restore(
+        cfg.eq_preset.as_deref(),
+        cfg.eq_gains,
+        &cfg.eq_custom_presets,
+    );
+    app.eq_source = restored.source;
+    app.eq_custom = restored.modified;
+    app.eq_gains = restored.gains;
+    if let Some(eq::Source::Builtin(i)) = restored.source {
+        app.eq_preset = i;
     }
     let _ = player.set_af(&eq::build_af_filter(&app.eq_gains));
     // which pane j/k/arrows/enter navigate: the sidebar's own results
@@ -3297,6 +3413,10 @@ fn main() -> anyhow::Result<()> {
     // treatment as the settings/keybinds menus.
     let mut eq_menu_open = false;
     let mut eq_menu_selected: usize = 0;
+    // the eq menu's name editor, armed delete and message line; the
+    // selection stays a loose `usize` above because the shellsong
+    // `view(eq)` path writes it too.
+    let mut eq_menu = ui::eq_menu::EqMenuState::default();
 
     let mut panels = PanelLayout::from_sizes(cfg.sidebar_width, cfg.bottom_bar_height);
     let start = Instant::now();
@@ -3690,7 +3810,7 @@ fn main() -> anyhow::Result<()> {
                         loop_mode: app.loop_mode,
                         shuffle_on: app.shuffle,
                         speed: app.speed,
-                        eq_preset: eq_label(&app),
+                        eq_preset: &eq_label(&app, &cfg),
                         crossfade_on: crossfade_enabled,
                         previous: previous_label.as_deref(),
                         next: next_label.as_deref(),
@@ -3899,9 +4019,12 @@ fn main() -> anyhow::Result<()> {
                 f.render_widget(
                     ui::eq_menu::EqMenu {
                         gains: &app.eq_gains,
-                        custom: app.eq_custom,
-                        active_preset: app.eq_preset,
+                        saved: &cfg.eq_custom_presets,
+                        source: app.eq_source,
+                        modified: app.eq_custom,
                         selected: eq_menu_selected,
+                        state: &eq_menu,
+                        elapsed: frame_elapsed,
                     },
                     top,
                 );
@@ -3944,9 +4067,11 @@ fn main() -> anyhow::Result<()> {
                     loop_mode: app.loop_mode,
                     shuffle_on: app.shuffle,
                     speed: app.speed,
-                    // the preset's name lives in the eq menu now; the
-                    // bar only answers "is the eq doing anything".
-                    eq_active: eq_label(&app) != "flat",
+                    // the curve's name lives in the eq menu now; the
+                    // bar only answers "is the eq doing anything",
+                    // which is a question about the gains rather than
+                    // about what the curve is called.
+                    eq_active: !eq::is_flat(&app.eq_gains),
                     crossfade_on: crossfade_enabled,
                     paused,
                     // mid-drag the bar draws the pending target, not
@@ -5144,15 +5269,89 @@ fn main() -> anyhow::Result<()> {
                 // dedicated keymap action of its own; esc is the only
                 // way to close it.
                 if eq_menu_open {
+                    // the name editor owns every key while it's up, so
+                    // a letter types instead of firing a menu action.
+                    if eq_menu.editor.is_some() {
+                        if let Some(mode) = eq_menu_editor_key(
+                            key.code,
+                            &mut eq_menu,
+                            &mut cfg.eq_custom_presets,
+                            &mut app,
+                        ) {
+                            persist_eq(&mut cfg, &app, &mut notifications);
+                            eq_menu_selected = match mode {
+                                // a save lands the cursor on the row
+                                // the curve now lives on; a rename
+                                // leaves it on the row it renamed.
+                                ui::eq_menu::EditorMode::Save => ui::eq_menu::opening_selection(
+                                    app.eq_source,
+                                    cfg.eq_custom_presets.len(),
+                                ),
+                                ui::eq_menu::EditorMode::Rename(i) => ui::eq_menu::PRESET_COUNT + i,
+                            };
+                        }
+                        continue;
+                    }
+                    let saved_len = cfg.eq_custom_presets.len();
+                    let at = ui::eq_menu::cursor(eq_menu_selected, saved_len);
+                    // any key other than a second delete cancels a
+                    // pending one, including moving off its row; same
+                    // rule the navidrome profile manager follows.
+                    if key.code != ui::eq_menu::DELETE_KEY {
+                        eq_menu.disarm_delete();
+                    }
                     if key.code == KeyCode::Esc {
                         eq_menu_open = false;
-                        cfg.eq_preset = if app.eq_custom {
-                            None
+                        eq_menu = ui::eq_menu::EqMenuState::default();
+                        persist_eq(&mut cfg, &app, &mut notifications);
+                        continue;
+                    }
+                    if key.code == ui::eq_menu::SAVE_KEY {
+                        eq_menu.editor = Some(ui::eq_menu::NameEditor::save());
+                        eq_menu.message.clear();
+                        continue;
+                    }
+                    if key.code == ui::eq_menu::RENAME_KEY {
+                        if let ui::eq_menu::Cursor::Saved(i) = at {
+                            let current = cfg.eq_custom_presets.name_at(i).unwrap_or("");
+                            eq_menu.editor = Some(ui::eq_menu::NameEditor::rename(i, current));
+                            eq_menu.message.clear();
                         } else {
-                            Some(eq::PRESETS[app.eq_preset].name.to_string())
+                            eq_menu.message = eq_saved_row_hint(&cfg, "rename");
+                        }
+                        continue;
+                    }
+                    if key.code == ui::eq_menu::DELETE_KEY {
+                        let ui::eq_menu::Cursor::Saved(i) = at else {
+                            eq_menu.message = eq_saved_row_hint(&cfg, "delete");
+                            continue;
                         };
-                        cfg.eq_gains = app.eq_gains;
-                        save_config(&cfg, &mut notifications);
+                        let name = cfg
+                            .eq_custom_presets
+                            .name_at(i)
+                            .unwrap_or_default()
+                            .to_string();
+                        // first press arms, a second on the same row
+                        // commits; this rewrites config.toml and the
+                        // curve is gone.
+                        if eq_menu.delete.press(i) {
+                            cfg.eq_custom_presets.remove(i);
+                            // the applied curve stays audible either
+                            // way, it just loses its name when the
+                            // preset behind it is the one deleted.
+                            app.eq_source = eq::source_after_removal(app.eq_source, i);
+                            app.eq_custom = app.eq_source.is_some() && app.eq_custom;
+                            persist_eq(&mut cfg, &app, &mut notifications);
+                            eq_menu_selected = eq_menu_selected.min(
+                                ui::eq_menu::selectable_count(cfg.eq_custom_presets.len()) - 1,
+                            );
+                            eq_menu.message = format!("deleted '{name}'");
+                        } else {
+                            eq_menu.message = format!(
+                                "press {} again to delete '{name}'",
+                                keymap::key_label(ui::eq_menu::DELETE_KEY)
+                            );
+                        }
                         continue;
                     }
                     match key.code {
@@ -5163,41 +5362,30 @@ fn main() -> anyhow::Result<()> {
                         // silently overwrote all ten hand-tuned gains,
                         // which esc then saved.
                         KeyCode::Char('j') | KeyCode::Down => {
-                            eq_menu_selected =
-                                (eq_menu_selected + 1).min(ui::eq_menu::ROW_COUNT - 1);
+                            eq_menu_selected = (eq_menu_selected + 1)
+                                .min(ui::eq_menu::selectable_count(saved_len) - 1);
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             eq_menu_selected = eq_menu_selected.saturating_sub(1);
                         }
                         KeyCode::Enter => {
-                            apply_eq_preset_row(
+                            apply_eq_row(
                                 &mut app,
                                 &player,
                                 &mut notifications,
+                                &cfg.eq_custom_presets,
                                 eq_menu_selected,
                             );
                         }
-                        KeyCode::Char('h') | KeyCode::Left
-                            if eq_menu_selected >= ui::eq_menu::PRESET_COUNT =>
-                        {
-                            adjust_eq_band(
-                                &mut app,
-                                &player,
-                                &mut notifications,
-                                eq_menu_selected - ui::eq_menu::PRESET_COUNT,
-                                -1.0,
-                            );
+                        KeyCode::Char('h') | KeyCode::Left => {
+                            if let ui::eq_menu::Cursor::Band(band) = at {
+                                adjust_eq_band(&mut app, &player, &mut notifications, band, -1.0);
+                            }
                         }
-                        KeyCode::Char('l') | KeyCode::Right
-                            if eq_menu_selected >= ui::eq_menu::PRESET_COUNT =>
-                        {
-                            adjust_eq_band(
-                                &mut app,
-                                &player,
-                                &mut notifications,
-                                eq_menu_selected - ui::eq_menu::PRESET_COUNT,
-                                1.0,
-                            );
+                        KeyCode::Char('l') | KeyCode::Right => {
+                            if let ui::eq_menu::Cursor::Band(band) = at {
+                                adjust_eq_band(&mut app, &player, &mut notifications, band, 1.0);
+                            }
                         }
                         _ => {}
                     }
@@ -5454,11 +5642,11 @@ fn main() -> anyhow::Result<()> {
                                 }
                                 Field::Eq => {
                                     eq_menu_open = true;
-                                    eq_menu_selected = if app.eq_custom {
-                                        ui::eq_menu::PRESET_COUNT
-                                    } else {
-                                        app.eq_preset
-                                    };
+                                    eq_menu = ui::eq_menu::EqMenuState::default();
+                                    eq_menu_selected = ui::eq_menu::opening_selection(
+                                        app.eq_source,
+                                        cfg.eq_custom_presets.len(),
+                                    );
                                 }
                                 Field::Crossfade => {
                                     crossfade_enabled = !crossfade_enabled;
