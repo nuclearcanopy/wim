@@ -130,22 +130,10 @@ fn draw_transport_row(
 }
 
 fn draw_centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
-    if y >= area.y + area.height || y < area.y {
-        return;
-    }
+    // centred on display width, not char count: a wide-char title
+    // used to drift right by its own overhang.
     let text = truncate_with_ellipsis(text, area.width as usize);
-    let text_width = text.chars().count() as u16;
-    let start_x = area.x + area.width.saturating_sub(text_width) / 2;
-    for (i, ch) in text.chars().enumerate() {
-        let x = start_x + i as u16;
-        if x >= area.x + area.width {
-            break;
-        }
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_fg(color);
-        }
-    }
+    crate::ui::draw::centered(buf, area, y, &text, color);
 }
 
 #[cfg(test)]

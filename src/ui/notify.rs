@@ -84,8 +84,5 @@ fn draw_box(
 }
 
 fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: ratatui::style::Color) {
-    if let Some(cell) = buf.cell_mut((x, y)) {
-        cell.set_char(ch);
-        cell.set_fg(color);
-    }
+    crate::ui::draw::put(buf, x, y, ch, color);
 }

@@ -90,16 +90,7 @@ impl Widget for MiniPlayerBar<'_> {
 }
 
 fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
-    for (col, ch) in text.chars().enumerate() {
-        let x = area.x + col as u16;
-        if x >= area.x + area.width {
-            break;
-        }
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_fg(color);
-        }
-    }
+    crate::ui::draw::line(buf, area, y, text, color);
 }
 
 #[cfg(test)]

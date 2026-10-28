@@ -217,20 +217,10 @@ fn draw_line(
     color: ratatui::style::Color,
     max_width: usize,
 ) {
-    if y >= area.y + area.height {
-        return;
-    }
+    // ellipsis first (it is what signals "there is more"), then the
+    // width-correct writer does the clipping and cell advance.
     let fitted = truncate_with_ellipsis(text, max_width);
-    for (col, ch) in fitted.chars().enumerate() {
-        let x = area.x + col as u16;
-        if x >= area.x + area.width {
-            break;
-        }
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_fg(color);
-        }
-    }
+    crate::ui::draw::line(buf, area, y, &fitted, color);
 }
 
 #[cfg(test)]
