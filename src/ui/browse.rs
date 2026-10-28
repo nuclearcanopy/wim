@@ -78,6 +78,97 @@ pub fn rule_rows(area: Rect, view: &BrowseView, art_mode: ArtMode, cell_aspect: 
     rows
 }
 
+/// The artist profile's two columns, as one split both the render and
+/// the host's hit map read; a second copy of these constraints is how
+/// a click ends up a row off whatever it looks like it hit.
+pub struct ArtistColumns {
+    pub albums_label: Rect,
+    pub albums: Rect,
+    pub songs_label: Rect,
+    pub filter: Rect,
+    pub songs: Rect,
+}
+
+pub fn artist_columns(area: Rect) -> ArtistColumns {
+    let cols = Layout::horizontal([Constraint::Percentage(35), Constraint::Min(0)]).split(area);
+    let album_rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(cols[0]);
+    // the blank row between the SONGS rule and the filter box is
+    // load-bearing: the box's own top border is a second parallel
+    // rule, and stacking the two reads as one doubled line.
+    let song_rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Min(0),
+    ])
+    .split(cols[1]);
+    ArtistColumns {
+        albums_label: album_rows[0],
+        albums: album_rows[1],
+        songs_label: song_rows[0],
+        filter: song_rows[2],
+        songs: song_rows[3],
+    }
+}
+
+/// Which lists a click in this pane can land on, with the item index
+/// per visible row of each. An album or playlist has only `tracks`
+/// (the whole list area); an artist profile has both of its columns.
+/// Built from the same splits and the same `scroll::offset_for` the
+/// render uses, so a click resolves to the row the user saw.
+pub struct BrowseRows {
+    pub albums: Option<(Rect, Vec<Option<usize>>)>,
+    pub tracks: (Rect, Vec<Option<usize>>),
+}
+
+pub fn rows(area: Rect, view: &BrowseView, art_mode: ArtMode, cell_aspect: f32) -> BrowseRows {
+    let has_art = view.art.is_some() && art_mode != ArtMode::Off;
+    let (_, list_area) = crate::browse::layout(
+        area,
+        has_art,
+        view.bio.is_some(),
+        view.is_artist,
+        cell_aspect,
+    );
+    if !view.is_artist {
+        let all: Vec<usize> = (0..view.tracks.len()).collect();
+        return BrowseRows {
+            albums: None,
+            tracks: (list_area, track_rows(list_area, &all, view.selected)),
+        };
+    }
+    let c = artist_columns(list_area);
+    let visible = view.visible_track_indices();
+    BrowseRows {
+        albums: Some((
+            c.albums,
+            simple_rows(c.albums, view.albums.len(), view.albums_selected),
+        )),
+        tracks: (c.songs, track_rows(c.songs, &visible, view.selected)),
+    }
+}
+
+/// Which of `indices` each visible row of `area` shows, at the
+/// clamp-to-selection offset `draw_track_list` draws from.
+fn track_rows(area: Rect, indices: &[usize], selected: usize) -> Vec<Option<usize>> {
+    let selected_row = indices.iter().position(|&i| i == selected).unwrap_or(0);
+    let visible_rows = area.height as usize;
+    let offset = scroll::offset_for(selected_row, visible_rows);
+    (0..visible_rows)
+        .map(|row| indices.get(offset + row).copied())
+        .collect()
+}
+
+/// Same for the albums column, whose rows are its indices outright (no
+/// filter sits between the two).
+fn simple_rows(area: Rect, len: usize, selected: usize) -> Vec<Option<usize>> {
+    let visible_rows = area.height as usize;
+    let offset = scroll::offset_for(selected, visible_rows);
+    (0..visible_rows)
+        .map(|row| (offset + row < len).then_some(offset + row))
+        .collect()
+}
+
 fn is_starred(track: &SearchItem, favorites: &Favorites, remote_starred: &HashSet<String>) -> bool {
     match track {
         SearchItem::LocalMusic { path, .. } | SearchItem::LocalVideo { path, .. } => {
@@ -177,12 +268,9 @@ impl BrowseListView<'_> {
     /// list; left/right switches which column navigation applies to
     /// (`view.albums_focused`, see main.rs).
     fn render_artist_columns(&self, area: Rect, buf: &mut Buffer) {
-        let cols = Layout::horizontal([Constraint::Percentage(35), Constraint::Min(0)]).split(area);
-        let album_rows =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(cols[0]);
-        draw_header_row(buf, album_rows[0], album_rows[0].y, "ALBUMS");
-        let albums_rect = album_rows[1];
-        let songs_col = cols[1];
+        let c = artist_columns(area);
+        draw_header_row(buf, c.albums_label, c.albums_label.y, "ALBUMS");
+        let albums_rect = c.albums;
 
         if self.view.albums.is_empty() {
             draw_line(buf, albums_rect, albums_rect.y, "(no albums)", shade(DIM));
@@ -198,17 +286,7 @@ impl BrowseListView<'_> {
             );
         }
 
-        // the blank row between the SONGS rule and the filter box is
-        // load-bearing: the box's own top border is a second parallel
-        // rule, and stacking the two reads as one doubled line.
-        let song_rows = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Min(0),
-        ])
-        .split(songs_col);
-        draw_header_row(buf, song_rows[0], song_rows[0].y, "SONGS");
+        draw_header_row(buf, c.songs_label, c.songs_label.y, "SONGS");
         SearchBox {
             query: &self.view.filter_query,
             editing: self.view.filtering,
@@ -218,9 +296,9 @@ impl BrowseListView<'_> {
             // so it closes itself rather than trailing off.
             right_border: true,
         }
-        .render(song_rows[2], buf);
+        .render(c.filter, buf);
 
-        let songs_rect = song_rows[3];
+        let songs_rect = c.songs;
         let visible = self.view.visible_track_indices();
         if visible.is_empty() {
             let msg = if self.view.filter_query.is_empty() {
@@ -264,14 +342,15 @@ fn draw_simple_list(
     // same clamp-to-selection scroll as the track list beside it; it
     // had none at all, so past the pane height `j` moved a cursor
     // nothing on screen ever showed.
-    let visible_rows = area.height as usize;
-    let scroll_offset = scroll::offset_for(selected, visible_rows);
-    for row in 0..visible_rows {
-        let Some(item) = items.get(scroll_offset + row) else {
+    for (row, idx) in simple_rows(area, items.len(), selected)
+        .into_iter()
+        .enumerate()
+    {
+        let Some(item) = idx.and_then(|i| items.get(i)) else {
             break;
         };
         let y = area.y + row as u16;
-        let is_selected = scroll_offset + row == selected;
+        let is_selected = idx == Some(selected);
         if is_selected {
             fill_row_bg(
                 buf,
@@ -321,12 +400,8 @@ fn draw_track_list(
 ) {
     // same clamp-to-selection scroll as ResultsList: a long album
     // shouldn't be unreachable past the bottom of the pane.
-    let selected_row = indices.iter().position(|&i| i == selected).unwrap_or(0);
-    let visible_rows = area.height as usize;
-    let scroll_offset = scroll::offset_for(selected_row, visible_rows);
-
-    for row in 0..visible_rows {
-        let Some(&idx) = indices.get(scroll_offset + row) else {
+    for (row, idx) in track_rows(area, indices, selected).into_iter().enumerate() {
+        let Some(idx) = idx else {
             break;
         };
         let track = &tracks[idx];
@@ -545,6 +620,102 @@ mod tests {
                 client: client.clone(),
             })
             .collect()
+    }
+
+    /// The row map a click resolves against has to name the rows the
+    /// render painted, in both columns and at a scroll offset; the
+    /// songs column also has a filter between its rows and its item
+    /// indices, which is exactly where an independent derivation goes
+    /// wrong.
+    #[test]
+    fn the_recorded_row_map_matches_the_rows_that_were_drawn() {
+        let mut view = test_view(test_songs(20));
+        view.is_artist = true;
+        view.albums = test_albums(20);
+        view.albums_selected = 15;
+        view.selected = 17;
+
+        let area = Rect::new(0, 0, 70, 16);
+        let buf = render_view(&view, area);
+        let map = rows(area, &view, ArtMode::Off, 2.0);
+
+        let (albums_rect, album_rows) = map.albums.expect("an artist profile has an albums column");
+        assert!(album_rows.iter().any(|r| *r == Some(15)), "{album_rows:?}");
+        for (row, idx) in album_rows.iter().enumerate() {
+            let text = row_text(&buf, albums_rect.y + row as u16);
+            match idx {
+                Some(i) => assert!(
+                    text.contains(&format!("album {i}")),
+                    "albums row {row} maps to {i} but reads {text:?}"
+                ),
+                None => assert!(
+                    !text.contains("album "),
+                    "albums row {row} maps to nothing but reads {text:?}"
+                ),
+            }
+        }
+
+        let (songs_rect, song_rows) = map.tracks;
+        assert!(song_rows.iter().any(|r| *r == Some(17)), "{song_rows:?}");
+        for (row, idx) in song_rows.iter().enumerate() {
+            let text = row_text(&buf, songs_rect.y + row as u16);
+            match idx {
+                // the row prints the track's own 1-based position,
+                // which is what a click has to come back with.
+                Some(i) => assert!(
+                    text.contains(&format!("{:>2}. ", i + 1)),
+                    "songs row {row} maps to {i} but reads {text:?}"
+                ),
+                None => assert!(
+                    text.trim().is_empty(),
+                    "songs row {row} maps to nothing but reads {text:?}"
+                ),
+            }
+        }
+    }
+
+    /// A filtered songs column's rows are its visible indices, not
+    /// `row + offset`: the map has to carry the filter's mapping.
+    #[test]
+    fn a_filtered_songs_column_maps_rows_to_the_tracks_own_indices() {
+        let mut view = test_view(test_songs(20));
+        view.is_artist = true;
+        view.filter_query = "7".to_string();
+        view.clamp_selection();
+
+        let area = Rect::new(0, 0, 70, 16);
+        let visible = view.visible_track_indices();
+        assert!(visible.len() > 1 && visible.len() < 20, "{visible:?}");
+        let (_, song_rows) = rows(area, &view, ArtMode::Off, 2.0).tracks;
+        let mapped: Vec<usize> = song_rows.iter().flatten().copied().collect();
+        assert_eq!(mapped, visible);
+    }
+
+    /// An album has one full-width list and no albums column at all,
+    /// so a click in the left third of the pane is a track.
+    #[test]
+    fn an_album_has_one_list_and_no_second_column() {
+        let view = test_view(test_songs(4));
+        let area = Rect::new(0, 0, 70, 16);
+        let map = rows(area, &view, ArtMode::Off, 2.0);
+        assert!(map.albums.is_none());
+        let (rect, song_rows) = map.tracks;
+        assert_eq!(rect.x, area.x);
+        assert_eq!(rect.width, area.width);
+        assert_eq!(song_rows.iter().flatten().count(), 4);
+    }
+
+    #[test]
+    fn a_pane_with_no_room_has_no_rows_to_click() {
+        let view = test_view(test_songs(4));
+        for area in [
+            Rect::new(0, 0, 70, 0),
+            Rect::new(0, 0, 0, 16),
+            Rect::new(0, 0, 70, 5),
+        ] {
+            let map = rows(area, &view, ArtMode::Off, 2.0);
+            assert!(map.tracks.1.iter().flatten().count() <= 4, "{area:?}");
+        }
     }
 
     #[test]
