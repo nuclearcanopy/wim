@@ -379,7 +379,9 @@ fn open_starred_view(
 /// an error, the album view just shows no art for it.
 fn fetch_cover_art(client: &subsonic::Client, album_id: &str) -> Option<image::DynamicImage> {
     let bytes = client.get_cover_art_bytes(album_id).ok()?;
-    image::load_from_memory(&bytes).ok()
+    // same bounded rgb8 decode the background fetches use, so an open
+    // view does not retain a multi-megapixel original either.
+    coverart::decode_cover(&bytes)
 }
 
 /// Whether the config names a graphics protocol outright, which is an
@@ -3112,7 +3114,7 @@ fn main() -> anyhow::Result<()> {
     let mut playback = mpv::Playback::default();
     // covers for tracks the open browse view does not have art for;
     // fetched on its own thread, see `coverart`.
-    let mut cover_art = coverart::Cache::default();
+    let mut cover_art = coverart::Cache::new(cfg.cache_eviction_days);
     // the player's own image protocol, separate from the browse
     // view's: they can be showing different albums at once, and
     // sharing one protocol made the player draw whatever album a view
@@ -3490,14 +3492,11 @@ fn main() -> anyhow::Result<()> {
         // reads this, so none of them can show a track mpv isn't
         // actually playing.
         let mut now_playing = play_queue.current().cloned();
-        // take delivery of any cover that finished, then ask for the
-        // playing track's if it is not already in hand. both are
-        // no-ops once an album's cover has arrived, so this is cheap
-        // to run every frame.
-        cover_art.poll();
-        if let Some(item) = &now_playing {
-            cover_art.request(item);
-        }
+        // take delivery of any cover that finished, ask for the
+        // playing track's if it is not already in hand, and warm the
+        // next queued track's. all no-ops once an album's cover has
+        // arrived, so this is cheap to run every frame.
+        cover_art.tick(now_playing.as_ref(), play_queue.peek_next());
         // which cover the player would draw: the open view's when the
         // playing track is one of its own (already decoded at the
         // right size), else whatever the background fetch has.
