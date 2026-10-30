@@ -523,8 +523,35 @@ yet.
   the corpus, no distance-2 typo match at all, nothing on the length
   window's top edge, no >31-char word needing the typo pass) which are
   now closed. `/tmp/sabotage*.py` is that harness, benign.
-- `perf/shell` (3 commits, had NOT reported). owns `src/shellsong.rs`,
-  `src/shellsong_host.rs`, `src/suggest.rs`.
+- `perf/shell` (4 commits, all four gates green: clippy clean, 664
+  tests, fmt clean, tree clean). the agent was KILLED mid-sentence by
+  an api limit while writing its docs, so there is no report; its
+  measurements are in the commit bodies instead, which is where the
+  numbers below come from. the code is landable, the prose is not
+  written.
+  per keystroke in the console with a 30k-item library 14.5 -> 5.7ms;
+  console-side table cost per keystroke `volume(50%)` 8.5 -> 0.7us,
+  `repeat(3, skip())` 11.8 -> 1.5us, `play(blade runner blues 1)`
+  19.6 -> 9.8us, and 10.1 -> 6.0ms with a 30k corpus behind it. a full
+  suggestion pass at 30.8k tracks 44.2 -> 16.7ms.
+  the three mechanisms: a 64-bit byte-set difference decides when a
+  word is missing more of the query's characters than the typo budget
+  allows, skipping a strsim call that allocates a matrix and a map per
+  invocation; the static command table's sorted names, keyword sets,
+  name resolutions and signatures are `LazyLock`-built once instead of
+  rebuilt and re-sorted every keystroke; and three of the nine
+  suggestion generators were walking the whole library building a
+  candidate per track (~150k allocations per pass at 30k tracks) for
+  `normalise` to throw all but 64 away, so a `Pool` now answers
+  `wants(raw)` before the caller pays, admitting ties and refusing to
+  prune below `normalise`'s epsilon where raw stops predicting order.
+  correctness: suggestion output identical over 30 catalog/starred/seed
+  configurations to six decimals, search output byte-identical over 120
+  query/corpus-size pairs, both skips pinned against the unbounded code
+  path and strsim themselves. the new pinned tables caught three real
+  bugs while being written (a case-sensitive compare, an off-by-one in
+  the byte path, a dropped dedup).
+  **what is missing:** `docs/` prose, and nobody has reviewed the diff.
 
 ### found by the agents, not yet fixed (all in files they own)
 
