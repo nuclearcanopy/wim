@@ -101,6 +101,20 @@ in
       '';
     };
 
+    videoOutput = mkOption {
+      type = types.enum [ "auto" "tct" "kitty" "off" ];
+      default = "auto";
+      description = ''
+        How 'v' draws a local video. mpv draws it itself, filling the
+        terminal, while wim stops drawing. "tct" is true-color
+        half-blocks and works in any terminal; "kitty" is the kitty
+        graphics protocol and needs a terminal that speaks it. "auto"
+        uses kitty only when the terminal answered the graphics probe
+        with it, "tct" otherwise. "off" disables the key. Music
+        playback is never affected.
+      '';
+    };
+
     libraryPaths = mkOption {
       type = types.listOf types.str;
       default = [ ];
@@ -340,6 +354,7 @@ in
 
     xdg.configFile."wim/config.toml".source = tomlFormat.generate "wim-config.toml" ({
       album_art = cfg.albumArt;
+      video_output = cfg.videoOutput;
       library_paths = cfg.libraryPaths;
       crossfade_enabled = cfg.crossfadeEnabled;
       crossfade_seconds = cfg.crossfadeSeconds;
