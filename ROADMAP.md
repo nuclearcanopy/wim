@@ -517,12 +517,29 @@ regularly costs nothing to land.
       covers but not the sidebar's search box**, and boxes answer ahead
       of lists, so a click top-left opened a search box under the
       picture.
-- [ ] **the selected control's plate is wider than its clickable rect.**
-      `fill_bg` recomputes the extent from the text rather than from
-      `placed.rect`, so the lit left and right edge of the selected
-      control is a visible miss. shrinking the plate to the rect is
-      probably right; growing the rect contradicts the existing
-      deliberate test that gaps between controls stay bottom bar.
+- [x] **the selected control's plate is wider than its clickable rect.**
+      fixed by making the plate exactly `placed.rect`, so the lit cells
+      and the clickable cells are one thing. the padding looked better
+      and lied: clicking the visibly highlighted edge of the selected
+      control missed.
+      **the rejected alternative is worth recording.** growing the rect
+      to the old plate would have kept the padding and made it
+      clickable, and it tiles cleanly (controls sit 2 cells apart and
+      each plate claimed one separator cell per side, so there is no
+      overlap). it was rejected because it leaves the bar with no dead
+      cells at all, which on a *transport* bar means a one-cell miss
+      presses the neighbour: aiming at nothing and skipping a track
+      instead. a miss that does nothing is the better failure, so the
+      2-cell separator stays a safe no-op zone.
+      pinned by `the_selection_plate_covers_exactly_the_clickable_cells`
+      at five bar widths, verified to fail when the padding is restored.
+      the old test that asserted the padding was rewritten rather than
+      deleted; it was pinning the bug.
+- [ ] **the same plate-wider-than-rect bug exists in the maximized
+      player** (`src/ui/player.rs` ~522 has the identical
+      `saturating_sub(1)` / `saturating_add(1)` pair). left for now
+      only because another agent is editing that file for album art;
+      it wants the same fix and the same reasoning.
 - [ ] **`HINT_SEP.len()` is bytes, not columns** (`src/ui/player.rs`
       ~472): the separator is 5 columns and 6 bytes, so the player's
       hint row over-charges a cell per separator and drops a hint
