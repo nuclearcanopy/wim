@@ -256,40 +256,22 @@ pub fn resolve(name: &str, saved: &CustomPresets) -> Option<(Source, [f64; 10])>
     Some((Source::Saved(i), clamp_gains(saved.get(i)?.gains)))
 }
 
-/// Why `name` did not resolve, phrased for whoever typed it: the
-/// closest known curve if one is near, otherwise the whole list.
+/// Why `name` did not resolve, phrased for whoever typed it.
 ///
-/// `eq()` used to get this for free from shellsong's parse-time
-/// keyword validation. Saved curves only exist at runtime, so the
-/// parser cannot see them and resolution moved to apply time; this
-/// keeps the error as useful as it was instead of degrading to a bare
-/// "no such preset". Same Jaro-Winkler floor shellsong's own
-/// `did_you_mean` uses, for the same reason: a candidate is often much
-/// longer than what was typed.
+/// `eq()` used to get this from shellsong's parse-time keyword
+/// validation. Saved curves only exist at runtime, so the parser
+/// cannot see them and resolution moved to apply time; this keeps the
+/// error as useful as it was. Built-ins first, then saved, the order
+/// `resolve` and the eq menu both use.
 pub fn resolve_failure(name: &str, saved: &CustomPresets) -> String {
-    const SUGGEST_FLOOR: f64 = 0.82;
-    let names: Vec<&str> = PRESETS
-        .iter()
-        .map(|p| p.name)
-        .chain(saved.iter().map(|p| p.name.as_str()))
-        .collect();
-    let lower = name.to_lowercase();
-    let mut near: Vec<(u32, &str)> = names
-        .iter()
-        .map(|c| {
-            (
-                (strsim::jaro_winkler(&lower, &c.to_lowercase()) * 1000.0) as u32,
-                *c,
-            )
-        })
-        .filter(|(score, _)| *score >= (SUGGEST_FLOOR * 1000.0) as u32)
-        .collect();
-    // closest, then shortest, then alphabetical: deterministic.
-    near.sort_by_key(|(score, c)| (std::cmp::Reverse(*score), c.len(), *c));
-    match near.first() {
-        Some((_, c)) => format!("no eq preset '{name}'; did you mean '{c}'?"),
-        None => format!("no eq preset '{name}'; have: {}", names.join(", ")),
-    }
+    crate::namehint::unknown(
+        "eq preset",
+        name,
+        PRESETS
+            .iter()
+            .map(|p| p.name)
+            .chain(saved.iter().map(|p| p.name.as_str())),
+    )
 }
 
 /// Which named curve `gains` exactly is, if any; built-ins first.
