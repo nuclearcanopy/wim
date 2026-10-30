@@ -2713,10 +2713,27 @@ impl FetchedCatalog {
 /// Pings before fetching; a typo'd url/password surfaces as an error
 /// rather than silently returning an empty catalog. Pure network I/O,
 /// safe to call from any thread.
+/// One catalog fetch's outcome. A panicked thread and a failed request
+/// are the same thing to the caller: we do not know what this server
+/// has, so nothing may be reconciled against it.
+fn fetched<T>(
+    joined: thread::Result<anyhow::Result<Vec<T>>>,
+    what: &str,
+) -> Result<Vec<T>, String> {
+    match joined {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(format!("{what} failed: {e}")),
+        Err(_) => Err(format!("{what} panicked")),
+    }
+}
+
 fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatalog, String> {
-    let client = subsonic::Client::new(nav)
-        .and_then(|c| c.ping().map(|_| c))
-        .map_err(|e| format!("connection failed: {e}"))?;
+    // no `ping` first: a failing fetch below says everything a ping
+    // would have, and the ping was a whole extra serial round trip on
+    // every pass (one per server per 45s sync, so ~80 wasted requests
+    // an hour). `Client::new` can still fail on a bad config, which is
+    // local and free to check.
+    let client = subsonic::Client::new(nav).map_err(|e| format!("connection failed: {e}"))?;
     // getArtists returns everything in one call, getAlbumList2 is
     // paginated (see subsonic.rs). songs stay fetched on demand (per
     // album/playlist/artist opened) rather than indexed eagerly; a
@@ -2725,16 +2742,24 @@ fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatal
     // independent requests; fetching them concurrently instead of one
     // after another is most of the difference between this feeling
     // instant and feeling like three round-trips stacked up.
+    //
+    // every one of these is propagated, never defaulted to empty.
+    // `Corpus::reconcile_server` drops what a server no longer lists,
+    // so an empty list is a *claim* that the server has nothing; a
+    // failed request that defaulted to empty would make a network blip
+    // delete that server's whole library from the corpus and then
+    // persist the deletion through `save_catalog`.
     let (artists, albums, playlists) = thread::scope(|scope| {
-        let artists = scope.spawn(|| client.all_artists().unwrap_or_default());
-        let albums = scope.spawn(|| client.all_albums().unwrap_or_default());
-        let playlists = scope.spawn(|| client.playlists().unwrap_or_default());
+        let artists = scope.spawn(|| client.all_artists());
+        let albums = scope.spawn(|| client.all_albums());
+        let playlists = scope.spawn(|| client.playlists());
         (
-            artists.join().unwrap_or_default(),
-            albums.join().unwrap_or_default(),
-            playlists.join().unwrap_or_default(),
+            fetched(artists.join(), "artists"),
+            fetched(albums.join(), "albums"),
+            fetched(playlists.join(), "playlists"),
         )
     });
+    let (artists, albums, playlists) = (artists?, albums?, playlists?);
     // persisted here, not where it gets merged: every caller of this
     // is already off the main thread (or already blocking on the
     // network), and serializing a catalog is not something to spend a
@@ -6791,6 +6816,42 @@ mod startup_tests {
             let msg = loading_message(scanning, syncing).unwrap();
             assert!(msg.len() <= 30, "{msg:?} would be truncated in the sidebar");
         }
+    }
+}
+
+#[cfg(test)]
+mod catalog_fetch_tests {
+    use super::*;
+
+    /// The load-bearing one. `Corpus::reconcile_server` treats an empty
+    /// catalog as "this server has nothing" and drops that server's
+    /// items, so a failed request must never arrive as an empty list.
+    /// It used to: each fetch was `unwrap_or_default()`, which turned a
+    /// network blip into "delete this server's whole library" and then
+    /// persisted it via `save_catalog`.
+    #[test]
+    fn a_failed_fetch_is_an_error_not_an_empty_catalog() {
+        let failed: thread::Result<anyhow::Result<Vec<u8>>> =
+            Ok(Err(anyhow::anyhow!("502 bad gateway")));
+        let got = fetched(failed, "artists");
+        assert!(got.is_err(), "a failed fetch must not read as empty");
+        assert!(got.unwrap_err().contains("502"), "the cause should survive");
+    }
+
+    #[test]
+    fn a_panicked_fetch_thread_is_also_an_error() {
+        let panicked: thread::Result<anyhow::Result<Vec<u8>>> =
+            Err(Box::new("thread died") as Box<dyn std::any::Any + Send>);
+        assert!(fetched(panicked, "albums").is_err());
+    }
+
+    /// A server that genuinely has nothing is still a legitimate answer
+    /// and must stay distinguishable from a failure, since that is the
+    /// case reconciliation exists to handle.
+    #[test]
+    fn a_genuinely_empty_server_still_succeeds() {
+        let empty: thread::Result<anyhow::Result<Vec<u8>>> = Ok(Ok(Vec::new()));
+        assert_eq!(fetched(empty, "playlists").unwrap(), Vec::<u8>::new());
     }
 }
 
