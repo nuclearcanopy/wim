@@ -525,6 +525,13 @@ impl Corpus {
     /// (they arrive from `search3`, opened albums and artist pages), so
     /// a catalog fetch is not an authoritative song list to prune
     /// against; see docs/startup-cache.md.
+    ///
+    /// **Caller contract:** an empty `catalog` is read as the server
+    /// claiming it has nothing, and empties it here. Never pass one
+    /// built by defaulting a failed request to empty; that turns a
+    /// network blip into deleting a server's library. See
+    /// `fetch_navidrome_catalog`, which propagates every fetch error
+    /// for exactly this reason.
     pub fn reconcile_server(&mut self, catalog: ServerCatalog, client: &Arc<Client>) {
         let url = client.base_url();
         let live: [HashSet<&str>; 3] = [
