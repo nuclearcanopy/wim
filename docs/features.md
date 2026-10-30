@@ -98,12 +98,15 @@ modern music players. built (`src/persistence.rs`); plain paths under
 
 ## album art
 
-real images (sixel/kitty/iterm2, auto-detected via `ratatui-image`)
-or a grayscale ascii-block rasterization for users who want to keep
-the interface purely monochrome; `i` toggles, `config.album_art` sets
-the starting mode. built (`src/ui/albumart.rs`); see
-`docs/architecture.md` for the technical mapping onto
-`ratatui-image`'s protocols.
+four modes plus off: `ascii-bw`/`ascii-color` (wim's own block
+rasterizer, which needs nothing from the terminal) and
+`full-bw`/`full-color` (real inline images over sixel/kitty/iterm2 via
+`ratatui-image`), so "pixelated or photographic" and "grey or colour"
+are separate choices. `i` cycles, `config.album_art` sets the starting
+mode, `auto` picks the best the terminal can actually do. built
+(`src/ui/albumart.rs`, `src/ui/raster.rs`); see `docs/architecture.md`
+for the protocol detection and why `Halfblocks` does not count as real
+art.
 
 ## subtitles (video)
 
