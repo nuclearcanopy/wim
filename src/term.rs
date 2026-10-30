@@ -37,6 +37,16 @@ impl TerminalGuard {
             // actually wanted: motion while a button is held, i.e. a
             // drag on the scrubber.
             write!(stdout, "\x1b[?1003l")?;
+            // the terminal defaults the pointer to an i-beam, because
+            // it assumes the screen is selectable text. with capture
+            // on it is not: a click is a button press, so ask for the
+            // ordinary arrow. OSC 22 is the pointer-shape sequence
+            // kitty defined; kitty, ghostty, wezterm and foot honour
+            // it, and a terminal that does not know it ignores the
+            // whole sequence, so sending it unconditionally is safe.
+            // alacritty is one of the ones that ignores it, so the
+            // i-beam stays there until the maintainer moves terminal.
+            write!(stdout, "\x1b]22;default\x07")?;
             stdout.flush()?;
         }
 
@@ -63,6 +73,12 @@ fn restore(mouse: bool) {
     let _ = crossterm::terminal::disable_raw_mode();
     if mouse {
         let _ = execute!(io::stdout(), DisableMouseCapture);
+        // empty payload resets the pointer to whatever the terminal
+        // would have chosen, so wim does not leave a shape behind on
+        // the shell it hands the screen back to.
+        let mut out = io::stdout();
+        let _ = write!(out, "\x1b]22;\x07");
+        let _ = out.flush();
     }
     let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
 }
