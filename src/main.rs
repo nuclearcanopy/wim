@@ -229,6 +229,7 @@ fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
                 filter_query: String::new(),
                 filtering: false,
                 show_track_artist: false,
+                loading: false,
             })
         }
         SearchItem::Playlist { id, name, client } => {
@@ -250,6 +251,7 @@ fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
                 filter_query: String::new(),
                 filtering: false,
                 show_track_artist: true,
+                loading: false,
             })
         }
         _ => unreachable!("open_browse_view only called for Album/Playlist"),
@@ -282,6 +284,7 @@ fn open_artist_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
         filter_query: String::new(),
         filtering: false,
         show_track_artist: false,
+        loading: false,
     })
 }
 
@@ -400,6 +403,7 @@ fn open_starred_view(
         filter_query: String::new(),
         filtering: false,
         show_track_artist: true,
+        loading: false,
     };
     // through `set_tracks`, not a bare assignment: it re-clamps
     // `selected` with the list it's an index into.
