@@ -63,7 +63,6 @@ impl Widget for CachedArt<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::raster::HALF_BLOCK;
     use crate::ui::testbuf::{assert_outside_untouched, buffer, char_at};
     use image::{Rgb, RgbImage};
 
@@ -91,9 +90,12 @@ mod tests {
             cell_aspect: 2.0,
         }
         .render(rect, &mut buf);
+        // a flat cover gives every cell four equal samples, so each
+        // draws a solid block rather than a half block with two equal
+        // shades.
         for y in rect.y..rect.y + rect.height {
             for x in rect.x..rect.x + rect.width {
-                assert_eq!(char_at(&buf, x, y), HALF_BLOCK);
+                assert_eq!(char_at(&buf, x, y), '\u{2588}');
             }
         }
         assert_outside_untouched(&buf, rect);

@@ -553,6 +553,42 @@ staying `None` costs nothing in sampling.
       1-wide/1-tall grids. costs nothing measurable: render of a 640px
       cover onto 40x20 is 69.8us total.
 
+- [x] **quadrant blocks: 2x2 subcells instead of the half block.** the
+      real fix for "not particularly sharp", because the limit was
+      never the filter: a 40x20 pane under half-blocks is 40x40 samples
+      for a whole cover, and no amount of unsharp invents detail that
+      was never sampled. `QUADRANTS` is the sixteen 2x2 block glyphs
+      (U+2580..U+259F, the same Unicode block as the half block, so any
+      font that drew the old output draws this), chosen per cell by
+      splitting its four samples at the midpoint of **its own** range,
+      so a cell spanning 90..110 still shows structure where a global
+      threshold would flatten it. a uniform cell draws a solid block
+      rather than a half block carrying one shade twice.
+      **the aspect bug this surfaced:** `place` assumed one sample per
+      cell *width*. with two, the physical width halved and the
+      letterbox bars came out wrong; `SAMPLES_X`/`SAMPLES_Y` now name
+      the relationship so it cannot be got wrong silently again.
+      cost: render of a 640px cover onto 40x20 went 69.8us to 141.5us
+      for 4x the samples, and 991us at 120x60. still nothing.
+      **known consequence, worth the maintainer's judgement:** samples
+      are now anisotropic. a half-block sample was one cell wide by
+      half tall, which is *square* at cell_aspect 2; a quadrant is half
+      by half, so 1:2, twice as tall as wide. horizontal detail
+      doubles, vertical does not, and the "pixels" are tall rectangles.
+      the balanced answer is **octants** (2x4, square at aspect 2,
+      double on both axes), but those are Unicode 16 "Symbols for
+      Legacy Computing Supplement" with thin font coverage, where
+      quadrants are universally available. sextants (2x3, Unicode 13)
+      sit in between. worth revisiting if the font in use has octants.
+- [x] **resolution-adaptive sharpening.** the maintainer's idea, and
+      right in direction: lower resolution reads softer because each
+      sample straddles more of the image. `sharpen_amount` scales
+      inversely with grid span from `SHARPEN_REF` at
+      `SHARPEN_REF_SPAN`, clamped to `SHARPEN_MIN..SHARPEN_MAX`.
+      inverse rather than exponential, and clamped at the top, because
+      past roughly 2.2 an unsharp mask stops adding definition and
+      starts drawing a bright rim along the dark side of every edge.
+
 - [ ] **alacritty cannot do real art at all.** not a wim bug, recorded
       so it stops being rediscovered: alacritty (0.17 here) implements
       no inline-graphics protocol, so the probe correctly reports none
