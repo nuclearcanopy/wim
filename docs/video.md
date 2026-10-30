@@ -135,23 +135,30 @@ answer rather than a bug: there are no wim widgets on screen to click.
 
 ### taking the screen back
 
-both terminal vos wrap themselves in `?1049h`/`?1049l` (alternate
-screen), `?25l`/`?25h` (cursor) and `?1003h`/`?1003l` (mouse tracking),
-emitted around the vo's own lifetime; measured as exactly one balanced
-pair of each per handover. so the moment the vo is torn down the
-terminal is back on the **primary** buffer, with the cursor visible and
-wim's own mouse capture switched off.
+the vos own the screen while they draw, and the escapes they emit are
+**not** balanced around a single vo's lifetime. measured, per window:
 
-`TerminalGuard::reclaim` re-asserts all three and then calls
+| event | emits |
+| --- | --- |
+| `set vo tct` | `?1049h` (enter alt screen), `?2J`, `?25l`, `?1003h` |
+| `set vo null` | `?25h`, `?1003l` |
+| mpv process exit | `?1049l` (leave alt screen) |
+
+so after a handover back, wim is still on the alternate screen, but the
+cursor is visible again and wim's own mouse capture is off.
+`TerminalGuard::reclaim` re-asserts both, re-enters the alternate screen
+as insurance against a vo that stops behaving this way, and then calls
 `Terminal::clear()`. the clear is not cosmetic: ratatui diffs the next
 frame against what it last drew, and mpv overwrote all of it, so without
 dropping that notion of the screen only the cells wim's own buffer
 thinks changed would be repainted.
 
-the same teardown runs once more after the main loop, before the
-terminal guard restores anything. `Mpv`'s drop (which quits mpv over
-ipc) runs later than the guard's, so a vo still up at that point would
-write its `?1049l`/`?25h` onto the user's shell.
+the asymmetry is also why the exit path is ordered backwards from the
+usual one. mpv holds that `?1049l` until its process exits, however long
+ago the vo went away, and `Mpv`'s drop normally runs *after* the terminal
+guard's; left that way the escape lands on the user's shell, where it
+restores a cursor position the shell never saved. so when a vo was up,
+`main` turns it off and drops `Mpv` before dropping the guard.
 
 ### what takes the screen back, and when
 

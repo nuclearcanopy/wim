@@ -7066,13 +7066,16 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
-    // mpv has to stop drawing before the guard restores the terminal,
-    // not after: `Mpv`'s own drop runs later (it quits mpv over ipc),
-    // and a vo tearing itself down by then writes its ?1049l/?25h onto
-    // the user's shell instead of onto a screen wim still owns.
+    // mpv has to be gone before the guard hands the terminal back, so
+    // this exit path is ordered the other way round from the usual one.
+    // a vo entered the alternate screen on init and mpv only leaves it
+    // when the process exits, not when the vo is torn down (measured),
+    // so `Mpv`'s drop running after the guard's puts that ?1049l on the
+    // user's shell, where it restores a cursor position the shell never
+    // saved.
     if video_vo.take().is_some() {
         let _ = player.set_video_output(video::Vo::Null.mpv_name());
-        let _ = guard.reclaim();
+        drop(player);
     }
     drop(guard);
 

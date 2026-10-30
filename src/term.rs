@@ -81,14 +81,18 @@ impl TerminalGuard {
     /// Takes the screen back after mpv's video output has been turned
     /// off again.
     ///
-    /// Both terminal vos wrap themselves in `?1049h`/`?1049l`,
-    /// `?25l`/`?25h` and `?1003h`/`?1003l`, so once one is torn down the
-    /// terminal is on the *primary* buffer with the cursor visible and
-    /// wim's own mouse capture switched off; all three have to be
-    /// re-asserted. The clear is the other half: ratatui diffs against
-    /// what it last drew, and mpv overwrote all of it, so without
-    /// dropping that notion of the screen only the cells wim's own
-    /// buffer calls changed would be repainted.
+    /// Tearing a vo down emits `?25h` and `?1003l`, so the cursor is
+    /// visible again and wim's own mouse capture is off; both have to
+    /// be re-asserted. The alternate screen is insurance rather than a
+    /// correction: mpv enters it on vo init (`?1049h`) but only leaves
+    /// it when the *process* exits, so wim is measurably still on it
+    /// here, and re-entering costs a redundant escape against the vo
+    /// that stops balancing itself.
+    ///
+    /// The clear is the other half, and not cosmetic: ratatui diffs
+    /// against what it last drew, and mpv overwrote all of it, so
+    /// without dropping that notion of the screen only the cells wim's
+    /// own buffer thinks changed would be repainted.
     pub fn reclaim(&mut self) -> io::Result<()> {
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, Hide)?;
