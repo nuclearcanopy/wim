@@ -180,7 +180,10 @@ pub struct Control {
 /// index per visible row of `rect`, `None` where that row is a section
 /// header, a gap or past the end of the list; it is recorded from the
 /// same layout call the render drew from, so a click lands on the row
-/// the user saw. Empty `rows` means the surface scrolls content rather
+/// the user saw. `len` is the space a wheel notch is clamped against,
+/// which is the number of things that can be selected here and not
+/// necessarily the length of the underlying list (a filtered column
+/// shows fewer). Empty `rows` means the surface scrolls content rather
 /// than a selection, and `len` is then its line count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct List {
