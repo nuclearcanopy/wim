@@ -9,9 +9,10 @@ terminal omniplayer for music and video.
 - auto lyrics lookup, auto opensubtitles lookup for local video
 - full subtitle control: delay, language, size, color, outline, background
   opacity/blur/radius, position
-- album art: real images (sixel/kitty/iterm2, auto-detected) or a
-  pixelated unicode-block mode for a pure-TUI look
-- strictly monochrome ui (grayscale only), vim-like navigation
+- album art in four modes: pixelated unicode blocks or real inline images
+  (sixel/kitty/iterm2, auto-detected), each in greyscale or colour
+- strictly monochrome ui (grayscale only, album art aside), vim-like
+  navigation
 - config is a plain toml file, or generate it declaratively from a nix
   flake via the home-manager module (see `nix/`)
 
@@ -49,7 +50,7 @@ module is exposed as `homeManagerModules.default`:
         passwordFile = config.age.secrets.navidrome-password.path; # or any path
       }
     ];
-    albumArt = "auto"; # auto | blocks | sixel | kitty | iterm2 | off
+    albumArt = "auto"; # auto | ascii-bw | ascii-color | full-bw | full-color | off
     libraryPaths = [ ]; # defaults to ~/Music, ~/Videos when empty
   };
 }
