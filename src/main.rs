@@ -3322,7 +3322,43 @@ fn eq_commit_name(
     }
 }
 
+/// Whether this terminal could plausibly answer a graphics-capability
+/// query, so the probe is worth the stdin race it costs.
+///
+/// Deliberately a denylist of terminals known to implement no inline
+/// graphics protocol at all, rather than an allowlist: a new or
+/// unrecognised terminal should still get asked, since the probe is
+/// the only authority. Alacritty is the one that matters here; it has
+/// never shipped sixel or kitty graphics, so the query is guaranteed
+/// to time out and steal a second of input on the way.
+fn graphics_plausible() -> bool {
+    let term = std::env::var("TERM").unwrap_or_default();
+    let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    graphics_plausible_in(&term, &program)
+}
+
+/// The decision itself, split from reading the environment so it is
+/// testable without mutating process-wide state.
+fn graphics_plausible_in(term: &str, program: &str) -> bool {
+    let known_blind = |s: &str| s.to_lowercase().contains("alacritty");
+    !(known_blind(term) || known_blind(program))
+}
+
+/// The commit this binary was built from, stamped by build.rs.
+const BUILD: &str = env!("WIM_BUILD");
+
 fn main() -> anyhow::Result<()> {
+    // answered before anything else, so it works with no terminal, no
+    // config and no server: `--version` exists specifically to settle
+    // "am I running the build I think I am", which has cost more time
+    // than any bug it was mistaken for.
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+    {
+        println!("wim {} ({BUILD})", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     trace::init();
     let is_first_run = !config::config_path()?.exists();
     let mut cfg = config::load_or_init()?;
@@ -3759,10 +3795,21 @@ fn main() -> anyhow::Result<()> {
     // raw mode is already on, since the probe saves and restores
     // whatever termios state it finds.
     let (picker_tx, picker_rx) = mpsc::channel::<Option<Picker>>();
-    thread::spawn(move || {
-        let _ = picker_tx.send(Picker::from_query_stdio().ok());
-        trace::mark("graphics probe answered");
-    });
+    if graphics_plausible() {
+        thread::spawn(move || {
+            let _ = picker_tx.send(Picker::from_query_stdio().ok());
+            trace::mark("graphics probe answered");
+        });
+    } else {
+        // skipped, not backgrounded: the probe reads stdin waiting for
+        // an answer, so on a terminal that will never send one it sits
+        // there for a full second racing the main loop for input and
+        // eating whatever arrives, mouse reports included. not probing
+        // at all is both faster and the only way the event loop is the
+        // single reader of stdin.
+        let _ = picker_tx.send(None);
+        trace::mark("graphics probe skipped (terminal has no protocol)");
+    }
     let mut picker: Option<Picker> = None;
     let mut picker_probed = false;
     trace::mark("terminal ready");
@@ -7458,6 +7505,34 @@ mod catalog_fetch_tests {
     /// It used to: each fetch was `unwrap_or_default()`, which turned a
     /// network blip into "delete this server's whole library" and then
     /// persisted it via `save_catalog`.
+    /// Alacritty never answers a graphics query, so probing it costs a
+    /// second of stolen stdin for a guaranteed "no". The probe reads
+    /// stdin on its own thread, which races the event loop, so this is
+    /// an input-correctness guard as much as a speed one.
+    #[test]
+    fn a_terminal_with_no_graphics_protocol_is_not_probed() {
+        assert!(!graphics_plausible_in("alacritty", ""));
+        assert!(!graphics_plausible_in("xterm-256color", "Alacritty"));
+    }
+
+    /// Everything else is asked, including terminals this code has
+    /// never heard of: the probe is the authority, and the denylist is
+    /// only for cases where asking is known to be pointless.
+    #[test]
+    fn any_other_terminal_is_still_probed() {
+        for (term, program) in [
+            ("xterm-kitty", ""),
+            ("xterm-256color", "ghostty"),
+            ("foot", ""),
+            ("something-nobody-has-shipped-yet", ""),
+        ] {
+            assert!(
+                graphics_plausible_in(term, program),
+                "{term}/{program} should still be probed"
+            );
+        }
+    }
+
     #[test]
     fn a_failed_fetch_is_an_error_not_an_empty_catalog() {
         let failed: thread::Result<anyhow::Result<Vec<u8>>> =
