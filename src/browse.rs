@@ -185,6 +185,25 @@ pub struct BrowseView {
     /// artist profile's own songs column, where every row is obviously
     /// the same artist.
     pub show_track_artist: bool,
+    /// Whether a fetch is still in flight for this view. The header
+    /// says so and an empty pane reads "loading ..." rather than
+    /// "(no tracks)", which is a lie while the answer is still on its
+    /// way.
+    pub loading: bool,
+}
+
+/// What a pane shows in place of rows: still fetching, filtered down
+/// to nothing, or genuinely empty. Same vocabulary as
+/// `main::loading_message` (lowercase, trailing ellipsis, short enough
+/// for a narrow column); `what` names the rows, e.g. "tracks".
+pub fn pane_message(loading: bool, filtered: bool, what: &str) -> String {
+    if loading {
+        format!("loading {what}...")
+    } else if filtered {
+        "(no matches)".to_string()
+    } else {
+        format!("(no {what})")
+    }
 }
 
 /// The bio's own rect, directly below the header and above whatever
@@ -409,6 +428,7 @@ pub(crate) mod tests {
             filter_query: String::new(),
             filtering: false,
             show_track_artist: false,
+            loading: false,
         }
     }
 
@@ -445,6 +465,27 @@ pub(crate) mod tests {
         view.selected = 99;
         view.clamp_selection();
         assert_eq!(view.selected, 1);
+    }
+
+    #[test]
+    fn a_pane_says_it_is_loading_rather_than_claiming_to_be_empty() {
+        assert_eq!(pane_message(true, false, "tracks"), "loading tracks...");
+        assert_eq!(pane_message(true, false, "albums"), "loading albums...");
+        assert_eq!(pane_message(false, false, "tracks"), "(no tracks)");
+        assert_eq!(pane_message(false, true, "tracks"), "(no matches)");
+        // a filter typed while the fetch is still running: still
+        // loading is the honest answer, there is more to match against.
+        assert_eq!(pane_message(true, true, "tracks"), "loading tracks...");
+    }
+
+    #[test]
+    fn loading_messages_fit_a_narrow_column() {
+        for what in ["tracks", "albums"] {
+            for (loading, filtered) in [(true, false), (false, false), (false, true)] {
+                let msg = pane_message(loading, filtered, what);
+                assert!(textfit::width(&msg) <= 20, "too wide for a column: {msg:?}");
+            }
+        }
     }
 
     #[test]
