@@ -3947,7 +3947,13 @@ fn main() -> anyhow::Result<()> {
             // on it resolves to nothing rather than to whichever side
             // a guess would round it to.
             hits.sidebar = Some(sidebar);
-            hits.workspace = Some(main_content);
+            // the mini player strip is drawn in this column, directly
+            // under it, so it is part of the pane a click there means;
+            // without it those rows belong to nothing at all.
+            hits.workspace = Some(Rect {
+                height: main_content.height + mini_bar_height,
+                ..main_content
+            });
             hits.bottom = Some(bottom);
 
             // only resize mode highlights a divider, and only the one
@@ -4212,7 +4218,10 @@ fn main() -> anyhow::Result<()> {
                     which: hit::Scrollable::BrowseTracks,
                     rect,
                     rows,
-                    len: bv.tracks.len(),
+                    // what the filter shows, not every track: `len` is
+                    // the space a wheel notch is clamped against, and
+                    // under a filter those are not the same number.
+                    len: bv.visible_track_indices().len(),
                 });
                 f.render_widget(
                     BrowseListView {
@@ -4335,6 +4344,9 @@ fn main() -> anyhow::Result<()> {
                 hits.sidebar = None;
                 hits.workspace = Some(top);
                 hits.lists.retain(|l| !top.intersects(l.rect));
+                // the sidebar's search box is under the picture too,
+                // and boxes answer before lists.
+                hits.boxes.retain(|(_, r)| !top.intersects(*r));
             }
 
             // 'u': settings, over the whole workspace (sidebar
