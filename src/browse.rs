@@ -4,13 +4,20 @@
 //! rather than jumping straight into playback. Closing (esc) always
 //! returns `main_content` to whatever it'd otherwise show (now-playing,
 //! lyrics, or the idle banner/logo).
+//!
+//! Opening never blocks: `Loader` hands back the view at once and the
+//! fetches report back over a channel the main loop drains. See
+//! docs/async-open.md for the stale-reply rules.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::thread;
 
 use ratatui::layout::Rect;
 
 use crate::search::SearchItem;
-use crate::subsonic::Client;
+use crate::subsonic::{ArtistLoad, Client};
 use crate::ui::textfit;
 
 /// Ascii is the "pure-TUI purity" default: a grayscale block
@@ -185,10 +192,10 @@ pub struct BrowseView {
     /// artist profile's own songs column, where every row is obviously
     /// the same artist.
     pub show_track_artist: bool,
-    /// Whether a fetch is still in flight for this view. The header
-    /// says so and an empty pane reads "loading ..." rather than
-    /// "(no tracks)", which is a lie while the answer is still on its
-    /// way.
+    /// Whether `Loader` still has fetches in flight for this view. The
+    /// header says so and an empty pane reads "loading ..." rather
+    /// than "(no tracks)", which is a lie while the answer is still on
+    /// its way.
     pub loading: bool,
 }
 
@@ -269,6 +276,29 @@ pub fn wrap_bio(text: &str, width: usize, max_lines: usize) -> Vec<String> {
 }
 
 impl BrowseView {
+    /// An empty view already marked as fetching, for `Loader` to fill
+    /// in; the caller overrides the title/subtitle it already knows
+    /// from the `SearchItem` it was opened on.
+    fn loading(is_artist: bool) -> BrowseView {
+        BrowseView {
+            title: String::new(),
+            subtitle: String::new(),
+            year: None,
+            tracks: Vec::new(),
+            selected: 0,
+            art: None,
+            bio: None,
+            is_artist,
+            albums: Vec::new(),
+            albums_selected: 0,
+            albums_focused: false,
+            filter_query: String::new(),
+            filtering: false,
+            show_track_artist: false,
+            loading: true,
+        }
+    }
+
     /// A stable name for whatever `art` this view holds, for the
     /// rasterizer's per-frame cache (`ui::raster::Memo`). A view is
     /// opened on one album or artist and keeps the single cover it
@@ -362,6 +392,391 @@ impl BrowseView {
             None => self.selected = visible.first().copied().unwrap_or(0),
         }
     }
+}
+
+/// Which open a reply belongs to. Every `Loader::open` bumps it, so a
+/// reply tagged with an older generation is for a view the user has
+/// since closed or replaced, and is dropped on arrival rather than
+/// overwriting the newer open. See docs/async-open.md.
+type Generation = u64;
+
+/// One piece of an open that finished. An album or playlist answers in
+/// a single round trip (`Tracks`); an artist sends `Albums` after its
+/// first one and then an `AlbumTracks` per album, so the songs column
+/// fills album by album instead of all at the end.
+enum Load {
+    Tracks {
+        year: Option<u32>,
+        tracks: Vec<SearchItem>,
+    },
+    Art(image::DynamicImage),
+    Bio(Option<String>),
+    Albums(Vec<SearchItem>),
+    AlbumTracks {
+        index: usize,
+        tracks: Vec<SearchItem>,
+    },
+    /// Nothing more is coming for this open.
+    Done,
+    /// The open failed outright; the view stays up (empty) and the
+    /// host toasts this, rather than no view appearing at all.
+    Failed(String),
+}
+
+struct Reply {
+    generation: Generation,
+    load: Load,
+}
+
+/// A worker's end of the loader's channel, tagged with the open it is
+/// fetching for. `send` reports false once that open is stale or the
+/// app is gone, which is every worker's cue to stop: an artist is
+/// dozens of round trips and none of them are worth finishing for a
+/// view nobody is looking at any more.
+struct ReplySender {
+    tx: Sender<Reply>,
+    current: Arc<AtomicU64>,
+    generation: Generation,
+}
+
+impl ReplySender {
+    fn send(&self, load: Load) -> bool {
+        if self.current.load(Ordering::SeqCst) != self.generation {
+            return false;
+        }
+        self.tx
+            .send(Reply {
+                generation: self.generation,
+                load,
+            })
+            .is_ok()
+    }
+}
+
+/// What a `poll` produced that only the host can act on.
+#[derive(Default)]
+pub struct Polled {
+    /// Cover art that just landed. The `ratatui-image` protocol is
+    /// built by the host because the `Picker` lives there, not here.
+    pub art: Option<image::DynamicImage>,
+    pub errors: Vec<String>,
+}
+
+/// Opens browse views without blocking the main thread. `open` returns
+/// the view to show immediately (title and subtitle are already in the
+/// `SearchItem`) and the network happens on worker threads that report
+/// back over one channel, drained by `poll` each pass of the main loop;
+/// same shape as `coverart::Cache`'s `request`/`poll`.
+pub struct Loader {
+    tx: Sender<Reply>,
+    rx: Receiver<Reply>,
+    /// The open every reply is checked against, shared with the workers
+    /// so they can stop early too.
+    current: Arc<AtomicU64>,
+    /// Artist views only: one slot per album, filled as the stream
+    /// answers (out of order). `tracks` is rebuilt from this in album
+    /// order, so the list stays chronological however the fetches race.
+    pending: Vec<Option<Vec<SearchItem>>>,
+}
+
+impl Default for Loader {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Loader {
+            tx,
+            rx,
+            current: Arc::new(AtomicU64::new(0)),
+            pending: Vec::new(),
+        }
+    }
+}
+
+impl Loader {
+    /// The view to show right now for `item`, with its fetches already
+    /// running; `None` for anything that isn't an album, playlist or
+    /// artist (those are one track, nothing to browse).
+    pub fn open(&mut self, item: &SearchItem) -> Option<BrowseView> {
+        let view = self.begin(item)?;
+        self.fetch(item);
+        Some(view)
+    }
+
+    /// Nothing still in flight may touch the browse view any more.
+    /// Call this wherever `browse_view` is closed or replaced by a view
+    /// the loader did not open (esc, the starred listing), or a reply
+    /// from the previous open lands in a view it was never requested
+    /// for.
+    pub fn invalidate(&mut self) {
+        self.current.fetch_add(1, Ordering::SeqCst);
+        self.pending.clear();
+    }
+
+    /// Takes delivery of whatever finished since the last call and
+    /// folds it into `view`. Replies for a stale generation are
+    /// dropped, which is the whole stale-reply guard: a late answer can
+    /// neither land in a closed view nor overwrite a newer open.
+    pub fn poll(&mut self, view: &mut Option<BrowseView>) -> Polled {
+        let mut polled = Polled::default();
+        while let Ok(reply) = self.rx.try_recv() {
+            if reply.generation != self.current.load(Ordering::SeqCst) {
+                continue;
+            }
+            let Some(view) = view.as_mut() else { continue };
+            self.apply(reply.load, view, &mut polled);
+        }
+        polled
+    }
+
+    fn apply(&mut self, load: Load, view: &mut BrowseView, polled: &mut Polled) {
+        match load {
+            Load::Tracks { year, tracks } => {
+                view.year = year;
+                view.set_tracks(tracks);
+                // one round trip, so this list is already complete.
+                view.loading = false;
+            }
+            Load::Art(image) => {
+                polled.art = Some(image.clone());
+                view.art = Some(image);
+            }
+            Load::Bio(bio) => view.bio = bio,
+            Load::Albums(albums) => {
+                self.pending = vec![None; albums.len()];
+                view.albums = albums;
+                view.albums_selected = view
+                    .albums_selected
+                    .min(view.albums.len().saturating_sub(1));
+            }
+            Load::AlbumTracks { index, tracks } => {
+                if let Some(slot) = self.pending.get_mut(index) {
+                    *slot = Some(tracks);
+                }
+                let so_far: Vec<SearchItem> =
+                    self.pending.iter().flatten().flatten().cloned().collect();
+                view.subtitle = song_count(so_far.len());
+                // the cursor follows the song it is on, not its index:
+                // albums land out of order, so an album that answers
+                // late inserts rows *above* a selection the user has
+                // already moved, and enter would act on another track.
+                let anchor = view
+                    .tracks
+                    .get(view.selected)
+                    .and_then(song_id)
+                    .map(str::to_string);
+                view.set_tracks(so_far);
+                if let Some(anchor) = anchor {
+                    if let Some(at) = view
+                        .tracks
+                        .iter()
+                        .position(|track| song_id(track) == Some(anchor.as_str()))
+                    {
+                        view.selected = at;
+                        view.clamp_selection();
+                    }
+                }
+            }
+            Load::Done => {
+                view.loading = false;
+                if view.is_artist {
+                    view.subtitle = song_count(view.tracks.len());
+                }
+            }
+            Load::Failed(msg) => {
+                view.loading = false;
+                polled.errors.push(msg);
+            }
+        }
+    }
+
+    /// Starts a new open: the generation moves, so every reply still in
+    /// flight for the previous one is now stale. Split from `fetch` so
+    /// tests can drive the two halves without a server.
+    fn begin(&mut self, item: &SearchItem) -> Option<BrowseView> {
+        self.invalidate();
+        Some(match item {
+            SearchItem::Album { name, artist, .. } => BrowseView {
+                title: name.clone(),
+                subtitle: artist.clone(),
+                show_track_artist: false,
+                ..BrowseView::loading(false)
+            },
+            SearchItem::Playlist { name, .. } => BrowseView {
+                title: name.clone(),
+                // playlists mix artists, so rows name theirs
+                show_track_artist: true,
+                ..BrowseView::loading(false)
+            },
+            SearchItem::Artist { name, .. } => BrowseView {
+                title: name.clone(),
+                ..BrowseView::loading(true)
+            },
+            _ => return None,
+        })
+    }
+
+    fn fetch(&self, item: &SearchItem) {
+        let sender = ReplySender {
+            tx: self.tx.clone(),
+            current: self.current.clone(),
+            generation: self.current.load(Ordering::SeqCst),
+        };
+        match item {
+            SearchItem::Album {
+                id,
+                name,
+                artist,
+                client,
+            } => {
+                let (id, name, artist, client) =
+                    (id.clone(), name.clone(), artist.clone(), client.clone());
+                thread::spawn(move || {
+                    match client.get_album(&id) {
+                        Ok(details) => {
+                            let tracks = songs_to_items(details.songs, &client);
+                            if !sender.send(Load::Tracks {
+                                year: details.year,
+                                tracks,
+                            }) {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            sender.send(Load::Failed(format!("couldn't open album: {e}")));
+                            return;
+                        }
+                    }
+                    // a second round trip, so it rides behind the track
+                    // list rather than holding it up.
+                    if let Some(art) = fetch_cover_art(&client, &id, &artist, &name) {
+                        sender.send(Load::Art(art));
+                    }
+                    sender.send(Load::Done);
+                });
+            }
+            SearchItem::Playlist { id, client, .. } => {
+                let (id, client) = (id.clone(), client.clone());
+                thread::spawn(move || {
+                    match client.get_playlist_songs(&id) {
+                        Ok(songs) => {
+                            sender.send(Load::Tracks {
+                                year: None,
+                                tracks: songs_to_items(songs, &client),
+                            });
+                        }
+                        Err(e) => {
+                            sender.send(Load::Failed(format!("couldn't open playlist: {e}")));
+                        }
+                    }
+                    sender.send(Load::Done);
+                });
+            }
+            SearchItem::Artist { id, name, client } => {
+                let (id, name, client) = (id.clone(), name.clone(), client.clone());
+                thread::spawn(move || stream_artist(&sender, &client, &id, &name));
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn generation(&self) -> Generation {
+        self.current.load(Ordering::SeqCst)
+    }
+
+    /// Delivers a reply as if a worker had sent it, so the stale guard
+    /// and the per-album assembly are testable without a server; same
+    /// trick `coverart::Cache::deliver` uses.
+    #[cfg(test)]
+    fn deliver(&mut self, generation: Generation, load: Load, view: &mut Option<BrowseView>) {
+        self.tx.send(Reply { generation, load }).unwrap();
+        let _ = self.poll(view);
+    }
+}
+
+/// The artist profile: `getArtist` first (the ALBUMS column renders off
+/// that alone), then one `getAlbum` per album streamed back as it
+/// lands, plus the bio. Only songs credited to this artist are kept;
+/// see `main::artist_tracks` for the Global/Various-Artists reasoning.
+fn stream_artist(sender: &ReplySender, client: &Arc<Client>, id: &str, name: &str) {
+    let (stream_tx, stream_rx) = mpsc::channel();
+    let albums = match client.stream_artist_tracks(id, stream_tx) {
+        Ok(albums) => albums,
+        Err(e) => {
+            sender.send(Load::Failed(format!("couldn't load artist: {e}")));
+            return;
+        }
+    };
+    let items: Vec<SearchItem> = albums
+        .iter()
+        .map(|album| SearchItem::Album {
+            id: album.id.clone(),
+            name: album.name.clone(),
+            artist: name.to_string(),
+            client: client.clone(),
+        })
+        .collect();
+    if !sender.send(Load::Albums(items)) {
+        return;
+    }
+    for event in stream_rx {
+        let delivered = match event {
+            ArtistLoad::Bio(bio) => sender.send(Load::Bio(bio)),
+            ArtistLoad::Album(album) => {
+                let tracks = songs_to_items(
+                    album
+                        .songs
+                        .into_iter()
+                        .filter(|song| song.artist == name)
+                        .collect(),
+                    client,
+                );
+                sender.send(Load::AlbumTracks {
+                    index: album.index,
+                    tracks,
+                })
+            }
+        };
+        // dropping `stream_rx` here is what stops the album fetches
+        // still queued behind this one.
+        if !delivered {
+            return;
+        }
+    }
+    sender.send(Load::Done);
+}
+
+fn song_id(item: &SearchItem) -> Option<&str> {
+    match item {
+        SearchItem::Song { id, .. } => Some(id),
+        _ => None,
+    }
+}
+
+fn song_count(n: usize) -> String {
+    if n == 1 {
+        "1 song".to_string()
+    } else {
+        format!("{n} songs")
+    }
+}
+
+/// An opened album's cover. Goes through the shared on-disk store
+/// keyed by the album's names, so reopening an album costs nothing and
+/// a cover the player already fetched for one of its tracks is a hit
+/// here (and the reverse).
+///
+/// `artist`/`album` rather than just the id because the store is
+/// name-keyed; falling back to the id's own slot keeps an untagged
+/// album working, just without sharing.
+fn fetch_cover_art(
+    client: &Client,
+    album_id: &str,
+    artist: &str,
+    album: &str,
+) -> Option<image::DynamicImage> {
+    let key = crate::coverart::Key::album(artist, album)
+        .unwrap_or_else(|| crate::coverart::Key::Track(format!("album:{album_id}")));
+    crate::coverart::fetch_stored(client, &key, album_id)
 }
 
 pub fn songs_to_items(songs: Vec<crate::subsonic::Song>, client: &Arc<Client>) -> Vec<SearchItem> {
@@ -465,6 +880,378 @@ pub(crate) mod tests {
         view.selected = 99;
         view.clamp_selection();
         assert_eq!(view.selected, 1);
+    }
+
+    fn test_album(name: &str) -> SearchItem {
+        SearchItem::Album {
+            id: format!("al-{name}"),
+            name: name.to_string(),
+            artist: "artist".to_string(),
+            client: test_client(),
+        }
+    }
+
+    fn test_artist() -> SearchItem {
+        SearchItem::Artist {
+            id: "ar-1".to_string(),
+            name: "artist".to_string(),
+            client: test_client(),
+        }
+    }
+
+    fn songs_named(names: &[&str]) -> Vec<SearchItem> {
+        let client = test_client();
+        names
+            .iter()
+            .map(|name| SearchItem::Song {
+                id: (*name).to_string(),
+                title: (*name).to_string(),
+                artist: "artist".to_string(),
+                album: "album".to_string(),
+                client: client.clone(),
+            })
+            .collect()
+    }
+
+    fn titles(view: &BrowseView) -> Vec<String> {
+        view.tracks
+            .iter()
+            .map(|track| match track {
+                SearchItem::Song { title, .. } => title.clone(),
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    /// `begin` rather than `open`: the view it hands back is the whole
+    /// point (no network has happened yet), and tests never talk to a
+    /// server.
+    #[test]
+    fn an_album_view_has_its_title_before_a_single_track_arrives() {
+        let mut loader = Loader::default();
+        let view = loader.begin(&test_album("kid a")).unwrap();
+        assert_eq!(view.title, "kid a");
+        assert_eq!(view.subtitle, "artist", "the item already carried it");
+        assert!(view.loading, "and it says it is still fetching");
+        assert!(view.tracks.is_empty());
+    }
+
+    #[test]
+    fn an_artist_view_opens_on_its_name_with_both_columns_empty() {
+        let mut loader = Loader::default();
+        let view = loader.begin(&test_artist()).unwrap();
+        assert_eq!(view.title, "artist");
+        assert!(view.is_artist);
+        assert!(view.loading);
+        assert!(view.albums.is_empty() && view.tracks.is_empty());
+    }
+
+    #[test]
+    fn a_song_has_nothing_to_browse() {
+        let mut loader = Loader::default();
+        assert!(loader.begin(&songs_named(&["one"])[0]).is_none());
+    }
+
+    #[test]
+    fn tracks_land_in_the_view_they_were_requested_for() {
+        let mut loader = Loader::default();
+        let mut view = Some(loader.begin(&test_album("kid a")).unwrap());
+        let generation = loader.generation();
+        loader.deliver(
+            generation,
+            Load::Tracks {
+                year: Some(2000),
+                tracks: songs_named(&["everything in its right place", "kid a"]),
+            },
+            &mut view,
+        );
+        let view = view.unwrap();
+        assert_eq!(view.tracks.len(), 2);
+        assert_eq!(view.year, Some(2000));
+        assert!(!view.loading, "one round trip, so the list is complete");
+    }
+
+    /// The fast-clicking case: open one album, open another before the
+    /// first answers, and the first answer must not land in the second
+    /// view. Remove the generation check in `Loader::poll` and this
+    /// fails.
+    #[test]
+    fn a_reply_from_the_previous_open_never_lands_in_the_newer_view() {
+        let mut loader = Loader::default();
+        let _stale_view = loader.begin(&test_album("kid a")).unwrap();
+        let stale = loader.generation();
+
+        let mut view = Some(loader.begin(&test_album("amnesiac")).unwrap());
+        loader.deliver(
+            stale,
+            Load::Tracks {
+                year: Some(2000),
+                tracks: songs_named(&["kid a"]),
+            },
+            &mut view,
+        );
+        let view = view.unwrap();
+        assert_eq!(view.title, "amnesiac");
+        assert!(
+            view.tracks.is_empty() && view.year.is_none(),
+            "the first album's answer overwrote the second's view"
+        );
+        assert!(view.loading, "and left it claiming it had finished");
+    }
+
+    /// Same album twice is still two different opens; nothing is keyed
+    /// by album id.
+    #[test]
+    fn reopening_the_same_album_still_discards_the_first_opens_reply() {
+        let mut loader = Loader::default();
+        loader.begin(&test_album("kid a")).unwrap();
+        let first = loader.generation();
+        let mut view = Some(loader.begin(&test_album("kid a")).unwrap());
+        loader.deliver(
+            first,
+            Load::Tracks {
+                year: None,
+                tracks: songs_named(&["kid a"]),
+            },
+            &mut view,
+        );
+        assert!(view.unwrap().tracks.is_empty());
+    }
+
+    #[test]
+    fn a_reply_after_the_view_was_closed_reopens_nothing() {
+        let mut loader = Loader::default();
+        let view = loader.begin(&test_album("kid a")).unwrap();
+        let generation = loader.generation();
+        // esc: the host drops the view and disowns the fetch.
+        drop(view);
+        let mut closed: Option<BrowseView> = None;
+        loader.invalidate();
+        loader.deliver(
+            generation,
+            Load::Tracks {
+                year: None,
+                tracks: songs_named(&["kid a"]),
+            },
+            &mut closed,
+        );
+        assert!(closed.is_none());
+    }
+
+    /// `invalidate` is also what the starred listing calls, since the
+    /// loader did not open that view.
+    #[test]
+    fn a_reply_never_lands_in_a_view_the_loader_did_not_open() {
+        let mut loader = Loader::default();
+        loader.begin(&test_album("kid a")).unwrap();
+        let generation = loader.generation();
+        let mut view = Some(test_view(Vec::new()));
+        loader.invalidate();
+        loader.deliver(
+            generation,
+            Load::Tracks {
+                year: None,
+                tracks: songs_named(&["kid a"]),
+            },
+            &mut view,
+        );
+        assert!(
+            view.unwrap().tracks.is_empty(),
+            "an album's tracks landed in the starred listing"
+        );
+    }
+
+    #[test]
+    fn the_open_after_an_invalidate_still_gets_its_own_replies() {
+        let mut loader = Loader::default();
+        loader.invalidate();
+        let mut view = Some(loader.begin(&test_album("kid a")).unwrap());
+        let generation = loader.generation();
+        loader.deliver(
+            generation,
+            Load::Tracks {
+                year: None,
+                tracks: songs_named(&["kid a"]),
+            },
+            &mut view,
+        );
+        assert_eq!(view.unwrap().tracks.len(), 1, "the gate stayed shut");
+    }
+
+    #[test]
+    fn an_artist_songs_column_stays_in_album_order_however_the_fetches_race() {
+        let mut loader = Loader::default();
+        let mut view = Some(loader.begin(&test_artist()).unwrap());
+        let generation = loader.generation();
+        loader.deliver(
+            generation,
+            Load::Albums(vec![
+                test_album("first"),
+                test_album("second"),
+                test_album("third"),
+            ]),
+            &mut view,
+        );
+        // the last album answers first, the middle one never answers
+        loader.deliver(
+            generation,
+            Load::AlbumTracks {
+                index: 2,
+                tracks: songs_named(&["c1", "c2"]),
+            },
+            &mut view,
+        );
+        assert_eq!(titles(view.as_ref().unwrap()), ["c1", "c2"]);
+        loader.deliver(
+            generation,
+            Load::AlbumTracks {
+                index: 0,
+                tracks: songs_named(&["a1"]),
+            },
+            &mut view,
+        );
+        let view = view.unwrap();
+        assert_eq!(
+            titles(&view),
+            ["a1", "c1", "c2"],
+            "tracks must read in album order, not arrival order"
+        );
+        assert_eq!(view.albums.len(), 3, "the column filled on one trip");
+        assert_eq!(view.subtitle, "3 songs");
+        assert!(view.loading, "the middle album is still coming");
+    }
+
+    /// The cursor must stay on the song it was parked on, even when a
+    /// late album inserts rows above it.
+    #[test]
+    fn a_late_album_does_not_drag_the_cursor_onto_another_song() {
+        let mut loader = Loader::default();
+        let mut view = Some(loader.begin(&test_artist()).unwrap());
+        let generation = loader.generation();
+        loader.deliver(
+            generation,
+            Load::Albums(vec![test_album("first"), test_album("second")]),
+            &mut view,
+        );
+        loader.deliver(
+            generation,
+            Load::AlbumTracks {
+                index: 1,
+                tracks: songs_named(&["b1", "b2"]),
+            },
+            &mut view,
+        );
+        view.as_mut().unwrap().selected = 1;
+        loader.deliver(
+            generation,
+            Load::AlbumTracks {
+                index: 0,
+                tracks: songs_named(&["a1", "a2", "a3"]),
+            },
+            &mut view,
+        );
+        let view = view.unwrap();
+        assert_eq!(titles(&view), ["a1", "a2", "a3", "b1", "b2"]);
+        assert_eq!(
+            titles(&view)[view.selected],
+            "b2",
+            "the cursor moved to a different song under the user"
+        );
+    }
+
+    #[test]
+    fn an_artists_albums_arrive_before_any_of_its_songs() {
+        let mut loader = Loader::default();
+        let mut view = Some(loader.begin(&test_artist()).unwrap());
+        let generation = loader.generation();
+        loader.deliver(
+            generation,
+            Load::Albums(vec![test_album("first")]),
+            &mut view,
+        );
+        let view = view.unwrap();
+        assert_eq!(view.albums.len(), 1);
+        assert!(view.tracks.is_empty());
+        assert!(view.loading);
+    }
+
+    #[test]
+    fn done_clears_loading_and_fixes_the_final_count() {
+        let mut loader = Loader::default();
+        let mut view = Some(loader.begin(&test_artist()).unwrap());
+        let generation = loader.generation();
+        loader.deliver(
+            generation,
+            Load::Albums(vec![test_album("first")]),
+            &mut view,
+        );
+        loader.deliver(
+            generation,
+            Load::AlbumTracks {
+                index: 0,
+                tracks: songs_named(&["a1"]),
+            },
+            &mut view,
+        );
+        loader.deliver(generation, Load::Done, &mut view);
+        let view = view.unwrap();
+        assert!(!view.loading);
+        assert_eq!(view.subtitle, "1 song");
+    }
+
+    #[test]
+    fn a_failed_open_leaves_the_view_up_and_reports_the_reason() {
+        let mut loader = Loader::default();
+        let mut view = Some(loader.begin(&test_album("kid a")).unwrap());
+        let generation = loader.generation();
+        loader
+            .tx
+            .send(Reply {
+                generation,
+                load: Load::Failed("couldn't open album: nope".to_string()),
+            })
+            .unwrap();
+        let polled = loader.poll(&mut view);
+        assert_eq!(polled.errors, ["couldn't open album: nope"]);
+        let view = view.unwrap();
+        assert_eq!(view.title, "kid a", "the view stays up, empty");
+        assert!(!view.loading);
+    }
+
+    #[test]
+    fn art_is_handed_to_the_host_as_well_as_the_view() {
+        let mut loader = Loader::default();
+        let mut view = Some(loader.begin(&test_album("kid a")).unwrap());
+        let generation = loader.generation();
+        let image = image::DynamicImage::new_rgb8(2, 2);
+        loader
+            .tx
+            .send(Reply {
+                generation,
+                load: Load::Art(image),
+            })
+            .unwrap();
+        let polled = loader.poll(&mut view);
+        assert!(polled.art.is_some(), "the host builds the image protocol");
+        assert!(view.unwrap().art.is_some());
+    }
+
+    #[test]
+    fn a_stale_cover_is_dropped_before_the_host_ever_sees_it() {
+        let mut loader = Loader::default();
+        loader.begin(&test_album("kid a")).unwrap();
+        let stale = loader.generation();
+        let mut view = Some(loader.begin(&test_album("amnesiac")).unwrap());
+        loader
+            .tx
+            .send(Reply {
+                generation: stale,
+                load: Load::Art(image::DynamicImage::new_rgb8(2, 2)),
+            })
+            .unwrap();
+        let polled = loader.poll(&mut view);
+        assert!(polled.art.is_none(), "wrong album's cover");
+        assert!(view.unwrap().art.is_none());
     }
 
     #[test]

@@ -198,94 +198,29 @@ fn artist_tracks(
     Ok((tracks, albums))
 }
 
-/// Opens the track-listing view on an album or playlist; the Enter-key
-/// response for those two kinds instead of `resolve_tracks`+immediate
-/// play, so picking one from search shows its tracks first rather than
-/// jumping straight into playback. `resolve_tracks` (full expand+queue,
-/// no browsing) is still what the quick-queue key uses.
-fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
-    match item {
-        SearchItem::Album {
-            id,
-            name,
-            artist,
-            client,
-        } => {
-            let details = client
-                .get_album(id)
-                .map_err(|e| format!("couldn't open album: {e}"))?;
-            Ok(browse::BrowseView {
-                title: name.clone(),
-                subtitle: artist.clone(),
-                year: details.year,
-                tracks: browse::songs_to_items(details.songs, client),
-                selected: 0,
-                art: fetch_cover_art(client, id, artist, name),
-                bio: None,
-                is_artist: false,
-                albums: Vec::new(),
-                albums_selected: 0,
-                albums_focused: false,
-                filter_query: String::new(),
-                filtering: false,
-                show_track_artist: false,
-                loading: false,
-            })
-        }
-        SearchItem::Playlist { id, name, client } => {
-            let songs = client
-                .get_playlist_songs(id)
-                .map_err(|e| format!("couldn't open playlist: {e}"))?;
-            Ok(browse::BrowseView {
-                title: name.clone(),
-                subtitle: String::new(),
-                year: None,
-                tracks: browse::songs_to_items(songs, client),
-                selected: 0,
-                art: None,
-                bio: None,
-                is_artist: false,
-                albums: Vec::new(),
-                albums_selected: 0,
-                albums_focused: false,
-                filter_query: String::new(),
-                filtering: false,
-                show_track_artist: true,
-                loading: false,
-            })
-        }
-        _ => unreachable!("open_browse_view only called for Album/Playlist"),
-    }
-}
-
-/// The artist profile view: a bio (best-effort, `None` if navidrome
-/// has nothing for this artist), an ALBUMS column, and a filterable
-/// SONGS column (every song actually credited to them across every
-/// album, chronologically). See `artist_tracks` for the Global/
-/// Various-Artists filtering this relies on.
-fn open_artist_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
-    let SearchItem::Artist { id, name, client } = item else {
-        unreachable!("open_artist_view only called for Artist");
+/// The one way a browse view is opened, so the keyboard's two enter
+/// paths (a search result, and an album picked out of the artist
+/// profile's ALBUMS column) and any pointer activation of the same
+/// rows cannot drift apart; nothing here touches the network, the
+/// loader's workers do. A kind with nothing to browse is a no-op.
+fn open_browse(
+    item: &SearchItem,
+    loader: &mut browse::Loader,
+    view: &mut Option<browse::BrowseView>,
+    real_art_protocol: &mut Option<StatefulProtocol>,
+    focus: &mut Focus,
+) {
+    let Some(opened) = loader.open(item) else {
+        return;
     };
-    let bio = client.get_artist_bio(id).ok().flatten();
-    let (tracks, albums) = artist_tracks(client, id, name)?;
-    Ok(browse::BrowseView {
-        title: name.clone(),
-        subtitle: format!("{} songs", tracks.len()),
-        year: None,
-        tracks,
-        selected: 0,
-        art: None,
-        bio,
-        is_artist: true,
-        albums,
-        albums_selected: 0,
-        albums_focused: false,
-        filter_query: String::new(),
-        filtering: false,
-        show_track_artist: false,
-        loading: false,
-    })
+    // the previous view's cover must not sit under the new title; the
+    // new one is built when `Loader::poll` hands the image over.
+    *real_art_protocol = None;
+    *view = Some(opened);
+    // opening something to browse and then still needing a separate
+    // keypress just to be able to scroll it read as "enter doesn't do
+    // anything"; land with it already focused instead.
+    *focus = Focus::Workspace;
 }
 
 /// Local files flip the persisted favorites set; remote songs call
@@ -409,27 +344,6 @@ fn open_starred_view(
     // `selected` with the list it's an index into.
     view.set_tracks(tracks);
     view
-}
-
-/// Best-effort: a missing/unreadable cover is not worth surfacing as
-/// an error, the album view just shows no art for it.
-/// An opened album's cover. Goes through the shared on-disk store
-/// keyed by the album's names, so reopening an album costs nothing and
-/// a cover the player already fetched for one of its tracks is a hit
-/// here (and the reverse).
-///
-/// `artist`/`album` rather than just the id because the store is
-/// name-keyed; falling back to the id's own slot keeps an untagged
-/// album working, just without sharing.
-fn fetch_cover_art(
-    client: &subsonic::Client,
-    album_id: &str,
-    artist: &str,
-    album: &str,
-) -> Option<image::DynamicImage> {
-    let key = coverart::Key::album(artist, album)
-        .unwrap_or_else(|| coverart::Key::Track(format!("album:{album_id}")));
-    coverart::fetch_stored(client, &key, album_id)
 }
 
 /// Whether the config names a graphics protocol outright, which is an
@@ -1047,6 +961,10 @@ struct ActionCtx<'a> {
     previous_track: &'a mut Option<SearchItem>,
     player_minimized: &'a mut bool,
     browse_view: &'a mut Option<browse::BrowseView>,
+    /// Opens `browse_view` without blocking on the network, and owns
+    /// the generation that keeps a late reply out of a view the user
+    /// has since closed or replaced; see docs/async-open.md.
+    browse_loader: &'a mut browse::Loader,
     real_art_protocol: &'a mut Option<StatefulProtocol>,
     picker: &'a mut Option<Picker>,
     focus: &'a mut Focus,
@@ -1076,28 +994,17 @@ fn dispatch_action(action: Action, ctx: &mut ActionCtx) -> Dispatch {
         Action::Play(item @ SearchItem::Album { .. })
         | Action::Play(item @ SearchItem::Playlist { .. })
         | Action::Play(item @ SearchItem::Artist { .. }) => {
-            // on success, the opened view itself (title + track count
-            // in its header) is the confirmation; no need to also
-            // repeat it on the status line.
-            let opened = match &item {
-                SearchItem::Artist { .. } => open_artist_view(&item),
-                _ => open_browse_view(&item),
-            };
-            match opened {
-                Ok(bv) => {
-                    *ctx.real_art_protocol = ctx
-                        .picker
-                        .as_mut()
-                        .and_then(|p| bv.art.clone().map(|img| p.new_resize_protocol(img)));
-                    *ctx.browse_view = Some(bv);
-                    // opening something to browse and then still
-                    // needing a separate keypress just to be able to
-                    // scroll it read as "enter doesn't do anything";
-                    // land with it already focused instead.
-                    *ctx.focus = Focus::Workspace;
-                }
-                Err(msg) => ctx.notifications.push(Severity::Error, msg),
-            };
+            // the view itself (title, and "loading..." until the
+            // tracks land) is the confirmation; no status line echo.
+            // nothing here waits on the network: the loader answers at
+            // once and fills the view in from `Loader::poll`.
+            open_browse(
+                &item,
+                ctx.browse_loader,
+                ctx.browse_view,
+                ctx.real_art_protocol,
+                ctx.focus,
+            );
         }
         Action::Play(item) => {
             match resolve_tracks(&item) {
@@ -1587,6 +1494,9 @@ fn open_shellsong_view(target: ViewTarget, ctx: &mut ShellsongCtx) -> (Dispatch,
                 .picker
                 .as_mut()
                 .and_then(|p| bv.art.clone().map(|img| p.new_resize_protocol(img)));
+            // this view isn't the loader's, so an album still loading
+            // behind it has to be disowned before it lands in here.
+            ctx.actx.browse_loader.invalidate();
             *ctx.actx.browse_view = Some(bv);
             // same as opening an album: the listing draws its own
             // cursor, so j/k have to move it rather than the hidden
@@ -3575,6 +3485,9 @@ fn main() -> anyhow::Result<()> {
     // until esc, same modal-ish precedence as lyrics but independent
     // of it (browsing doesn't require anything to already be playing).
     let mut browse_view: Option<browse::BrowseView> = None;
+    // fills `browse_view` in from its worker threads, so opening one
+    // costs no frames; drained once a pass below.
+    let mut browse_loader = browse::Loader::default();
 
     // tracks the last known reachability per server url, so the
     // background sync below only notifies on an actual transition
@@ -4871,6 +4784,18 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        // whatever an open album/artist fetched since the last frame.
+        // replies for a view that's since been closed or replaced are
+        // dropped inside `poll` (see docs/async-open.md); the art
+        // protocol is built here because the `Picker` lives here.
+        let browse_loaded = browse_loader.poll(&mut browse_view);
+        if let Some(image) = browse_loaded.art {
+            real_art_protocol = picker.as_mut().map(|p| p.new_resize_protocol(image));
+        }
+        for msg in browse_loaded.errors {
+            notifications.push(Severity::Error, msg);
+        }
+
         // a subtitle `fire_subtitle_fetch` landed; loading it is this
         // thread's job, it owns the mpv handle.
         while let Ok(sub) = subtitle_rx.try_recv() {
@@ -5103,6 +5028,7 @@ fn main() -> anyhow::Result<()> {
                         previous_track: &mut previous_track,
                         player_minimized: &mut player_minimized,
                         browse_view: &mut browse_view,
+                        browse_loader: &mut browse_loader,
                         real_art_protocol: &mut real_art_protocol,
                         picker: &mut picker,
                         focus: &mut focus,
@@ -5210,6 +5136,9 @@ fn main() -> anyhow::Result<()> {
                 // the idle poll would make an awaited search crawl.
                 || shellsong_program.is_some()
                 || browse_view.as_ref().is_some_and(|bv| bv.filtering)
+                // an open still filling in has to redraw as its rows
+                // land, whichever pane holds focus.
+                || browse_view.as_ref().is_some_and(|bv| bv.loading)
                 || (now_playing.is_some() && !player_minimized)
                 || scrub.is_some()
                 || input_mode == InputMode::Move
@@ -5771,6 +5700,7 @@ fn main() -> anyhow::Result<()> {
                             previous_track: &mut previous_track,
                             player_minimized: &mut player_minimized,
                             browse_view: &mut browse_view,
+                            browse_loader: &mut browse_loader,
                             real_art_protocol: &mut real_art_protocol,
                             picker: &mut picker,
                             focus: &mut focus,
@@ -6384,6 +6314,9 @@ fn main() -> anyhow::Result<()> {
                 // does (see the Focus match further down).
                 if browse_view.is_some() && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     browse_view = None;
+                    // whatever was still fetching for it must not
+                    // reopen it when it answers.
+                    browse_loader.invalidate();
                     continue;
                 }
 
@@ -6532,15 +6465,13 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 if let Some(album) = open_album {
-                    match open_browse_view(&album) {
-                        Ok(new_bv) => {
-                            real_art_protocol = picker.as_mut().and_then(|p| {
-                                new_bv.art.clone().map(|img| p.new_resize_protocol(img))
-                            });
-                            browse_view = Some(new_bv);
-                        }
-                        Err(msg) => notifications.push(Severity::Error, msg),
-                    }
+                    open_browse(
+                        &album,
+                        &mut browse_loader,
+                        &mut browse_view,
+                        &mut real_art_protocol,
+                        &mut focus,
+                    );
                     continue;
                 }
 
@@ -6668,6 +6599,7 @@ fn main() -> anyhow::Result<()> {
                             previous_track: &mut previous_track,
                             player_minimized: &mut player_minimized,
                             browse_view: &mut browse_view,
+                            browse_loader: &mut browse_loader,
                             real_art_protocol: &mut real_art_protocol,
                             picker: &mut picker,
                             focus: &mut focus,
@@ -6818,6 +6750,9 @@ fn main() -> anyhow::Result<()> {
                     real_art_protocol = picker
                         .as_mut()
                         .and_then(|p| bv.art.clone().map(|img| p.new_resize_protocol(img)));
+                    // not the loader's view, so an album still fetching
+                    // behind it is disowned rather than landing here.
+                    browse_loader.invalidate();
                     browse_view = Some(bv);
                     // same as opening an album: the starred list draws
                     // a selection cursor, so j/k have to move *it*
@@ -6997,6 +6932,7 @@ fn main() -> anyhow::Result<()> {
                         previous_track: &mut previous_track,
                         player_minimized: &mut player_minimized,
                         browse_view: &mut browse_view,
+                        browse_loader: &mut browse_loader,
                         real_art_protocol: &mut real_art_protocol,
                         picker: &mut picker,
                         focus: &mut focus,
