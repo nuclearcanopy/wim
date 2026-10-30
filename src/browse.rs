@@ -250,6 +250,22 @@ pub fn wrap_bio(text: &str, width: usize, max_lines: usize) -> Vec<String> {
 }
 
 impl BrowseView {
+    /// A stable name for whatever `art` this view holds, for the
+    /// rasterizer's per-frame cache (`ui::raster::Memo`). A view is
+    /// opened on one album or artist and keeps the single cover it
+    /// fetched then, so the view's own identity *is* the cover's.
+    /// Everything that could pick out a different record is in it,
+    /// the year included, so it discriminates at least as finely as
+    /// `coverart::Key` does.
+    pub fn art_key(&self) -> String {
+        let kind = if self.is_artist { "artist" } else { "album" };
+        let year = self.year.unwrap_or(0);
+        format!(
+            "bv:{kind}\u{1}{}\u{1}{}\u{1}{year}",
+            self.subtitle, self.title
+        )
+    }
+
     /// Indices into `tracks` that match `filter_query`: a plain
     /// case-insensitive substring match on the same label the row
     /// itself shows. Empty query matches everything, so this is
