@@ -230,11 +230,24 @@ impl Mpv {
             // displaying it anywhere; `screenshot-raw` (the embedded
             // video pane's own frame source) still works, since a
             // screenshot is taken from the decoded/filtered frame,
-            // not from whatever vo would've shown it in.
+            // not from whatever vo would've shown it in. `vo` is
+            // settable at runtime over ipc, which is how fullscreen
+            // video flips to a terminal output and back; see
+            // `set_video_output` and docs/video.md.
             .arg("--vo=null")
             .arg(format!("--input-ipc-server={}", sock_path.display()))
+            // stdin stays closed: `--no-terminal` already implies
+            // `--no-input-terminal`, and mpv must never compete with the
+            // tui for keystrokes. stdout is this terminal, because mpv's
+            // `tct`/`kitty` outputs draw a fullscreen video by writing
+            // escapes to it; with `--vo=null` it writes nothing at all
+            // (measured: zero bytes across a load, a seek and a volume
+            // change), so ordinary music playback is unaffected. stderr
+            // stays closed since `--no-terminal` implies
+            // `--really-quiet` but a loader warning would still land on
+            // top of the ui.
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::inherit())
             .stderr(Stdio::null());
         reap_with_parent(&mut cmd);
         let child = cmd
@@ -435,6 +448,45 @@ impl Mpv {
 
     pub fn set_property(&self, name: &str, value: Value) -> Result<()> {
         self.command(&[json!("set_property"), json!(name), value])?;
+        Ok(())
+    }
+
+    /// Points mpv's video output at this terminal, or back at `null`.
+    ///
+    /// Safe to call mid-playback: the switch keeps the playlist, the
+    /// position and the pause state, so there is no relaunch and
+    /// nothing to seek back to. The vo owns the screen while it draws
+    /// (it enters and leaves the alternate screen itself); see
+    /// `term::TerminalGuard::reclaim` and docs/video.md.
+    pub fn set_video_output(&self, vo: &str) -> Result<()> {
+        self.set_property("vo", json!(vo))
+    }
+
+    /// How big a drawing vo gets to be, in terminal cells. Has to be
+    /// pushed from here and cannot be left at mpv's 0 ("ask the tty"):
+    /// under `--no-terminal` mpv never queries the tty and silently
+    /// falls back to 80x25, so a video on a larger terminal drew into
+    /// the top-left 80x25 of it.
+    ///
+    /// Only takes effect when the vo next initializes, so a resize has
+    /// to bounce `vo` through `null`; both outputs' options are set
+    /// together, since neither matters until its own vo is selected.
+    pub fn set_video_geometry(&self, cols: u16, rows: u16) -> Result<()> {
+        let cmds: Vec<Vec<Value>> = [
+            ("vo-tct-width", json!(cols)),
+            ("vo-tct-height", json!(rows)),
+            ("vo-kitty-cols", json!(cols)),
+            ("vo-kitty-rows", json!(rows)),
+            // one write per frame instead of per row: a half-block vo
+            // painting a row at a time tears visibly at this size.
+            ("vo-tct-buffering", json!("frame")),
+        ]
+        .into_iter()
+        .map(|(name, value)| vec![json!("set_property"), json!(name), value])
+        .collect();
+        for result in self.command_batch(&cmds) {
+            result?;
+        }
         Ok(())
     }
 

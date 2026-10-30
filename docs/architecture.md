@@ -61,7 +61,26 @@ asks for it.
   batch instead of one each. the subtitle menu fires its seven on every
   keypress.
 
+## video: mpv draws it, wim stops drawing
+
+fullscreen video ('v') is one of mpv's own terminal video outputs
+(`tct` half-blocks, or the `kitty` graphics protocol) writing straight
+to this terminal, while wim skips `terminal.draw` entirely for as long
+as it is up. `vo` is settable live over the existing ipc connection, so
+there is no relaunch and no position to preserve.
+
+the rest of the reasoning; why frames cannot be pulled out of mpv at
+all, why mpv's stdout had to be reconnected, why the vo's geometry has
+to be pushed from wim, why `auto` cannot guess kitty, and what still
+blocks video in a sub-rect of the ui; is in `docs/video.md`. read that
+before touching `src/video.rs`, `Mpv::set_video_output` or
+`TerminalGuard::reclaim`/`draw_unless_video`.
+
 ## video frames: a pump, not a poll
+
+the frame pump below is the *old* approach and its source does not
+work; see `docs/video.md`. it is still wired up, and still reports
+`Unsupported` rather than hanging, but nothing draws from it.
 
 `mpv::FramePump` owns a second ipc connection and a thread. it captures
 on an interval, decodes, and keeps exactly the newest frame; the render

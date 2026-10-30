@@ -1,5 +1,6 @@
 use std::io::{self, Stdout, Write};
 
+use crossterm::cursor::Hide;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
@@ -58,6 +59,51 @@ impl TerminalGuard {
 
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self { terminal, mouse })
+    }
+
+    /// Draws, unless mpv currently owns the screen.
+    ///
+    /// Fullscreen video is mpv drawing straight to this terminal, and
+    /// ratatui repaints from its own buffer: a single `draw` while the
+    /// vo is up overwrites the picture with the ui that was there
+    /// before. The gate lives here rather than at the call site so the
+    /// one `draw` in the app stays one expression. See docs/video.md.
+    pub fn draw_unless_video<F>(&mut self, mpv_owns_screen: bool, render: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut ratatui::Frame),
+    {
+        if mpv_owns_screen {
+            return Ok(());
+        }
+        self.terminal.draw(render).map(|_| ())
+    }
+
+    /// Takes the screen back after mpv's video output has been turned
+    /// off again.
+    ///
+    /// Tearing a vo down emits `?25h` and `?1003l`, so the cursor is
+    /// visible again and wim's own mouse capture is off; both have to
+    /// be re-asserted. The alternate screen is insurance rather than a
+    /// correction: mpv enters it on vo init (`?1049h`) but only leaves
+    /// it when the *process* exits, so wim is measurably still on it
+    /// here, and re-entering costs a redundant escape against the vo
+    /// that stops balancing itself.
+    ///
+    /// The clear is the other half, and not cosmetic: ratatui diffs
+    /// against what it last drew, and mpv overwrote all of it, so
+    /// without dropping that notion of the screen only the cells wim's
+    /// own buffer thinks changed would be repainted.
+    pub fn reclaim(&mut self) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, Hide)?;
+        if self.mouse {
+            execute!(stdout, EnableMouseCapture)?;
+            // same two follow-ups as `new`, and for the same reasons.
+            write!(stdout, "\x1b[?1003l")?;
+            write!(stdout, "\x1b]22;default\x07")?;
+        }
+        stdout.flush()?;
+        self.terminal.clear()
     }
 }
 
