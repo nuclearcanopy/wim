@@ -88,6 +88,44 @@ fn row_of(rows: &[Row], selected: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// The rect the entry rows are drawn into, so a hit map knows which
+/// absolute row is row 0 of `row_items` (see `hit::List`). The header's
+/// height comes from `ui::header`, which is also where it is checked
+/// against what `draw_header` actually returns.
+pub fn body_rect(area: Rect) -> Rect {
+    crate::ui::header::body(area)
+}
+
+/// Entry index per visible body row, `None` where `render` drew a
+/// section label or ran out of queue; always exactly `body_rect`'s
+/// height long, so the caller can index it by row. Same `rows` and
+/// offset the render itself uses, so a click resolves to the row the
+/// user saw rather than to a second guess at where it landed.
+pub fn row_items(
+    entries: &[SearchItem],
+    pos: Option<usize>,
+    selected: usize,
+    area: Rect,
+) -> Vec<Option<usize>> {
+    // the empty queue draws two message rows and no entries, so there
+    // is nothing on it to click.
+    if area.width == 0 || entries.is_empty() {
+        return Vec::new();
+    }
+    let body_height = body_rect(area).height as usize;
+    if body_height == 0 {
+        return Vec::new();
+    }
+    let rows = rows(entries, pos);
+    let offset = scroll::offset_for(row_of(&rows, selected), body_height);
+    (0..body_height)
+        .map(|row| match rows.get(offset + row) {
+            Some(Row::Entry(index)) => Some(*index),
+            Some(Row::Section(_)) | None => None,
+        })
+        .collect()
+}
+
 /// Entry indices in display order, which is what j/k step through;
 /// the caller needs this to move the cursor past a section label in
 /// one keypress rather than landing on it.
@@ -124,7 +162,10 @@ impl Widget for QueueView<'_> {
             shade(DIM),
             shade(NEAR_BLACK),
         );
-        let body_height = (area.y + area.height).saturating_sub(body_top) as usize;
+        // one derivation of the body geometry, shared with `row_items`.
+        let body = body_rect(area);
+        debug_assert_eq!(body_top, body.y, "ui::header::ROWS is out of step");
+        let body_height = body.height as usize;
         if body_height == 0 {
             return;
         }
@@ -226,7 +267,7 @@ fn draw_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::testbuf::{buffer, grid};
+    use crate::ui::testbuf::{buffer, char_at, grid};
 
     fn song(title: &str) -> SearchItem {
         SearchItem::LocalMusic {
@@ -346,6 +387,142 @@ mod tests {
         let e: Vec<_> = (0..40).map(|i| song(&format!("t{i}"))).collect();
         let out = render(&e, Some(0), 35);
         assert!(out.contains("36. t35"), "selection must be visible:\n{out}");
+    }
+
+    /// What `row_items` claims for each body row, paired with the text
+    /// `render` actually painted on that same row.
+    fn painted(
+        entries: &[SearchItem],
+        pos: Option<usize>,
+        selected: usize,
+        w: u16,
+        h: u16,
+    ) -> Vec<(Option<usize>, String)> {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = buffer(w.max(1), h.max(1));
+        QueueView {
+            entries,
+            pos,
+            selected,
+            focused: true,
+            elapsed: Duration::ZERO,
+        }
+        .render(area, &mut buf);
+        let lines: Vec<String> = grid(&buf).lines().map(str::to_string).collect();
+        row_items(entries, pos, selected, area)
+            .into_iter()
+            .enumerate()
+            .map(|(i, item)| (item, lines[crate::ui::header::ROWS as usize + i].clone()))
+            .collect()
+    }
+
+    /// Every body row's answer is the entry whose text is on it; a
+    /// `None` row has to be a section label or untouched fill, never an
+    /// entry the map failed to name.
+    fn assert_agrees(entries: &[SearchItem], pos: Option<usize>, selected: usize, w: u16, h: u16) {
+        for (i, (item, text)) in painted(entries, pos, selected, w, h).iter().enumerate() {
+            match item {
+                Some(index) => {
+                    let want = format!("{}. {}", index + 1, label(&entries[*index]));
+                    assert!(
+                        text.contains(&want),
+                        "body row {i} claims entry {index} but painted {text:?}"
+                    );
+                }
+                None => {
+                    let blank = text.chars().all(|c| c == '.');
+                    let section = ["now playing", "up next", "played"]
+                        .iter()
+                        .any(|s| text.contains(s));
+                    assert!(
+                        blank || section,
+                        "body row {i} claims no entry but painted {text:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row_items_names_the_entry_render_painted_on_each_row() {
+        let e: Vec<_> = ["a", "b", "c", "d"].iter().map(|t| song(t)).collect();
+        assert_eq!(
+            row_items(&e, Some(1), 1, Rect::new(0, 0, 44, 12)),
+            vec![
+                None, // now playing
+                Some(1),
+                None, // up next
+                Some(2),
+                Some(3),
+                None, // played
+                Some(0),
+                // past the end of the list
+                None,
+                None,
+                None,
+            ],
+            "ten body rows under a two-row header"
+        );
+        assert_agrees(&e, Some(1), 1, 44, 12);
+    }
+
+    #[test]
+    fn row_items_follows_the_scroll_offset() {
+        let e: Vec<_> = (0..40).map(|i| song(&format!("t{i}"))).collect();
+        // a window this far down holds no label and no blank row, so
+        // every answer has to be an entry and an offset of 0 would name
+        // the wrong one.
+        let map = row_items(&e, Some(0), 35, Rect::new(0, 0, 60, 12));
+        assert_eq!(map, (26..=35).map(Some).collect::<Vec<_>>());
+        assert_agrees(&e, Some(0), 35, 60, 12);
+
+        // and with the selection on the very last entry.
+        let map = row_items(&e, Some(0), 39, Rect::new(0, 0, 60, 12));
+        assert_eq!(map, (30..=39).map(Some).collect::<Vec<_>>());
+        assert_agrees(&e, Some(0), 39, 60, 12);
+    }
+
+    #[test]
+    fn the_body_rect_is_where_render_starts_drawing_rows() {
+        let e: Vec<_> = ["aaa", "bbb"].iter().map(|t| song(t)).collect();
+        let area = Rect::new(3, 1, 40, 10);
+        let mut buf = buffer(50, 12);
+        QueueView {
+            entries: &e,
+            pos: Some(0),
+            selected: 0,
+            focused: true,
+            elapsed: Duration::ZERO,
+        }
+        .render(area, &mut buf);
+        let body = body_rect(area);
+        assert_eq!((body.x, body.y, body.width, body.height), (3, 3, 40, 8));
+        let row: String = (body.x..body.x + body.width)
+            .map(|x| char_at(&buf, x, body.y))
+            .collect();
+        assert!(
+            row.contains("now playing"),
+            "row 0 of the body rect is the first row render drew: {row}"
+        );
+    }
+
+    #[test]
+    fn row_items_at_degenerate_sizes_is_empty_or_exactly_the_body() {
+        let e: Vec<_> = ["a", "b"].iter().map(|t| song(t)).collect();
+        for (w, h) in [(1, 1), (0, 5), (5, 0), (3, 2), (80, 1), (80, 2), (80, 3)] {
+            let area = Rect::new(0, 0, w, h);
+            let map = row_items(&e, Some(0), 0, area);
+            let body = body_rect(area).height as usize;
+            assert!(
+                map.is_empty() || map.len() == body,
+                "{w}x{h}: {} answers for a {body}-row body",
+                map.len()
+            );
+            assert_agrees(&e, Some(0), 0, w, h);
+        }
+        // the empty queue draws messages, not entries, so no row on it
+        // is clickable.
+        assert!(row_items(&[], None, 0, Rect::new(0, 0, 44, 12)).is_empty());
     }
 
     #[test]
