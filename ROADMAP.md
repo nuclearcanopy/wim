@@ -535,20 +535,64 @@ staying `None` costs nothing in sampling.
       "have: " (the likeliest case for `load_queue`, since a user with
       no saved queues is exactly who mistypes one). long lists are cut
       at 40 and counted so a notification stays readable.
-- [ ] **fresh `Client` per call in `open_starred_view`,
-      `test_navidrome_connectivity` and every 45s sync pass**, each
-      re-reading `password_file` and starting with a cold pool. a
-      shared client per server fixes it but must not park the password
-      in a static, which would break the zeroize-on-drop guarantee.
+- [x] **fresh `Client` per call in `open_starred_view` and
+      `test_navidrome_connectivity`.** both reuse a live client now via
+      `client_for`, falling back to building one only when the corpus
+      holds none for that server (cold start, or a profile just added).
+      the zeroize worry in the original note turned out to be moot
+      rather than solved: the reused clients are the **corpus's own**,
+      which already live for the session and already hold the password,
+      so nothing extends its lifetime and it is still zeroized when the
+      corpus drops. a `static` would have been the problem, since it
+      would never drop and so never zeroize; this is not one.
+      **`Client::matches` includes the stream options, not just
+      username and url.** a client carries `max_bitrate_kbps` and
+      `transcode_format` into every stream url it builds, and
+      `open_starred_view`'s items get *played*, so matching on identity
+      alone would have let a client built before a bitrate change go on
+      streaming at the old setting. that is a bug this fix would have
+      introduced; a test pins it.
+      pinging the live client is also the better connectivity test:
+      same pool, same resolved credentials, rather than a throwaway's.
+- [ ] **the 45s sync pass still builds its own `Client`.** left out of
+      the `client_for` change deliberately: `fetch_navidrome_catalog`
+      runs on a background thread and returns the client it used inside
+      `FetchedCatalog`, so handing it a live one means snapshotting the
+      corpus's clients at spawn time and deciding what happens when a
+      profile is edited mid-pass. worth doing, but it is a lifetime
+      question rather than the one-line lookup the other two were.
+- [ ] **`Corpus::remote_clients` is an O(corpus) scan.** it walks every
+      item and dedupes by url, so it is a full 40k-item pass to answer
+      "which servers are live". fine where it is called now (a keypress:
+      starred view, the profile manager, `load_queue`), but it must not
+      drift onto a per-frame path, and a cached per-server list keyed on
+      the corpus's own generation would retire the worry.
 - [ ] **the first open of an album or artist still blocks the main
       thread.** `open_browse_view`/`open_artist_view` are synchronous;
       the response cache makes repeats free and the pool makes a cold
       open 5x faster, but truly non-blocking needs the currently unused
       `stream_artist_tracks` wired into the ui.
-- [ ] **the browse view's own cover fetch bypasses the new disk
-      store** (it is keyed by album id, the store by artist/album
-      name), so reopening an album still re-fetches. unifying the two
-      keyspaces is the same blocker as the name-based-identity item.
+- [x] **the browse view's own cover fetch bypasses the new disk
+      store.** it goes through it now. the two keyspaces are one:
+      `Key::album(artist, album)` is the single definition and `Key::of`
+      delegates to it, so an album opened in browse and the same
+      album's tracks played from the player derive the same key and so
+      the same file on disk. reopening an album is now free, and a
+      cover either side fetched is the other's hit. `fetch_stored` is
+      the public store-first/store-after fetch for callers outside
+      `Cache`, reusing the private `fetch` rather than growing a second
+      copy of the sequence.
+      it did not need the identity work after all: the browse site
+      already destructures `SearchItem::Album { id, name, artist, .. }`,
+      so the names were in hand. **what identity would still buy** is
+      pinned as a test rather than left as a surprise
+      (`a_compilation_track_does_not_share_the_albums_key`): a
+      compilation's tracks each carry their own artist, so they key
+      separately from the album and that cover is still fetched more
+      than once. an album-artist or album id on `SearchItem` is what
+      closes that, and nothing else here depends on it.
+      untagged albums fall back to the id's own slot, so they keep
+      working, just without sharing.
 - [ ] **catalog parse beyond ~100k rows** would start outgrowing mpv's
       spawn and resurface on the first frame; parallelize the row parse
       if that ever shows up.
