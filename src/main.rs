@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 
@@ -347,36 +347,85 @@ fn open_starred_view(
     view
 }
 
-/// Whether the config names a graphics protocol outright, which is an
-/// explicit ask for real raster art; `auto` isn't one of those (it
-/// documents ascii as its starting point, with 'i' to switch).
-fn wants_real_art(mode: config::AlbumArtMode) -> bool {
+/// Whether the config asks for a real graphics protocol outright, so
+/// the host owes an explanation when the terminal has none; `auto`
+/// isn't one of those, it is "whatever is available".
+///
+/// `fetch_cover_art` used to live here; it moved to `browse.rs` with
+/// the async loader, which is the only thing that fetches art now.
+fn wants_full_art(mode: config::AlbumArtMode) -> bool {
     matches!(
         mode,
-        config::AlbumArtMode::Sixel | config::AlbumArtMode::Kitty | config::AlbumArtMode::Iterm2
+        config::AlbumArtMode::FullBw | config::AlbumArtMode::FullColor
     )
+}
+
+/// Whether the terminal has an actual inline graphics protocol.
+///
+/// `Picker::from_query_stdio` hands back a `Picker` even when the
+/// terminal answered nothing at all, carrying
+/// `ProtocolType::Halfblocks`: ratatui-image's own unicode fallback,
+/// coloured half-block glyphs and not real art. So `picker.is_some()`
+/// is true on every terminal and was never a capability test; the
+/// protocol it holds is. This is what made alacritty render "the old
+/// ascii but with colour" while claiming to be in real-art mode.
+fn has_real_protocol(protocol: Option<ProtocolType>) -> bool {
+    matches!(
+        protocol,
+        Some(ProtocolType::Sixel | ProtocolType::Kitty | ProtocolType::Iterm2)
+    )
+}
+
+/// `has_real_protocol` over whatever the probe handed back.
+fn real_graphics(picker: Option<Picker>) -> bool {
+    has_real_protocol(picker.map(|p| p.protocol_type()))
 }
 
 /// Which art mode to start in, once the graphics probe has answered.
 ///
-/// `auto` means *detect*: real art when the terminal actually answered
-/// the probe with a protocol, ascii when it did not. It used to mean
-/// "start in ascii and press `i`", which is not what anyone reads
-/// "auto" as; the practical effect was that the default config never
-/// showed real art on a terminal that fully supported it.
-///
-/// `blocks` is the explicit ask for the monochrome half-block
-/// rasterizer, so it stays ascii whatever the terminal can do. A named
-/// protocol still waits for the probe: real mode with no `Picker`
-/// renders nothing at all, so claiming it early would mean an empty
-/// pane rather than the ascii fallback. `i` cycles regardless.
+/// `auto` means *detect*: the best available, i.e. `full-color` on a
+/// terminal with a real protocol and `ascii-color` on one without.
+/// The `ascii-*` modes never depend on the terminal. A `full-*` mode
+/// waits for the probe and then degrades to its own ascii half if no
+/// protocol turned up, since a full mode with nothing to draw it is a
+/// blank pane rather than a fallback.
 fn art_mode_for_picker(mode: config::AlbumArtMode, protocol_detected: bool) -> browse::ArtMode {
-    match mode {
+    let asked = match mode {
         config::AlbumArtMode::Off => browse::ArtMode::Off,
-        config::AlbumArtMode::Blocks => browse::ArtMode::Ascii,
-        config::AlbumArtMode::Auto if protocol_detected => browse::ArtMode::Real,
-        _ if wants_real_art(mode) && protocol_detected => browse::ArtMode::Real,
-        _ => browse::ArtMode::Ascii,
+        config::AlbumArtMode::AsciiBw => browse::ArtMode::AsciiBw,
+        config::AlbumArtMode::AsciiColor => browse::ArtMode::AsciiColor,
+        config::AlbumArtMode::FullBw => browse::ArtMode::FullBw,
+        config::AlbumArtMode::FullColor | config::AlbumArtMode::Auto => browse::ArtMode::FullColor,
+    };
+    if protocol_detected {
+        asked
+    } else {
+        asked.without_graphics()
+    }
+}
+
+/// Said once per session, not once per keypress: the full modes are
+/// not reachable here at all, so cycling past them needs a reason.
+fn warn_no_graphics(notifications: &mut Notifications, warned: &mut bool) {
+    if *warned {
+        return;
+    }
+    *warned = true;
+    notifications.push(
+        Severity::Alert,
+        "album art: this terminal reports no graphics protocol (sixel/kitty/iterm2), so the full-* modes are unavailable here",
+    );
+}
+
+/// The image handed to a graphics protocol: greyscaled for `full-bw`,
+/// the source untouched otherwise. Converted here rather than at paint
+/// time so the protocol's own resize/encode cache holds the already
+/// greyscaled picture.
+fn protocol_image(img: &image::DynamicImage, mode: browse::ArtMode) -> image::DynamicImage {
+    if mode.is_bw() {
+        image::DynamicImage::ImageRgb8(img.grayscale().into_rgb8())
+    } else {
+        img.clone()
     }
 }
 
@@ -966,8 +1015,11 @@ struct ActionCtx<'a> {
     /// the generation that keeps a late reply out of a view the user
     /// has since closed or replaced; see docs/async-open.md.
     browse_loader: &'a mut browse::Loader,
+    /// Cleared when a view opens, so the previous album's cover cannot
+    /// sit under the new title for a frame. Building it is the render
+    /// loop's keyed rebuild, which is also the only thing that can see
+    /// `i` changing the art mode with no view change at all.
     real_art_protocol: &'a mut Option<StatefulProtocol>,
-    picker: &'a mut Option<Picker>,
     focus: &'a mut Focus,
     flash: &'a mut Option<(Field, Instant)>,
     cache: &'a Arc<Mutex<CacheIndex>>,
@@ -1490,13 +1542,10 @@ fn open_shellsong_view(target: ViewTarget, ctx: &mut ShellsongCtx) -> (Dispatch,
             let live = ctx.actx.app.corpus.remote_clients();
             let bv = open_starred_view(&ctx.actx.cfg.navidrome_servers, ctx.favorites, &live);
             let count = bv.tracks.len();
-            *ctx.actx.real_art_protocol = ctx
-                .actx
-                .picker
-                .as_mut()
-                .and_then(|p| bv.art.clone().map(|img| p.new_resize_protocol(img)));
-            // this view isn't the loader's, so an album still loading
-            // behind it has to be disowned before it lands in here.
+            // the protocol is built by the render loop's keyed
+            // rebuild, not here. this view isn't the loader's, so an
+            // album still loading behind it has to be disowned before
+            // it lands in here.
             ctx.actx.browse_loader.invalidate();
             *ctx.actx.browse_view = Some(bv);
             // same as opening an album: the listing draws its own
@@ -3374,11 +3423,11 @@ fn main() -> anyhow::Result<()> {
     // the track listing stays visible rather than getting replaced.
     // 'm' toggles it by hand either way.
     let mut player_minimized = false;
-    // 'i' cycles ascii -> real -> off from here; this is just the
-    // config-driven starting point, with the graphics probe still out
-    // (so never Real yet, see `art_mode_for_picker`). kept around so
-    // the probe landing can only upgrade a mode the user hasn't since
-    // cycled by hand.
+    // 'i' cycles ascii-bw -> ascii-color -> full-bw -> full-color ->
+    // off from here; this is just the config-driven starting point,
+    // with the graphics probe still out (so never a full mode yet, see
+    // `art_mode_for_picker`). kept around so the probe landing can only
+    // upgrade a mode the user hasn't since cycled by hand.
     let art_mode_pending = art_mode_for_picker(cfg.album_art, false);
     let mut art_mode = art_mode_pending;
     // one alert, not one per keypress, when `i` reaches a real mode
@@ -3739,10 +3788,12 @@ fn main() -> anyhow::Result<()> {
     let mut picker: Option<Picker> = None;
     let mut picker_probed = false;
     trace::mark("terminal ready");
-    // rebuilt (not re-encoded every frame) whenever a newly-opened
-    // album's art changes; `ratatui-image` owns the actual resize/
-    // encode caching per protocol instance.
+    // rebuilt (not re-encoded every frame) whenever the open view's
+    // art or the art mode changes; `ratatui-image` owns the actual
+    // resize/encode caching per protocol instance. `browse_art_key`
+    // names what the protocol currently holds, cover and tone both.
     let mut real_art_protocol: Option<StatefulProtocol> = None;
+    let mut browse_art_key: Option<String> = None;
     // the display's refresh rate decides how often an animation is
     // sampled (never how fast it runs, see `anim`); one subprocess on
     // a thread, applied whenever it answers, so the first frame never
@@ -3794,22 +3845,48 @@ fn main() -> anyhow::Result<()> {
                 .and_then(|bv| bv.art.as_ref())
                 .or_else(|| cover_art.get(item))
         });
-        // rebuild the player's protocol only when the cover changes;
-        // every frame would throw away the resize state a protocol
-        // exists to hold.
+        // rebuild either image protocol only when its cover or the art
+        // mode changes; every frame would throw away the resize state a
+        // protocol exists to hold. the mode is in the key because
+        // `full-bw` encodes a greyscaled copy of the picture, so
+        // switching tone is as much a new image as a new album is.
+        let protocol_key = |key: &str| format!("{key}\u{1}{}", art_mode.label());
         match (&now_playing, playing_art) {
-            (Some(item), Some(img)) => {
-                let key = coverart::art_key(item);
+            (Some(item), Some(img)) if art_mode.is_full() => {
+                let key = protocol_key(&coverart::art_key(item));
                 let stale = player_art_protocol
                     .as_ref()
                     .is_none_or(|(have, _)| *have != key);
                 if stale {
                     player_art_protocol = picker
                         .as_mut()
-                        .map(|p| (key, p.new_resize_protocol(img.clone())));
+                        .map(|p| (key, p.new_resize_protocol(protocol_image(img, art_mode))));
                 }
             }
             _ => player_art_protocol = None,
+        }
+        // the browse view's own protocol, same rule. keyed here rather
+        // than rebuilt wherever a view opens: the mode can change with
+        // no view change at all ('i'), and four open sites could not
+        // agree on that on their own.
+        match &browse_view {
+            Some(bv) if art_mode.is_full() => {
+                // `None` while the view has no art, so a cover that
+                // only arrives later is still picked up rather than
+                // latched behind a key that never changed.
+                let want = bv.art.as_ref().map(|_| protocol_key(&bv.art_key()));
+                if browse_art_key != want {
+                    real_art_protocol = picker
+                        .as_mut()
+                        .zip(bv.art.as_ref())
+                        .map(|(p, img)| p.new_resize_protocol(protocol_image(img, art_mode)));
+                    browse_art_key = want;
+                }
+            }
+            _ => {
+                real_art_protocol = None;
+                browse_art_key = None;
+            }
         }
         if let Ok(detected) = frame_rx.try_recv() {
             frame = detected;
@@ -4198,6 +4275,9 @@ fn main() -> anyhow::Result<()> {
                     AsciiArt {
                         image: video_frame.as_deref(),
                         cell_aspect: aspect,
+                        // the video pane stays monochrome with the rest
+                        // of the ui; album art is the one exception.
+                        tone: ui::raster::Tone::Mono,
                     },
                     main_content,
                 );
@@ -4247,7 +4327,7 @@ fn main() -> anyhow::Result<()> {
                     hits.tracks.push((hit::Transport::Player, rect));
                 }
                 f.render_widget(player_view, main_content);
-                if art_mode == browse::ArtMode::Real {
+                if art_mode.is_full() {
                     // same contract as the browse view: the widget drew
                     // no ascii art, the real image goes on the exact
                     // rect its own layout picked.
@@ -4331,7 +4411,7 @@ fn main() -> anyhow::Result<()> {
                     },
                     main_content,
                 );
-                if art_mode == browse::ArtMode::Real {
+                if art_mode.is_full() {
                     if let Some(protocol) = &mut real_art_protocol {
                         let (art_rect, _) = browse::layout(
                             main_content,
@@ -4423,11 +4503,7 @@ fn main() -> anyhow::Result<()> {
             // included) same as the video pane's fullscreen mode,
             // never the bottom bar; painted last for the same reason.
             if settings_menu_open {
-                let art_mode_label = match art_mode {
-                    browse::ArtMode::Ascii => "ascii",
-                    browse::ArtMode::Real => "real",
-                    browse::ArtMode::Off => "off",
-                };
+                let art_mode_label = art_mode.label();
                 let token_value = if settings_token_editing {
                     format!(
                         "{} (enter to save, esc to cancel)",
@@ -4816,23 +4892,28 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // the terminal's answer to the graphics probe, or `None` if it
-        // never gave one. a config that named a protocol only gets
-        // real art from here on; until (or unless) this lands it stays
-        // ascii, and a terminal that stayed silent is said so out loud
-        // rather than leaving an art pane that never fills.
+        // the terminal's answer to the graphics probe. a `full-*` mode
+        // only starts drawing from here on; until (or unless) this
+        // lands it stays ascii, and a terminal with no real protocol is
+        // said so out loud rather than leaving an art pane that never
+        // fills. the test is the *protocol*, never `picker.is_some()`:
+        // see `has_real_protocol`.
         if !picker_probed {
             match picker_rx.try_recv() {
                 Ok(probed) => {
                     picker_probed = true;
                     picker = probed;
+                    let real = real_graphics(picker);
                     if art_mode == art_mode_pending {
-                        art_mode = art_mode_for_picker(cfg.album_art, picker.is_some());
+                        art_mode = art_mode_for_picker(cfg.album_art, real);
                     }
-                    if picker.is_none() && wants_real_art(cfg.album_art) {
+                    if !real && wants_full_art(cfg.album_art) {
                         notifications.push(
                             Severity::Alert,
-                            "album art: terminal reported no graphics protocol, using ascii",
+                            format!(
+                                "album art: terminal reported no graphics protocol, using {}",
+                                art_mode_for_picker(cfg.album_art, false).label()
+                            ),
                         );
                     }
                 }
@@ -5140,7 +5221,6 @@ fn main() -> anyhow::Result<()> {
                         browse_view: &mut browse_view,
                         browse_loader: &mut browse_loader,
                         real_art_protocol: &mut real_art_protocol,
-                        picker: &mut picker,
                         focus: &mut focus,
                         flash: &mut flash,
                         cache: &cache_index,
@@ -5806,7 +5886,6 @@ fn main() -> anyhow::Result<()> {
                             browse_view: &mut browse_view,
                             browse_loader: &mut browse_loader,
                             real_art_protocol: &mut real_art_protocol,
-                            picker: &mut picker,
                             focus: &mut focus,
                             flash: &mut flash,
                             cache: &cache_index,
@@ -5951,14 +6030,19 @@ fn main() -> anyhow::Result<()> {
                                 (settings_menu_selected + ui::settings_menu::FIELD_COUNT - 1)
                                     % ui::settings_menu::FIELD_COUNT;
                         }
-                        // art mode is a 3-state cycle (ascii -> real
-                        // -> off); both directions step the same way
-                        // 'i' already does, rather than adding a
-                        // second reverse-cycle method just for this.
+                        // art mode is a cycle (ascii-bw -> ascii-color
+                        // -> full-bw -> full-color -> off); both
+                        // directions step the same way 'i' already
+                        // does, rather than adding a second
+                        // reverse-cycle method just for this.
                         KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right
                             if settings_menu_selected == 0 =>
                         {
-                            art_mode = art_mode.toggle();
+                            let (next, skipped) = art_mode.cycle(real_graphics(picker));
+                            art_mode = next;
+                            if skipped {
+                                warn_no_graphics(&mut notifications, &mut warned_no_graphics);
+                            }
                         }
                         KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 1 => {
                             crossfade_enabled = false;
@@ -6425,25 +6509,16 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if key.code == keymap.get(KeyAction::CycleArtMode) {
-                    let next = art_mode.toggle();
-                    // real art is drawn by overlaying an image on the
-                    // rect the widget left empty, so with no graphics
-                    // protocol it is not "ascii anyway", it is a blank
-                    // pane. skip the mode this terminal cannot do, and
-                    // say why the first time rather than letting `i`
-                    // look broken.
-                    art_mode = if next == browse::ArtMode::Real && picker.is_none() {
-                        if !warned_no_graphics {
-                            warned_no_graphics = true;
-                            notifications.push(
-                                Severity::Alert,
-                                "album art: this terminal reports no graphics protocol (sixel/kitty/iterm2), so real art is unavailable here",
-                            );
-                        }
-                        next.toggle()
-                    } else {
-                        next
-                    };
+                    // a full mode is drawn by overlaying an image on
+                    // the rect the widget left empty, so with no
+                    // graphics protocol it is not "ascii anyway", it is
+                    // a blank pane; `cycle` steps past those and says
+                    // so once rather than letting `i` look broken.
+                    let (next, skipped) = art_mode.cycle(real_graphics(picker));
+                    art_mode = next;
+                    if skipped {
+                        warn_no_graphics(&mut notifications, &mut warned_no_graphics);
+                    }
                     continue;
                 }
 
@@ -6705,7 +6780,6 @@ fn main() -> anyhow::Result<()> {
                             browse_view: &mut browse_view,
                             browse_loader: &mut browse_loader,
                             real_art_protocol: &mut real_art_protocol,
-                            picker: &mut picker,
                             focus: &mut focus,
                             flash: &mut flash,
                             cache: &cache_index,
@@ -6851,11 +6925,10 @@ fn main() -> anyhow::Result<()> {
                         &favorites,
                         &app.corpus.remote_clients(),
                     );
-                    real_art_protocol = picker
-                        .as_mut()
-                        .and_then(|p| bv.art.clone().map(|img| p.new_resize_protocol(img)));
-                    // not the loader's view, so an album still fetching
-                    // behind it is disowned rather than landing here.
+                    // the render loop's keyed rebuild builds the
+                    // protocol. not the loader's view, so an album
+                    // still fetching behind it is disowned rather than
+                    // landing here.
                     browse_loader.invalidate();
                     browse_view = Some(bv);
                     // same as opening an album: the starred list draws
@@ -7046,7 +7119,6 @@ fn main() -> anyhow::Result<()> {
                         browse_view: &mut browse_view,
                         browse_loader: &mut browse_loader,
                         real_art_protocol: &mut real_art_protocol,
-                        picker: &mut picker,
                         focus: &mut focus,
                         flash: &mut flash,
                         cache: &cache_index,
@@ -7482,48 +7554,92 @@ mod startup_tests {
         );
     }
 
+    /// The bug this whole mode system exists to fix.
+    ///
+    /// `Picker::from_query_stdio` falls back to
+    /// `ProtocolType::Halfblocks` when the terminal answers nothing, so
+    /// it hands back `Some(Picker)` on alacritty too. Treating that as
+    /// "real art available" is what made `full-color` render coloured
+    /// half-blocks at half the horizontal resolution of wim's own
+    /// rasterizer and call it real art. Halfblocks is not a protocol.
     #[test]
-    fn a_named_protocol_only_claims_real_art_once_the_probe_answers() {
-        assert_eq!(
-            art_mode_for_picker(config::AlbumArtMode::Kitty, true),
-            browse::ArtMode::Real
+    fn halfblocks_is_not_a_real_graphics_protocol() {
+        assert!(
+            !has_real_protocol(Some(ProtocolType::Halfblocks)),
+            "halfblocks is ratatui-image's unicode fallback, not real art"
         );
-        assert_eq!(
-            art_mode_for_picker(config::AlbumArtMode::Kitty, false),
-            browse::ArtMode::Ascii,
-            "real mode without a picker renders nothing at all"
-        );
-        assert_eq!(
-            art_mode_for_picker(config::AlbumArtMode::Sixel, false),
-            browse::ArtMode::Ascii
+        assert!(!has_real_protocol(None));
+        for p in [
+            ProtocolType::Sixel,
+            ProtocolType::Kitty,
+            ProtocolType::Iterm2,
+        ] {
+            assert!(has_real_protocol(Some(p)), "{p:?} is a real protocol");
+        }
+        // and the probe's own fallback picker, built the way
+        // `from_query_stdio` builds it when nothing answers, must not
+        // read as capable just because it exists.
+        let mut silent = Picker::from_fontsize((10, 20));
+        silent.set_protocol_type(ProtocolType::Halfblocks);
+        assert!(
+            !real_graphics(Some(silent)),
+            "a picker is not a capability; the protocol in it is"
         );
     }
 
-    /// `auto` is a detect, not a synonym for ascii. It used to return
-    /// ascii either way, which meant the default config never showed
-    /// real art even on a terminal that fully supported it.
+    /// A `full-*` mode on a terminal with no protocol degrades to the
+    /// matching ascii mode rather than to a blank pane, and keeps the
+    /// tone that was asked for.
+    #[test]
+    fn a_full_mode_waits_for_the_probe_and_then_degrades_in_kind() {
+        assert_eq!(
+            art_mode_for_picker(config::AlbumArtMode::FullColor, true),
+            browse::ArtMode::FullColor
+        );
+        assert_eq!(
+            art_mode_for_picker(config::AlbumArtMode::FullColor, false),
+            browse::ArtMode::AsciiColor,
+            "a full mode with no protocol renders nothing at all"
+        );
+        assert_eq!(
+            art_mode_for_picker(config::AlbumArtMode::FullBw, true),
+            browse::ArtMode::FullBw
+        );
+        assert_eq!(
+            art_mode_for_picker(config::AlbumArtMode::FullBw, false),
+            browse::ArtMode::AsciiBw,
+            "asking for greyscale must not fall back into colour"
+        );
+    }
+
+    /// `auto` is a detect: the best available, which is full colour on
+    /// a terminal with a protocol and ascii colour on one without.
     #[test]
     fn auto_follows_the_probe() {
         assert_eq!(
             art_mode_for_picker(config::AlbumArtMode::Auto, true),
-            browse::ArtMode::Real,
-            "a terminal that answered the probe should get real art on auto"
+            browse::ArtMode::FullColor,
+            "a terminal with a real protocol should get real art on auto"
         );
         assert_eq!(
             art_mode_for_picker(config::AlbumArtMode::Auto, false),
-            browse::ArtMode::Ascii,
-            "no protocol means ascii, since real mode would draw nothing"
+            browse::ArtMode::AsciiColor,
+            "no protocol means the rasterizer, which still does colour"
         );
     }
 
-    /// `blocks` is the explicit ask for the monochrome rasterizer, so
-    /// it is the one mode a capable terminal must not override.
+    /// The `ascii-*` modes are an explicit ask for wim's own
+    /// rasterizer, so a capable terminal must not override them.
     #[test]
-    fn blocks_stays_ascii_even_when_the_terminal_can_do_better() {
+    fn the_ascii_modes_stay_ascii_even_when_the_terminal_can_do_better() {
         for detected in [true, false] {
             assert_eq!(
-                art_mode_for_picker(config::AlbumArtMode::Blocks, detected),
-                browse::ArtMode::Ascii
+                art_mode_for_picker(config::AlbumArtMode::AsciiBw, detected),
+                browse::ArtMode::AsciiBw
+            );
+            assert_eq!(
+                art_mode_for_picker(config::AlbumArtMode::AsciiColor, detected),
+                browse::ArtMode::AsciiColor
             );
         }
     }
@@ -7538,14 +7654,35 @@ mod startup_tests {
         }
     }
 
+    /// Only a `full-*` config is owed the "no graphics protocol here"
+    /// alert; `auto` asked for whatever was available and got it.
     #[test]
-    fn only_a_named_protocol_counts_as_asking_for_real_art() {
-        assert!(wants_real_art(config::AlbumArtMode::Kitty));
-        assert!(wants_real_art(config::AlbumArtMode::Sixel));
-        assert!(wants_real_art(config::AlbumArtMode::Iterm2));
-        assert!(!wants_real_art(config::AlbumArtMode::Auto));
-        assert!(!wants_real_art(config::AlbumArtMode::Blocks));
-        assert!(!wants_real_art(config::AlbumArtMode::Off));
+    fn only_a_full_mode_counts_as_asking_for_a_graphics_protocol() {
+        assert!(wants_full_art(config::AlbumArtMode::FullBw));
+        assert!(wants_full_art(config::AlbumArtMode::FullColor));
+        assert!(!wants_full_art(config::AlbumArtMode::Auto));
+        assert!(!wants_full_art(config::AlbumArtMode::AsciiBw));
+        assert!(!wants_full_art(config::AlbumArtMode::AsciiColor));
+        assert!(!wants_full_art(config::AlbumArtMode::Off));
+    }
+
+    /// `full-bw` is greyscale because the image is converted before the
+    /// protocol ever encodes it; `full-color` hands the source over
+    /// untouched.
+    #[test]
+    fn full_bw_greyscales_the_image_before_the_protocol_sees_it() {
+        let hued = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(4, 4, |x, y| {
+            image::Rgb([(x * 60) as u8, (y * 50) as u8, 220])
+        }));
+        let grey = protocol_image(&hued, browse::ArtMode::FullBw).to_rgb8();
+        for p in grey.pixels() {
+            assert!(
+                p[0] == p[1] && p[1] == p[2],
+                "full-bw handed the protocol a hue: {p:?}"
+            );
+        }
+        let kept = protocol_image(&hued, browse::ArtMode::FullColor).to_rgb8();
+        assert_eq!(kept, hued.to_rgb8(), "full-color must not touch the source");
     }
 
     #[test]

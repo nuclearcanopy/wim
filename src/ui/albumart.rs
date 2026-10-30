@@ -2,10 +2,11 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
-use crate::ui::raster::{self, Fit};
+use crate::ui::raster::{self, Fit, Style, Tone};
 
-/// Grayscale half-block rasterization of an album's cover art, the
-/// "pure-TUI purity" default mode. The rasterization itself lives in
+/// Block-glyph rasterization of an album's cover art, the "pure-TUI
+/// purity" modes: `tone` picks grey (`ascii-bw`) or the source's own
+/// rgb (`ascii-color`). The rasterization itself lives in
 /// `ui::raster`, which knows nothing about covers; this is just the
 /// widget wrapper that hands it a rect.
 ///
@@ -21,6 +22,9 @@ pub struct AsciiArt<'a> {
     /// decides where a non-square image lands, so the art keeps its
     /// proportions instead of being stretched to whatever the rect is.
     pub cell_aspect: f32,
+    /// `Tone::Mono` everywhere but the album-art `ascii-color` mode;
+    /// the video pane stays monochrome with the rest of the ui.
+    pub tone: Tone,
 }
 
 impl Widget for AsciiArt<'_> {
@@ -30,7 +34,11 @@ impl Widget for AsciiArt<'_> {
         };
         // one kept rasterizer per render thread, so a steady frame
         // rate allocates nothing.
-        raster::with_scratch(|r| r.render(img, area, self.cell_aspect, Fit::Contain, buf));
+        let style = Style {
+            fit: Fit::Contain,
+            tone: self.tone,
+        };
+        raster::with_scratch(|r| r.render(img, area, self.cell_aspect, style, buf));
     }
 }
 
@@ -47,6 +55,7 @@ pub struct CachedArt<'a> {
     pub image: Option<&'a image::DynamicImage>,
     pub cell_aspect: f32,
     pub key: &'a str,
+    pub tone: Tone,
 }
 
 impl Widget for CachedArt<'_> {
@@ -54,8 +63,14 @@ impl Widget for CachedArt<'_> {
         let Some(img) = self.image else {
             return;
         };
+        // the memo keys on the style too, so flipping bw/colour
+        // resamples rather than repainting the other tone's grid.
+        let style = Style {
+            fit: Fit::Contain,
+            tone: self.tone,
+        };
         raster::with_memo(|m| {
-            m.render(self.key, img, area, self.cell_aspect, Fit::Contain, buf);
+            m.render(self.key, img, area, self.cell_aspect, style, buf);
         });
     }
 }
@@ -76,6 +91,7 @@ mod tests {
         AsciiArt {
             image: None,
             cell_aspect: 2.0,
+            tone: Tone::Mono,
         }
         .render(Rect::new(0, 0, 6, 3), &mut buf);
         assert_eq!(char_at(&buf, 0, 0), '.');
@@ -88,6 +104,7 @@ mod tests {
         AsciiArt {
             image: Some(&cover(300, 300, 160)),
             cell_aspect: 2.0,
+            tone: Tone::Mono,
         }
         .render(rect, &mut buf);
         // a flat cover gives every cell four equal samples, so each

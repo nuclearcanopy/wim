@@ -126,11 +126,15 @@ writing every frame to a directory. the pump's public surface
 ## strictly monochrome ui
 
 every color anywhere in the ui is `Color::Rgb(v, v, v)` via
-`src/theme.rs`'s `shade()`/`lerp_shade()` helpers. no hues, ever,
-including album art in `blocks` mode (see below). this is an explicit,
-non-negotiable aesthetic choice, not a limitation of the tooling; state
-(errors, selection, emphasis) is conveyed via brightness, weight, and
-modifiers instead of color.
+`src/theme.rs`'s `shade()`/`lerp_shade()` helpers. no hues, ever. this is
+an explicit, non-negotiable aesthetic choice, not a limitation of the
+tooling; state (errors, selection, emphasis) is conveyed via brightness,
+weight, and modifiers instead of color.
+
+album art is the one sanctioned exception, authorised by the maintainer
+directly: the `ascii-color` and `full-color` modes show the cover in its
+own color (see below). it is image data, not ui chrome. nothing else on
+screen may carry a hue, and `ascii-bw`/`full-bw` stay grey.
 
 ## no stock ratatui widgets
 
@@ -145,20 +149,41 @@ animated brightness sweep, built on ratatui's buffer/terminal/input
 plumbing (resize handling, double-buffering/diffing, crossterm input)
 without touching its widget library.
 
-## album art: real images vs. pixelated blocks
+## album art: four modes
 
-`ratatui-image` supports multiple rendering backends (sixel, kitty
-graphics protocol, iterm2 protocol, and a `Halfblocks` unicode fallback)
-with terminal auto-detection. the `album_art` config option
-(`auto | blocks | sixel | kitty | iterm2 | off`) exposes this directly:
+two independent choices: who draws the picture, and whether it has color.
+`config.album_art` (and `i`, which cycles) names the result rather than
+the protocol:
 
-- `auto`/`sixel`/`kitty`/`iterm2`: real raster album art, true color;
-  this is actual image data, not ui chrome, so the monochrome rule
-  doesn't apply to it.
-- `blocks`: forces the halfblock protocol even on terminals that support
-  real graphics, *and* desaturates the art to grayscale first, so users
-  who want the "pure tui" look get it consistently rather than a
-  colorful image poking a hole in an otherwise monochrome interface.
+- `ascii-bw`, `ascii-color`: wim's own rasterizer, `src/ui/raster.rs`.
+  the sixteen 2x2 block glyphs, two samples per cell on each axis, so it
+  carries twice the horizontal detail a half-block renderer does. needs
+  nothing from the terminal. `ascii-bw` goes through `theme::shade`;
+  `ascii-color` emits each cell's two groups as the cover's own rgb
+  (`raster::Tone`), grouped by the same glyph mask so the colors and the
+  glyph describe one split.
+- `full-bw`, `full-color`: a real inline graphics protocol
+  (sixel/kitty/iterm2) through `ratatui-image`, overlaid by main.rs on
+  the rect the widget left empty. `full-bw` greyscales the image before
+  the protocol encodes it, so the protocol's resize/encode cache holds
+  the already-greyscaled picture; the mode is therefore part of the
+  protocol cache key alongside the cover.
+- `auto`: the best available, i.e. `full-color` where a real protocol
+  exists and `ascii-color` where none does.
+- `off`: no panel at all, the track list gets the full width.
+
+the capability test is the *protocol*, never whether a `Picker` exists.
+`Picker::from_query_stdio` falls back to `ProtocolType::Halfblocks` when
+the terminal answers nothing at all, so `picker.is_some()` is true
+everywhere; believing it meant alacritty rendered ratatui-image's
+coloured half-blocks and called it real art, at half the rasterizer's
+horizontal resolution. `main::has_real_protocol` accepts only
+sixel/kitty/iterm2, a `full-*` mode on a terminal without one falls back
+to the matching ascii mode and says so once, and `i` steps straight past
+the full modes there rather than cycling into a blank pane.
+
+pre-rename config values still parse as aliases: `blocks` is `ascii-bw`,
+and `sixel`/`kitty`/`iterm2` are `full-color`.
 
 ## startup: nothing blocks the first frame
 

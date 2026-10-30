@@ -31,8 +31,14 @@ at it; don't mark it done on build+test passing alone.
 - every commit must leave `nix develop --command cargo build` passing
   (and `cargo clippy` clean where reasonable) before you commit
 - strictly monochrome ui: every color is `Color::Rgb(v,v,v)` via
-  `src/theme.rs` helpers, never a hue, anywhere, including album art in
-  `blocks` mode (real sixel/kitty/iterm2 art can stay true color)
+  `src/theme.rs` helpers, never a hue, anywhere. **album art is the one
+  exception, authorised by the maintainer directly** ("i want FOUR ART
+  OPTIONS: ASCII BW, ASCII COLOR, FULL BW, FULL COLOR"): `ascii-color`
+  rasterizes the cover in its own rgb via `raster::Tone::Color`, and
+  `full-color` is the graphics protocol's own true color. do not "fix"
+  that back out. everything that is not album art stays monochrome, and
+  `ascii-bw`/`full-bw` stay grey; tests in `src/ui/raster.rs`,
+  `src/ui/player.rs` and `src/browse.rs` pin both halves of that
 - no stock ratatui `Block`/`Paragraph`/`List` widgets; custom-painted
   widgets only (see `src/ui/banner.rs` for the pattern)
 - can't test raw-mode TUI rendering headlessly (no real tty in CI/loop
@@ -135,15 +141,23 @@ at it; don't mark it done on build+test passing alone.
       strip above the main bottom bar, spanning only `main_content`'s
       width so it never slides under the sidebar. transport uses real
       unicode media-control glyphs (⏮ ⏯ ⏭), not ascii stand-ins.
-- [x] album art (`src/ui/albumart.rs`, `ratatui-image`): fetched via
-      `getCoverArt` when an album opens. `i` toggles ascii (default;
-      grayscale block rasterization resampled fresh from the source
-      image at the panel's current size every render, so resizing the
-      terminal re-rasterizes at the new resolution for free, strictly
-      monochrome) vs. real (`ratatui-image`'s actual sixel/kitty/iterm2
-      protocols, auto-detected once at startup, falling back to
-      colored halfblocks if none is supported; that fallback isn't
-      monochrome, the explicit tradeoff of asking for real images).
+- [x] album art (`src/ui/albumart.rs`, `src/ui/raster.rs`,
+      `ratatui-image`): fetched via `getCoverArt` when an album opens.
+      four modes plus off, cycled with `i` and set by
+      `config.album_art`: `ascii-bw`/`ascii-color` are wim's own
+      quadrant-block rasterizer (resampled fresh at the panel's current
+      size every render, so a terminal resize re-rasterizes for free,
+      and 2x the horizontal detail of a half-block renderer), grey or
+      in the cover's own rgb; `full-bw`/`full-color` are a real inline
+      graphics protocol (sixel/kitty/iterm2) through `ratatui-image`,
+      the bw one greyscaling the image before it is encoded. `auto`
+      resolves to `full-color` where a protocol exists and
+      `ascii-color` where none does. a `full-*` mode on a terminal with
+      no protocol falls back to the matching ascii mode and says so
+      once; `ratatui-image`'s own `Halfblocks` fallback is never used
+      (it is coloured half-blocks at half the rasterizer's resolution,
+      which is exactly the "ascii but with colour" confusion this
+      replaced).
 - [x] result row icons switched twice this round: unicode glyphs (◉/○
       etc.) risked emoji-presentation fallback or ambiguous terminal
       width depending on font, so both the row icons and the
@@ -929,7 +943,8 @@ regularly costs nothing to land.
       no fetch needed and it is already decoded at the right size.
       eleven tests over the key derivation, in-flight dedup, negative
       caching and the bound.
-- [x] **cover art in `ArtMode::Real`.** the player has its own
+- [x] **cover art in `ArtMode::Real`** (since split into `full-bw`/
+      `full-color`)**.** the player has its own
       `StatefulProtocol` now, keyed by `coverart::art_key` so it is
       rebuilt only when the cover actually changes (a protocol holds
       resize state; rebuilding per frame would throw it away). this
