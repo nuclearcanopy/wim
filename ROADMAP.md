@@ -391,39 +391,44 @@ real video is the DEFAULT and stays the default. the ascii path is a
 thing the user turns on deliberately, never something they land in by
 accident.
 
-- [ ] **mpv renders to the terminal itself; we may not need frames at
-      all.** found 2026-10-30 while answering "could ghostty play video
-      in the terminal". `mpv --vo=help` on v0.41.0 here lists **`kitty`**
-      (kitty graphics protocol) and **`tct`** (true-color text, whose
-      `--vo-tct-algo` default is literally `half-blocks`). there is no
-      `sixel` vo in this build, so that route would need mpv rebuilt
-      with libsixel.
-      the decisive part is that `--vo=kitty` takes a geometry:
-      `--vo-kitty-cols/rows/left/top`, plus `--vo-kitty-alt-screen=no`
-      and `--vo-kitty-config-clear=no` so it neither takes over the
-      screen nor wipes it, and `--vo-kitty-use-shm` to hand frames over
-      via shared memory instead of base64 through the pty. that is
-      video drawn **into an exact sub-rect**, which is precisely what
-      "video plays as real video in the workspace" asks for, with **no
-      frame extraction whatsoever**. the `screenshot-raw` blocker below
-      simply does not apply to this route.
-      `--vo=tct` is the same idea for the ascii path (`--vo-tct-width`
-      / `--vo-tct-height`), and works in any terminal, alacritty
-      included; it has no left/top, so placement is cursor-relative and
-      harder than kitty's.
-      what to verify before committing to it: whether mpv's own writes
-      and ratatui's buffer flush can coexist without fighting over the
-      screen (wim owns the alt screen and repaints every frame, so the
-      two need a protocol about who touches which cells, and `kitty`'s
-      image placements may survive a ratatui repaint better than tct's
-      text cells, which ratatui will overwrite). if they cannot be made
-      to coexist, this becomes "mpv draws video, wim draws chrome
-      around a hole", which is still far cheaper than a frame pump.
-      **consequence for the terminal choice:** this is the one real
-      argument for kitty protocol over sixel here. with this mpv build,
-      `--vo=kitty` works in ghostty/kitty and there is no sixel vo to
-      use in foot.
-
+- [x] **video works: mpv draws it, fullscreen, and `tct` works in any
+      terminal including alacritty.** `src/video.rs` plus a
+      `video_output = "auto" | "tct" | "kitty" | "off"` config.
+      `video::wanted` is the whole decision: `auto` picks kitty only
+      when the probe reported `ProtocolType::Kitty`, else `tct`.
+      four things found by measuring rather than assuming, each of
+      which would have shipped broken:
+      **mpv's stdout was `Stdio::null()`**, so a drawing vo had nowhere
+      to write at all; it is `inherit()` now, and with `--vo=null` mpv
+      writes *zero bytes* across a load, a seek and a volume change, so
+      it costs nothing for music.
+      **`vo` is settable at runtime**, verified mid-playback with
+      `time-pos` still advancing, so no relaunch and no seek-restore is
+      needed. but `set_property vo bogusvo` replies `"error":"success"`
+      and then silently never draws, so only a `video::Vo` variant is
+      ever handed over, never a config string.
+      **`--no-terminal` breaks vo auto-sizing**: mpv never queries the
+      tty and falls back to 80x25, so wim pushes the geometry itself.
+      mpv reads it only at vo init, so a resize has to bounce `vo`
+      through `null`.
+      **mpv's alt-screen escapes are not balanced around a vo.** `set
+      vo tct` emits `?1049h ?2J ?25l ?1003h`, `set vo null` emits only
+      `?25h ?1003l`, and the matching `?1049l` arrives at mpv's
+      *process exit*. `Mpv`'s drop normally ran after the terminal
+      guard's, so that escape landed on the user's shell and restored a
+      cursor position the shell never saved; `Mpv` is dropped before
+      the guard when a vo was up.
+      six guards were mutation-checked individually.
+- [ ] **in-workspace (sub-rect) video.** detailed in docs/video.md. the
+      real blocker is not mpv: ratatui owns a rectangle of cells and
+      diffs all of them with no concept of a hole, so both the render
+      path and the diff have to learn to skip a rect. beyond that,
+      `kitty` has `--vo-kitty-left/top` and `alt-screen=no` so it can
+      draw at an offset, but `tct` has neither and always paints from
+      the top-left of the alt screen it just entered; both emit
+      `ESC[2J` at init and neither can be told not to; and init-only
+      geometry makes every pane resize a vo bounce. realistic shape is
+      kitty-only sub-rect video with tct staying fullscreen.
 - [ ] **BLOCKER (for the pull-frames-ourselves route only): there is no
       working way to get frames out of mpv.**
       found by `perf/mpv` and it gates every item below. `screenshot-raw`
@@ -676,11 +681,29 @@ regularly costs nothing to land.
       starred view, the profile manager, `load_queue`), but it must not
       drift onto a per-frame path, and a cached per-server list keyed on
       the corpus's own generation would retire the worry.
-- [ ] **the first open of an album or artist still blocks the main
-      thread.** `open_browse_view`/`open_artist_view` are synchronous;
-      the response cache makes repeats free and the pool makes a cold
-      open 5x faster, but truly non-blocking needs the currently unused
-      `stream_artist_tracks` wired into the ui.
+- [x] **the first open of an album or artist still blocks the main
+      thread.** fixed; `browse::Loader` owns opening and nothing on the
+      input path touches the network. the view appears at once from the
+      `SearchItem`'s own title/subtitle with `loading: true` and fills
+      in as replies land. an album's cover is a second round trip that
+      rides in behind the tracks, so a slow cover never holds the list
+      up. `subsonic::stream_artist_tracks`, which was dead code, is now
+      the artist path: `getArtist` answers first so the ALBUMS column
+      renders after one round trip, then the SONGS column grows album
+      by album.
+      **the two hard parts, both pinned by tests that fail when the
+      guard is removed.** completions race, so the loader keeps a
+      bucket per album index and rebuilds `tracks` in album order,
+      which inserts rows *above* a cursor the user may have moved; the
+      selection anchors to the song id it was on and is restored to its
+      new index. and a reply from a superseded open must never land: one
+      generation counter, bumped on every open and on every close or
+      replacement the loader did not perform, checked in `poll` and
+      again by each worker before it sends. four named tests cover the
+      stale paths and all four fail if the two-line check is deleted.
+      see docs/async-open.md.
+      still synchronous and out of scope: `resolve_tracks`, so the
+      quick-queue key on an album or artist holds the thread.
 - [x] **the browse view's own cover fetch bypasses the new disk
       store.** it goes through it now. the two keyspaces are one:
       `Key::album(artist, album)` is the single definition and `Key::of`
