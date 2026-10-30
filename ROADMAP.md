@@ -496,6 +496,56 @@ because the branch kept merging master rather than diverging. that is
 the lesson worth keeping: a long-lived branch that merges down
 regularly costs nothing to land.
 
+- [x] **the three reported mouse symptoms were the feature being
+      absent, but the audit found three real bugs anyway.** audited on
+      `feat/mouse` and merged. none of "clicking a song does not get me
+      to it", "clicking the sidebar does not focus it" or "nor does it
+      click what i wanted" reproduced in the branch's logic: all six
+      row maps derive from the same layout call and the same
+      `ui::scroll::offset_for` the render used, proved with tests that
+      render the real widget, click the cell a song's own text was
+      painted on, and assert `act` answers with that song. those tests
+      were committed BEFORE any fix so the history shows them passing
+      against untouched code, and each was shown non-vacuous by
+      perturbing the row lookup.
+      what did reproduce, all three now fixed:
+      **a notification toast answered for the cells it covered**, so a
+      click on a list under a toast selected nothing (this one would
+      have looked exactly like the first reported symptom);
+      **the mini player strip sat outside every hit rect**, so clicking
+      it did nothing; and **fullscreen video dropped the lists it
+      covers but not the sidebar's search box**, and boxes answer ahead
+      of lists, so a click top-left opened a search box under the
+      picture.
+- [ ] **the selected control's plate is wider than its clickable rect.**
+      `fill_bg` recomputes the extent from the text rather than from
+      `placed.rect`, so the lit left and right edge of the selected
+      control is a visible miss. shrinking the plate to the rect is
+      probably right; growing the rect contradicts the existing
+      deliberate test that gaps between controls stay bottom bar.
+- [ ] **`HINT_SEP.len()` is bytes, not columns** (`src/ui/player.rs`
+      ~472): the separator is 5 columns and 6 bytes, so the player's
+      hint row over-charges a cell per separator and drops a hint
+      earlier than it needs to. the same char-vs-cell class this
+      codebase keeps rediscovering.
+- [ ] **the mini player strip reads like a button but only focuses.**
+      it hints "m: maximize", so a click on it arguably should
+      maximize. it also draws two emoji-presentation codepoints the
+      bottom bar's own glyph alphabet explicitly forbids, so those
+      should be replaced either way.
+- [ ] **the bottom-right "? help" box looks clickable** but only
+      focuses the bottom bar; it should open the help overlay.
+- [ ] **`WHEEL_ROWS` is applied in items, not rows**, so one notch over
+      suggestions (two painted rows per item) moves six screen rows.
+      the behaviour follows the documented "the wheel does what j/k
+      do"; it is the constant's doc comment saying "rows" that is wrong.
+- [ ] **a drag resolved against the previous frame's rect is one cell
+      off for one frame** when the elapsed readout crosses 9:59 to
+      10:00 and grows from 4 cells to 5, shifting the track.
+- [ ] **the six `hits.lists.push` sites in the draw closure have no
+      test.** extracting them into a pure `fn lists(..)` over
+      already-computed rects would make the rect/map pairing testable;
+      it is a real refactor of the closure.
 - [ ] **nobody has driven a real click yet.** the maintainer tried, but
       was running **master**, which had no `src/hit.rs` and no
       `EnableMouseCapture` at all, so the terminal was never put into
