@@ -187,7 +187,14 @@ impl Widget for BrowseListView<'_> {
             (true, Some(y)) => format!(" · {y}"),
             (true, None) => String::new(),
         };
-        let title_line = format!("{}{subtitle}", self.view.title);
+        // while fetches are still in flight the header says so, so a
+        // short list is never mistaken for the whole album.
+        let still_loading = if self.view.loading {
+            " · loading..."
+        } else {
+            ""
+        };
+        let title_line = format!("{}{subtitle}{still_loading}", self.view.title);
         // exactly one rule above the title and one below it: this
         // first one continues the sidebar's search-box top border
         // straight across (`ui::junctions` puts the ┬ there),
@@ -244,7 +251,8 @@ impl Widget for BrowseListView<'_> {
         }
 
         if self.view.tracks.is_empty() {
-            draw_line(buf, list_area, y, "(no tracks)", shade(DIM));
+            let msg = crate::browse::pane_message(self.view.loading, false, "tracks");
+            draw_line(buf, list_area, y, &msg, shade(DIM));
             return;
         }
         draw_track_list(
@@ -274,7 +282,8 @@ impl BrowseListView<'_> {
         let albums_rect = c.albums;
 
         if self.view.albums.is_empty() {
-            draw_line(buf, albums_rect, albums_rect.y, "(no albums)", shade(DIM));
+            let msg = crate::browse::pane_message(self.view.loading, false, "albums");
+            draw_line(buf, albums_rect, albums_rect.y, &msg, shade(DIM));
         } else {
             draw_simple_list(
                 buf,
@@ -302,12 +311,12 @@ impl BrowseListView<'_> {
         let songs_rect = c.songs;
         let visible = self.view.visible_track_indices();
         if visible.is_empty() {
-            let msg = if self.view.filter_query.is_empty() {
-                "(no tracks)"
-            } else {
-                "(no matches)"
-            };
-            draw_line(buf, songs_rect, songs_rect.y, msg, shade(DIM));
+            let msg = crate::browse::pane_message(
+                self.view.loading,
+                !self.view.filter_query.is_empty(),
+                "tracks",
+            );
+            draw_line(buf, songs_rect, songs_rect.y, &msg, shade(DIM));
             return;
         }
         draw_track_list(
@@ -465,6 +474,7 @@ mod tests {
             filter_query: String::new(),
             filtering: false,
             show_track_artist: false,
+            loading: false,
         }
     }
 
@@ -497,6 +507,29 @@ mod tests {
                 "........................",
                 "(no tracks).............",
                 "........................",
+            ]
+            .join("\n")
+        );
+    }
+
+    /// An open that has not answered yet says so in both places: the
+    /// header, and the row where the tracks will go.
+    #[test]
+    fn a_still_loading_album_says_so_instead_of_reading_as_empty() {
+        let area = Rect::new(0, 0, 30, 6);
+        let mut buf = buffer(30, 6);
+        let mut loading = view("Bladee", false);
+        loading.loading = true;
+        render(area, &loading, &mut buf);
+        assert_eq!(
+            grid(&buf),
+            [
+                "──────────────────────────────",
+                "Bladee · loading... │ enter: …",
+                "────────────────────┴─────────",
+                "..............................",
+                "loading tracks................",
+                "..............................",
             ]
             .join("\n")
         );

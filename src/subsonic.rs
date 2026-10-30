@@ -218,10 +218,8 @@ pub struct AlbumDetails {
 pub struct ArtistAlbum {
     pub id: String,
     /// `getArtist` already carries every album name, so the artist
-    /// view's ALBUMS column can render off one round trip instead of
-    /// waiting on a `getAlbum` per album to learn the names. Read by
-    /// the ui wiring that lands separately, hence the allow.
-    #[allow(dead_code)]
+    /// view's ALBUMS column renders off one round trip instead of
+    /// waiting on a `getAlbum` per album to learn the names.
     pub name: String,
     /// `None` sorts last rather than first; an unknown release date
     /// shouldn't jump to the front of a chronological listing.
@@ -232,16 +230,19 @@ pub struct ArtistAlbum {
 /// slot in the chronological album list it came from, because parallel
 /// fetches complete out of order.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // consumed by the artist view; ui wiring lands separately
 pub struct ArtistAlbumTracks {
     pub index: usize,
+    /// Which album these songs are from. `browse::Loader` keys off
+    /// `index` into the album list it already has, so nothing reads
+    /// this yet; it stays because an event that says only "some
+    /// album's songs" is a worse thing to hand a consumer.
+    #[allow(dead_code)]
     pub album: ArtistAlbum,
     pub songs: Vec<Song>,
 }
 
 /// Progress events from `stream_artist_tracks`, in arrival order.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // same as ArtistAlbumTracks
 pub enum ArtistLoad {
     /// Best-effort, `None` when the server has no biography.
     Bio(Option<String>),
@@ -665,10 +666,9 @@ impl Client {
     }
 }
 
-/// The artist-page data path. Separate impl block (and one blanket
-/// `dead_code` allow) because the ui wiring that calls these lands
-/// separately; drop the allow once it does.
-#[allow(dead_code)]
+/// The artist-page data path: `stream_artist_tracks` is what the
+/// artist view opens on (see `browse::Loader`), the rest is what it
+/// is built out of.
 impl Client {
     /// Every song on every album credited to this artist, grouped by
     /// album, chronological. Subsonic has no single call for this:
@@ -679,6 +679,9 @@ impl Client {
     /// serially. Callers wanting only the artist's own tracks filter on
     /// each `Song::artist` (a compilation's other credits land here
     /// too, same as before).
+    /// The serial reference the streaming path is checked against
+    /// (see this module's tests); nothing in the app calls it.
+    #[allow(dead_code)]
     pub fn artist_albums_with_tracks(
         &self,
         artist_id: &str,
