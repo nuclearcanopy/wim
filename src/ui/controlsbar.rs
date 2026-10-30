@@ -628,11 +628,21 @@ fn draw_placed(
         ),
         _ => placed.text.clone(),
     };
-    // one cell of padding each side, so a single-glyph element's
-    // plate reads as a plate and not as one stray lit cell.
+    // the plate is exactly `placed.rect`, which is also exactly what
+    // `layout` reports as this control's clickable cells. it used to
+    // pad a cell each side so a single-glyph element read as a plate
+    // rather than one stray lit cell, which looked better and lied:
+    // the lit edge was not clickable, so clicking what was visibly
+    // highlighted missed. lit and clickable are one thing now.
+    //
+    // the alternative was growing the rect to the old plate. rejected:
+    // controls sit 2 cells apart, so padding both sides would tile the
+    // whole bar and a one-cell miss would press the *neighbour*. on a
+    // transport bar that means skipping a track when you meant to miss,
+    // and a miss that does nothing is the better failure.
     if let Some(bg) = bg {
-        let end = x.saturating_add(width(&text) as u16).saturating_add(1);
-        fill_bg(buf, x.saturating_sub(1).max(area.x), end.min(limit), y, bg);
+        let end = placed.rect.x.saturating_add(placed.rect.width);
+        fill_bg(buf, placed.rect.x.max(area.x), end.min(limit), y, bg);
     }
     draw_chars(buf, x, limit, y, &text, shade(level), bg);
 }
@@ -933,13 +943,25 @@ mod tests {
         assert_eq!(fg_of(&fast, 1, GLYPH_SPEED), shade(BRIGHT));
     }
 
+    /// The plate used to pad a cell either side. It looked better and
+    /// it lied: the padding was not in the rect `layout` reports, so
+    /// clicking the lit edge of the selected control missed. The plate
+    /// is the rect now, and the cells either side go back to the row.
     #[test]
-    fn the_selected_element_gets_a_background_plate_padded_either_side() {
+    fn the_selected_element_is_plated_over_exactly_its_own_cells() {
         let buf = bar_at(100, 2, |cb| cb.selected = Some(Field::Shuffle));
         let col = col_of(&buf, 1, GLYPH_SHUFFLE);
         assert_eq!(bg_of(&buf, 1, GLYPH_SHUFFLE), shade(SELECT_BG));
-        assert_eq!(buf.cell((col - 1, 1)).unwrap().bg, shade(SELECT_BG));
-        assert_eq!(buf.cell((col + 1, 1)).unwrap().bg, shade(SELECT_BG));
+        assert_ne!(
+            buf.cell((col - 1, 1)).unwrap().bg,
+            shade(SELECT_BG),
+            "the cell left of a single-glyph control is not part of it"
+        );
+        assert_ne!(
+            buf.cell((col + 1, 1)).unwrap().bg,
+            shade(SELECT_BG),
+            "nor the cell right of it"
+        );
         // nothing else on the row is plated, and an unselected
         // neighbour keeps its own state brightness.
         assert_eq!(bg_of(&buf, 1, GLYPH_LOOP), Color::Reset);
@@ -1324,5 +1346,40 @@ mod tests {
         assert!(rows[0].contains("resize mode"), "{:?}", rows[0]);
         assert!(rows[1].contains("-- INTERACT"), "{:?}", rows[1]);
         assert!(rows[2].contains(GLYPH_QUEUE), "{:?}", rows[2]);
+    }
+
+    /// The invariant the padding broke: every cell the selection plate
+    /// lights is a cell `layout` reports as that control's, and every
+    /// cell it reports is lit. Clicking what looks highlighted has to
+    /// press it, which was the bug.
+    #[test]
+    fn the_selection_plate_covers_exactly_the_clickable_cells() {
+        for width in [20u16, 40, 60, 100, 160] {
+            let (buf, layout) = bar_and_layout(width, 1, |cb| {
+                cb.focused = true;
+                cb.selected = Some(Field::Loop);
+            });
+            let Some((_, rect)) = layout
+                .controls
+                .iter()
+                .find(|(field, _)| *field == Field::Loop)
+            else {
+                continue;
+            };
+
+            // the plate is the only thing on this row with a non-default
+            // background, so "lit" is just "bg differs from its row".
+            let default_bg = buf.cell((width - 1, 0)).map(|c| c.bg);
+            let lit: Vec<u16> = (0..width)
+                .filter(|x| buf.cell((*x, 0)).map(|c| c.bg) != default_bg)
+                .collect();
+            let claimed: Vec<u16> = (rect.x..rect.x + rect.width).collect();
+            assert_eq!(
+                lit,
+                claimed,
+                "at {width} cells the lit plate and the clickable rect disagree:\n{}",
+                grid(&buf)
+            );
+        }
     }
 }
