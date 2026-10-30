@@ -500,6 +500,25 @@ staying `None` costs nothing in sampling.
       a protocol, so cycling with `i` got no explanation at all. `i`
       now skips a real mode the terminal cannot render and says why
       once.
+- [x] **the ascii rasterizer was blurry, wanted pixel art.** it was a
+      blur by construction, not by accident: mapping a 600px cover onto
+      a 40-cell pane box-averages ~15 source pixels per sample, which
+      is a correct downscale and therefore soft. an unsharp mask now
+      runs over the **output** grid (cheaper than touching the source,
+      and the right place: the grid is the final resolution, so an edge
+      either lands on a sample boundary or it does not). four-neighbour
+      cross, since diagonals change nothing visible at this size for
+      twice the reads.
+      **the dial is `SHARPEN` in `src/ui/raster.rs`**, currently 1.0;
+      0.0 is the old box downscale, past ~2.0 edges start ringing. one
+      line, tune to taste.
+      uniform input is a fixed point (every neighbour equals the
+      centre, so the correction is zero), which is what keeps this
+      pixelated rather than noisy; that is pinned as a test along with
+      edge-steepening, clamping instead of wrapping, and degenerate
+      1-wide/1-tall grids. costs nothing measurable: render of a 640px
+      cover onto 40x20 is 69.8us total.
+
 - [ ] **alacritty cannot do real art at all.** not a wim bug, recorded
       so it stops being rediscovered: alacritty (0.17 here) implements
       no inline-graphics protocol, so the probe correctly reports none
