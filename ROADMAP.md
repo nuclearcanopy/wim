@@ -504,11 +504,24 @@ staying `None` costs nothing in sampling.
       fallback that cannot fire**, and `row_items` does not mirror it;
       that is the one place the hit map could formally name a row the
       render skipped.
-- [ ] **`fetch_navidrome_catalog` pings before fetching, serially.**
-      every sync pass pays an extra round trip, roughly 80 wasted
-      requests per hour per server. `all_artists()` failing would be
-      just as informative; left alone because it is error-reporting
-      semantics in a contested file.
+- [x] **`fetch_navidrome_catalog` pings before fetching, serially.**
+      ping removed; a failing fetch says everything it said, and it was
+      a serial round trip per server per 45s pass (~80 wasted requests
+      an hour). `Client::new` still runs, being local and free.
+      **the ping was hiding something worse, which is the real fix
+      here.** each of the three fetches was `unwrap_or_default()`, so
+      any request failure arrived as an empty list inside an `Ok`. once
+      `perf/startup` added `Corpus::reconcile_server`, which drops what
+      a server no longer lists, an empty list stopped being harmless
+      and became a *claim that the server has nothing*: one failed
+      `getArtists` during a sync would delete that server's whole
+      library from the corpus, and `save_catalog` would then persist
+      the deletion. the ping only narrowed the window (ping fine, fetch
+      times out moments later) rather than closing it. every fetch
+      error and thread panic now propagates, via `fetched()`, with
+      three tests pinning that a failure is not an empty catalog while
+      a genuinely empty server still succeeds. `reconcile_server`'s doc
+      now states the caller contract both ways.
 - [ ] **fresh `Client` per call in `open_starred_view`,
       `test_navidrome_connectivity` and every 45s sync pass**, each
       re-reading `password_file` and starting with a cold pool. a
