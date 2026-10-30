@@ -86,6 +86,22 @@ the widgets hand over their own geometry rather than being guessed at:
   the same layout call and the same `ui::scroll::offset_for` the render
   used. headers, gaps and rows past the end come back as `None`, so a
   click cannot move a selection onto a row that is not one.
+- `notify::boxes` returns the cells the toasts own, from the same
+  placement pass the overlay paints from.
+
+## a toast answers for the cells it covers
+
+the notification toasts are painted last, over panes whose lists and
+controls the same frame already recorded, and each owns every cell of
+its own box (`notify::draw_box` clears first). a click on one is
+therefore a click on something the user cannot see, the same as under
+a covering tier, and resolves to `Act::Nothing` instead of reaching
+the row or control underneath. without this a toast over a song list
+selected whichever song it was hiding.
+
+the wheel still passes through, by the same split the help overlay
+uses: a notch acts on no particular row, so a toast appearing
+mid-scroll must not make the wheel go dead.
 
 `hit::act` is pure given a map, which is the point: raw-mode input
 cannot be driven headlessly, so every decision lives below the event
