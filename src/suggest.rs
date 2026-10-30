@@ -17,6 +17,7 @@
 //! input (last.fm-proxied similar artists, `getArtistInfo2`) arrives
 //! through the `Enrichment` trait so tests fake it.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -413,6 +414,20 @@ fn norm(s: &str) -> String {
     s.trim().to_lowercase()
 }
 
+/// `norm` into a buffer the caller owns, for the per-track loops that
+/// would otherwise allocate a key each. Ascii takes the byte path,
+/// which is the same answer `to_lowercase` gives there; anything else
+/// goes through `to_lowercase` itself rather than per-character
+/// lowercasing, which is not the same thing (final sigma).
+fn norm_into(s: &str, out: &mut String) {
+    let s = s.trim();
+    if s.is_ascii() {
+        out.extend(s.chars().map(|c| c.to_ascii_lowercase()));
+    } else {
+        out.push_str(&s.to_lowercase());
+    }
+}
+
 /// `(normalised artist, normalised album)`.
 type AlbumKey = (String, String);
 
@@ -795,8 +810,15 @@ fn decay(last_played_secs: Option<u64>, now_secs: u64, half_life_days: f32) -> f
 /// evening is one day of interest, which is why the day count is
 /// linear and the play count is logarithmic.
 fn frequency(days: u32, plays: u32, starred: bool, tuning: &Tuning) -> f32 {
-    let mut f = tuning.distinct_day_weight * days as f32
-        + tuning.play_count_weight * (1.0 + plays as f32).ln();
+    // `ln(1) == 0`, exactly, so skipping it for a never-played track is
+    // the same number; it is also most of the library, and this is one
+    // call per track per pass.
+    let plays_term = if plays == 0 {
+        0.0
+    } else {
+        (1.0 + plays as f32).ln()
+    };
+    let mut f = tuning.distinct_day_weight * days as f32 + tuning.play_count_weight * plays_term;
     if starred {
         f += tuning.starred_bonus;
     }
@@ -869,9 +891,20 @@ impl<'a> Model<'a> {
     fn build(req: &Request<'a>) -> Model<'a> {
         let catalog = req.catalog;
         let tuning = req.tuning;
+        // the starred set is the user's own, orders of magnitude smaller
+        // than the library, and `by_key` is keyed on exactly what it
+        // holds: look its members up here rather than asking of every
+        // track in the library whether it is one of them.
+        let mut is_starred = vec![false; catalog.tracks.len()];
+        for key in req.starred {
+            if let Some(&index) = catalog.by_key.get(key) {
+                is_starred[index] = true;
+            }
+        }
+
         let mut tracks = Vec::with_capacity(catalog.tracks.len());
         let mut total_plays = 0u32;
-        for track in &catalog.tracks {
+        for (index, track) in catalog.tracks.iter().enumerate() {
             let entry = req.cache.entry(&track.key);
             let plays = entry.map_or(0, |e| e.play_count);
             let days = entry.map_or(0, |e| e.play_days.len() as u32);
@@ -879,7 +912,7 @@ impl<'a> Model<'a> {
             let first_day = entry
                 .and_then(|e| e.play_days.first())
                 .and_then(|d| day_number(d));
-            let starred = req.starred.contains(&track.key);
+            let starred = is_starred[index];
             let raw = frequency(days, plays, starred, tuning);
             total_plays += plays;
             tracks.push(TrackAffinity {
@@ -906,21 +939,35 @@ impl<'a> Model<'a> {
             }
         }
 
+        // this runs once per genre per track over the whole library, so
+        // the key is normalised into one reused buffer and only cloned
+        // when a genre is seen for the first time; three
+        // `entry(key.clone())` calls was three fresh keys a track.
         let mut genres: HashMap<String, Roll> = HashMap::new();
         let mut genre_names: HashMap<String, String> = HashMap::new();
         let mut genre_artists: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut key = String::new();
         for (index, track) in catalog.tracks.iter().enumerate() {
             for genre in &track.genres {
-                let key = norm(genre);
+                key.clear();
+                norm_into(genre, &mut key);
                 if key.is_empty() {
                     continue;
                 }
-                genres.entry(key.clone()).or_default().add(&tracks[index]);
-                genre_names
-                    .entry(key.clone())
-                    .or_insert_with(|| genre.clone());
+                match genres.get_mut(&key) {
+                    Some(roll) => roll.add(&tracks[index]),
+                    None => {
+                        // the two maps are only ever written together,
+                        // so one missing means both do.
+                        genres.entry(key.clone()).or_default().add(&tracks[index]);
+                        genre_names.insert(key.clone(), genre.clone());
+                    }
+                }
                 if let Some(artist) = catalog.track_artist[index] {
-                    let owned = genre_artists.entry(key).or_default();
+                    if !genre_artists.contains_key(&key) {
+                        genre_artists.insert(key.clone(), Vec::new());
+                    }
+                    let owned = genre_artists.get_mut(&key).expect("just inserted");
                     if !owned.contains(&artist) {
                         owned.push(artist);
                     }
@@ -1083,6 +1130,91 @@ impl Candidate {
         self.album_key = album_key;
         self.genre_key = genre_key;
         self
+    }
+}
+
+/// A pool that holds only the best `cap` candidates, in the order
+/// `normalise` sorts and `suggest_with` truncates to. A generator asks
+/// `wants` before paying for one, which is the point: three of them
+/// walk the whole library and would otherwise build a candidate per
+/// track (a reason sentence, a cloned `SearchItem` and five keys
+/// apiece) for `normalise` to throw all but `cap` of them away.
+struct Pool {
+    held: Vec<Candidate>,
+    cap: usize,
+    /// `raw` of the weakest candidate still held, once the pool is
+    /// over its cap; nothing below this can get in.
+    floor: f32,
+    /// length at which to prune again.
+    prune_at: usize,
+}
+
+impl Pool {
+    fn new(cap: usize) -> Pool {
+        let cap = cap.max(1);
+        Pool {
+            held: Vec::new(),
+            cap,
+            floor: f32::NEG_INFINITY,
+            prune_at: cap * 2,
+        }
+    }
+
+    /// Whether a candidate scoring `raw` can still make the cut. A tie
+    /// with the floor is admitted rather than dropped: equal raws are
+    /// separated by identity, which does not exist until the candidate
+    /// is built. Spelled as "not below" rather than `raw >= floor` so
+    /// that a NaN is admitted too, the way an unbounded pool held it.
+    fn wants(&self, raw: f32) -> bool {
+        !matches!(raw.partial_cmp(&self.floor), Some(Ordering::Less))
+    }
+
+    fn push(&mut self, candidate: Candidate) {
+        self.held.push(candidate);
+        if self.held.len() >= self.prune_at {
+            self.tighten();
+        }
+    }
+
+    /// Best-first in exactly `normalise`'s order, which is the order
+    /// `suggest_with` then truncates. Within one pool the weight and
+    /// the max are constant, so ranking on `raw` ranks on `score`;
+    /// except for a pool whose best is at or below the epsilon, which
+    /// gets one flat score, where identity alone orders it.
+    fn sort(&mut self) {
+        if self.held.iter().map(|c| c.raw).fold(0.0f32, f32::max) <= f32::EPSILON {
+            self.held.sort_by(|a, b| a.identity.cmp(&b.identity));
+        } else {
+            self.held.sort_by(|a, b| {
+                b.raw
+                    .total_cmp(&a.raw)
+                    .then_with(|| a.identity.cmp(&b.identity))
+            });
+        }
+    }
+
+    /// Drops everything past the cap and raises the floor, but only
+    /// while the cut is above that epsilon: below it `raw` does not
+    /// predict the order, so nothing may be dropped on the strength of
+    /// it. Keep the lot in that case, exactly as an unbounded pool did.
+    fn tighten(&mut self) {
+        self.sort();
+        let Some(cut) = self.held.get(self.cap - 1).map(|c| c.raw) else {
+            return;
+        };
+        if cut <= f32::EPSILON {
+            self.prune_at = usize::MAX;
+            return;
+        }
+        self.held.truncate(self.cap);
+        self.floor = cut;
+        self.prune_at = self.cap * 2;
+    }
+
+    fn into_vec(mut self) -> Vec<Candidate> {
+        self.sort();
+        self.held.truncate(self.cap);
+        self.held
     }
 }
 
@@ -1268,7 +1400,7 @@ fn top_artists(model: &Model<'_>, limit: usize) -> Vec<usize> {
 /// Tracks played on a high fraction of the days since you first played
 /// them. Not discovery: quick access to what is already in rotation.
 fn daily_rotation(model: &Model<'_>) -> Vec<Candidate> {
-    let mut out = Vec::new();
+    let mut out = Pool::new(model.tuning.per_generator_candidates);
     for index in 0..model.catalog.tracks.len() {
         let affinity = &model.tracks[index];
         if affinity.plays == 0 || affinity.days < model.tuning.daily_min_days {
@@ -1281,6 +1413,10 @@ fn daily_rotation(model: &Model<'_>) -> Vec<Candidate> {
         if rate < model.tuning.daily_min_day_rate {
             continue;
         }
+        let raw = rate * affinity.days as f32;
+        if !out.wants(raw) {
+            continue;
+        }
         let text = format!(
             "played on {} of the last {span} days",
             affinity.days.min(span as u32)
@@ -1289,18 +1425,18 @@ fn daily_rotation(model: &Model<'_>) -> Vec<Candidate> {
             model,
             Reason::DailyRotation,
             index,
-            rate * affinity.days as f32,
+            raw,
             text,
         ));
     }
-    out
+    out.into_vec()
 }
 
 /// High artist affinity, album barely touched. The maintainer's
 /// headline example: "you play Bladee a lot and have never played
 /// Crest."
 fn album_gap(model: &Model<'_>) -> Vec<Candidate> {
-    let mut out = Vec::new();
+    let mut out = Pool::new(model.tuning.per_generator_candidates);
     for (slot, album) in model.catalog.albums.iter().enumerate() {
         let Some(item) = &album.item else {
             continue;
@@ -1314,6 +1450,10 @@ fn album_gap(model: &Model<'_>) -> Vec<Candidate> {
         let total = album.track_total.unwrap_or(roll.known_tracks);
         let coverage = roll.coverage(total);
         if coverage > model.tuning.album_gap_max_coverage {
+            continue;
+        }
+        let raw = artist_score * (1.0 - coverage);
+        if !out.wants(raw) {
             continue;
         }
         let artist_roll = artist_slot.map(|s| &model.artists[s]);
@@ -1336,23 +1476,21 @@ fn album_gap(model: &Model<'_>) -> Vec<Candidate> {
             )
         };
         out.push(
-            Candidate::new(
-                Reason::AlbumGap,
-                item,
-                artist_score * (1.0 - coverage),
-                text,
-            )
-            .attributes(album.key.0.clone(), Some(album.key.clone()), None),
+            Candidate::new(Reason::AlbumGap, item, raw, text).attributes(
+                album.key.0.clone(),
+                Some(album.key.clone()),
+                None,
+            ),
         );
     }
-    out
+    out.into_vec()
 }
 
 /// High album affinity, specific unplayed tracks. "4 of 5 tracks
 /// played" is exactly the signal; the fuller the album, the more
 /// glaring the hole.
 fn track_gap(model: &Model<'_>) -> Vec<Candidate> {
-    let mut out = Vec::new();
+    let mut out = Pool::new(model.tuning.per_generator_candidates);
     for (slot, album) in model.catalog.albums.iter().enumerate() {
         let roll = &model.albums[slot];
         if roll.score <= 0.0 || roll.played_tracks == 0 {
@@ -1366,33 +1504,31 @@ fn track_gap(model: &Model<'_>) -> Vec<Candidate> {
         if coverage < model.tuning.track_gap_min_coverage {
             continue;
         }
+        let raw = roll.score * coverage;
         for &index in &album.tracks {
-            if model.tracks[index].plays > 0 {
+            if model.tracks[index].plays > 0 || !out.wants(raw) {
                 continue;
             }
             let text = format!(
                 "{} of {total} tracks played from {}, never this one",
                 roll.played_tracks, album.name
             );
-            out.push(track_candidate(
-                model,
-                Reason::TrackGap,
-                index,
-                roll.score * coverage,
-                text,
-            ));
+            out.push(track_candidate(model, Reason::TrackGap, index, raw, text));
         }
     }
-    out
+    out.into_vec()
 }
 
 /// Unplayed tracks sitting immediately next to heavily played ones on
 /// the same album. Needs track order, so only albums ingested whole
 /// can fire this.
 fn album_neighbours(model: &Model<'_>) -> Vec<Candidate> {
-    let mut out = Vec::new();
+    let mut out = Pool::new(model.tuning.per_generator_candidates);
+    // one map reused across albums, cleared rather than reallocated:
+    // positions are per album, so clearing is the same map.
+    let mut by_position: HashMap<usize, usize> = HashMap::new();
     for album in &model.catalog.albums {
-        let mut by_position: HashMap<usize, usize> = HashMap::new();
+        by_position.clear();
         for &index in &album.tracks {
             if let Some(position) = model.catalog.tracks[index].position {
                 by_position.insert(position, index);
@@ -1415,6 +1551,9 @@ fn album_neighbours(model: &Model<'_>) -> Vec<Candidate> {
             let Some((score, neighbour)) = best else {
                 continue;
             };
+            if !out.wants(score) {
+                continue;
+            }
             let text = format!(
                 "sits right next to \"{}\", which you played on {} days",
                 model.catalog.tracks[neighbour].title, model.tracks[neighbour].days
@@ -1428,7 +1567,7 @@ fn album_neighbours(model: &Model<'_>) -> Vec<Candidate> {
             ));
         }
     }
-    out
+    out.into_vec()
 }
 
 /// Within a genre you play a lot, the artist you own but play least.
@@ -1499,7 +1638,7 @@ fn genre_under_explored(model: &Model<'_>) -> Vec<Candidate> {
 /// Formerly high affinity, nothing recent. "You used to play this
 /// constantly."
 fn rediscovery(model: &Model<'_>) -> Vec<Candidate> {
-    let mut out = Vec::new();
+    let mut out = Pool::new(model.tuning.per_generator_candidates);
     for index in 0..model.catalog.tracks.len() {
         let affinity = &model.tracks[index];
         if affinity.plays == 0 || affinity.raw < model.tuning.rediscovery_min_frequency {
@@ -1517,6 +1656,10 @@ fn rediscovery(model: &Model<'_>) -> Vec<Candidate> {
                 model.now_secs,
                 model.tuning.half_life_days,
             );
+        let raw = affinity.raw * staleness;
+        if !out.wants(raw) {
+            continue;
+        }
         let text = format!(
             "played on {} days, nothing in the last {}",
             affinity.days,
@@ -1526,22 +1669,26 @@ fn rediscovery(model: &Model<'_>) -> Vec<Candidate> {
             model,
             Reason::Rediscovery,
             index,
-            affinity.raw * staleness,
+            raw,
             text,
         ));
     }
-    out
+    out.into_vec()
 }
 
 /// Explicit interest, zero follow-through.
 fn starred_unplayed(model: &Model<'_>) -> Vec<Candidate> {
-    let mut out = Vec::new();
+    let mut out = Pool::new(model.tuning.per_generator_candidates);
     for index in 0..model.catalog.tracks.len() {
         let affinity = &model.tracks[index];
         if !affinity.starred || affinity.plays > 0 {
             continue;
         }
         let artist_slot = model.catalog.track_artist[index];
+        let raw = 1.0 + model.artist_score(artist_slot);
+        if !out.wants(raw) {
+            continue;
+        }
         let artist_roll = artist_slot.map(|s| &model.artists[s]);
         let other_plays = artist_roll.map_or(0, |r| r.plays);
         let text = if other_plays > 0 {
@@ -1556,11 +1703,11 @@ fn starred_unplayed(model: &Model<'_>) -> Vec<Candidate> {
             model,
             Reason::StarredUnplayed,
             index,
-            1.0 + model.artist_score(artist_slot),
+            raw,
             text,
         ));
     }
-    out
+    out.into_vec()
 }
 
 /// last.fm's own similar-artist graph (via `getArtistInfo2`), seeded
@@ -1938,6 +2085,7 @@ mod tests {
     use super::*;
     use crate::cache::day_of;
     use crate::config::NavidromeConfig;
+    use std::time::Instant;
 
     const DAY: u64 = 86_400;
     /// Fixed "now" for every test: 2026-01-01, so decay ages and day
@@ -3063,5 +3211,205 @@ mod tests {
             !after.iter().any(|t| t.name == "Eversince"),
             "a failed fetch must be remembered, not retried forever"
         );
+    }
+
+    // ------------------------------------------------- bounded pool
+
+    /// The bounded pool must hold exactly the candidates an unbounded
+    /// one would have, after `normalise` sorted and `suggest_with`
+    /// truncated it: same members, same order.
+    fn pool_matches_unbounded(cap: usize, arrivals: &[(f32, usize)], case: &str) {
+        fn candidate(id: usize, raw: f32) -> Candidate {
+            Candidate::new(
+                Reason::TrackGap,
+                &SearchItem::Song {
+                    id: format!("s{id}"),
+                    title: format!("t{id}"),
+                    artist: "a".into(),
+                    album: "al".into(),
+                    client: client(),
+                },
+                raw,
+                String::new(),
+            )
+        }
+
+        let mut pool = Pool::new(cap);
+        for &(raw, id) in arrivals {
+            if pool.wants(raw) {
+                pool.push(candidate(id, raw));
+            }
+        }
+        let bounded: Vec<(f32, (u8, String))> = pool
+            .into_vec()
+            .into_iter()
+            .map(|c| (c.raw, c.identity))
+            .collect();
+
+        // the reference: build every candidate, normalise, truncate,
+        // which is what the generators did before the pool existed.
+        let mut all: Vec<Candidate> = arrivals
+            .iter()
+            .map(|&(raw, id)| candidate(id, raw))
+            .collect();
+        normalise(&mut all, &Tuning::default());
+        all.truncate(cap);
+        let reference: Vec<(f32, (u8, String))> =
+            all.into_iter().map(|c| (c.raw, c.identity)).collect();
+
+        assert_eq!(bounded, reference, "{case}");
+    }
+
+    #[test]
+    fn a_bounded_pool_keeps_what_an_unbounded_one_would_have() {
+        for (cap, count, spread) in [
+            (4usize, 3usize, 97u64),
+            (4, 4, 97),
+            (4, 40, 97),
+            (64, 500, 997),
+            (64, 500, 7),
+            (64, 500, 3),
+            (8, 300, 1),
+        ] {
+            let mut seed = 0x9e3779b97f4a7c15u64;
+            let arrivals: Vec<(f32, usize)> = (0..count)
+                .map(|i| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    ((seed % spread) as f32, i)
+                })
+                .collect();
+            pool_matches_unbounded(cap, &arrivals, &format!("cap {cap}, {count}/{spread}"));
+        }
+    }
+
+    /// Every candidate scores the same and the ones that sort first
+    /// arrive last, so a pool that dropped a tie with its own floor
+    /// instead of admitting it would hold the wrong rows.
+    #[test]
+    fn a_bounded_pool_admits_a_tie_with_its_floor() {
+        let arrivals: Vec<(f32, usize)> = (0..40usize).map(|i| (5.0, 39 - i)).collect();
+        pool_matches_unbounded(4, &arrivals, "equal scores, reversed identities");
+    }
+
+    /// Scores whose maximum is below `normalise`'s epsilon, descending,
+    /// with
+    /// identities descending too. `normalise` flattens them to one
+    /// score and orders on identity alone, so a pool that dropped
+    /// anything for scoring under its floor would hold the wrong rows.
+    #[test]
+    fn a_bounded_pool_drops_nothing_on_a_score_normalise_will_flatten() {
+        let arrivals: Vec<(f32, usize)> = (0..40usize)
+            .map(|i| (1e-9 * (40 - i) as f32, 39 - i))
+            .collect();
+        pool_matches_unbounded(4, &arrivals, "sub-epsilon scores, reversed identities");
+    }
+
+    // ------------------------------------------------------- benchmark
+
+    /// A library-shaped catalog: `albums` albums of `per_album` tracks
+    /// each, spread over artists and genres the way a real one is, with
+    /// positions and track totals set so every generator can fire.
+    fn big_catalog(albums: usize, per_album: usize) -> Catalog {
+        const GENRES: [&str; 8] = [
+            "Cloud Rap",
+            "Ambient",
+            "Dubstep",
+            "Shoegaze",
+            "Drone",
+            "IDM",
+            "Post-Rock",
+            "Trance",
+        ];
+        let client = client();
+        let mut catalog = Catalog::new();
+        let artists = (albums / 7).max(1);
+        for a in 0..artists {
+            catalog.ingest_item(&artist_item(&format!("ar-{a}"), &format!("Artist {a}")));
+        }
+        for al in 0..albums {
+            let artist = format!("Artist {}", al % artists);
+            let album = format!("Album {al}");
+            catalog.ingest_item(&album_item(&format!("al-{al}"), &album, &artist));
+            let songs: Vec<Song> = (0..per_album)
+                .map(|t| {
+                    song(
+                        &format!("s-{al}-{t}"),
+                        &format!("Track {t} of {al}"),
+                        &artist,
+                        &album,
+                        &[GENRES[al % GENRES.len()]],
+                    )
+                })
+                .collect();
+            catalog.ingest_album(&artist, &album, &songs, &client);
+        }
+        catalog
+    }
+
+    /// A listen history over the first `played` albums: a mix of fresh,
+    /// stale and long-dead plays, so decay and rediscovery both have
+    /// something real to chew on.
+    fn big_history(played: usize, per_album: usize) -> CacheIndex {
+        let mut history = History::new();
+        for al in 0..played {
+            for t in 0..per_album {
+                if (al * per_album + t).is_multiple_of(3) {
+                    continue;
+                }
+                let days_ago = ((al * 7 + t * 13) % 400) as u64;
+                let plays = 1 + ((al + t) % 9) as u32;
+                let days = 1 + ((al + t) % 5) as u32;
+                history = history.played(&format!("s-{al}-{t}"), plays, days, days_ago);
+            }
+        }
+        history.build()
+    }
+
+    /// Not an assertion: prints how long one suggestion pass takes,
+    /// which is what decides whether opening the menu drops a frame.
+    /// Absolute numbers are machine-dependent. Run with
+    /// `cargo test --release --bin wim -- --ignored --nocapture bench_suggest`.
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_suggest() {
+        for (albums, per_album, played) in [(700usize, 14usize, 350usize), (2_200, 14, 1_100)] {
+            let catalog = big_catalog(albums, per_album);
+            let cache = big_history(played, per_album);
+            let starred = starred(&["s-1-1", "s-2-2", "s-900-3", "s-901-4"]);
+            let tracks = albums * per_album;
+            let enrichment = EnrichmentCache::new();
+            let tuning = Tuning::default();
+            let request = Request {
+                catalog: &catalog,
+                cache: &cache,
+                starred: &starred,
+                now_secs: NOW,
+                seed: 7,
+                enrichment: &enrichment,
+                tuning: &tuning,
+            };
+            let iters = 20u32;
+            let start = Instant::now();
+            let mut rows = 0usize;
+            for _ in 0..iters {
+                rows += suggest(&request)
+                    .sections
+                    .iter()
+                    .map(|s| s.items.len())
+                    .sum::<usize>();
+            }
+            let pass = start.elapsed() / iters;
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = Model::build(&request);
+            }
+            let model = start.elapsed() / iters;
+            println!(
+                "{tracks:>6} tracks {albums:>5} albums  pass {pass:>10.3?}  of which model {model:>10.3?}  ({} rows)",
+                rows / iters as usize
+            );
+        }
     }
 }

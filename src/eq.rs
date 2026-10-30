@@ -66,14 +66,6 @@ pub const PRESETS: &[Preset] = &[
     },
 ];
 
-/// Index of the preset named `name`, if any; used to restore a
-/// persisted eq selection by name (see `config::Config::eq_preset`)
-/// rather than a raw index, which could point at a different preset
-/// entirely if `PRESETS` is ever reordered.
-pub fn index_of(name: &str) -> Option<usize> {
-    PRESETS.iter().position(|p| p.name == name)
-}
-
 /// A curve the user saved under a name, persisted in config.toml (see
 /// `config::Config::eq_custom_presets`).
 ///
@@ -264,6 +256,24 @@ pub fn resolve(name: &str, saved: &CustomPresets) -> Option<(Source, [f64; 10])>
     Some((Source::Saved(i), clamp_gains(saved.get(i)?.gains)))
 }
 
+/// Why `name` did not resolve, phrased for whoever typed it.
+///
+/// `eq()` used to get this from shellsong's parse-time keyword
+/// validation. Saved curves only exist at runtime, so the parser
+/// cannot see them and resolution moved to apply time; this keeps the
+/// error as useful as it was. Built-ins first, then saved, the order
+/// `resolve` and the eq menu both use.
+pub fn resolve_failure(name: &str, saved: &CustomPresets) -> String {
+    crate::namehint::unknown(
+        "eq preset",
+        name,
+        PRESETS
+            .iter()
+            .map(|p| p.name)
+            .chain(saved.iter().map(|p| p.name.as_str())),
+    )
+}
+
 /// Which named curve `gains` exactly is, if any; built-ins first.
 /// Lets a persisted nameless curve that happens to match a preset be
 /// credited to it instead of reading as anonymous.
@@ -339,10 +349,13 @@ pub fn persisted(
     (name, Some(gains))
 }
 
-/// Label on the trailing `astats` analysis stage (see
-/// `build_af_filter`); mpv exposes a labeled lavfi filter's metadata
-/// at `af-metadata/<label>/...`, polled by the now-playing level
-/// meter. Doesn't touch the audio itself, purely an analysis tap.
+/// mpv's own label on the `lavfi` filter `build_af_filter` emits;
+/// `af-metadata/<label>/...` (observed by the now-playing level meter,
+/// see `mpv::PROP_LEVEL_RMS`) resolves against *this*, not against a
+/// label written inside the lavfi graph. Labelling only the inner
+/// `astats` stage made that property resolve nothing at all, which is
+/// what left the meter dead. Purely an analysis tap; it doesn't touch
+/// the audio.
 pub const LEVEL_METADATA_LABEL: &str = "wimlevel";
 
 /// True when no band asks for anything, i.e. the eq has nothing to do
@@ -429,8 +442,8 @@ pub fn build_af_filter(gains: &[f64; 10]) -> String {
             stages.push(format!("equalizer=f={hz}:width_type=o:width=1:g={g:.3}"));
         }
     }
-    stages.push(format!("astats@{LEVEL_METADATA_LABEL}=metadata=1:reset=1"));
-    format!("lavfi=[{}]", stages.join(","))
+    stages.push("astats=metadata=1:reset=1".to_string());
+    format!("@{LEVEL_METADATA_LABEL}:lavfi=[{}]", stages.join(","))
 }
 
 #[cfg(test)]
@@ -446,7 +459,7 @@ mod tests {
     #[test]
     fn filter_string_emits_bands_low_to_high() {
         let filter = build_af_filter(&PRESETS[1].gains); // bass boost
-        assert!(filter.starts_with("lavfi=["));
+        assert!(filter.starts_with(&format!("@{LEVEL_METADATA_LABEL}:lavfi=[")));
         assert!(filter.ends_with(']'));
         // bass boost only touches the bottom four bands, so the top
         // ones solve to nothing and are dropped entirely.
@@ -483,15 +496,18 @@ mod tests {
         assert!(!filter.contains("equalizer"));
         assert_eq!(
             filter,
-            format!("lavfi=[astats@{LEVEL_METADATA_LABEL}=metadata=1:reset=1]")
+            format!("@{LEVEL_METADATA_LABEL}:lavfi=[astats=metadata=1:reset=1]")
         );
     }
 
+    /// The tap has to be in the graph *and* the graph has to carry
+    /// mpv's own label, or `af-metadata/<label>` resolves nothing.
     #[test]
-    fn every_filter_keeps_the_level_meter_tap() {
+    fn every_filter_keeps_the_labeled_level_meter_tap() {
         for preset in PRESETS {
             let filter = build_af_filter(&preset.gains);
-            assert!(filter.contains(&format!("astats@{LEVEL_METADATA_LABEL}=")));
+            assert!(filter.starts_with(&format!("@{LEVEL_METADATA_LABEL}:lavfi=[")));
+            assert!(filter.contains("astats=metadata=1:reset=1"));
         }
     }
 
@@ -799,5 +815,49 @@ mod tests {
         assert_eq!(filter.matches("equalizer=f=").count(), 2);
         assert!(filter.contains("f=31:"));
         assert!(filter.contains("f=62:"));
+    }
+
+    #[test]
+    fn resolve_failure_suggests_the_closest_builtin() {
+        let saved = CustomPresets::default();
+        let msg = resolve_failure("rok", &saved);
+        assert!(msg.contains("did you mean 'rock'"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_failure_suggests_a_saved_curve_too() {
+        let mut saved = CustomPresets::default();
+        saved.insert("my bass curve", [0.0; 10]);
+        let msg = resolve_failure("my bass curv", &saved);
+        assert!(msg.contains("did you mean 'my bass curve'"), "{msg}");
+    }
+
+    /// Nothing near it: list what there is rather than inventing a
+    /// suggestion, which is what the parse-time error used to do.
+    #[test]
+    fn resolve_failure_lists_the_names_when_nothing_is_close() {
+        let saved = CustomPresets::default();
+        let msg = resolve_failure("disco", &saved);
+        assert!(msg.contains("have:"), "{msg}");
+        assert!(msg.contains("bass boost"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_reaches_a_saved_curve_by_name() {
+        let mut saved = CustomPresets::default();
+        saved.insert("my bass curve", [3.0; 10]);
+        let (source, gains) = resolve("my bass curve", &saved).expect("should resolve");
+        assert_eq!(source, Source::Saved(0));
+        assert_eq!(gains, [3.0; 10]);
+    }
+
+    /// Built-ins win a name clash, which is the precedence `resolve`
+    /// documents and the eq menu shows.
+    #[test]
+    fn a_saved_curve_cannot_shadow_a_builtin() {
+        let mut saved = CustomPresets::default();
+        saved.insert("rock", [9.0; 10]);
+        let (source, _) = resolve("rock", &saved).unwrap();
+        assert!(matches!(source, Source::Builtin(_)));
     }
 }

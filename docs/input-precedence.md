@@ -44,6 +44,15 @@ the three menus (settings, keybinds, eq) that only cover `top` and
 leave the bottom bar drawn underneath: the keyboard gives them every
 key while they are up, so the mouse gives them every cell.
 
+the help overlay is the one partial exception, and only for the wheel.
+it is the single covering tier with more content than screen, so a
+notch over it scrolls the table rather than being swallowed, by the
+same rule as everywhere else: the wheel does what `j`/`k` do on this
+surface, and `j`/`k` there move a content offset. clicks on it are
+still swallowed, so none of its rows are targets. handled in `main`
+ahead of `hit::act` on purpose, so `Modal::covers_screen` stays a plain
+swallow with no wheel exception threaded through it.
+
 the two text boxes do not swallow. a keystroke has no location, so a
 text box has to claim every key or lose some of them to whatever else
 is listening; a click names its target and cannot leak that way.
@@ -106,9 +115,10 @@ keyboard to disagree with: these lists have none today, they derive the
 offset from the selection every frame via `ui::scroll::offset_for`,
 which is also what keeps a wheeled selection on screen for free.
 
-the lyrics pane is the exception, and not an inconsistent one: it has
-no selection at all, `j`/`k` there move a content offset
-(`lyrics_scroll`), so the wheel moves the same offset. the rule is
+the lyrics pane and the help overlay are the exceptions, and not
+inconsistent ones: neither has a selection at all, `j`/`k` on both move
+a content offset (`lyrics_scroll`, `help_scroll`), so the wheel moves
+the same offset. the rule is
 "the wheel does what `j`/`k` do on this surface", and that is what it
 resolves to in both cases.
 

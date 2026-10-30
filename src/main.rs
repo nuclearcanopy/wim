@@ -14,6 +14,7 @@ mod library;
 mod listenbrainz;
 mod lyrics;
 mod mpv;
+mod namehint;
 mod navmanager;
 mod notify;
 mod onboarding;
@@ -157,19 +158,11 @@ fn artist_tracks(
     // one getAlbum round-trip per album, done one at a time, was the
     // whole reason opening a prolific artist's profile felt so slow
     // (dozens of sequential network calls, each paying its own
-    // latency); they're entirely independent requests, so fetch them
-    // all in parallel instead. `Client` wraps a `ureq::Agent`, which
-    // is explicitly safe to share and use concurrently across
-    // threads for exactly this.
-    let details: Vec<Option<subsonic::AlbumDetails>> = thread::scope(|scope| {
-        artist_albums
-            .iter()
-            .map(|album| scope.spawn(|| client.get_album(&album.id).ok()))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|handle| handle.join().unwrap_or(None))
-            .collect()
-    });
+    // latency); they're independent requests, so they go through
+    // `album_details`'s bounded pool instead (a thread per album was
+    // a socket per album against a real navidrome instance).
+    let ids: Vec<&str> = artist_albums.iter().map(|a| a.id.as_str()).collect();
+    let details = client.album_details(&ids);
 
     let mut tracks = Vec::new();
     let mut albums = Vec::new();
@@ -380,7 +373,9 @@ fn open_starred_view(
 /// an error, the album view just shows no art for it.
 fn fetch_cover_art(client: &subsonic::Client, album_id: &str) -> Option<image::DynamicImage> {
     let bytes = client.get_cover_art_bytes(album_id).ok()?;
-    image::load_from_memory(&bytes).ok()
+    // same bounded rgb8 decode the background fetches use, so an open
+    // view does not retain a multi-megapixel original either.
+    coverart::decode_cover(&bytes)
 }
 
 /// Whether the config names a graphics protocol outright, which is an
@@ -1776,20 +1771,28 @@ fn run_shellsong_op(op: Op, ctx: &mut ShellsongCtx) -> (Dispatch, Report) {
             let dispatch = dispatch_action(Action::SetSpeed(speed), ctx.actx);
             (dispatch, Report::Note(format!("speed: {speed}x")))
         }
-        Op::SetEqPreset(index) => {
-            // `apply_eq_row` takes an eq-menu row, and the rows below
-            // `PRESET_COUNT` are exactly the built-in presets in
-            // order; the saved ones sit after them and are not
-            // addressable from shellsong yet.
-            if index >= ui::eq_menu::PRESET_COUNT {
-                return op_fail(format!("no eq preset {index}"));
-            }
+        Op::SetEqPreset(name) => {
+            // resolved here rather than at lowering time, because the
+            // saved curves only exist at runtime; `eq::resolve` reads
+            // built-ins first, then the saved list, same precedence the
+            // eq menu shows them in.
+            let saved = &ctx.actx.cfg.eq_custom_presets;
+            let Some((source, _)) = eq::resolve(&name, saved) else {
+                return op_fail(eq::resolve_failure(&name, saved));
+            };
+            // `apply_eq_row` speaks eq-menu rows, which is exactly
+            // built-ins then saved; `eq_menu::cursor` is the inverse of
+            // this and a test pins the two agreeing.
+            let row = match source {
+                eq::Source::Builtin(i) => i,
+                eq::Source::Saved(i) => ui::eq_menu::PRESET_COUNT + i,
+            };
             apply_eq_row(
                 ctx.actx.app,
                 ctx.actx.player,
                 ctx.actx.notifications,
-                &ctx.actx.cfg.eq_custom_presets,
-                index,
+                saved,
+                row,
             );
             op_done()
         }
@@ -1959,6 +1962,13 @@ fn run_shellsong_op(op: Op, ctx: &mut ShellsongCtx) -> (Dispatch, Report) {
                 None => op_fail(format!("no page for '{}'", item.primary_name())),
             }
         }
+        Op::ClearConsole => {
+            // the report line is pushed after this returns, so the
+            // console ends up holding exactly one line saying what
+            // happened rather than looking like it crashed.
+            ctx.console.lines.clear();
+            op_done()
+        }
         Op::ClearQueue => {
             // mpv's own `playlist-clear` keeps the file that is
             // playing and drops the rest, which is exactly what
@@ -2019,7 +2029,11 @@ fn run_shellsong_op(op: Op, ctx: &mut ShellsongCtx) -> (Dispatch, Report) {
         Op::LoadQueue(name) => {
             let clients = shellsong_host::clients_of(&ctx.actx.app.corpus);
             match queues::load(&name, &clients) {
-                None => op_fail(format!("no saved queue called '{name}'")),
+                None => op_fail(namehint::unknown(
+                    "saved queue",
+                    &name,
+                    queues::list().iter().map(String::as_str),
+                )),
                 Some(items) if items.is_empty() => {
                     op_fail(format!("nothing in '{name}' could be found any more"))
                 }
@@ -2214,27 +2228,18 @@ fn trigger_downloads(
     }
 }
 
-/// Current output level, 0..1, for the now-playing level meter.
-/// Best-effort: reads the `astats` tap `build_af_filter` (eq.rs) adds
-/// to the end of the af chain, via mpv's `af-metadata/<label>/...`
-/// property. If that property path doesn't resolve the way expected
-/// (wrong mpv version, filter not actually in the graph yet, af-
-/// metadata represented differently than guessed), this falls back to
-/// a calm idle breathe instead of silently showing a dead meter,
-/// driven off `elapsed` (time since app start) like every other
+/// Current output level, 0..1, for the now-playing level meter. Reads
+/// the `astats` tap `build_af_filter` (eq.rs) puts at the end of the af
+/// chain, which mpv pushes (`mpv::PROP_LEVEL_RMS`) rather than being
+/// asked for: this used to be a blocking IPC round trip per frame. No
+/// fresh reading (paused, stopped, or an mpv that doesn't resolve the
+/// property) falls back to a calm idle breathe instead of silently
+/// showing a dead meter, driven off `elapsed` like every other
 /// animation.
-fn audio_level(player: &mpv::Mpv, elapsed: Duration) -> f32 {
-    let key = format!(
-        "af-metadata/{}/lavfi.astats.Overall.RMS_level",
-        eq::LEVEL_METADATA_LABEL
-    );
-    if let Some(db) = player.get_property(&key).ok().and_then(|v| v.as_f64()) {
-        // RMS level is dBFS, roughly -60 (near silent) to 0 (full
-        // scale); map that range to 0..1 rather than guessing a
-        // narrower one that'd clip real audio's dynamic range.
-        return ((db as f32 + 60.0) / 60.0).clamp(0.0, 1.0);
-    }
-    (anim::pulse(elapsed, anim::LEVEL_FALLBACK_PERIOD) * 0.6 + 0.05).clamp(0.0, 1.0)
+fn audio_level(playback: &mpv::Playback, elapsed: Duration) -> f32 {
+    playback.level().unwrap_or_else(|| {
+        (anim::pulse(elapsed, anim::LEVEL_FALLBACK_PERIOD) * 0.6 + 0.05).clamp(0.0, 1.0)
+    })
 }
 
 /// How often the background thread (see `spawn_background_sync`)
@@ -2259,11 +2264,18 @@ fn sweep_cache(cache: &Arc<Mutex<CacheIndex>>, eviction_days: u64) {
     }
 }
 
-/// How often the embedded video pane pulls a fresh frame from mpv;
-/// each pull is an IPC round-trip plus a base64 decode, not free, and
-/// the ascii/halfblock rendering it feeds was never going to look
-/// smooth at real video frame rates anyway.
+/// How often the frame pump pulls a fresh frame from mpv; each pull is
+/// an IPC round-trip plus a base64 decode, all of it on the pump's own
+/// thread, so this only sets how smooth the pane looks, never whether
+/// the UI stalls.
 const VIDEO_FRAME_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Longest edge the pump scales a captured frame down to, or `None` for
+/// the source resolution. `None` today because the pane's rasterizer
+/// averages over every source pixel, and changing that changes what is
+/// drawn; the knob is here for the renderer being built on `perf/art`,
+/// which will want the frame already near its cell grid.
+const VIDEO_FRAME_MAX_EDGE: Option<u32> = None;
 
 fn now_playing_is_video(now_playing: &Option<SearchItem>) -> bool {
     matches!(now_playing, Some(SearchItem::LocalVideo { .. }))
@@ -2317,6 +2329,14 @@ fn save_config(cfg: &config::Config, notifications: &mut Notifications) {
 /// those is `adjust_eq_band`'s job. Deliberately not wired to j/k:
 /// this overwrites all ten gains, which is not something plain
 /// navigation should ever do.
+/// Saved eq curve names, for shellsong's `eq()` completion. Built
+/// fresh per keystroke like the corpus candidates are; the list is a
+/// handful of short strings, so cloning beats threading a borrow
+/// through `CorpusCandidates`'s lifetime.
+fn eq_preset_names(saved: &eq::CustomPresets) -> Vec<String> {
+    saved.iter().map(|p| p.name.clone()).collect()
+}
+
 fn apply_eq_row(
     app: &mut app::App,
     player: &mpv::Mpv,
@@ -2853,10 +2873,27 @@ impl FetchedCatalog {
 /// Pings before fetching; a typo'd url/password surfaces as an error
 /// rather than silently returning an empty catalog. Pure network I/O,
 /// safe to call from any thread.
+/// One catalog fetch's outcome. A panicked thread and a failed request
+/// are the same thing to the caller: we do not know what this server
+/// has, so nothing may be reconciled against it.
+fn fetched<T>(
+    joined: thread::Result<anyhow::Result<Vec<T>>>,
+    what: &str,
+) -> Result<Vec<T>, String> {
+    match joined {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(format!("{what} failed: {e}")),
+        Err(_) => Err(format!("{what} panicked")),
+    }
+}
+
 fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatalog, String> {
-    let client = subsonic::Client::new(nav)
-        .and_then(|c| c.ping().map(|_| c))
-        .map_err(|e| format!("connection failed: {e}"))?;
+    // no `ping` first: a failing fetch below says everything a ping
+    // would have, and the ping was a whole extra serial round trip on
+    // every pass (one per server per 45s sync, so ~80 wasted requests
+    // an hour). `Client::new` can still fail on a bad config, which is
+    // local and free to check.
+    let client = subsonic::Client::new(nav).map_err(|e| format!("connection failed: {e}"))?;
     // getArtists returns everything in one call, getAlbumList2 is
     // paginated (see subsonic.rs). songs stay fetched on demand (per
     // album/playlist/artist opened) rather than indexed eagerly; a
@@ -2865,16 +2902,29 @@ fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatal
     // independent requests; fetching them concurrently instead of one
     // after another is most of the difference between this feeling
     // instant and feeling like three round-trips stacked up.
+    //
+    // every one of these is propagated, never defaulted to empty.
+    // `Corpus::reconcile_server` drops what a server no longer lists,
+    // so an empty list is a *claim* that the server has nothing; a
+    // failed request that defaulted to empty would make a network blip
+    // delete that server's whole library from the corpus and then
+    // persist the deletion through `save_catalog`.
     let (artists, albums, playlists) = thread::scope(|scope| {
-        let artists = scope.spawn(|| client.all_artists().unwrap_or_default());
-        let albums = scope.spawn(|| client.all_albums().unwrap_or_default());
-        let playlists = scope.spawn(|| client.playlists().unwrap_or_default());
+        let artists = scope.spawn(|| client.all_artists());
+        let albums = scope.spawn(|| client.all_albums());
+        let playlists = scope.spawn(|| client.playlists());
         (
-            artists.join().unwrap_or_default(),
-            albums.join().unwrap_or_default(),
-            playlists.join().unwrap_or_default(),
+            fetched(artists.join(), "artists"),
+            fetched(albums.join(), "albums"),
+            fetched(playlists.join(), "playlists"),
         )
     });
+    let (artists, albums, playlists) = (artists?, albums?, playlists?);
+    // persisted here, not where it gets merged: every caller of this
+    // is already off the main thread (or already blocking on the
+    // network), and serializing a catalog is not something to spend a
+    // frame on. best-effort, and a no-op when nothing changed.
+    let _ = cache::save_catalog(&client, &artists, &albums, &playlists);
     Ok(FetchedCatalog {
         client: Arc::new(client),
         artists,
@@ -2888,15 +2938,14 @@ fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatal
 /// (startup, manual reconnect, add-profile, background auto-sync) gets
 /// it for free instead of having to remember it.
 fn merge_catalog_into_app(app: &mut app::App, catalog: FetchedCatalog) {
-    app.corpus.add_subsonic_search_result(
-        subsonic::SearchResult {
+    app.corpus.reconcile_server(
+        cache::ServerCatalog {
             artists: catalog.artists,
             albums: catalog.albums,
-            songs: Vec::new(),
+            playlists: catalog.playlists,
         },
         &catalog.client,
     );
-    app.corpus.add_playlists(catalog.playlists, &catalog.client);
     app.resync_results();
 }
 
@@ -3197,6 +3246,13 @@ fn main() -> anyhow::Result<()> {
     // channel can never be reused.
     let (scan_tx, mut scan_rx) = mpsc::channel::<library::ScanBatch>();
     library::spawn_scan(cfg.library_paths.clone(), scan_tx);
+    // every configured server's catalog as of its last session, read
+    // straight off the disk so the first frame has a full library
+    // rather than "connecting to navidrome..."; started here so the
+    // read overlaps mpv's spawn below, taken where `app` is built.
+    // the background sync reconciles it against what each server
+    // really has. see `search::spawn_warm_from_cache`.
+    let warming_corpus = search::spawn_warm_from_cache(&cfg.navidrome_servers);
 
     let player = mpv::Mpv::spawn()?;
     trace::mark("mpv spawned");
@@ -3212,7 +3268,7 @@ fn main() -> anyhow::Result<()> {
     // (universal navigation primitives, applied the same way
     // everywhere rather than individually named commands).
     let mut keymap = Keymap::from_overrides(&cfg.keybinds);
-    let mut app = app::App::new(search::Corpus::new());
+    let mut app = app::App::new(warming_corpus.take());
     // so the first frame says "scanning" rather than "no local music
     // found"; cleared when the scan thread drops its sender. the
     // server equivalent is set below.
@@ -3260,7 +3316,7 @@ fn main() -> anyhow::Result<()> {
     let mut playback = mpv::Playback::default();
     // covers for tracks the open browse view does not have art for;
     // fetched on its own thread, see `coverart`.
-    let mut cover_art = coverart::Cache::default();
+    let mut cover_art = coverart::Cache::new(cfg.cache_eviction_days);
     // the player's own image protocol, separate from the browse
     // view's: they can be showing different albums at once, and
     // sharing one protocol made the player draw whatever album a view
@@ -3289,14 +3345,22 @@ fn main() -> anyhow::Result<()> {
     // playing or a capture hasn't landed yet. 'v' expands its pane
     // from main_content to the whole workspace (sidebar included),
     // never the bottom bar.
-    let mut video_frame: Option<image::DynamicImage> = None;
+    let mut video_frame: Option<std::sync::Arc<image::DynamicImage>> = None;
     let mut video_fullscreen = false;
-    // throttles screenshot-raw calls (an IPC round-trip each time) to
-    // a modest rate rather than once per render tick.
-    let mut last_video_frame_at = Instant::now() - VIDEO_FRAME_INTERVAL;
+    // captures and decodes frames on its own thread and its own ipc
+    // connection, so the render path only ever reads the newest one
+    // (see `mpv::FramePump`).
+    let frame_pump = player.frame_pump().ok();
+    let mut video_frames_unsupported = false;
     // full keybind reference, opened with '?'; takes over the whole
     // screen the same way onboarding/the nav manager do.
     let mut help_open = false;
+    // the table is taller than a 24-row terminal, so it scrolls rather
+    // than letting its last column overflow and be clipped (which ate
+    // the section holding how to quit). Reset on open; clamped against
+    // `help_scroll_max`, which only the draw knows.
+    let mut help_scroll: usize = 0;
+    let mut help_scroll_max: usize = 0;
     // 't': a small centered box over whatever's already on screen
     // (not a full takeover like help_open), for live subtitle style
     // tweaks instead of only the ,/. delay-only adjustment.
@@ -3645,14 +3709,11 @@ fn main() -> anyhow::Result<()> {
         // reads this, so none of them can show a track mpv isn't
         // actually playing.
         let mut now_playing = play_queue.current().cloned();
-        // take delivery of any cover that finished, then ask for the
-        // playing track's if it is not already in hand. both are
-        // no-ops once an album's cover has arrived, so this is cheap
-        // to run every frame.
-        cover_art.poll();
-        if let Some(item) = &now_playing {
-            cover_art.request(item);
-        }
+        // take delivery of any cover that finished, ask for the
+        // playing track's if it is not already in hand, and warm the
+        // next queued track's. all no-ops once an album's cover has
+        // arrived, so this is cheap to run every frame.
+        cover_art.tick(now_playing.as_ref(), play_queue.peek_next());
         // which cover the player would draw: the open view's when the
         // playing track is one of its own (already decoded at the
         // right size), else whatever the background fetch has.
@@ -3717,12 +3778,13 @@ fn main() -> anyhow::Result<()> {
             if let Some(ob) = &onboarding {
                 match ob.step {
                     Step::Welcome => f.render_widget(WelcomeView, area),
-                    Step::Controls => f.render_widget(ControlsView, area),
+                    Step::Controls => f.render_widget(ControlsView { keymap: &keymap }, area),
                     Step::Navidrome => {
                         f.render_widget(
                             LoginView {
                                 form: &ob.login,
                                 message: &ob.login_message,
+                                step: Some(ui::onboarding::NAVIDROME_STEP),
                             },
                             area,
                         );
@@ -3776,6 +3838,7 @@ fn main() -> anyhow::Result<()> {
                             LoginView {
                                 form,
                                 message: &nm.message,
+                                step: None,
                             },
                             area,
                         );
@@ -3791,13 +3854,17 @@ fn main() -> anyhow::Result<()> {
             }
 
             if help_open {
-                f.render_widget(
-                    ui::help::HelpOverlay {
-                        keymap: &keymap,
-                        mouse: cfg.mouse,
-                    },
-                    area,
-                );
+                let overlay = ui::help::HelpOverlay {
+                    keymap: &keymap,
+                    mouse: cfg.mouse,
+                    scroll: help_scroll,
+                };
+                // recorded off the frame being drawn, same contract as
+                // the hit map: the next key or notch is clamped against
+                // the layout the user was actually looking at.
+                help_scroll_max = overlay.max_scroll(area);
+                help_scroll = help_scroll.min(help_scroll_max);
+                f.render_widget(overlay, area);
                 return;
             }
 
@@ -3989,7 +4056,7 @@ fn main() -> anyhow::Result<()> {
                 // picture that's already moving.
                 f.render_widget(
                     AsciiArt {
-                        image: video_frame.as_ref(),
+                        image: video_frame.as_deref(),
                         cell_aspect: aspect,
                     },
                     main_content,
@@ -4009,6 +4076,7 @@ fn main() -> anyhow::Result<()> {
                 let player_view = PlayerView {
                     title: &label(item),
                     art: playing_art,
+                    art_key: &coverart::art_key(item),
                     art_mode,
                     cell_aspect: aspect,
                     // mid-drag the screen draws the pending target,
@@ -4057,7 +4125,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                level_history.push(audio_level(&player, frame_elapsed));
+                level_history.push(audio_level(&playback, frame_elapsed));
                 let max_history = main_content.width.max(1) as usize;
                 if level_history.len() > max_history {
                     level_history.drain(..level_history.len() - max_history);
@@ -4217,7 +4285,7 @@ fn main() -> anyhow::Result<()> {
             if video_fullscreen && show_full_player && now_playing_is_video(&now_playing) {
                 f.render_widget(
                     AsciiArt {
-                        image: video_frame.as_ref(),
+                        image: video_frame.as_deref(),
                         cell_aspect: aspect,
                     },
                     top,
@@ -4564,7 +4632,9 @@ fn main() -> anyhow::Result<()> {
         if crossfade_enabled && now_playing.is_some() {
             if let Some(started) = fade_in_started_at {
                 let t = (started.elapsed().as_secs_f64() / cfg.crossfade_seconds).clamp(0.0, 1.0);
-                let _ = player.set_volume(base_volume * t);
+                // a ramp step per frame, so it is sent without waiting
+                // for mpv's reply; see `mpv::set_volume_nowait`.
+                let _ = player.set_volume_nowait(base_volume * t);
                 if t >= 1.0 {
                     fade_in_started_at = None;
                 }
@@ -4575,7 +4645,7 @@ fn main() -> anyhow::Result<()> {
                     let remaining = duration - elapsed;
                     if remaining <= cfg.crossfade_seconds {
                         let t = (remaining / cfg.crossfade_seconds).clamp(0.0, 1.0);
-                        let _ = player.set_volume(base_volume * t);
+                        let _ = player.set_volume_nowait(base_volume * t);
                     }
                 }
             }
@@ -4606,15 +4676,23 @@ fn main() -> anyhow::Result<()> {
         // actually on screen right now would be wasted IPC/decode
         // work the moment it's covered by the browse view or help
         // overlay; only bother while it'd actually be visible.
-        if now_playing_is_video(&now_playing) && !help_open {
-            if last_video_frame_at.elapsed() >= VIDEO_FRAME_INTERVAL {
-                if let Ok(frame) = player.screenshot_raw() {
-                    video_frame = frame.into_image().map(image::DynamicImage::ImageRgb8);
-                }
-                last_video_frame_at = Instant::now();
+        if let Some(pump) = &frame_pump {
+            pump.set_capture(mpv::Capture {
+                on: now_playing_is_video(&now_playing) && !help_open,
+                interval: VIDEO_FRAME_INTERVAL,
+                max_edge: VIDEO_FRAME_MAX_EDGE,
+            });
+            video_frame = pump.latest().map(|f| f.image);
+            // said once per session: this mpv cannot hand frames over
+            // json ipc at all, so the pane would otherwise just stay
+            // empty with no explanation.
+            if pump.state() == mpv::PumpState::Unsupported && !video_frames_unsupported {
+                video_frames_unsupported = true;
+                notifications.push(
+                    Severity::Alert,
+                    "video frames: this mpv won't return screenshot-raw over ipc",
+                );
             }
-        } else {
-            video_frame = None;
         }
 
         // the terminal's answer to the graphics probe, or `None` if it
@@ -4870,7 +4948,7 @@ fn main() -> anyhow::Result<()> {
         // fade whether or not the console is still on screen.
         let shellsong_now = start.elapsed();
         if let Some(ramp) = shellsong_fade {
-            let _ = player.set_volume(ramp.level_at(shellsong_now));
+            let _ = player.set_volume_nowait(ramp.level_at(shellsong_now));
             if ramp.finished(shellsong_now) {
                 shellsong_fade = None;
             }
@@ -5078,6 +5156,7 @@ fn main() -> anyhow::Result<()> {
                         &CorpusCandidates {
                             corpus: &app.corpus,
                             saved: &saved_queues,
+                            eq_presets: eq_preset_names(&cfg.eq_custom_presets),
                         },
                     );
                 } else if !help_open {
@@ -5107,6 +5186,24 @@ fn main() -> anyhow::Result<()> {
                     col: m.column,
                     row: m.row,
                 };
+                // The help overlay is the one screen-covering tier with
+                // more content than screen, so a notch over it scrolls
+                // instead of being swallowed: "the wheel does what j/k
+                // do on this surface" (docs/input-precedence.md).
+                // Handled before `hit::act` so `Modal::covers_screen`
+                // stays a plain swallow with no wheel exception in it.
+                if help_open {
+                    match click.kind {
+                        hit::Kind::WheelDown => {
+                            help_scroll = (help_scroll + hit::WHEEL_ROWS).min(help_scroll_max);
+                        }
+                        hit::Kind::WheelUp => {
+                            help_scroll = help_scroll.saturating_sub(hit::WHEEL_ROWS);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 let act = hit::act(&hits, click, dragging);
                 // a click lands somewhere specific, so unlike a key it
                 // cannot leak into a text box; what it does instead is
@@ -5491,6 +5588,22 @@ fn main() -> anyhow::Result<()> {
                 if help_open {
                     if key.code == KeyCode::Esc || key.code == keymap.get(KeyAction::OpenHelp) {
                         help_open = false;
+                    } else {
+                        // j/k here for the same reason they scroll the
+                        // lyrics pane: the surface has a content offset
+                        // rather than a selection. Clamped to the
+                        // layout the last frame actually produced.
+                        match key.code {
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                help_scroll = (help_scroll + 1).min(help_scroll_max);
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                help_scroll = help_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Char('G') | KeyCode::End => help_scroll = help_scroll_max,
+                            KeyCode::Char('g') | KeyCode::Home => help_scroll = 0,
+                            _ => {}
+                        }
                     }
                     continue;
                 }
@@ -5507,6 +5620,7 @@ fn main() -> anyhow::Result<()> {
                     let cand = CorpusCandidates {
                         corpus: &app.corpus,
                         saved: &saved_queues,
+                        eq_presets: eq_preset_names(&cfg.eq_custom_presets),
                     };
                     // the whole `KeyEvent`, not just `key.code`: the
                     // console reads ctrl for its accept key, which no
@@ -5582,6 +5696,9 @@ fn main() -> anyhow::Result<()> {
                 // text box at all.
                 if key.code == keymap.get(KeyAction::OpenHelp) {
                     help_open = true;
+                    // always opens at the top, so '?' twice is the same
+                    // screen both times.
+                    help_scroll = 0;
                     continue;
                 }
 
@@ -7188,6 +7305,42 @@ mod startup_tests {
             let msg = loading_message(scanning, syncing).unwrap();
             assert!(msg.len() <= 30, "{msg:?} would be truncated in the sidebar");
         }
+    }
+}
+
+#[cfg(test)]
+mod catalog_fetch_tests {
+    use super::*;
+
+    /// The load-bearing one. `Corpus::reconcile_server` treats an empty
+    /// catalog as "this server has nothing" and drops that server's
+    /// items, so a failed request must never arrive as an empty list.
+    /// It used to: each fetch was `unwrap_or_default()`, which turned a
+    /// network blip into "delete this server's whole library" and then
+    /// persisted it via `save_catalog`.
+    #[test]
+    fn a_failed_fetch_is_an_error_not_an_empty_catalog() {
+        let failed: thread::Result<anyhow::Result<Vec<u8>>> =
+            Ok(Err(anyhow::anyhow!("502 bad gateway")));
+        let got = fetched(failed, "artists");
+        assert!(got.is_err(), "a failed fetch must not read as empty");
+        assert!(got.unwrap_err().contains("502"), "the cause should survive");
+    }
+
+    #[test]
+    fn a_panicked_fetch_thread_is_also_an_error() {
+        let panicked: thread::Result<anyhow::Result<Vec<u8>>> =
+            Err(Box::new("thread died") as Box<dyn std::any::Any + Send>);
+        assert!(fetched(panicked, "albums").is_err());
+    }
+
+    /// A server that genuinely has nothing is still a legitimate answer
+    /// and must stay distinguishable from a failure, since that is the
+    /// case reconciliation exists to handle.
+    #[test]
+    fn a_genuinely_empty_server_still_succeeds() {
+        let empty: thread::Result<anyhow::Result<Vec<u8>>> = Ok(Ok(Vec::new()));
+        assert_eq!(fetched(empty, "playlists").unwrap(), Vec::<u8>::new());
     }
 }
 

@@ -1,22 +1,25 @@
-use image::GenericImageView;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
-use crate::theme::shade;
+use crate::ui::raster::{self, Fit};
 
-/// Grayscale ascii-block rasterization of an album's cover art, the
-/// "pure-TUI purity" default mode. Deliberately resamples straight
-/// from the source image at whatever `area` actually is on every
-/// render call rather than caching a fixed-size grid: scale the
-/// terminal and the next frame resamples at the new resolution for
-/// free, no explicit resize handling needed.
+/// Grayscale half-block rasterization of an album's cover art, the
+/// "pure-TUI purity" default mode. The rasterization itself lives in
+/// `ui::raster`, which knows nothing about covers; this is just the
+/// widget wrapper that hands it a rect.
+///
+/// Deliberately resamples on every render call rather than caching a
+/// fixed-size grid: scale the terminal and the next frame resamples at
+/// the new resolution for free, no explicit resize handling needed.
+/// That is affordable because `raster` keeps its buffers and bounds
+/// the work per output sample; see docs/raster.md for the numbers.
 pub struct AsciiArt<'a> {
     pub image: Option<&'a image::DynamicImage>,
     /// The terminal's real cell height:width ratio (see
-    /// `main::cell_aspect`); must match whatever `browse::layout` used
-    /// to size the rect this renders into, or the two disagreeing
-    /// assumptions are exactly what makes the art look non-square.
+    /// `main::cell_aspect`); together with the rect's own shape it
+    /// decides where a non-square image lands, so the art keeps its
+    /// proportions instead of being stretched to whatever the rect is.
     pub cell_aspect: f32,
 }
 
@@ -25,74 +28,74 @@ impl Widget for AsciiArt<'_> {
         let Some(img) = self.image else {
             return;
         };
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let (iw, ih) = img.dimensions();
-        if iw == 0 || ih == 0 {
-            return;
-        }
-
-        // terminal cells are taller than wide by `cell_aspect`;
-        // sampling one cell as a single square pixel leaves the image
-        // looking vertically squashed. sample two vertical sub-rows
-        // per cell instead and render them as an upper half block
-        // (U+2580): foreground paints the top sub-row, background the
-        // bottom, doubling the effective vertical resolution so each
-        // pair of sub-rows covers the same physical height as one
-        // sub-row's width, same ratio `browse::layout` sized this
-        // rect with.
-        let out_w = area.width as u32;
-        let out_h = (area.height as f32 * self.cell_aspect).round() as u32;
-
-        for row in 0..area.height {
-            for col in 0..area.width {
-                let top = sample_luma(img, iw, ih, out_w, out_h, col as u32, row as u32 * 2);
-                let bottom = sample_luma(img, iw, ih, out_w, out_h, col as u32, row as u32 * 2 + 1);
-
-                let x = area.x + col;
-                let y = area.y + row;
-                if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_char('▀');
-                    cell.set_fg(shade(top));
-                    cell.set_bg(shade(bottom));
-                }
-            }
-        }
+        // one kept rasterizer per render thread, so a steady frame
+        // rate allocates nothing.
+        raster::with_scratch(|r| r.render(img, area, self.cell_aspect, Fit::Contain, buf));
     }
 }
 
-/// Average luma (0..1) of the source-image region corresponding to
-/// one cell of an `out_w` x `out_h` virtual sampling grid.
-fn sample_luma(
-    img: &image::DynamicImage,
-    iw: u32,
-    ih: u32,
-    out_w: u32,
-    out_h: u32,
-    col: u32,
-    row: u32,
-) -> f32 {
-    let sx0 = (col * iw) / out_w;
-    let sx1 = (((col + 1) * iw) / out_w).clamp(sx0 + 1, iw);
-    let sy0 = (row * ih) / out_h;
-    let sy1 = (((row + 1) * ih) / out_h).clamp(sy0 + 1, ih);
+/// `AsciiArt` for a picture that does not change between frames:
+/// identical rasterization, but skipped outright when neither the
+/// picture nor the rect's size has moved since the last frame (see
+/// `raster::Memo`). Painting still happens every frame.
+///
+/// `key` names the *image*, which is the whole invalidation story:
+/// album art passes `coverart::art_key`, the same name the
+/// `ratatui-image` protocol cache is already rebuilt on, so a cover
+/// can only ever be reused for the album it was fetched for.
+pub struct CachedArt<'a> {
+    pub image: Option<&'a image::DynamicImage>,
+    pub cell_aspect: f32,
+    pub key: &'a str,
+}
 
-    let mut sum = 0u64;
-    let mut count = 0u64;
-    for y in sy0..sy1 {
-        for x in sx0..sx1 {
-            let p = img.get_pixel(x, y);
-            // standard luma weights; alpha isn't factored in since
-            // cover art is opaque in practice.
-            let luma = 0.2126 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.0722 * p[2] as f64;
-            sum += luma as u64;
-            count += 1;
-        }
+impl Widget for CachedArt<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let Some(img) = self.image else {
+            return;
+        };
+        raster::with_memo(|m| {
+            m.render(self.key, img, area, self.cell_aspect, Fit::Contain, buf);
+        });
     }
-    if count > 0 {
-        (sum as f32 / count as f32) / 255.0
-    } else {
-        0.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::raster::HALF_BLOCK;
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, char_at};
+    use image::{Rgb, RgbImage};
+
+    fn cover(w: u32, h: u32, v: u8) -> image::DynamicImage {
+        image::DynamicImage::ImageRgb8(RgbImage::from_pixel(w, h, Rgb([v, v, v])))
+    }
+
+    #[test]
+    fn no_image_draws_nothing() {
+        let mut buf = buffer(6, 3);
+        AsciiArt {
+            image: None,
+            cell_aspect: 2.0,
+        }
+        .render(Rect::new(0, 0, 6, 3), &mut buf);
+        assert_eq!(char_at(&buf, 0, 0), '.');
+    }
+
+    #[test]
+    fn a_square_cover_fills_a_square_rect_with_half_blocks() {
+        let mut buf = buffer(10, 6);
+        let rect = Rect::new(1, 1, 8, 4);
+        AsciiArt {
+            image: Some(&cover(300, 300, 160)),
+            cell_aspect: 2.0,
+        }
+        .render(rect, &mut buf);
+        for y in rect.y..rect.y + rect.height {
+            for x in rect.x..rect.x + rect.width {
+                assert_eq!(char_at(&buf, x, y), HALF_BLOCK);
+            }
+        }
+        assert_outside_untouched(&buf, rect);
     }
 }

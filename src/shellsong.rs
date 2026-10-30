@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -287,7 +288,7 @@ pub enum Op {
     SpeedUp,
     SpeedDown,
     /// index into `eq::PRESETS`.
-    SetEqPreset(usize),
+    SetEqPreset(String),
     ToggleCrossfade,
     /// replace the query and re-filter, exactly as typing it would.
     Search(String),
@@ -309,6 +310,11 @@ pub enum Op {
     /// open the page a result belongs to (an artist's or album's own
     /// view); `view(q, ...)` resolves to this.
     OpenPage(Target),
+    /// Wipes the console's own scrollback. Console-local: the host
+    /// clears `Console::lines` and nothing else moves, which is why it
+    /// is an op rather than something the parser handles, so it still
+    /// shows up in `dry` like every other command.
+    ClearConsole,
     ClearQueue,
     /// 1-based queue positions, descending so the host can remove in
     /// order without reindexing.
@@ -354,9 +360,7 @@ impl Op {
             Op::SetSpeed(s) => format!("speed: {s}x"),
             Op::SpeedUp => "speed up".into(),
             Op::SpeedDown => "speed down".into(),
-            Op::SetEqPreset(i) => {
-                format!("eq: {}", eq::PRESETS.get(*i).map(|p| p.name).unwrap_or("?"))
-            }
+            Op::SetEqPreset(name) => format!("eq: {name}"),
             Op::ToggleCrossfade => "crossfade toggled".into(),
             Op::Search(q) => format!("search: {q}"),
             Op::MoveSelection(d) if *d < 0 => "up".into(),
@@ -373,6 +377,7 @@ impl Op {
             Op::Star { on: false, .. } => "unstarred".into(),
             Op::Download(_) => "downloading".into(),
             Op::OpenPage(_) => "opened its page".into(),
+            Op::ClearConsole => "scrollback cleared".into(),
             Op::ClearQueue => "queue cleared".into(),
             Op::RemoveFromQueue(v) => format!("removed {} from the queue", v.len()),
             Op::GotoQueue(n) => format!("jumped to queue {n}"),
@@ -424,6 +429,10 @@ pub enum Ty {
     SavedName,
     /// the name of a command, for `help`.
     CommandName,
+    /// the name of an eq curve, built-in or saved. A free name rather
+    /// than a `Words` set because the saved half only exists at
+    /// runtime; see `Completes::EqPresets`.
+    EqName,
     /// unsigned time literal: absolute position.
     Pos,
     /// signed time literal: a relative offset.
@@ -463,32 +472,41 @@ pub enum Words {
 impl Words {
     /// What completion offers and `help()` prints: canonical spellings
     /// only, so the list stays readable even where the parser accepts
-    /// several words for one thing.
-    pub fn options(self) -> Vec<&'static str> {
-        match self {
-            Words::Position => vec!["front", "back"],
-            Words::LoopMode => vec!["one", "all", "off"],
-            Words::Switch => vec!["on", "off"],
-            Words::EqPreset => eq::PRESETS.iter().map(|p| p.name).collect(),
-            Words::ViewTarget => VIEW_QUERY_WORDS[..1]
+    /// several words for one thing. Borrowed rather than built, because
+    /// completion asks for a set on every keystroke.
+    pub fn options(self) -> &'static [&'static str] {
+        static EQ_PRESETS: LazyLock<Vec<&'static str>> =
+            LazyLock::new(|| eq::PRESETS.iter().map(|p| p.name).collect());
+        static VIEW_TARGETS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+            VIEW_QUERY_WORDS[..1]
                 .iter()
                 .copied()
                 .chain(VIEW_NAMES.iter().filter(|v| v.canonical).map(|v| v.word))
-                .collect(),
-            Words::FadeDir => vec!["in", "out"],
+                .collect()
+        });
+        match self {
+            Words::Position => &["front", "back"],
+            Words::LoopMode => &["one", "all", "off"],
+            Words::Switch => &["on", "off"],
+            Words::EqPreset => &EQ_PRESETS,
+            Words::ViewTarget => &VIEW_TARGETS,
+            Words::FadeDir => &["in", "out"],
         }
     }
 
     /// Every spelling the parser accepts, which is a superset of
     /// `options`; validation reads this so an alias still parses even
     /// though completion does not advertise it.
-    fn accepts(self) -> Vec<&'static str> {
-        match self {
-            Words::ViewTarget => VIEW_QUERY_WORDS
+    fn accepts(self) -> &'static [&'static str] {
+        static VIEW_ACCEPTS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+            VIEW_QUERY_WORDS
                 .iter()
                 .copied()
                 .chain(VIEW_NAMES.iter().map(|v| v.word))
-                .collect(),
+                .collect()
+        });
+        match self {
+            Words::ViewTarget => &VIEW_ACCEPTS,
             other => other.options(),
         }
     }
@@ -509,6 +527,10 @@ pub enum Completes {
     CommandNames,
     /// the host's saved queue names.
     SavedQueues,
+    /// built-in eq curves plus whatever the user has saved. Not a
+    /// `Words` set: the saved half only exists at runtime, which is the
+    /// whole reason `eq()` could not reach it before.
+    EqPresets,
     /// nothing insertable; show this instead, and never accept it.
     Hint(&'static str),
 }
@@ -528,6 +550,7 @@ impl Ty {
         match self {
             Ty::Terms | Ty::Query => Completes::CorpusTerms,
             Ty::SavedName => Completes::SavedQueues,
+            Ty::EqName => Completes::EqPresets,
             Ty::CommandName | Ty::Call => Completes::CommandNames,
             Ty::Words(w) => Completes::Words(w),
             Ty::NewName => Completes::Hint("a name to save it under"),
@@ -548,12 +571,12 @@ impl Ty {
     /// a type that accepts keywords without a way to list them is the
     /// surprising half of the pair.
     #[allow(dead_code)]
-    pub fn options(self) -> Vec<&'static str> {
+    pub fn options(self) -> &'static [&'static str] {
         match self {
             Ty::Words(w) => w.options(),
-            Ty::Speed => vec!["up", "down", "reset"],
-            Ty::Duration => vec!["off"],
-            _ => Vec::new(),
+            Ty::Speed => &["up", "down", "reset"],
+            Ty::Duration => &["off"],
+            _ => &[],
         }
     }
 
@@ -563,6 +586,7 @@ impl Ty {
             Ty::Query => "something to search for".into(),
             Ty::NewName => "a name".into(),
             Ty::SavedName => "the name of a saved queue".into(),
+            Ty::EqName => "an eq preset name".into(),
             Ty::CommandName => "a command name".into(),
             Ty::Pos => "an unsigned position like 30s, 1m20s or 50%".into(),
             Ty::Offset => "a signed offset like +30s or -10s".into(),
@@ -747,7 +771,7 @@ pub const COMMANDS: &[Command] = &[
     cmd(
         "eq",
         &["equalizer"],
-        &[req("preset", Ty::Words(Words::EqPreset))],
+        &[req("preset", Ty::EqName)],
         &[],
         "apply an eq preset; view(eq) opens the menu",
     ),
@@ -789,8 +813,15 @@ pub const COMMANDS: &[Command] = &[
         "insert next (front) or append (back)",
     ),
     cmd(
+        "clear",
+        &["cls"],
+        NONE,
+        &[],
+        "clear this console's scrollback",
+    ),
+    cmd(
         "clear_queue",
-        &["clear", "flush"],
+        &["qclear", "flush"],
         NONE,
         &[],
         "empty the queue",
@@ -914,29 +945,40 @@ pub const COMMANDS: &[Command] = &[
     ),
 ];
 
-/// Resolves a written name to a command plus the `kind=` value its
-/// suffix desugars to, if any.
-fn lookup(name: &str) -> Option<(&'static Command, Option<&'static str>)> {
-    if let Some(c) = COMMANDS
-        .iter()
-        .find(|c| c.name == name || c.aliases.contains(&name))
-    {
-        return Some((c, None));
-    }
-    for (suffix, kind) in KIND_SUFFIXES {
-        let Some(stem) = name.strip_suffix(suffix) else {
-            continue;
-        };
-        if let Some(c) = COMMANDS
-            .iter()
-            .find(|c| c.name == stem || c.aliases.contains(&stem))
-        {
-            if widenable(c) {
-                return Some((c, Some(kind)));
+/// Every written name, suffixed spellings included, to the command it
+/// resolves to and the `kind=` value the suffix desugars to. Built once:
+/// `site` resolves the enclosing name on every keystroke, and a linear
+/// scan of the table plus its alias lists was that whole cost.
+///
+/// A plain spelling is inserted before any suffixed one, so a direct
+/// name still wins over a collision the way the scan it replaced did.
+type Resolved = (&'static Command, Option<&'static str>);
+
+fn by_name() -> &'static HashMap<String, Resolved> {
+    static BY_NAME: LazyLock<HashMap<String, Resolved>> = LazyLock::new(|| {
+        let mut map: HashMap<String, Resolved> = HashMap::new();
+        for c in COMMANDS {
+            for name in std::iter::once(&c.name).chain(c.aliases) {
+                map.entry((*name).to_string()).or_insert((c, None));
             }
         }
-    }
-    None
+        for c in COMMANDS.iter().filter(|c| widenable(c)) {
+            for name in std::iter::once(&c.name).chain(c.aliases) {
+                for (suffix, kind) in KIND_SUFFIXES {
+                    map.entry(format!("{name}{suffix}"))
+                        .or_insert((c, Some(*kind)));
+                }
+            }
+        }
+        map
+    });
+    &BY_NAME
+}
+
+/// Resolves a written name to a command plus the `kind=` value its
+/// suffix desugars to, if any.
+fn lookup(name: &str) -> Option<Resolved> {
+    by_name().get(name).copied()
 }
 
 /// The `kind=` ladder widens *from songs*, so only a song-rooted
@@ -950,19 +992,22 @@ fn widenable(c: &Command) -> bool {
 /// Every written name the parser accepts, canonical and alias alike;
 /// what tab completion offers and what the did-you-mean suggestion
 /// searches.
-pub fn every_name() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = Vec::new();
-    for c in COMMANDS {
-        names.push(c.name);
-        names.extend_from_slice(c.aliases);
-    }
-    names.sort_unstable();
-    names
+pub fn every_name() -> &'static [&'static str] {
+    static NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+        let mut names: Vec<&'static str> = Vec::new();
+        for c in COMMANDS {
+            names.push(c.name);
+            names.extend_from_slice(c.aliases);
+        }
+        names.sort_unstable();
+        names
+    });
+    &NAMES
 }
 
 /// Closest known name to `name`, for "did you mean".
 fn did_you_mean(name: &str) -> Option<&'static str> {
-    closest(name, &every_name())
+    closest(name, every_name())
 }
 
 /// `strsim`, same dependency search.rs recovers typos with, but
@@ -982,6 +1027,15 @@ fn closest(name: &str, among: &[&'static str]) -> Option<&'static str> {
     // way down.
     hits.sort_by_key(|(score, c)| (std::cmp::Reverse(*score), c.len(), *c));
     hits.first().map(|(_, c)| *c)
+}
+
+/// `name(a, b)` off the cache rather than rebuilt: `site` wants the
+/// enclosing call's signature on every keystroke, and `signature`
+/// formats and joins to produce it.
+fn signature_of(c: &Command) -> String {
+    static SIGS: LazyLock<HashMap<&'static str, String>> =
+        LazyLock::new(|| COMMANDS.iter().map(|c| (c.name, c.signature())).collect());
+    SIGS.get(c.name).cloned().unwrap_or_else(|| c.signature())
 }
 
 /// `help()` output, generated from `COMMANDS`; canonical names only,
@@ -1667,12 +1721,20 @@ impl Call {
                 Some(Arg::Speed(SpeedArg::Reset)) => Op::SetSpeed(1.0),
                 _ => return None,
             },
-            "eq" => Op::SetEqPreset(self.keyword(Words::EqPreset).and_then(eq::index_of)?),
+            // the name travels as typed and is resolved at apply
+            // time against the live saved list, so a curve saved after
+            // this line was typed still resolves and `dry` can still
+            // print what was asked for.
+            "eq" => match first {
+                Some(Arg::Name(n)) => Op::SetEqPreset(n.clone()),
+                _ => return None,
+            },
             "crossfade" => Op::ToggleCrossfade,
             "search" => match first {
                 Some(Arg::Name(q)) => Op::Search(q.clone()),
                 _ => return None,
             },
+            "clear" => Op::ClearConsole,
             "clear_queue" => Op::ClearQueue,
             "remove" => match first {
                 Some(Arg::Indices(v)) => {
@@ -2112,7 +2174,7 @@ fn coerce(
         }
         // every free-text type parses identically; they differ only in
         // what they complete from (see `Ty::completes`).
-        Ty::Query | Ty::NewName | Ty::SavedName | Ty::CommandName => {
+        Ty::Query | Ty::NewName | Ty::SavedName | Ty::EqName | Ty::CommandName => {
             if text.starts_with('[') {
                 return Err(expected());
             }
@@ -2194,9 +2256,9 @@ fn coerce(
         // every accepted spelling parses, but an unrecognised one is
         // measured against the *canonical* list so the suggestion is
         // something worth typing.
-        Ty::Words(set) => match set.accepts().into_iter().find(|o| *o == text) {
+        Ty::Words(set) => match set.accepts().iter().copied().find(|o| *o == text) {
             Some(word) => Ok(Arg::Word(word)),
-            None => Err(bad(match closest(text, &set.options()) {
+            None => Err(bad(match closest(text, set.options()) {
                 Some(near) => format!(
                     "{}: unknown {} '{text}'; did you mean '{near}'?",
                     command.name, param.name
@@ -2395,6 +2457,12 @@ pub trait Candidates {
 
     /// Names of the saved queues `load_queue` could take.
     fn saved_queues(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Names of the user's saved eq curves, which `eq()` can take
+    /// alongside the built-ins.
+    fn eq_presets(&self) -> Vec<String> {
         Vec::new()
     }
 }
@@ -2703,26 +2771,41 @@ impl Console {
 
     /// Ranked, prefix-only candidates for the token under the cursor.
     fn candidates_at(&self, here: &Site, cand: &dyn Candidates) -> Vec<String> {
-        let found: Vec<String> = match here.completes {
+        let mut seen = match here.completes {
             Completes::Hint(_) => return Vec::new(),
-            Completes::Words(set) => set.options().iter().map(|s| s.to_string()).collect(),
-            Completes::CommandNames => every_name().iter().map(|s| s.to_string()).collect(),
+            Completes::Words(set) => {
+                keep_extensions(&here.token, set.options().iter().copied(), MAX_CANDIDATES)
+            }
+            Completes::CommandNames => {
+                keep_extensions(&here.token, every_name().iter().copied(), MAX_CANDIDATES)
+            }
             // fuzzy discovery, so a subsequence or typo match surfaces
             // things a prefix scan would miss; the prefix filter below
             // then drops whatever could not be inserted without
             // overwriting what was typed.
-            Completes::CorpusTerms => cand.corpus(&here.token),
-            Completes::SavedQueues => cand.saved_queues(),
-        };
-        let mut seen: Vec<String> = Vec::new();
-        for c in found {
-            if extend(&here.token, &c).is_some() && !seen.contains(&c) {
-                seen.push(c);
-                if seen.len() >= MAX_CANDIDATES {
-                    break;
-                }
+            Completes::CorpusTerms => keep_extensions(
+                &here.token,
+                cand.corpus(&here.token).iter().map(String::as_str),
+                MAX_CANDIDATES,
+            ),
+            Completes::SavedQueues => keep_extensions(
+                &here.token,
+                cand.saved_queues().iter().map(String::as_str),
+                MAX_CANDIDATES,
+            ),
+            Completes::EqPresets => {
+                let saved = cand.eq_presets();
+                keep_extensions(
+                    &here.token,
+                    Words::EqPreset
+                        .options()
+                        .iter()
+                        .copied()
+                        .chain(saved.iter().map(String::as_str)),
+                    MAX_CANDIDATES,
+                )
             }
-        }
+        };
         self.ranks.order(&mut seen);
         seen
     }
@@ -2730,14 +2813,15 @@ impl Console {
     /// The best past command line the whole input is a prefix of, as
     /// zsh-autosuggestions does it.
     fn history_extension(&self) -> Option<String> {
-        let mut hits: Vec<String> = Vec::new();
         // newest first, so recency is the order anything unranked
         // falls back to.
-        for past in self.history.iter().rev() {
-            if extend(&self.input, past).is_some() && !hits.contains(past) {
-                hits.push(past.clone());
-            }
-        }
+        // uncapped on purpose: the ranker picks the winner out of the
+        // whole matching history, not out of the newest `n` of it.
+        let mut hits = keep_extensions(
+            &self.input,
+            self.history.iter().rev().map(String::as_str),
+            usize::MAX,
+        );
         self.ranks.order(&mut hits);
         hits.first().map(|h| remainder(&self.input, h))
     }
@@ -2834,12 +2918,12 @@ pub fn site(input: &str, cursor: usize) -> Site {
         None => (Completes::CommandNames, None),
         Some((name, arg)) => match lookup(name) {
             Some((command, _)) => match command.params.get(arg) {
-                Some(param) => (param.ty.completes(), Some((command.signature(), arg))),
+                Some(param) => (param.ty.completes(), Some((signature_of(command), arg))),
                 // past the last parameter: nothing left to offer, but
                 // still show the signature so the arity is visible.
                 None => (
                     Completes::Hint("no more arguments"),
-                    Some((command.signature(), arg)),
+                    Some((signature_of(command), arg)),
                 ),
             },
             // the enclosing name is not (yet) a command, so whatever is
@@ -2935,18 +3019,62 @@ fn enclosing(input: &str, at: usize) -> Option<(&str, usize)> {
 /// resulting term still resolves. A fuzzy hit that is not a prefix
 /// extension returns `None` and is dropped: inserting it would replace
 /// characters the user typed, which completion must never do.
-fn extend(token: &str, candidate: &str) -> Option<String> {
-    let keep = token.chars().count();
-    let head: String = candidate.chars().take(keep).collect();
-    if head.chars().count() < keep || head.to_lowercase() != token.to_lowercase() {
-        return None;
+///
+/// Borrowed, and on an ascii token (every real one) decided on bytes
+/// with nothing allocated: this runs once per candidate per keystroke.
+fn extension<'a>(token: &str, candidate: &'a str) -> Option<&'a str> {
+    if token.is_ascii() {
+        let keep = token.len();
+        let bytes = candidate.as_bytes();
+        // a candidate of at most `keep` bytes has at most `keep` chars,
+        // so it is either too short or has no remainder to offer.
+        if bytes.len() <= keep {
+            return None;
+        }
+        // all-ascii up to `keep` makes `keep` a char boundary, and
+        // makes the ascii comparison the same answer `to_lowercase`
+        // would have given on both sides.
+        if bytes[..keep].is_ascii() {
+            return candidate[..keep]
+                .eq_ignore_ascii_case(token)
+                .then(|| &candidate[keep..]);
+        }
     }
-    let rest: String = candidate.chars().skip(keep).collect();
-    (!rest.is_empty()).then_some(rest)
+    let keep = token.chars().count();
+    // `nth(keep)` landing means the head is exactly `keep` chars and
+    // the remainder is not empty; missing means one or the other fails.
+    let (at, _) = candidate.char_indices().nth(keep)?;
+    (candidate[..at].to_lowercase() == token.to_lowercase()).then(|| &candidate[at..])
+}
+
+fn extends(token: &str, candidate: &str) -> bool {
+    extension(token, candidate).is_some()
+}
+
+/// The candidates that extend `token`, in arrival order, deduped, up to
+/// `cap`. Only a kept candidate is ever allocated, which is the whole
+/// point: the lists coming in are static names or a corpus page, and
+/// most of a long one is dropped by the prefix filter.
+fn keep_extensions<'a>(
+    token: &str,
+    from: impl Iterator<Item = &'a str>,
+    cap: usize,
+) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for candidate in from {
+        if !extends(token, candidate) || kept.iter().any(|k| k == candidate) {
+            continue;
+        }
+        kept.push(candidate.to_string());
+        if kept.len() >= cap {
+            break;
+        }
+    }
+    kept
 }
 
 fn remainder(token: &str, candidate: &str) -> String {
-    extend(token, candidate).unwrap_or_default()
+    extension(token, candidate).unwrap_or_default().to_string()
 }
 
 // -------------------------------------------------------------- ranking
@@ -3179,6 +3307,7 @@ fn save_history(history: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     const SETTLED: Env = Env {
         now: Duration::ZERO,
@@ -3310,7 +3439,7 @@ mod tests {
             // term alongside it (see `check_view`).
             Ty::Words(Words::ViewTarget) => "queue".into(),
             Ty::Terms => "crest".into(),
-            Ty::Query | Ty::NewName | Ty::SavedName => "crest".into(),
+            Ty::Query | Ty::NewName | Ty::SavedName | Ty::EqName => "crest".into(),
             Ty::CommandName => "pause".into(),
             Ty::Pos => "30s".into(),
             Ty::Offset => "+30s".into(),
@@ -3499,18 +3628,29 @@ mod tests {
     /// which is what removes the old arity overload.
     #[test]
     fn eq_applies_a_preset_and_the_menu_moved_to_view() {
-        let rock = eq::index_of("rock").unwrap();
-        assert_eq!(ops("eq(rock)"), vec![Op::SetEqPreset(rock)]);
-        assert_eq!(ops("eq(flat)"), vec![Op::SetEqPreset(0)]);
+        // the name travels as typed now; resolution happens at apply
+        // time, which is what lets a saved curve be named here at all.
+        assert_eq!(ops("eq(rock)"), vec![Op::SetEqPreset("rock".into())]);
+        assert_eq!(ops("eq(flat)"), vec![Op::SetEqPreset("flat".into())]);
+        // the point of the change: a name that is not a built-in still
+        // lowers, instead of failing to parse.
+        assert_eq!(
+            ops("eq(my bass curve)"),
+            vec![Op::SetEqPreset("my bass curve".into())]
+        );
         assert_eq!(ops("view(eq)"), vec![Op::View(ViewTarget::Eq)]);
         assert_eq!(ops("view(equalizer)"), vec![Op::View(ViewTarget::Eq)]);
+        // a missing argument is still a parse error; the table says
+        // the parameter is required and that does not need the saved
+        // list to decide.
         let e = error("eq()");
         assert!(e.message.contains("missing preset"), "{}", e.message);
-        // nothing near "disco", so it lists what there is rather than
-        // inventing a suggestion.
-        let e = error("eq(disco)");
-        assert!(e.message.contains("bass boost"), "{}", e.message);
-        assert!(error("eq(rok)").message.contains("did you mean 'rock'"));
+        // an *unknown* name is no longer a parse error: the parser
+        // cannot see the user's saved curves, so "is this a real
+        // preset" is answered at apply time. the message quality that
+        // used to live here (listing the names, "did you mean") moved
+        // with it, to `eq::resolve_failure`, which has its own tests.
+        assert_eq!(ops("eq(disco)"), vec![Op::SetEqPreset("disco".into())]);
     }
 
     // ------------------------------------------------------------ view
@@ -4458,6 +4598,7 @@ mod tests {
             Ty::Query,
             Ty::NewName,
             Ty::SavedName,
+            Ty::EqName,
             Ty::CommandName,
             Ty::Pos,
             Ty::Offset,
@@ -4509,7 +4650,7 @@ mod tests {
                 let Completes::Words(set) = p.ty.completes() else {
                     continue;
                 };
-                for option in set.options() {
+                for option in set.options().iter().copied() {
                     // every offered keyword has to coerce; the only
                     // exception is view's `q`, which needs a term too.
                     let extra = if c.name == "view" && option == "q" {
@@ -5177,5 +5318,730 @@ mod tests {
 
         let _: Vec<String> = Candidates::corpus(&fake, "fl");
         let _: Vec<String> = Candidates::saved_queues(&fake);
+    }
+
+    #[test]
+    fn clear_is_the_console_and_clear_queue_is_the_queue() {
+        assert_eq!(ops("clear()"), vec![Op::ClearConsole]);
+        assert_eq!(ops("cls()"), vec![Op::ClearConsole]);
+        assert_eq!(ops("clear_queue()"), vec![Op::ClearQueue]);
+        assert_eq!(ops("qclear()"), vec![Op::ClearQueue]);
+        assert_eq!(ops("flush()"), vec![Op::ClearQueue]);
+    }
+
+    #[test]
+    fn clear_no_longer_empties_the_queue() {
+        // it used to be an alias of clear_queue; anyone typing clear()
+        // expecting the terminal behaviour would have wiped the queue.
+        assert_ne!(ops("clear()"), vec![Op::ClearQueue]);
+    }
+
+    // --------------------------------------------- pinned completion
+
+    /// The corpus the pinned table below completes against.
+    /// Deliberately mixed case and full of non-prefix fuzzy hits, since
+    /// `Fake::corpus` ignores the token and hands back the lot: the
+    /// prefix filter is what has to earn every line of the table. The
+    /// repeated names are there so the dedup is load-bearing too; two
+    /// albums really can share a track title.
+    const PINNED_CORPUS: &[&str] = &[
+        "flatline",
+        "Flatline (Remix)",
+        "floor",
+        "flatline",
+        "sulfur surfer",
+        "4 star crest",
+        "crest",
+        "crest",
+        "hex",
+        "Icedancer",
+        "Eversince",
+    ];
+
+    const PINNED_QUEUES: &[&str] = &["late-night", "late-bloom", "gym"];
+
+    const PINNED_INPUTS: &[&str] = &[
+        "",
+        "p",
+        "pl",
+        "play",
+        "qu",
+        "vol",
+        "xyzzy",
+        "view(",
+        "view(q",
+        "view(que",
+        "view(sugg",
+        "play(",
+        "play(fl",
+        "play(FL",
+        "play(fl,",
+        "queue([a, fl",
+        "queue([4 star cre",
+        "dry(queue([fl",
+        "dry(",
+        "repeat(",
+        "repeat(3, sk",
+        "volume(",
+        "seek(",
+        "moveto(",
+        "speed(",
+        "sleep(",
+        "goto(",
+        "remove(",
+        "save_queue(",
+        "load_queue(",
+        "load_queue(late",
+        "add_to_queue(",
+        "add_to_queue(fr",
+        "loop(",
+        "shuffle(",
+        "eq(",
+        "eq(ba",
+        "fade(",
+        "help(",
+        "help(pl",
+        "search(cre",
+        "star(hex",
+        "quit(",
+        "nonexistent(fl",
+    ];
+
+    /// One row of the pinned table: typed keys, the buffer they produce
+    /// (auto-pairing included), the ghost, the hint, the signature with
+    /// its active parameter, and the whole candidate list in order.
+    ///
+    /// This is the guard an optimisation has to get past: it pins what
+    /// the user actually sees for every class of parameter at once, so a
+    /// faster candidate path that reorders, over-offers or drops a
+    /// prefix match fails here rather than in the app.
+    fn pin(
+        keys: &str,
+        buffer: &str,
+        ghost: &str,
+        hint: Option<&'static str>,
+        signature: Option<(&str, usize)>,
+        candidates: &[&str],
+    ) {
+        let mut fake = Fake::new(PINNED_CORPUS);
+        fake.queues = PINNED_QUEUES.to_vec();
+        let c = console_with(&fake, keys);
+        let here = site(&c.input, c.cursor);
+        assert_eq!(c.input, buffer, "buffer for {keys:?}");
+        assert_eq!(c.suggestion.ghost, ghost, "ghost for {keys:?}");
+        assert_eq!(c.suggestion.hint, hint, "hint for {keys:?}");
+        assert_eq!(
+            here.signature,
+            signature.map(|(s, i)| (s.to_string(), i)),
+            "signature for {keys:?}"
+        );
+        let want: Vec<String> = candidates.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            c.candidates_at(&here, &fake),
+            want,
+            "candidates for {keys:?}"
+        );
+    }
+
+    /// Captured off the implementation this pins, with `gen_pinned`.
+    #[test]
+    fn completion_output_is_pinned_across_every_parameter_class() {
+        pin(
+            "",
+            "",
+            "",
+            None,
+            None,
+            &[
+                "add_to_queue",
+                "back",
+                "bottom",
+                "cache",
+                "clear",
+                "clear_queue",
+                "cls",
+                "crossfade",
+                "dl",
+                "down",
+                "download",
+                "dry",
+                "enqueue",
+                "enter",
+                "eq",
+                "equalizer",
+                "exit",
+                "explain",
+                "fade",
+                "fav",
+                "favorite",
+                "find",
+                "flush",
+                "forward",
+                "fwd",
+                "go",
+                "goto",
+                "grep",
+                "help",
+                "like",
+                "load_queue",
+                "loop",
+                "ls",
+                "move",
+                "moveto",
+                "mute",
+                "next",
+                "offline",
+                "open",
+                "pause",
+                "play",
+                "play_pause",
+                "prev",
+                "previous",
+                "qclear",
+                "queue",
+                "quit",
+                "random",
+                "randomize",
+                "remove",
+            ],
+        );
+        pin(
+            "p",
+            "p",
+            "ause",
+            None,
+            None,
+            &["pause", "play", "play_pause", "prev", "previous"],
+        );
+        pin("pl", "pl", "ay", None, None, &["play", "play_pause"]);
+        pin("play", "play", "_pause", None, None, &["play_pause"]);
+        pin("qu", "qu", "eue", None, None, &["queue", "quit"]);
+        pin("vol", "vol", "ume", None, None, &["volume"]);
+        pin("xyzzy", "xyzzy", "", None, None, &[]);
+        pin(
+            "view(",
+            "view()",
+            "q",
+            None,
+            Some(("view(target, terms?)", 0)),
+            &[
+                "q",
+                "queue",
+                "now",
+                "suggestions",
+                "settings",
+                "keybinds",
+                "lyrics",
+                "starred",
+                "index",
+                "history",
+                "playlists",
+                "eq",
+                "help",
+            ],
+        );
+        pin(
+            "view(q",
+            "view(q)",
+            "ueue",
+            None,
+            Some(("view(target, terms?)", 0)),
+            &["queue"],
+        );
+        pin(
+            "view(que",
+            "view(que)",
+            "ue",
+            None,
+            Some(("view(target, terms?)", 0)),
+            &["queue"],
+        );
+        pin(
+            "view(sugg",
+            "view(sugg)",
+            "estions",
+            None,
+            Some(("view(target, terms?)", 0)),
+            &["suggestions"],
+        );
+        pin(
+            "play(",
+            "play()",
+            "flatline",
+            None,
+            Some(("play(terms?)", 0)),
+            &[
+                "flatline",
+                "Flatline (Remix)",
+                "floor",
+                "sulfur surfer",
+                "4 star crest",
+                "crest",
+                "hex",
+                "Icedancer",
+                "Eversince",
+            ],
+        );
+        pin(
+            "play(fl",
+            "play(fl)",
+            "atline",
+            None,
+            Some(("play(terms?)", 0)),
+            &["flatline", "Flatline (Remix)", "floor"],
+        );
+        pin(
+            "play(FL",
+            "play(FL)",
+            "atline",
+            None,
+            Some(("play(terms?)", 0)),
+            &["flatline", "Flatline (Remix)", "floor"],
+        );
+        pin(
+            "play(fl,",
+            "play(fl,)",
+            "",
+            Some("no more arguments"),
+            Some(("play(terms?)", 1)),
+            &[],
+        );
+        pin(
+            "queue([a, fl",
+            "queue([a, fl])",
+            "atline",
+            None,
+            Some(("queue(terms?)", 0)),
+            &["flatline", "Flatline (Remix)", "floor"],
+        );
+        pin(
+            "queue([4 star cre",
+            "queue([4 star cre])",
+            "st",
+            None,
+            Some(("queue(terms?)", 0)),
+            &["4 star crest"],
+        );
+        pin(
+            "dry(queue([fl",
+            "dry(queue([fl]))",
+            "atline",
+            None,
+            Some(("queue(terms?)", 0)),
+            &["flatline", "Flatline (Remix)", "floor"],
+        );
+        pin(
+            "dry(",
+            "dry()",
+            "add_to_queue",
+            None,
+            Some(("dry(call)", 0)),
+            &[
+                "add_to_queue",
+                "back",
+                "bottom",
+                "cache",
+                "clear",
+                "clear_queue",
+                "cls",
+                "crossfade",
+                "dl",
+                "down",
+                "download",
+                "dry",
+                "enqueue",
+                "enter",
+                "eq",
+                "equalizer",
+                "exit",
+                "explain",
+                "fade",
+                "fav",
+                "favorite",
+                "find",
+                "flush",
+                "forward",
+                "fwd",
+                "go",
+                "goto",
+                "grep",
+                "help",
+                "like",
+                "load_queue",
+                "loop",
+                "ls",
+                "move",
+                "moveto",
+                "mute",
+                "next",
+                "offline",
+                "open",
+                "pause",
+                "play",
+                "play_pause",
+                "prev",
+                "previous",
+                "qclear",
+                "queue",
+                "quit",
+                "random",
+                "randomize",
+                "remove",
+            ],
+        );
+        pin(
+            "repeat(",
+            "repeat()",
+            "",
+            Some("how many times, 1-256"),
+            Some(("repeat(count, call)", 0)),
+            &[],
+        );
+        pin(
+            "repeat(3, sk",
+            "repeat(3, sk)",
+            "ip",
+            None,
+            Some(("repeat(count, call)", 1)),
+            &["skip"],
+        );
+        pin(
+            "volume(",
+            "volume()",
+            "",
+            Some("0-100, or +N% / -N%"),
+            Some(("volume(level)", 0)),
+            &[],
+        );
+        pin(
+            "seek(",
+            "seek()",
+            "",
+            Some("+30s / -10s (sign required)"),
+            Some(("seek(offset)", 0)),
+            &[],
+        );
+        pin(
+            "moveto(",
+            "moveto()",
+            "",
+            Some("10% / 90 / 1m20s"),
+            Some(("moveto(pos)", 0)),
+            &[],
+        );
+        pin(
+            "speed(",
+            "speed()",
+            "",
+            Some("0.25-3.0, or up / down / reset"),
+            Some(("speed(speed)", 0)),
+            &[],
+        );
+        pin(
+            "sleep(",
+            "sleep()",
+            "",
+            Some("30m / off"),
+            Some(("sleep(after)", 0)),
+            &[],
+        );
+        pin(
+            "goto(",
+            "goto()",
+            "",
+            Some("a queue position, 1 or higher"),
+            Some(("goto(index)", 0)),
+            &[],
+        );
+        pin(
+            "remove(",
+            "remove()",
+            "",
+            Some("1, or [1, 3, 5]"),
+            Some(("remove(indices)", 0)),
+            &[],
+        );
+        pin(
+            "save_queue(",
+            "save_queue()",
+            "",
+            Some("a name to save it under"),
+            Some(("save_queue(name)", 0)),
+            &[],
+        );
+        pin(
+            "load_queue(",
+            "load_queue()",
+            "late-night",
+            None,
+            Some(("load_queue(name)", 0)),
+            &["late-night", "late-bloom", "gym"],
+        );
+        pin(
+            "load_queue(late",
+            "load_queue(late)",
+            "-night",
+            None,
+            Some(("load_queue(name)", 0)),
+            &["late-night", "late-bloom"],
+        );
+        pin(
+            "add_to_queue(",
+            "add_to_queue()",
+            "front",
+            None,
+            Some(("add_to_queue(position, terms?)", 0)),
+            &["front", "back"],
+        );
+        pin(
+            "add_to_queue(fr",
+            "add_to_queue(fr)",
+            "ont",
+            None,
+            Some(("add_to_queue(position, terms?)", 0)),
+            &["front"],
+        );
+        pin(
+            "loop(",
+            "loop()",
+            "one",
+            None,
+            Some(("loop(mode?)", 0)),
+            &["one", "all", "off"],
+        );
+        pin(
+            "shuffle(",
+            "shuffle()",
+            "on",
+            None,
+            Some(("shuffle(state?)", 0)),
+            &["on", "off"],
+        );
+        pin(
+            "eq(",
+            "eq()",
+            "flat",
+            None,
+            Some(("eq(preset)", 0)),
+            &[
+                "flat",
+                "bass boost",
+                "vocal boost",
+                "treble boost",
+                "rock",
+                "classical",
+            ],
+        );
+        pin(
+            "eq(ba",
+            "eq(ba)",
+            "ss boost",
+            None,
+            Some(("eq(preset)", 0)),
+            &["bass boost"],
+        );
+        pin(
+            "fade(",
+            "fade()",
+            "in",
+            None,
+            Some(("fade(direction, over?)", 0)),
+            &["in", "out"],
+        );
+        pin(
+            "help(",
+            "help()",
+            "add_to_queue",
+            None,
+            Some(("help(name?)", 0)),
+            &[
+                "add_to_queue",
+                "back",
+                "bottom",
+                "cache",
+                "clear",
+                "clear_queue",
+                "cls",
+                "crossfade",
+                "dl",
+                "down",
+                "download",
+                "dry",
+                "enqueue",
+                "enter",
+                "eq",
+                "equalizer",
+                "exit",
+                "explain",
+                "fade",
+                "fav",
+                "favorite",
+                "find",
+                "flush",
+                "forward",
+                "fwd",
+                "go",
+                "goto",
+                "grep",
+                "help",
+                "like",
+                "load_queue",
+                "loop",
+                "ls",
+                "move",
+                "moveto",
+                "mute",
+                "next",
+                "offline",
+                "open",
+                "pause",
+                "play",
+                "play_pause",
+                "prev",
+                "previous",
+                "qclear",
+                "queue",
+                "quit",
+                "random",
+                "randomize",
+                "remove",
+            ],
+        );
+        pin(
+            "help(pl",
+            "help(pl)",
+            "ay",
+            None,
+            Some(("help(name?)", 0)),
+            &["play", "play_pause"],
+        );
+        pin(
+            "search(cre",
+            "search(cre)",
+            "st",
+            None,
+            Some(("search(query)", 0)),
+            &["crest"],
+        );
+        pin(
+            "star(hex",
+            "star(hex)",
+            "",
+            None,
+            Some(("star(terms?)", 0)),
+            &[],
+        );
+        pin(
+            "quit(",
+            "quit()",
+            "",
+            Some("no more arguments"),
+            Some(("quit()", 0)),
+            &[],
+        );
+        pin(
+            "nonexistent(fl",
+            "nonexistent(fl)",
+            "ush",
+            None,
+            None,
+            &["flush"],
+        );
+    }
+
+    /// Prints the table above in source form, for when a deliberate
+    /// behaviour change makes all 44 rows need updating:
+    /// `cargo test --bin wim -- --ignored --nocapture gen_pinned`.
+    #[test]
+    #[ignore = "writes the pinned table, run manually"]
+    fn gen_pinned() {
+        let mut fake = Fake::new(PINNED_CORPUS);
+        fake.queues = PINNED_QUEUES.to_vec();
+        for input in PINNED_INPUTS {
+            let c = console_with(&fake, input);
+            let here = site(&c.input, c.cursor);
+            let hits = c.candidates_at(&here, &fake);
+            let sig = match &here.signature {
+                None => "None".to_string(),
+                Some((s, i)) => format!("Some((\"{s}\", {i}))"),
+            };
+            let hint = match here.completes {
+                Completes::Hint(h) => format!("Some(\"{h}\")"),
+                _ => "None".to_string(),
+            };
+            let cands = hits
+                .iter()
+                .map(|h| format!("\"{h}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "        pin(\"{}\", \"{}\", \"{}\", {}, {}, &[{}]);",
+                input.escape_debug(),
+                c.input.escape_debug(),
+                c.suggestion.ghost.escape_debug(),
+                hint,
+                sig,
+                cands
+            );
+        }
+    }
+
+    // ------------------------------------------------------- benchmarks
+
+    /// A host-shaped provider: hands back exactly the 50 names the real
+    /// `CorpusCandidates` caps at, so the console-side cost is measured
+    /// against the list length it really sees.
+    struct FiftyNames(Vec<String>);
+
+    impl FiftyNames {
+        fn new() -> FiftyNames {
+            FiftyNames(
+                (0..MAX_CANDIDATES)
+                    .map(|i| format!("blade runner blues {i}"))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Candidates for FiftyNames {
+        fn corpus(&self, _token: &str) -> Vec<String> {
+            self.0.clone()
+        }
+    }
+
+    /// Not an assertion: prints the per-keystroke wall time of the whole
+    /// `handle_key` -> `refresh` path, which is what decides whether the
+    /// prompt feels instant. Absolute numbers are machine-dependent.
+    /// `cargo test --release --bin wim -- --ignored --nocapture bench_keystrokes`
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_keystrokes() {
+        let cand = FiftyNames::new();
+        // a command name (every_name + the prefix filter), a corpus
+        // term (the 50-name list), and a value parameter (hint only,
+        // the cheap case) in one line each.
+        for line in [
+            "play(blade runner blues 1)",
+            "queue([blade runner blues 1, blade runner blues 2])",
+            "volume(50%)",
+            "repeat(3, skip())",
+            "add_to_queue(front, blade runner blues 7)",
+        ] {
+            let iters = 200u32;
+            let mut worst = Duration::ZERO;
+            let start = Instant::now();
+            for _ in 0..iters {
+                let mut console = Console::empty();
+                for ch in line.chars() {
+                    let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+                    let one = Instant::now();
+                    console.handle_key(key, &cand);
+                    worst = worst.max(one.elapsed());
+                }
+            }
+            let keys = line.chars().count() as u32;
+            let per = start.elapsed() / (iters * keys);
+            println!("{:<52} {per:>10.3?}/key  worst {worst:>10.3?}", line);
+        }
     }
 }
