@@ -298,6 +298,24 @@ impl Client {
         })
     }
 
+    /// Whether this client is already the one `cfg` describes, so a
+    /// caller holding live clients can reuse one instead of building
+    /// another. `Client::new` re-reads `password_file` off disk and
+    /// starts with a cold connection pool, which is the whole 1.94s to
+    /// 375ms difference this codebase already paid for once.
+    ///
+    /// Stream options are part of identity, not just username and url:
+    /// a client carries `max_bitrate_kbps` and `transcode_format` into
+    /// every stream url it builds, and `open_starred_view`'s items get
+    /// played. Matching on identity alone would let a client built
+    /// before a bitrate change go on streaming at the old setting.
+    pub fn matches(&self, cfg: &NavidromeConfig) -> bool {
+        self.base_url == normalize_url(&cfg.url)
+            && self.username == cfg.username
+            && self.max_bitrate_kbps == cfg.max_bitrate_kbps
+            && self.transcode_format == cfg.transcode_format
+    }
+
     /// Subsonic token auth: `t = md5(password + salt)`, random `s` per
     /// request, so the plaintext password never goes over the wire (only
     /// matters if the server isn't behind TLS; harmless either way).
@@ -1873,5 +1891,51 @@ mod tests {
         assert_eq!(serial, reopened);
         assert!(parallel_elapsed * 2 < serial_elapsed);
         assert!(reopened_elapsed * 10 < parallel_elapsed);
+    }
+
+    fn cfg(url: &str, user: &str) -> NavidromeConfig {
+        NavidromeConfig {
+            url: url.into(),
+            username: user.into(),
+            password: Some("pw".into()),
+            password_file: None,
+            max_bitrate_kbps: None,
+            transcode_format: None,
+        }
+    }
+
+    #[test]
+    fn a_client_matches_the_config_it_was_built_from() {
+        let c = cfg("https://example.invalid", "ana");
+        assert!(Client::new(&c).unwrap().matches(&c));
+    }
+
+    /// Normalization is why this lives on `Client`: a trailing slash
+    /// must not look like a different server.
+    #[test]
+    fn a_trailing_slash_is_still_the_same_server() {
+        let built = Client::new(&cfg("https://example.invalid", "ana")).unwrap();
+        assert!(built.matches(&cfg("https://example.invalid/", "ana")));
+    }
+
+    #[test]
+    fn a_different_user_or_host_does_not_match() {
+        let built = Client::new(&cfg("https://example.invalid", "ana")).unwrap();
+        assert!(!built.matches(&cfg("https://example.invalid", "bob")));
+        assert!(!built.matches(&cfg("https://other.invalid", "ana")));
+    }
+
+    /// The reason stream options are in the match: reusing a client
+    /// built before a bitrate change would stream at the old setting.
+    #[test]
+    fn changed_stream_options_make_it_a_different_client() {
+        let base = cfg("https://example.invalid", "ana");
+        let built = Client::new(&base).unwrap();
+        let mut rebitrated = base.clone();
+        rebitrated.max_bitrate_kbps = Some(128);
+        assert!(!built.matches(&rebitrated));
+        let mut retranscoded = base.clone();
+        retranscoded.transcode_format = Some("opus".into());
+        assert!(!built.matches(&retranscoded));
     }
 }

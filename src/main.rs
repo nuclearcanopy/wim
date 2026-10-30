@@ -321,16 +321,36 @@ fn toggle_star(
 /// configured server's own starred list with local favorites into one
 /// `BrowseView`. Fetched fresh on open rather than cached, same as
 /// opening an album, so it can't go stale.
+/// A live client for `nav` if the corpus already holds one, else a
+/// fresh one. `Client::new` re-reads `password_file` off disk and
+/// starts with a cold connection pool, so building one per call is
+/// paid for in both disk io and the first round trip.
+///
+/// Reuse rather than a cached singleton on purpose: these clients are
+/// the corpus's own, so the password lives exactly as long as the
+/// corpus does and is still zeroized when it drops. Parking one in a
+/// `static` would mean it never drops and never zeroizes.
+fn client_for(
+    nav: &config::NavidromeConfig,
+    live: &[Arc<subsonic::Client>],
+) -> Option<Arc<subsonic::Client>> {
+    live.iter()
+        .find(|c| c.matches(nav))
+        .cloned()
+        .or_else(|| subsonic::Client::new(nav).ok().map(Arc::new))
+}
+
 fn open_starred_view(
     servers: &[config::NavidromeConfig],
     favorites: &favorites::Favorites,
+    live: &[Arc<subsonic::Client>],
 ) -> browse::BrowseView {
     let per_server: Vec<Vec<SearchItem>> = thread::scope(|scope| {
         servers
             .iter()
             .map(|nav| {
                 scope.spawn(|| {
-                    let client = Arc::new(subsonic::Client::new(nav).ok()?);
+                    let client = client_for(nav, live)?;
                     let songs = client.get_starred_songs().ok()?;
                     Some(browse::songs_to_items(songs, &client))
                 })
@@ -1362,7 +1382,8 @@ fn open_shellsong_view(target: ViewTarget, ctx: &mut ShellsongCtx) -> (Dispatch,
         }
         ViewTarget::Lyrics => open_shellsong_lyrics(ctx),
         ViewTarget::Starred => {
-            let bv = open_starred_view(&ctx.actx.cfg.navidrome_servers, ctx.favorites);
+            let live = ctx.actx.app.corpus.remote_clients();
+            let bv = open_starred_view(&ctx.actx.cfg.navidrome_servers, ctx.favorites, &live);
             let count = bv.tracks.len();
             *ctx.actx.real_art_protocol = ctx
                 .actx
@@ -2828,11 +2849,17 @@ fn index_navidrome_server(
 /// configured server at once, so opening the profile manager shows
 /// where each one stands immediately rather than making you select
 /// each one individually to find out.
-fn test_navidrome_connectivity(servers: &[config::NavidromeConfig]) -> Vec<Option<bool>> {
+fn test_navidrome_connectivity(
+    servers: &[config::NavidromeConfig],
+    live: &[Arc<subsonic::Client>],
+) -> Vec<Option<bool>> {
     thread::scope(|scope| {
         servers
             .iter()
-            .map(|nav| scope.spawn(|| subsonic::Client::new(nav).and_then(|c| c.ping()).is_ok()))
+            // pinging the client the app actually uses is a better test
+            // than pinging a throwaway: it exercises the same pool and
+            // the same resolved credentials.
+            .map(|nav| scope.spawn(|| client_for(nav, live).is_some_and(|c| c.ping().is_ok())))
             .collect::<Vec<_>>()
             .into_iter()
             .map(|handle| Some(handle.join().unwrap_or(false)))
@@ -6008,7 +6035,10 @@ fn main() -> anyhow::Result<()> {
 
                 if key.code == keymap.get(KeyAction::OpenNavManager) {
                     let mut nm = NavManager::new();
-                    nm.connection_status = test_navidrome_connectivity(&cfg.navidrome_servers);
+                    nm.connection_status = test_navidrome_connectivity(
+                        &cfg.navidrome_servers,
+                        &app.corpus.remote_clients(),
+                    );
                     for (nav, result) in cfg.navidrome_servers.iter().zip(&nm.connection_status) {
                         if *result == Some(false) {
                             notifications
@@ -6207,7 +6237,11 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if key.code == keymap.get(KeyAction::OpenStarredView) {
-                    let bv = open_starred_view(&cfg.navidrome_servers, &favorites);
+                    let bv = open_starred_view(
+                        &cfg.navidrome_servers,
+                        &favorites,
+                        &app.corpus.remote_clients(),
+                    );
                     real_art_protocol = picker
                         .as_mut()
                         .and_then(|p| bv.art.clone().map(|img| p.new_resize_protocol(img)));
