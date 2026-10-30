@@ -109,12 +109,15 @@ and no fallback; the user would see a screenful of mojibake.
 
 so `video_output = "auto"` resolves to kitty **only** when wim's own
 graphics probe reported `ProtocolType::Kitty`, and to `tct` for
-everything else: another protocol, halfblocks, or a probe that has not
-answered yet. note that `Picker::from_query_stdio()` returning `Ok` does
-not mean a real protocol exists; on `NoCap` it hands back a `Halfblocks`
-picker with a made-up font size, so `picker.is_some()` is not a proxy
-for "this terminal does graphics" and `protocol_type()` has to be asked.
-see `video::drawing_vo`.
+everything else: another protocol, halfblocks, a probe that has not
+answered yet, or one that was never run at all (`graphics_plausible`
+skips it on alacritty, so alacritty lands on tct without asking).
+
+note that `Picker::from_query_stdio()` returning `Ok` does not mean a
+real protocol exists; on `NoCap` it hands back a `Halfblocks` picker
+with a made-up font size, so `picker.is_some()` is not a proxy for "this
+terminal does graphics" and `protocol_type()` has to be asked. see
+`video::drawing_vo`.
 
 ## the handover
 
