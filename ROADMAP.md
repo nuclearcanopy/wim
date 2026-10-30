@@ -783,6 +783,66 @@ report, not in a batch at the end.
       sidebar and main content and an interior cell left unwritten
       showed through (the box can be wider than its text, see the
       `max(4)`).
+## shellswim and the undo tree (maintainer, 2026-10-31)
+
+Two features the maintainer asked for that share one prerequisite, so
+the order below is not a preference, it is a dependency.
+
+- [ ] **`shellswim`: a second binary that is just the shell.** the
+      maintainer's shape: no panes, no sidebar, no results list. a
+      full-screen shellsong console with **only the bottom bar** kept,
+      showing the track and its scrubber:
+      `BLADEE - FLATLINE  --:--  (*)-------------------  --:--`
+      and nothing else. everything is done by command. it has to feel
+      responsive and deliberate, not like typing at `python3`.
+      almost all of this exists already: `ui::shellsong` is the
+      console, `ui::controlsbar` is the bar, `Program::step` is the
+      interpreter, and `Op` is the whole vocabulary. what is missing is
+      **a host that is not main.rs**: `apply_shellsong_op` takes a
+      `ShellsongCtx` assembled from ~30 locals in `main()`, so today
+      the only way to run an op is to boot the entire app.
+      **this crate is bin-only; there is no `src/lib.rs`.** a second
+      binary cannot share any of it. so the real work is: extract a
+      library (the player core: mpv, queue, corpus, cache, config, and
+      the op applier), leave `main.rs` as a thin wim front-end, and add
+      `shellswim` as a second front-end over the same core.
+      that is **the same work as the decompose-main.rs item below**,
+      which until now had no motivation beyond tidiness. it has one
+      now: the decomposition is what makes a second front-end possible,
+      and shellswim is the proof the seam is in the right place.
+- [ ] **undo and redo as a tree, not a stack.** the maintainer's words:
+      "nice decision trees that should be super smart and dynamic". a
+      tree rather than linear history means undoing three steps and
+      then doing something new does not destroy the branch you left;
+      it becomes a sibling you can walk back to, the way vim's undo
+      tree works. thematically right for an app called wim.
+      **why this app can do it properly and others cannot:** every
+      state change already funnels through one choke point,
+      `apply_shellsong_op`, and every op already has
+      `Op::describe()`. so there is exactly one place to record
+      history, which is the difference between complete undo and
+      best-effort undo, and every node gets a human-readable label for
+      free. a branch of the tree is then *already* a list of ops, which
+      is to say **a `.shg` script**: exporting a branch is close to
+      free once scripts exist, and that ties the two headline features
+      together.
+      design calls to make deliberately:
+      - **snapshot, do not invert.** the undoable state is small (queue
+        entries plus position, eq source and gains, volume, speed,
+        loop, shuffle, crossfade), so storing it per node is cheaper to
+        write and impossible to get subtly wrong, unlike per-op
+        inverses.
+      - **some ops cannot be undone and must say so** rather than
+        pretending: a sent scrobble, a server-side star, a download, a
+        deleted file. mark them, and have undo refuse with a reason
+        instead of silently restoring half a change.
+      - **restoring a queue while music plays** needs a rule: restore
+        entries and position, but do not restart the current track if
+        it survives the restore, or undo becomes a skip.
+      - the tree view is a real layout problem (branch glyphs,
+        timestamps, labels from `describe()`), and it is the part most
+        likely to end up barebones; it deserves the ux self-check.
+
 - [ ] **decompose main.rs** (~3.9k lines). a reviewed, ordered plan
       exists: extract focus/InputMode, then the playback free functions,
       then the sync/channel plumbing, then a `struct Ui` for the ~35
