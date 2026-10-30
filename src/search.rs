@@ -310,10 +310,36 @@ struct Needle {
     /// Word lengths that could come in under budget, in `Entry`'s
     /// `word_lens` encoding.
     length_window: u32,
+    /// Lowercased terms from `!term` tokens; a match containing any of
+    /// them is dropped. See `split_exclusions`.
+    excluded: Vec<String>,
+}
+
+/// Splits a raw query into the part that must match and the lowercased
+/// `!term` parts that must not.
+///
+/// nucleo 0.3 parses `!foo` but `Pattern::score` does not honour it: a
+/// `!foo` query scores identically to `'foo`, so the exclusion silently
+/// did nothing while reading like working syntax. Handled here instead
+/// of being handed to nucleo. A bare `!` is not an exclusion (there is
+/// no term), so it stays in the positive text as the literal the user
+/// typed.
+fn split_exclusions(query: &str) -> (String, Vec<String>) {
+    let mut positive: Vec<&str> = Vec::new();
+    let mut excluded: Vec<String> = Vec::new();
+    for token in query.split_whitespace() {
+        match token.strip_prefix('!') {
+            Some(term) if !term.is_empty() => excluded.push(term.to_lowercase()),
+            _ => positive.push(token),
+        }
+    }
+    (positive.join(" "), excluded)
 }
 
 impl Needle {
     fn new(query: &str) -> Self {
+        let (positive, excluded) = split_exclusions(query);
+        let query = positive.as_str();
         let lower = query.to_lowercase();
         let len = lower.chars().count();
         // nucleo reads `^ $ ! ' \ |` and whitespace as pattern syntax
@@ -335,7 +361,17 @@ impl Needle {
             },
             typo_mask: char_mask(lower.chars()),
             lower,
+            excluded,
         }
+    }
+
+    /// Whether `haystack_lower` holds any excluded term. Substring, not
+    /// word-boundary, matching: `!live` should drop "Live at Leeds" and
+    /// "Alive" alike is the wrong call, but a word-boundary rule would
+    /// keep "(Live)" only by luck of the punctuation, so the blunter
+    /// rule is the predictable one.
+    fn excludes(&self, haystack_lower: &str) -> bool {
+        self.excluded.iter().any(|t| haystack_lower.contains(t))
     }
 
     /// How many distinct chars `self` has that `mask` lacks; a lower
@@ -729,6 +765,11 @@ impl Corpus {
             return Vec::new();
         }
         let needle = Needle::new(query);
+        // "!foo" on its own leaves nothing to match on, so it ranks
+        // nothing rather than ranking the whole corpus minus foo.
+        if needle.lower.trim().is_empty() {
+            return Vec::new();
+        }
         let mut scratches = self.scratches.borrow_mut();
         if scratches.is_empty() {
             scratches.resize_with(thread_count().max(1), Scratch::default);
@@ -847,6 +888,11 @@ fn score_chunk<'a>(
     let Scratch { matcher, buf } = scratch;
     let mut scored = Vec::new();
     for entry in entries {
+        // checked before scoring: an excluded item cannot be rescued by
+        // any score, so this is the cheapest possible rejection.
+        if needle.excludes(&entry.haystack_lower) {
+            continue;
+        }
         // a subsequence match needs every pattern char somewhere in
         // the haystack, so one mask test retires the items nucleo
         // would walk the whole haystack only to reject.
@@ -1810,7 +1856,11 @@ mod tests {
         ("^blade", 63, 0x27a1_0f63_2322_5e0b),
         ("blade$", 68, 0x3877_9407_b137_8259),
         ("'blade", 307, 0xf8a9_24ad_cde1_23c5),
-        ("!blade", 307, 0xf8a9_24ad_cde1_23c5),
+        // was (307, 0xf8a9_24ad_cde1_23c5), byte-identical to
+        // `'blade`'s row above, which is what "nucleo ignores
+        // negation" looked like from here. now 0: the exclusion is
+        // honoured, and `!blade` alone leaves nothing positive to rank.
+        ("!blade", 0, 0xcbf2_9ce4_8422_2325),
         ("blade|runner", 0, 0xcbf2_9ce4_8422_2325),
         ("bl\u{e0}d\u{e9}", 0, 0xcbf2_9ce4_8422_2325),
     ];
@@ -1913,9 +1963,16 @@ mod tests {
             let needle = Needle::new(query);
             let mut scratch = Scratch::default();
             let fast = score_chunk(&c.items, &needle, &mut scratch);
+            // the reference gets the same exclusion the hot path
+            // applies: `!term` is a filter over the corpus, not part of
+            // scoring, so excluding it here keeps this an apples-to-
+            // apples test of the *scorer*. that exclusion is correct is
+            // what `an_excluded_term_drops_the_matches_that_contain_it`
+            // and its neighbours are for.
             let expected: Vec<(u32, &SearchItem)> = c
                 .items
                 .iter()
+                .filter(|e| !needle.excludes(&e.haystack_lower))
                 .filter_map(|e| {
                     reference_score(
                         e,
@@ -2280,5 +2337,107 @@ mod tests {
             3,
             "no standout match among near-equal candidates; none should be cut: got {results:?}"
         );
+    }
+
+    /// A corpus where one item carries a word the other does not, for
+    /// the exclusion tests.
+    fn exclusion_corpus() -> Corpus {
+        let mut c = Corpus::new();
+        c.add_local_tracks([
+            LocalTrack {
+                path: PathBuf::from("/m/a.flac"),
+                title: "Blade Runner Blues".into(),
+                artist: Some("Vangelis".into()),
+                album: Some("Blade Runner".into()),
+                duration_secs: None,
+                kind: MediaKind::Music,
+            },
+            LocalTrack {
+                path: PathBuf::from("/m/b.flac"),
+                title: "Blade Runner Blues (Live)".into(),
+                artist: Some("Vangelis".into()),
+                album: Some("Blade Runner Live".into()),
+                duration_secs: None,
+                kind: MediaKind::Music,
+            },
+        ]);
+        c
+    }
+
+    fn titles(items: &[SearchItem]) -> Vec<String> {
+        items.iter().map(|i| i.primary_name().to_string()).collect()
+    }
+
+    /// The bug: nucleo parses `!foo` but `Pattern::score` ignores it, so
+    /// this used to return both rows.
+    #[test]
+    fn an_excluded_term_drops_the_matches_that_contain_it() {
+        let c = exclusion_corpus();
+        let got = titles(&c.search("blade runner !live"));
+        assert!(
+            got.iter().any(|t| t == "Blade Runner Blues"),
+            "the positive match should survive: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|t| t.contains("Live")),
+            "the excluded row is still here: {got:?}"
+        );
+    }
+
+    #[test]
+    fn exclusion_ignores_case() {
+        let c = exclusion_corpus();
+        for q in ["blade runner !LIVE", "blade runner !Live"] {
+            let got = titles(&c.search(q));
+            assert!(!got.iter().any(|t| t.contains("Live")), "{q}: {got:?}");
+            assert!(!got.is_empty(), "{q} dropped everything: {got:?}");
+        }
+    }
+
+    /// Excluding something absent must not disturb the ranking, which
+    /// is what says the positive half still goes through the normal path.
+    #[test]
+    fn excluding_an_absent_term_leaves_the_ranking_alone() {
+        let c = exclusion_corpus();
+        assert_eq!(
+            titles(&c.search("blade runner !zzzznothing")),
+            titles(&c.search("blade runner")),
+        );
+    }
+
+    #[test]
+    fn an_exclusion_only_query_ranks_nothing() {
+        let c = exclusion_corpus();
+        assert!(
+            c.search("!live").is_empty(),
+            "there is nothing positive to rank against"
+        );
+        assert!(c.search("  !live   ").is_empty());
+    }
+
+    /// A bare `!` has no term after it, so it is the literal the user
+    /// typed rather than an exclusion of everything.
+    #[test]
+    fn a_bare_bang_is_not_an_exclusion() {
+        let (positive, excluded) = split_exclusions("blade !");
+        assert_eq!(positive, "blade !");
+        assert!(excluded.is_empty());
+    }
+
+    #[test]
+    fn several_exclusions_all_apply() {
+        let (positive, excluded) = split_exclusions("blade !live !remix");
+        assert_eq!(positive, "blade");
+        assert_eq!(excluded, vec!["live".to_string(), "remix".to_string()]);
+    }
+
+    /// `search_names` reads the same ranking, so it has to honour the
+    /// exclusion too; it would be its own bug if only `search` did.
+    #[test]
+    fn search_names_honours_exclusions() {
+        let c = exclusion_corpus();
+        let names = c.search_names("blade runner !live", 10);
+        assert!(!names.is_empty(), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("Live")), "{names:?}");
     }
 }
