@@ -205,6 +205,12 @@ pub struct HitMap {
     /// else, instead of the surrounding pane taking the click and
     /// closing it.
     pub boxes: Vec<(TextBox, Rect)>,
+    /// The cells the notification toasts own. They are painted last,
+    /// over panes whose lists this map already recorded, and they own
+    /// every cell of their own box; a click on one is therefore a click
+    /// on something the user cannot see, the same as under a covering
+    /// tier (`ui::notify::boxes`).
+    pub toasts: Vec<Rect>,
     /// The scrubber's track cells, per surface that drew one; both are
     /// on screen while the player is maximized. This, not the whole
     /// progress element, is what an x offset is a fraction of: the time
@@ -314,6 +320,14 @@ pub fn act(map: &HitMap, click: Click, dragging: Option<Transport>) -> Act {
         };
     }
     if kind != Kind::Down {
+        return Act::Nothing;
+    }
+
+    // a toast sits over whatever was recorded underneath it, so it has
+    // to answer before any of it. the wheel passed through above on
+    // purpose: a notch acts on no particular row, and a toast that
+    // appeared mid-scroll must not make the wheel go dead.
+    if map.toasts.iter().any(|r| inside(*r, col, row)) {
         return Act::Nothing;
     }
 
@@ -682,6 +696,62 @@ mod tests {
         // one.
         assert_eq!(act(&m, down(5, 4), None), Act::Focus(Focus::Sidebar));
         assert_eq!(act(&m, down(5, 8), None), Act::Focus(Focus::Sidebar));
+    }
+
+    /// A toast owns every cell of its own box and is painted after the
+    /// lists under it were recorded, so it has to answer for those
+    /// cells; otherwise a click on a visible toast moves a selection
+    /// onto a row the toast is hiding.
+    #[test]
+    fn a_toast_answers_for_the_cells_it_covers_instead_of_what_is_under_them() {
+        let mut m = map();
+        bar(&mut m, &[(Field::Pause, 4, 1)]);
+        m.boxes = vec![(TextBox::Query, Rect::new(0, 0, 20, 3))];
+        m.lists = vec![List {
+            which: Scrollable::SidebarResults,
+            rect: Rect::new(0, 4, 20, 5),
+            rows: vec![Some(0), Some(1), Some(2), Some(3), Some(4)],
+            len: 5,
+        }];
+        // one over the top of the results list, one over the search box
+        // and one over a live bottom-bar control.
+        m.toasts = vec![
+            Rect::new(2, 4, 14, 3),
+            Rect::new(0, 1, 10, 1),
+            Rect::new(4, 19, 6, 1),
+        ];
+        for (col, row) in [(5, 4), (15, 6), (5, 1), (4, 19)] {
+            assert_eq!(
+                act(&m, down(col, row), None),
+                Act::Nothing,
+                "({col},{row}) is under a toast"
+            );
+        }
+        // one row below the toast the list answers again, and one
+        // column right of it.
+        assert_eq!(
+            act(&m, down(5, 7), None),
+            Act::Select(Scrollable::SidebarResults, 3)
+        );
+        assert_eq!(
+            act(&m, down(16, 4), None),
+            Act::Select(Scrollable::SidebarResults, 0)
+        );
+        // the wheel still reaches the list under a toast: a notch acts
+        // on no particular row, so one appearing mid-scroll must not
+        // make the wheel go dead.
+        assert_eq!(
+            act(
+                &m,
+                Click {
+                    kind: Kind::WheelDown,
+                    col: 5,
+                    row: 4
+                },
+                None
+            ),
+            Act::Wheel(Scrollable::SidebarResults, true)
+        );
     }
 
     #[test]

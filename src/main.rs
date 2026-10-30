@@ -4501,12 +4501,12 @@ fn main() -> anyhow::Result<()> {
                     height: bottom.height.saturating_sub(1),
                 },
             );
-            f.render_widget(
-                NotificationOverlay {
-                    items: notifications.visible(),
-                },
-                area,
-            );
+            // recorded, not just painted: these boxes own every cell
+            // they cover, so a click on one must stop there instead of
+            // reaching the row underneath.
+            let toasts = notifications.visible();
+            hits.toasts = ui::notify::boxes(toasts, area);
+            f.render_widget(NotificationOverlay { items: toasts }, area);
 
             if subtitle_menu_open {
                 let values = [
