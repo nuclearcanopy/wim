@@ -15,25 +15,49 @@ pub struct NotificationOverlay<'a> {
     pub items: &'a [Notification],
 }
 
+/// One placement pass: the rect and the fitted text per toast that
+/// fits, newest first, in the order they are painted. Both the render
+/// and `boxes` walk this, so the cells a click is tested against are
+/// the cells that were drawn.
+fn placed(items: &[Notification], area: Rect) -> Vec<(Rect, String, &Notification)> {
+    let mut placed = Vec::new();
+    let mut y = area.y;
+    for n in items.iter().rev() {
+        if y + 3 > area.y + area.height {
+            break;
+        }
+
+        let text = format!("[{}] {}", n.severity.icon(), n.message);
+        let max_inner = (area.width as usize).saturating_sub(4);
+        let text = truncate_with_ellipsis(&text, max_inner.max(1));
+        // cells, not chars: a cjk or emoji track label in the
+        // message measures wider than its char count, and sizing
+        // the box by chars left the text overrunning its own right
+        // border.
+        let inner_width = (text_width(&text) as u16).max(4);
+        let box_width = inner_width + 2;
+        let start_x = area.x + area.width.saturating_sub(box_width);
+
+        placed.push((Rect::new(start_x, y, box_width, 3), text, n));
+        y += 4; // box height (3) + one row of gap before the next
+    }
+    placed
+}
+
+/// The cells the toasts own, for the frame's hit map. These are
+/// painted over the panes after the draw pass recorded their lists, so
+/// without this a click on a toast reaches whatever row is hidden
+/// behind it (see `hit::HitMap::toasts`).
+pub fn boxes(items: &[Notification], area: Rect) -> Vec<Rect> {
+    placed(items, area)
+        .into_iter()
+        .map(|(rect, _, _)| rect)
+        .collect()
+}
+
 impl Widget for NotificationOverlay<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let mut y = area.y;
-        for n in self.items.iter().rev() {
-            if y + 3 > area.y + area.height {
-                break;
-            }
-
-            let text = format!("[{}] {}", n.severity.icon(), n.message);
-            let max_inner = (area.width as usize).saturating_sub(4);
-            let text = truncate_with_ellipsis(&text, max_inner.max(1));
-            // cells, not chars: a cjk or emoji track label in the
-            // message measures wider than its char count, and sizing
-            // the box by chars left the text overrunning its own right
-            // border.
-            let inner_width = (text_width(&text) as u16).max(4);
-            let box_width = inner_width + 2;
-            let start_x = area.x + area.width.saturating_sub(box_width);
-
+        for (rect, text, n) in placed(self.items, area) {
             // brightness carries severity, not color (monochrome
             // rule): error is the most prominent, info the least.
             let color = shade(match n.severity {
@@ -41,9 +65,7 @@ impl Widget for NotificationOverlay<'_> {
                 Severity::Alert => BRIGHT,
                 Severity::Error => WHITE,
             });
-
-            draw_box(buf, start_x, y, box_width, &text, &n.footer(), color);
-            y += 4; // box height (3) + one row of gap before the next
+            draw_box(buf, rect.x, rect.y, rect.width, &text, &n.footer(), color);
         }
     }
 }
@@ -187,6 +209,46 @@ mod tests {
         for x in left..40 {
             let c = char_at(&buf, x, 1);
             assert_ne!(c, '¤', "bleed-through at x={x} on the box's row");
+        }
+    }
+
+    /// The rects the hit map is given have to be the cells the boxes
+    /// were painted on, in both directions: every reported rect holds
+    /// a box, and every box drawn is inside a reported rect. A click
+    /// resolves against these, so a rect that drifts off the paint
+    /// either swallows a row the toast is not covering or lets one
+    /// through that it is.
+    #[test]
+    fn the_reported_boxes_are_the_cells_the_toasts_were_painted_on() {
+        let mut n = Notifications::default();
+        n.push(Severity::Info, "queued 3 tracks");
+        n.push(Severity::Alert, "server went offline");
+        n.push(Severity::Error, "error loading file");
+        // a non-zero origin: the overlay is given the whole frame, but
+        // nothing here may assume that frame starts at 0,0.
+        let area = Rect::new(2, 1, 44, 14);
+        let mut buf = buffer(area.x + area.width, area.y + area.height);
+        NotificationOverlay { items: n.visible() }.render(area, &mut buf);
+
+        let rects = boxes(n.visible(), area);
+        assert_eq!(rects.len(), 3, "all three fit in 14 rows");
+        for r in &rects {
+            assert_eq!(r.height, 3, "a toast is three rows: {r:?}");
+            assert_eq!(char_at(&buf, r.x, r.y), '┌', "{r:?}");
+            assert_eq!(char_at(&buf, r.x + r.width - 1, r.y), '┐', "{r:?}");
+            assert_eq!(char_at(&buf, r.x, r.y + 2), '└', "{r:?}");
+            assert_eq!(char_at(&buf, r.x + r.width - 1, r.y + 2), '┘', "{r:?}");
+        }
+        // the converse: no box was painted outside what was reported.
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if char_at(&buf, x, y) == '┌' {
+                    assert!(
+                        rects.iter().any(|r| r.x == x && r.y == y),
+                        "a box at ({x},{y}) is in no reported rect"
+                    );
+                }
+            }
         }
     }
 
