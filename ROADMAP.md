@@ -440,118 +440,46 @@ accident.
       rate and make it tunable; dropping to a lower rate must degrade
       smoothness, never block the input path.
 
-## in flight (branches, NOT merged; do not start work that touches these)
+## in flight
 
-**verify against `git worktree list` and `git log --oneline master..<branch>`
-before trusting this; a stale version reads as "these files are free"
-when they are not.** as of 2026-10-28 all six worktrees have commits
-and none are merged. three have reported in full, three had committed
-work but had not reported when this was written.
+**all five perf branches are MERGED into master as of 2026-10-28**
+(`perf/search`, `perf/startup`, `perf/mpv`, `perf/art`, `perf/shell`),
+each verified after its own merge: clippy `-D warnings` clean, full
+test suite green, fmt clean. 741 tests now pass. their measurements and
+findings are recorded in the sections below and in `docs/`
+(`search-performance.md`, `startup-cache.md`, `raster.md`,
+`architecture.md`).
 
-merge order matters: `feat/mouse`, `perf/art` and `perf/startup` all
-touch `main.rs`, and mouse rewrote the region the other two touch in
-4 hunks each. merge mouse first, then re-apply the small footprints on
-top; do not merge art or startup into a tree that has not taken mouse
-yet.
+one real collision, worth knowing about if agents are ever fanned out
+this way again: **`perf/search` and `perf/shell` independently
+optimized `Corpus::search`** and restructured the same function, so six
+conflicts landed in `search.rs`. resolved toward `perf/search`'s
+machinery, because it carries an oracle test that keeps the
+pre-optimization scorer verbatim and compares item-by-item over 38
+query shapes; shell's one non-overlapping piece (`search_names`, which
+completion calls per keystroke to avoid cloning a `SearchItem` per
+match) was re-implemented on top, with `rank` now being
+`rank_borrowed` plus the clone so the two entry points cannot rank
+differently.
 
-- `feat/mouse` (12 commits, REPORTED, all four gates clean, 690 tests).
-  click to focus and to press buttons, wheel moves the selection, drag
-  on the progress bar scrubs. new `src/hit.rs` holds a per-frame
-  `HitMap` the draw closure fills as it computes each rect, so a
-  frame's map is by construction a description of what is on screen.
-  widgets hand over their own geometry (`ControlsBar::layout`,
-  `PlayerView::transport`, `row_items`/`rows` on the four lists) rather
-  than being guessed at; `hit::TIERS` writes the precedence order down
-  once as data so adding a tier fails to compile until every place
-  names it. **nobody has actually clicked it**: under a bare pty the
-  ratatui-image graphics probe goes unanswered and then eats stdin, so
-  raw-mode input is not exercisable headlessly. needs one human pass.
-- `perf/art` (5 commits, REPORTED, all gates clean). the per-frame
-  resampling claim was real: `AsciiArt::render` resampled the full
-  source through `get_pixel` every frame, cost scaling with the source
-  rather than the output (a 1500px cover cost 37ms per frame for a
-  40x20 panel). new `src/ui/raster.rs` is O(output) half-block
-  rasterization with reused scratch buffers, plus a `Memo` keyed on
-  (key, size, cell_aspect, fit): 7.0ms -> 0.015ms for a real art panel,
-  35.9ms -> 1.6ms for a 1080p frame at 400x200 cells. decoded covers
-  bounded to 640px, so 24 of them is a flat 28MB instead of 154-617MB.
-  disk store for cover bytes under `cache_dir()/covers`.
-- `perf/startup` (6 commits, REPORTED, tree clean). persistent NDJSON
-  catalog per server loaded before the first frame, so a warm start has
-  the library on screen AT the first frame (81.9ms) instead of 8.1s.
-  `Corpus::reconcile_server` makes sync drop what a server no longer
-  lists, which a persisted catalog makes mandatory. `artist_tracks` was
-  spawning a thread and socket PER ALBUM (60 connections for a
-  60-release artist); now a bounded pool of 8, and an artist page goes
-  1937ms -> 361ms cold -> 0.46ms reopened. new artifact is 0600 inside
-  a 0700 dir, holds no credentials, salted digest instead of the url.
-- `perf/mpv` (6 commits, REPORTED, all gates clean, 668 tests). the
-  level meter read went 144us mean / 1204us worst per frame (blocking,
-  and returning `None` every time) to 0.040us returning a real value;
-  subtitle style per keypress 1592us to 605us by pipelining 7 round
-  trips into one batch; bgr0->rgb conversion 13.4ms to 3.6ms at 1080p.
-  found three bugs doing it: the af-metadata property path resolved
-  against the lavfi graph's inner label instead of mpv's own filter
-  label so it never resolved; mpv hands af-metadata through as strings
-  so `as_f64()` read every value as absent; and a `property-change`
-  for a vanished property carries no `data` key at all (not
-  `data: null`), so the reader dropped exactly the event meaning "this
-  reading is gone" and the last one stood forever. also fixed a latent
-  socket-naming bug: `Mpv::spawn` named the socket by pid alone, so a
-  second `Mpv` in one process deleted the first's socket and both
-  mpvs answered on the same path.
-- `perf/search` (REPORTED, all gates clean, 666 tests, `main.rs`
-  untouched at 0 lines). 2.3x to 180x in cpu time at 40k items,
-  depending on query shape; a typo query 54.1ms -> 7.2ms, a no-match
-  query 43.4ms -> 0.24ms. typing "bladee" one char at a time went
-  141.5ms total -> 30.0ms. five exact short circuits, each a
-  *necessary* condition so none can reject a real match (per-entry char
-  mask, word-length bitmask, nearest-length word bounding the best
-  achievable typo score, the char mask as an edit-distance lower
-  bound, and an O(n) byte compare replacing strsim's dp table at
-  budget 1). `PARALLEL_SCORING_FLOOR` moved 2k -> 16k on measurement.
-  **incremental narrowing was verified UNSAFE and deliberately not
-  done**, correcting the brief that proposed it: the candidate set is
-  not monotone under appending because the typo budget grows with
-  query length, and a probe found counterexamples automatically
-  (`brainm` -> `brainmi` adds 1666 candidates; "god" is 2 edits from
-  "goes" while "gods" is 1). pinned as
-  `appending_a_char_can_add_candidates`. the correctness oracle keeps
-  the pre-optimization scorer verbatim and compares item-by-item over
-  38 query shapes; 10 deliberate sabotages were run and **4 initially
-  passed**, exposing real coverage gaps (no budget-1 transposition in
-  the corpus, no distance-2 typo match at all, nothing on the length
-  window's top edge, no >31-char word needing the typo pass) which are
-  now closed. `/tmp/sabotage*.py` is that harness, benign.
-- `perf/shell` (4 commits, all four gates green: clippy clean, 664
-  tests, fmt clean, tree clean). the agent was KILLED mid-sentence by
-  an api limit while writing its docs, so there is no report; its
-  measurements are in the commit bodies instead, which is where the
-  numbers below come from. the code is landable, the prose is not
-  written.
-  per keystroke in the console with a 30k-item library 14.5 -> 5.7ms;
-  console-side table cost per keystroke `volume(50%)` 8.5 -> 0.7us,
-  `repeat(3, skip())` 11.8 -> 1.5us, `play(blade runner blues 1)`
-  19.6 -> 9.8us, and 10.1 -> 6.0ms with a 30k corpus behind it. a full
-  suggestion pass at 30.8k tracks 44.2 -> 16.7ms.
-  the three mechanisms: a 64-bit byte-set difference decides when a
-  word is missing more of the query's characters than the typo budget
-  allows, skipping a strsim call that allocates a matrix and a map per
-  invocation; the static command table's sorted names, keyword sets,
-  name resolutions and signatures are `LazyLock`-built once instead of
-  rebuilt and re-sorted every keystroke; and three of the nine
-  suggestion generators were walking the whole library building a
-  candidate per track (~150k allocations per pass at 30k tracks) for
-  `normalise` to throw all but 64 away, so a `Pool` now answers
-  `wants(raw)` before the caller pays, admitting ties and refusing to
-  prune below `normalise`'s epsilon where raw stops predicting order.
-  correctness: suggestion output identical over 30 catalog/starred/seed
-  configurations to six decimals, search output byte-identical over 120
-  query/corpus-size pairs, both skips pinned against the unbounded code
-  path and strsim themselves. the new pinned tables caught three real
-  bugs while being written (a case-sensitive compare, an off-by-one in
-  the byte path, a dropped dedup).
-  **what is missing:** `docs/` prose, and nobody has reviewed the diff.
+also reconciled at merge, as `perf/mpv` predicted: `sample_luma` is
+gone entirely and both art paths go through `perf/art`'s O(output)
+rasterizer (`with_memo` for static covers, `with_scratch` for anything
+changing per frame), so mpv's warning about ~2.07M `get_pixel` calls
+per frame on the render thread is moot and `VIDEO_FRAME_MAX_EDGE`
+staying `None` costs nothing in sampling.
+
+- `feat/mouse` + `wim-wt-mouse` (12 commits, NOT merged, held
+  deliberately). all four gates pass on its tip and it adds click to
+  focus, click to press, wheel to move the selection and drag to
+  scrub. **held because no human has ever clicked it**: under a bare
+  pty the ratatui-image graphics probe goes unanswered and then eats
+  stdin, so raw-mode input cannot be exercised headlessly here. the
+  hit resolution is well covered as pure functions, which is not the
+  same as working. merge after one manual pass. note it rewrote the
+  `main.rs` regions the merged perf branches patched, so expect
+  conflicts there now and resolve toward mouse's structure with the
+  perf call sites re-applied.
 
 ### found by the agents, not yet fixed (all in files they own)
 
