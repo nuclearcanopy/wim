@@ -24,6 +24,9 @@ pub struct CorpusCandidates<'a> {
     /// Snapshotted when the console opens and after a `save_queue`,
     /// not read off disk here: this is called per keystroke too.
     pub saved: &'a [String],
+    /// The user's saved eq curve names, so `eq()` completes to them as
+    /// well as to the built-ins.
+    pub eq_presets: Vec<String>,
 }
 
 /// Matches offered per keystroke. `Console` caps the list again at its
@@ -45,6 +48,10 @@ impl Candidates for CorpusCandidates<'_> {
 
     fn saved_queues(&self) -> Vec<String> {
         self.saved.to_vec()
+    }
+
+    fn eq_presets(&self) -> Vec<String> {
+        self.eq_presets.clone()
     }
 }
 
@@ -301,6 +308,7 @@ mod tests {
         let cand = CorpusCandidates {
             corpus: &corpus,
             saved: &[],
+            eq_presets: Vec::new(),
         };
         let got = cand.corpus("flat");
         // the bare title, not "flatline · bladee": a decorated label
@@ -322,6 +330,7 @@ mod tests {
         let cand = CorpusCandidates {
             corpus: &corpus,
             saved: &[],
+            eq_presets: Vec::new(),
         };
         assert_eq!(cand.corpus("hex"), vec!["hex".to_string()]);
     }
@@ -342,6 +351,7 @@ mod tests {
         let cand = CorpusCandidates {
             corpus: &corpus,
             saved: &[],
+            eq_presets: Vec::new(),
         };
         assert_eq!(cand.corpus("same"), vec!["same title".to_string()]);
     }
@@ -352,6 +362,7 @@ mod tests {
         let cand = CorpusCandidates {
             corpus: &corpus,
             saved: &[],
+            eq_presets: Vec::new(),
         };
         assert!(cand.corpus("").is_empty());
     }
@@ -363,6 +374,7 @@ mod tests {
         let cand = CorpusCandidates {
             corpus: &corpus,
             saved: &saved,
+            eq_presets: Vec::new(),
         };
         assert_eq!(cand.saved_queues(), saved);
     }
@@ -527,6 +539,7 @@ mod tests {
             let cand = CorpusCandidates {
                 corpus: &corpus,
                 saved: &saved,
+                eq_presets: Vec::new(),
             };
             for line in ["play(blade r", "queue([bladee, obedient])", "volume(50%)"] {
                 let iters = if size >= 30_000 { 10u32 } else { 25 };

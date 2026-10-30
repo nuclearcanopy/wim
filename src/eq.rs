@@ -66,14 +66,6 @@ pub const PRESETS: &[Preset] = &[
     },
 ];
 
-/// Index of the preset named `name`, if any; used to restore a
-/// persisted eq selection by name (see `config::Config::eq_preset`)
-/// rather than a raw index, which could point at a different preset
-/// entirely if `PRESETS` is ever reordered.
-pub fn index_of(name: &str) -> Option<usize> {
-    PRESETS.iter().position(|p| p.name == name)
-}
-
 /// A curve the user saved under a name, persisted in config.toml (see
 /// `config::Config::eq_custom_presets`).
 ///
@@ -262,6 +254,42 @@ pub fn resolve(name: &str, saved: &CustomPresets) -> Option<(Source, [f64; 10])>
     }
     let i = saved.index_of(name)?;
     Some((Source::Saved(i), clamp_gains(saved.get(i)?.gains)))
+}
+
+/// Why `name` did not resolve, phrased for whoever typed it: the
+/// closest known curve if one is near, otherwise the whole list.
+///
+/// `eq()` used to get this for free from shellsong's parse-time
+/// keyword validation. Saved curves only exist at runtime, so the
+/// parser cannot see them and resolution moved to apply time; this
+/// keeps the error as useful as it was instead of degrading to a bare
+/// "no such preset". Same Jaro-Winkler floor shellsong's own
+/// `did_you_mean` uses, for the same reason: a candidate is often much
+/// longer than what was typed.
+pub fn resolve_failure(name: &str, saved: &CustomPresets) -> String {
+    const SUGGEST_FLOOR: f64 = 0.82;
+    let names: Vec<&str> = PRESETS
+        .iter()
+        .map(|p| p.name)
+        .chain(saved.iter().map(|p| p.name.as_str()))
+        .collect();
+    let lower = name.to_lowercase();
+    let mut near: Vec<(u32, &str)> = names
+        .iter()
+        .map(|c| {
+            (
+                (strsim::jaro_winkler(&lower, &c.to_lowercase()) * 1000.0) as u32,
+                *c,
+            )
+        })
+        .filter(|(score, _)| *score >= (SUGGEST_FLOOR * 1000.0) as u32)
+        .collect();
+    // closest, then shortest, then alphabetical: deterministic.
+    near.sort_by_key(|(score, c)| (std::cmp::Reverse(*score), c.len(), *c));
+    match near.first() {
+        Some((_, c)) => format!("no eq preset '{name}'; did you mean '{c}'?"),
+        None => format!("no eq preset '{name}'; have: {}", names.join(", ")),
+    }
 }
 
 /// Which named curve `gains` exactly is, if any; built-ins first.
@@ -805,5 +833,49 @@ mod tests {
         assert_eq!(filter.matches("equalizer=f=").count(), 2);
         assert!(filter.contains("f=31:"));
         assert!(filter.contains("f=62:"));
+    }
+
+    #[test]
+    fn resolve_failure_suggests_the_closest_builtin() {
+        let saved = CustomPresets::default();
+        let msg = resolve_failure("rok", &saved);
+        assert!(msg.contains("did you mean 'rock'"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_failure_suggests_a_saved_curve_too() {
+        let mut saved = CustomPresets::default();
+        saved.insert("my bass curve", [0.0; 10]);
+        let msg = resolve_failure("my bass curv", &saved);
+        assert!(msg.contains("did you mean 'my bass curve'"), "{msg}");
+    }
+
+    /// Nothing near it: list what there is rather than inventing a
+    /// suggestion, which is what the parse-time error used to do.
+    #[test]
+    fn resolve_failure_lists_the_names_when_nothing_is_close() {
+        let saved = CustomPresets::default();
+        let msg = resolve_failure("disco", &saved);
+        assert!(msg.contains("have:"), "{msg}");
+        assert!(msg.contains("bass boost"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_reaches_a_saved_curve_by_name() {
+        let mut saved = CustomPresets::default();
+        saved.insert("my bass curve", [3.0; 10]);
+        let (source, gains) = resolve("my bass curve", &saved).expect("should resolve");
+        assert_eq!(source, Source::Saved(0));
+        assert_eq!(gains, [3.0; 10]);
+    }
+
+    /// Built-ins win a name clash, which is the precedence `resolve`
+    /// documents and the eq menu shows.
+    #[test]
+    fn a_saved_curve_cannot_shadow_a_builtin() {
+        let mut saved = CustomPresets::default();
+        saved.insert("rock", [9.0; 10]);
+        let (source, _) = resolve("rock", &saved).unwrap();
+        assert!(matches!(source, Source::Builtin(_)));
     }
 }
