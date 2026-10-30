@@ -6,7 +6,7 @@ use crate::app::LoopMode;
 use crate::browse::ArtMode;
 use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::theme::{shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE, WHITE};
-use crate::ui::albumart::AsciiArt;
+use crate::ui::albumart::CachedArt;
 use crate::ui::controlsbar::{
     fill_bg, segments_that_fit, track, Field, GLYPH_CROSSFADE, GLYPH_EQ, GLYPH_LOOP, GLYPH_PAUSE,
     GLYPH_PLAY, GLYPH_SHUFFLE, GLYPH_SPEED, SCRUB_BG, SELECT_BG, TRACK_MIN,
@@ -180,12 +180,16 @@ pub struct PlayerView<'a> {
     /// the one an open `BrowseView` holds art for; the host decides
     /// that (and fetches it) and passes `None` when it has none.
     pub art: Option<&'a image::DynamicImage>,
+    /// Names whatever cover `art` is, for the rasterizer's per-frame
+    /// cache; `coverart::art_key` of the playing track, the same name
+    /// the host rebuilds its image protocol on.
+    pub art_key: &'a str,
     /// `Real` leaves the cover panel to the host's image overlay,
     /// which goes on the `PlayerLayout::art` rect this view used; same
     /// contract as `BrowseListView`.
     pub art_mode: ArtMode,
     /// The terminal's real cell height:width ratio
-    /// (`main::cell_aspect`), threaded to `layout` and `AsciiArt` so
+    /// (`main::cell_aspect`), threaded to `layout` and `CachedArt` so
     /// both agree on what "square" means here.
     pub cell_aspect: f32,
     /// Mid-drag this is the pending scrub target rather than mpv's own
@@ -221,9 +225,10 @@ impl Widget for PlayerView<'_> {
         };
 
         if let (Some(rect), ArtMode::Ascii) = (l.art, self.art_mode) {
-            AsciiArt {
+            CachedArt {
                 image: self.art,
                 cell_aspect: self.cell_aspect,
+                key: self.art_key,
             }
             .render(rect, buf);
         }
@@ -552,6 +557,7 @@ mod tests {
         PlayerView {
             title: "a song",
             art,
+            art_key: "a:artist\u{1}album",
             art_mode: ArtMode::Ascii,
             cell_aspect: 2.0,
             elapsed_secs: Some(30.0),
