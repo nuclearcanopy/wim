@@ -57,6 +57,23 @@ pub enum AlbumArtMode {
     Off,
 }
 
+/// Which video output mpv is told to draw a fullscreen video with.
+/// `tct` is true-color half-blocks and works in every terminal; `kitty`
+/// is the kitty graphics protocol and needs a terminal that speaks it.
+/// `auto` picks kitty only when the graphics probe actually reported
+/// kitty, because mpv's kitty vo does no detection of its own: pointed
+/// at a terminal that cannot decode it, it emits graphics escapes
+/// anyway. See `video::drawing_vo` and `docs/video.md`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoOutput {
+    #[default]
+    Auto,
+    Tct,
+    Kitty,
+    Off,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Multiple servers, all merged into one unified search corpus;
@@ -174,6 +191,13 @@ pub struct Config {
     /// terminals offer (see the README's config section).
     #[serde(default = "default_mouse")]
     pub mouse: bool,
+    /// How 'v' (fullscreen video) draws. mpv draws it itself, straight
+    /// to this terminal, and wim stops drawing while it does; nothing
+    /// is rasterized on wim's side. `off` disables the key entirely for
+    /// a terminal where neither output is wanted. Music is never
+    /// affected: only a `LocalVideo` item ever gets a drawing vo.
+    #[serde(default)]
+    pub video_output: VideoOutput,
 }
 
 fn default_mouse() -> bool {
@@ -337,6 +361,7 @@ impl Default for Config {
             cache_days_threshold: default_cache_days_threshold(),
             cache_eviction_days: default_cache_eviction_days(),
             mouse: default_mouse(),
+            video_output: VideoOutput::default(),
         }
     }
 }
@@ -445,6 +470,29 @@ mod tests {
         assert!(old.mouse);
         let off: Config = toml::from_str("mouse = false\n").expect("parsing");
         assert!(!off.mouse);
+    }
+
+    /// `auto` is the default and has to survive a config written before
+    /// the option existed, same reasoning as `mouse`: shipping it as
+    /// `off` by default is shipping a feature nobody gets.
+    #[test]
+    fn video_output_defaults_to_auto_and_round_trips() {
+        assert_eq!(Config::default().video_output, VideoOutput::Auto);
+        let old: Config = toml::from_str("album_art = \"auto\"\n").expect("parsing");
+        assert_eq!(old.video_output, VideoOutput::Auto);
+
+        for (raw, want) in [
+            ("video_output = \"tct\"\n", VideoOutput::Tct),
+            ("video_output = \"kitty\"\n", VideoOutput::Kitty),
+            ("video_output = \"off\"\n", VideoOutput::Off),
+            ("video_output = \"auto\"\n", VideoOutput::Auto),
+        ] {
+            let cfg: Config = toml::from_str(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert_eq!(cfg.video_output, want, "{raw}");
+            let back: Config =
+                toml::from_str(&toml::to_string_pretty(&cfg).expect("serializing")).expect("back");
+            assert_eq!(back.video_output, want, "{raw}");
+        }
     }
 
     /// Verbatim shape `nix/home-manager.nix` generates for a declared
