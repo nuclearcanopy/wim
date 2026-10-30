@@ -184,9 +184,9 @@ pub struct PlayerView<'a> {
     /// cache; `coverart::art_key` of the playing track, the same name
     /// the host rebuilds its image protocol on.
     pub art_key: &'a str,
-    /// `Real` leaves the cover panel to the host's image overlay,
-    /// which goes on the `PlayerLayout::art` rect this view used; same
-    /// contract as `BrowseListView`.
+    /// A `Full*` mode leaves the cover panel to the host's image
+    /// overlay, which goes on the `PlayerLayout::art` rect this view
+    /// used; same contract as `BrowseListView`.
     pub art_mode: ArtMode,
     /// The terminal's real cell height:width ratio
     /// (`main::cell_aspect`), threaded to `layout` and `CachedArt` so
@@ -224,11 +224,12 @@ impl Widget for PlayerView<'_> {
             return;
         };
 
-        if let (Some(rect), ArtMode::Ascii) = (l.art, self.art_mode) {
+        if let Some(rect) = l.art.filter(|_| self.art_mode.is_ascii()) {
             CachedArt {
                 image: self.art,
                 cell_aspect: self.cell_aspect,
                 key: self.art_key,
+                tone: self.art_mode.tone(),
             }
             .render(rect, buf);
         }
@@ -648,12 +649,20 @@ mod tests {
         }))
     }
 
+    /// A cover with a real hue in it, for the `ascii-color` tests: a
+    /// grey source would pass them without proving anything.
+    fn hued_art() -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(8, 8, |x, y| {
+            image::Rgb([(x * 31) as u8, (y * 17) as u8, 200])
+        }))
+    }
+
     fn view<'a>(keymap: &'a Keymap, art: Option<&'a DynamicImage>) -> PlayerView<'a> {
         PlayerView {
             title: "a song",
             art,
             art_key: "a:artist\u{1}album",
-            art_mode: ArtMode::Ascii,
+            art_mode: ArtMode::AsciiBw,
             cell_aspect: 2.0,
             elapsed_secs: Some(30.0),
             duration_secs: Some(120.0),
@@ -769,21 +778,21 @@ mod tests {
 
     #[test]
     fn the_rect_the_widget_drew_into_is_the_rect_the_host_overlays() {
-        // `Real` mode: the widget draws no ascii art, and the host puts
-        // its image on the rect `layout` reported. Both sides have to
-        // get the same answer from the same arguments.
+        // a `Full*` mode: the widget draws no rasterized art, and the
+        // host puts its image on the rect `layout` reported. Both sides
+        // have to get the same answer from the same arguments.
         let area = Rect::new(3, 2, 70, 34);
         let reported = layout(area, true, false, 2.0).unwrap().art.unwrap();
         let keymap = Keymap::default();
         let cover = art();
 
         let mut real = view(&keymap, Some(&cover));
-        real.art_mode = ArtMode::Real;
+        real.art_mode = ArtMode::FullColor;
         let mut real_buf = buffer(80, 40);
         real.render(area, &mut real_buf);
 
         let mut ascii = view(&keymap, Some(&cover));
-        ascii.art_mode = ArtMode::Ascii;
+        ascii.art_mode = ArtMode::AsciiBw;
         let mut ascii_buf = buffer(80, 40);
         ascii.render(area, &mut ascii_buf);
 
@@ -812,6 +821,51 @@ mod tests {
                 .symbol(),
             "."
         );
+    }
+
+    /// The monochrome exception, bounded: `ascii-color` may put hues in
+    /// the cover rect and nowhere else. Everything around it (title,
+    /// transport, hints) stays `theme::shade`, and `ascii-bw` stays
+    /// strictly grey over the whole pane including the cover.
+    #[test]
+    fn ascii_color_tints_the_cover_and_nothing_else() {
+        let is_grey = |c: Color| match c {
+            Color::Rgb(r, g, b) => r == g && g == b,
+            // `Reset` is the untouched default, not a hue.
+            Color::Reset => true,
+            other => panic!("not a shade or a tint: {other:?}"),
+        };
+        let area = Rect::new(0, 0, 80, 40);
+        let cover = hued_art();
+        let reported = layout(area, true, false, 2.0).unwrap().art.unwrap();
+        let keymap = Keymap::default();
+
+        for (mode, want_tint) in [(ArtMode::AsciiColor, true), (ArtMode::AsciiBw, false)] {
+            let mut v = view(&keymap, Some(&cover));
+            v.art_mode = mode;
+            let mut buf = buffer(80, 40);
+            v.render(area, &mut buf);
+
+            let mut tinted = 0;
+            for y in area.y..area.y + area.height {
+                for x in area.x..area.x + area.width {
+                    let cell = buf.cell((x, y)).unwrap();
+                    let grey = is_grey(cell.fg) && is_grey(cell.bg);
+                    let in_art = (reported.x..reported.x + reported.width).contains(&x)
+                        && (reported.y..reported.y + reported.height).contains(&y);
+                    assert!(
+                        grey || in_art,
+                        "{mode:?} leaked a hue outside the cover at {x},{y}: {cell:?}"
+                    );
+                    tinted += u32::from(!grey);
+                }
+            }
+            assert_eq!(
+                tinted > 0,
+                want_tint,
+                "{mode:?} painted {tinted} tinted cells"
+            );
+        }
     }
 
     #[test]
