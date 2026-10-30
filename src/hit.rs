@@ -758,6 +758,163 @@ mod tests {
         }
     }
 
+    /// The index a user can read off a rendered row, parsed digit by
+    /// digit rather than by `contains`: "track 3" is a prefix of
+    /// "track 39", so a substring test would accept the wrong song.
+    fn song_on_row(buf: &ratatui::buffer::Buffer, rect: Rect, row: u16) -> (Option<usize>, String) {
+        let text: String = (rect.x..rect.x + rect.width)
+            .map(|x| crate::ui::testbuf::char_at(buf, x, rect.y + row))
+            .collect();
+        let digits: String = text
+            .split("track ")
+            .nth(1)
+            .unwrap_or("")
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        (digits.parse().ok(), text)
+    }
+
+    fn songs(n: usize) -> Vec<crate::search::SearchItem> {
+        (0..n)
+            .map(|i| crate::search::SearchItem::LocalMusic {
+                path: format!("/m/{i}.flac").into(),
+                title: format!("track {i}"),
+                artist: None,
+                album: None,
+            })
+            .collect()
+    }
+
+    /// The whole resolution path for a real list, with no hand-written
+    /// row map: the list is rendered, its map is recorded the way the
+    /// draw pass records it, and every click is aimed at the cell a
+    /// song's own text landed on. This is the maintainer's "click a
+    /// song in the list" end to end, minus the terminal. A map built
+    /// off a different scroll offset than the render used, or a lookup
+    /// that is off by a row, answers with the neighbouring song here.
+    #[test]
+    fn clicking_the_cell_a_song_was_painted_on_selects_that_song() {
+        use crate::favorites::Favorites;
+        use crate::ui::results_list::{row_items, ResultsList};
+        use ratatui::widgets::Widget;
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        let items = songs(40);
+        // a rect at a non-zero origin, with the scroll offset at zero,
+        // mid-list, and pinned to the last song.
+        for (height, selected) in [(5u16, 0usize), (12, 20), (8, 39)] {
+            let rect = Rect::new(2, 3, 26, height);
+            let mut buf = crate::ui::testbuf::buffer(rect.x + rect.width, rect.y + rect.height);
+            ResultsList {
+                items: &items,
+                selected,
+                empty_message: "",
+                favorites: &Favorites::default(),
+                remote_starred: &HashSet::new(),
+                focused: true,
+                elapsed: Duration::ZERO,
+            }
+            .render(rect, &mut buf);
+            let m = HitMap {
+                sidebar: Some(Rect::new(0, 0, 30, rect.y + rect.height)),
+                lists: vec![List {
+                    which: Scrollable::SidebarResults,
+                    rect,
+                    rows: row_items(&items, selected, rect),
+                    len: items.len(),
+                }],
+                ..Default::default()
+            };
+
+            let mut songs_seen = 0;
+            for row in 0..height {
+                let (painted, text) = song_on_row(&buf, rect, row);
+                let what = act(&m, down(rect.x + 1, rect.y + row), None);
+                match painted {
+                    Some(i) => {
+                        songs_seen += 1;
+                        assert_eq!(
+                            what,
+                            Act::Select(Scrollable::SidebarResults, i),
+                            "row {row} of a {height}-row list reads {text:?}"
+                        );
+                    }
+                    // a section header, or past the end of the list:
+                    // the pane, but no song.
+                    None => assert_eq!(
+                        what,
+                        Act::Focus(Focus::Sidebar),
+                        "row {row} of a {height}-row list reads {text:?}"
+                    ),
+                }
+            }
+            assert!(songs_seen > 0, "nothing was painted, so nothing is proven");
+        }
+    }
+
+    /// The other wiring shape the draw pass uses: the rect recorded is
+    /// the body rect under a two-row header while the row map is
+    /// derived from the whole pane, so row 0 of the map has to be the
+    /// first row of that rect and not of the pane.
+    #[test]
+    fn clicking_the_cell_a_queue_entry_was_painted_on_selects_that_entry() {
+        use crate::ui::queue::{body_rect, row_items, QueueView};
+        use ratatui::widgets::Widget;
+        use std::time::Duration;
+
+        let entries = songs(40);
+        for (height, selected) in [(9u16, 0usize), (14, 20), (10, 39)] {
+            let area = Rect::new(21, 1, 44, height);
+            let mut buf = crate::ui::testbuf::buffer(area.x + area.width, area.y + area.height);
+            QueueView {
+                entries: &entries,
+                pos: Some(0),
+                selected,
+                focused: true,
+                elapsed: Duration::ZERO,
+            }
+            .render(area, &mut buf);
+            let body = body_rect(area);
+            let m = HitMap {
+                workspace: Some(area),
+                lists: vec![List {
+                    which: Scrollable::Queue,
+                    rect: body,
+                    rows: row_items(&entries, Some(0), selected, area),
+                    len: entries.len(),
+                }],
+                ..Default::default()
+            };
+
+            let mut entries_seen = 0;
+            for row in 0..body.height {
+                let (painted, text) = song_on_row(&buf, body, row);
+                let what = act(&m, down(body.x + 1, body.y + row), None);
+                match painted {
+                    Some(i) => {
+                        entries_seen += 1;
+                        assert_eq!(
+                            what,
+                            Act::Select(Scrollable::Queue, i),
+                            "body row {row} of a {height}-row pane reads {text:?}"
+                        );
+                    }
+                    None => assert_eq!(
+                        what,
+                        Act::Focus(Focus::Workspace),
+                        "body row {row} of a {height}-row pane reads {text:?}"
+                    ),
+                }
+            }
+            assert!(
+                entries_seen > 0,
+                "nothing was painted, so nothing is proven"
+            );
+        }
+    }
+
     #[test]
     fn the_maximized_players_controls_carry_their_own_surface() {
         let mut m = map();
