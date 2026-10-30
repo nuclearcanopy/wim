@@ -3,8 +3,12 @@
 //! we need (ping, catalog browsing, playlists, stream urls) is small enough that
 //! owning it directly is simpler than fighting someone else's types.
 
+use std::collections::HashMap;
 use std::io::Read;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use md5::{Digest, Md5};
 use rand::Rng;
@@ -28,6 +32,108 @@ const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 16;
 /// hides nearly all the latency without opening a socket per album.
 const ALBUM_FETCH_CONCURRENCY: usize = 8;
 
+/// `getAlbumList2`'s per-page cap per the subsonic spec.
+const ALBUM_PAGE_SIZE: usize = 500;
+
+/// How many catalog pages `all_albums` has in flight at once. Lower
+/// than `ALBUM_FETCH_CONCURRENCY` because each page is 500 albums of
+/// json, and because every launch pays this against every configured
+/// server at the same time.
+const ALBUM_PAGE_CONCURRENCY: usize = 4;
+
+/// How long a cached navigation answer (a tracklist, an album's year,
+/// an artist's album list, a bio) may be served from memory. Pinned to
+/// the background catalog sync's own interval, so nothing a server
+/// changes is ever more than one sync cycle stale; see
+/// docs/startup-cache.md.
+const NAV_CACHE_TTL: Duration = Duration::from_secs(45);
+
+/// Cached navigation answers per server. 256 covers any plausible
+/// browsing session (an album tracklist each) and bounds what a day-
+/// long session can hold.
+const NAV_CACHE_CAPACITY: usize = 256;
+
+/// One cached response, with when it was fetched.
+struct CachedResponse {
+    at: Instant,
+    value: serde_json::Value,
+}
+
+/// Request-keyed navigation responses plus the catalog fingerprints
+/// that invalidate them. Insertion-ordered keys so the cap evicts the
+/// oldest entry rather than an arbitrary one.
+#[derive(Default)]
+struct NavCache {
+    entries: HashMap<String, CachedResponse>,
+    order: Vec<String>,
+    /// Per catalog endpoint, a digest of the ids it last answered with
+    /// (see `catalog_fingerprint`). A change means the server's
+    /// catalog moved under us, so every cached tracklist for it is
+    /// suspect and goes immediately rather than waiting out its ttl.
+    fingerprints: HashMap<&'static str, String>,
+}
+
+impl NavCache {
+    fn get(&self, key: &str) -> Option<serde_json::Value> {
+        let hit = self.entries.get(key)?;
+        (hit.at.elapsed() < NAV_CACHE_TTL).then(|| hit.value.clone())
+    }
+
+    fn put(&mut self, key: String, value: serde_json::Value) {
+        self.order.retain(|k| k != &key);
+        self.order.push(key.clone());
+        self.entries.insert(
+            key,
+            CachedResponse {
+                at: Instant::now(),
+                value,
+            },
+        );
+        while self.order.len() > NAV_CACHE_CAPACITY {
+            let oldest = self.order.remove(0);
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+}
+
+/// Navigation caches keyed by `username@base_url`, so every `Client`
+/// built for one server shares one: the catalog sync builds a fresh
+/// client per pass, and it is the thing that knows the catalog
+/// changed, while the clients the corpus hands to the ui live for the
+/// whole session. Holds parsed responses and id digests only, never a
+/// credential (see docs/security.md).
+static NAV_CACHES: OnceLock<Mutex<HashMap<String, Arc<Mutex<NavCache>>>>> = OnceLock::new();
+
+fn nav_cache_for(username: &str, base_url: &str) -> Arc<Mutex<NavCache>> {
+    let registry = NAV_CACHES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = format!("{username}@{base_url}");
+    let Ok(mut registry) = registry.lock() else {
+        // a poisoned registry means some thread panicked holding it;
+        // an unshared cache is still correct, just not shared.
+        return Arc::new(Mutex::new(NavCache::default()));
+    };
+    registry.entry(key).or_default().clone()
+}
+
+/// Order-independent digest of whatever ids a catalog endpoint
+/// answered with: the cheapest "did this server's catalog change"
+/// signal available without the server telling us.
+fn catalog_fingerprint(ids: impl Iterator<Item = impl AsRef<str>>) -> String {
+    let mut sorted: Vec<String> = ids.map(|id| id.as_ref().to_string()).collect();
+    sorted.sort_unstable();
+    let mut hasher = Md5::new();
+    for id in sorted {
+        hasher.update(id.as_bytes());
+        hasher.update(b"\n");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// Cheap to clone (ureq's `Agent` is `Arc`-backed internally); every
 /// remote `SearchItem` carries an `Arc<Client>` so playback can later
 /// resolve to the right server's stream url without the app needing a
@@ -49,6 +155,9 @@ pub struct Client {
     /// own configured transcoding profile decide," the default.
     max_bitrate_kbps: Option<u32>,
     transcode_format: Option<String>,
+    /// Shared with every other `Client` for the same server; see
+    /// `NAV_CACHES`.
+    nav_cache: Arc<Mutex<NavCache>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -167,9 +276,18 @@ impl Client {
         &self.base_url
     }
 
+    /// Half of the identity of a persisted catalog (`cache.rs`): two
+    /// accounts on one server don't see the same playlists, so the
+    /// username is part of which catalog is whose.
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
     pub fn new(cfg: &NavidromeConfig) -> anyhow::Result<Self> {
+        let base_url = normalize_url(&cfg.url);
         Ok(Client {
-            base_url: normalize_url(&cfg.url),
+            nav_cache: nav_cache_for(&cfg.username, &base_url),
+            base_url,
             username: cfg.username.clone(),
             password: Zeroizing::new(cfg.resolve_password()?),
             agent: ureq::AgentBuilder::new()
@@ -226,6 +344,57 @@ impl Client {
         Ok(serde_json::to_value(body.subsonic_response)?)
     }
 
+    /// `get` for the listings a navigation hit is made of, served from
+    /// memory while an answer younger than `NAV_CACHE_TTL` is around.
+    /// Only ever used for idempotent reads whose answer is the same
+    /// for every caller; the catalog endpoints deliberately stay
+    /// uncached, since they are the invalidation signal and the thing
+    /// asking for them is the sync that wants fresh data.
+    fn get_cached(
+        &self,
+        endpoint: &str,
+        extra: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        let key = extra.iter().fold(endpoint.to_string(), |mut key, (k, v)| {
+            key.push('\u{1f}');
+            key.push_str(k);
+            key.push('=');
+            key.push_str(v);
+            key
+        });
+        if let Some(hit) = self.nav_cache.lock().ok().and_then(|c| c.get(&key)) {
+            return Ok(hit);
+        }
+        let value = self.get(endpoint, extra)?;
+        if let Ok(mut cache) = self.nav_cache.lock() {
+            cache.put(key, value.clone());
+        }
+        Ok(value)
+    }
+
+    /// Drops every cached navigation answer for this server when
+    /// `ids` differ from what the same endpoint answered last time.
+    /// Called from the catalog endpoints, which is what makes the
+    /// background sync the invalidation path rather than the ttl
+    /// alone.
+    fn invalidate_on_catalog_change(
+        &self,
+        endpoint: &'static str,
+        ids: impl Iterator<Item = impl AsRef<str>>,
+    ) {
+        let fingerprint = catalog_fingerprint(ids);
+        let Ok(mut cache) = self.nav_cache.lock() else {
+            return;
+        };
+        match cache.fingerprints.insert(endpoint, fingerprint.clone()) {
+            // first catalog fetch of the process: nothing cached yet
+            // from before it, so there is nothing to drop.
+            None => {}
+            Some(previous) if previous == fingerprint => {}
+            Some(_) => cache.clear(),
+        }
+    }
+
     pub fn ping(&self) -> anyhow::Result<()> {
         self.get("ping", &[])?;
         Ok(())
@@ -237,7 +406,7 @@ impl Client {
     /// album into its actual tracks and to populate the track-listing
     /// view when you open one.
     pub fn get_album(&self, album_id: &str) -> anyhow::Result<AlbumDetails> {
-        let v = self.get("getAlbum", &[("id", album_id)])?;
+        let v = self.get_cached("getAlbum", &[("id", album_id)])?;
         let album = v.get("album");
         Ok(AlbumDetails {
             year: album
@@ -253,7 +422,7 @@ impl Client {
     /// songs; see `get_album` per-album for those (and the Global/
     /// Various-Artists filtering that requires).
     pub fn get_artist(&self, artist_id: &str) -> anyhow::Result<Vec<ArtistAlbum>> {
-        let v = self.get("getArtist", &[("id", artist_id)])?;
+        let v = self.get_cached("getArtist", &[("id", artist_id)])?;
         Ok(parse_artist_albums(&v))
     }
 
@@ -263,7 +432,7 @@ impl Client {
     /// when the server has nothing (unknown artist, no internet
     /// metadata lookup configured, etc.).
     pub fn get_artist_info(&self, artist_id: &str) -> anyhow::Result<ArtistInfo> {
-        let v = self.get("getArtistInfo2", &[("id", artist_id)])?;
+        let v = self.get_cached("getArtistInfo2", &[("id", artist_id)])?;
         Ok(parse_artist_info(&v))
     }
 
@@ -277,7 +446,7 @@ impl Client {
     /// `entry`, not `song`, but the per-track shape is identical.
     /// Playlists have no release year, so no metadata wrapper needed.
     pub fn get_playlist_songs(&self, playlist_id: &str) -> anyhow::Result<Vec<Song>> {
-        let v = self.get("getPlaylist", &[("id", playlist_id)])?;
+        let v = self.get_cached("getPlaylist", &[("id", playlist_id)])?;
         Ok(parse_song_array(
             v.get("playlist").and_then(|p| p.get("entry")),
         ))
@@ -306,7 +475,7 @@ impl Client {
 
     pub fn playlists(&self) -> anyhow::Result<Vec<Playlist>> {
         let v = self.get("getPlaylists", &[])?;
-        let list = v
+        let list: Vec<Playlist> = v
             .get("playlists")
             .and_then(|p| p.get("playlist"))
             .and_then(|p| p.as_array())
@@ -321,6 +490,7 @@ impl Client {
                     .collect()
             })
             .unwrap_or_default();
+        self.invalidate_on_catalog_change("getPlaylists", list.iter().map(|p| &p.id));
         Ok(list)
     }
 
@@ -331,39 +501,77 @@ impl Client {
     /// index's `artist` array into one flat list.
     pub fn all_artists(&self) -> anyhow::Result<Vec<Artist>> {
         let v = self.get("getArtists", &[])?;
-        Ok(parse_artists_index(&v))
+        let artists = parse_artists_index(&v);
+        self.invalidate_on_catalog_change("getArtists", artists.iter().map(|a| &a.id));
+        Ok(artists)
     }
 
     /// The entire album catalog, paginated via `getAlbumList2`
     /// (`offset`/`size`); unlike artists, album listing has no
-    /// single-call "everything" mode, so this loops until a page
+    /// single-call "everything" mode, so this runs until a page
     /// returns fewer than requested (the standard termination
     /// condition; Navidrome also reports `x-total-count` but that
     /// requires reading response headers, which ureq's `into_json()`
     /// convenience here doesn't expose; the fewer-than-requested check
     /// is sufficient and matches what the spec guarantees).
+    ///
+    /// Pages after the first are independent requests at known
+    /// offsets, so they go out `ALBUM_PAGE_CONCURRENCY` at a time
+    /// instead of one round trip per page: a 5k-album library was 11
+    /// stacked round trips. The cost is a handful of requests past the
+    /// end of the catalog (one short of a full wave, worst case),
+    /// which answer empty; only libraries over one page pay it at all.
     pub fn all_albums(&self) -> anyhow::Result<Vec<Album>> {
-        const PAGE_SIZE: usize = 500;
-        let mut albums = Vec::new();
-        let mut offset = 0usize;
-        loop {
-            let v = self.get(
-                "getAlbumList2",
-                &[
-                    ("type", "alphabeticalByName"),
-                    ("size", &PAGE_SIZE.to_string()),
-                    ("offset", &offset.to_string()),
-                ],
-            )?;
-            let page = parse_album_list2_page(&v);
-            let got = page.len();
-            albums.extend(page);
-            if got < PAGE_SIZE {
-                break;
-            }
-            offset += PAGE_SIZE;
-        }
+        let albums = self.all_album_pages()?;
+        self.invalidate_on_catalog_change("getAlbumList2", albums.iter().map(|a| &a.id));
         Ok(albums)
+    }
+
+    fn all_album_pages(&self) -> anyhow::Result<Vec<Album>> {
+        let mut albums = self.album_page(0)?;
+        if albums.len() < ALBUM_PAGE_SIZE {
+            return Ok(albums);
+        }
+        let mut offset = ALBUM_PAGE_SIZE;
+        loop {
+            let wave: Vec<anyhow::Result<Vec<Album>>> = thread::scope(|scope| {
+                (0..ALBUM_PAGE_CONCURRENCY)
+                    .map(|i| scope.spawn(move || self.album_page(offset + i * ALBUM_PAGE_SIZE)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .unwrap_or_else(|_| anyhow::bail!("panicked fetching an album page"))
+                    })
+                    .collect()
+            });
+            for page in wave {
+                let page = page?;
+                let got = page.len();
+                albums.extend(page);
+                // a short page is the end of the catalog, so every
+                // later offset in this wave is past it; whatever they
+                // answered is dropped rather than appended out of
+                // order (the next sync picks up anything added since).
+                if got < ALBUM_PAGE_SIZE {
+                    return Ok(albums);
+                }
+            }
+            offset += ALBUM_PAGE_SIZE * ALBUM_PAGE_CONCURRENCY;
+        }
+    }
+
+    fn album_page(&self, offset: usize) -> anyhow::Result<Vec<Album>> {
+        let v = self.get(
+            "getAlbumList2",
+            &[
+                ("type", "alphabeticalByName"),
+                ("size", &ALBUM_PAGE_SIZE.to_string()),
+                ("offset", &offset.to_string()),
+            ],
+        )?;
+        Ok(parse_album_list2_page(&v))
     }
 
     /// Stream url for a song id. Asks for `format=raw` (the subsonic
@@ -458,22 +666,52 @@ impl Client {
         artist_id: &str,
     ) -> anyhow::Result<Vec<ArtistAlbumTracks>> {
         let albums = self.artist_albums_chronological(artist_id)?;
-        let workers = ALBUM_FETCH_CONCURRENCY.min(albums.len());
+        let ids: Vec<&str> = albums.iter().map(|a| a.id.as_str()).collect();
+        Ok(self
+            .album_details(&ids)
+            .into_iter()
+            .zip(albums)
+            .enumerate()
+            .filter_map(|(index, (details, album))| {
+                Some(ArtistAlbumTracks {
+                    index,
+                    album,
+                    songs: details?.songs,
+                })
+            })
+            .collect())
+    }
+
+    /// `getAlbum` for many album ids at once, answers in the same
+    /// order as `album_ids` (`None` where that album's fetch failed;
+    /// one unreadable album shouldn't take down a whole artist page).
+    ///
+    /// The one bounded fan-out for album fetches: a worker per slot
+    /// would be a socket per album, which against a real Navidrome
+    /// instance means an artist with 60 releases opening 60
+    /// connections. Workers pull from a shared counter rather than
+    /// striping a fixed slice each, since album sizes vary a lot.
+    pub fn album_details(&self, album_ids: &[&str]) -> Vec<Option<AlbumDetails>> {
+        let workers = ALBUM_FETCH_CONCURRENCY.min(album_ids.len());
         if workers == 0 {
-            return Ok(Vec::new());
+            return Vec::new();
         }
-        let albums = &albums;
-        let batches: Vec<Vec<ArtistAlbumTracks>> = thread::scope(|scope| {
+        let next = AtomicUsize::new(0);
+        let done: Vec<Vec<(usize, AlbumDetails)>> = thread::scope(|scope| {
             (0..workers)
-                .map(|worker| {
+                .map(|_| {
+                    let next = &next;
                     scope.spawn(move || {
-                        albums
-                            .iter()
-                            .enumerate()
-                            .skip(worker)
-                            .step_by(workers)
-                            .filter_map(|(index, album)| self.album_tracks(index, album))
-                            .collect::<Vec<_>>()
+                        let mut mine = Vec::new();
+                        loop {
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(id) = album_ids.get(index) else {
+                                return mine;
+                            };
+                            if let Ok(details) = self.get_album(id) {
+                                mine.push((index, details));
+                            }
+                        }
                     })
                 })
                 .collect::<Vec<_>>()
@@ -481,9 +719,13 @@ impl Client {
                 .map(|handle| handle.join().unwrap_or_default())
                 .collect()
         });
-        let mut tracks: Vec<ArtistAlbumTracks> = batches.into_iter().flatten().collect();
-        tracks.sort_by_key(|t| t.index);
-        Ok(tracks)
+        let mut slots: Vec<Option<AlbumDetails>> = (0..album_ids.len()).map(|_| None).collect();
+        for (index, details) in done.into_iter().flatten() {
+            if let Some(slot) = slots.get_mut(index) {
+                *slot = Some(details);
+            }
+        }
+        slots
     }
 
     /// Non-blocking counterpart for the artist view: one `getArtist`
@@ -544,7 +786,7 @@ impl Client {
     /// artist you love that you have never played" suggestion, which
     /// plain play-coverage can't rank on its own.
     pub fn get_top_songs(&self, artist_name: &str, count: usize) -> anyhow::Result<Vec<Song>> {
-        let v = self.get(
+        let v = self.get_cached(
             "getTopSongs",
             &[("artist", artist_name), ("count", &count.to_string())],
         )?;
@@ -597,7 +839,7 @@ struct SubsonicError {
 /// actually works instead of silently failing to connect; defaults to
 /// https, since that's the sane assumption for anything reachable from
 /// outside localhost. Trailing slashes are trimmed either way.
-fn normalize_url(url: &str) -> String {
+pub(crate) fn normalize_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         trimmed.to_string()
@@ -813,6 +1055,24 @@ mod tests {
     use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
 
+    /// What the mock's catalog endpoints answer, mutable so a test can
+    /// change a server's catalog under a client that's already running
+    /// (which is what the background sync sees on a real server).
+    struct MockCatalog {
+        albums: AtomicUsize,
+        rev: AtomicUsize,
+    }
+
+    /// Everything one mock server answers from, shared with each
+    /// connection handler.
+    struct MockFixture {
+        albums: usize,
+        songs_per_album: usize,
+        latency: Duration,
+        requests: Arc<AtomicUsize>,
+        catalog: Arc<MockCatalog>,
+    }
+
     /// Minimal http/1.1 server for the fetch-path tests: canned
     /// subsonic json, an optional per-request delay standing in for
     /// network latency, and counters for requests and accepted
@@ -821,6 +1081,7 @@ mod tests {
         url: String,
         requests: Arc<AtomicUsize>,
         connections: Arc<AtomicUsize>,
+        catalog: Arc<MockCatalog>,
     }
 
     impl MockServer {
@@ -829,14 +1090,25 @@ mod tests {
             let url = format!("http://{}", listener.local_addr().unwrap());
             let requests = Arc::new(AtomicUsize::new(0));
             let connections = Arc::new(AtomicUsize::new(0));
-            let (req, conn) = (requests.clone(), connections.clone());
+            let catalog = Arc::new(MockCatalog {
+                albums: AtomicUsize::new(0),
+                rev: AtomicUsize::new(0),
+            });
+            let fixture = Arc::new(MockFixture {
+                albums,
+                songs_per_album,
+                latency,
+                requests: requests.clone(),
+                catalog: catalog.clone(),
+            });
+            let conn = connections.clone();
             // detached: the test binary exits without waiting on it
             thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
                     conn.fetch_add(1, Ordering::Relaxed);
-                    let req = req.clone();
+                    let fixture = fixture.clone();
                     thread::spawn(move || {
-                        serve(stream, albums, songs_per_album, latency, &req);
+                        serve(stream, &fixture);
                     });
                 }
             });
@@ -844,6 +1116,7 @@ mod tests {
                 url,
                 requests,
                 connections,
+                catalog,
             }
         }
 
@@ -866,16 +1139,23 @@ mod tests {
         fn connections(&self) -> usize {
             self.connections.load(Ordering::Relaxed)
         }
+
+        /// How many albums `getAlbumList2` has to page through.
+        fn with_catalog_albums(self, total: usize) -> MockServer {
+            self.catalog.albums.store(total, Ordering::Relaxed);
+            self
+        }
+
+        /// Same album count, different ids: a catalog that changed
+        /// under the client, which is what has to drop cached
+        /// tracklists.
+        fn replace_catalog(&self) {
+            self.catalog.rev.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// One keep-alive connection: requests until the client hangs up.
-    fn serve(
-        stream: TcpStream,
-        albums: usize,
-        songs_per_album: usize,
-        latency: Duration,
-        requests: &AtomicUsize,
-    ) {
+    fn serve(stream: TcpStream, fixture: &MockFixture) {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         loop {
@@ -892,9 +1172,9 @@ mod tests {
                     Err(_) => return,
                 }
             }
-            requests.fetch_add(1, Ordering::Relaxed);
-            thread::sleep(latency);
-            let body = mock_body(&request_line, albums, songs_per_album);
+            fixture.requests.fetch_add(1, Ordering::Relaxed);
+            thread::sleep(fixture.latency);
+            let body = mock_body(&request_line, fixture);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
@@ -906,9 +1186,36 @@ mod tests {
         }
     }
 
+    /// One query parameter off a request line, or `None`.
+    fn query_param(request_line: &str, key: &str) -> Option<usize> {
+        request_line
+            .split(&format!("{key}="))
+            .nth(1)?
+            .split(['&', ' '])
+            .next()?
+            .parse()
+            .ok()
+    }
+
     /// Years descend with album position, so the returned order is the
     /// reverse of the chronological one every caller sorts into.
-    fn mock_body(request_line: &str, albums: usize, songs_per_album: usize) -> String {
+    fn mock_body(request_line: &str, fixture: &MockFixture) -> String {
+        let (albums, songs_per_album) = (fixture.albums, fixture.songs_per_album);
+        if request_line.contains("/rest/getAlbumList2") {
+            let total = fixture.catalog.albums.load(Ordering::Relaxed);
+            let rev = fixture.catalog.rev.load(Ordering::Relaxed);
+            let offset = query_param(request_line, "offset").unwrap_or(0);
+            let size = query_param(request_line, "size").unwrap_or(ALBUM_PAGE_SIZE);
+            let page: Vec<String> = (offset..total.min(offset + size))
+                .map(|i| {
+                    format!(r#"{{"id":"cat{rev}-{i}","name":"catalog {i}","artist":"artist"}}"#)
+                })
+                .collect();
+            return format!(
+                r#"{{"subsonic-response":{{"status":"ok","albumList2":{{"album":[{}]}}}}}}"#,
+                page.join(",")
+            );
+        }
         if request_line.contains("/rest/getArtistInfo2") {
             return r#"{"subsonic-response":{"status":"ok","artistInfo2":{"biography":"mock bio"}}}"#
                 .to_string();
@@ -1343,6 +1650,171 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_whole_album_catalog_comes_back_across_pages() {
+        let server = MockServer::start(0, 0, Duration::ZERO).with_catalog_albums(1_200);
+        let albums = server.client().all_albums().unwrap();
+        assert_eq!(albums.len(), 1_200);
+        assert_eq!(albums[0].id, "cat0-0");
+        assert_eq!(albums[1_199].id, "cat0-1199");
+        let distinct: std::collections::HashSet<&str> =
+            albums.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(distinct.len(), 1_200, "no page was fetched twice");
+        // page 0, then one wave of four: 500 + 500 + 200 is the whole
+        // catalog, and the two offsets past the end answer empty.
+        assert_eq!(server.requests(), 5);
+    }
+
+    #[test]
+    fn a_catalog_inside_one_page_is_a_single_request() {
+        let server = MockServer::start(0, 0, Duration::ZERO).with_catalog_albums(120);
+        assert_eq!(server.client().all_albums().unwrap().len(), 120);
+        assert_eq!(
+            server.requests(),
+            1,
+            "a library under one page must not pay for a wave"
+        );
+    }
+
+    /// Catalog pages are independent round trips at known offsets, so
+    /// they overlap; serial pagination cost one latency per page.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn album_pagination_timing_serial_vs_waved() {
+        const LATENCY: Duration = Duration::from_millis(120);
+        let server = MockServer::start(0, 0, LATENCY).with_catalog_albums(5_000);
+        let client = server.client();
+
+        let started = Instant::now();
+        let mut serial = 0usize;
+        let mut offset = 0usize;
+        loop {
+            let page = client.album_page(offset).unwrap();
+            let got = page.len();
+            serial += got;
+            if got < ALBUM_PAGE_SIZE {
+                break;
+            }
+            offset += ALBUM_PAGE_SIZE;
+        }
+        let serial_elapsed = started.elapsed();
+        let serial_requests = server.requests();
+
+        let server = MockServer::start(0, 0, LATENCY).with_catalog_albums(5_000);
+        let client = server.client();
+        let started = Instant::now();
+        let waved = client.all_albums().unwrap().len();
+        let waved_elapsed = started.elapsed();
+
+        eprintln!(
+            "5000 albums @ {LATENCY:?} latency:\n  \
+             serial: {serial} albums, {serial_requests} requests, {serial_elapsed:?}\n  \
+             waved:  {waved} albums, {} requests, {waved_elapsed:?}",
+            server.requests(),
+        );
+        assert_eq!(serial, waved);
+        assert!(waved_elapsed * 2 < serial_elapsed);
+    }
+
+    #[test]
+    fn opening_the_same_album_twice_costs_one_request() {
+        let server = MockServer::start(2, 3, Duration::ZERO);
+        let client = server.client();
+        let first = client.get_album("al-0").unwrap();
+        let second = client.get_album("al-0").unwrap();
+        assert_eq!(first.songs.len(), second.songs.len());
+        assert_eq!(first.year, second.year);
+        assert_eq!(server.requests(), 1, "the second open must be served warm");
+
+        client.get_album("al-1").unwrap();
+        assert_eq!(server.requests(), 2, "a different album is its own key");
+    }
+
+    /// Opening an artist, then one of their albums, used to re-ask for
+    /// a tracklist the artist fetch had already read.
+    #[test]
+    fn an_artist_page_reopened_costs_nothing() {
+        let server = MockServer::start(6, 4, Duration::ZERO);
+        let client = server.client();
+        assert_eq!(client.artist_albums_with_tracks("ar-1").unwrap().len(), 6);
+        assert_eq!(server.requests(), 7); // getArtist + one per album
+        assert_eq!(client.artist_albums_with_tracks("ar-1").unwrap().len(), 6);
+        client.get_album("al-3").unwrap();
+        assert_eq!(
+            server.requests(),
+            7,
+            "reopening an artist within the ttl must not re-ask for anything"
+        );
+    }
+
+    /// The invalidation path: the background catalog sync is what
+    /// notices a server's catalog moved, and every cached tracklist
+    /// for it has to go at that point rather than waiting out its ttl.
+    #[test]
+    fn a_changed_catalog_drops_cached_tracklists() {
+        let server = MockServer::start(2, 3, Duration::ZERO).with_catalog_albums(10);
+        // the sync client and the client the corpus hands the ui are
+        // different instances for the same server, exactly as in the
+        // app; they share one cache.
+        let syncing = server.client();
+        let browsing = server.client();
+
+        syncing.all_albums().unwrap(); // first fingerprint
+        browsing.get_album("al-0").unwrap();
+        browsing.get_album("al-0").unwrap();
+        let before = server.requests();
+
+        syncing.all_albums().unwrap(); // unchanged: nothing dropped
+        browsing.get_album("al-0").unwrap();
+        assert_eq!(
+            server.requests(),
+            before + 1,
+            "an unchanged catalog must not throw the cache away"
+        );
+
+        server.replace_catalog();
+        syncing.all_albums().unwrap();
+        let after_sync = server.requests();
+        browsing.get_album("al-0").unwrap();
+        assert_eq!(
+            server.requests(),
+            after_sync + 1,
+            "a changed catalog must force the next open to refetch"
+        );
+    }
+
+    #[test]
+    fn a_cached_answer_past_its_ttl_is_not_served() {
+        let mut cache = NavCache::default();
+        let key = "getAlbum\u{1f}id=al-1".to_string();
+        cache.put(key.clone(), serde_json::json!({"album": {}}));
+        assert!(cache.get(&key).is_some());
+        // backdate past the ttl rather than sleeping through it
+        if let Some(entry) = cache.entries.get_mut(&key) {
+            entry.at = Instant::now() - NAV_CACHE_TTL - Duration::from_secs(1);
+        }
+        assert!(
+            cache.get(&key).is_none(),
+            "nothing may be served for longer than one sync interval"
+        );
+    }
+
+    #[test]
+    fn the_response_cache_stays_bounded() {
+        let mut cache = NavCache::default();
+        for i in 0..NAV_CACHE_CAPACITY + 50 {
+            cache.put(format!("getAlbum\u{1f}id=al-{i}"), serde_json::json!(i));
+        }
+        assert_eq!(cache.entries.len(), NAV_CACHE_CAPACITY);
+        assert_eq!(cache.order.len(), NAV_CACHE_CAPACITY);
+        assert!(
+            cache.get("getAlbum\u{1f}id=al-0").is_none(),
+            "the oldest entry is the one that goes"
+        );
+        let newest = format!("getAlbum\u{1f}id=al-{}", NAV_CACHE_CAPACITY + 49);
+        assert!(cache.get(&newest).is_some());
+    }
+
     /// Serial-vs-parallel numbers for the artist page against the mock
     /// server's simulated latency; a timing assertion, so it's opt-in
     /// (`cargo test -- --ignored --nocapture`).
@@ -1377,12 +1849,29 @@ mod tests {
         eprintln!(
             "serial:   {serial} songs, {serial_requests} requests, {serial_connections} connections, {serial_elapsed:?}"
         );
+        // a second open of the same artist, which is what going back
+        // to the sidebar and in again costs.
+        let started = Instant::now();
+        let reopened: usize = client
+            .artist_albums_with_tracks("ar-1")
+            .unwrap()
+            .iter()
+            .map(|t| t.songs.len())
+            .sum();
+        let reopened_elapsed = started.elapsed();
+
         eprintln!(
             "parallel: {parallel} songs, {} requests, {} connections, {parallel_elapsed:?}",
             server.requests(),
             server.connections()
         );
+        eprintln!(
+            "reopened: {reopened} songs, {} requests total, {reopened_elapsed:?}",
+            server.requests()
+        );
         assert_eq!(serial, parallel);
+        assert_eq!(serial, reopened);
         assert!(parallel_elapsed * 2 < serial_elapsed);
+        assert!(reopened_elapsed * 10 < parallel_elapsed);
     }
 }
