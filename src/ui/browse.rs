@@ -512,6 +512,29 @@ mod tests {
         );
     }
 
+    /// An open that has not answered yet says so in both places: the
+    /// header, and the row where the tracks will go.
+    #[test]
+    fn a_still_loading_album_says_so_instead_of_reading_as_empty() {
+        let area = Rect::new(0, 0, 30, 6);
+        let mut buf = buffer(30, 6);
+        let mut loading = view("Bladee", false);
+        loading.loading = true;
+        render(area, &loading, &mut buf);
+        assert_eq!(
+            grid(&buf),
+            [
+                "──────────────────────────────",
+                "Bladee · loading... │ enter: …",
+                "────────────────────┴─────────",
+                "..............................",
+                "loading tracks................",
+                "..............................",
+            ]
+            .join("\n")
+        );
+    }
+
     #[test]
     fn rule_rows_are_the_two_header_rules_for_an_album() {
         let area = Rect::new(10, 0, 24, 10);
