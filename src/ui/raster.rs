@@ -32,19 +32,64 @@ pub const HALF_BLOCK: char = '▀';
 /// the box average over the sample's source span is exact.
 const MAX_TAPS: u32 = 4;
 
-/// How hard the sharpen pass pulls each output sample away from its
-/// neighbours. **This is the dial**: 0.0 is the plain box downscale,
-/// 1.0 reads as pixel art, past ~2.0 edges start ringing (a bright rim
-/// on the dark side of a boundary).
+/// Samples per cell on each axis. The 2x2 block glyphs carry two
+/// across and two down, so a sample is half a cell wide and half a
+/// cell tall; `place` needs both numbers to keep the picture's aspect
+/// right, and getting the horizontal one wrong is what squashed the
+/// letterbox bars when this went from half-blocks to quadrants.
+const SAMPLES_X: u32 = 2;
+const SAMPLES_Y: u32 = 2;
+
+/// The sixteen 2x2 block glyphs, indexed by a mask of which quadrants
+/// take the foreground shade: bit 0 upper-left, 1 upper-right, 2
+/// lower-left, 3 lower-right.
 ///
-/// Why it is needed at all: mapping a 600px cover onto a 40-cell pane
-/// averages ~15 source pixels per sample. That is a correct box
-/// filter, and a box filter is a blur; the art looked soft because it
-/// genuinely was. Sharpening the *output* grid rather than the source
-/// is both cheaper and the right place, since the grid is the final
-/// resolution and an edge either lands on a sample boundary or does
-/// not.
-const SHARPEN: f32 = 1.0;
+/// All of these live in Unicode's Block Elements (U+2580..U+259F), the
+/// same block as the half-block this used to draw with, so a font that
+/// could render the old output can render this.
+const QUADRANTS: [char; 16] = [
+    '\u{2588}', // 0000 all background, drawn as a solid in the bg shade
+    '\u{2598}', // 0001 upper left
+    '\u{259d}', // 0010 upper right
+    HALF_BLOCK, // 0011 upper half, the glyph this used to draw with
+    '\u{2596}', // 0100 lower left
+    '\u{258c}', // 0101 left half
+    '\u{259e}', // 0110 upper right + lower left
+    '\u{259b}', // 0111 all but lower right
+    '\u{2597}', // 1000 lower right
+    '\u{259a}', // 1001 upper left + lower right
+    '\u{2590}', // 1010 right half
+    '\u{259c}', // 1011 all but lower left
+    '\u{2584}', // 1100 lower half
+    '\u{2599}', // 1101 all but upper right
+    '\u{259f}', // 1110 all but upper left
+    '\u{2588}', // 1111 full block
+];
+
+/// Sharpen strength at `SHARPEN_REF_SPAN` samples across, scaled
+/// inversely with resolution by `sharpen_amount`.
+const SHARPEN_REF: f32 = 0.7;
+/// Grid span the reference strength is tuned for.
+const SHARPEN_REF_SPAN: f32 = 160.0;
+/// Floor and ceiling on the scaled amount. The ceiling is the load
+/// bearing one: past roughly this, an unsharp mask stops adding
+/// definition and starts drawing a bright rim along the dark side of
+/// every edge, which reads as a worse picture, not a sharper one.
+const SHARPEN_MIN: f32 = 0.5;
+const SHARPEN_MAX: f32 = 2.2;
+
+/// How hard to sharpen a grid this size.
+///
+/// Lower resolution gets more, which is the right instinct: each
+/// output sample straddles more of the image, so the box average that
+/// produced it cut more detail and the result reads softer. It is
+/// inverse-proportional rather than exponential, and clamped at both
+/// ends, because sharpening cannot recover detail that was never
+/// sampled; past `SHARPEN_MAX` it only adds halos.
+fn sharpen_amount(grid_w: u32, grid_h: u32) -> f32 {
+    let span = grid_w.max(grid_h).max(1) as f32;
+    (SHARPEN_REF * (SHARPEN_REF_SPAN / span)).clamp(SHARPEN_MIN, SHARPEN_MAX)
+}
 
 /// How the image is mapped onto the cell rect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,16 +197,20 @@ impl Raster {
     pub fn sample(&mut self, img: &DynamicImage, area: Rect, cell_aspect: f32, fit: Fit) {
         self.cols = area.width;
         self.rows = area.height;
-        let halves = area.width as usize * area.height as usize * 2;
+        // four samples per cell: two across, two down. The 2x2 block
+        // glyphs carry twice the horizontal detail the half-block did,
+        // which is the only thing that actually makes a cover look
+        // sharper; a filter cannot add detail that was never sampled.
+        let samples = area.width as usize * area.height as usize * 4;
         self.luma.clear();
-        self.luma.resize(halves, 0);
-        if halves == 0 {
+        self.luma.resize(samples, 0);
+        if samples == 0 {
             return;
         }
         match Pixels::of(img) {
             Some(px) => {
                 self.fill(&px, cell_aspect, fit);
-                self.sharpen_with(SHARPEN);
+                self.sharpen();
             }
             None => {
                 // not 8 bits per channel (a 16-bit or float png).
@@ -174,7 +223,7 @@ impl Raster {
                 let (w, h) = lum.dimensions();
                 if let Some(px) = Pixels::new(lum.as_raw(), w, h, 1, true) {
                     self.fill(&px, cell_aspect, fit);
-                    self.sharpen_with(SHARPEN);
+                    self.sharpen();
                 }
             }
         }
@@ -190,11 +239,16 @@ impl Raster {
     /// Uniform input is a fixed point: every neighbour equals the
     /// centre, so the correction is zero and flat areas stay flat.
     /// That is what keeps this "pixelated" rather than "noisy".
+    fn sharpen(&mut self) {
+        let amount = sharpen_amount(self.cols as u32 * 2, self.rows as u32 * 2);
+        self.sharpen_with(amount);
+    }
+
     fn sharpen_with(&mut self, amount: f32) {
         if amount <= 0.0 {
             return;
         }
-        let w = self.cols as usize;
+        let w = self.cols as usize * 2;
         let h = self.rows as usize * 2;
         // a 1-wide or 1-tall grid has no neighbourhood worth the name.
         if w < 3 || h < 3 || self.luma.len() < w * h {
@@ -232,8 +286,8 @@ impl Raster {
             acc,
             ..
         } = self;
-        let grid_w = *cols as u32;
-        let grid_h = *rows as u32 * 2;
+        let grid_w = *cols as u32 * SAMPLES_X;
+        let grid_h = *rows as u32 * SAMPLES_Y;
         let (ow, oh, off_x, off_y) = place(px.w, px.h, grid_w, grid_h, cell_aspect, fit);
         if ow == 0 || oh == 0 {
             return;
@@ -300,7 +354,7 @@ impl Raster {
             return;
         }
         let shades = shades();
-        let grid_w = self.cols as usize;
+        let grid_w = self.cols as usize * 2;
         let buf_w = buf.area.width as usize;
         let first_col = (vis.x - area.x) as usize;
         for y in vis.y..vis.y + vis.height {
@@ -314,12 +368,21 @@ impl Raster {
             let row = &mut buf.content[start..start + vis.width as usize];
             for (i, cell) in row.iter_mut().enumerate() {
                 let col = first_col + i;
-                if col >= grid_w {
+                if col >= self.cols as usize {
                     break;
                 }
-                cell.set_char(HALF_BLOCK);
-                cell.set_fg(shades[self.luma[top + col] as usize]);
-                cell.set_bg(shades[self.luma[bottom + col] as usize]);
+                // the cell's four samples, clockwise from upper left.
+                let gx = col * 2;
+                let q = [
+                    self.luma[top + gx],
+                    self.luma[top + gx + 1],
+                    self.luma[bottom + gx],
+                    self.luma[bottom + gx + 1],
+                ];
+                let (glyph, fg, bg) = quantize(q);
+                cell.set_char(glyph);
+                cell.set_fg(shades[fg as usize]);
+                cell.set_bg(shades[bg as usize]);
             }
         }
     }
@@ -336,6 +399,45 @@ impl Raster {
         self.sample(img, area, cell_aspect, fit);
         self.paint(area, buf);
     }
+}
+
+/// One cell's four samples reduced to a glyph plus two shades.
+///
+/// A terminal cell can hold exactly two colours, so four samples have
+/// to be split in two groups and each group averaged. The split is at
+/// the midpoint of the cell's own range rather than a fixed level, so
+/// it adapts to local contrast: a cell spanning 90..110 splits at 100
+/// and keeps the detail a global threshold would flatten away.
+///
+/// A uniform cell (every sample equal) lands wholly in the foreground
+/// and draws a full block, which is the crispest thing available and
+/// avoids inventing an edge inside flat colour.
+fn quantize(q: [u8; 4]) -> (char, u8, u8) {
+    let lo = q.iter().copied().min().unwrap_or(0);
+    let hi = q.iter().copied().max().unwrap_or(0);
+    let mid = (lo as u16 + hi as u16).div_ceil(2) as u8;
+
+    let mut mask = 0usize;
+    let mut fg_sum = 0u32;
+    let mut fg_n = 0u32;
+    let mut bg_sum = 0u32;
+    let mut bg_n = 0u32;
+    for (i, &v) in q.iter().enumerate() {
+        if v >= mid {
+            mask |= 1 << i;
+            fg_sum += v as u32;
+            fg_n += 1;
+        } else {
+            bg_sum += v as u32;
+            bg_n += 1;
+        }
+    }
+    // `mid` is inside the range, so at least one sample is always in
+    // the foreground; the background can be empty when the cell is
+    // flat, and then both shades are that one level.
+    let fg = fg_sum.checked_div(fg_n).map_or(lo, |v| v as u8);
+    let bg = bg_sum.checked_div(bg_n).map_or(fg, |v| v as u8);
+    (QUADRANTS[mask], fg, bg)
 }
 
 /// Reading the grid back without a `Buffer`: what the tests assert
@@ -356,19 +458,21 @@ impl Raster {
         self.rows
     }
 
-    /// The whole output: `cols() * rows() * 2` luma levels, row-major
-    /// over sub-rows.
+    /// The whole output: `cols() * 2 * rows() * 2` luma levels,
+    /// row-major over sub-rows; two samples per cell on each axis.
     pub fn luma(&self) -> &[u8] {
         &self.luma
     }
 
-    /// One half-cell's luma; `sub_row` runs `0..rows() * 2`, and
-    /// anything outside the grid reads as 0 rather than panicking.
+    /// One sample's luma. `col` runs `0..cols() * 2` and `sub_row`
+    /// `0..rows() * 2`, both twice the cell count; anything outside
+    /// the grid reads as 0 rather than panicking.
     pub fn at(&self, col: u16, sub_row: u16) -> u8 {
-        if col >= self.cols || sub_row >= self.rows.saturating_mul(2) {
+        let grid_w = self.cols.saturating_mul(2);
+        if col >= grid_w || sub_row >= self.rows.saturating_mul(2) {
             return 0;
         }
-        self.luma[sub_row as usize * self.cols as usize + col as usize]
+        self.luma[sub_row as usize * grid_w as usize + col as usize]
     }
 }
 
@@ -398,24 +502,25 @@ fn place(
     if fit == Fit::Stretch || iw == 0 || ih == 0 || grid_w == 0 || grid_h == 0 {
         return (grid_w, grid_h, 0, 0);
     }
-    // the rect's physical shape measured in cell widths: `grid_w`
-    // across, and `grid_h` half-cells down at `cell_aspect / 2` cell
-    // widths each.
+    // the rect's physical shape measured in cell widths: each sample
+    // is `1 / SAMPLES_X` of a cell across and `cell_aspect /
+    // SAMPLES_Y` of a cell width down.
     let aspect = if cell_aspect.is_finite() {
         cell_aspect.clamp(0.25, 8.0)
     } else {
         2.0
     };
-    let phys_w = grid_w as f32;
-    let phys_h = grid_h as f32 * aspect / 2.0;
+    let phys_w = grid_w as f32 / SAMPLES_X as f32;
+    let phys_h = grid_h as f32 * aspect / SAMPLES_Y as f32;
     let want = iw as f32 / ih as f32;
     let (draw_w, draw_h) = if phys_w / phys_h > want {
         (phys_h * want, phys_h)
     } else {
         (phys_w, phys_w / want)
     };
-    let ow = (draw_w.round() as u32).clamp(1, grid_w);
-    let oh = ((draw_h * 2.0 / aspect).round() as u32).clamp(1, grid_h);
+    // back from cell widths into grid samples on each axis.
+    let ow = ((draw_w * SAMPLES_X as f32).round() as u32).clamp(1, grid_w);
+    let oh = ((draw_h * SAMPLES_Y as f32 / aspect).round() as u32).clamp(1, grid_h);
     (ow, oh, (grid_w - ow) / 2, (grid_h - oh) / 2)
 }
 
@@ -534,6 +639,13 @@ pub fn with_memo<R>(f: impl FnOnce(&mut Memo) -> R) -> R {
 
 #[cfg(test)]
 mod tests {
+    /// Any of the sixteen block glyphs. Tests about *placement* assert
+    /// this rather than one specific glyph, since which one a cell
+    /// gets depends on its own four samples.
+    fn is_block(c: char) -> bool {
+        QUADRANTS.contains(&c)
+    }
+
     use super::*;
     use crate::ui::testbuf::{assert_outside_untouched, buffer, char_at};
     use image::{Rgb, RgbImage};
@@ -577,8 +689,8 @@ mod tests {
         assert_eq!((r.cols(), r.rows()), (10, 4));
         assert_eq!(
             levels(&r).len(),
-            10 * 4 * 2,
-            "one luma per half-cell, not per cell"
+            10 * 4 * 4,
+            "four samples per cell: two across, two down"
         );
     }
 
@@ -603,15 +715,31 @@ mod tests {
             Fit::Stretch,
             &mut buf,
         );
+        // a cell wholly inside one half of the picture has nothing to
+        // split, so it draws a solid in that shade: crisper than a
+        // half block carrying the same shade twice.
         for y in 0..2 {
             for x in 0..3 {
-                assert_eq!(char_at(&buf, x, y), HALF_BLOCK);
+                assert_eq!(char_at(&buf, x, y), '\u{2588}');
             }
         }
-        // top cell row is entirely in the white half, bottom entirely
-        // in the black one.
         assert_eq!(buf.cell((0, 0)).unwrap().fg, shade(1.0));
-        assert_eq!(buf.cell((0, 1)).unwrap().bg, shade(0.0));
+        assert_eq!(buf.cell((0, 1)).unwrap().fg, shade(0.0));
+
+        // one cell row instead of two, so a single cell straddles the
+        // boundary and the half block earns its place: white over black.
+        let mut buf = buffer(3, 1);
+        let mut r = Raster::new();
+        r.render(
+            &split(4, 4),
+            Rect::new(0, 0, 3, 1),
+            2.0,
+            Fit::Stretch,
+            &mut buf,
+        );
+        assert_eq!(char_at(&buf, 0, 0), HALF_BLOCK);
+        assert_eq!(buf.cell((0, 0)).unwrap().fg, shade(1.0));
+        assert_eq!(buf.cell((0, 0)).unwrap().bg, shade(0.0));
     }
 
     #[test]
@@ -672,8 +800,10 @@ mod tests {
         for sub in 0..7 {
             assert_eq!(r.at(10, sub), 0, "top bar should be black");
         }
+        // the grid is 40 samples across now (two per cell), so the
+        // ramp's bright end is column 39, not 19.
         assert!(
-            r.at(19, 10) > 200,
+            r.at(39, 10) > 200,
             "the image itself should sit in the middle band"
         );
         for sub in 14..20 {
@@ -804,7 +934,9 @@ mod tests {
             Fit::Contain,
             &mut buf
         ));
-        assert_eq!(char_at(&buf, 9, 3), HALF_BLOCK, "it moved with the rect");
+        // flat image, so every cell is a solid; the point is that the
+        // memo did not resample just because the rect moved.
+        assert_eq!(char_at(&buf, 9, 3), '\u{2588}', "it moved with the rect");
     }
 
     #[test]
@@ -846,7 +978,9 @@ mod tests {
             Fit::Stretch,
             &mut buf,
         );
-        assert_eq!(char_at(&buf, 3, 1), HALF_BLOCK);
+        // which glyph depends on the ramp inside that cell; the point
+        // is that it was painted at all and nothing outside was.
+        assert!(is_block(char_at(&buf, 3, 1)), "{}", char_at(&buf, 3, 1));
         assert_eq!(char_at(&buf, 0, 0), '.', "outside the rect, untouched");
     }
 
@@ -945,7 +1079,7 @@ mod tests {
         );
         r.sample(&flat(32, 32, 10), Rect::new(0, 0, 4, 2), 2.0, Fit::Stretch);
         assert_eq!((r.cols(), r.rows()), (4, 2));
-        assert_eq!(levels(&r).len(), 16);
+        assert_eq!(levels(&r).len(), 4 * 2 * 4);
         assert!(levels(&r).iter().all(|&v| v == 10));
         assert_eq!(r.at(9, 0), 0, "out of the new grid reads as nothing");
     }
@@ -1114,7 +1248,7 @@ mod tests {
         let mut r = Raster::new();
         r.cols = cols;
         r.rows = rows;
-        assert_eq!(luma.len(), cols as usize * rows as usize * 2);
+        assert_eq!(luma.len(), cols as usize * rows as usize * 4);
         r.luma = luma;
         r
     }
@@ -1124,35 +1258,36 @@ mod tests {
     /// flat however hard the dial is turned.
     #[test]
     fn sharpening_leaves_a_flat_image_alone() {
-        let mut r = grid_raster(4, 2, vec![128; 16]);
+        let mut r = grid_raster(4, 2, vec![128; 32]);
         r.sharpen_with(2.5);
-        assert_eq!(r.luma, vec![128; 16], "a flat field must not gain texture");
+        assert_eq!(r.luma, vec![128; 32], "a flat field must not gain texture");
     }
 
     /// The point of the pass: an edge comes out steeper than the box
     /// average left it.
     #[test]
     fn sharpening_steepens_an_edge() {
-        // 4 wide, 4 sub-rows; left half dark, right half bright.
-        let row = [60u8, 60, 200, 200];
-        let flat: Vec<u8> = row.iter().cycle().copied().take(16).collect();
-        let before = (flat[2] as i32 - flat[1] as i32).abs();
+        // 4 cells across is 8 samples; left half dark, right bright,
+        // so the edge sits between sample 3 and sample 4.
+        let row = [60u8, 60, 60, 60, 200, 200, 200, 200];
+        let flat: Vec<u8> = row.iter().cycle().copied().take(32).collect();
+        let before = (flat[4] as i32 - flat[3] as i32).abs();
 
         let mut r = grid_raster(4, 2, flat);
         r.sharpen_with(1.0);
-        let after = (r.luma[2] as i32 - r.luma[1] as i32).abs();
+        let after = (r.luma[4] as i32 - r.luma[3] as i32).abs();
 
         assert!(
             after > before,
             "edge contrast should rise: {before} -> {after}"
         );
-        assert!(r.luma[1] < 60, "the dark side should darken");
-        assert!(r.luma[2] > 200, "the bright side should brighten");
+        assert!(r.luma[3] < 60, "the dark side should darken");
+        assert!(r.luma[4] > 200, "the bright side should brighten");
     }
 
     #[test]
     fn a_zero_amount_is_exactly_the_box_downscale() {
-        let flat: Vec<u8> = (0..16).map(|i| i * 16).collect();
+        let flat: Vec<u8> = (0..32).map(|i| (i * 8) as u8).collect();
         let mut r = grid_raster(4, 2, flat.clone());
         r.sharpen_with(0.0);
         assert_eq!(r.luma, flat);
@@ -1162,27 +1297,31 @@ mod tests {
     /// that has to clamp rather than wrap a dark sample to white.
     #[test]
     fn sharpening_clamps_instead_of_wrapping() {
-        let mut luma = vec![0u8; 16];
-        luma[5] = 255;
+        let mut luma = vec![0u8; 32];
+        luma[10] = 255;
         let mut r = grid_raster(4, 2, luma);
         r.sharpen_with(3.0);
         // nothing to assert beyond "it is still a byte and did not
         // invert": a wrap would have turned the 0s next to the spike
         // into near-white.
-        assert_eq!(r.luma[4], 0, "a dark sample must not wrap to bright");
-        assert_eq!(r.luma[5], 255);
+        assert_eq!(r.luma[8], 0, "a dark sample must not wrap to bright");
+        assert_eq!(r.luma[10], 255);
     }
 
     /// A one-column or one-row grid has no neighbourhood, and the
     /// index arithmetic would read out of the grid if it tried.
     #[test]
     fn a_degenerate_grid_is_left_alone_rather_than_panicking() {
-        let mut thin = grid_raster(1, 2, vec![10, 200, 30, 40]);
-        thin.sharpen_with(1.0);
-        assert_eq!(thin.luma, vec![10, 200, 30, 40]);
+        // one cell across is a 2-wide grid: no neighbourhood.
+        let thin: Vec<u8> = vec![10, 200, 30, 40, 50, 60, 70, 80];
+        let mut r = grid_raster(1, 2, thin.clone());
+        r.sharpen_with(1.0);
+        assert_eq!(r.luma, thin);
 
-        let mut short = grid_raster(4, 1, vec![10, 20, 30, 40, 50, 60, 70, 80]);
-        short.sharpen_with(1.0);
-        assert_eq!(short.luma, vec![10, 20, 30, 40, 50, 60, 70, 80]);
+        // one cell down is a 2-tall grid: likewise.
+        let short: Vec<u8> = (0..16).map(|i| (i * 10) as u8).collect();
+        let mut r = grid_raster(4, 1, short.clone());
+        r.sharpen_with(1.0);
+        assert_eq!(r.luma, short);
     }
 }
