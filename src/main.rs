@@ -3886,14 +3886,16 @@ fn main() -> anyhow::Result<()> {
         // agree on that on their own.
         match &browse_view {
             Some(bv) if art_mode.is_full() => {
-                let key = protocol_key(&bv.art_key());
-                if browse_art_key.as_deref() != Some(key.as_str()) {
-                    real_art_protocol = picker.as_mut().and_then(|p| {
-                        bv.art
-                            .as_ref()
-                            .map(|img| p.new_resize_protocol(protocol_image(img, art_mode)))
-                    });
-                    browse_art_key = Some(key);
+                // `None` while the view has no art, so a cover that
+                // only arrives later is still picked up rather than
+                // latched behind a key that never changed.
+                let want = bv.art.as_ref().map(|_| protocol_key(&bv.art_key()));
+                if browse_art_key != want {
+                    real_art_protocol = picker
+                        .as_mut()
+                        .zip(bv.art.as_ref())
+                        .map(|(p, img)| p.new_resize_protocol(protocol_image(img, art_mode)));
+                    browse_art_key = want;
                 }
             }
             _ => {
