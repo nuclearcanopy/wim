@@ -646,9 +646,12 @@ mod tests {
                     ".",
                     "real mode drew into the host's overlay rect at {x},{y}"
                 );
-                assert_eq!(
+                // which block glyph a cell gets depends on its own
+                // four samples, so the claim under test is that every
+                // cell in the reported rect was painted at all.
+                assert_ne!(
                     ascii_buf.cell((x, y)).unwrap().symbol(),
-                    "▀",
+                    ".",
                     "ascii art did not fill the rect it reported at {x},{y}"
                 );
             }
