@@ -31,6 +31,7 @@ mod term;
 mod theme;
 mod trace;
 mod ui;
+mod video;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
@@ -3440,7 +3441,15 @@ fn main() -> anyhow::Result<()> {
     // from main_content to the whole workspace (sidebar included),
     // never the bottom bar.
     let mut video_frame: Option<std::sync::Arc<image::DynamicImage>> = None;
+    // 'v': hands the whole terminal to mpv, which draws the video with
+    // a terminal video output of its own while wim stops drawing
+    // entirely. `video_vo` is the vo mpv is drawing with *right now*
+    // (`None` = mpv is back on `vo=null` and the screen is wim's), and
+    // `video_geometry` the cell size that vo was initialized at, since
+    // mpv only reads it on init. see docs/video.md.
     let mut video_fullscreen = false;
+    let mut video_vo: Option<video::Vo> = None;
+    let mut video_geometry: (u16, u16) = (0, 0);
     // captures and decodes frames on its own thread and its own ipc
     // connection, so the render path only ever reads the newest one
     // (see `mpv::FramePump`).
@@ -3844,6 +3853,68 @@ fn main() -> anyhow::Result<()> {
         // sampled once per frame rather than per widget, so everything
         // on screen animates off the same instant.
         let frame_elapsed = start.elapsed();
+        // read here rather than next to the poll timeout that also uses
+        // it, because the fullscreen-video decision below needs it and
+        // nothing between the two touches any of these flags.
+        let overlay = onboarding.is_some()
+            || nav_manager.is_some()
+            || help_open
+            || settings_menu_open
+            || keybinds_menu_open
+            || eq_menu_open;
+        // whether mpv should be drawing the video right now; the whole
+        // decision is `video::wanted`, including the guard that keeps
+        // music on `vo=null`.
+        let want_vo = video::wanted(
+            video::Screen {
+                fullscreen: video_fullscreen,
+                minimized: player_minimized,
+                overlay,
+                is_video: now_playing_is_video(&now_playing),
+            },
+            cfg.video_output,
+            picker.map(|p| p.protocol_type()),
+        );
+        let size = guard
+            .terminal
+            .size()
+            .map(|s| (s.width, s.height))
+            .unwrap_or(video_geometry);
+        if want_vo != video_vo {
+            // the handover. nothing is seeked or reloaded: `vo` is
+            // settable live and mpv keeps playing straight through it.
+            if let Some(vo) = want_vo {
+                let armed = player
+                    .set_video_geometry(size.0, size.1)
+                    .and_then(|()| player.set_video_output(vo.mpv_name()));
+                match armed {
+                    Ok(()) => {
+                        video_vo = Some(vo);
+                        video_geometry = size;
+                    }
+                    Err(_) => {
+                        // leave the screen alone and stop asking, rather
+                        // than retrying the handover every frame.
+                        video_fullscreen = false;
+                        notifications.push(Severity::Alert, "video: mpv refused the video output");
+                    }
+                }
+            } else {
+                let _ = player.set_video_output(video::Vo::Null.mpv_name());
+                video_vo = None;
+                let _ = guard.reclaim();
+            }
+        } else if video_vo.is_some() && size != video_geometry {
+            // mpv reads the vo's size once, at init, so a resize has to
+            // bounce it; wim is not drawing, so the screen it flickers
+            // through belongs to nobody in between.
+            if let Some(vo) = want_vo {
+                let _ = player.set_video_output(video::Vo::Null.mpv_name());
+                let _ = player.set_video_geometry(size.0, size.1);
+                let _ = player.set_video_output(vo.mpv_name());
+                video_geometry = size;
+            }
+        }
         // cleared here and refilled by the draw below, so a mouse
         // event is always answered by the frame the user clicked on.
         // `hit::front` resolves the tier from the key cascade's own
@@ -3864,7 +3935,12 @@ fn main() -> anyhow::Result<()> {
             }),
             ..Default::default()
         };
-        guard.terminal.draw(|f| {
+        // skipped outright while mpv owns the screen: a repaint from
+        // ratatui's buffer would overwrite the video with the ui that
+        // was on screen before the handover. `hits` stays as reset
+        // above, i.e. empty, which is the right answer for a click on a
+        // screen holding no wim widgets at all.
+        guard.draw_unless_video(video_vo.is_some(), |f| {
             let area = f.area();
 
             // onboarding takes the whole screen; no divider/status bar
@@ -4368,28 +4444,6 @@ fn main() -> anyhow::Result<()> {
                     },
                     main_content,
                 );
-            }
-
-            // 'v': expands the video pane from main_content to cover
-            // the whole workspace (sidebar included), painted last so
-            // it simply overwrites whatever the sidebar/divider/
-            // results list already drew in `top` rather than needing
-            // to skip rendering them in the first place. never covers
-            // `bottom`, which sits outside `top` entirely.
-            if video_fullscreen && show_full_player && now_playing_is_video(&now_playing) {
-                f.render_widget(
-                    AsciiArt {
-                        image: video_frame.as_deref(),
-                        cell_aspect: aspect,
-                    },
-                    top,
-                );
-                // the picture covers the sidebar and the lists in it,
-                // so a click up here is a click on the video, not on
-                // a row nothing on screen shows.
-                hits.sidebar = None;
-                hits.workspace = Some(top);
-                hits.lists.retain(|l| !top.intersects(l.rect));
             }
 
             // 'u': settings, over the whole workspace (sidebar
@@ -5180,12 +5234,6 @@ fn main() -> anyhow::Result<()> {
         // moving, a long idle sleep otherwise. a static screen (no
         // selection pulse, no blinking cursor, nothing playing) must
         // not redraw at 60fps just because the display could.
-        let overlay = onboarding.is_some()
-            || nav_manager.is_some()
-            || help_open
-            || settings_menu_open
-            || keybinds_menu_open
-            || eq_menu_open;
         let selection_pulsing = match focus {
             Focus::Sidebar => !app.results.is_empty(),
             // every list the workspace can hold, not just the browse
@@ -6830,7 +6878,15 @@ fn main() -> anyhow::Result<()> {
                 if key.code == keymap.get(KeyAction::ToggleFullscreenVideo)
                     && now_playing_is_video(&now_playing)
                 {
-                    video_fullscreen = !video_fullscreen;
+                    // `off` has no vo to hand the screen to, so the key
+                    // would blank the ui and show nothing; say which
+                    // option turns it on rather than doing that.
+                    if cfg.video_output == config::VideoOutput::Off {
+                        notifications
+                            .push(Severity::Alert, "video: video_output is off in config.toml");
+                    } else {
+                        video_fullscreen = !video_fullscreen;
+                    }
                     continue;
                 }
 
@@ -7009,6 +7065,14 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+    }
+    // mpv has to stop drawing before the guard restores the terminal,
+    // not after: `Mpv`'s own drop runs later (it quits mpv over ipc),
+    // and a vo tearing itself down by then writes its ?1049l/?25h onto
+    // the user's shell instead of onto a screen wim still owns.
+    if video_vo.take().is_some() {
+        let _ = player.set_video_output(video::Vo::Null.mpv_name());
+        let _ = guard.reclaim();
     }
     drop(guard);
 
@@ -7240,6 +7304,52 @@ mod shellsong_wiring_tests {
         // which is reported rather than faked: a `Song` carries its
         // album's name, not its id.
         assert!(album_page(&corpus, "some other album", &client).is_none());
+    }
+}
+
+#[cfg(test)]
+mod video_wiring_tests {
+    use super::*;
+
+    /// The one question the whole video path hangs off: only a local
+    /// video file ever hands the screen to mpv. wim is mostly a music
+    /// player, so getting this wrong means a blanked ui on every song;
+    /// `set_vid_for_item` splits the same way, and the two must agree
+    /// or mpv would be asked to draw a track it is not decoding video
+    /// for.
+    #[test]
+    fn only_a_local_video_counts_as_video() {
+        let video = SearchItem::LocalVideo {
+            path: "/tmp/a.mkv".into(),
+            title: "a".into(),
+        };
+        assert!(now_playing_is_video(&Some(video)));
+
+        assert!(!now_playing_is_video(&None));
+        assert!(!now_playing_is_video(&Some(SearchItem::LocalMusic {
+            path: "/tmp/a.flac".into(),
+            title: "a".into(),
+            artist: None,
+            album: None,
+        })));
+    }
+
+    /// Mapped from the file extension at scan time, never from mpv, so
+    /// the extension list is the real definition of "video" here.
+    #[test]
+    fn the_video_extensions_classify_as_video() {
+        for ext in ["mp4", "mkv", "webm", "MKV"] {
+            assert_eq!(
+                library::classify(ext),
+                Some(library::MediaKind::Video),
+                "{ext}"
+            );
+        }
+        assert_eq!(
+            library::classify("flac"),
+            Some(library::MediaKind::Music),
+            "music must not classify as video"
+        );
     }
 }
 
