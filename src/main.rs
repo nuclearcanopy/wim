@@ -2058,27 +2058,18 @@ fn trigger_downloads(
     }
 }
 
-/// Current output level, 0..1, for the now-playing level meter.
-/// Best-effort: reads the `astats` tap `build_af_filter` (eq.rs) adds
-/// to the end of the af chain, via mpv's `af-metadata/<label>/...`
-/// property. If that property path doesn't resolve the way expected
-/// (wrong mpv version, filter not actually in the graph yet, af-
-/// metadata represented differently than guessed), this falls back to
-/// a calm idle breathe instead of silently showing a dead meter,
-/// driven off `elapsed` (time since app start) like every other
+/// Current output level, 0..1, for the now-playing level meter. Reads
+/// the `astats` tap `build_af_filter` (eq.rs) puts at the end of the af
+/// chain, which mpv pushes (`mpv::PROP_LEVEL_RMS`) rather than being
+/// asked for: this used to be a blocking IPC round trip per frame. No
+/// fresh reading (paused, stopped, or an mpv that doesn't resolve the
+/// property) falls back to a calm idle breathe instead of silently
+/// showing a dead meter, driven off `elapsed` like every other
 /// animation.
-fn audio_level(player: &mpv::Mpv, elapsed: Duration) -> f32 {
-    let key = format!(
-        "af-metadata/{}/lavfi.astats.Overall.RMS_level",
-        eq::LEVEL_METADATA_LABEL
-    );
-    if let Some(db) = player.get_property(&key).ok().and_then(|v| v.as_f64()) {
-        // RMS level is dBFS, roughly -60 (near silent) to 0 (full
-        // scale); map that range to 0..1 rather than guessing a
-        // narrower one that'd clip real audio's dynamic range.
-        return ((db as f32 + 60.0) / 60.0).clamp(0.0, 1.0);
-    }
-    (anim::pulse(elapsed, anim::LEVEL_FALLBACK_PERIOD) * 0.6 + 0.05).clamp(0.0, 1.0)
+fn audio_level(playback: &mpv::Playback, elapsed: Duration) -> f32 {
+    playback.level().unwrap_or_else(|| {
+        (anim::pulse(elapsed, anim::LEVEL_FALLBACK_PERIOD) * 0.6 + 0.05).clamp(0.0, 1.0)
+    })
 }
 
 /// How often the background thread (see `spawn_background_sync`)
@@ -2103,11 +2094,18 @@ fn sweep_cache(cache: &Arc<Mutex<CacheIndex>>, eviction_days: u64) {
     }
 }
 
-/// How often the embedded video pane pulls a fresh frame from mpv;
-/// each pull is an IPC round-trip plus a base64 decode, not free, and
-/// the ascii/halfblock rendering it feeds was never going to look
-/// smooth at real video frame rates anyway.
+/// How often the frame pump pulls a fresh frame from mpv; each pull is
+/// an IPC round-trip plus a base64 decode, all of it on the pump's own
+/// thread, so this only sets how smooth the pane looks, never whether
+/// the UI stalls.
 const VIDEO_FRAME_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Longest edge the pump scales a captured frame down to, or `None` for
+/// the source resolution. `None` today because the pane's rasterizer
+/// averages over every source pixel, and changing that changes what is
+/// drawn; the knob is here for the renderer being built on `perf/art`,
+/// which will want the frame already near its cell grid.
+const VIDEO_FRAME_MAX_EDGE: Option<u32> = None;
 
 fn now_playing_is_video(now_playing: &Option<SearchItem>) -> bool {
     matches!(now_playing, Some(SearchItem::LocalVideo { .. }))
@@ -3144,11 +3142,13 @@ fn main() -> anyhow::Result<()> {
     // playing or a capture hasn't landed yet. 'v' expands its pane
     // from main_content to the whole workspace (sidebar included),
     // never the bottom bar.
-    let mut video_frame: Option<image::DynamicImage> = None;
+    let mut video_frame: Option<std::sync::Arc<image::DynamicImage>> = None;
     let mut video_fullscreen = false;
-    // throttles screenshot-raw calls (an IPC round-trip each time) to
-    // a modest rate rather than once per render tick.
-    let mut last_video_frame_at = Instant::now() - VIDEO_FRAME_INTERVAL;
+    // captures and decodes frames on its own thread and its own ipc
+    // connection, so the render path only ever reads the newest one
+    // (see `mpv::FramePump`).
+    let frame_pump = player.frame_pump().ok();
+    let mut video_frames_unsupported = false;
     // full keybind reference, opened with '?'; takes over the whole
     // screen the same way onboarding/the nav manager do.
     let mut help_open = false;
@@ -3800,7 +3800,7 @@ fn main() -> anyhow::Result<()> {
                 // picture that's already moving.
                 f.render_widget(
                     AsciiArt {
-                        image: video_frame.as_ref(),
+                        image: video_frame.as_deref(),
                         cell_aspect: aspect,
                     },
                     main_content,
@@ -3859,7 +3859,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                level_history.push(audio_level(&player, frame_elapsed));
+                level_history.push(audio_level(&playback, frame_elapsed));
                 let max_history = main_content.width.max(1) as usize;
                 if level_history.len() > max_history {
                     level_history.drain(..level_history.len() - max_history);
@@ -3960,7 +3960,7 @@ fn main() -> anyhow::Result<()> {
             if video_fullscreen && show_full_player && now_playing_is_video(&now_playing) {
                 f.render_widget(
                     AsciiArt {
-                        image: video_frame.as_ref(),
+                        image: video_frame.as_deref(),
                         cell_aspect: aspect,
                     },
                     top,
@@ -4291,7 +4291,9 @@ fn main() -> anyhow::Result<()> {
         if crossfade_enabled && now_playing.is_some() {
             if let Some(started) = fade_in_started_at {
                 let t = (started.elapsed().as_secs_f64() / cfg.crossfade_seconds).clamp(0.0, 1.0);
-                let _ = player.set_volume(base_volume * t);
+                // a ramp step per frame, so it is sent without waiting
+                // for mpv's reply; see `mpv::set_volume_nowait`.
+                let _ = player.set_volume_nowait(base_volume * t);
                 if t >= 1.0 {
                     fade_in_started_at = None;
                 }
@@ -4302,7 +4304,7 @@ fn main() -> anyhow::Result<()> {
                     let remaining = duration - elapsed;
                     if remaining <= cfg.crossfade_seconds {
                         let t = (remaining / cfg.crossfade_seconds).clamp(0.0, 1.0);
-                        let _ = player.set_volume(base_volume * t);
+                        let _ = player.set_volume_nowait(base_volume * t);
                     }
                 }
             }
@@ -4333,15 +4335,23 @@ fn main() -> anyhow::Result<()> {
         // actually on screen right now would be wasted IPC/decode
         // work the moment it's covered by the browse view or help
         // overlay; only bother while it'd actually be visible.
-        if now_playing_is_video(&now_playing) && !help_open {
-            if last_video_frame_at.elapsed() >= VIDEO_FRAME_INTERVAL {
-                if let Ok(frame) = player.screenshot_raw() {
-                    video_frame = frame.into_image().map(image::DynamicImage::ImageRgb8);
-                }
-                last_video_frame_at = Instant::now();
+        if let Some(pump) = &frame_pump {
+            pump.set_capture(mpv::Capture {
+                on: now_playing_is_video(&now_playing) && !help_open,
+                interval: VIDEO_FRAME_INTERVAL,
+                max_edge: VIDEO_FRAME_MAX_EDGE,
+            });
+            video_frame = pump.latest().map(|f| f.image);
+            // said once per session: this mpv cannot hand frames over
+            // json ipc at all, so the pane would otherwise just stay
+            // empty with no explanation.
+            if pump.state() == mpv::PumpState::Unsupported && !video_frames_unsupported {
+                video_frames_unsupported = true;
+                notifications.push(
+                    Severity::Alert,
+                    "video frames: this mpv won't return screenshot-raw over ipc",
+                );
             }
-        } else {
-            video_frame = None;
         }
 
         // the terminal's answer to the graphics probe, or `None` if it
@@ -4597,7 +4607,7 @@ fn main() -> anyhow::Result<()> {
         // fade whether or not the console is still on screen.
         let shellsong_now = start.elapsed();
         if let Some(ramp) = shellsong_fade {
-            let _ = player.set_volume(ramp.level_at(shellsong_now));
+            let _ = player.set_volume_nowait(ramp.level_at(shellsong_now));
             if ramp.finished(shellsong_now) {
                 shellsong_fade = None;
             }

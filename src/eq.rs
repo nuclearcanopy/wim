@@ -339,10 +339,13 @@ pub fn persisted(
     (name, Some(gains))
 }
 
-/// Label on the trailing `astats` analysis stage (see
-/// `build_af_filter`); mpv exposes a labeled lavfi filter's metadata
-/// at `af-metadata/<label>/...`, polled by the now-playing level
-/// meter. Doesn't touch the audio itself, purely an analysis tap.
+/// mpv's own label on the `lavfi` filter `build_af_filter` emits;
+/// `af-metadata/<label>/...` (observed by the now-playing level meter,
+/// see `mpv::PROP_LEVEL_RMS`) resolves against *this*, not against a
+/// label written inside the lavfi graph. Labelling only the inner
+/// `astats` stage made that property resolve nothing at all, which is
+/// what left the meter dead. Purely an analysis tap; it doesn't touch
+/// the audio.
 pub const LEVEL_METADATA_LABEL: &str = "wimlevel";
 
 /// True when no band asks for anything, i.e. the eq has nothing to do
@@ -429,8 +432,8 @@ pub fn build_af_filter(gains: &[f64; 10]) -> String {
             stages.push(format!("equalizer=f={hz}:width_type=o:width=1:g={g:.3}"));
         }
     }
-    stages.push(format!("astats@{LEVEL_METADATA_LABEL}=metadata=1:reset=1"));
-    format!("lavfi=[{}]", stages.join(","))
+    stages.push("astats=metadata=1:reset=1".to_string());
+    format!("@{LEVEL_METADATA_LABEL}:lavfi=[{}]", stages.join(","))
 }
 
 #[cfg(test)]
@@ -446,7 +449,7 @@ mod tests {
     #[test]
     fn filter_string_emits_bands_low_to_high() {
         let filter = build_af_filter(&PRESETS[1].gains); // bass boost
-        assert!(filter.starts_with("lavfi=["));
+        assert!(filter.starts_with(&format!("@{LEVEL_METADATA_LABEL}:lavfi=[")));
         assert!(filter.ends_with(']'));
         // bass boost only touches the bottom four bands, so the top
         // ones solve to nothing and are dropped entirely.
@@ -483,15 +486,18 @@ mod tests {
         assert!(!filter.contains("equalizer"));
         assert_eq!(
             filter,
-            format!("lavfi=[astats@{LEVEL_METADATA_LABEL}=metadata=1:reset=1]")
+            format!("@{LEVEL_METADATA_LABEL}:lavfi=[astats=metadata=1:reset=1]")
         );
     }
 
+    /// The tap has to be in the graph *and* the graph has to carry
+    /// mpv's own label, or `af-metadata/<label>` resolves nothing.
     #[test]
-    fn every_filter_keeps_the_level_meter_tap() {
+    fn every_filter_keeps_the_labeled_level_meter_tap() {
         for preset in PRESETS {
             let filter = build_af_filter(&preset.gains);
-            assert!(filter.contains(&format!("astats@{LEVEL_METADATA_LABEL}=")));
+            assert!(filter.starts_with(&format!("@{LEVEL_METADATA_LABEL}:lavfi=[")));
+            assert!(filter.contains("astats=metadata=1:reset=1"));
         }
     }
 
