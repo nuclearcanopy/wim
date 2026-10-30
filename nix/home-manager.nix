@@ -92,12 +92,28 @@ in
     };
 
     albumArt = mkOption {
-      type = types.enum [ "auto" "blocks" "sixel" "kitty" "iterm2" "off" ];
+      type = types.enum [
+        "auto"
+        "ascii-bw"
+        "ascii-color"
+        "full-bw"
+        "full-color"
+        "off"
+        # pre-rename values, still accepted by wim itself: "blocks" is
+        # "ascii-bw", the protocol names are all "full-color".
+        "blocks"
+        "sixel"
+        "kitty"
+        "iterm2"
+      ];
       default = "auto";
       description = ''
-        "blocks" forces the pixelated unicode-block look (desaturated
-        to grayscale) even on terminals that support real image
-        protocols, for users who want the ui to stay purely monochrome.
+        "ascii-bw"/"ascii-color" use wim's own unicode-block rasterizer,
+        which needs nothing from the terminal. "full-bw"/"full-color"
+        use a real inline graphics protocol (sixel/kitty/iterm2) and
+        fall back to the matching ascii mode on terminals that have
+        none. "auto" picks the best available. the *-bw modes keep the
+        ui purely monochrome.
       '';
     };
 

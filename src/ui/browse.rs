@@ -24,10 +24,10 @@ pub struct BrowseListView<'a> {
     pub view: &'a BrowseView,
     pub favorites: &'a Favorites,
     pub remote_starred: &'a HashSet<String>,
-    /// In `Real` mode the art panel is left to main.rs, which overlays
-    /// a `ratatui-image` stateful widget on the exact same rect
-    /// `browse::layout` gives this widget; this just skips drawing the
-    /// ascii fallback there instead of drawing over it.
+    /// In a `Full*` mode the art panel is left to main.rs, which
+    /// overlays a `ratatui-image` stateful widget on the exact same
+    /// rect `browse::layout` gives this widget; this just skips drawing
+    /// the rasterized art there instead of drawing under it.
     pub art_mode: ArtMode,
     /// The terminal's real cell height:width ratio (see
     /// `main::cell_aspect`), threaded through to `browse::layout` and
@@ -236,11 +236,12 @@ impl Widget for BrowseListView<'_> {
             self.cell_aspect,
         );
         let y = list_area.y;
-        if let (Some(rect), ArtMode::Ascii) = (art_rect, self.art_mode) {
+        if let Some(rect) = art_rect.filter(|_| self.art_mode.is_ascii()) {
             CachedArt {
                 image: self.view.art.as_ref(),
                 cell_aspect: self.cell_aspect,
                 key: &self.view.art_key(),
+                tone: self.art_mode.tone(),
             }
             .render(rect, buf);
         }
