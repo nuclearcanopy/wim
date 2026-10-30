@@ -273,6 +273,10 @@ struct Element {
     field: Field,
     text: String,
     lit: bool,
+    /// Scrubber only: the track's offset into `text` and its length,
+    /// both in cells, so a click lands on a position on the track
+    /// rather than on one of the readouts either side of it.
+    track: Option<(usize, usize)>,
 }
 
 impl PlayerView<'_> {
@@ -340,6 +344,7 @@ impl PlayerView<'_> {
         vec![
             Element {
                 field: Field::Pause,
+                track: None,
                 // lit means "audio is moving", same as the bar: the
                 // play triangle is the bright state.
                 lit: !self.paused,
@@ -352,6 +357,7 @@ impl PlayerView<'_> {
             },
             Element {
                 field: Field::Loop,
+                track: None,
                 lit: self.loop_mode != LoopMode::Off,
                 text: match detail {
                     Detail::Glyph if self.loop_mode == LoopMode::One => {
@@ -363,11 +369,13 @@ impl PlayerView<'_> {
             },
             Element {
                 field: Field::Shuffle,
+                track: None,
                 lit: self.shuffle_on,
                 text: named(GLYPH_SHUFFLE, "shuffle", onoff(self.shuffle_on).to_string()),
             },
             Element {
                 field: Field::Speed,
+                track: None,
                 lit: speed_changed,
                 // the rate stays even at 1.00x on the two word tiers:
                 // the bar drops it to save cells, this screen has them
@@ -384,6 +392,7 @@ impl PlayerView<'_> {
             },
             Element {
                 field: Field::Eq,
+                track: None,
                 lit: self.eq_preset != "flat",
                 text: match detail {
                     Detail::Full => format!("{GLYPH_EQ} eq {}", self.eq_preset),
@@ -393,6 +402,7 @@ impl PlayerView<'_> {
             },
             Element {
                 field: Field::Crossfade,
+                track: None,
                 lit: self.crossfade_on,
                 text: match detail {
                     Detail::Full => {
@@ -415,18 +425,22 @@ impl PlayerView<'_> {
         let dragging = self.scrubbing && self.selected == Some(Field::Progress);
         // two spaces around the track, two cells for the plate.
         let fixed = width(&elapsed) + width(&total) + 4;
-        let text = match avail.checked_sub(fixed + TRACK_MIN) {
-            Some(slack) => format!(
-                "{elapsed} {} {total}",
-                track(frac, TRACK_MIN + slack.min(TRACK_MAX - TRACK_MIN), dragging)
-            ),
+        let (text, cells) = match avail.checked_sub(fixed + TRACK_MIN) {
+            Some(slack) => {
+                let cells = TRACK_MIN + slack.min(TRACK_MAX - TRACK_MIN);
+                (
+                    format!("{elapsed} {} {total}", track(frac, cells, dragging)),
+                    Some(cells),
+                )
+            }
             // too narrow for a track anyone could read a position off,
             // so the position goes as text rather than as a stub bar.
-            None => format!("{elapsed} / {total}"),
+            None => (format!("{elapsed} / {total}"), None),
         };
         Element {
             field: Field::Progress,
             lit: self.elapsed_secs.is_some(),
+            track: cells.map(|cells| (width(&elapsed) + 1, cells)),
             text,
         }
     }
@@ -481,20 +495,9 @@ impl PlayerView<'_> {
     /// brightness stays free to mean on/off, and an inactive control is
     /// only lifted to `MID` so it reads against its own plate.
     fn draw_row(&self, buf: &mut Buffer, area: Rect, y: u16, items: &[Element], sep: usize) {
-        if items.is_empty() || y >= area.y + area.height {
-            return;
-        }
-        let total: usize =
-            items.iter().map(|e| width(&e.text)).sum::<usize>() + sep * (items.len() - 1);
         let limit = area.x + area.width;
-        let mut x = area.x + ((area.width as usize).saturating_sub(total) / 2) as u16;
-        for (i, item) in items.iter().enumerate() {
-            if i > 0 {
-                x += sep as u16;
-            }
-            if x >= limit {
-                return;
-            }
+        for (item, placed) in items.iter().zip(row_rects(items, area, y, sep)) {
+            let x = placed.rect.x;
             let is_selected = self.selected == Some(item.field);
             let dragging = is_selected && self.scrubbing && item.field == Field::Progress;
             let level = if dragging {
@@ -518,7 +521,7 @@ impl PlayerView<'_> {
                 let end = x.saturating_add(width(&item.text) as u16 + 1);
                 fill_bg(buf, x.saturating_sub(1).max(area.x), end.min(limit), y, bg);
             }
-            x = draw::at_styled(
+            draw::at_styled(
                 buf,
                 x,
                 y,
@@ -529,6 +532,98 @@ impl PlayerView<'_> {
             );
         }
     }
+
+    /// Where this screen's transport ended up, for the host's hit map
+    /// (see `hit::HitMap`). Same contract `layout` has with the art
+    /// overlay: the columns are decided while drawing (centred, at
+    /// whichever detail tier fit), so the host cannot derive them and
+    /// must be handed them.
+    pub fn transport(&self, area: Rect) -> TransportLayout {
+        let Some(l) = layout(
+            area,
+            self.art.is_some() && self.art_mode != ArtMode::Off,
+            self.previous.is_some() || self.next.is_some(),
+            self.cell_aspect,
+        ) else {
+            return TransportLayout::default();
+        };
+        let mut out = TransportLayout::default();
+        if let Some(y) = l.controls_y {
+            let (controls, sep) = self.controls(area.width as usize);
+            for placed in row_rects(&controls, area, y, sep) {
+                out.controls.push((placed.field, placed.rect));
+            }
+        }
+        if let Some(y) = l.progress_y {
+            let items = [self.scrubber(area.width as usize)];
+            for placed in row_rects(&items, area, y, SEP_WORDS) {
+                out.controls.push((placed.field, placed.rect));
+                out.track = placed.track;
+            }
+        }
+        out
+    }
+}
+
+/// The transport as drawn, for hit-testing a click against it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransportLayout {
+    pub controls: Vec<(Field, Rect)>,
+    /// The scrubber's track cells only; `None` when the pane was too
+    /// narrow for a track and the position went as plain text.
+    pub track: Option<Rect>,
+}
+
+/// One element of a centred row and the columns it lands on.
+struct Placed {
+    field: Field,
+    rect: Rect,
+    track: Option<Rect>,
+}
+
+/// Columns each element of a centred row occupies. `draw_row` paints
+/// from this and `PlayerView::transport` hit-tests against it, so a
+/// click can never land on an element the row dropped or shifted; the
+/// row is centred on its own total width, which is not something a
+/// caller can recover from the field list.
+fn row_rects(items: &[Element], area: Rect, y: u16, sep: usize) -> Vec<Placed> {
+    if items.is_empty() || y >= area.y + area.height {
+        return Vec::new();
+    }
+    let total: usize =
+        items.iter().map(|e| width(&e.text)).sum::<usize>() + sep * (items.len() - 1);
+    let limit = area.x + area.width;
+    let mut out = Vec::with_capacity(items.len());
+    let mut x = area.x + ((area.width as usize).saturating_sub(total) / 2) as u16;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            x += sep as u16;
+        }
+        if x >= limit {
+            break;
+        }
+        let drawn = (width(&item.text) as u16).min(limit - x);
+        out.push(Placed {
+            field: item.field,
+            rect: Rect {
+                x,
+                y,
+                width: drawn,
+                height: 1,
+            },
+            track: item.track.and_then(|(offset, cells)| {
+                let tx = x + offset as u16;
+                (tx < limit).then(|| Rect {
+                    x: tx,
+                    y,
+                    width: (cells as u16).min(limit - tx),
+                    height: 1,
+                })
+            }),
+        });
+        x += drawn;
+    }
+    out
 }
 
 fn draw_centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
@@ -598,6 +693,59 @@ mod tests {
 
     fn row(buf: &Buffer, y: u16) -> String {
         grid(buf).lines().nth(y as usize).unwrap().to_string()
+    }
+
+    /// The hit layout the host records has to name the columns the
+    /// glyphs were painted on, at every detail tier the row falls back
+    /// through; this screen's row is centred on its own total width,
+    /// which is precisely what a caller cannot guess.
+    #[test]
+    fn the_exposed_transport_points_at_the_columns_the_row_drew_on() {
+        let keymap = Keymap::default();
+        let cover = art();
+        for (w, h) in [(120u16, 40u16), (80, 30), (50, 20), (30, 10), (20, 6)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut v = view(&keymap, Some(&cover));
+            v.selected = Some(Field::Pause);
+            let t = v.transport(area);
+            let mut v = view(&keymap, Some(&cover));
+            v.selected = Some(Field::Pause);
+            let mut buf = buffer(w, h);
+            v.render(area, &mut buf);
+
+            for (field, glyph) in [
+                (Field::Pause, GLYPH_PLAY),
+                (Field::Loop, GLYPH_LOOP),
+                (Field::Shuffle, GLYPH_SHUFFLE),
+                (Field::Speed, GLYPH_SPEED),
+            ] {
+                let Some((_, rect)) = t.controls.iter().find(|(f, _)| *f == field) else {
+                    assert!(
+                        !grid(&buf).contains(glyph),
+                        "{field:?} has no rect at {w}x{h} but was drawn"
+                    );
+                    continue;
+                };
+                let col = col_of(&buf, rect.y, glyph);
+                assert!(
+                    col >= rect.x && col < rect.x + rect.width,
+                    "{field:?}: {glyph:?} at column {col}, rect {rect:?} ({w}x{h})"
+                );
+            }
+            // and the track rect is track cells, not the readouts
+            // around them, which is what a seek fraction is measured
+            // against.
+            if let Some(track) = t.track {
+                for x in [track.x, track.x + track.width - 1] {
+                    let sym = buf.cell((x, track.y)).unwrap().symbol().to_string();
+                    assert!(
+                        ['━', '─', TRACK_HEAD].iter().any(|c| sym.starts_with(*c)),
+                        "column {x} of the track rect holds {sym:?} at {w}x{h}"
+                    );
+                }
+                assert_eq!(buf.cell((track.x - 1, track.y)).unwrap().symbol(), " ");
+            }
+        }
     }
 
     #[test]
