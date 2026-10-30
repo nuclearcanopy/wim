@@ -626,12 +626,30 @@ staying `None` costs nothing in sampling.
       standalone one asserting the absence of a frame and rail so the
       shared path cannot be changed by accident.
 
-- [ ] **shellsong's `eq(<preset>)` cannot reach saved curves.** it
-      resolves names through `eq::index_of`, which is built-ins only.
-      `eq::resolve(name, &cfg.eq_custom_presets)` already returns
-      `(Source, gains)` for both, so `Op::SetEqPreset` needs to carry
-      a `Source` rather than a bare index, and `Words::EqPreset`
-      completion wants the saved names too.
+- [x] **shellsong's `eq(<preset>)` cannot reach saved curves.** fixed,
+      though not the way this entry proposed: `Op::SetEqPreset` carries
+      the **name**, not a `Source`. a `Source` cannot be built at
+      lowering time, because `Program::parse` has no host context and
+      the saved curves only exist at runtime; carrying the name defers
+      resolution to apply time, where `eq::resolve` reads built-ins
+      then saved (the precedence the eq menu shows), and a curve saved
+      after the line was typed still resolves.
+      the parameter went from `Ty::Words(Words::EqPreset)` to a new
+      `Ty::EqName`, since a `Words` set is static by definition.
+      completion merges the built-ins with `Candidates::eq_presets()`,
+      the same host-provides-runtime-names pattern `SavedQueues`
+      already uses for `load_queue`. `eq::index_of` is deleted; it was
+      the built-ins-only resolver this bug was made of.
+      **the thing worth not losing:** parse-time validation used to
+      give `eq(rok)` -> "did you mean 'rock'" and `eq(disco)` -> the
+      list of real names, for free. moving resolution to apply time
+      would have degraded that to a bare failure, so the message moved
+      with it, as `eq::resolve_failure` (same jaro-winkler floor
+      shellsong's own `did_you_mean` uses, and it suggests saved curves
+      too). `load_queue`'s unknown-name path is still the bare
+      "no saved queue called X" and could borrow the same treatment.
+      a missing argument is still a parse error; that needs no host
+      context to decide.
 - [x] **`!foo` does not exclude anything.** fixed by handling it
       ourselves instead of handing it to nucleo, which parses `!` and
       then ignores it in `Pattern::score`. `split_exclusions` peels

@@ -288,7 +288,7 @@ pub enum Op {
     SpeedUp,
     SpeedDown,
     /// index into `eq::PRESETS`.
-    SetEqPreset(usize),
+    SetEqPreset(String),
     ToggleCrossfade,
     /// replace the query and re-filter, exactly as typing it would.
     Search(String),
@@ -360,9 +360,7 @@ impl Op {
             Op::SetSpeed(s) => format!("speed: {s}x"),
             Op::SpeedUp => "speed up".into(),
             Op::SpeedDown => "speed down".into(),
-            Op::SetEqPreset(i) => {
-                format!("eq: {}", eq::PRESETS.get(*i).map(|p| p.name).unwrap_or("?"))
-            }
+            Op::SetEqPreset(name) => format!("eq: {name}"),
             Op::ToggleCrossfade => "crossfade toggled".into(),
             Op::Search(q) => format!("search: {q}"),
             Op::MoveSelection(d) if *d < 0 => "up".into(),
@@ -431,6 +429,10 @@ pub enum Ty {
     SavedName,
     /// the name of a command, for `help`.
     CommandName,
+    /// the name of an eq curve, built-in or saved. A free name rather
+    /// than a `Words` set because the saved half only exists at
+    /// runtime; see `Completes::EqPresets`.
+    EqName,
     /// unsigned time literal: absolute position.
     Pos,
     /// signed time literal: a relative offset.
@@ -525,6 +527,10 @@ pub enum Completes {
     CommandNames,
     /// the host's saved queue names.
     SavedQueues,
+    /// built-in eq curves plus whatever the user has saved. Not a
+    /// `Words` set: the saved half only exists at runtime, which is the
+    /// whole reason `eq()` could not reach it before.
+    EqPresets,
     /// nothing insertable; show this instead, and never accept it.
     Hint(&'static str),
 }
@@ -544,6 +550,7 @@ impl Ty {
         match self {
             Ty::Terms | Ty::Query => Completes::CorpusTerms,
             Ty::SavedName => Completes::SavedQueues,
+            Ty::EqName => Completes::EqPresets,
             Ty::CommandName | Ty::Call => Completes::CommandNames,
             Ty::Words(w) => Completes::Words(w),
             Ty::NewName => Completes::Hint("a name to save it under"),
@@ -579,6 +586,7 @@ impl Ty {
             Ty::Query => "something to search for".into(),
             Ty::NewName => "a name".into(),
             Ty::SavedName => "the name of a saved queue".into(),
+            Ty::EqName => "an eq preset name".into(),
             Ty::CommandName => "a command name".into(),
             Ty::Pos => "an unsigned position like 30s, 1m20s or 50%".into(),
             Ty::Offset => "a signed offset like +30s or -10s".into(),
@@ -763,7 +771,7 @@ pub const COMMANDS: &[Command] = &[
     cmd(
         "eq",
         &["equalizer"],
-        &[req("preset", Ty::Words(Words::EqPreset))],
+        &[req("preset", Ty::EqName)],
         &[],
         "apply an eq preset; view(eq) opens the menu",
     ),
@@ -1713,7 +1721,14 @@ impl Call {
                 Some(Arg::Speed(SpeedArg::Reset)) => Op::SetSpeed(1.0),
                 _ => return None,
             },
-            "eq" => Op::SetEqPreset(self.keyword(Words::EqPreset).and_then(eq::index_of)?),
+            // the name travels as typed and is resolved at apply
+            // time against the live saved list, so a curve saved after
+            // this line was typed still resolves and `dry` can still
+            // print what was asked for.
+            "eq" => match first {
+                Some(Arg::Name(n)) => Op::SetEqPreset(n.clone()),
+                _ => return None,
+            },
             "crossfade" => Op::ToggleCrossfade,
             "search" => match first {
                 Some(Arg::Name(q)) => Op::Search(q.clone()),
@@ -2159,7 +2174,7 @@ fn coerce(
         }
         // every free-text type parses identically; they differ only in
         // what they complete from (see `Ty::completes`).
-        Ty::Query | Ty::NewName | Ty::SavedName | Ty::CommandName => {
+        Ty::Query | Ty::NewName | Ty::SavedName | Ty::EqName | Ty::CommandName => {
             if text.starts_with('[') {
                 return Err(expected());
             }
@@ -2442,6 +2457,12 @@ pub trait Candidates {
 
     /// Names of the saved queues `load_queue` could take.
     fn saved_queues(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Names of the user's saved eq curves, which `eq()` can take
+    /// alongside the built-ins.
+    fn eq_presets(&self) -> Vec<String> {
         Vec::new()
     }
 }
@@ -2772,6 +2793,18 @@ impl Console {
                 cand.saved_queues().iter().map(String::as_str),
                 MAX_CANDIDATES,
             ),
+            Completes::EqPresets => {
+                let saved = cand.eq_presets();
+                keep_extensions(
+                    &here.token,
+                    Words::EqPreset
+                        .options()
+                        .iter()
+                        .copied()
+                        .chain(saved.iter().map(String::as_str)),
+                    MAX_CANDIDATES,
+                )
+            }
         };
         self.ranks.order(&mut seen);
         seen
@@ -3406,7 +3439,7 @@ mod tests {
             // term alongside it (see `check_view`).
             Ty::Words(Words::ViewTarget) => "queue".into(),
             Ty::Terms => "crest".into(),
-            Ty::Query | Ty::NewName | Ty::SavedName => "crest".into(),
+            Ty::Query | Ty::NewName | Ty::SavedName | Ty::EqName => "crest".into(),
             Ty::CommandName => "pause".into(),
             Ty::Pos => "30s".into(),
             Ty::Offset => "+30s".into(),
@@ -3595,18 +3628,29 @@ mod tests {
     /// which is what removes the old arity overload.
     #[test]
     fn eq_applies_a_preset_and_the_menu_moved_to_view() {
-        let rock = eq::index_of("rock").unwrap();
-        assert_eq!(ops("eq(rock)"), vec![Op::SetEqPreset(rock)]);
-        assert_eq!(ops("eq(flat)"), vec![Op::SetEqPreset(0)]);
+        // the name travels as typed now; resolution happens at apply
+        // time, which is what lets a saved curve be named here at all.
+        assert_eq!(ops("eq(rock)"), vec![Op::SetEqPreset("rock".into())]);
+        assert_eq!(ops("eq(flat)"), vec![Op::SetEqPreset("flat".into())]);
+        // the point of the change: a name that is not a built-in still
+        // lowers, instead of failing to parse.
+        assert_eq!(
+            ops("eq(my bass curve)"),
+            vec![Op::SetEqPreset("my bass curve".into())]
+        );
         assert_eq!(ops("view(eq)"), vec![Op::View(ViewTarget::Eq)]);
         assert_eq!(ops("view(equalizer)"), vec![Op::View(ViewTarget::Eq)]);
+        // a missing argument is still a parse error; the table says
+        // the parameter is required and that does not need the saved
+        // list to decide.
         let e = error("eq()");
         assert!(e.message.contains("missing preset"), "{}", e.message);
-        // nothing near "disco", so it lists what there is rather than
-        // inventing a suggestion.
-        let e = error("eq(disco)");
-        assert!(e.message.contains("bass boost"), "{}", e.message);
-        assert!(error("eq(rok)").message.contains("did you mean 'rock'"));
+        // an *unknown* name is no longer a parse error: the parser
+        // cannot see the user's saved curves, so "is this a real
+        // preset" is answered at apply time. the message quality that
+        // used to live here (listing the names, "did you mean") moved
+        // with it, to `eq::resolve_failure`, which has its own tests.
+        assert_eq!(ops("eq(disco)"), vec![Op::SetEqPreset("disco".into())]);
     }
 
     // ------------------------------------------------------------ view
@@ -4554,6 +4598,7 @@ mod tests {
             Ty::Query,
             Ty::NewName,
             Ty::SavedName,
+            Ty::EqName,
             Ty::CommandName,
             Ty::Pos,
             Ty::Offset,

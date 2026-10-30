@@ -1615,20 +1615,28 @@ fn run_shellsong_op(op: Op, ctx: &mut ShellsongCtx) -> (Dispatch, Report) {
             let dispatch = dispatch_action(Action::SetSpeed(speed), ctx.actx);
             (dispatch, Report::Note(format!("speed: {speed}x")))
         }
-        Op::SetEqPreset(index) => {
-            // `apply_eq_row` takes an eq-menu row, and the rows below
-            // `PRESET_COUNT` are exactly the built-in presets in
-            // order; the saved ones sit after them and are not
-            // addressable from shellsong yet.
-            if index >= ui::eq_menu::PRESET_COUNT {
-                return op_fail(format!("no eq preset {index}"));
-            }
+        Op::SetEqPreset(name) => {
+            // resolved here rather than at lowering time, because the
+            // saved curves only exist at runtime; `eq::resolve` reads
+            // built-ins first, then the saved list, same precedence the
+            // eq menu shows them in.
+            let saved = &ctx.actx.cfg.eq_custom_presets;
+            let Some((source, _)) = eq::resolve(&name, saved) else {
+                return op_fail(eq::resolve_failure(&name, saved));
+            };
+            // `apply_eq_row` speaks eq-menu rows, which is exactly
+            // built-ins then saved; `eq_menu::cursor` is the inverse of
+            // this and a test pins the two agreeing.
+            let row = match source {
+                eq::Source::Builtin(i) => i,
+                eq::Source::Saved(i) => ui::eq_menu::PRESET_COUNT + i,
+            };
             apply_eq_row(
                 ctx.actx.app,
                 ctx.actx.player,
                 ctx.actx.notifications,
-                &ctx.actx.cfg.eq_custom_presets,
-                index,
+                saved,
+                row,
             );
             op_done()
         }
@@ -2161,6 +2169,14 @@ fn save_config(cfg: &config::Config, notifications: &mut Notifications) {
 /// those is `adjust_eq_band`'s job. Deliberately not wired to j/k:
 /// this overwrites all ten gains, which is not something plain
 /// navigation should ever do.
+/// Saved eq curve names, for shellsong's `eq()` completion. Built
+/// fresh per keystroke like the corpus candidates are; the list is a
+/// handful of short strings, so cloning beats threading a borrow
+/// through `CorpusCandidates`'s lifetime.
+fn eq_preset_names(saved: &eq::CustomPresets) -> Vec<String> {
+    saved.iter().map(|p| p.name.clone()).collect()
+}
+
 fn apply_eq_row(
     app: &mut app::App,
     player: &mpv::Mpv,
@@ -4815,6 +4831,7 @@ fn main() -> anyhow::Result<()> {
                         &CorpusCandidates {
                             corpus: &app.corpus,
                             saved: &saved_queues,
+                            eq_presets: eq_preset_names(&cfg.eq_custom_presets),
                         },
                     );
                 } else if !help_open {
@@ -5038,6 +5055,7 @@ fn main() -> anyhow::Result<()> {
                     let cand = CorpusCandidates {
                         corpus: &app.corpus,
                         saved: &saved_queues,
+                        eq_presets: eq_preset_names(&cfg.eq_custom_presets),
                     };
                     // the whole `KeyEvent`, not just `key.code`: the
                     // console reads ctrl for its accept key, which no
