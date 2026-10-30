@@ -391,7 +391,41 @@ real video is the DEFAULT and stays the default. the ascii path is a
 thing the user turns on deliberately, never something they land in by
 accident.
 
-- [ ] **BLOCKER: there is no working way to get frames out of mpv.**
+- [ ] **mpv renders to the terminal itself; we may not need frames at
+      all.** found 2026-10-30 while answering "could ghostty play video
+      in the terminal". `mpv --vo=help` on v0.41.0 here lists **`kitty`**
+      (kitty graphics protocol) and **`tct`** (true-color text, whose
+      `--vo-tct-algo` default is literally `half-blocks`). there is no
+      `sixel` vo in this build, so that route would need mpv rebuilt
+      with libsixel.
+      the decisive part is that `--vo=kitty` takes a geometry:
+      `--vo-kitty-cols/rows/left/top`, plus `--vo-kitty-alt-screen=no`
+      and `--vo-kitty-config-clear=no` so it neither takes over the
+      screen nor wipes it, and `--vo-kitty-use-shm` to hand frames over
+      via shared memory instead of base64 through the pty. that is
+      video drawn **into an exact sub-rect**, which is precisely what
+      "video plays as real video in the workspace" asks for, with **no
+      frame extraction whatsoever**. the `screenshot-raw` blocker below
+      simply does not apply to this route.
+      `--vo=tct` is the same idea for the ascii path (`--vo-tct-width`
+      / `--vo-tct-height`), and works in any terminal, alacritty
+      included; it has no left/top, so placement is cursor-relative and
+      harder than kitty's.
+      what to verify before committing to it: whether mpv's own writes
+      and ratatui's buffer flush can coexist without fighting over the
+      screen (wim owns the alt screen and repaints every frame, so the
+      two need a protocol about who touches which cells, and `kitty`'s
+      image placements may survive a ratatui repaint better than tct's
+      text cells, which ratatui will overwrite). if they cannot be made
+      to coexist, this becomes "mpv draws video, wim draws chrome
+      around a hole", which is still far cheaper than a frame pump.
+      **consequence for the terminal choice:** this is the one real
+      argument for kitty protocol over sixel here. with this mpv build,
+      `--vo=kitty` works in ghostty/kitty and there is no sixel vo to
+      use in foot.
+
+- [ ] **BLOCKER (for the pull-frames-ourselves route only): there is no
+      working way to get frames out of mpv.**
       found by `perf/mpv` and it gates every item below. `screenshot-raw`
       **cannot work over json ipc at all**: mpv's own manual says it is
       client-api/script only, and over ipc it replies with a `data`
