@@ -74,6 +74,14 @@ the terminal's own click-drag text selection away from the terminal;
 hold `shift` while dragging to get it back (works in most terminals),
 or set `mouse = false` to give it back for good.
 
+`video_output = "auto"` (the default) picks how `v` draws a local
+video. mpv draws it itself, filling the terminal, while wim stops
+drawing: `tct` is true-color half-blocks and works in any terminal,
+`kitty` is the kitty graphics protocol and needs a terminal that speaks
+it. `auto` uses kitty only when the terminal actually answered the
+graphics probe with it, `tct` otherwise. `off` disables the key. music
+playback is never affected.
+
 ## keybindings
 
 press `?` in the app for the full list. it resolves every key from the
