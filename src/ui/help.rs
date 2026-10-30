@@ -126,6 +126,20 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
         ],
     ),
     (
+        // the app has quietly supported nucleo's anchors and exact
+        // match all along and never said so anywhere; `!` now works
+        // too (see search.rs's split_exclusions), so the whole syntax
+        // is worth one block rather than being folklore.
+        "search syntax",
+        &[
+            (Key::Fixed("foo bar"), "fuzzy, typos forgiven"),
+            (Key::Fixed("'foo"), "exact substring"),
+            (Key::Fixed("^foo"), "starts with"),
+            (Key::Fixed("foo$"), "ends with"),
+            (Key::Fixed("!foo"), "exclude matches"),
+        ],
+    ),
+    (
         "other",
         &[
             (Key::Bound(KeyAction::OpenSettingsMenu), "settings"),

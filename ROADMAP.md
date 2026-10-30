@@ -632,11 +632,29 @@ staying `None` costs nothing in sampling.
       `(Source, gains)` for both, so `Op::SetEqPreset` needs to carry
       a `Source` rather than a bare index, and `Words::EqPreset`
       completion wants the saved names too.
-- [ ] **`!foo` does not exclude anything.** pre-existing, found by
-      `perf/search` and now merely pinned: in nucleo 0.3 a `!foo`
-      query scores identically to `'foo`, because negation is not
-      honored by `Pattern::score`. so typing `!` reads as a working
-      exclusion syntax and silently does nothing.
+- [x] **`!foo` does not exclude anything.** fixed by handling it
+      ourselves instead of handing it to nucleo, which parses `!` and
+      then ignores it in `Pattern::score`. `split_exclusions` peels
+      `!term` tokens off the query, the positive remainder is what
+      nucleo sees, and `Needle::excludes` drops a match before it is
+      scored (an excluded item cannot be rescued by any score, so that
+      is the cheapest rejection point).
+      the pinned guard table proved the old bug outright: `!blade`'s
+      pinned row was byte-identical to `'blade`'s, hash and all.
+      exactly one row of 38 changed, which is the check that says
+      nothing else moved.
+      decisions: a bare `!` stays literal text (no term to exclude);
+      an exclusion-only query ranks nothing rather than the whole
+      corpus minus the term, matching how an empty query behaves;
+      matching is substring, not word-boundary, since a boundary rule
+      would keep "(Live)" only by luck of the punctuation.
+      the oracle test now applies the same exclusion to its reference
+      scorer, since `!term` is a filter over the corpus rather than
+      part of scoring; that the exclusion itself is right is what the
+      seven new tests cover.
+      also: the app had quietly supported `'foo`, `^foo` and `foo$`
+      all along and said so nowhere, so the help overlay has a "search
+      syntax" block now instead of leaving it folklore.
 - [ ] **the remaining search cost is the result clone, and it needs an
       api change to fix.** for a broad query at 40k items, 3-5ms of a
       ~7ms search is `rank` cloning ~15k `SearchItem`s. cutting it
