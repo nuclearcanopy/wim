@@ -156,19 +156,11 @@ fn artist_tracks(
     // one getAlbum round-trip per album, done one at a time, was the
     // whole reason opening a prolific artist's profile felt so slow
     // (dozens of sequential network calls, each paying its own
-    // latency); they're entirely independent requests, so fetch them
-    // all in parallel instead. `Client` wraps a `ureq::Agent`, which
-    // is explicitly safe to share and use concurrently across
-    // threads for exactly this.
-    let details: Vec<Option<subsonic::AlbumDetails>> = thread::scope(|scope| {
-        artist_albums
-            .iter()
-            .map(|album| scope.spawn(|| client.get_album(&album.id).ok()))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|handle| handle.join().unwrap_or(None))
-            .collect()
-    });
+    // latency); they're independent requests, so they go through
+    // `album_details`'s bounded pool instead (a thread per album was
+    // a socket per album against a real navidrome instance).
+    let ids: Vec<&str> = artist_albums.iter().map(|a| a.id.as_str()).collect();
+    let details = client.album_details(&ids);
 
     let mut tracks = Vec::new();
     let mut albums = Vec::new();
@@ -2727,6 +2719,11 @@ fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatal
             playlists.join().unwrap_or_default(),
         )
     });
+    // persisted here, not where it gets merged: every caller of this
+    // is already off the main thread (or already blocking on the
+    // network), and serializing a catalog is not something to spend a
+    // frame on. best-effort, and a no-op when nothing changed.
+    let _ = cache::save_catalog(&client, &artists, &albums, &playlists);
     Ok(FetchedCatalog {
         client: Arc::new(client),
         artists,
@@ -2740,15 +2737,14 @@ fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatal
 /// (startup, manual reconnect, add-profile, background auto-sync) gets
 /// it for free instead of having to remember it.
 fn merge_catalog_into_app(app: &mut app::App, catalog: FetchedCatalog) {
-    app.corpus.add_subsonic_search_result(
-        subsonic::SearchResult {
+    app.corpus.reconcile_server(
+        cache::ServerCatalog {
             artists: catalog.artists,
             albums: catalog.albums,
-            songs: Vec::new(),
+            playlists: catalog.playlists,
         },
         &catalog.client,
     );
-    app.corpus.add_playlists(catalog.playlists, &catalog.client);
     app.resync_results();
 }
 
@@ -3049,6 +3045,13 @@ fn main() -> anyhow::Result<()> {
     // channel can never be reused.
     let (scan_tx, mut scan_rx) = mpsc::channel::<library::ScanBatch>();
     library::spawn_scan(cfg.library_paths.clone(), scan_tx);
+    // every configured server's catalog as of its last session, read
+    // straight off the disk so the first frame has a full library
+    // rather than "connecting to navidrome..."; started here so the
+    // read overlaps mpv's spawn below, taken where `app` is built.
+    // the background sync reconciles it against what each server
+    // really has. see `search::spawn_warm_from_cache`.
+    let warming_corpus = search::spawn_warm_from_cache(&cfg.navidrome_servers);
 
     let player = mpv::Mpv::spawn()?;
     trace::mark("mpv spawned");
@@ -3064,7 +3067,7 @@ fn main() -> anyhow::Result<()> {
     // (universal navigation primitives, applied the same way
     // everywhere rather than individually named commands).
     let mut keymap = Keymap::from_overrides(&cfg.keybinds);
-    let mut app = app::App::new(search::Corpus::new());
+    let mut app = app::App::new(warming_corpus.take());
     // so the first frame says "scanning" rather than "no local music
     // found"; cleared when the scan thread drops its sender. the
     // server equivalent is set below.

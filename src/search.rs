@@ -20,10 +20,13 @@ use std::thread;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 
+use crate::cache::{self, ServerCatalog};
+use crate::config::NavidromeConfig;
 use crate::library::{LocalTrack, MediaKind};
 use crate::subsonic::{
     Album, Artist, Client, Playlist, SearchResult as SubsonicSearchResult, Song,
 };
+use crate::trace;
 
 /// Results-list section a `SearchItem` groups under; see
 /// `SearchItem::category`.
@@ -388,6 +391,27 @@ struct Scratch {
     buf: Vec<char>,
 }
 
+/// A persisted-catalog load running on its own thread. Started before
+/// the first blocking thing `main` does and `take`n where the corpus is
+/// actually needed, so the disk read overlaps the mpv spawn instead of
+/// landing on top of it.
+pub struct WarmingCorpus(thread::JoinHandle<Corpus>);
+
+impl WarmingCorpus {
+    /// Blocks until the load finishes; an empty corpus if its thread
+    /// panicked, same best-effort stance as every other cache read.
+    pub fn take(self) -> Corpus {
+        self.0.join().unwrap_or_default()
+    }
+}
+
+/// Reads every configured server's persisted catalog in the
+/// background; see `Corpus::warm_from_cache` for what it builds.
+pub fn spawn_warm_from_cache(servers: &[NavidromeConfig]) -> WarmingCorpus {
+    let servers = servers.to_vec();
+    WarmingCorpus(thread::spawn(move || Corpus::warm_from_cache(&servers)))
+}
+
 /// The merged corpus to search over, built once per library scan /
 /// Navidrome sync and re-searched on every keystroke.
 #[derive(Debug, Clone, Default)]
@@ -413,6 +437,101 @@ pub struct Corpus {
 impl Corpus {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A corpus already holding every configured server's catalog as
+    /// of its last session, read off the disk (`cache::load_catalog`)
+    /// with no network at all, so the first frame paints a full
+    /// library instead of "connecting to navidrome...". The background
+    /// sync then reconciles each server against what it really has
+    /// (see `reconcile_server`), which is what keeps this from being a
+    /// library frozen at whatever was true last launch.
+    ///
+    /// Also drops catalogs for servers no longer configured; this runs
+    /// exactly once per launch and is the one place holding the live
+    /// server list.
+    ///
+    /// Call it through `spawn_warm_from_cache` rather than directly:
+    /// tens of thousands of rows is tens of milliseconds, which the
+    /// first frame shouldn't wait for when there is an mpv process
+    /// being spawned anyway.
+    fn warm_from_cache(servers: &[NavidromeConfig]) -> Corpus {
+        let mut corpus = Corpus::new();
+        for nav in servers {
+            let Some(catalog) = cache::load_catalog(nav) else {
+                continue;
+            };
+            if catalog.is_empty() {
+                continue;
+            }
+            // offline: `Client::new` only resolves the password and
+            // builds an http agent, it never talks to the server.
+            let Ok(client) = Client::new(nav) else {
+                continue;
+            };
+            corpus.add_catalog(catalog, &Arc::new(client));
+        }
+        cache::sweep_foreign_catalogs(servers);
+        trace::mark(&format!(
+            "navidrome: {} cached catalog rows loaded",
+            corpus.items.len()
+        ));
+        corpus
+    }
+
+    /// Folds one server's full catalog in, dropping whatever it no
+    /// longer lists: the reconciliation half of `warm_from_cache`.
+    /// Without it, an artist or album deleted on the server would be
+    /// listed by every later launch for as long as the corpus lived,
+    /// since `add_subsonic_search_result` only ever adds.
+    ///
+    /// Songs are deliberately untouched. Nothing indexes them up front
+    /// (they arrive from `search3`, opened albums and artist pages), so
+    /// a catalog fetch is not an authoritative song list to prune
+    /// against; see docs/startup-cache.md.
+    pub fn reconcile_server(&mut self, catalog: ServerCatalog, client: &Arc<Client>) {
+        let url = client.base_url();
+        let live: [HashSet<&str>; 3] = [
+            catalog.artists.iter().map(|a| a.id.as_str()).collect(),
+            catalog.albums.iter().map(|a| a.id.as_str()).collect(),
+            catalog.playlists.iter().map(|p| p.id.as_str()).collect(),
+        ];
+        let gone = |item: &SearchItem| {
+            if item.source() != Some(url) {
+                return false;
+            }
+            match item.remote_key() {
+                Some((0, id)) => !live[0].contains(id),
+                Some((1, id)) => !live[1].contains(id),
+                Some((3, id)) => !live[2].contains(id),
+                _ => false,
+            }
+        };
+        let dropped: Vec<(u8, String)> = self
+            .items
+            .iter()
+            .filter(|e| gone(&e.item))
+            .filter_map(|e| e.item.remote_key().map(|(k, id)| (k, id.to_string())))
+            .collect();
+        if !dropped.is_empty() {
+            for (kind, id) in &dropped {
+                self.remote_keys[*kind as usize].remove(id);
+            }
+            self.items.retain(|e| !gone(&e.item));
+        }
+        self.add_catalog(catalog, client);
+    }
+
+    fn add_catalog(&mut self, catalog: ServerCatalog, client: &Arc<Client>) {
+        self.add_subsonic_search_result(
+            SubsonicSearchResult {
+                artists: catalog.artists,
+                albums: catalog.albums,
+                songs: Vec::new(),
+            },
+            client,
+        );
+        self.add_playlists(catalog.playlists, client);
     }
 
     /// Single insertion point: every path that adds an item has to go
@@ -942,6 +1061,112 @@ mod tests {
             &client,
         );
         c
+    }
+
+    fn other_client() -> Arc<Client> {
+        Arc::new(
+            Client::new(&NavidromeConfig {
+                url: "https://other.invalid".into(),
+                username: "test".into(),
+                password: Some("test".into()),
+                password_file: None,
+                max_bitrate_kbps: None,
+                transcode_format: None,
+            })
+            .unwrap(),
+        )
+    }
+
+    fn catalog(artists: &[&str], albums: &[&str], playlists: &[&str]) -> ServerCatalog {
+        ServerCatalog {
+            artists: artists
+                .iter()
+                .map(|id| Artist {
+                    id: (*id).into(),
+                    name: format!("artist {id}"),
+                })
+                .collect(),
+            albums: albums
+                .iter()
+                .map(|id| Album {
+                    id: (*id).into(),
+                    name: format!("album {id}"),
+                    artist: "artist".into(),
+                })
+                .collect(),
+            playlists: playlists
+                .iter()
+                .map(|id| Playlist {
+                    id: (*id).into(),
+                    name: format!("playlist {id}"),
+                })
+                .collect(),
+        }
+    }
+
+    fn ids(c: &Corpus) -> Vec<String> {
+        c.items()
+            .map(|i| i.identity().1.into_owned())
+            .collect::<Vec<_>>()
+    }
+
+    /// The whole reason a persisted catalog is safe to load: what the
+    /// server no longer has stops being listed, rather than lingering
+    /// for the rest of the session (and every session after it).
+    #[test]
+    fn reconciling_drops_what_the_server_no_longer_lists() {
+        let client = test_client();
+        let mut c = Corpus::new();
+        c.reconcile_server(catalog(&["a1", "a2"], &["al1"], &["p1"]), &client);
+        assert_eq!(c.items().count(), 4);
+
+        c.reconcile_server(catalog(&["a2"], &["al1", "al2"], &[]), &client);
+        let left = ids(&c);
+        assert!(!left.contains(&"a1".to_string()), "deleted artist stayed");
+        assert!(!left.contains(&"p1".to_string()), "deleted playlist stayed");
+        assert!(left.contains(&"a2".to_string()));
+        assert!(left.contains(&"al1".to_string()));
+        assert!(left.contains(&"al2".to_string()), "new album never landed");
+        assert_eq!(left.len(), 3);
+
+        // and the dedup bookkeeping went with them: a server that
+        // brings a dropped id back must be able to re-add it.
+        c.reconcile_server(catalog(&["a1", "a2"], &["al1", "al2"], &["p1"]), &client);
+        assert_eq!(c.items().count(), 5);
+    }
+
+    /// Nothing indexes songs up front, so a catalog fetch is not an
+    /// authoritative song list; dropping songs here would throw away
+    /// every tracklist an opened album had taught the corpus.
+    #[test]
+    fn reconciling_leaves_songs_and_local_tracks_alone() {
+        let mut c = corpus();
+        let client = test_client();
+        c.reconcile_server(catalog(&["a1"], &["al1"], &["p1"]), &client);
+        let left = ids(&c);
+        assert!(left.contains(&"s1".to_string()), "a known song was dropped");
+        assert!(
+            left.iter().any(|id| id.contains("blade runner ost.flac")),
+            "a local file was dropped"
+        );
+    }
+
+    #[test]
+    fn reconciling_one_server_does_not_touch_another() {
+        let mut c = Corpus::new();
+        let first = test_client();
+        let second = other_client();
+        c.reconcile_server(catalog(&["a1"], &["al1"], &[]), &first);
+        c.reconcile_server(catalog(&["b1"], &["bl1"], &[]), &second);
+        assert_eq!(c.items().count(), 4);
+
+        // the first server emptied out; the second one's entries are
+        // not its business.
+        c.reconcile_server(catalog(&[], &[], &[]), &first);
+        let left = ids(&c);
+        assert_eq!(left.len(), 2);
+        assert!(left.contains(&"b1".to_string()));
+        assert!(left.contains(&"bl1".to_string()));
     }
 
     #[test]
