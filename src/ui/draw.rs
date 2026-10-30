@@ -147,10 +147,72 @@ pub fn framed_inner(area: Rect) -> Rect {
 /// frame it so it reads as a surface rather than text floating over
 /// the layout, and hand back the content rect inside the frame.
 pub fn overlay(buf: &mut Buffer, area: Rect) -> Rect {
-    clear(buf, area);
+    scrim(buf, area);
     frame(buf, area, shade(NEAR_BLACK));
     framed_inner(area)
 }
+
+/// How much brightness survives the scrim. Low enough that an
+/// overlay's own text reads cleanly on top, high enough that the shape
+/// of what is behind still comes through.
+const SCRIM_KEEP: f32 = 0.22;
+
+/// Darkens `area` to one flat block per cell instead of wiping it.
+///
+/// Each cell's foreground and background collapse into a single level,
+/// which is where the softness comes from: a quadrant glyph carries
+/// two shades in one cell, so merging them throws the sub-cell detail
+/// away on purpose. The result is darkened and painted as a full
+/// block, so what sits behind a menu reads as a dim, chunky version of
+/// itself rather than a black hole.
+///
+/// This started as a bug (a menu that forgot to clear its rect) and is
+/// deliberate now, because over album art it looks far better than a
+/// wipe: the cover is still legibly *there* behind the menu. Every
+/// cell is still written, so an overlay owns its whole rect and
+/// nothing underneath shows through unscrimmed.
+pub fn scrim(buf: &mut Buffer, area: Rect) {
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                let behind = (level_of(cell.fg) + level_of(cell.bg)) * 0.5;
+                cell.reset();
+                // nothing behind this cell, so there is nothing to
+                // show through: leave it blank. without this the
+                // menu's own padding fills with dim blocks, which is
+                // noise rather than frosted glass, and a menu opened
+                // over the banner or an empty pane looks broken.
+                if behind <= NOTHING_BEHIND {
+                    continue;
+                }
+                cell.set_char(FULL_BLOCK);
+                cell.set_fg(shade(behind * SCRIM_KEEP));
+            }
+        }
+    }
+}
+
+/// A `theme::shade` level back out of a `Color`. Luma rather than one
+/// channel, so a coloured cover scrims by how bright it reads; `Reset`
+/// is the terminal's own background, i.e. black as far as this is
+/// concerned.
+fn level_of(c: Color) -> f32 {
+    match c {
+        Color::Rgb(r, g, b) => (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0,
+        Color::Reset | Color::Black => 0.0,
+        // nothing in this app sets a named colour; treat an unknown one
+        // as mid rather than guessing it dark and losing the shape.
+        _ => 0.5,
+    }
+}
+
+/// The scrim's glyph: one solid cell, which is the point (it is what
+/// discards the sub-cell detail).
+const FULL_BLOCK: char = '\u{2588}';
+
+/// At or below this, a cell is reading as the terminal's own black and
+/// there is nothing to scrim.
+const NOTHING_BEHIND: f32 = 0.02;
 
 /// Centred by *display* width, so a wide-char title still sits in the
 /// middle rather than drifting right by its own overhang.
@@ -174,7 +236,7 @@ pub fn centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: Color) 
 mod tests {
     use super::*;
     use crate::theme::NEAR_WHITE;
-    use crate::ui::testbuf::{buffer, grid};
+    use crate::ui::testbuf::{assert_no_bleed_through, buffer, grid, plated_buffer};
 
     fn row(buf: &Buffer, y: u16, w: u16) -> String {
         (0..w)
@@ -305,5 +367,57 @@ mod tests {
         let empty = Rect::new(0, 0, 4, 0);
         line(&mut buf, empty, 0, "abc", shade(NEAR_WHITE));
         assert_eq!(row(&buf, 0, 4), "....");
+    }
+
+    /// The effect, deliberately: a quadrant cell carries two shades,
+    /// the scrim merges them into one dim full block. That merge is
+    /// what reads as softness, and the block is what reads as chunky.
+    #[test]
+    fn the_scrim_collapses_a_two_shade_cell_into_one_dim_block() {
+        let mut buf = buffer(3, 1);
+        if let Some(cell) = buf.cell_mut((1u16, 0u16)) {
+            cell.set_char('\u{2580}');
+            cell.set_fg(shade(1.0));
+            cell.set_bg(shade(0.0));
+        }
+        scrim(&mut buf, Rect::new(0, 0, 3, 1));
+
+        let cell = buf.cell((1u16, 0u16)).unwrap();
+        assert_eq!(cell.symbol(), "\u{2588}", "the sub-cell detail should go");
+        let Color::Rgb(v, _, _) = cell.fg else {
+            panic!("scrim must stay on the grey ramp: {:?}", cell.fg)
+        };
+        assert!(v > 0, "something was behind it, so it is not black");
+        assert!(
+            v < 128,
+            "and it must be darker than what it replaced, not brighter: {v}"
+        );
+    }
+
+    /// The bug the first version had: a menu over the banner or an
+    /// empty pane filled its own padding with dim blocks. Nothing
+    /// behind a cell means nothing to show through.
+    #[test]
+    fn the_scrim_leaves_a_cell_with_nothing_behind_it_blank() {
+        let mut buf = buffer(3, 1);
+        scrim(&mut buf, Rect::new(0, 0, 3, 1));
+        for x in 0..3u16 {
+            assert_eq!(
+                buf.cell((x, 0u16)).unwrap().symbol(),
+                " ",
+                "an empty cell should stay empty"
+            );
+        }
+    }
+
+    /// An overlay still owns every cell of its rect: the scrim writes
+    /// or blanks all of them, so nothing underneath survives
+    /// unscrimmed. This is what `assert_no_bleed_through` checks for
+    /// the real menus.
+    #[test]
+    fn an_overlay_still_owns_every_cell_it_covers() {
+        let mut buf = plated_buffer(10, 4);
+        overlay(&mut buf, Rect::new(0, 0, 10, 4));
+        assert_no_bleed_through(&buf, Rect::new(0, 0, 10, 4));
     }
 }
