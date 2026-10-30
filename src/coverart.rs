@@ -66,11 +66,8 @@ impl Key {
     /// are named by, and both need an answer for everything.
     pub fn of(item: &SearchItem) -> Key {
         if let SearchItem::Song { artist, album, .. } = item {
-            if !artist.trim().is_empty() && !album.trim().is_empty() {
-                return Key::Album {
-                    artist: artist.trim().to_lowercase(),
-                    album: album.trim().to_lowercase(),
-                };
+            if let Some(key) = Key::album(artist, album) {
+                return key;
             }
         }
         // no album to group under (an untagged track) or nothing
@@ -79,6 +76,25 @@ impl Key {
         // still cannot collide here.
         let (kind, id) = item.identity();
         Key::Track(format!("{kind}:{id}"))
+    }
+
+    /// An album's key from its names, or `None` when either is blank
+    /// (an untagged file needs its own slot rather than colliding with
+    /// every other untagged file).
+    ///
+    /// Public because the browse view reaches a cover by album id and
+    /// the album's own names, with no `SearchItem` in hand; routing it
+    /// through here is what puts an opened album and its played tracks
+    /// in **one** keyspace, so the two share the on-disk store instead
+    /// of each fetching the same cover.
+    pub fn album(artist: &str, album: &str) -> Option<Key> {
+        if artist.trim().is_empty() || album.trim().is_empty() {
+            return None;
+        }
+        Some(Key::Album {
+            artist: artist.trim().to_lowercase(),
+            album: album.trim().to_lowercase(),
+        })
     }
 
     /// The one canonical name for this key: the in-memory map, the
@@ -265,6 +281,21 @@ fn fetch(
         store::write(dir, key, &bytes);
     }
     Some(img)
+}
+
+/// One cover, store first and store after, for a caller outside
+/// `Cache`: the browse view opens an album synchronously on the key
+/// press and holds the image itself.
+///
+/// Uses the same store directory `Cache` does, so a cover either side
+/// fetched is the other's hit. Sweeping stays `Cache::new`'s job; this
+/// only reads and writes.
+pub fn fetch_stored(
+    client: &crate::subsonic::Client,
+    key: &Key,
+    art_id: &str,
+) -> Option<DynamicImage> {
+    fetch(client, art_id, key, store::dir().as_deref())
 }
 
 struct Fetched {
@@ -791,5 +822,45 @@ mod tests {
                 rgb_bytes(&bounded) * MAX_ENTRIES / 1_048_576,
             );
         }
+    }
+
+    /// The whole point of `Key::album`: an album opened in the browse
+    /// view and the same album's tracks played from the player must
+    /// land on one key, or each fetches the same cover separately and
+    /// neither is the other's disk hit.
+    #[test]
+    fn an_opened_album_and_its_tracks_share_one_key() {
+        let from_track = Key::of(&song("1", "Bladee", "Crest"));
+        let from_album = Key::album("Bladee", "Crest").expect("both names present");
+        assert_eq!(from_track, from_album);
+        // and therefore the same file on disk, which is the bit that
+        // actually saves the round trip.
+        assert_eq!(from_track.name(), from_album.name());
+    }
+
+    #[test]
+    fn an_album_key_normalizes_the_same_way_a_track_key_does() {
+        assert_eq!(
+            Key::album(" bladee ", "CREST"),
+            Key::album("Bladee", "Crest")
+        );
+    }
+
+    #[test]
+    fn a_blank_name_yields_no_album_key() {
+        assert!(Key::album("", "Crest").is_none());
+        assert!(Key::album("Bladee", "   ").is_none());
+    }
+
+    /// Known limit of name keying, recorded as a test so it is a
+    /// decision rather than a surprise: a compilation's tracks each
+    /// carry their own artist, so they do not share the album's key.
+    /// Fixing it needs an album-artist or an album id on `SearchItem`
+    /// (see ROADMAP's name-based-identity item).
+    #[test]
+    fn a_compilation_track_does_not_share_the_albums_key() {
+        let album = Key::album("Various Artists", "Now 42").unwrap();
+        let track = Key::of(&song("1", "Bladee", "Now 42"));
+        assert_ne!(track, album);
     }
 }
