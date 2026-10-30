@@ -330,14 +330,32 @@ fn toggle_star(
 /// the corpus's own, so the password lives exactly as long as the
 /// corpus does and is still zeroized when it drops. Parking one in a
 /// `static` would mean it never drops and never zeroizes.
+/// Drops any kept client no current profile still describes.
+///
+/// The sync thread holds clients across passes, so this is what stops
+/// a removed or edited profile from being synced through a client
+/// carrying the old credentials; dropping it is also what zeroizes
+/// that password. `Client::matches` counts the stream options, so a
+/// bitrate change is an edit too.
+fn retain_live_clients(
+    clients: &mut Vec<Arc<subsonic::Client>>,
+    servers: &[config::NavidromeConfig],
+) {
+    clients.retain(|c| servers.iter().any(|nav| c.matches(nav)));
+}
+
+/// `Result` rather than `Option` so the reason survives: `Client::new`
+/// fails on an unreadable `password_file` or a malformed url, and
+/// "connection failed" with no cause is a worse error than the one
+/// this replaced.
 fn client_for(
     nav: &config::NavidromeConfig,
     live: &[Arc<subsonic::Client>],
-) -> Option<Arc<subsonic::Client>> {
-    live.iter()
-        .find(|c| c.matches(nav))
-        .cloned()
-        .or_else(|| subsonic::Client::new(nav).ok().map(Arc::new))
+) -> anyhow::Result<Arc<subsonic::Client>> {
+    if let Some(live) = live.iter().find(|c| c.matches(nav)) {
+        return Ok(live.clone());
+    }
+    Ok(Arc::new(subsonic::Client::new(nav)?))
 }
 
 fn open_starred_view(
@@ -350,7 +368,7 @@ fn open_starred_view(
             .iter()
             .map(|nav| {
                 scope.spawn(|| {
-                    let client = client_for(nav, live)?;
+                    let client = client_for(nav, live).ok()?;
                     let songs = client.get_starred_songs().ok()?;
                     Some(browse::songs_to_items(songs, &client))
                 })
@@ -2394,7 +2412,14 @@ fn spawn_background_sync(
     thread::spawn(move || {
         let mut servers = initial_servers;
         let mut first_pass = true;
+        // kept across passes: `Client::new` re-reads `password_file`
+        // off disk and starts with a cold connection pool, and this
+        // loop runs every 45 seconds for the life of the app, so
+        // rebuilding per pass is pure waste. the sync thread cannot see
+        // the corpus's clients (different thread), so it keeps its own.
+        let mut clients: Vec<Arc<subsonic::Client>> = Vec::new();
         loop {
+            retain_live_clients(&mut clients, &servers);
             // independent per-server requests, so run them
             // concurrently rather than making every server wait for
             // the one before it.
@@ -2404,7 +2429,7 @@ fn spawn_background_sync(
                     .map(|nav| {
                         (
                             nav.url.clone(),
-                            scope.spawn(|| fetch_navidrome_everything(nav)),
+                            scope.spawn(|| fetch_navidrome_everything(nav, &clients)),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -2417,6 +2442,15 @@ fn spawn_background_sync(
                     })
                     .collect()
             });
+            // take delivery of any client this pass had to build, so
+            // the next one reuses it.
+            for r in &results {
+                if let Ok((catalog, _)) = &r.result {
+                    if !clients.iter().any(|c| Arc::ptr_eq(c, &catalog.client)) {
+                        clients.push(catalog.client.clone());
+                    }
+                }
+            }
             if first_pass && !servers.is_empty() {
                 trace::mark("navidrome: first sync landed");
                 first_pass = false;
@@ -2765,13 +2799,16 @@ fn fetched<T>(
     }
 }
 
-fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatalog, String> {
+fn fetch_navidrome_catalog(
+    nav: &config::NavidromeConfig,
+    live: &[Arc<subsonic::Client>],
+) -> Result<FetchedCatalog, String> {
     // no `ping` first: a failing fetch below says everything a ping
     // would have, and the ping was a whole extra serial round trip on
     // every pass (one per server per 45s sync, so ~80 wasted requests
     // an hour). `Client::new` can still fail on a bad config, which is
     // local and free to check.
-    let client = subsonic::Client::new(nav).map_err(|e| format!("connection failed: {e}"))?;
+    let client = client_for(nav, live).map_err(|e| format!("connection failed: {e}"))?;
     // getArtists returns everything in one call, getAlbumList2 is
     // paginated (see subsonic.rs). songs stay fetched on demand (per
     // album/playlist/artist opened) rather than indexed eagerly; a
@@ -2804,7 +2841,7 @@ fn fetch_navidrome_catalog(nav: &config::NavidromeConfig) -> Result<FetchedCatal
     // frame on. best-effort, and a no-op when nothing changed.
     let _ = cache::save_catalog(&client, &artists, &albums, &playlists);
     Ok(FetchedCatalog {
-        client: Arc::new(client),
+        client,
         artists,
         albums,
         playlists,
@@ -2833,8 +2870,11 @@ type NavidromeEverything = Result<(FetchedCatalog, Vec<String>), String>;
 /// the startup multi-server pass (see `main`) only connects once per
 /// server rather than once for the catalog and again for starred
 /// songs. Pure network I/O, safe to call from any thread.
-fn fetch_navidrome_everything(nav: &config::NavidromeConfig) -> NavidromeEverything {
-    let catalog = fetch_navidrome_catalog(nav)?;
+fn fetch_navidrome_everything(
+    nav: &config::NavidromeConfig,
+    live: &[Arc<subsonic::Client>],
+) -> NavidromeEverything {
+    let catalog = fetch_navidrome_catalog(nav, live)?;
     let starred = catalog
         .client
         .get_starred_songs()
@@ -2851,7 +2891,11 @@ fn index_navidrome_server(
     app: &mut app::App,
     nav: &config::NavidromeConfig,
 ) -> Result<String, String> {
-    let catalog = fetch_navidrome_catalog(nav)?;
+    // `&[]` on purpose: this runs when a profile is added or
+    // reconnected after an edit, where the whole point is to build a
+    // client from the credentials as they are now rather than reuse one
+    // carrying the old ones.
+    let catalog = fetch_navidrome_catalog(nav, &[])?;
     let summary = catalog.summary();
     merge_catalog_into_app(app, catalog);
     Ok(summary)
@@ -2871,7 +2915,7 @@ fn test_navidrome_connectivity(
             // pinging the client the app actually uses is a better test
             // than pinging a throwaway: it exercises the same pool and
             // the same resolved credentials.
-            .map(|nav| scope.spawn(|| client_for(nav, live).is_some_and(|c| c.ping().is_ok())))
+            .map(|nav| scope.spawn(|| client_for(nav, live).is_ok_and(|c| c.ping().is_ok())))
             .collect::<Vec<_>>()
             .into_iter()
             .map(|handle| Some(handle.join().unwrap_or(false)))
@@ -6894,6 +6938,60 @@ mod catalog_fetch_tests {
         let panicked: thread::Result<anyhow::Result<Vec<u8>>> =
             Err(Box::new("thread died") as Box<dyn std::any::Any + Send>);
         assert!(fetched(panicked, "albums").is_err());
+    }
+
+    fn nav(url: &str, user: &str) -> config::NavidromeConfig {
+        config::NavidromeConfig {
+            url: url.into(),
+            username: user.into(),
+            password: Some("pw".into()),
+            password_file: None,
+            max_bitrate_kbps: None,
+            transcode_format: None,
+        }
+    }
+
+    /// The sync thread reuses clients across passes, so an edited
+    /// profile must not keep syncing through the old one. Dropping it
+    /// here is also what zeroizes the superseded password.
+    #[test]
+    fn an_edited_profile_loses_its_kept_client() {
+        let profile = nav("https://example.invalid", "ana");
+        let mut clients = vec![Arc::new(subsonic::Client::new(&profile).unwrap())];
+        let mut servers = vec![profile];
+
+        retain_live_clients(&mut clients, &servers);
+        assert_eq!(clients.len(), 1, "an unchanged profile keeps its client");
+
+        servers[0].max_bitrate_kbps = Some(128);
+        retain_live_clients(&mut clients, &servers);
+        assert!(
+            clients.is_empty(),
+            "a changed stream option is an edit; the old client must go"
+        );
+    }
+
+    #[test]
+    fn a_removed_profile_loses_its_kept_client() {
+        let profile = nav("https://example.invalid", "ana");
+        let mut clients = vec![Arc::new(subsonic::Client::new(&profile).unwrap())];
+        retain_live_clients(&mut clients, &[]);
+        assert!(clients.is_empty());
+    }
+
+    /// Several servers configured: each keeps its own, and only the one
+    /// that went away is dropped.
+    #[test]
+    fn retaining_is_per_server_not_all_or_nothing() {
+        let a = nav("https://a.invalid", "ana");
+        let b = nav("https://b.invalid", "bob");
+        let mut clients = vec![
+            Arc::new(subsonic::Client::new(&a).unwrap()),
+            Arc::new(subsonic::Client::new(&b).unwrap()),
+        ];
+        retain_live_clients(&mut clients, std::slice::from_ref(&a));
+        assert_eq!(clients.len(), 1);
+        assert!(clients[0].matches(&a));
     }
 
     /// A server that genuinely has nothing is still a legitimate answer

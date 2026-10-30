@@ -554,13 +554,28 @@ staying `None` costs nothing in sampling.
       introduced; a test pins it.
       pinging the live client is also the better connectivity test:
       same pool, same resolved credentials, rather than a throwaway's.
-- [ ] **the 45s sync pass still builds its own `Client`.** left out of
-      the `client_for` change deliberately: `fetch_navidrome_catalog`
-      runs on a background thread and returns the client it used inside
-      `FetchedCatalog`, so handing it a live one means snapshotting the
-      corpus's clients at spawn time and deciding what happens when a
-      profile is edited mid-pass. worth doing, but it is a lifetime
-      question rather than the one-line lookup the other two were.
+- [x] **the 45s sync pass still builds its own `Client`.** done, and
+      the lifetime question answered differently than this note
+      guessed: the sync thread does **not** reach for the corpus's
+      clients (it cannot; different thread) but keeps its own across
+      passes. `Client::new` re-reads `password_file` off disk and
+      starts with a cold pool, and this loop runs every 45 seconds for
+      the life of the app, so rebuilding per pass was continuous waste.
+      `retain_live_clients` runs at the top of every pass and drops any
+      kept client no current profile still describes, which is what
+      stops an edited or removed profile from syncing through the old
+      credentials; dropping it is also what zeroizes that password.
+      extracted as a named function rather than left inline so the
+      three tests exercise the real predicate instead of a copy that
+      could drift. `Client::matches` counts the stream options, so a
+      bitrate change is an edit here too.
+      `index_navidrome_server` deliberately passes `&[]`: it runs when
+      a profile is added or reconnected after an edit, where building
+      from the credentials as they are now is the whole point.
+      also fixed on the way through: routing the catalog fetch via
+      `client_for` had reduced "connection failed: {e}" to a bare
+      "connection failed", losing an unreadable `password_file` or a
+      malformed url as the cause, so `client_for` returns `Result`.
 - [ ] **`Corpus::remote_clients` is an O(corpus) scan.** it walks every
       item and dedupes by url, so it is a full 40k-item pass to answer
       "which servers are live". fine where it is called now (a keypress:
