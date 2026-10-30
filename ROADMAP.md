@@ -476,126 +476,37 @@ accident.
 
 ## in flight
 
-**all five perf branches are MERGED into master as of 2026-10-28**
-(`perf/search`, `perf/startup`, `perf/mpv`, `perf/art`, `perf/shell`),
-each verified after its own merge: clippy `-D warnings` clean, full
-test suite green, fmt clean. 741 tests now pass. their measurements and
-findings are recorded in the sections below and in `docs/`
-(`search-performance.md`, `startup-cache.md`, `raster.md`,
-`architecture.md`).
+**nothing is in flight. all six branches are merged into master as of
+2026-10-30** (`perf/search`, `perf/startup`, `perf/mpv`, `perf/art`,
+`perf/shell`, then `feat/mouse`), each verified after its own merge:
+clippy `-D warnings` clean, full suite green, fmt clean. 824 tests.
 
-one real collision, worth knowing about if agents are ever fanned out
-this way again: **`perf/search` and `perf/shell` independently
-optimized `Corpus::search`** and restructured the same function, so six
-conflicts landed in `search.rs`. resolved toward `perf/search`'s
-machinery, because it carries an oracle test that keeps the
-pre-optimization scorer verbatim and compares item-by-item over 38
-query shapes; shell's one non-overlapping piece (`search_names`, which
-completion calls per keystroke to avoid cloning a `SearchItem` per
-match) was re-implemented on top, with `rank` now being
-`rank_borrowed` plus the clone so the two entry points cannot rank
-differently.
+`feat/mouse` merged with zero conflicts, because the branch had already
+merged master into itself twice; git had everything it needed. a clean
+textual merge proves nothing semantically, so the integration points
+were spot-checked by hand afterwards: the quadrant rasterizer,
+`SAMPLES_X`, the `auto` art-mode detect, `sharpen_amount`,
+`split_exclusions` and `retain_live_clients` all survived alongside
+`src/hit.rs`, `EnableMouseCapture`, the help overlay's new mouse
+section and `config.mouse`.
 
-also reconciled at merge, as `perf/mpv` predicted: `sample_luma` is
-gone entirely and both art paths go through `perf/art`'s O(output)
-rasterizer (`with_memo` for static covers, `with_scratch` for anything
-changing per frame), so mpv's warning about ~2.07M `get_pixel` calls
-per frame on the render thread is moot and `VIDEO_FRAME_MAX_EDGE`
-staying `None` costs nothing in sampling.
+the merge-order worry recorded here before (mouse rewrote the `main.rs`
+regions the perf branches patched) never materialised, precisely
+because the branch kept merging master rather than diverging. that is
+the lesson worth keeping: a long-lived branch that merges down
+regularly costs nothing to land.
 
-- `feat/mouse` + `wim-wt-mouse` (12 commits, NOT merged, held
-  deliberately). all four gates pass on its tip and it adds click to
-  focus, click to press, wheel to move the selection and drag to
-  scrub. **held because no human has ever clicked it**: under a bare
-  pty the ratatui-image graphics probe goes unanswered and then eats
-  stdin, so raw-mode input cannot be exercised headlessly here. the
-  hit resolution is well covered as pure functions, which is not the
-  same as working. merge after one manual pass. note it rewrote the
-  `main.rs` regions the merged perf branches patched, so expect
-  conflicts there now and resolve toward mouse's structure with the
-  perf call sites re-applied.
-
-### album art, real vs ascii (maintainer report, 2026-10-30)
-
-- [x] **`album_art = "auto"` never showed real art.** the default
-      config's own mode. `wants_real_art` excluded `Auto` and
-      `art_mode_for_picker` only returned `Real` for a *named* protocol,
-      so "auto" effectively meant "start in ascii and press `i`", which
-      is not what the word means and left the default config on the
-      rasterizer even where the terminal fully supported sixel/kitty.
-      `auto` is a detect now: real when the probe answered with a
-      protocol, ascii when it did not. `blocks` is unchanged and is the
-      way to ask for the monochrome rasterizer deliberately.
-- [x] **`i` into real mode on a terminal with no graphics protocol was
-      a silent blank.** the widgets draw ascii only in `ArtMode::Ascii`
-      and main.rs overlays the image in `Real`, so with no `Picker`
-      real mode is an *empty pane*, not a fallback. the existing
-      "no graphics protocol" alert only fired when the **config** named
-      a protocol, so cycling with `i` got no explanation at all. `i`
-      now skips a real mode the terminal cannot render and says why
-      once.
-- [x] **the ascii rasterizer was blurry, wanted pixel art.** it was a
-      blur by construction, not by accident: mapping a 600px cover onto
-      a 40-cell pane box-averages ~15 source pixels per sample, which
-      is a correct downscale and therefore soft. an unsharp mask now
-      runs over the **output** grid (cheaper than touching the source,
-      and the right place: the grid is the final resolution, so an edge
-      either lands on a sample boundary or it does not). four-neighbour
-      cross, since diagonals change nothing visible at this size for
-      twice the reads.
-      **the dial is `SHARPEN` in `src/ui/raster.rs`**, currently 1.0;
-      0.0 is the old box downscale, past ~2.0 edges start ringing. one
-      line, tune to taste.
-      uniform input is a fixed point (every neighbour equals the
-      centre, so the correction is zero), which is what keeps this
-      pixelated rather than noisy; that is pinned as a test along with
-      edge-steepening, clamping instead of wrapping, and degenerate
-      1-wide/1-tall grids. costs nothing measurable: render of a 640px
-      cover onto 40x20 is 69.8us total.
-
-- [x] **quadrant blocks: 2x2 subcells instead of the half block.** the
-      real fix for "not particularly sharp", because the limit was
-      never the filter: a 40x20 pane under half-blocks is 40x40 samples
-      for a whole cover, and no amount of unsharp invents detail that
-      was never sampled. `QUADRANTS` is the sixteen 2x2 block glyphs
-      (U+2580..U+259F, the same Unicode block as the half block, so any
-      font that drew the old output draws this), chosen per cell by
-      splitting its four samples at the midpoint of **its own** range,
-      so a cell spanning 90..110 still shows structure where a global
-      threshold would flatten it. a uniform cell draws a solid block
-      rather than a half block carrying one shade twice.
-      **the aspect bug this surfaced:** `place` assumed one sample per
-      cell *width*. with two, the physical width halved and the
-      letterbox bars came out wrong; `SAMPLES_X`/`SAMPLES_Y` now name
-      the relationship so it cannot be got wrong silently again.
-      cost: render of a 640px cover onto 40x20 went 69.8us to 141.5us
-      for 4x the samples, and 991us at 120x60. still nothing.
-      **known consequence, worth the maintainer's judgement:** samples
-      are now anisotropic. a half-block sample was one cell wide by
-      half tall, which is *square* at cell_aspect 2; a quadrant is half
-      by half, so 1:2, twice as tall as wide. horizontal detail
-      doubles, vertical does not, and the "pixels" are tall rectangles.
-      the balanced answer is **octants** (2x4, square at aspect 2,
-      double on both axes), but those are Unicode 16 "Symbols for
-      Legacy Computing Supplement" with thin font coverage, where
-      quadrants are universally available. sextants (2x3, Unicode 13)
-      sit in between. worth revisiting if the font in use has octants.
-- [x] **resolution-adaptive sharpening.** the maintainer's idea, and
-      right in direction: lower resolution reads softer because each
-      sample straddles more of the image. `sharpen_amount` scales
-      inversely with grid span from `SHARPEN_REF` at
-      `SHARPEN_REF_SPAN`, clamped to `SHARPEN_MIN..SHARPEN_MAX`.
-      inverse rather than exponential, and clamped at the top, because
-      past roughly 2.2 an unsharp mask stops adding definition and
-      starts drawing a bright rim along the dark side of every edge.
-
-- [ ] **alacritty cannot do real art at all.** not a wim bug, recorded
-      so it stops being rediscovered: alacritty (0.17 here) implements
-      no inline-graphics protocol, so the probe correctly reports none
-      and ascii is the only honest output. `foot` is installed on this
-      machine and does support sixel, which is the way to actually see
-      the real-art path. worth a line in the readme next to the
-      `album_art` setting.
+- [ ] **nobody has driven a real click yet.** the maintainer tried, but
+      was running **master**, which had no `src/hit.rs` and no
+      `EnableMouseCapture` at all, so the terminal was never put into
+      mouse-reporting mode and the clicks went to alacritty as text
+      selection. all three symptoms they reported ("clicking a song
+      does not get me to it", "clicking the sidebar does not focus it",
+      "nor does it click what i wanted") were the feature being absent
+      from the build, not bugs. holding the branch for a click-through
+      that could not happen without merging it was a deadlock; merged
+      now. **the click-through is still owed**, and raw-mode input
+      cannot be exercised headlessly here, so it has to be a human.
 
 ### found by the agents, not yet fixed (all in files they own)
 
