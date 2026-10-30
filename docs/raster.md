@@ -12,10 +12,31 @@ background the bottom. so a `w x h` cell rect samples a `w x 2h` grid
 and gets twice the vertical resolution a full block would give for the
 same cells.
 
-every colour is `theme::shade(level)`. the module memoizes `shade` over
-its 256 possible inputs (`shades()`) rather than calling it twice per
-cell, so a 400x200 grid does not pay 160000 float conversions; the
-palette is still entirely `shade`'s.
+## tone
+
+under `Tone::Mono` every colour is `theme::shade(level)`. the module
+memoizes `shade` over its 256 possible inputs (`shades()`) rather than
+calling it twice per cell, so a 400x200 grid does not pay 160000 float
+conversions; the palette is still entirely `shade`'s.
+
+under `Tone::Color` (the album-art `ascii-color` mode, the one
+sanctioned exception to the monochrome rule) the fill loop accumulates
+three channels into a parallel rgb grid and `paint` emits each cell's
+two groups as rgb instead. the glyph is unchanged: it still comes from
+the luma grid, and the colours are grouped by the same mask, so colour
+costs none of the 2x horizontal resolution and the glyph and the two
+colours always describe one split. luma in colour mode is derived from
+the averaged rgb rather than accumulated beside it; `rgb_luma` is linear
+in the channels, so it is the same number the mono path computes and the
+two grids cannot disagree.
+
+the sharpen pass stays luma-only in colour mode too: luma is what picks
+the glyph, so sharpening it steepens the structure, while leaving rgb
+the plain box average keeps hues off the unsharp mask's halos.
+
+a mono rasterization allocates no rgb grid at all, and a grey source
+asked for in colour fills it with the grey rather than walking the
+three-channel path for three times the reads.
 
 ## fit
 
@@ -23,8 +44,11 @@ palette is still entirely `shade`'s.
   physical shape disagrees with it.
 - `Fit::Contain` keeps the image's aspect against the rect's *physical*
   shape (a cell is `cell_aspect` times taller than wide, see
-  `main::cell_aspect`), centres it, and leaves the rest at luma 0, i.e.
-  a black bar.
+  `main::cell_aspect`), centres it, and leaves the rest at luma 0 (and
+  rgb `[0, 0, 0]`), i.e. a black bar.
+
+`Fit` and `Tone` travel together as a `Style`, so `Memo::render` stays
+inside clippy's argument limit and the memo invalidates on either.
 
 album art and the video pane both use `Contain`. for album art this is
 usually a no-op: `browse::layout` and `ui::player::layout` already size
