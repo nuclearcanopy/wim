@@ -437,16 +437,24 @@ fn wants_real_art(mode: config::AlbumArtMode) -> bool {
     )
 }
 
-/// `Auto`/`Blocks` both start in ascii (the strictly-monochrome
-/// default); a named protocol starts in real-image mode, but only once
-/// the terminal has actually answered the graphics probe (see the
-/// `picker_rx` drain). Real mode with no `Picker` renders no art at
-/// all, so claiming it before the answer is in would mean an empty
-/// pane rather than the ascii fallback. `i` still cycles through all
-/// three regardless of where it started.
+/// Which art mode to start in, once the graphics probe has answered.
+///
+/// `auto` means *detect*: real art when the terminal actually answered
+/// the probe with a protocol, ascii when it did not. It used to mean
+/// "start in ascii and press `i`", which is not what anyone reads
+/// "auto" as; the practical effect was that the default config never
+/// showed real art on a terminal that fully supported it.
+///
+/// `blocks` is the explicit ask for the monochrome half-block
+/// rasterizer, so it stays ascii whatever the terminal can do. A named
+/// protocol still waits for the probe: real mode with no `Picker`
+/// renders nothing at all, so claiming it early would mean an empty
+/// pane rather than the ascii fallback. `i` cycles regardless.
 fn art_mode_for_picker(mode: config::AlbumArtMode, protocol_detected: bool) -> browse::ArtMode {
     match mode {
         config::AlbumArtMode::Off => browse::ArtMode::Off,
+        config::AlbumArtMode::Blocks => browse::ArtMode::Ascii,
+        config::AlbumArtMode::Auto if protocol_detected => browse::ArtMode::Real,
         _ if wants_real_art(mode) && protocol_detected => browse::ArtMode::Real,
         _ => browse::ArtMode::Ascii,
     }
@@ -3267,6 +3275,9 @@ fn main() -> anyhow::Result<()> {
     // cycled by hand.
     let art_mode_pending = art_mode_for_picker(cfg.album_art, false);
     let mut art_mode = art_mode_pending;
+    // one alert, not one per keypress, when `i` reaches a real mode
+    // the terminal cannot render.
+    let mut warned_no_graphics = false;
     // latest captured frame while playing a local video, rendered
     // through the same ascii pipeline as album art instead of mpv
     // opening its own window; `None` whenever nothing video is
@@ -5889,7 +5900,25 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if key.code == keymap.get(KeyAction::CycleArtMode) {
-                    art_mode = art_mode.toggle();
+                    let next = art_mode.toggle();
+                    // real art is drawn by overlaying an image on the
+                    // rect the widget left empty, so with no graphics
+                    // protocol it is not "ascii anyway", it is a blank
+                    // pane. skip the mode this terminal cannot do, and
+                    // say why the first time rather than letting `i`
+                    // look broken.
+                    art_mode = if next == browse::ArtMode::Real && picker.is_none() {
+                        if !warned_no_graphics {
+                            warned_no_graphics = true;
+                            notifications.push(
+                                Severity::Alert,
+                                "album art: this terminal reports no graphics protocol (sixel/kitty/iterm2), so real art is unavailable here",
+                            );
+                        }
+                        next.toggle()
+                    } else {
+                        next
+                    };
                     continue;
                 }
 
@@ -6877,17 +6906,38 @@ mod startup_tests {
         );
     }
 
+    /// `auto` is a detect, not a synonym for ascii. It used to return
+    /// ascii either way, which meant the default config never showed
+    /// real art even on a terminal that fully supported it.
     #[test]
-    fn auto_and_blocks_stay_ascii_whatever_the_probe_says() {
+    fn auto_follows_the_probe() {
+        assert_eq!(
+            art_mode_for_picker(config::AlbumArtMode::Auto, true),
+            browse::ArtMode::Real,
+            "a terminal that answered the probe should get real art on auto"
+        );
+        assert_eq!(
+            art_mode_for_picker(config::AlbumArtMode::Auto, false),
+            browse::ArtMode::Ascii,
+            "no protocol means ascii, since real mode would draw nothing"
+        );
+    }
+
+    /// `blocks` is the explicit ask for the monochrome rasterizer, so
+    /// it is the one mode a capable terminal must not override.
+    #[test]
+    fn blocks_stays_ascii_even_when_the_terminal_can_do_better() {
         for detected in [true, false] {
-            assert_eq!(
-                art_mode_for_picker(config::AlbumArtMode::Auto, detected),
-                browse::ArtMode::Ascii
-            );
             assert_eq!(
                 art_mode_for_picker(config::AlbumArtMode::Blocks, detected),
                 browse::ArtMode::Ascii
             );
+        }
+    }
+
+    #[test]
+    fn off_stays_off_whatever_the_probe_says() {
+        for detected in [true, false] {
             assert_eq!(
                 art_mode_for_picker(config::AlbumArtMode::Off, detected),
                 browse::ArtMode::Off

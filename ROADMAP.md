@@ -481,6 +481,33 @@ staying `None` costs nothing in sampling.
   conflicts there now and resolve toward mouse's structure with the
   perf call sites re-applied.
 
+### album art, real vs ascii (maintainer report, 2026-10-30)
+
+- [x] **`album_art = "auto"` never showed real art.** the default
+      config's own mode. `wants_real_art` excluded `Auto` and
+      `art_mode_for_picker` only returned `Real` for a *named* protocol,
+      so "auto" effectively meant "start in ascii and press `i`", which
+      is not what the word means and left the default config on the
+      rasterizer even where the terminal fully supported sixel/kitty.
+      `auto` is a detect now: real when the probe answered with a
+      protocol, ascii when it did not. `blocks` is unchanged and is the
+      way to ask for the monochrome rasterizer deliberately.
+- [x] **`i` into real mode on a terminal with no graphics protocol was
+      a silent blank.** the widgets draw ascii only in `ArtMode::Ascii`
+      and main.rs overlays the image in `Real`, so with no `Picker`
+      real mode is an *empty pane*, not a fallback. the existing
+      "no graphics protocol" alert only fired when the **config** named
+      a protocol, so cycling with `i` got no explanation at all. `i`
+      now skips a real mode the terminal cannot render and says why
+      once.
+- [ ] **alacritty cannot do real art at all.** not a wim bug, recorded
+      so it stops being rediscovered: alacritty (0.17 here) implements
+      no inline-graphics protocol, so the probe correctly reports none
+      and ascii is the only honest output. `foot` is installed on this
+      machine and does support sixel, which is the way to actually see
+      the real-art path. worth a line in the readme next to the
+      `album_art` setting.
+
 ### found by the agents, not yet fixed (all in files they own)
 
 - [ ] **nobody has clicked the mouse support.** see `feat/mouse` above;
