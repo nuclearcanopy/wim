@@ -32,6 +32,20 @@ pub const HALF_BLOCK: char = '▀';
 /// the box average over the sample's source span is exact.
 const MAX_TAPS: u32 = 4;
 
+/// How hard the sharpen pass pulls each output sample away from its
+/// neighbours. **This is the dial**: 0.0 is the plain box downscale,
+/// 1.0 reads as pixel art, past ~2.0 edges start ringing (a bright rim
+/// on the dark side of a boundary).
+///
+/// Why it is needed at all: mapping a 600px cover onto a 40-cell pane
+/// averages ~15 source pixels per sample. That is a correct box
+/// filter, and a box filter is a blur; the art looked soft because it
+/// genuinely was. Sharpening the *output* grid rather than the source
+/// is both cheaper and the right place, since the grid is the final
+/// resolution and an edge either lands on a sample boundary or does
+/// not.
+const SHARPEN: f32 = 1.0;
+
 /// How the image is mapped onto the cell rect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fit {
@@ -121,6 +135,10 @@ pub struct Raster {
     /// One output row's running sums, so the source is walked row by
     /// row instead of re-entered per output sample.
     acc: Vec<u32>,
+    /// The pre-sharpen grid, so the pass reads neighbours that have
+    /// not already been rewritten. Reused, like every other buffer
+    /// here, so a frame still allocates nothing.
+    flat: Vec<u8>,
 }
 
 impl Raster {
@@ -141,7 +159,10 @@ impl Raster {
             return;
         }
         match Pixels::of(img) {
-            Some(px) => self.fill(&px, cell_aspect, fit),
+            Some(px) => {
+                self.fill(&px, cell_aspect, fit);
+                self.sharpen_with(SHARPEN);
+            }
             None => {
                 // not 8 bits per channel (a 16-bit or float png).
                 // converted whole once here, which does allocate,
@@ -153,7 +174,49 @@ impl Raster {
                 let (w, h) = lum.dimensions();
                 if let Some(px) = Pixels::new(lum.as_raw(), w, h, 1, true) {
                     self.fill(&px, cell_aspect, fit);
+                    self.sharpen_with(SHARPEN);
                 }
+            }
+        }
+    }
+
+    /// Unsharp mask over the sampled grid, in place.
+    ///
+    /// A four-neighbour cross rather than a full 3x3: at this
+    /// resolution the diagonals change nothing anyone can see, for
+    /// twice the reads. Edge samples clamp to themselves, so the
+    /// border neither wraps nor darkens.
+    ///
+    /// Uniform input is a fixed point: every neighbour equals the
+    /// centre, so the correction is zero and flat areas stay flat.
+    /// That is what keeps this "pixelated" rather than "noisy".
+    fn sharpen_with(&mut self, amount: f32) {
+        if amount <= 0.0 {
+            return;
+        }
+        let w = self.cols as usize;
+        let h = self.rows as usize * 2;
+        // a 1-wide or 1-tall grid has no neighbourhood worth the name.
+        if w < 3 || h < 3 || self.luma.len() < w * h {
+            return;
+        }
+        let Self { luma, flat, .. } = self;
+        flat.clear();
+        flat.extend_from_slice(luma);
+        for y in 0..h {
+            let ym = y.saturating_sub(1) * w;
+            let yp = (y + 1).min(h - 1) * w;
+            let row = y * w;
+            for x in 0..w {
+                let xm = x.saturating_sub(1);
+                let xp = (x + 1).min(w - 1);
+                let around = (flat[row + xm] as f32
+                    + flat[row + xp] as f32
+                    + flat[ym + x] as f32
+                    + flat[yp + x] as f32)
+                    * 0.25;
+                let c = flat[row + x] as f32;
+                luma[row + x] = (c + amount * (c - around)).clamp(0.0, 255.0) as u8;
             }
         }
     }
@@ -167,6 +230,7 @@ impl Raster {
             rows,
             xs,
             acc,
+            ..
         } = self;
         let grid_w = *cols as u32;
         let grid_h = *rows as u32 * 2;
@@ -1042,5 +1106,83 @@ mod tests {
             });
             println!("legacy {name}: {each:?}");
         }
+    }
+
+    /// A grid set up by hand, so the sharpen pass can be tested on
+    /// known input rather than through a resample.
+    fn grid_raster(cols: u16, rows: u16, luma: Vec<u8>) -> Raster {
+        let mut r = Raster::new();
+        r.cols = cols;
+        r.rows = rows;
+        assert_eq!(luma.len(), cols as usize * rows as usize * 2);
+        r.luma = luma;
+        r
+    }
+
+    /// The invariant that makes this "pixelated" and not "noisy":
+    /// uniform input is a fixed point, so flat areas of a cover stay
+    /// flat however hard the dial is turned.
+    #[test]
+    fn sharpening_leaves_a_flat_image_alone() {
+        let mut r = grid_raster(4, 2, vec![128; 16]);
+        r.sharpen_with(2.5);
+        assert_eq!(r.luma, vec![128; 16], "a flat field must not gain texture");
+    }
+
+    /// The point of the pass: an edge comes out steeper than the box
+    /// average left it.
+    #[test]
+    fn sharpening_steepens_an_edge() {
+        // 4 wide, 4 sub-rows; left half dark, right half bright.
+        let row = [60u8, 60, 200, 200];
+        let flat: Vec<u8> = row.iter().cycle().copied().take(16).collect();
+        let before = (flat[2] as i32 - flat[1] as i32).abs();
+
+        let mut r = grid_raster(4, 2, flat);
+        r.sharpen_with(1.0);
+        let after = (r.luma[2] as i32 - r.luma[1] as i32).abs();
+
+        assert!(
+            after > before,
+            "edge contrast should rise: {before} -> {after}"
+        );
+        assert!(r.luma[1] < 60, "the dark side should darken");
+        assert!(r.luma[2] > 200, "the bright side should brighten");
+    }
+
+    #[test]
+    fn a_zero_amount_is_exactly_the_box_downscale() {
+        let flat: Vec<u8> = (0..16).map(|i| i * 16).collect();
+        let mut r = grid_raster(4, 2, flat.clone());
+        r.sharpen_with(0.0);
+        assert_eq!(r.luma, flat);
+    }
+
+    /// Extreme neighbours push the correction past the byte range;
+    /// that has to clamp rather than wrap a dark sample to white.
+    #[test]
+    fn sharpening_clamps_instead_of_wrapping() {
+        let mut luma = vec![0u8; 16];
+        luma[5] = 255;
+        let mut r = grid_raster(4, 2, luma);
+        r.sharpen_with(3.0);
+        // nothing to assert beyond "it is still a byte and did not
+        // invert": a wrap would have turned the 0s next to the spike
+        // into near-white.
+        assert_eq!(r.luma[4], 0, "a dark sample must not wrap to bright");
+        assert_eq!(r.luma[5], 255);
+    }
+
+    /// A one-column or one-row grid has no neighbourhood, and the
+    /// index arithmetic would read out of the grid if it tried.
+    #[test]
+    fn a_degenerate_grid_is_left_alone_rather_than_panicking() {
+        let mut thin = grid_raster(1, 2, vec![10, 200, 30, 40]);
+        thin.sharpen_with(1.0);
+        assert_eq!(thin.luma, vec![10, 200, 30, 40]);
+
+        let mut short = grid_raster(4, 1, vec![10, 20, 30, 40, 50, 60, 70, 80]);
+        short.sharpen_with(1.0);
+        assert_eq!(short.luma, vec![10, 20, 30, 40, 50, 60, 70, 80]);
     }
 }
