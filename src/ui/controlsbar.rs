@@ -1149,6 +1149,103 @@ mod tests {
         }
     }
 
+    /// The seam the host sits on: the layout it records fed to the
+    /// resolver that reads it, clicked on the cell each glyph was
+    /// actually painted on. Both halves are tested on their own; this
+    /// is the only place they meet, and it is what "clicking a control
+    /// presses that control" means.
+    #[test]
+    fn clicking_the_cell_a_control_was_painted_on_presses_that_control() {
+        use crate::hit::{act, Act, Click, Control, HitMap, Kind, Transport};
+
+        for width_cells in [20u16, 40, 60, 100, 160] {
+            let (buf, layout) = bar_and_layout(width_cells, 2, |cb| {
+                cb.queue_len = 3;
+                cb.loop_mode = LoopMode::One;
+                cb.shuffle_on = true;
+                cb.speed = 1.25;
+                cb.eq_active = true;
+                cb.crossfade_on = true;
+            });
+            let m = HitMap {
+                bottom: Some(Rect::new(0, 0, width_cells, 2)),
+                controls: layout
+                    .controls
+                    .iter()
+                    .map(|(field, rect)| Control {
+                        transport: Transport::Bar,
+                        field: *field,
+                        rect: *rect,
+                    })
+                    .collect(),
+                tracks: layout
+                    .track
+                    .map(|t| (Transport::Bar, t))
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let click = |col| {
+                act(
+                    &m,
+                    Click {
+                        kind: Kind::Down,
+                        col,
+                        row: 1,
+                    },
+                    None,
+                )
+            };
+
+            let mut pressed = 0;
+            for (field, glyph) in [
+                (Field::Pause, GLYPH_PLAY.to_string()),
+                (Field::Loop, GLYPH_LOOP.to_string()),
+                (Field::Shuffle, GLYPH_SHUFFLE.to_string()),
+                (Field::Speed, GLYPH_SPEED.to_string()),
+                (Field::Eq, GLYPH_EQ.to_string()),
+                (Field::Crossfade, GLYPH_CROSSFADE.to_string()),
+            ] {
+                // dropped at this width, so there is nothing drawn to
+                // click; the layout test either side covers that.
+                if !layout.controls.iter().any(|(f, _)| *f == field) {
+                    continue;
+                }
+                let ch = glyph.chars().next().expect("a glyph has a first char");
+                let col = col_of(&buf, 1, ch);
+                assert_eq!(
+                    click(col),
+                    Act::Press(Transport::Bar, field, None),
+                    "{field:?} is drawn at column {col} of a {width_cells}-cell bar"
+                );
+                pressed += 1;
+            }
+            assert!(pressed > 0, "a {width_cells}-cell bar drew no control");
+
+            // every cell of the track, both ways: the fraction a click
+            // resolves to has to put the head back on the cell that
+            // was clicked, or the seek lands off the pointer.
+            if let Some(t) = layout.track {
+                for x in t.x..t.x + t.width {
+                    let frac = match click(x) {
+                        Act::Press(Transport::Bar, Field::Progress, Some(frac)) => frac,
+                        other => panic!("column {x} of the track gave {other:?}"),
+                    };
+                    let head = track(frac, t.width as usize, false)
+                        .chars()
+                        .position(|c| c == TRACK_HEAD)
+                        .expect("the track carries a head");
+                    assert_eq!(
+                        head as u16,
+                        x - t.x,
+                        "track cell {} came back as {frac}",
+                        x - t.x
+                    );
+                }
+            }
+        }
+    }
+
     /// A one-row bar puts the controls on the only row there is, and a
     /// resize hint pushes them down; the layout has to follow.
     /// A one-row bar puts the controls on the only row there is, and a
