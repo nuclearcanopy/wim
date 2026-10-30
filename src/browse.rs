@@ -11,29 +11,108 @@ use ratatui::layout::Rect;
 
 use crate::search::SearchItem;
 use crate::subsonic::Client;
+use crate::ui::raster::Tone;
 use crate::ui::textfit;
 
-/// Ascii is the "pure-TUI purity" default: a grayscale block
-/// rasterization that stays strictly monochrome and needs nothing
-/// from the terminal. Real asks `ratatui-image` to use whatever
-/// graphics protocol the terminal actually supports (sixel/kitty/
-/// iterm2), falling back to colored halfblocks if none is detected;
-/// that fallback is explicitly not monochrome, which is the tradeoff
-/// of asking for real images at all. Off skips the art panel
-/// entirely, giving the track list the full width instead.
+/// What the art panel actually shows, named after what the user gets
+/// rather than which library draws it. Two axes crossed:
+///
+/// - `Ascii*` is wim's own rasterizer (`ui::raster`): block glyphs,
+///   nothing needed from the terminal, and twice the horizontal detail
+///   a half-block renderer carries.
+/// - `Full*` is a real inline graphics protocol (sixel/kitty/iterm2)
+///   through `ratatui-image`, overlaid by the host on the rect the
+///   widget leaves empty. Unavailable terminals never reach these; see
+///   `main::has_real_protocol`.
+/// - `*Bw` is greyscale, `*Color` the source's own colour.
+///
+/// `Off` skips the panel entirely, giving the track list the full
+/// width. Colour in the two `*Color` modes is the one sanctioned
+/// exception to the monochrome rule (see ROADMAP.md); nothing else on
+/// screen may carry a hue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtMode {
-    Ascii,
-    Real,
+    AsciiBw,
+    AsciiColor,
+    FullBw,
+    FullColor,
     Off,
 }
 
 impl ArtMode {
-    pub fn toggle(self) -> Self {
+    /// Drawn by wim's own rasterizer, i.e. the widget paints the panel
+    /// itself instead of leaving the rect to the host's image overlay.
+    pub fn is_ascii(self) -> bool {
+        matches!(self, ArtMode::AsciiBw | ArtMode::AsciiColor)
+    }
+
+    /// Needs a real graphics protocol, so the widget draws nothing in
+    /// the art rect and the host overlays an image there.
+    pub fn is_full(self) -> bool {
+        matches!(self, ArtMode::FullBw | ArtMode::FullColor)
+    }
+
+    /// Greyscale: the `bw` half of each pair. For a `Full*` mode this
+    /// is what the host converts the image by before encoding it.
+    pub fn is_bw(self) -> bool {
+        matches!(self, ArtMode::AsciiBw | ArtMode::FullBw)
+    }
+
+    pub fn tone(self) -> Tone {
+        if self == ArtMode::AsciiColor {
+            Tone::Color
+        } else {
+            Tone::Mono
+        }
+    }
+
+    /// What a `Full*` mode degrades to where no graphics protocol
+    /// exists: the matching ascii mode, so asking for colour still
+    /// gets colour and asking for grey still gets grey.
+    pub fn without_graphics(self) -> Self {
         match self {
-            ArtMode::Ascii => ArtMode::Real,
-            ArtMode::Real => ArtMode::Off,
-            ArtMode::Off => ArtMode::Ascii,
+            ArtMode::FullBw => ArtMode::AsciiBw,
+            ArtMode::FullColor => ArtMode::AsciiColor,
+            other => other,
+        }
+    }
+
+    /// The next mode in the cycle `i` walks, ignoring what the
+    /// terminal can actually render.
+    pub fn next(self) -> Self {
+        match self {
+            ArtMode::AsciiBw => ArtMode::AsciiColor,
+            ArtMode::AsciiColor => ArtMode::FullBw,
+            ArtMode::FullBw => ArtMode::FullColor,
+            ArtMode::FullColor => ArtMode::Off,
+            ArtMode::Off => ArtMode::AsciiBw,
+        }
+    }
+
+    /// `next`, but stepping straight past the `Full*` modes when the
+    /// terminal has no graphics protocol: a full mode there is a blank
+    /// pane, not "ascii anyway", so cycling into one looks broken. The
+    /// flag says one was skipped, which is what the host says out loud
+    /// once. `Off` stays reachable either way.
+    pub fn cycle(self, real_graphics: bool) -> (Self, bool) {
+        let mut next = self.next();
+        let mut skipped = false;
+        while next.is_full() && !real_graphics {
+            next = next.next();
+            skipped = true;
+        }
+        (next, skipped)
+    }
+
+    /// How the mode is named on screen (the settings menu) and in
+    /// config.toml, hyphen for hyphen.
+    pub fn label(self) -> &'static str {
+        match self {
+            ArtMode::AsciiBw => "ascii-bw",
+            ArtMode::AsciiColor => "ascii-color",
+            ArtMode::FullBw => "full-bw",
+            ArtMode::FullColor => "full-color",
+            ArtMode::Off => "off",
         }
     }
 }
@@ -490,6 +569,76 @@ pub(crate) mod tests {
                 textfit::width(line) <= 8,
                 "line wider than the pane: {line:?}"
             );
+        }
+    }
+
+    /// The four modes plus off, in order, and back to the start.
+    #[test]
+    fn the_cycle_visits_all_four_modes_and_off() {
+        let mut seen = vec![ArtMode::AsciiBw];
+        let mut m = ArtMode::AsciiBw;
+        for _ in 0..5 {
+            let (next, skipped) = m.cycle(true);
+            assert!(!skipped, "nothing to skip on a terminal with a protocol");
+            m = next;
+            seen.push(m);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ArtMode::AsciiBw,
+                ArtMode::AsciiColor,
+                ArtMode::FullBw,
+                ArtMode::FullColor,
+                ArtMode::Off,
+                ArtMode::AsciiBw,
+            ]
+        );
+    }
+
+    /// With no graphics protocol the cycle is ascii-bw, ascii-color,
+    /// off: never a full mode (which would draw nothing at all), and
+    /// `off` still reachable.
+    #[test]
+    fn the_cycle_skips_the_full_modes_with_no_graphics_protocol() {
+        let (after_color, skipped) = ArtMode::AsciiColor.cycle(false);
+        assert_eq!(after_color, ArtMode::Off);
+        assert!(skipped, "the host has to be able to say why");
+
+        let mut m = ArtMode::AsciiBw;
+        for _ in 0..9 {
+            m = m.cycle(false).0;
+            assert!(!m.is_full(), "cycled into an unrenderable mode: {m:?}");
+        }
+        assert!(
+            ArtMode::AsciiBw.cycle(false).0 == ArtMode::AsciiColor
+                && !ArtMode::AsciiBw.cycle(false).1
+        );
+    }
+
+    /// A full mode that cannot render falls back to the *matching*
+    /// ascii mode, so bw stays bw and colour stays colour.
+    #[test]
+    fn a_full_mode_degrades_to_its_own_ascii_half() {
+        assert_eq!(ArtMode::FullBw.without_graphics(), ArtMode::AsciiBw);
+        assert_eq!(ArtMode::FullColor.without_graphics(), ArtMode::AsciiColor);
+        for m in [ArtMode::AsciiBw, ArtMode::AsciiColor, ArtMode::Off] {
+            assert_eq!(m.without_graphics(), m, "{m:?} needs no fallback");
+        }
+    }
+
+    /// Only `ascii-color` rasterizes in colour; `full-color` is the
+    /// graphics protocol's own true colour, not the rasterizer's.
+    #[test]
+    fn only_ascii_color_asks_the_rasterizer_for_colour() {
+        assert_eq!(ArtMode::AsciiColor.tone(), Tone::Color);
+        for m in [
+            ArtMode::AsciiBw,
+            ArtMode::FullBw,
+            ArtMode::FullColor,
+            ArtMode::Off,
+        ] {
+            assert_eq!(m.tone(), Tone::Mono, "{m:?} must not tint the rasterizer");
         }
     }
 
