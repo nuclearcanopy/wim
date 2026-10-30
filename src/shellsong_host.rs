@@ -24,6 +24,9 @@ pub struct CorpusCandidates<'a> {
     /// Snapshotted when the console opens and after a `save_queue`,
     /// not read off disk here: this is called per keystroke too.
     pub saved: &'a [String],
+    /// The user's saved eq curve names, so `eq()` completes to them as
+    /// well as to the built-ins.
+    pub eq_presets: Vec<String>,
 }
 
 /// Matches offered per keystroke. `Console` caps the list again at its
@@ -33,27 +36,22 @@ const MAX_CORPUS_CANDIDATES: usize = 50;
 
 impl Candidates for CorpusCandidates<'_> {
     fn corpus(&self, token: &str) -> Vec<String> {
-        let mut names: Vec<String> = Vec::new();
-        for item in self.corpus.search(token) {
-            let name = item.primary_name();
-            // deliberately the bare name, not `results_list::label`'s
-            // "title · artist": a candidate is inserted back into the
-            // command line, so the decorated form would never be a
-            // prefix extension of what was typed and the completer
-            // would drop every one of them.
-            if name.is_empty() || names.iter().any(|n| n == name) {
-                continue;
-            }
-            names.push(name.to_string());
-            if names.len() >= MAX_CORPUS_CANDIDATES {
-                break;
-            }
-        }
-        names
+        // `search_names` rather than `search`: same ranking, but it
+        // stops at the cap and never clones a `SearchItem`, which on a
+        // wide token is thousands of them per keystroke. Deliberately
+        // the bare name, not `results_list::label`'s "title · artist":
+        // a candidate is inserted back into the command line, so the
+        // decorated form would never be a prefix extension of what was
+        // typed and the completer would drop every one of them.
+        self.corpus.search_names(token, MAX_CORPUS_CANDIDATES)
     }
 
     fn saved_queues(&self) -> Vec<String> {
         self.saved.to_vec()
+    }
+
+    fn eq_presets(&self) -> Vec<String> {
+        self.eq_presets.clone()
     }
 }
 
@@ -218,6 +216,8 @@ pub fn sleep_step(due: Duration, fade: Duration, base: f64, now: Duration) -> Sl
 mod tests {
     use super::*;
     use crate::library::{LocalTrack, MediaKind};
+    use crate::shellsong::Console;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
 
     fn secs(s: u64) -> Duration {
@@ -308,6 +308,7 @@ mod tests {
         let cand = CorpusCandidates {
             corpus: &corpus,
             saved: &[],
+            eq_presets: Vec::new(),
         };
         let got = cand.corpus("flat");
         // the bare title, not "flatline · bladee": a decorated label
@@ -329,6 +330,7 @@ mod tests {
         let cand = CorpusCandidates {
             corpus: &corpus,
             saved: &[],
+            eq_presets: Vec::new(),
         };
         assert_eq!(cand.corpus("hex"), vec!["hex".to_string()]);
     }
@@ -349,6 +351,7 @@ mod tests {
         let cand = CorpusCandidates {
             corpus: &corpus,
             saved: &[],
+            eq_presets: Vec::new(),
         };
         assert_eq!(cand.corpus("same"), vec!["same title".to_string()]);
     }
@@ -359,6 +362,7 @@ mod tests {
         let cand = CorpusCandidates {
             corpus: &corpus,
             saved: &[],
+            eq_presets: Vec::new(),
         };
         assert!(cand.corpus("").is_empty());
     }
@@ -370,6 +374,7 @@ mod tests {
         let cand = CorpusCandidates {
             corpus: &corpus,
             saved: &saved,
+            eq_presets: Vec::new(),
         };
         assert_eq!(cand.saved_queues(), saved);
     }
@@ -473,5 +478,89 @@ mod tests {
             sleep_step(secs(2), secs(5), 100.0, secs(0)),
             SleepStep::Fading(40.0)
         );
+    }
+
+    // ------------------------------------------------------- benchmark
+
+    /// A library-shaped corpus: real artist/album/title spread, so the
+    /// fuzzy scorer sees the same mix of near-misses a real one does.
+    fn synthetic_corpus(n: usize) -> Corpus {
+        const ARTISTS: [&str; 8] = [
+            "Bladee",
+            "Ecco2k",
+            "Thaiboy Digital",
+            "Burial",
+            "Boards of Canada",
+            "Godspeed You! Black Emperor",
+            "Aphex Twin",
+            "Mazzy Star",
+        ];
+        const ALBUMS: [&str; 6] = [
+            "Icedancer",
+            "Eversince",
+            "Crest",
+            "Untrue",
+            "Selected Ambient Works",
+            "The Fourth Wall",
+        ];
+        const TITLES: [&str; 8] = [
+            "Blade Runner Blues",
+            "Be Nice 2 Me",
+            "Who Goes There",
+            "Rewind",
+            "Tears of Joy",
+            "Obedient",
+            "Hotel Breakfast",
+            "Into Dust",
+        ];
+        let mut corpus = Corpus::new();
+        corpus.add_local_tracks((0..n).map(|i| LocalTrack {
+            path: PathBuf::from(format!("/music/{i:06}.flac")),
+            title: format!("{} {i}", TITLES[i % TITLES.len()]),
+            artist: Some(ARTISTS[(i / 7) % ARTISTS.len()].to_string()),
+            album: Some(ALBUMS[(i / 13) % ALBUMS.len()].to_string()),
+            duration_secs: None,
+            kind: MediaKind::Music,
+        }));
+        corpus
+    }
+
+    /// Not an assertion: prints the per-keystroke wall time of the real
+    /// completion path, corpus included, which is the number that
+    /// decides whether the `:` prompt keeps up with typing. Absolute
+    /// numbers are machine-dependent. Run with
+    /// `cargo test --release --bin wim -- --ignored --nocapture bench_completion`.
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_completion() {
+        let saved: Vec<String> = Vec::new();
+        for size in [10_000usize, 30_000] {
+            let corpus = synthetic_corpus(size);
+            let cand = CorpusCandidates {
+                corpus: &corpus,
+                saved: &saved,
+                eq_presets: Vec::new(),
+            };
+            for line in ["play(blade r", "queue([bladee, obedient])", "volume(50%)"] {
+                let iters = if size >= 30_000 { 10u32 } else { 25 };
+                let mut worst = Duration::ZERO;
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    let mut console = Console::empty();
+                    for ch in line.chars() {
+                        let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+                        let one = std::time::Instant::now();
+                        console.handle_key(key, &cand);
+                        worst = worst.max(one.elapsed());
+                    }
+                }
+                let keys = line.chars().count() as u32;
+                let per = start.elapsed() / (iters * keys);
+                println!(
+                    "{size:>6} items  {:<28} {per:>10.3?}/key  worst {worst:>10.3?}",
+                    line
+                );
+            }
+        }
     }
 }

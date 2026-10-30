@@ -6,6 +6,7 @@ use ratatui::widgets::Widget;
 use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
+use crate::ui::textfit::width;
 
 /// Full keybind reference, opened with `?` (hinted by `HelpBox` in the
 /// bottom-right corner); takes over the whole screen the same way
@@ -21,13 +22,23 @@ pub struct HelpOverlay<'a> {
     /// lists input the app is not accepting is worse than one that
     /// says nothing.
     pub mouse: bool,
+    /// First content row drawn, in the same units `content_rows`
+    /// reports. The table outgrew one screen (64 rows against the 20
+    /// a 24-row terminal leaves), and the old layout resolved that by
+    /// letting the last column overflow and be clipped, which silently
+    /// ate the section holding how to quit. Scrolling makes a new
+    /// section cost a keypress instead of a disappearance.
+    pub scroll: usize,
 }
 
 /// `Fixed` for universal navigation primitives and modal-internal
 /// conventions that deliberately aren't part of the remappable
 /// keymap (see keymap.rs); `Bound` for anything that is, so its
 /// label always reflects whatever it's actually currently bound to.
-enum Key {
+/// Lives here rather than in keymap.rs because it is about *showing* a
+/// binding, not resolving one; onboarding's controls screen shares it
+/// (it had the same baked-in-literal bug this enum exists to prevent).
+pub(crate) enum Key {
     Fixed(&'static str),
     Bound(KeyAction),
     /// Two remappable actions that read as one row ("speed down /
@@ -35,6 +46,24 @@ enum Key {
     /// this table ended up lying about four rebindable keys: the text
     /// was baked in, so a remap left the help showing the old pair.
     Pair(KeyAction, KeyAction),
+}
+
+impl Key {
+    /// The label to print, resolved against the live keymap so a
+    /// rebound key is never shown as the default it replaced.
+    pub(crate) fn label(&self, keymap: &Keymap) -> String {
+        match self {
+            Key::Fixed(s) => (*s).to_string(),
+            Key::Bound(action) => key_label(keymap.get(*action)),
+            Key::Pair(a, b) => {
+                format!(
+                    "{} / {}",
+                    key_label(keymap.get(*a)),
+                    key_label(keymap.get(*b))
+                )
+            }
+        }
+    }
 }
 
 const SECTIONS: &[(&str, &[(Key, &str)])] = &[
@@ -119,6 +148,20 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
         ],
     ),
     (
+        // the app has quietly supported nucleo's anchors and exact
+        // match all along and never said so anywhere; `!` now works
+        // too (see search.rs's split_exclusions), so the whole syntax
+        // is worth one block rather than being folklore.
+        "search syntax",
+        &[
+            (Key::Fixed("foo bar"), "fuzzy, typos forgiven"),
+            (Key::Fixed("'foo"), "exact substring"),
+            (Key::Fixed("^foo"), "starts with"),
+            (Key::Fixed("foo$"), "ends with"),
+            (Key::Fixed("!foo"), "exclude matches"),
+        ],
+    ),
+    (
         "other",
         &[
             (Key::Bound(KeyAction::OpenSettingsMenu), "settings"),
@@ -150,29 +193,113 @@ impl Widget for HelpOverlay<'_> {
             shade(NEAR_BLACK),
         ) + 1;
 
+        debug_assert_eq!(
+            top,
+            area.y + HEADER_ROWS,
+            "max_scroll derives `top` arithmetically; keep it equal to the header"
+        );
+
         // laid out in columns rather than one tall list: the full
         // reference is ~50 rows, so on a normal 24-row terminal the
         // last sections (including how to quit) used to just silently
         // fall off the bottom. columns are balanced by row count, and
-        // a narrow terminal falls back to a single column.
-        let rows_available = (area.y + area.height).saturating_sub(top) as usize;
+        // a narrow terminal falls back to a single column. taller than
+        // the screen now scrolls rather than being clipped.
+        let Layout {
+            rows,
+            tallest,
+            scroll_max,
+        } = self.layout(area);
         let blocks = self.rendered_blocks();
-        let columns = split_into_columns(&blocks, rows_available, area.width as usize);
+        let columns = split_into_columns(&blocks, rows, area.width as usize);
 
         let col_width = if columns.len() > 1 {
             area.width as usize / columns.len()
         } else {
             area.width as usize
         };
+        // clamped here as well as by the caller: `area` is what decides
+        // how much fits, and only the render sees the real one.
+        let scroll = self.scroll.min(scroll_max);
+
         for (i, column) in columns.iter().enumerate() {
             let x = area.x + (i * col_width) as u16;
-            for (y, line) in (top..).zip(column.iter()) {
+            for (y, line) in (top..top + rows as u16).zip(column.iter().skip(scroll)) {
                 if y >= area.y + area.height {
                     break;
                 }
                 draw_line(buf, area, x, col_width, y, &line.text, shade(line.level));
             }
         }
+
+        // only drawn when there is something off-screen, so a table that
+        // fits says nothing and loses no row to the hint.
+        if scroll_max > 0 {
+            let left = tallest - rows - scroll;
+            let hint = if left > 0 {
+                format!("{left} more below -- j/k, wheel")
+            } else {
+                "end -- k, wheel up".to_string()
+            };
+            let w = width(&hint);
+            let y = top + rows as u16;
+            let x = area.x + area.width.saturating_sub(w as u16 + 1);
+            draw_line(buf, area, x, w + 1, y, &hint, shade(DIM));
+        }
+    }
+}
+
+/// Rows the header owns before the table starts, counted from `area.y`.
+/// `draw_header` returns `y + 2` and the overlay adds one, so this is
+/// that sum written down where `max_scroll` can reach it without a
+/// `Buffer`; the render `debug_assert`s the two agree.
+const HEADER_ROWS: u16 = 3;
+
+/// What the render resolved for one `area`, so `max_scroll` and the
+/// render cannot disagree about how much fits.
+struct Layout {
+    /// Content rows drawn, after the hint row is reserved.
+    rows: usize,
+    /// Rows the tallest column needs.
+    tallest: usize,
+    /// Largest useful `scroll`; 0 when everything fits.
+    scroll_max: usize,
+}
+
+impl HelpOverlay<'_> {
+    fn layout(&self, area: Rect) -> Layout {
+        let full = (area.y + area.height).saturating_sub(area.y + HEADER_ROWS) as usize;
+        let blocks = self.rendered_blocks();
+        let tallest = |rows: usize| {
+            split_into_columns(&blocks, rows, area.width as usize)
+                .iter()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(0)
+        };
+        // two passes on purpose: whether the hint row is needed depends
+        // on a packing that itself depends on the row count.
+        if tallest(full) <= full {
+            return Layout {
+                rows: full,
+                tallest: tallest(full),
+                scroll_max: 0,
+            };
+        }
+        let rows = full.saturating_sub(1);
+        let t = tallest(rows);
+        Layout {
+            rows,
+            tallest: t,
+            scroll_max: t.saturating_sub(rows),
+        }
+    }
+
+    /// Largest `scroll` worth passing for this `area`, so the caller can
+    /// clamp a key or wheel step without a `Buffer`. Takes the *outer*
+    /// rect and insets it exactly as the render's `draw::overlay` does.
+    pub fn max_scroll(&self, area: Rect) -> usize {
+        self.layout(crate::ui::draw::framed_inner(area)).scroll_max
     }
 }
 
@@ -198,17 +325,15 @@ impl HelpOverlay<'_> {
                     level: NEAR_WHITE,
                 }];
                 for (key, desc) in *binds {
-                    let key_text = match key {
-                        Key::Fixed(s) => (*s).to_string(),
-                        Key::Bound(action) => key_label(self.keymap.get(*action)),
-                        Key::Pair(a, b) => format!(
-                            "{} / {}",
-                            key_label(self.keymap.get(*a)),
-                            key_label(self.keymap.get(*b))
-                        ),
-                    };
+                    let key_text = key.label(self.keymap);
+                    // padded by display width, by hand: `{key:<13}`
+                    // counts chars, so a key bound to a wide char was
+                    // one cell wider than it counted and pushed its own
+                    // description a cell right of the column. same fix
+                    // banner.rs records for its menu.
+                    let pad = " ".repeat(KEY_COLUMN.saturating_sub(width(&key_text)));
                     block.push(Line {
-                        text: format!("  {key_text:<13} {desc}"),
+                        text: format!("  {key_text}{pad} {desc}"),
                         level: DIM,
                     });
                 }
@@ -226,14 +351,22 @@ impl HelpOverlay<'_> {
 /// index so reordering `SECTIONS` cannot drop the wrong one.
 const MOUSE_SECTION: &str = "mouse";
 
-/// Minimum usable width for one column; below two of these the layout
-/// stays single-column and scrolls off as before, which is still
-/// better than two columns of truncated nonsense. 38 is the widest
-/// line this table actually produces ("  " + a 13-cell key column +
-/// " " + the longest description), not a round number: the frame added
-/// around this overlay costs four columns, and a 40 here turned 120
-/// cells into two columns, which is how sections fell off the bottom.
-const MIN_COLUMN_WIDTH: usize = 38;
+/// Cells reserved for the key column, so every description in every
+/// section starts at the same offset. Fixed rather than derived from
+/// the widest resolved label on purpose: a single long rebind ("f12")
+/// would otherwise shift every description in the table, and
+/// `MIN_COLUMN_WIDTH` below is computed from this number.
+const KEY_COLUMN: usize = 13;
+
+/// Minimum usable width for one column: the widest line this table
+/// actually produces, i.e. `"  "` + `KEY_COLUMN` + `" "` + the longest
+/// description. Keep it equal to that, not below it. At 38 a 120-cell
+/// terminal took three 40-cell columns and silently truncated the
+/// three widest rows mid-word ("press a bottom-bar con", "select text
+/// (bypass ca"); the overlay scrolls now, so trading a column for
+/// readable lines costs a keypress rather than the content.
+/// `widest_line` keeps this honest against the table itself.
+const MIN_COLUMN_WIDTH: usize = 44;
 
 /// Packs whole sections into columns, never splitting a section across
 /// a column boundary. First-fit rather than "fill one column then move
@@ -301,13 +434,32 @@ mod tests {
     use crate::keymap::Keymap;
     use crate::ui::testbuf::{assert_no_bleed_through, buffer, grid, plated_buffer};
 
-    fn render_to_lines(width: u16, height: u16) -> Vec<String> {
+    /// Every row the overlay can show at this size, across all reachable
+    /// scroll offsets. The table is taller than a 24-row terminal, so
+    /// "is it on screen" is the wrong question; "can the user get to it"
+    /// is the one the layout actually has to answer.
+    fn reachable(width: u16, height: u16) -> String {
+        let keymap = Keymap::default();
+        let max = HelpOverlay {
+            keymap: &keymap,
+            mouse: true,
+            scroll: 0,
+        }
+        .max_scroll(Rect::new(0, 0, width, height));
+        (0..=max)
+            .map(|s| render_at(width, height, s).join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn render_at(width: u16, height: u16, scroll: usize) -> Vec<String> {
         let keymap = Keymap::default();
         let area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(area);
         HelpOverlay {
             keymap: &keymap,
             mouse: true,
+            scroll,
         }
         .render(area, &mut buf);
         (0..height)
@@ -327,6 +479,7 @@ mod tests {
         HelpOverlay {
             keymap: &keymap,
             mouse: true,
+            scroll: 0,
         }
         .render(area, &mut buf);
         assert_no_bleed_through(&buf, area);
@@ -340,6 +493,7 @@ mod tests {
         HelpOverlay {
             keymap: &keymap,
             mouse: true,
+            scroll: 0,
         }
         .render(area, &mut buf);
         let g = grid(&buf);
@@ -351,16 +505,35 @@ mod tests {
     }
 
     #[test]
-    fn every_section_heading_is_visible_on_a_standard_terminal() {
-        // 80x24 is the floor worth supporting; the single-column
-        // layout used to drop the last sections (quit included) off
-        // the bottom with no indication they existed.
-        let rendered = render_to_lines(120, 24).join("\n");
+    fn every_section_heading_is_reachable_on_a_standard_terminal() {
+        // the single-column layout used to drop the last sections
+        // (quit included) off the bottom with no indication they
+        // existed, and the column layout then did the same thing the
+        // moment the table outgrew three columns. scrolling is what
+        // makes this assertion hold for any number of sections.
+        let rendered = reachable(120, 24);
         for (section, _) in SECTIONS {
             assert!(
                 rendered.contains(section),
-                "section {section:?} fell off the overlay:\n{rendered}"
+                "section {section:?} cannot be reached at 120x24:\n{rendered}"
             );
+        }
+    }
+
+    /// The rows themselves, not just the headings: a section whose
+    /// heading is on the last visible row is not actually readable.
+    #[test]
+    fn every_bind_row_is_reachable_on_a_standard_terminal() {
+        let keymap = Keymap::default();
+        let rendered = reachable(120, 24);
+        for (section, binds) in SECTIONS {
+            for (key, desc) in *binds {
+                assert!(
+                    rendered.contains(desc),
+                    "{section:?} / {desc:?} (key {:?}) cannot be reached at 120x24",
+                    key.label(&keymap)
+                );
+            }
         }
     }
 
@@ -374,6 +547,7 @@ mod tests {
             HelpOverlay {
                 keymap: &keymap,
                 mouse,
+                scroll: 0,
             }
             .rendered_blocks()
             .iter()
@@ -390,8 +564,28 @@ mod tests {
 
     #[test]
     fn how_to_quit_is_always_reachable() {
-        let rendered = render_to_lines(120, 24).join("\n");
-        assert!(rendered.contains("quit from anywhere"));
+        assert!(reachable(120, 24).contains("quit from anywhere"));
+    }
+
+    /// The column width is derived from the table, so a description
+    /// longer than `MIN_COLUMN_WIDTH` allows for silently truncates
+    /// mid-word. That is how "press a bottom-bar con" and "select text
+    /// (bypass ca" shipped: the mouse section added the two widest
+    /// rows and nothing recomputed the constant.
+    #[test]
+    fn no_row_is_wider_than_a_column() {
+        let keymap = Keymap::default();
+        let widest = SECTIONS
+            .iter()
+            .flat_map(|(_, binds)| binds.iter())
+            .map(|(key, desc)| 2 + KEY_COLUMN.max(width(&key.label(&keymap))) + 1 + width(desc))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            widest <= MIN_COLUMN_WIDTH,
+            "widest row is {widest} cells but MIN_COLUMN_WIDTH is {MIN_COLUMN_WIDTH}; \
+             a column that narrow truncates it"
+        );
     }
 
     #[test]
@@ -401,6 +595,7 @@ mod tests {
             HelpOverlay {
                 keymap: &keymap,
                 mouse: true,
+                scroll: 0,
             }
             .rendered_blocks()
         };
@@ -414,6 +609,7 @@ mod tests {
         let blocks = HelpOverlay {
             keymap: &keymap,
             mouse: true,
+            scroll: 0,
         }
         .rendered_blocks();
         let cols = split_into_columns(&blocks, 12, 160);
@@ -441,6 +637,7 @@ mod tests {
         HelpOverlay {
             keymap: &keymap,
             mouse: true,
+            scroll: 0,
         }
         .render(area, &mut buf);
         // row 0 is the frame's top edge now; the title is one inside.
@@ -460,6 +657,7 @@ mod tests {
             HelpOverlay {
                 keymap: &keymap,
                 mouse: true,
+                scroll: 0,
             }
             .render(area, &mut buf);
         }
@@ -476,6 +674,7 @@ mod tests {
         HelpOverlay {
             keymap: &keymap,
             mouse: true,
+            scroll: 0,
         }
         .render(area, &mut buf);
         let rendered: String = (0..30)
@@ -493,6 +692,38 @@ mod tests {
         assert!(
             !rendered.contains("[ / ]"),
             "and must not still show the baked-in default"
+        );
+    }
+
+    /// A key can be rebound to a wide char, which owns two cells while
+    /// `{:<13}` counted it as one; that pushed its own description a
+    /// cell right of every other row's.
+    #[test]
+    fn a_wide_key_label_does_not_shift_its_own_description() {
+        use crossterm::event::KeyCode;
+        let mut keymap = Keymap::default();
+        keymap.set(KeyAction::CycleEq, KeyCode::Char('\u{65e5}'));
+        let mut buf = buffer(120, 40);
+        HelpOverlay {
+            keymap: &keymap,
+            mouse: true,
+            scroll: 0,
+        }
+        .render(Rect::new(0, 0, 120, 40), &mut buf);
+        let g = grid(&buf);
+        let eq = g.lines().find(|l| l.contains("cycle eq preset")).unwrap();
+        let shuffle = g.lines().find(|l| l.contains("shuffle")).unwrap();
+        // cell columns, not byte offsets: the wide key is three bytes
+        // and two cells, so `find` alone would compare the wrong thing
+        // (which is how this test first "failed" against a correct fix).
+        let col = |line: &str, needle: &str| {
+            let byte = line.find(needle).unwrap();
+            line[..byte].chars().count()
+        };
+        assert_eq!(
+            col(eq, "cycle eq preset"),
+            col(shuffle, "shuffle"),
+            "the wide key pushed its description out of the column:\n{eq}\n{shuffle}"
         );
     }
 }

@@ -3,21 +3,30 @@
 //! the single most-emphasized requirement in the spec; searching "bla"
 //! should surface matching artists, albums, songs, playlists, and local
 //! files together, ranked by actual relevance, not just substring hits.
+//!
+//! This runs on every keystroke over the whole library, so the hot
+//! path carries several exact short circuits plus a load-bearing
+//! reason *not* to narrow the previous result set; read
+//! docs/search-performance.md before adding a short circuit, a cache,
+//! or a cap here.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 
+use crate::cache::{self, ServerCatalog};
+use crate::config::NavidromeConfig;
 use crate::library::{LocalTrack, MediaKind};
 use crate::subsonic::{
     Album, Artist, Client, Playlist, SearchResult as SubsonicSearchResult, Song,
 };
+use crate::trace;
 
 /// Results-list section a `SearchItem` groups under; see
 /// `SearchItem::category`.
@@ -218,27 +227,194 @@ impl SearchItem {
     }
 }
 
-/// A corpus item plus the two haystacks `search` would otherwise
-/// rebuild for every item on every keystroke: the matcher text in its
-/// original case (nucleo's smart-case matching reads it) and a
-/// lowercased copy the edit-distance fallback splits into words.
+/// A corpus item plus what `search` would otherwise rebuild for every
+/// item on every keystroke: the matcher text in its original case
+/// (nucleo's smart-case matching reads it), a lowercased copy the
+/// edit-distance fallback splits into words, and the char mask both
+/// prefilters test against.
 #[derive(Debug, Clone)]
 struct Entry {
     item: SearchItem,
     haystack: String,
     haystack_lower: String,
+    /// `char_mask` of `haystack_lower`, or `u64::MAX` when the
+    /// haystack is not ascii. nucleo matches an ascii pattern against
+    /// *normalized* text ("blade" hits "blàde"), so a raw char mask
+    /// would reject accented haystacks it shouldn't; `MAX` opts those
+    /// out of both prefilters instead of guessing.
+    mask: u64,
+    /// Bit `n` set when some word of the haystack is `n` chars long,
+    /// anything from 31 up sharing bit 31. The typo pass needs a word
+    /// within the budget of the query's length, so one and-test
+    /// retires an entry whose words are all the wrong size.
+    word_lens: u32,
+    /// Whether the haystack is ascii, letting the typo pass split on
+    /// bytes and take `len()` as the char count. Unicode whitespace
+    /// outside ascii splits into different words, so this is a real
+    /// precondition rather than only a fast path.
+    ascii: bool,
 }
 
 impl Entry {
     fn new(item: SearchItem) -> Self {
         let haystack = item.haystack();
         let haystack_lower = haystack.to_lowercase();
+        let ascii = haystack_lower.is_ascii();
         Self {
+            mask: if ascii {
+                char_mask(haystack_lower.chars())
+            } else {
+                u64::MAX
+            },
+            word_lens: haystack_lower
+                .split_whitespace()
+                .fold(0u32, |bits, word| bits | 1 << char_count(word).min(31)),
+            ascii,
             item,
             haystack,
             haystack_lower,
         }
     }
+}
+
+/// One bit per character, `ch as u32 % 64`, which gives every ascii
+/// letter and digit its own bit and lets anything else collide. Two
+/// cheap necessary conditions ride on this: a subsequence match needs
+/// every pattern char present in the haystack, and an edit distance is
+/// at least the number of distinct chars one side has and the other
+/// lacks. Collisions only ever drop a bit from the "missing" set, so
+/// they weaken the filters and can never reject a real match.
+fn char_mask(chars: impl Iterator<Item = char>) -> u64 {
+    chars.fold(0u64, |mask, ch| mask | 1u64 << (ch as u32 % 64))
+}
+
+/// Everything derived from the query that is identical for every item,
+/// hoisted out of the per-item loop.
+#[derive(Debug)]
+struct Needle {
+    pattern: Pattern,
+    /// Lowercased query text, what the edit-distance pass compares
+    /// against each haystack word.
+    lower: String,
+    /// `true` when `lower` is ascii, so the distance fast path can
+    /// treat bytes as chars.
+    ascii: bool,
+    len: usize,
+    budget: usize,
+    /// Chars every fuzzy match must contain, or 0 (prefilter off) when
+    /// the query holds anything nucleo's pattern parser might read as
+    /// syntax rather than as literal haystack text.
+    fuzzy_mask: u64,
+    /// Chars of the whole query, for the edit-distance lower bound.
+    typo_mask: u64,
+    /// Word lengths that could come in under budget, in `Entry`'s
+    /// `word_lens` encoding.
+    length_window: u32,
+    /// Lowercased terms from `!term` tokens; a match containing any of
+    /// them is dropped. See `split_exclusions`.
+    excluded: Vec<String>,
+}
+
+/// Splits a raw query into the part that must match and the lowercased
+/// `!term` parts that must not.
+///
+/// nucleo 0.3 parses `!foo` but `Pattern::score` does not honour it: a
+/// `!foo` query scores identically to `'foo`, so the exclusion silently
+/// did nothing while reading like working syntax. Handled here instead
+/// of being handed to nucleo. A bare `!` is not an exclusion (there is
+/// no term), so it stays in the positive text as the literal the user
+/// typed.
+fn split_exclusions(query: &str) -> (String, Vec<String>) {
+    let mut positive: Vec<&str> = Vec::new();
+    let mut excluded: Vec<String> = Vec::new();
+    for token in query.split_whitespace() {
+        match token.strip_prefix('!') {
+            Some(term) if !term.is_empty() => excluded.push(term.to_lowercase()),
+            _ => positive.push(token),
+        }
+    }
+    (positive.join(" "), excluded)
+}
+
+impl Needle {
+    fn new(query: &str) -> Self {
+        let (positive, excluded) = split_exclusions(query);
+        let query = positive.as_str();
+        let lower = query.to_lowercase();
+        let len = lower.chars().count();
+        // nucleo reads `^ $ ! ' \ |` and whitespace as pattern syntax
+        // (anchors, negation, exact-match, escapes), so only a plain
+        // alphanumeric query is guaranteed to be literal text that a
+        // match has to actually contain.
+        let literal = lower.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ');
+        let budget = edit_distance_budget(len);
+        Self {
+            pattern: Pattern::parse(query, CaseMatching::Smart, Normalization::Smart),
+            ascii: lower.is_ascii(),
+            len,
+            budget,
+            length_window: length_window(len, budget),
+            fuzzy_mask: if literal {
+                char_mask(lower.chars().filter(|c| *c != ' '))
+            } else {
+                0
+            },
+            typo_mask: char_mask(lower.chars()),
+            lower,
+            excluded,
+        }
+    }
+
+    /// Whether `haystack_lower` holds any excluded term. Substring, not
+    /// word-boundary, matching: `!live` should drop "Live at Leeds" and
+    /// "Alive" alike is the wrong call, but a word-boundary rule would
+    /// keep "(Live)" only by luck of the punctuation, so the blunter
+    /// rule is the predictable one.
+    fn excludes(&self, haystack_lower: &str) -> bool {
+        self.excluded.iter().any(|t| haystack_lower.contains(t))
+    }
+
+    /// How many distinct chars `self` has that `mask` lacks; a lower
+    /// bound on the edit distance (every one of them needs at least an
+    /// insertion or a substitution), so over budget means no match.
+    fn missing_from(&self, mask: u64) -> usize {
+        (self.typo_mask & !mask).count_ones() as usize
+    }
+}
+
+/// Smallest length difference between `len` and any word the haystack
+/// has, read straight off `Entry::word_lens`. A lower bound on the best
+/// edit distance the typo pass could possibly report, and so (through
+/// `typo_score`) an upper bound on the score it could add: when the
+/// fuzzy score already beats that, the pass cannot change the answer
+/// and is skipped. The saturating 31-char bucket makes this an
+/// underestimate for very long words, which only ever means running a
+/// pass that could have been skipped.
+fn min_length_gap(word_lens: u32, len: usize) -> usize {
+    if word_lens == 0 {
+        // no words at all: 32 is past every bucket, and scores as 0,
+        // so a haystack like this never reaches the typo pass.
+        return 32;
+    }
+    let target = len.min(31) as u32;
+    let at_or_below = word_lens & (!0u32 >> (31 - target));
+    let down = if at_or_below == 0 {
+        u32::MAX
+    } else {
+        target - (31 - at_or_below.leading_zeros())
+    };
+    let up = (word_lens >> target).trailing_zeros();
+    down.min(up) as usize
+}
+
+/// Every word length within `budget` of `len`, in `Entry::word_lens`'s
+/// encoding. Lengths from 31 up all share bit 31, which only ever
+/// widens the window (a 40-char word still tests as a candidate for a
+/// 33-char query), so the exact per-word length check still has to run.
+fn length_window(len: usize, budget: usize) -> u32 {
+    let lo = len.saturating_sub(budget).min(31) as u32;
+    let hi = (len + budget).min(31) as u32;
+    (!0u32 >> (31 - (hi - lo))) << lo
 }
 
 /// Scoring scratch, reused instead of reallocated per item: nucleo's
@@ -251,6 +427,27 @@ struct Scratch {
     buf: Vec<char>,
 }
 
+/// A persisted-catalog load running on its own thread. Started before
+/// the first blocking thing `main` does and `take`n where the corpus is
+/// actually needed, so the disk read overlaps the mpv spawn instead of
+/// landing on top of it.
+pub struct WarmingCorpus(thread::JoinHandle<Corpus>);
+
+impl WarmingCorpus {
+    /// Blocks until the load finishes; an empty corpus if its thread
+    /// panicked, same best-effort stance as every other cache read.
+    pub fn take(self) -> Corpus {
+        self.0.join().unwrap_or_default()
+    }
+}
+
+/// Reads every configured server's persisted catalog in the
+/// background; see `Corpus::warm_from_cache` for what it builds.
+pub fn spawn_warm_from_cache(servers: &[NavidromeConfig]) -> WarmingCorpus {
+    let servers = servers.to_vec();
+    WarmingCorpus(thread::spawn(move || Corpus::warm_from_cache(&servers)))
+}
+
 /// The merged corpus to search over, built once per library scan /
 /// Navidrome sync and re-searched on every keystroke.
 #[derive(Debug, Clone, Default)]
@@ -261,16 +458,123 @@ pub struct Corpus {
     /// key. Kept for the corpus's whole life rather than recomputed
     /// per incoming batch, which cloned every indexed id every time.
     remote_keys: [HashSet<String>; 4],
+    /// One scratch per scoring thread (index 0 doubles as the
+    /// single-threaded one), kept for the corpus's whole life: a fresh
+    /// `Matcher` per fan-out thread per keystroke meant allocating and
+    /// touching ~1mb of dp matrices on every typed character.
+    ///
     /// `search` takes `&self` (it is called on shared corpus bindings,
-    /// and only ever from the input thread), so the scratch lives
-    /// behind a `RefCell` instead of forcing `&mut` on every caller;
-    /// `search` is not reentrant, so the borrow can't conflict.
-    scratch: RefCell<Scratch>,
+    /// and only ever from the input thread), so these live behind a
+    /// `RefCell` instead of forcing `&mut` on every caller; `search`
+    /// is not reentrant, so the borrow can't conflict.
+    scratches: RefCell<Vec<Scratch>>,
 }
 
 impl Corpus {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A corpus already holding every configured server's catalog as
+    /// of its last session, read off the disk (`cache::load_catalog`)
+    /// with no network at all, so the first frame paints a full
+    /// library instead of "connecting to navidrome...". The background
+    /// sync then reconciles each server against what it really has
+    /// (see `reconcile_server`), which is what keeps this from being a
+    /// library frozen at whatever was true last launch.
+    ///
+    /// Also drops catalogs for servers no longer configured; this runs
+    /// exactly once per launch and is the one place holding the live
+    /// server list.
+    ///
+    /// Call it through `spawn_warm_from_cache` rather than directly:
+    /// tens of thousands of rows is tens of milliseconds, which the
+    /// first frame shouldn't wait for when there is an mpv process
+    /// being spawned anyway.
+    fn warm_from_cache(servers: &[NavidromeConfig]) -> Corpus {
+        let mut corpus = Corpus::new();
+        for nav in servers {
+            let Some(catalog) = cache::load_catalog(nav) else {
+                continue;
+            };
+            if catalog.is_empty() {
+                continue;
+            }
+            // offline: `Client::new` only resolves the password and
+            // builds an http agent, it never talks to the server.
+            let Ok(client) = Client::new(nav) else {
+                continue;
+            };
+            corpus.add_catalog(catalog, &Arc::new(client));
+        }
+        cache::sweep_foreign_catalogs(servers);
+        trace::mark(&format!(
+            "navidrome: {} cached catalog rows loaded",
+            corpus.items.len()
+        ));
+        corpus
+    }
+
+    /// Folds one server's full catalog in, dropping whatever it no
+    /// longer lists: the reconciliation half of `warm_from_cache`.
+    /// Without it, an artist or album deleted on the server would be
+    /// listed by every later launch for as long as the corpus lived,
+    /// since `add_subsonic_search_result` only ever adds.
+    ///
+    /// Songs are deliberately untouched. Nothing indexes them up front
+    /// (they arrive from `search3`, opened albums and artist pages), so
+    /// a catalog fetch is not an authoritative song list to prune
+    /// against; see docs/startup-cache.md.
+    ///
+    /// **Caller contract:** an empty `catalog` is read as the server
+    /// claiming it has nothing, and empties it here. Never pass one
+    /// built by defaulting a failed request to empty; that turns a
+    /// network blip into deleting a server's library. See
+    /// `fetch_navidrome_catalog`, which propagates every fetch error
+    /// for exactly this reason.
+    pub fn reconcile_server(&mut self, catalog: ServerCatalog, client: &Arc<Client>) {
+        let url = client.base_url();
+        let live: [HashSet<&str>; 3] = [
+            catalog.artists.iter().map(|a| a.id.as_str()).collect(),
+            catalog.albums.iter().map(|a| a.id.as_str()).collect(),
+            catalog.playlists.iter().map(|p| p.id.as_str()).collect(),
+        ];
+        let gone = |item: &SearchItem| {
+            if item.source() != Some(url) {
+                return false;
+            }
+            match item.remote_key() {
+                Some((0, id)) => !live[0].contains(id),
+                Some((1, id)) => !live[1].contains(id),
+                Some((3, id)) => !live[2].contains(id),
+                _ => false,
+            }
+        };
+        let dropped: Vec<(u8, String)> = self
+            .items
+            .iter()
+            .filter(|e| gone(&e.item))
+            .filter_map(|e| e.item.remote_key().map(|(k, id)| (k, id.to_string())))
+            .collect();
+        if !dropped.is_empty() {
+            for (kind, id) in &dropped {
+                self.remote_keys[*kind as usize].remove(id);
+            }
+            self.items.retain(|e| !gone(&e.item));
+        }
+        self.add_catalog(catalog, client);
+    }
+
+    fn add_catalog(&mut self, catalog: ServerCatalog, client: &Arc<Client>) {
+        self.add_subsonic_search_result(
+            SubsonicSearchResult {
+                artists: catalog.artists,
+                albums: catalog.albums,
+                songs: Vec::new(),
+            },
+            client,
+        );
+        self.add_playlists(catalog.playlists, client);
     }
 
     /// Single insertion point: every path that adds an item has to go
@@ -428,36 +732,67 @@ impl Corpus {
     /// order so nucleo alone would miss it). An item counts as a match if
     /// *either* signal fires, so a typo never silently returns nothing.
     pub fn search(&self, query: &str) -> Vec<SearchItem> {
+        let scored = self.score_all(query);
+        rank(scored)
+    }
+
+    /// The primary names of the best matches, deduped and capped at
+    /// `cap`. Exactly `search`'s ranking and order, since it scores and
+    /// ranks through the same path; it just stops at `cap` names and
+    /// clones a name rather than a whole `SearchItem` per match, which
+    /// is what shellsong's completion wants on every keystroke.
+    pub fn search_names(&self, query: &str, cap: usize) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for item in rank_borrowed(self.score_all(query)) {
+            let name = item.primary_name();
+            if name.is_empty() || !seen.insert(name) {
+                continue;
+            }
+            names.push(name.to_string());
+            if names.len() >= cap {
+                break;
+            }
+        }
+        names
+    }
+
+    /// Phase one of `search`: every item that either signal fired on,
+    /// with its score, in corpus order. Split out from the ranking so
+    /// the two can be benchmarked separately.
+    fn score_all(&self, query: &str) -> Vec<(u32, &SearchItem)> {
+        self.score_all_maybe_parallel(query, self.items.len() >= PARALLEL_SCORING_FLOOR)
+    }
+
+    /// `score_all` with the fan-out decision forced, so a benchmark can
+    /// measure the per-item cost single-threaded (immune to whatever
+    /// else is loading the machine) as well as end to end.
+    fn score_all_maybe_parallel(&self, query: &str, parallel: bool) -> Vec<(u32, &SearchItem)> {
         if query.trim().is_empty() {
             return Vec::new();
         }
-        let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
-        let query_lower = query.to_lowercase();
-        let query_len = query_lower.chars().count();
-        let typo_budget = edit_distance_budget(query_len);
+        let needle = Needle::new(query);
+        // "!foo" on its own leaves nothing to match on, so it ranks
+        // nothing rather than ranking the whole corpus minus foo.
+        if needle.lower.trim().is_empty() {
+            return Vec::new();
+        }
+        let mut scratches = self.scratches.borrow_mut();
+        if scratches.is_empty() {
+            scratches.resize_with(thread_count().max(1), Scratch::default);
+        }
 
-        let mut scored: Vec<(u32, &SearchItem)> = if self.items.len() >= PARALLEL_SCORING_FLOOR {
+        if parallel {
             // chunks are joined back in corpus order, so the stable
             // sort below still breaks ties exactly as it does
-            // single-threaded; each thread needs its own scratch.
-            let threads = thread::available_parallelism().map_or(1, |n| n.get());
-            let chunk = self.items.len().div_ceil(threads);
+            // single-threaded; each thread takes one of the corpus's
+            // own scratches rather than building its own.
+            let chunk = self.items.len().div_ceil(scratches.len());
             let parts: Vec<Vec<(u32, &SearchItem)>> = thread::scope(|scope| {
                 self.items
                     .chunks(chunk)
-                    .map(|part| {
-                        scope.spawn(|| {
-                            let mut scratch = Scratch::default();
-                            score_chunk(
-                                part,
-                                &pattern,
-                                &query_lower,
-                                query_len,
-                                typo_budget,
-                                &mut scratch,
-                            )
-                        })
-                    })
+                    .zip(scratches.iter_mut())
+                    .map(|(part, scratch)| scope.spawn(|| score_chunk(part, &needle, scratch)))
                     .collect::<Vec<_>>()
                     .into_iter()
                     .map(|handle| handle.join().unwrap_or_default())
@@ -465,66 +800,87 @@ impl Corpus {
             });
             parts.concat()
         } else {
-            let mut scratch = self.scratch.borrow_mut();
-            score_chunk(
-                &self.items,
-                &pattern,
-                &query_lower,
-                query_len,
-                typo_budget,
-                &mut scratch,
-            )
-        };
-
-        scored.sort_by_key(|a| std::cmp::Reverse(a.0));
-
-        // relative score cutoff: nucleo's own subsequence matcher will
-        // happily return *some* nonzero score for almost any haystack
-        // against a short query (e.g. "crest" is a valid, if scattered,
-        // subsequence of "Cigarettes After Sex"), and with no floor at
-        // all every one of those sparse, low-quality matches rendered
-        // right alongside a genuine exact title hit. Anything scoring
-        // under `WEAK_MATCH_CUTOFF_FRACTION` of the *best* match in
-        // this search is almost certainly that kind of noise rather
-        // than something the user meant, so drop it. This is
-        // self-limiting rather than needing a separate "don't leave it
-        // empty" guard: the top result's score always clears its own
-        // threshold, so the list can never be pruned to nothing, and
-        // when every candidate is in the same (even if low) ballpark
-        // (no single standout match), they're all close enough to the
-        // top score to clear the cutoff together, so weak guesses
-        // still show exactly when there's nothing better on offer.
-        if let Some(&(top_score, _)) = scored.first() {
-            let threshold = (top_score as f64 * WEAK_MATCH_CUTOFF_FRACTION).round() as u32;
-            scored.retain(|(s, _)| *s >= threshold);
+            score_chunk(&self.items, &needle, &mut scratches[0])
         }
-
-        // group same-category items together (section headers in the
-        // results list), but order the groups themselves by each
-        // one's single best match rather than a fixed kind ordering:
-        // the first item of a category in this already best-first
-        // list *is* that category's best score, so the order
-        // categories are first seen in is already "best match leads".
-        // searching "bladee" with a 100% artist match still puts
-        // Artists first even though a song titled "Rewind feat.
-        // Bladee" might outscore the rest of that artist's own songs.
-        let mut group_order: Vec<Category> = Vec::new();
-        for (_, item) in &scored {
-            let cat = item.category();
-            if !group_order.contains(&cat) {
-                group_order.push(cat);
-            }
-        }
-        group_order
-            .into_iter()
-            .flat_map(|cat| {
-                scored
-                    .iter()
-                    .filter(move |(_, item)| item.category() == cat)
-                    .map(|(_, item)| (*item).clone())
-            })
-            .collect()
     }
+}
+
+/// Cores to fan scoring out over, asked once rather than per keystroke:
+/// `available_parallelism` reads the current affinity mask/cgroup quota
+/// every call, and the answer cannot change under us in a way that
+/// matters here.
+fn thread_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+/// Phase two of `search`: sort, cut weak matches, group by category,
+/// materialize. Takes the scored candidates in corpus order, which the
+/// stable sort relies on for tie-breaking.
+/// `rank`, but borrowed. Split out so shellsong's completion can read
+/// the ranking without cloning a `SearchItem` per match; `rank` is
+/// this plus the clone, so the two cannot order differently.
+fn rank_borrowed(mut scored: Vec<(u32, &SearchItem)>) -> Vec<&SearchItem> {
+    // relative score cutoff: nucleo's own subsequence matcher will
+    // happily return *some* nonzero score for almost any haystack
+    // against a short query (e.g. "crest" is a valid, if scattered,
+    // subsequence of "Cigarettes After Sex"), and with no floor at
+    // all every one of those sparse, low-quality matches rendered
+    // right alongside a genuine exact title hit. Anything scoring
+    // under `WEAK_MATCH_CUTOFF_FRACTION` of the *best* match in
+    // this search is almost certainly that kind of noise rather
+    // than something the user meant, so drop it. This is
+    // self-limiting rather than needing a separate "don't leave it
+    // empty" guard: the top result's score always clears its own
+    // threshold, so the list can never be pruned to nothing, and
+    // when every candidate is in the same (even if low) ballpark
+    // (no single standout match), they're all close enough to the
+    // top score to clear the cutoff together, so weak guesses
+    // still show exactly when there's nothing better on offer.
+    //
+    // Cut before sorting, not after: the threshold depends only on the
+    // best score, so one max pass finds it, and a broad query ("bla"
+    // over a 40k library) then sorts the few thousand survivors
+    // instead of the tens of thousands of candidates. `retain` keeps
+    // corpus order, which the stable sort below needs for ties, so
+    // this is the same list in the same order either way.
+    let Some(top_score) = scored.iter().map(|&(score, _)| score).max() else {
+        return Vec::new();
+    };
+    let threshold = (top_score as f64 * WEAK_MATCH_CUTOFF_FRACTION).round() as u32;
+    scored.retain(|(s, _)| *s >= threshold);
+    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
+
+    // group same-category items together (section headers in the
+    // results list), but order the groups themselves by each
+    // one's single best match rather than a fixed kind ordering:
+    // the first item of a category in this already best-first
+    // list *is* that category's best score, so the order
+    // categories are first seen in is already "best match leads".
+    // searching "bladee" with a 100% artist match still puts
+    // Artists first even though a song titled "Rewind feat.
+    // Bladee" might outscore the rest of that artist's own songs.
+    let mut group_order: Vec<Category> = Vec::new();
+    for (_, item) in &scored {
+        let cat = item.category();
+        if !group_order.contains(&cat) {
+            group_order.push(cat);
+        }
+    }
+    let mut out = Vec::with_capacity(scored.len());
+    for cat in group_order {
+        out.extend(
+            scored
+                .iter()
+                .filter(|(_, item)| item.category() == cat)
+                .map(|(_, item)| *item),
+        );
+    }
+    out
+}
+
+fn rank(scored: Vec<(u32, &SearchItem)>) -> Vec<SearchItem> {
+    rank_borrowed(scored).into_iter().cloned().collect()
 }
 
 /// Scores one slice of the corpus against `pattern`, reusing a single
@@ -533,41 +889,137 @@ impl Corpus {
 /// Keeps corpus order, which the caller's stable sort relies on.
 fn score_chunk<'a>(
     entries: &'a [Entry],
-    pattern: &Pattern,
-    query_lower: &str,
-    query_len: usize,
-    typo_budget: usize,
+    needle: &Needle,
     scratch: &mut Scratch,
 ) -> Vec<(u32, &'a SearchItem)> {
     let Scratch { matcher, buf } = scratch;
     let mut scored = Vec::new();
     for entry in entries {
-        let utf32 = Utf32Str::new(&entry.haystack, buf);
-        let fuzzy_score = pattern.score(utf32, matcher);
-
-        // two free skips of the edit-distance pass, both no-ops on the
-        // final score: a typo can never beat `typo_score(0)`, and edit
-        // distance is at least the length difference, so a word that
-        // far off can't come in under budget.
-        let typo_score = if fuzzy_score.is_some_and(|s| s >= typo_score(0)) {
+        // checked before scoring: an excluded item cannot be rescued by
+        // any score, so this is the cheapest possible rejection.
+        if needle.excludes(&entry.haystack_lower) {
+            continue;
+        }
+        // a subsequence match needs every pattern char somewhere in
+        // the haystack, so one mask test retires the items nucleo
+        // would walk the whole haystack only to reject.
+        let fuzzy_score = if needle.fuzzy_mask & !entry.mask != 0 {
             None
         } else {
-            entry
-                .haystack_lower
-                .split_whitespace()
-                .filter(|word| char_count(word).abs_diff(query_len) <= typo_budget)
-                .map(|word| strsim::damerau_levenshtein(query_lower, word))
-                .filter(|&dist| dist <= typo_budget)
-                .map(typo_score)
-                .max()
+            let utf32 = Utf32Str::new(&entry.haystack, buf);
+            needle.pattern.score(utf32, matcher)
         };
 
-        match (fuzzy_score, typo_score) {
+        // four free skips of the edit-distance pass, none of which can
+        // change the final score: the distance is at least the length
+        // difference, so a haystack with no word anywhere near the
+        // query's length is out, and where the closest-length word
+        // still bounds the best typo score below what the fuzzy pass
+        // already scored, the pass cannot win; and the distance is
+        // also at least the number of query chars the haystack lacks
+        // entirely.
+        let typo = if entry.word_lens & needle.length_window == 0
+            || fuzzy_score
+                .is_some_and(|s| s >= typo_score(min_length_gap(entry.word_lens, needle.len)))
+            || needle.missing_from(entry.mask) > needle.budget
+        {
+            None
+        } else {
+            best_typo_score(entry, needle)
+        };
+
+        match (fuzzy_score, typo) {
             (None, None) => {}
             (a, b) => scored.push((a.unwrap_or(0).max(b.unwrap_or(0)), &entry.item)),
         }
     }
     scored
+}
+
+/// Best (lowest-distance) typo score over the haystack's words, or
+/// `None` if no word comes in under budget.
+fn best_typo_score(entry: &Entry, needle: &Needle) -> Option<u32> {
+    let mut best: Option<usize> = None;
+    // `true` to stop: distance 0 is the best score there is.
+    let mut consider = |word: &str, len: usize| {
+        if len.abs_diff(needle.len) > needle.budget {
+            return false;
+        }
+        let dist = if needle.budget == 1 && needle.ascii && entry.ascii {
+            distance_at_most_one(needle.lower.as_bytes(), word.as_bytes())
+        } else if word_is_reachable(word, needle) {
+            let dist = strsim::damerau_levenshtein(&needle.lower, word);
+            (dist <= needle.budget).then_some(dist)
+        } else {
+            None
+        };
+        match dist {
+            Some(dist) if best.is_none_or(|b| dist < b) => {
+                best = Some(dist);
+                dist == 0
+            }
+            _ => false,
+        }
+    };
+    // an ascii haystack has no unicode whitespace to split on, so the
+    // byte-wise split sees exactly the same words for a fraction of
+    // the work, and the word length is just its byte length.
+    if entry.ascii {
+        for word in entry.haystack_lower.split_ascii_whitespace() {
+            if consider(word, word.len()) {
+                break;
+            }
+        }
+    } else {
+        for word in entry.haystack_lower.split_whitespace() {
+            if consider(word, word.chars().count()) {
+                break;
+            }
+        }
+    }
+    best.map(typo_score)
+}
+
+/// Whether `word` is close enough to the query to be worth the full
+/// distance computation: each distinct char one side has and the other
+/// lacks costs at least one edit, in both directions.
+fn word_is_reachable(word: &str, needle: &Needle) -> bool {
+    let mask = char_mask(word.chars());
+    needle.missing_from(mask) <= needle.budget
+        && (mask & !needle.typo_mask).count_ones() as usize <= needle.budget
+}
+
+/// `Some(damerau_levenshtein(a, b))` when that distance is 0 or 1,
+/// `None` when it is more, over ascii bytes and without strsim's dp
+/// table and position hashmap. Exact rather than approximate: a single
+/// edit is trivially an edit no substring sees twice, so the restricted
+/// and unrestricted distances agree at 1, and every way to be one edit
+/// apart is one of the four cases below. Only used where the budget
+/// *is* 1; a budget of 2 keeps the full strsim distance, where that
+/// equivalence no longer holds (classically "ca" to "abc": 2
+/// unrestricted, 3 restricted).
+fn distance_at_most_one(a: &[u8], b: &[u8]) -> Option<usize> {
+    if a.len().abs_diff(b.len()) > 1 {
+        return None;
+    }
+    let common = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    if common == a.len() && common == b.len() {
+        return Some(0);
+    }
+    let (ra, rb) = (&a[common..], &b[common..]);
+    if a.len() == b.len() {
+        // one substitution, or one adjacent transposition
+        let sub = ra[1..] == rb[1..];
+        let swap = ra.len() >= 2 && ra[0] == rb[1] && ra[1] == rb[0] && ra[2..] == rb[2..];
+        return (sub || swap).then_some(1);
+    }
+    // one insertion or deletion: drop the extra char from the longer side
+    let (long, short) = if a.len() > b.len() {
+        (ra, rb)
+    } else {
+        (rb, ra)
+    };
+    (long[1..] == *short).then_some(1)
 }
 
 /// `chars().count()` with the ascii fast path spelled out; the typo
@@ -582,11 +1034,15 @@ fn char_count(s: &str) -> usize {
 }
 
 /// Corpus size at which `search` fans per-item scoring out across
-/// threads. Below it the fixed cost of the fan-out (spawn/join plus a
-/// fresh ~135kb matcher per thread, measured at ~0.8ms on 8 cores)
-/// dominates: at 100 items it made every query ~8x slower, at 500 it
-/// broke even, and from ~2k up it's a consistent ~2x win.
-const PARALLEL_SCORING_FLOOR: usize = 2_000;
+/// threads. Below it the fixed ~0.4ms of spawn/join dominates, and the
+/// char-mask prefilters cut the per-item cost enough that the floor had
+/// to move up an order of magnitude: measured on 8 cores
+/// (`bench_parallel_floor`), sequential wins at 4k for every query
+/// shape and at 8k for all but one, threads win at 16k and up for
+/// everything except a query that matches nothing at all, which is so
+/// cheap that no corpus size pays back the fan-out. Below the floor,
+/// scoring a whole 8k corpus sequentially is still only ~2ms.
+const PARALLEL_SCORING_FLOOR: usize = 16_000;
 
 /// Below this fraction of the best match's score in a given search, a
 /// result is treated as noise rather than a real candidate; see the
@@ -686,6 +1142,112 @@ mod tests {
             &client,
         );
         c
+    }
+
+    fn other_client() -> Arc<Client> {
+        Arc::new(
+            Client::new(&NavidromeConfig {
+                url: "https://other.invalid".into(),
+                username: "test".into(),
+                password: Some("test".into()),
+                password_file: None,
+                max_bitrate_kbps: None,
+                transcode_format: None,
+            })
+            .unwrap(),
+        )
+    }
+
+    fn catalog(artists: &[&str], albums: &[&str], playlists: &[&str]) -> ServerCatalog {
+        ServerCatalog {
+            artists: artists
+                .iter()
+                .map(|id| Artist {
+                    id: (*id).into(),
+                    name: format!("artist {id}"),
+                })
+                .collect(),
+            albums: albums
+                .iter()
+                .map(|id| Album {
+                    id: (*id).into(),
+                    name: format!("album {id}"),
+                    artist: "artist".into(),
+                })
+                .collect(),
+            playlists: playlists
+                .iter()
+                .map(|id| Playlist {
+                    id: (*id).into(),
+                    name: format!("playlist {id}"),
+                })
+                .collect(),
+        }
+    }
+
+    fn ids(c: &Corpus) -> Vec<String> {
+        c.items()
+            .map(|i| i.identity().1.into_owned())
+            .collect::<Vec<_>>()
+    }
+
+    /// The whole reason a persisted catalog is safe to load: what the
+    /// server no longer has stops being listed, rather than lingering
+    /// for the rest of the session (and every session after it).
+    #[test]
+    fn reconciling_drops_what_the_server_no_longer_lists() {
+        let client = test_client();
+        let mut c = Corpus::new();
+        c.reconcile_server(catalog(&["a1", "a2"], &["al1"], &["p1"]), &client);
+        assert_eq!(c.items().count(), 4);
+
+        c.reconcile_server(catalog(&["a2"], &["al1", "al2"], &[]), &client);
+        let left = ids(&c);
+        assert!(!left.contains(&"a1".to_string()), "deleted artist stayed");
+        assert!(!left.contains(&"p1".to_string()), "deleted playlist stayed");
+        assert!(left.contains(&"a2".to_string()));
+        assert!(left.contains(&"al1".to_string()));
+        assert!(left.contains(&"al2".to_string()), "new album never landed");
+        assert_eq!(left.len(), 3);
+
+        // and the dedup bookkeeping went with them: a server that
+        // brings a dropped id back must be able to re-add it.
+        c.reconcile_server(catalog(&["a1", "a2"], &["al1", "al2"], &["p1"]), &client);
+        assert_eq!(c.items().count(), 5);
+    }
+
+    /// Nothing indexes songs up front, so a catalog fetch is not an
+    /// authoritative song list; dropping songs here would throw away
+    /// every tracklist an opened album had taught the corpus.
+    #[test]
+    fn reconciling_leaves_songs_and_local_tracks_alone() {
+        let mut c = corpus();
+        let client = test_client();
+        c.reconcile_server(catalog(&["a1"], &["al1"], &["p1"]), &client);
+        let left = ids(&c);
+        assert!(left.contains(&"s1".to_string()), "a known song was dropped");
+        assert!(
+            left.iter().any(|id| id.contains("blade runner ost.flac")),
+            "a local file was dropped"
+        );
+    }
+
+    #[test]
+    fn reconciling_one_server_does_not_touch_another() {
+        let mut c = Corpus::new();
+        let first = test_client();
+        let second = other_client();
+        c.reconcile_server(catalog(&["a1"], &["al1"], &[]), &first);
+        c.reconcile_server(catalog(&["b1"], &["bl1"], &[]), &second);
+        assert_eq!(c.items().count(), 4);
+
+        // the first server emptied out; the second one's entries are
+        // not its business.
+        c.reconcile_server(catalog(&[], &[], &[]), &first);
+        let left = ids(&c);
+        assert_eq!(left.len(), 2);
+        assert!(left.contains(&"b1".to_string()));
+        assert!(left.contains(&"bl1".to_string()));
     }
 
     #[test]
@@ -793,6 +1355,111 @@ mod tests {
                 .any(|i| matches!(i, SearchItem::Artist { name, .. } if name == "Branimir")),
             "transposition typo should still match via edit-distance fallback"
         );
+
+        // "brainmirr": the same transposition plus a doubled last
+        // letter, so distance 2, which only a query this long has the
+        // budget for. Pins that queries over the one-edit budget keep
+        // the full distance rather than the budget-1 fast path.
+        let two_edits = c.search("brainmirr");
+        assert!(
+            two_edits
+                .iter()
+                .any(|i| matches!(i, SearchItem::Artist { name, .. } if name == "Branimir")),
+            "a 9-char query has a 2-edit budget and must still match"
+        );
+    }
+
+    /// `min_length_gap` has to agree with the obvious loop over the
+    /// set bits, for every single- and two-word length mask.
+    #[test]
+    fn min_length_gap_finds_the_nearest_word_length() {
+        let expected = |mask: u32, len: usize| -> usize {
+            let target = len.min(31);
+            (0..32)
+                .filter(|bit| mask & (1 << bit) != 0)
+                .map(|bit: usize| bit.abs_diff(target))
+                .min()
+                .unwrap_or(32)
+        };
+        let masks = (0..32u32)
+            .flat_map(|a| (0..32u32).map(move |b| (1 << a) | (1 << b)))
+            .chain([0, !0]);
+        for mask in masks {
+            for len in 0..40usize {
+                assert_eq!(
+                    min_length_gap(mask, len),
+                    expected(mask, len),
+                    "mask {mask:#034b} len {len}"
+                );
+            }
+        }
+    }
+
+    /// The word-length window has to keep every length the budget can
+    /// actually reach (a dropped length silently loses typo matches)
+    /// and, below the saturating 31-char bucket, nothing else. Checked
+    /// white-box because at the window's top edge the two signals
+    /// overlap: a word longer than the query by the whole budget is
+    /// only reachable by insertions, which makes the query a
+    /// subsequence of it, so the fuzzy pass hides the bug from any
+    /// end-to-end membership check.
+    #[test]
+    fn length_window_covers_exactly_the_reachable_word_lengths() {
+        for len in 0..40usize {
+            for budget in 0..4usize {
+                let window = length_window(len, budget);
+                for word_len in 0..60usize {
+                    let kept = window & (1 << word_len.min(31)) != 0;
+                    if word_len.abs_diff(len) <= budget {
+                        assert!(
+                            kept,
+                            "len {len} budget {budget} drops {word_len}-char words"
+                        );
+                    } else if word_len < 31 && len + budget < 31 {
+                        assert!(
+                            !kept,
+                            "len {len} budget {budget} keeps {word_len}-char words"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Exhaustive proof of the fast distance's equivalence to strsim
+    /// at a budget of 1: every pair of strings up to 4 chars over a
+    /// 3-letter alphabet (plus a few longer hand-picked ones), which
+    /// covers every substitution, insertion, deletion and adjacent
+    /// transposition shape there is.
+    #[test]
+    fn distance_at_most_one_matches_strsim_exactly() {
+        let mut words: Vec<String> = vec![String::new()];
+        for _ in 0..4 {
+            let grown: Vec<String> = words
+                .iter()
+                .flat_map(|w| "abc".chars().map(move |c| format!("{w}{c}")))
+                .collect();
+            words.extend(grown);
+        }
+        words.extend(
+            [
+                "branimir",
+                "brainmir",
+                "icedancer",
+                "icedacnre",
+                "blade",
+                "balde",
+            ]
+            .map(String::from),
+        );
+        for a in &words {
+            for b in &words {
+                let real = strsim::damerau_levenshtein(a, b);
+                let fast = distance_at_most_one(a.as_bytes(), b.as_bytes());
+                let want = (real <= 1).then_some(real);
+                assert_eq!(fast, want, "distance {a:?} -> {b:?} is {real}");
+            }
+        }
     }
 
     /// Regression test for the reported bug: searching "crest" (an
@@ -934,31 +1601,703 @@ mod tests {
         c
     }
 
+    /// Second synthetic corpus, same generator shape but a *wide*
+    /// vocabulary and all five item kinds, so match counts and word
+    /// shapes look like a real 40k library rather than 12 artists
+    /// repeated 3000 times each. `synthetic_corpus` is the worst case
+    /// for result-set size; this one is the realistic case.
+    fn varied_corpus(n: usize) -> Corpus {
+        const WORDS: [&str; 48] = [
+            "blade",
+            "runner",
+            "blues",
+            "cold",
+            "visions",
+            "crest",
+            "icedancer",
+            "eversince",
+            "obedient",
+            "rewind",
+            "decay",
+            "drownin",
+            "sunset",
+            "mall",
+            "western",
+            "union",
+            "hotel",
+            "breakfast",
+            "into",
+            "dust",
+            "tears",
+            "joy",
+            "paranoid",
+            "blackout",
+            "selected",
+            "ambient",
+            "works",
+            "music",
+            "right",
+            "children",
+            "lift",
+            "skinny",
+            "fists",
+            "college",
+            "dropout",
+            "justice",
+            "metal",
+            "essentials",
+            "midnight",
+            "city",
+            "velvet",
+            "mirror",
+            "static",
+            "garden",
+            "ghost",
+            "parade",
+            "winter",
+            "signal",
+        ];
+        // deterministic lcg; a real library's vocabulary is wide and
+        // its distribution lumpy, and a fixed stride would correlate
+        // every field of an item with every other.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |m: usize| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % m
+        };
+        let mut words = move |k: usize| {
+            (0..k)
+                .map(|_| WORDS[next(WORDS.len())])
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let client = test_client();
+        let mut c = Corpus::new();
+        // same mix a real library has: mostly songs, then albums,
+        // artists, a few playlists and videos.
+        let songs = n * 80 / 100;
+        let albums = n * 12 / 100;
+        let artists = n * 6 / 100;
+        c.add_local_tracks((0..songs / 2).map(|i| LocalTrack {
+            path: PathBuf::from(format!("/music/{i:06}.flac")),
+            title: words(2),
+            artist: Some(words(2)),
+            album: Some(words(2)),
+            duration_secs: None,
+            kind: MediaKind::Music,
+        }));
+        c.add_local_tracks((0..n / 100).map(|i| LocalTrack {
+            path: PathBuf::from(format!("/video/{i:06}.mkv")),
+            title: words(3),
+            artist: None,
+            album: None,
+            kind: MediaKind::Video,
+            duration_secs: None,
+        }));
+        c.add_subsonic_search_result(
+            SubsonicSearchResult {
+                artists: (0..artists)
+                    .map(|i| Artist {
+                        id: format!("ar{i}"),
+                        name: words(2),
+                    })
+                    .collect(),
+                albums: (0..albums)
+                    .map(|i| Album {
+                        id: format!("al{i}"),
+                        name: words(2),
+                        artist: words(2),
+                    })
+                    .collect(),
+                songs: (0..songs / 2)
+                    .map(|i| Song {
+                        id: format!("s{i}"),
+                        title: words(2),
+                        artist: words(2),
+                        album: words(2),
+                        duration: None,
+                        genres: Vec::new(),
+                    })
+                    .collect(),
+            },
+            &client,
+        );
+        c.add_playlists(
+            (0..n / 200).map(|i| Playlist {
+                id: format!("p{i}"),
+                name: words(2),
+            }),
+            &client,
+        );
+        c
+    }
+
+    /// Every query shape the correctness guards sweep: short/broad
+    /// prefixes, exact hits, multi-word, typos, no-match, mixed case,
+    /// non-ascii, and the characters nucleo's own pattern parser
+    /// treats as operators (`^ $ ! ' \ |`), which any prefilter must
+    /// not assume are literal haystack text.
+    const GUARD_QUERIES: [&str; 38] = [
+        // one char short of the 5-char word it matches, i.e. a word
+        // sitting on the top edge of the length window, where the
+        // typo score (85) beats what nucleo gives a gappy match
+        "blde",
+        // the long word again with two letters transposed, so it is
+        // reachable only through the edit-distance pass: proves the
+        // word-length bucket saturates instead of wrapping
+        "averyveryverylongsinglewordtitlethatoverflowsthebukcet",
+        // longer than the 31-char word-length bucket, so the length
+        // window saturates at its top bit
+        "averyveryverylongsinglewordtitlethatoverflowsthebucket",
+        // two substitutions over a word whose substituted letters are
+        // unique to it, so both directions of the char-mask lower
+        // bound sit exactly on a 2-edit budget: "midnight" and
+        // "obedient" with two letters each swapped for letters
+        // neither word contains
+        "xidnighy",
+        "obedixnz",
+        // adjacent transpositions inside a 1-edit budget, the one
+        // shape `distance_at_most_one` handles that a plain
+        // substitution/insertion/deletion check would miss
+        "balde",
+        "clod",
+        // 8 and 9 chars, where the budget is 2 and the fast path
+        // hands back off to strsim: one edit from "obedient", two
+        // (two transpositions) from "icedancer"
+        "obedeint",
+        "icedacnre",
+        "b",
+        "bl",
+        "bla",
+        "blad",
+        "blade",
+        "bladee",
+        "blade runner",
+        "blade runner blues",
+        "cold visions",
+        "crest",
+        "icedancer",
+        "obedient",
+        "ob",
+        "obe",
+        "god",
+        "gods",
+        "brainm",
+        "brainmi",
+        "brainmir",
+        "qqqxzz",
+        "BLADE",
+        "Blade Runner",
+        "mIdNiGhT",
+        "^blade",
+        "blade$",
+        "'blade",
+        "!blade",
+        "blade|runner",
+        "blàdé",
+    ];
+
+    /// Order-and-membership fingerprint of a result list: fnv-1a over
+    /// every item's identity in order. Pinned per query by
+    /// `search_results_are_unchanged`, so any reordering, addition or
+    /// removal shows up as a failure rather than as a "faster" search.
+    fn fingerprint(items: &[SearchItem]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut eat = |bytes: &[u8]| {
+            for b in bytes {
+                hash ^= u64::from(*b);
+                hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        for item in items {
+            let (tag, key) = item.identity();
+            eat(&[tag]);
+            eat(key.as_bytes());
+            eat(b"\x1f");
+        }
+        hash
+    }
+
+    /// `(query, result count, fingerprint)` for `varied_corpus(3_000)`,
+    /// blessed from the pre-optimization implementation. Any change to
+    /// what search returns, or to the order it returns it in, breaks
+    /// this; reranking is a product decision, so re-blessing has to be
+    /// deliberate. Regenerate by running the test and pasting the table
+    /// it prints.
+    #[rustfmt::skip]
+    const PINNED: [(&str, usize, u64); 38] = [
+        ("blde", 485, 0xda38_f4b1_7cf9_c977),
+        ("averyveryverylongsinglewordtitlethatoverflowsthebukcet", 0, 0xcbf2_9ce4_8422_2325),
+        ("averyveryverylongsinglewordtitlethatoverflowsthebucket", 0, 0xcbf2_9ce4_8422_2325),
+        ("xidnighy", 354, 0x304c_09f0_ed6e_ea13),
+        ("obedixnz", 315, 0xdfad_bcd4_8e6c_8b68),
+        ("balde", 387, 0x385d_1bdd_4dd7_c7df),
+        ("clod", 474, 0x6a83_5d47_2ec9_e1c0),
+        ("obedeint", 129, 0xb3b3_8077_be08_5dce),
+        ("icedacnre", 73, 0xd229_2d69_866b_4280),
+        ("b", 1094, 0xb7e9_d075_2c60_f452),
+        ("bl", 867, 0xba5b_70fc_7a23_c14b),
+        ("bla", 717, 0x2eda_b913_f7b3_caf4),
+        ("blad", 501, 0xf650_49a4_b2d9_cccf),
+        ("blade", 447, 0x162c_be8f_180a_1ccd),
+        ("bladee", 271, 0xebb4_3859_f29c_f61c),
+        ("blade runner", 45, 0x6ca9_aefc_081d_eb25),
+        ("blade runner blues", 17, 0xce83_cec8_ffab_bee6),
+        ("cold visions", 72, 0xad50_0026_04f9_a4a2),
+        ("crest", 460, 0x7bc1_6525_b793_7c6d),
+        ("icedancer", 333, 0x0ee3_890c_975c_e108),
+        ("obedient", 315, 0xdfad_bcd4_8e6c_8b68),
+        ("ob", 315, 0xdfad_bcd4_8e6c_8b68),
+        ("obe", 316, 0xb7fa_9087_3781_aa47),
+        ("god", 211, 0xde03_7bfb_b2cc_a968),
+        ("gods", 82, 0xddec_aa68_23ad_5921),
+        ("brainm", 30, 0xce74_4cdb_c837_b406),
+        ("brainmi", 27, 0x2e81_9569_db6b_55c3),
+        ("brainmir", 12, 0xf9e9_71d8_1237_8cc6),
+        ("qqqxzz", 0, 0xcbf2_9ce4_8422_2325),
+        ("BLADE", 307, 0xf8a9_24ad_cde1_23c5),
+        ("Blade Runner", 0, 0xcbf2_9ce4_8422_2325),
+        ("mIdNiGhT", 354, 0x304c_09f0_ed6e_ea13),
+        ("^blade", 63, 0x27a1_0f63_2322_5e0b),
+        ("blade$", 68, 0x3877_9407_b137_8259),
+        ("'blade", 307, 0xf8a9_24ad_cde1_23c5),
+        // was (307, 0xf8a9_24ad_cde1_23c5), byte-identical to
+        // `'blade`'s row above, which is what "nucleo ignores
+        // negation" looked like from here. now 0: the exclusion is
+        // honoured, and `!blade` alone leaves nothing positive to rank.
+        ("!blade", 0, 0xcbf2_9ce4_8422_2325),
+        ("blade|runner", 0, 0xcbf2_9ce4_8422_2325),
+        ("bl\u{e0}d\u{e9}", 0, 0xcbf2_9ce4_8422_2325),
+    ];
+
+    /// Membership and order are the product; speed is not allowed to
+    /// change either. See `PINNED`.
+    #[test]
+    fn search_results_are_unchanged() {
+        let c = varied_corpus(3_000);
+        let actual: Vec<(&str, usize, u64)> = GUARD_QUERIES
+            .iter()
+            .map(|q| {
+                let r = c.search(q);
+                (*q, r.len(), fingerprint(&r))
+            })
+            .collect();
+        if actual.as_slice() != PINNED.as_slice() {
+            let table: String = actual
+                .iter()
+                .map(|(q, n, h)| {
+                    let (a, b, c, d) =
+                        (h >> 48, (h >> 32) & 0xffff, (h >> 16) & 0xffff, h & 0xffff);
+                    format!("        ({q:?}, {n}, 0x{a:04x}_{b:04x}_{c:04x}_{d:04x}),\n")
+                })
+                .collect();
+            panic!("search results changed; fresh table:\n{table}");
+        }
+    }
+
+    /// The pre-optimization scorer, kept verbatim as the oracle every
+    /// prefilter and fast path has to agree with: no char-mask
+    /// prefilters, always the full `strsim` distance. Deliberately
+    /// naive; `scorers_agree_on_every_query_shape` compares the real
+    /// hot path against it item by item.
+    fn reference_score(
+        entry: &Entry,
+        pattern: &Pattern,
+        query_lower: &str,
+        query_len: usize,
+        typo_budget: usize,
+        matcher: &mut Matcher,
+    ) -> Option<u32> {
+        let mut buf = Vec::new();
+        let fuzzy_score = pattern.score(Utf32Str::new(&entry.haystack, &mut buf), matcher);
+        let typo_score_val = if fuzzy_score.is_some_and(|s| s >= typo_score(0)) {
+            None
+        } else {
+            entry
+                .haystack_lower
+                .split_whitespace()
+                .filter(|word| word.chars().count().abs_diff(query_len) <= typo_budget)
+                .map(|word| strsim::damerau_levenshtein(query_lower, word))
+                .filter(|&dist| dist <= typo_budget)
+                .map(typo_score)
+                .max()
+        };
+        match (fuzzy_score, typo_score_val) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0).max(b.unwrap_or(0))),
+        }
+    }
+
+    /// The real hot path must score every item exactly as the naive
+    /// reference does: same match/no-match decision, same score. This
+    /// is the guard that catches a prefilter that rejects something it
+    /// should have kept (verified by deliberately breaking one).
+    /// Items built to break the prefilters: accented text nucleo
+    /// matches an ascii pattern against anyway, unicode whitespace
+    /// that splits into different words than ascii whitespace does, a
+    /// word past the 31-char length bucket, and a bare digit.
+    fn hostile_items(c: &mut Corpus) {
+        for (i, title) in [
+            "Blàdé Rünner Blües",
+            "blade\u{a0}runner\u{3000}blues",
+            "averyveryverylongsinglewordtitlethatoverflowsthebucket blade",
+            "7",
+            "BLADE RUNNER",
+            "bladé",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            c.add_local_tracks([LocalTrack {
+                path: PathBuf::from(format!("/music/hostile{i}.flac")),
+                title: title.to_string(),
+                artist: None,
+                album: None,
+                duration_secs: None,
+                kind: MediaKind::Music,
+            }]);
+        }
+    }
+
+    #[test]
+    fn scorers_agree_on_every_query_shape() {
+        let mut c = varied_corpus(4_000);
+        hostile_items(&mut c);
+        let mut matcher = Matcher::default();
+        for query in GUARD_QUERIES {
+            let needle = Needle::new(query);
+            let mut scratch = Scratch::default();
+            let fast = score_chunk(&c.items, &needle, &mut scratch);
+            // the reference gets the same exclusion the hot path
+            // applies: `!term` is a filter over the corpus, not part of
+            // scoring, so excluding it here keeps this an apples-to-
+            // apples test of the *scorer*. that exclusion is correct is
+            // what `an_excluded_term_drops_the_matches_that_contain_it`
+            // and its neighbours are for.
+            let expected: Vec<(u32, &SearchItem)> = c
+                .items
+                .iter()
+                .filter(|e| !needle.excludes(&e.haystack_lower))
+                .filter_map(|e| {
+                    reference_score(
+                        e,
+                        &needle.pattern,
+                        &needle.lower,
+                        needle.len,
+                        needle.budget,
+                        &mut matcher,
+                    )
+                    .map(|s| (s, &e.item))
+                })
+                .collect();
+            assert_eq!(
+                fast.len(),
+                expected.len(),
+                "{query:?}: candidate count differs from the reference scorer"
+            );
+            for (i, ((fs, fi), (es, ei))) in fast.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(
+                    (fs, fi.identity()),
+                    (es, ei.identity()),
+                    "{query:?}: candidate {i} differs from the reference scorer"
+                );
+            }
+        }
+    }
+
+    /// Fanning the scoring out across threads must not change a single
+    /// result: chunks are rejoined in corpus order precisely so the
+    /// stable sort breaks ties the same way at any thread count.
+    #[test]
+    fn threaded_and_sequential_scoring_agree() {
+        let c = varied_corpus(5_000);
+        assert!(
+            c.items.len() > thread_count(),
+            "needs more items than threads, or there is only one chunk to compare"
+        );
+        for query in GUARD_QUERIES {
+            let par = rank(c.score_all_maybe_parallel(query, true));
+            let seq = rank(c.score_all_maybe_parallel(query, false));
+            assert_eq!(
+                fingerprint(&par),
+                fingerprint(&seq),
+                "{query:?}: threaded scoring changed the result list"
+            );
+        }
+    }
+
+    /// Appending a character can *add* candidates, so a type-ahead
+    /// optimization must not narrow the previous result set: the typo
+    /// fallback's budget grows with query length, and a longer query
+    /// can land inside a word's edit distance that a shorter one
+    /// missed. Pinned as a test because the "just narrow the previous
+    /// hits" shortcut is otherwise extremely tempting; see
+    /// docs/search-performance.md.
+    #[test]
+    fn appending_a_char_can_add_candidates() {
+        let mut c = Corpus::new();
+        c.add_subsonic_search_result(
+            SubsonicSearchResult {
+                artists: vec![Artist {
+                    id: "a1".into(),
+                    name: "Branimir".into(),
+                }],
+                albums: vec![],
+                songs: vec![],
+            },
+            &test_client(),
+        );
+        // "brainm" is 3 edits from "branimir" (budget 1 at that
+        // length), "brainmir" is 1 (budget 2): the superset is the
+        // longer query, not the shorter one.
+        assert!(
+            c.search("brainm").is_empty(),
+            "precondition: the shorter query must miss"
+        );
+        assert!(
+            !c.search("brainmir").is_empty(),
+            "appending chars turned a miss into a hit; narrowing the \
+             previous result set would have lost this match"
+        );
+    }
+
+    /// Minimum of `iters` runs, plus the last run's value. The *minimum*
+    /// rather than the mean on purpose: this machine's other cores are
+    /// not idle during a bench run (parallel builds), and only the
+    /// minimum is close to the uncontended cost.
+    fn bench<T>(iters: u32, mut f: impl FnMut() -> T) -> (std::time::Duration, T) {
+        let mut best = std::time::Duration::MAX;
+        let mut last = f();
+        for _ in 0..iters {
+            let start = std::time::Instant::now();
+            last = f();
+            best = best.min(start.elapsed());
+        }
+        (best, last)
+    }
+
+    /// Cpu time, not wall time: this machine's other cores are busy
+    /// during a bench run, so wall clock varies 2-3x between runs
+    /// while the work done does not. Paired with `parallel = false` it
+    /// is the one number that can be compared across commits.
+    fn cpu_now() -> std::time::Duration {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime only writes the timespec we hand it.
+        unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+        std::time::Duration::new(
+            u64::try_from(ts.tv_sec).unwrap_or(0),
+            u32::try_from(ts.tv_nsec).unwrap_or(0),
+        )
+    }
+
+    fn bench_cpu<T>(iters: u32, mut f: impl FnMut() -> T) -> (std::time::Duration, T) {
+        let mut best = std::time::Duration::MAX;
+        let mut last = f();
+        for _ in 0..iters {
+            let start = cpu_now();
+            last = f();
+            best = best.min(cpu_now().saturating_sub(start));
+        }
+        (best, last)
+    }
+
+    /// The whole of `search`, scored on one thread, in cpu time. The
+    /// comparable-across-commits number; the threaded wall clock is in
+    /// `bench_search`.
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_cpu_search() {
+        for (label, c) in [
+            ("narrow-vocab 40k", synthetic_corpus(40_000)),
+            ("varied 40k", varied_corpus(40_000)),
+            ("varied 150k", varied_corpus(150_000)),
+        ] {
+            for query in BENCH_QUERIES {
+                let (cpu, out) =
+                    bench_cpu(8, || rank(c.score_all_maybe_parallel(query, false)).len());
+                println!("{label:<18} {query:<14} cpu {cpu:>11.3?}  ({out} hits)");
+            }
+        }
+    }
+
+    const BENCH_QUERIES: [&str; 7] = [
+        "b",
+        "bla",
+        "blade",
+        "bladee",
+        "blade runner",
+        "brainmir",
+        "qqqxzz",
+    ];
+
     /// Not an assertion: prints per-query wall time, since absolute
     /// numbers are machine-dependent. Run with
     /// `cargo test --release -- --ignored --nocapture bench_search`.
     /// "b" is the worst case for match count, "brainmir" for the
-    /// edit-distance fallback.
+    /// edit-distance fallback, "qqqxzz" for pure rejection cost.
     #[test]
     #[ignore = "timing benchmark, run manually"]
     fn bench_search() {
-        for size in [10_000usize, 100_000] {
-            let c = synthetic_corpus(size);
-            for query in ["b", "bla", "blade", "blade runner", "brainmir"] {
-                let iters: u32 = if size >= 100_000 { 5 } else { 20 };
-                let mut hits = 0usize;
-                let start = std::time::Instant::now();
-                for _ in 0..iters {
-                    hits += c.search(query).len();
+        for (label, c) in [
+            ("narrow-vocab 40k", synthetic_corpus(40_000)),
+            ("varied 40k", varied_corpus(40_000)),
+            ("varied 150k", varied_corpus(150_000)),
+        ] {
+            for query in BENCH_QUERIES {
+                let (per, hits) = bench(12, || c.search(query).len());
+                println!("{label:<18} {query:<14} {per:>12.3?}  ({hits} hits)");
+            }
+        }
+    }
+
+    /// Where the time goes: scoring (fanned out, and forced
+    /// single-threaded so the number is noise-immune) vs ranking
+    /// (sort + weak-match cutoff + grouping + materializing).
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_phases() {
+        for (label, c) in [
+            ("narrow-vocab 40k", synthetic_corpus(40_000)),
+            ("varied 40k", varied_corpus(40_000)),
+        ] {
+            for query in BENCH_QUERIES {
+                let (par, cand) = bench(12, || c.score_all(query).len());
+                let (seq, _) = bench(6, || c.score_all_maybe_parallel(query, false).len());
+                // ranking is timed on its own, with the scoring it
+                // needs as input left outside the clock; subtracting
+                // two independently-taken minima is not a measurement.
+                let mut rank_t = std::time::Duration::MAX;
+                let mut out = 0;
+                for _ in 0..12 {
+                    let scored = c.score_all(query);
+                    let start = std::time::Instant::now();
+                    let ranked = rank(scored);
+                    rank_t = rank_t.min(start.elapsed());
+                    out = ranked.len();
                 }
-                let per = start.elapsed() / iters;
                 println!(
-                    "{size:>7} items  {:<14} {per:>12.3?}  ({} hits)",
-                    query,
-                    hits / iters as usize
+                    "{label:<18} {query:<14} score {par:>10.3?} (1 thread {seq:>10.3?})  \
+                     rank {rank_t:>10.3?}   cand {cand:>6} out {out:>6}"
                 );
             }
         }
+    }
+
+    /// Where fanning the scoring out across threads starts paying for
+    /// its own spawn/join cost; sets `PARALLEL_SCORING_FLOOR`.
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_parallel_floor() {
+        for size in [500usize, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000] {
+            let c = varied_corpus(size);
+            for query in ["b", "bladee", "brainmir", "qqqxzz"] {
+                let (seq, _) = bench(20, || c.score_all_maybe_parallel(query, false).len());
+                let (par, _) = bench(20, || c.score_all_maybe_parallel(query, true).len());
+                let verdict = if par < seq {
+                    "threads win"
+                } else {
+                    "sequential wins"
+                };
+                println!(
+                    "{:>6} items  {query:<10} seq {seq:>10.3?}  par {par:>10.3?}  {verdict}",
+                    c.items.len()
+                );
+            }
+        }
+    }
+
+    /// The shape that actually matters: one keystroke at a time, each
+    /// re-searching with one more char. Prints the per-keystroke cost
+    /// (min over replays of the whole sequence).
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_typeahead() {
+        for (label, c) in [
+            ("narrow-vocab 40k", synthetic_corpus(40_000)),
+            ("varied 40k", varied_corpus(40_000)),
+        ] {
+            for typed in ["bladee", "blade runner", "qqqxzz"] {
+                let chars: Vec<char> = typed.chars().collect();
+                let mut best = vec![std::time::Duration::MAX; chars.len()];
+                let mut hits = vec![0usize; chars.len()];
+                for _ in 0..6 {
+                    for (i, _) in chars.iter().enumerate() {
+                        let prefix: String = chars[..=i].iter().collect();
+                        let start = std::time::Instant::now();
+                        let out = c.search(&prefix);
+                        best[i] = best[i].min(start.elapsed());
+                        hits[i] = out.len();
+                    }
+                }
+                let total: std::time::Duration = best.iter().sum();
+                println!("{label:<18} typing {typed:?}: total {total:>10.3?}");
+                for (i, t) in best.iter().enumerate() {
+                    let prefix: String = chars[..=i].iter().collect();
+                    println!("    {:<14} {t:>10.3?}  ({} hits)", prefix, hits[i]);
+                }
+            }
+        }
+    }
+
+    /// Throwaway probe: is the *candidate* set (pre-cutoff) monotone
+    /// shrinking as a query grows by one char? Prints counterexamples.
+    #[test]
+    #[ignore = "diagnostic probe, run manually"]
+    fn probe_monotonicity() {
+        let c = synthetic_corpus(20_000);
+        let words = [
+            "blade runner blues",
+            "bladee",
+            "brainmir",
+            "branimir stulic",
+            "cigarettes",
+            "icedancer",
+            "selena gomez",
+            "godspeed",
+            "obedient",
+            "zzyzx",
+            "lesna",
+            "crest",
+            "music has the right",
+        ];
+        let mut breaks = 0usize;
+        for w in words {
+            let chars: Vec<char> = w.chars().collect();
+            for len in 1..chars.len() {
+                let short: String = chars[..len].iter().collect();
+                let long: String = chars[..len + 1].iter().collect();
+                let a: HashSet<(u8, String)> = c
+                    .score_all(&short)
+                    .into_iter()
+                    .map(|(_, i)| {
+                        let (t, k) = i.identity();
+                        (t, k.into_owned())
+                    })
+                    .collect();
+                let mut escaped = Vec::new();
+                for (_, item) in c.score_all(&long) {
+                    let (t, k) = item.identity();
+                    let key = (t, k.into_owned());
+                    if !a.contains(&key) {
+                        escaped.push((key, item.haystack()));
+                    }
+                }
+                if !escaped.is_empty() {
+                    breaks += 1;
+                    println!(
+                        "NOT MONOTONE: {short:?} -> {long:?}: {} new candidates, e.g. {:?}",
+                        escaped.len(),
+                        &escaped[..escaped.len().min(3)]
+                    );
+                }
+            }
+        }
+        println!("{breaks} non-monotone steps");
     }
 
     /// Mirror of the above: when nothing in the corpus is a strong
@@ -1005,5 +2344,107 @@ mod tests {
             3,
             "no standout match among near-equal candidates; none should be cut: got {results:?}"
         );
+    }
+
+    /// A corpus where one item carries a word the other does not, for
+    /// the exclusion tests.
+    fn exclusion_corpus() -> Corpus {
+        let mut c = Corpus::new();
+        c.add_local_tracks([
+            LocalTrack {
+                path: PathBuf::from("/m/a.flac"),
+                title: "Blade Runner Blues".into(),
+                artist: Some("Vangelis".into()),
+                album: Some("Blade Runner".into()),
+                duration_secs: None,
+                kind: MediaKind::Music,
+            },
+            LocalTrack {
+                path: PathBuf::from("/m/b.flac"),
+                title: "Blade Runner Blues (Live)".into(),
+                artist: Some("Vangelis".into()),
+                album: Some("Blade Runner Live".into()),
+                duration_secs: None,
+                kind: MediaKind::Music,
+            },
+        ]);
+        c
+    }
+
+    fn titles(items: &[SearchItem]) -> Vec<String> {
+        items.iter().map(|i| i.primary_name().to_string()).collect()
+    }
+
+    /// The bug: nucleo parses `!foo` but `Pattern::score` ignores it, so
+    /// this used to return both rows.
+    #[test]
+    fn an_excluded_term_drops_the_matches_that_contain_it() {
+        let c = exclusion_corpus();
+        let got = titles(&c.search("blade runner !live"));
+        assert!(
+            got.iter().any(|t| t == "Blade Runner Blues"),
+            "the positive match should survive: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|t| t.contains("Live")),
+            "the excluded row is still here: {got:?}"
+        );
+    }
+
+    #[test]
+    fn exclusion_ignores_case() {
+        let c = exclusion_corpus();
+        for q in ["blade runner !LIVE", "blade runner !Live"] {
+            let got = titles(&c.search(q));
+            assert!(!got.iter().any(|t| t.contains("Live")), "{q}: {got:?}");
+            assert!(!got.is_empty(), "{q} dropped everything: {got:?}");
+        }
+    }
+
+    /// Excluding something absent must not disturb the ranking, which
+    /// is what says the positive half still goes through the normal path.
+    #[test]
+    fn excluding_an_absent_term_leaves_the_ranking_alone() {
+        let c = exclusion_corpus();
+        assert_eq!(
+            titles(&c.search("blade runner !zzzznothing")),
+            titles(&c.search("blade runner")),
+        );
+    }
+
+    #[test]
+    fn an_exclusion_only_query_ranks_nothing() {
+        let c = exclusion_corpus();
+        assert!(
+            c.search("!live").is_empty(),
+            "there is nothing positive to rank against"
+        );
+        assert!(c.search("  !live   ").is_empty());
+    }
+
+    /// A bare `!` has no term after it, so it is the literal the user
+    /// typed rather than an exclusion of everything.
+    #[test]
+    fn a_bare_bang_is_not_an_exclusion() {
+        let (positive, excluded) = split_exclusions("blade !");
+        assert_eq!(positive, "blade !");
+        assert!(excluded.is_empty());
+    }
+
+    #[test]
+    fn several_exclusions_all_apply() {
+        let (positive, excluded) = split_exclusions("blade !live !remix");
+        assert_eq!(positive, "blade");
+        assert_eq!(excluded, vec!["live".to_string(), "remix".to_string()]);
+    }
+
+    /// `search_names` reads the same ranking, so it has to honour the
+    /// exclusion too; it would be its own bug if only `search` did.
+    #[test]
+    fn search_names_honours_exclusions() {
+        let c = exclusion_corpus();
+        let names = c.search_names("blade runner !live", 10);
+        assert!(!names.is_empty(), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("Live")), "{names:?}");
     }
 }
