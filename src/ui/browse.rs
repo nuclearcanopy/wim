@@ -187,7 +187,14 @@ impl Widget for BrowseListView<'_> {
             (true, Some(y)) => format!(" · {y}"),
             (true, None) => String::new(),
         };
-        let title_line = format!("{}{subtitle}", self.view.title);
+        // while fetches are still in flight the header says so, so a
+        // short list is never mistaken for the whole album.
+        let still_loading = if self.view.loading {
+            " · loading..."
+        } else {
+            ""
+        };
+        let title_line = format!("{}{subtitle}{still_loading}", self.view.title);
         // exactly one rule above the title and one below it: this
         // first one continues the sidebar's search-box top border
         // straight across (`ui::junctions` puts the ┬ there),
@@ -244,7 +251,8 @@ impl Widget for BrowseListView<'_> {
         }
 
         if self.view.tracks.is_empty() {
-            draw_line(buf, list_area, y, "(no tracks)", shade(DIM));
+            let msg = crate::browse::pane_message(self.view.loading, false, "tracks");
+            draw_line(buf, list_area, y, &msg, shade(DIM));
             return;
         }
         draw_track_list(
@@ -274,7 +282,8 @@ impl BrowseListView<'_> {
         let albums_rect = c.albums;
 
         if self.view.albums.is_empty() {
-            draw_line(buf, albums_rect, albums_rect.y, "(no albums)", shade(DIM));
+            let msg = crate::browse::pane_message(self.view.loading, false, "albums");
+            draw_line(buf, albums_rect, albums_rect.y, &msg, shade(DIM));
         } else {
             draw_simple_list(
                 buf,
@@ -302,12 +311,12 @@ impl BrowseListView<'_> {
         let songs_rect = c.songs;
         let visible = self.view.visible_track_indices();
         if visible.is_empty() {
-            let msg = if self.view.filter_query.is_empty() {
-                "(no tracks)"
-            } else {
-                "(no matches)"
-            };
-            draw_line(buf, songs_rect, songs_rect.y, msg, shade(DIM));
+            let msg = crate::browse::pane_message(
+                self.view.loading,
+                !self.view.filter_query.is_empty(),
+                "tracks",
+            );
+            draw_line(buf, songs_rect, songs_rect.y, &msg, shade(DIM));
             return;
         }
         draw_track_list(
@@ -465,6 +474,7 @@ mod tests {
             filter_query: String::new(),
             filtering: false,
             show_track_artist: false,
+            loading: false,
         }
     }
 
