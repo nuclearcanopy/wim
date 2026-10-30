@@ -45,15 +45,28 @@ impl NavidromeConfig {
     }
 }
 
+/// What the album-art panel should show, named after the result rather
+/// than the protocol: `ascii-*` is wim's own block rasterizer (nothing
+/// needed from the terminal), `full-*` a real inline graphics protocol
+/// (sixel/kitty/iterm2), each in greyscale or colour. `auto` resolves
+/// to the best available, `off` drops the panel.
+///
+/// The pre-rename values still parse, as serde aliases, so a config
+/// written before this existed keeps loading: `blocks` was the
+/// monochrome rasterizer, and naming a protocol outright
+/// (`sixel`/`kitty`/`iterm2`) was an explicit ask for real art, which
+/// is `full-color`. Serializing writes the new names.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum AlbumArtMode {
     #[default]
     Auto,
-    Blocks,
-    Sixel,
-    Kitty,
-    Iterm2,
+    #[serde(alias = "blocks")]
+    AsciiBw,
+    AsciiColor,
+    FullBw,
+    #[serde(alias = "sixel", alias = "kitty", alias = "iterm2")]
+    FullColor,
     Off,
 }
 
@@ -432,6 +445,54 @@ mod tests {
         let cfg: Config = toml::from_str("album_art = \"auto\"\n").expect("parsing");
         assert!(cfg.eq_custom_presets.is_empty());
         assert_eq!(cfg.eq_gains, None);
+    }
+
+    /// A config written before the four art modes existed names a
+    /// protocol or `blocks`; every one of those has to keep parsing,
+    /// into the mode that means the same thing. `blocks` asked for the
+    /// monochrome rasterizer (`ascii-bw`); naming a protocol asked for
+    /// real art, which is `full-color`.
+    #[test]
+    fn the_pre_rename_album_art_values_still_parse() {
+        for (raw, want) in [
+            ("auto", AlbumArtMode::Auto),
+            ("blocks", AlbumArtMode::AsciiBw),
+            ("sixel", AlbumArtMode::FullColor),
+            ("kitty", AlbumArtMode::FullColor),
+            ("iterm2", AlbumArtMode::FullColor),
+            ("off", AlbumArtMode::Off),
+            // and the names this writes now
+            ("ascii-bw", AlbumArtMode::AsciiBw),
+            ("ascii-color", AlbumArtMode::AsciiColor),
+            ("full-bw", AlbumArtMode::FullBw),
+            ("full-color", AlbumArtMode::FullColor),
+        ] {
+            let cfg: Config = toml::from_str(&format!("album_art = \"{raw}\"\n"))
+                .unwrap_or_else(|e| panic!("album_art = {raw:?} stopped parsing: {e}"));
+            assert_eq!(cfg.album_art, want, "album_art = {raw:?}");
+        }
+    }
+
+    /// What `save` writes has to be what `load_or_init` reads, so a
+    /// mode set in the app survives a restart.
+    #[test]
+    fn every_album_art_mode_round_trips_through_toml() {
+        for mode in [
+            AlbumArtMode::Auto,
+            AlbumArtMode::AsciiBw,
+            AlbumArtMode::AsciiColor,
+            AlbumArtMode::FullBw,
+            AlbumArtMode::FullColor,
+            AlbumArtMode::Off,
+        ] {
+            let cfg = Config {
+                album_art: mode,
+                ..Default::default()
+            };
+            let text = toml::to_string_pretty(&cfg).expect("serializing");
+            let back: Config = toml::from_str(&text).expect("parsing back");
+            assert_eq!(back.album_art, mode, "{mode:?} did not survive:\n{text}");
+        }
     }
 
     /// A config written before mouse support existed has to come back
