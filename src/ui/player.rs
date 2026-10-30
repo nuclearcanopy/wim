@@ -470,7 +470,10 @@ impl PlayerView<'_> {
             vec!["tab: move focus".into(), minimize]
         };
         let lengths: Vec<usize> = parts.iter().map(|p| width(p)).collect();
-        let fits = segments_that_fit(&lengths, avail, HINT_SEP.len()).max(1);
+        // cells, not bytes: the separator is 5 columns and 6 bytes
+        // (the middle dot is two), so `len()` over-charged a cell per
+        // gap and dropped a hint earlier than it needed to.
+        let fits = segments_that_fit(&lengths, avail, width(HINT_SEP)).max(1);
         parts[..fits].join(HINT_SEP)
     }
 
