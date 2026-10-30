@@ -78,6 +78,44 @@ pub fn count(s: &Suggestions) -> usize {
     s.len()
 }
 
+/// Rows `draw_header` eats above the body: its text line plus the rule
+/// under it. Hardcoded here because the body's y is needed without
+/// drawing; it must match what `ui::header::draw_header` returns.
+/// The rect the suggestion rows are drawn into, so a hit map knows which
+/// absolute row is row 0 of `row_items` (see `hit::List`). The header's
+/// height comes from `ui::header`, which is also where it is checked
+/// against what `draw_header` actually returns.
+pub fn body_rect(area: Rect) -> Rect {
+    crate::ui::header::body(area)
+}
+
+/// Suggestion index per visible body row, `None` on a gap, a heading or
+/// past the end; always exactly `body_rect`'s height long, so the
+/// caller can index it by row. Same `rows` and offset the render itself
+/// uses, so a click resolves to the row the user saw rather than to a
+/// second guess at where it landed.
+pub fn row_items(suggestions: &Suggestions, selected: usize, area: Rect) -> Vec<Option<usize>> {
+    // nothing to suggest draws two message rows and no suggestions, so
+    // there is nothing on it to click.
+    if area.width == 0 || suggestions.is_empty() {
+        return Vec::new();
+    }
+    let body_height = body_rect(area).height as usize;
+    if body_height == 0 {
+        return Vec::new();
+    }
+    let rows = rows(suggestions);
+    let offset = scroll::offset_for(row_of(&rows, selected), body_height);
+    (0..body_height)
+        .map(|row| match rows.get(offset + row) {
+            // the reason line is part of the suggestion above it (the
+            // plate already spans both), so either row picks it.
+            Some(Row::Item(i) | Row::Reason(i)) => Some(*i),
+            Some(Row::Gap | Row::Section(_)) | None => None,
+        })
+        .collect()
+}
+
 impl Widget for SuggestionsView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
@@ -98,7 +136,10 @@ impl Widget for SuggestionsView<'_> {
             shade(DIM),
             shade(NEAR_BLACK),
         );
-        let body_height = (area.y + area.height).saturating_sub(body_top) as usize;
+        // one derivation of the body geometry, shared with `row_items`.
+        let body = body_rect(area);
+        debug_assert_eq!(body_top, body.y, "ui::header::ROWS is out of step");
+        let body_height = body.height as usize;
         if body_height == 0 {
             return;
         }
@@ -172,7 +213,7 @@ mod tests {
     use super::*;
     use crate::search::SearchItem;
     use crate::suggest::{Section, Suggestion};
-    use crate::ui::testbuf::{buffer, grid};
+    use crate::ui::testbuf::{buffer, char_at, grid};
 
     fn song(title: &str) -> SearchItem {
         SearchItem::LocalMusic {
@@ -352,6 +393,175 @@ mod tests {
         };
         let out = render(&s, 27, 60, 10);
         assert!(out.contains("t27"), "selection must be visible:\n{out}");
+    }
+
+    /// Thirty suggestions in one section, named so that no title or
+    /// reason is a substring of another's (`t2` inside `t27` would let a
+    /// wrong answer pass the painted-text check below).
+    fn one_long_section() -> Suggestions {
+        Suggestions {
+            sections: vec![Section {
+                title: Reason::DailyRotation.title().to_string(),
+                reason: Reason::DailyRotation,
+                items: (0..30)
+                    .map(|i| suggestion(&format!("t{i}"), &format!("because {i} fired")))
+                    .collect(),
+            }],
+        }
+    }
+
+    /// What `row_items` claims for each body row, paired with the text
+    /// `render` actually painted on that same row.
+    fn painted(s: &Suggestions, selected: usize, w: u16, h: u16) -> Vec<(Option<usize>, String)> {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = buffer(w.max(1), h.max(1));
+        SuggestionsView {
+            suggestions: s,
+            selected,
+            focused: true,
+            elapsed: Duration::ZERO,
+            enriching: false,
+        }
+        .render(area, &mut buf);
+        let lines: Vec<String> = grid(&buf).lines().map(str::to_string).collect();
+        row_items(s, selected, area)
+            .into_iter()
+            .enumerate()
+            .map(|(i, item)| (item, lines[crate::ui::header::ROWS as usize + i].clone()))
+            .collect()
+    }
+
+    /// Every body row's answer is the suggestion whose title or reason
+    /// is on it; a `None` row has to be a heading or untouched fill (a
+    /// gap paints nothing), never a suggestion the map failed to name.
+    fn assert_agrees(s: &Suggestions, selected: usize, w: u16, h: u16) {
+        let flat: Vec<_> = s.flat().collect();
+        for (i, (item, text)) in painted(s, selected, w, h).iter().enumerate() {
+            match item {
+                Some(idx) => {
+                    let (_, sug) = flat[*idx];
+                    assert!(
+                        text.contains(&label(&sug.item)) || text.contains(&sug.reason_text),
+                        "body row {i} claims suggestion {idx} but painted {text:?}"
+                    );
+                }
+                None => {
+                    let blank = text.chars().all(|c| c == '.');
+                    let heading = s
+                        .sections
+                        .iter()
+                        .any(|sec| text.contains(sec.reason.title()));
+                    assert!(
+                        blank || heading,
+                        "body row {i} claims no suggestion but painted {text:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row_items_names_the_suggestion_render_painted_on_each_row() {
+        let s = two_sections();
+        assert_eq!(
+            row_items(&s, 0, Rect::new(0, 0, 60, 12)),
+            vec![
+                None, // heading
+                Some(0),
+                Some(0), // the reason line belongs to the title above it
+                None,    // gap
+                None,    // heading
+                Some(1),
+                Some(1),
+                // past the end of the list
+                None,
+                None,
+                None,
+            ],
+            "ten body rows under a two-row header"
+        );
+        assert_agrees(&s, 0, 60, 12);
+    }
+
+    #[test]
+    fn row_items_follows_the_scroll_offset() {
+        let s = one_long_section();
+        // a window this far down holds no heading and no gap, and it
+        // opens on a reason line rather than a title, which an offset of
+        // 0 would get wrong in both directions.
+        assert_eq!(
+            row_items(&s, 27, Rect::new(0, 0, 60, 10)),
+            vec![
+                Some(23),
+                Some(24),
+                Some(24),
+                Some(25),
+                Some(25),
+                Some(26),
+                Some(26),
+                Some(27),
+            ]
+        );
+        assert_agrees(&s, 27, 60, 10);
+
+        // and with the selection on the very last suggestion.
+        assert_eq!(
+            row_items(&s, 29, Rect::new(0, 0, 60, 10)),
+            vec![
+                Some(25),
+                Some(26),
+                Some(26),
+                Some(27),
+                Some(27),
+                Some(28),
+                Some(28),
+                Some(29),
+            ]
+        );
+        assert_agrees(&s, 29, 60, 10);
+    }
+
+    #[test]
+    fn the_body_rect_is_where_render_starts_drawing_rows() {
+        let s = two_sections();
+        let area = Rect::new(2, 1, 50, 10);
+        let mut buf = buffer(60, 12);
+        SuggestionsView {
+            suggestions: &s,
+            selected: 0,
+            focused: true,
+            elapsed: Duration::ZERO,
+            enriching: false,
+        }
+        .render(area, &mut buf);
+        let body = body_rect(area);
+        assert_eq!((body.x, body.y, body.width, body.height), (2, 3, 50, 8));
+        let row: String = (body.x..body.x + body.width)
+            .map(|x| char_at(&buf, x, body.y))
+            .collect();
+        assert!(
+            row.contains("your daily rotation"),
+            "row 0 of the body rect is the first row render drew: {row}"
+        );
+    }
+
+    #[test]
+    fn row_items_at_degenerate_sizes_is_empty_or_exactly_the_body() {
+        let s = two_sections();
+        for (w, h) in [(1, 1), (0, 5), (5, 0), (3, 2), (80, 1), (80, 2), (80, 3)] {
+            let area = Rect::new(0, 0, w, h);
+            let map = row_items(&s, 0, area);
+            let body = body_rect(area).height as usize;
+            assert!(
+                map.is_empty() || map.len() == body,
+                "{w}x{h}: {} answers for a {body}-row body",
+                map.len()
+            );
+            assert_agrees(&s, 0, w, h);
+        }
+        // an empty result draws messages, not suggestions, so no row on
+        // it is clickable.
+        assert!(row_items(&Suggestions::default(), 0, Rect::new(0, 0, 50, 8)).is_empty());
     }
 
     #[test]
