@@ -495,253 +495,42 @@ accident.
 
 ## in flight
 
-**nothing is in flight. all six branches are merged into master as of
-2026-10-30** (`perf/search`, `perf/startup`, `perf/mpv`, `perf/art`,
-`perf/shell`, then `feat/mouse`), each verified after its own merge:
-clippy `-D warnings` clean, full suite green, fmt clean. 824 tests.
+**nothing. all ten branches are merged as of 2026-10-31**: the five
+perf ones, `feat/mouse`, `fix/async-open`, `feat/video`,
+`feat/art-modes`, and the mouse audit's follow-up commits. 874 tests,
+clippy `-D warnings` clean, fmt clean.
 
-`feat/mouse` merged with zero conflicts, because the branch had already
-merged master into itself twice; git had everything it needed. a clean
-textual merge proves nothing semantically, so the integration points
-were spot-checked by hand afterwards: the quadrant rasterizer,
-`SAMPLES_X`, the `auto` art-mode detect, `sharpen_amount`,
-`split_exclusions` and `retain_live_clients` all survived alongside
-`src/hit.rs`, `EnableMouseCapture`, the help overlay's new mouse
-section and `config.mouse`.
+`feat/art-modes` was the one hard merge: 12 conflicts, because it was
+based three merges back and both `fix/async-open` and `feat/video` had
+rewritten the regions it touched. the resolutions, recorded because the
+merge commit's own message lost three backticked words to shell
+interpretation (write commit bodies through a file, not an inline
+double-quoted string):
 
-the merge-order worry recorded here before (mouse rewrote the `main.rs`
-regions the perf branches patched) never materialised, precisely
-because the branch kept merging master rather than diverging. that is
-the lesson worth keeping: a long-lived branch that merges down
-regularly costs nothing to land.
+- art-modes replaced four scattered open-time protocol builds with one
+  per-frame keyed rebuild. that wins, because it is the only shape that
+  can see the `i` key change the art mode with **no view change at
+  all**, which four separate open-time sites could never agree on. the
+  open-time builds stay deleted.
+- `real_art_protocol` stays on `ActionCtx` even so, because
+  `open_browse` still clears it; without that the previous album's
+  cover sits under the new title for a frame. the `picker` field does
+  leave `ActionCtx`, since its only users were the builds now gone.
+- every `invalidate()` from async-open is kept. dropping one would let
+  a late album land in a view the loader does not own, which is the
+  exact bug its generation counter exists to stop. all three call sites
+  (esc/q, and both starred opens) and all four guard tests were
+  re-verified after the merge, not assumed.
+- the fullscreen ascii video pane art-modes was tinting is gone, since
+  fullscreen video now means mpv draws and wim stops drawing entirely.
+- `fetch_cover_art` is not restored to main.rs; it moved to browse.rs
+  with the loader.
 
-- [x] **the three reported mouse symptoms were the feature being
-      absent, but the audit found three real bugs anyway.** audited on
-      `feat/mouse` and merged. none of "clicking a song does not get me
-      to it", "clicking the sidebar does not focus it" or "nor does it
-      click what i wanted" reproduced in the branch's logic: all six
-      row maps derive from the same layout call and the same
-      `ui::scroll::offset_for` the render used, proved with tests that
-      render the real widget, click the cell a song's own text was
-      painted on, and assert `act` answers with that song. those tests
-      were committed BEFORE any fix so the history shows them passing
-      against untouched code, and each was shown non-vacuous by
-      perturbing the row lookup.
-      what did reproduce, all three now fixed:
-      **a notification toast answered for the cells it covered**, so a
-      click on a list under a toast selected nothing (this one would
-      have looked exactly like the first reported symptom);
-      **the mini player strip sat outside every hit rect**, so clicking
-      it did nothing; and **fullscreen video dropped the lists it
-      covers but not the sidebar's search box**, and boxes answer ahead
-      of lists, so a click top-left opened a search box under the
-      picture.
-- [x] **the selected control's plate is wider than its clickable rect.**
-      fixed by making the plate exactly `placed.rect`, so the lit cells
-      and the clickable cells are one thing. the padding looked better
-      and lied: clicking the visibly highlighted edge of the selected
-      control missed.
-      **the rejected alternative is worth recording.** growing the rect
-      to the old plate would have kept the padding and made it
-      clickable, and it tiles cleanly (controls sit 2 cells apart and
-      each plate claimed one separator cell per side, so there is no
-      overlap). it was rejected because it leaves the bar with no dead
-      cells at all, which on a *transport* bar means a one-cell miss
-      presses the neighbour: aiming at nothing and skipping a track
-      instead. a miss that does nothing is the better failure, so the
-      2-cell separator stays a safe no-op zone.
-      pinned by `the_selection_plate_covers_exactly_the_clickable_cells`
-      at five bar widths, verified to fail when the padding is restored.
-      the old test that asserted the padding was rewritten rather than
-      deleted; it was pinning the bug.
-- [ ] **the same plate-wider-than-rect bug exists in the maximized
-      player** (`src/ui/player.rs` ~522 has the identical
-      `saturating_sub(1)` / `saturating_add(1)` pair). left for now
-      only because another agent is editing that file for album art;
-      it wants the same fix and the same reasoning.
-- [ ] **`HINT_SEP.len()` is bytes, not columns** (`src/ui/player.rs`
-      ~472): the separator is 5 columns and 6 bytes, so the player's
-      hint row over-charges a cell per separator and drops a hint
-      earlier than it needs to. the same char-vs-cell class this
-      codebase keeps rediscovering.
-- [ ] **the mini player strip reads like a button but only focuses.**
-      it hints "m: maximize", so a click on it arguably should
-      maximize. it also draws two emoji-presentation codepoints the
-      bottom bar's own glyph alphabet explicitly forbids, so those
-      should be replaced either way.
-- [ ] **the bottom-right "? help" box looks clickable** but only
-      focuses the bottom bar; it should open the help overlay.
-- [ ] **`WHEEL_ROWS` is applied in items, not rows**, so one notch over
-      suggestions (two painted rows per item) moves six screen rows.
-      the behaviour follows the documented "the wheel does what j/k
-      do"; it is the constant's doc comment saying "rows" that is wrong.
-- [ ] **a drag resolved against the previous frame's rect is one cell
-      off for one frame** when the elapsed readout crosses 9:59 to
-      10:00 and grows from 4 cells to 5, shifting the track.
-- [ ] **the six `hits.lists.push` sites in the draw closure have no
-      test.** extracting them into a pure `fn lists(..)` over
-      already-computed rects would make the rect/map pairing testable;
-      it is a real refactor of the closure.
-- [ ] **nobody has driven a real click yet.** the maintainer tried, but
-      was running **master**, which had no `src/hit.rs` and no
-      `EnableMouseCapture` at all, so the terminal was never put into
-      mouse-reporting mode and the clicks went to alacritty as text
-      selection. all three symptoms they reported ("clicking a song
-      does not get me to it", "clicking the sidebar does not focus it",
-      "nor does it click what i wanted") were the feature being absent
-      from the build, not bugs. holding the branch for a click-through
-      that could not happen without merging it was a deadlock; merged
-      now. **the click-through is still owed**, and raw-mode input
-      cannot be exercised headlessly here, so it has to be a human.
-
-### found by the agents, not yet fixed (all in files they own)
-
-- [ ] **nobody has clicked the mouse support.** see `feat/mouse` above;
-      the hit resolution is well covered as pure functions but no real
-      click has been driven end to end. a human pass is the only way.
-- [ ] **the paste handler's tier chain diverges from the key cascade.**
-      `Event::Paste` checks `settings_token_editing` before
-      `console_open` (keys do the reverse) and has no `editing_query`
-      guard at all, so a paste reaches `app.query` whether or not the
-      box holds the keyboard. harmless only because those states cannot
-      currently coexist, which is the kind of thing that stops being
-      true silently.
-- [ ] **`InputMode`'s doc claims `focus` is only ever changed from
-      `InputMode::Move`, never as a side effect.** already untrue
-      (`dispatch_action` and several pane tiers change it) and clicks
-      make it more so. the comment is load-bearing elsewhere, so it
-      wants a careful reword rather than a delete. also `main.rs:2870`
-      has the `focus_in_direction` doc block attached to `enum
-      InputMode` by mistake.
-- [ ] **`suggestions::render` has a `flat.get(idx)` -> `continue`
-      fallback that cannot fire**, and `row_items` does not mirror it;
-      that is the one place the hit map could formally name a row the
-      render skipped.
-- [x] **`fetch_navidrome_catalog` pings before fetching, serially.**
-      ping removed; a failing fetch says everything it said, and it was
-      a serial round trip per server per 45s pass (~80 wasted requests
-      an hour). `Client::new` still runs, being local and free.
-      **the ping was hiding something worse, which is the real fix
-      here.** each of the three fetches was `unwrap_or_default()`, so
-      any request failure arrived as an empty list inside an `Ok`. once
-      `perf/startup` added `Corpus::reconcile_server`, which drops what
-      a server no longer lists, an empty list stopped being harmless
-      and became a *claim that the server has nothing*: one failed
-      `getArtists` during a sync would delete that server's whole
-      library from the corpus, and `save_catalog` would then persist
-      the deletion. the ping only narrowed the window (ping fine, fetch
-      times out moments later) rather than closing it. every fetch
-      error and thread panic now propagates, via `fetched()`, with
-      three tests pinning that a failure is not an empty catalog while
-      a genuinely empty server still succeeds. `reconcile_server`'s doc
-      now states the caller contract both ways.
-- [x] **unknown runtime names gave bare errors.** `eq::resolve_failure`
-      (added with the `eq()` fix) and `load_queue`'s
-      "no saved queue called X" were the same problem solved once and
-      not at all: names the user invented are in no static table, so
-      shellsong cannot validate them while parsing and the error has to
-      be built at apply time. `src/namehint.rs` is the shared one;
-      `eq::resolve_failure` delegates to it and `load_queue` uses it
-      now. three behaviours worth keeping: a near miss suggests
-      ("did you mean 'rock'?"), nothing near lists what exists, and an
-      **empty** list says "none saved yet" rather than rendering a bare
-      "have: " (the likeliest case for `load_queue`, since a user with
-      no saved queues is exactly who mistypes one). long lists are cut
-      at 40 and counted so a notification stays readable.
-- [x] **fresh `Client` per call in `open_starred_view` and
-      `test_navidrome_connectivity`.** both reuse a live client now via
-      `client_for`, falling back to building one only when the corpus
-      holds none for that server (cold start, or a profile just added).
-      the zeroize worry in the original note turned out to be moot
-      rather than solved: the reused clients are the **corpus's own**,
-      which already live for the session and already hold the password,
-      so nothing extends its lifetime and it is still zeroized when the
-      corpus drops. a `static` would have been the problem, since it
-      would never drop and so never zeroize; this is not one.
-      **`Client::matches` includes the stream options, not just
-      username and url.** a client carries `max_bitrate_kbps` and
-      `transcode_format` into every stream url it builds, and
-      `open_starred_view`'s items get *played*, so matching on identity
-      alone would have let a client built before a bitrate change go on
-      streaming at the old setting. that is a bug this fix would have
-      introduced; a test pins it.
-      pinging the live client is also the better connectivity test:
-      same pool, same resolved credentials, rather than a throwaway's.
-- [x] **the 45s sync pass still builds its own `Client`.** done, and
-      the lifetime question answered differently than this note
-      guessed: the sync thread does **not** reach for the corpus's
-      clients (it cannot; different thread) but keeps its own across
-      passes. `Client::new` re-reads `password_file` off disk and
-      starts with a cold pool, and this loop runs every 45 seconds for
-      the life of the app, so rebuilding per pass was continuous waste.
-      `retain_live_clients` runs at the top of every pass and drops any
-      kept client no current profile still describes, which is what
-      stops an edited or removed profile from syncing through the old
-      credentials; dropping it is also what zeroizes that password.
-      extracted as a named function rather than left inline so the
-      three tests exercise the real predicate instead of a copy that
-      could drift. `Client::matches` counts the stream options, so a
-      bitrate change is an edit here too.
-      `index_navidrome_server` deliberately passes `&[]`: it runs when
-      a profile is added or reconnected after an edit, where building
-      from the credentials as they are now is the whole point.
-      also fixed on the way through: routing the catalog fetch via
-      `client_for` had reduced "connection failed: {e}" to a bare
-      "connection failed", losing an unreadable `password_file` or a
-      malformed url as the cause, so `client_for` returns `Result`.
-- [ ] **`Corpus::remote_clients` is an O(corpus) scan.** it walks every
-      item and dedupes by url, so it is a full 40k-item pass to answer
-      "which servers are live". fine where it is called now (a keypress:
-      starred view, the profile manager, `load_queue`), but it must not
-      drift onto a per-frame path, and a cached per-server list keyed on
-      the corpus's own generation would retire the worry.
-- [x] **the first open of an album or artist still blocks the main
-      thread.** fixed; `browse::Loader` owns opening and nothing on the
-      input path touches the network. the view appears at once from the
-      `SearchItem`'s own title/subtitle with `loading: true` and fills
-      in as replies land. an album's cover is a second round trip that
-      rides in behind the tracks, so a slow cover never holds the list
-      up. `subsonic::stream_artist_tracks`, which was dead code, is now
-      the artist path: `getArtist` answers first so the ALBUMS column
-      renders after one round trip, then the SONGS column grows album
-      by album.
-      **the two hard parts, both pinned by tests that fail when the
-      guard is removed.** completions race, so the loader keeps a
-      bucket per album index and rebuilds `tracks` in album order,
-      which inserts rows *above* a cursor the user may have moved; the
-      selection anchors to the song id it was on and is restored to its
-      new index. and a reply from a superseded open must never land: one
-      generation counter, bumped on every open and on every close or
-      replacement the loader did not perform, checked in `poll` and
-      again by each worker before it sends. four named tests cover the
-      stale paths and all four fail if the two-line check is deleted.
-      see docs/async-open.md.
-      still synchronous and out of scope: `resolve_tracks`, so the
-      quick-queue key on an album or artist holds the thread.
-- [x] **the browse view's own cover fetch bypasses the new disk
-      store.** it goes through it now. the two keyspaces are one:
-      `Key::album(artist, album)` is the single definition and `Key::of`
-      delegates to it, so an album opened in browse and the same
-      album's tracks played from the player derive the same key and so
-      the same file on disk. reopening an album is now free, and a
-      cover either side fetched is the other's hit. `fetch_stored` is
-      the public store-first/store-after fetch for callers outside
-      `Cache`, reusing the private `fetch` rather than growing a second
-      copy of the sequence.
-      it did not need the identity work after all: the browse site
-      already destructures `SearchItem::Album { id, name, artist, .. }`,
-      so the names were in hand. **what identity would still buy** is
-      pinned as a test rather than left as a surprise
-      (`a_compilation_track_does_not_share_the_albums_key`): a
-      compilation's tracks each carry their own artist, so they key
-      separately from the album and that cover is still fetched more
-      than once. an album-artist or album id on `SearchItem` is what
-      closes that, and nothing else here depends on it.
-      untagged albums fall back to the id's own slot, so they keep
-      working, just without sharing.
-- [ ] **catalog parse beyond ~100k rows** would start outgrowing mpv's
-      spawn and resurface on the first frame; parallelize the row parse
-      if that ever shows up.
+**the lesson from this batch**, since it cost real time twice: a branch
+that merges master down regularly lands for free (`feat/mouse` merged
+with zero conflicts after twelve commits), and one that does not pays
+for every merge that happened meanwhile. merge agent branches as they
+report, not in a batch at the end.
 
 ## shellsong and suggestions (engines merged, hosts not wired)
 
