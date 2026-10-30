@@ -219,7 +219,7 @@ fn open_browse_view(item: &SearchItem) -> Result<browse::BrowseView, String> {
                 year: details.year,
                 tracks: browse::songs_to_items(details.songs, client),
                 selected: 0,
-                art: fetch_cover_art(client, id),
+                art: fetch_cover_art(client, id, artist, name),
                 bio: None,
                 is_artist: false,
                 albums: Vec::new(),
@@ -390,11 +390,23 @@ fn open_starred_view(
 
 /// Best-effort: a missing/unreadable cover is not worth surfacing as
 /// an error, the album view just shows no art for it.
-fn fetch_cover_art(client: &subsonic::Client, album_id: &str) -> Option<image::DynamicImage> {
-    let bytes = client.get_cover_art_bytes(album_id).ok()?;
-    // same bounded rgb8 decode the background fetches use, so an open
-    // view does not retain a multi-megapixel original either.
-    coverart::decode_cover(&bytes)
+/// An opened album's cover. Goes through the shared on-disk store
+/// keyed by the album's names, so reopening an album costs nothing and
+/// a cover the player already fetched for one of its tracks is a hit
+/// here (and the reverse).
+///
+/// `artist`/`album` rather than just the id because the store is
+/// name-keyed; falling back to the id's own slot keeps an untagged
+/// album working, just without sharing.
+fn fetch_cover_art(
+    client: &subsonic::Client,
+    album_id: &str,
+    artist: &str,
+    album: &str,
+) -> Option<image::DynamicImage> {
+    let key = coverart::Key::album(artist, album)
+        .unwrap_or_else(|| coverart::Key::Track(format!("album:{album_id}")));
+    coverart::fetch_stored(client, &key, album_id)
 }
 
 /// Whether the config names a graphics protocol outright, which is an

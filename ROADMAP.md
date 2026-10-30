@@ -572,10 +572,27 @@ staying `None` costs nothing in sampling.
       the response cache makes repeats free and the pool makes a cold
       open 5x faster, but truly non-blocking needs the currently unused
       `stream_artist_tracks` wired into the ui.
-- [ ] **the browse view's own cover fetch bypasses the new disk
-      store** (it is keyed by album id, the store by artist/album
-      name), so reopening an album still re-fetches. unifying the two
-      keyspaces is the same blocker as the name-based-identity item.
+- [x] **the browse view's own cover fetch bypasses the new disk
+      store.** it goes through it now. the two keyspaces are one:
+      `Key::album(artist, album)` is the single definition and `Key::of`
+      delegates to it, so an album opened in browse and the same
+      album's tracks played from the player derive the same key and so
+      the same file on disk. reopening an album is now free, and a
+      cover either side fetched is the other's hit. `fetch_stored` is
+      the public store-first/store-after fetch for callers outside
+      `Cache`, reusing the private `fetch` rather than growing a second
+      copy of the sequence.
+      it did not need the identity work after all: the browse site
+      already destructures `SearchItem::Album { id, name, artist, .. }`,
+      so the names were in hand. **what identity would still buy** is
+      pinned as a test rather than left as a surprise
+      (`a_compilation_track_does_not_share_the_albums_key`): a
+      compilation's tracks each carry their own artist, so they key
+      separately from the album and that cover is still fetched more
+      than once. an album-artist or album id on `SearchItem` is what
+      closes that, and nothing else here depends on it.
+      untagged albums fall back to the id's own slot, so they keep
+      working, just without sharing.
 - [ ] **catalog parse beyond ~100k rows** would start outgrowing mpv's
       spawn and resurface on the first frame; parallelize the row parse
       if that ever shows up.
