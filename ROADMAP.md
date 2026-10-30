@@ -783,6 +783,45 @@ report, not in a batch at the end.
       sidebar and main content and an interior cell left unwritten
       showed through (the box can be wider than its text, see the
       `max(4)`).
+## the overnight run (2026-10-31, four agents in flight)
+
+The maintainer went to sleep asking for a lot built and no questions.
+Four agents are working in parallel, partitioned by file so they cannot
+collide. Every one of them was told the same thing, which is the
+lesson this repo learned the hard way today: **merge master down at the
+start, at every stage boundary, and before finishing.** `feat/mouse`
+merged with zero conflicts after twelve commits because it kept merging
+down; `feat/art-modes` was based three merges back and cost twelve
+conflicts.
+
+- `feat/shellsong-lang` (`../wim-wt-lang`): variables (`let x = [...]`),
+  `.shg` scripts, per-identity eq/volume/speed, then the queue
+  **timeline**: pause as a queue entry, a default gap between tracks,
+  and clips. owns `shellsong.rs`, `shellsong_host.rs`,
+  `ui/shellsong.rs`, `playqueue.rs`. the `when` conditional engine in
+  its original brief was **cancelled** by the maintainer ("writing
+  conditionals is just not particularly it") and replaced with the
+  timeline, which is the right call: a rules engine is a programmer's
+  idea of a feature, the timeline is something a listener uses.
+- `feat/shellswim` (`../wim-wt-swim`): the **library split** plus the
+  second binary. owns `main.rs` exclusively, which is why nobody else
+  may touch it tonight.
+- `fix/ui-batch` (`../wim-wt-uibatch`): the recorded ui defects, plus a
+  sweep for the char-versus-cell bug class (four separate instances
+  found and fixed today, so a fifth is likely) and for
+  emoji-presentation glyphs. owns `hit.rs` and `ui/*`.
+- `feat/identity` (`../wim-wt-ident`): album and artist ids on
+  `SearchItem`, the catalog parse at scale, and a verdict on
+  `remote_clients`'s O(corpus) scan. owns the data layer.
+
+**Queued behind the lib split, in this order, because each needs
+`main.rs` and the split rewrites it:**
+1. the **undo tree** (hooks the single op dispatch; see below),
+2. **in-workspace sub-rect video** (needs ratatui taught to leave a
+   hole; `docs/video.md` has the analysis),
+3. **cron scheduling** (`at(07:00) ...`), which needs the language
+   work landed first.
+
 ## shellswim and the undo tree (maintainer, 2026-10-31)
 
 Two features the maintainer asked for that share one prerequisite, so
