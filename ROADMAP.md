@@ -522,6 +522,19 @@ staying `None` costs nothing in sampling.
       three tests pinning that a failure is not an empty catalog while
       a genuinely empty server still succeeds. `reconcile_server`'s doc
       now states the caller contract both ways.
+- [x] **unknown runtime names gave bare errors.** `eq::resolve_failure`
+      (added with the `eq()` fix) and `load_queue`'s
+      "no saved queue called X" were the same problem solved once and
+      not at all: names the user invented are in no static table, so
+      shellsong cannot validate them while parsing and the error has to
+      be built at apply time. `src/namehint.rs` is the shared one;
+      `eq::resolve_failure` delegates to it and `load_queue` uses it
+      now. three behaviours worth keeping: a near miss suggests
+      ("did you mean 'rock'?"), nothing near lists what exists, and an
+      **empty** list says "none saved yet" rather than rendering a bare
+      "have: " (the likeliest case for `load_queue`, since a user with
+      no saved queues is exactly who mistypes one). long lists are cut
+      at 40 and counted so a notification stays readable.
 - [ ] **fresh `Client` per call in `open_starred_view`,
       `test_navidrome_connectivity` and every 45s sync pass**, each
       re-reading `password_file` and starting with a cold pool. a
@@ -659,8 +672,7 @@ staying `None` costs nothing in sampling.
       would have degraded that to a bare failure, so the message moved
       with it, as `eq::resolve_failure` (same jaro-winkler floor
       shellsong's own `did_you_mean` uses, and it suggests saved curves
-      too). `load_queue`'s unknown-name path is still the bare
-      "no saved queue called X" and could borrow the same treatment.
+      too).
       a missing argument is still a parse error; that needs no host
       context to decide.
 - [x] **`!foo` does not exclude anything.** fixed by handling it

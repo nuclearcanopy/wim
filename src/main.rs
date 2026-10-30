@@ -13,6 +13,7 @@ mod library;
 mod listenbrainz;
 mod lyrics;
 mod mpv;
+mod namehint;
 mod navmanager;
 mod notify;
 mod onboarding;
@@ -1873,7 +1874,11 @@ fn run_shellsong_op(op: Op, ctx: &mut ShellsongCtx) -> (Dispatch, Report) {
         Op::LoadQueue(name) => {
             let clients = shellsong_host::clients_of(&ctx.actx.app.corpus);
             match queues::load(&name, &clients) {
-                None => op_fail(format!("no saved queue called '{name}'")),
+                None => op_fail(namehint::unknown(
+                    "saved queue",
+                    &name,
+                    queues::list().iter().map(String::as_str),
+                )),
                 Some(items) if items.is_empty() => {
                     op_fail(format!("nothing in '{name}' could be found any more"))
                 }
