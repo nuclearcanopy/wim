@@ -21,6 +21,89 @@ request replies (matched by `request_id`) and async events
 (`property-change`, `end-file`, ...), dispatched to different channels so
 callers awaiting a specific command's reply never see event noise.
 
+one detail worth stating, because getting it wrong looks exactly like a
+stale cache: a `property-change` for a property that has *become
+unavailable* (af cleared, playback stopped) carries no `data` key at
+all, not a `data: null`. requiring the key dropped precisely the event
+that says "this reading is gone", so the last one stood forever. the
+reader coerces a missing `data` to `Value::Null`, which every folder
+already reads as "no value".
+
+## nothing on the render path waits for mpv
+
+`get_property` is a blocking request/reply round trip; measured at
+~1.5ms on a warm local socket. at display refresh rate that is the
+frame budget, so the rule is: the render path reads state, it never
+asks for it.
+
+- everything the render path reads is `observe_property`'d and folded
+  into `mpv::Playback` by `apply`: position, duration, pause, and the
+  level meter's `astats` RMS tap. one pipelined round trip at startup,
+  none per frame.
+- the level tap's property path is `af-metadata/<label>/...` where
+  `<label>` must be **mpv's own filter label**
+  (`af=@wimlevel:lavfi=[...]`), not a label written inside the lavfi
+  graph (`lavfi=[astats@wimlevel=...]`). the second spelling resolves
+  nothing at all, which is how the meter spent a release dead while
+  still paying a round trip per frame to learn nothing.
+- mpv pushes that tap ~20/s while audio flows and simply stops pushing
+  when it doesn't (pause), so a reading is only believed for
+  `LEVEL_FRESH_FOR` (300ms) past when it landed; past that the meter
+  falls back to its idle breathe. that horizon is the whole staleness
+  story, since stop and af-clear both push an explicit "no value".
+- per-frame *writes* (the crossfade and shellsong volume ramps) use
+  `command_nowait`: the reply is the only cost, the next frame's value
+  supersedes this one, and mpv applies one connection's commands in
+  order so the ramp's last write still wins.
+- several properties that have to be set together (`observe_playback`,
+  `set_subtitle_style`) go through `command_batch`, which writes them
+  all and then collects every reply: one round trip's latency for the
+  batch instead of one each. the subtitle menu fires its seven on every
+  keypress.
+
+## video frames: a pump, not a poll
+
+`mpv::FramePump` owns a second ipc connection and a thread. it captures
+on an interval, decodes, and keeps exactly the newest frame; the render
+path calls `latest()`, which is a short lock and an `Arc` clone. a
+decode slower than the interval therefore drops frames instead of
+building a backlog, and the ipc round trip, the json parse of a
+multi-megabyte payload, and the bgr0 to rgb conversion are all off the
+render thread. `Capture { interval, max_edge }` is the cost knob:
+frame rate and optional downscale are parameters, not constants.
+
+the second connection is deliberate. a frame reply is megabytes of
+json; sharing the control connection would put that parse in front of
+the `time-pos` events the render path reads.
+
+**the frame source itself does not currently work.** mpv's own manual
+says `screenshot-raw` "can be used only through the client API or from
+a script using `mp.command_native`", and that is literal: over json ipc
+mpv answers it with
+
+```
+{"data":{"w":640,"h":480,"stride":2560,"format":"bgr0","data":},...}
+```
+
+i.e. a `data` field with nothing after it, because the value is an
+`MPV_FORMAT_BYTE_ARRAY` and mpv's json writer has no encoding for one.
+the line does not parse. measured on mpv 0.41.0 for both a real h264
+file and a lavfi source, with and without `--vo=null`, for every
+`flags` value.
+
+the old code called this straight from the main loop, so the failure
+cost the full 10s reply timeout per attempt: the whole ui froze in 10s
+blocks for as long as a local video was playing. the pump recognises an
+unparseable reply as `PumpState::Unsupported`, stops asking, and says
+so once; a blank pane is bad, a frozen app is worse.
+
+what is left for a working source, none of it free: `screenshot-to-file`
+plus a read-back measures 200ms (480p) to 530ms (1080p) per frame on
+mpv's side, so ~2-5fps at best; an mpv lua script using
+`mp.command_native` and shipping frames out itself; or `--vo=image`
+writing every frame to a directory. the pump's public surface
+(`latest()` -> newest `Frame`) does not change under any of them.
+
 ## strictly monochrome ui
 
 every color anywhere in the ui is `Color::Rgb(v, v, v)` via

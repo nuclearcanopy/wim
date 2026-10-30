@@ -10,7 +10,7 @@ use crate::browse::{ArtMode, BrowseView};
 use crate::favorites::Favorites;
 use crate::search::SearchItem;
 use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK, NEAR_WHITE};
-use crate::ui::albumart::AsciiArt;
+use crate::ui::albumart::CachedArt;
 use crate::ui::header::draw_header;
 use crate::ui::results_list::{draw_header_row, fill_row_bg};
 use crate::ui::scroll;
@@ -230,9 +230,10 @@ impl Widget for BrowseListView<'_> {
         );
         let y = list_area.y;
         if let (Some(rect), ArtMode::Ascii) = (art_rect, self.art_mode) {
-            AsciiArt {
+            CachedArt {
                 image: self.view.art.as_ref(),
                 cell_aspect: self.cell_aspect,
+                key: &self.view.art_key(),
             }
             .render(rect, buf);
         }

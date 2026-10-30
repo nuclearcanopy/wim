@@ -43,6 +43,27 @@ at it; don't mark it done on build+test passing alone.
 
 ## done
 
+- [x] **onboarding looked like a debug dump, and taught wrong keys.**
+      two problems in one file. visually: five screens each painting
+      raw left-aligned lines at `area.y`, no frame, no vertical
+      centring, no sense of progress, and a plain-text "welcome to wim"
+      where the ansi-shadow wordmark should be; exactly the "thin
+      unimpressive title card" the ux self-check above was written
+      about. all five now share one `Screen` chrome (frame, content
+      block centred as a unit so short and long rows do not stagger, a
+      progress rail pinned to the interior's bottom row) and welcome
+      draws `banner::logo_lines(0)`.
+      correctness: the controls list baked in key literals ("l",
+      "[ / ]", "a"), so onboarding confidently taught the defaults to
+      anyone with a custom keymap. `help.rs` had this exact bug and
+      fixed it with its `Key` enum; that enum is now `pub(crate)` with
+      a `label(&Keymap)` method and onboarding resolves through it, so
+      a rebound key is shown as what it is actually bound to. the
+      guard test was verified to FAIL when the old behaviour is
+      simulated, rather than just passing.
+      the rail degrades rather than clipping: under ~23 interior cells
+      the dots are dropped and the words "step n of 6" alone remain.
+
 - [x] scaffold: flake.nix devshell, AGPL-3.0, README
 - [x] cargo init, full dependency set pinned
 - [x] config: toml file at `$XDG_CONFIG_HOME/wim/config.toml`, templated
@@ -364,33 +385,173 @@ measurements are what settled it.
   measured spill matrix; a flat eq emits no biquads at all and null
   tests bit-identical.
 
-## in flight (branches, NOT merged; do not start work that touches these)
+## video in the workspace (maintainer spec, 2026-10-28)
 
-five branches exist with uncommitted-to-master work. check
-`git worktree list` and `git branch` before picking anything up; a loop
-run that edits these files will collide.
+real video is the DEFAULT and stays the default. the ascii path is a
+thing the user turns on deliberately, never something they land in by
+accident.
 
-- `feat/shellsong` + `wim-wt-shellsong`: "shellsong", a music command
-  language on `:` (`src/shellsong.rs`, `src/ui/shellsong.rs`,
-  `docs/shellsong.md`). call-only grammar, `play(crest)`,
-  `queue([hex, 4 star crest])`, `queue_aa(...)`, `favorite(...)`,
-  `add_to_queue(front, ...)`, `moveto(10%)`, `seek(+30s)`. deliberately
-  scoped to pure modules with zero main.rs edits; **host wiring is
-  still to do** and is the one remaining step.
-- `feat/pulse-animations` + `wim-wt-pulse`: selection shown by a
-  pulsing row background instead of border colour, plus one `src/anim.rs`
-  driving every animation off wall-clock time scaled to the display's
-  refresh rate (the loop currently polls a flat 100ms, so everything
-  animates at ~10fps).
-- `fix/nowplaying-queue` + `wim-wt-queue`: "now playing" shows the
-  wrong track because the app mirrors mpv's playlist position by
-  counting end-file events instead of observing `playlist-pos`; any
-  missed event desyncs it permanently. also moves the download trigger
-  from "played twice" to "played on two distinct days".
-- `feat/controls-bar-icons` + `wim-wt-controls`: bottom controls bar to
-  glyphs instead of `loop: off` text, arrow-key selection within the
-  bar, enter to interact, and enter on the progress bar entering a
-  scrub mode.
+- [ ] **BLOCKER: there is no working way to get frames out of mpv.**
+      found by `perf/mpv` and it gates every item below. `screenshot-raw`
+      **cannot work over json ipc at all**: mpv's own manual says it is
+      client-api/script only, and over ipc it replies with a `data`
+      field containing nothing after it (the value is an
+      `MPV_FORMAT_BYTE_ARRAY` and mpv's json writer has no encoding for
+      one), so **the reply line is not valid json**. the old reader
+      skipped the unparseable line, the pending request was never
+      answered, and the main loop sat in a 10 second `recv_timeout`;
+      **the whole ui froze in 10 second blocks for as long as a local
+      video played.** verified on a real h264 file and a lavfi source,
+      with and without `--vo=null`, at every `flags` value. the pump
+      now recognises the reply as `Unsupported`, stops asking and
+      notifies once, so the freeze is gone, but no frames arrive.
+      measured alternatives, none free: `screenshot-to-file` plus
+      read-back is 202ms at 480p and 530ms at 1080p per frame on mpv's
+      side (2-5fps, and 1080p jpg failed outright); an mpv lua script
+      using `mp.command_native`; or `--vo=image`. each is a new
+      subsystem, so none were built. `FramePump`'s public surface does
+      not change under any replacement source, so this is a swap of the
+      source only. see QUESTIONS.md.
+- [ ] **video plays as real video in the workspace.** confirm the
+      maximized-song path actually shows a real video surface for a
+      video file, not the album-art fallback and not ascii.
+- [ ] **ascii video renderer, opt-in.** same technique as album art,
+      via the shared rasterizer being extracted on `perf/art`:
+      half-block glyphs so one cell carries two vertical samples.
+      toggled by the user (config key plus a shellsong command plus a
+      key binding); default off.
+- [ ] **usable at absurd zoom-out.** ascii video is only watchable
+      once the font is small enough to give a few hundred cells across,
+      so the layout has to survive that: sidebar and bottom bar must
+      stay visible and operable at very small cell sizes, rather than
+      the video eating the frame or the chrome collapsing to unreadable
+      slivers. this is a layout constraint, not a rendering one; the
+      chrome should scale its own footprint, not vanish.
+- [ ] **frame budget.** a few hundred cells across times a few hundred
+      down, at video frame rate, is the real cost. the work is CPU
+      (decode, downscale, per-cell sampling, diffing the buffer), not
+      gpu: the terminal emulator rasterizes glyphs on the gpu and that
+      part is cheap even for a full-screen repaint. the things that will
+      actually cook a core, in order: decoding every frame at full
+      resolution rather than downscaling once to the cell grid,
+      per-pixel `get_pixel` instead of a contiguous walk, reallocating
+      the output buffer per frame, and repainting cells that did not
+      change. decouple the ascii frame rate from the display refresh
+      rate and make it tunable; dropping to a lower rate must degrade
+      smoothness, never block the input path.
+
+## in flight
+
+**all five perf branches are MERGED into master as of 2026-10-28**
+(`perf/search`, `perf/startup`, `perf/mpv`, `perf/art`, `perf/shell`),
+each verified after its own merge: clippy `-D warnings` clean, full
+test suite green, fmt clean. 741 tests now pass. their measurements and
+findings are recorded in the sections below and in `docs/`
+(`search-performance.md`, `startup-cache.md`, `raster.md`,
+`architecture.md`).
+
+one real collision, worth knowing about if agents are ever fanned out
+this way again: **`perf/search` and `perf/shell` independently
+optimized `Corpus::search`** and restructured the same function, so six
+conflicts landed in `search.rs`. resolved toward `perf/search`'s
+machinery, because it carries an oracle test that keeps the
+pre-optimization scorer verbatim and compares item-by-item over 38
+query shapes; shell's one non-overlapping piece (`search_names`, which
+completion calls per keystroke to avoid cloning a `SearchItem` per
+match) was re-implemented on top, with `rank` now being
+`rank_borrowed` plus the clone so the two entry points cannot rank
+differently.
+
+also reconciled at merge, as `perf/mpv` predicted: `sample_luma` is
+gone entirely and both art paths go through `perf/art`'s O(output)
+rasterizer (`with_memo` for static covers, `with_scratch` for anything
+changing per frame), so mpv's warning about ~2.07M `get_pixel` calls
+per frame on the render thread is moot and `VIDEO_FRAME_MAX_EDGE`
+staying `None` costs nothing in sampling.
+
+- `feat/mouse` + `wim-wt-mouse` (12 commits, NOT merged, held
+  deliberately). all four gates pass on its tip and it adds click to
+  focus, click to press, wheel to move the selection and drag to
+  scrub. **held because no human has ever clicked it**: under a bare
+  pty the ratatui-image graphics probe goes unanswered and then eats
+  stdin, so raw-mode input cannot be exercised headlessly here. the
+  hit resolution is well covered as pure functions, which is not the
+  same as working. merge after one manual pass. note it rewrote the
+  `main.rs` regions the merged perf branches patched, so expect
+  conflicts there now and resolve toward mouse's structure with the
+  perf call sites re-applied.
+
+### found by the agents, not yet fixed (all in files they own)
+
+- [ ] **nobody has clicked the mouse support.** see `feat/mouse` above;
+      the hit resolution is well covered as pure functions but no real
+      click has been driven end to end. a human pass is the only way.
+- [ ] **the paste handler's tier chain diverges from the key cascade.**
+      `Event::Paste` checks `settings_token_editing` before
+      `console_open` (keys do the reverse) and has no `editing_query`
+      guard at all, so a paste reaches `app.query` whether or not the
+      box holds the keyboard. harmless only because those states cannot
+      currently coexist, which is the kind of thing that stops being
+      true silently.
+- [ ] **`InputMode`'s doc claims `focus` is only ever changed from
+      `InputMode::Move`, never as a side effect.** already untrue
+      (`dispatch_action` and several pane tiers change it) and clicks
+      make it more so. the comment is load-bearing elsewhere, so it
+      wants a careful reword rather than a delete. also `main.rs:2870`
+      has the `focus_in_direction` doc block attached to `enum
+      InputMode` by mistake.
+- [ ] **`suggestions::render` has a `flat.get(idx)` -> `continue`
+      fallback that cannot fire**, and `row_items` does not mirror it;
+      that is the one place the hit map could formally name a row the
+      render skipped.
+- [x] **`fetch_navidrome_catalog` pings before fetching, serially.**
+      ping removed; a failing fetch says everything it said, and it was
+      a serial round trip per server per 45s pass (~80 wasted requests
+      an hour). `Client::new` still runs, being local and free.
+      **the ping was hiding something worse, which is the real fix
+      here.** each of the three fetches was `unwrap_or_default()`, so
+      any request failure arrived as an empty list inside an `Ok`. once
+      `perf/startup` added `Corpus::reconcile_server`, which drops what
+      a server no longer lists, an empty list stopped being harmless
+      and became a *claim that the server has nothing*: one failed
+      `getArtists` during a sync would delete that server's whole
+      library from the corpus, and `save_catalog` would then persist
+      the deletion. the ping only narrowed the window (ping fine, fetch
+      times out moments later) rather than closing it. every fetch
+      error and thread panic now propagates, via `fetched()`, with
+      three tests pinning that a failure is not an empty catalog while
+      a genuinely empty server still succeeds. `reconcile_server`'s doc
+      now states the caller contract both ways.
+- [x] **unknown runtime names gave bare errors.** `eq::resolve_failure`
+      (added with the `eq()` fix) and `load_queue`'s
+      "no saved queue called X" were the same problem solved once and
+      not at all: names the user invented are in no static table, so
+      shellsong cannot validate them while parsing and the error has to
+      be built at apply time. `src/namehint.rs` is the shared one;
+      `eq::resolve_failure` delegates to it and `load_queue` uses it
+      now. three behaviours worth keeping: a near miss suggests
+      ("did you mean 'rock'?"), nothing near lists what exists, and an
+      **empty** list says "none saved yet" rather than rendering a bare
+      "have: " (the likeliest case for `load_queue`, since a user with
+      no saved queues is exactly who mistypes one). long lists are cut
+      at 40 and counted so a notification stays readable.
+- [ ] **fresh `Client` per call in `open_starred_view`,
+      `test_navidrome_connectivity` and every 45s sync pass**, each
+      re-reading `password_file` and starting with a cold pool. a
+      shared client per server fixes it but must not park the password
+      in a static, which would break the zeroize-on-drop guarantee.
+- [ ] **the first open of an album or artist still blocks the main
+      thread.** `open_browse_view`/`open_artist_view` are synchronous;
+      the response cache makes repeats free and the pool makes a cold
+      open 5x faster, but truly non-blocking needs the currently unused
+      `stream_artist_tracks` wired into the ui.
+- [ ] **the browse view's own cover fetch bypasses the new disk
+      store** (it is keyed by album id, the store by artist/album
+      name), so reopening an album still re-fetches. unifying the two
+      keyspaces is the same blocker as the name-based-identity item.
+- [ ] **catalog parse beyond ~100k rows** would start outgrowing mpv's
+      spawn and resurface on the first frame; parallelize the row parse
+      if that ever shows up.
 
 ## shellsong and suggestions (engines merged, hosts not wired)
 
@@ -478,12 +639,77 @@ run that edits these files will collide.
       rate.** `selection_pulsing` only counted the browse view for
       `Focus::Workspace`, so both of those idled at the 100ms poll and
       animated their selection plate at a tenth of the display rate.
-- [ ] **shellsong's `eq(<preset>)` cannot reach saved curves.** it
-      resolves names through `eq::index_of`, which is built-ins only.
-      `eq::resolve(name, &cfg.eq_custom_presets)` already returns
-      `(Source, gains)` for both, so `Op::SetEqPreset` needs to carry
-      a `Source` rather than a bare index, and `Words::EqPreset`
-      completion wants the saved names too.
+- [x] **the navidrome step has no progress rail.** done, and it was
+      more than the rail: step 3 is `ui::login::LoginView`, which drew
+      top-aligned behind a `draw_header` with no frame, so the flow
+      visibly changed shape in the middle. the chrome is extracted out
+      of `Screen::render` into `ui::onboarding::chrome(buf, area, step)`
+      and login borrows it, which also removes the duplicate rail math.
+      `LoginView::step` is `Option<usize>`: `Some` only from the
+      onboarding render site (via `NAVIDROME_STEP`), `None` from the
+      profile manager's add form and the standalone reopen, where
+      "step 3 of 6" would be a lie. both are pinned by tests, the
+      standalone one asserting the absence of a frame and rail so the
+      shared path cannot be changed by accident.
+
+- [x] **shellsong's `eq(<preset>)` cannot reach saved curves.** fixed,
+      though not the way this entry proposed: `Op::SetEqPreset` carries
+      the **name**, not a `Source`. a `Source` cannot be built at
+      lowering time, because `Program::parse` has no host context and
+      the saved curves only exist at runtime; carrying the name defers
+      resolution to apply time, where `eq::resolve` reads built-ins
+      then saved (the precedence the eq menu shows), and a curve saved
+      after the line was typed still resolves.
+      the parameter went from `Ty::Words(Words::EqPreset)` to a new
+      `Ty::EqName`, since a `Words` set is static by definition.
+      completion merges the built-ins with `Candidates::eq_presets()`,
+      the same host-provides-runtime-names pattern `SavedQueues`
+      already uses for `load_queue`. `eq::index_of` is deleted; it was
+      the built-ins-only resolver this bug was made of.
+      **the thing worth not losing:** parse-time validation used to
+      give `eq(rok)` -> "did you mean 'rock'" and `eq(disco)` -> the
+      list of real names, for free. moving resolution to apply time
+      would have degraded that to a bare failure, so the message moved
+      with it, as `eq::resolve_failure` (same jaro-winkler floor
+      shellsong's own `did_you_mean` uses, and it suggests saved curves
+      too).
+      a missing argument is still a parse error; that needs no host
+      context to decide.
+- [x] **`!foo` does not exclude anything.** fixed by handling it
+      ourselves instead of handing it to nucleo, which parses `!` and
+      then ignores it in `Pattern::score`. `split_exclusions` peels
+      `!term` tokens off the query, the positive remainder is what
+      nucleo sees, and `Needle::excludes` drops a match before it is
+      scored (an excluded item cannot be rescued by any score, so that
+      is the cheapest rejection point).
+      the pinned guard table proved the old bug outright: `!blade`'s
+      pinned row was byte-identical to `'blade`'s, hash and all.
+      exactly one row of 38 changed, which is the check that says
+      nothing else moved.
+      decisions: a bare `!` stays literal text (no term to exclude);
+      an exclusion-only query ranks nothing rather than the whole
+      corpus minus the term, matching how an empty query behaves;
+      matching is substring, not word-boundary, since a boundary rule
+      would keep "(Live)" only by luck of the punctuation.
+      the oracle test now applies the same exclusion to its reference
+      scorer, since `!term` is a filter over the corpus rather than
+      part of scoring; that the exclusion itself is right is what the
+      seven new tests cover.
+      also: the app had quietly supported `'foo`, `^foo` and `foo$`
+      all along and said so nowhere, so the help overlay has a "search
+      syntax" block now instead of leaving it folklore.
+- [ ] **the remaining search cost is the result clone, and it needs an
+      api change to fix.** for a broad query at 40k items, 3-5ms of a
+      ~7ms search is `rank` cloning ~15k `SearchItem`s. cutting it
+      means not materializing rows nobody scrolled to, which cannot be
+      made invisible while `App::results` is a `Vec<SearchItem>` that
+      `main.rs` reads directly for drawing, `G`, the result counter,
+      shellsong's `Target::Index` and `resync_results`'s identity scan.
+      doing it properly is `App` owning the ranked index list and
+      materializing a growing prefix with those five call sites behind
+      accessors; that is the `main.rs` decomposition item's lane. no
+      cap was added, deliberately, since any cap is visible at all five
+      sites.
 - [ ] **album/artist identity is name-based.** `SearchItem` carries no
       `album_id`/`artist_id`, so the suggestion catalog joins on
       trimmed-lowercased names. two same-named albums by one artist
@@ -563,10 +789,20 @@ run that edits these files will collide.
       columns and reintroduced the sections-falling-off-the-bottom
       failure. 38 is the widest line that table actually produces, and
       the regression test still passes at 80x24.
-- [ ] **`notify.rs` still has a per-char text loop** (around line 63),
-      the last writer outside `ui::draw`. Notification bodies include
-      track labels, so a wide-char title there overdraws exactly as
-      the migrated widgets used to.
+- [x] **`notify.rs` goes through `ui::draw`**, the last per-char text
+      writer in the app. Three width bugs, and the interesting one was
+      not the draw loop: the box sized its interior with
+      `chars().count()`, so a cjk track label in a message got a box
+      too narrow for it, and because the text writer budgets correctly
+      the symptom was not an overrun but a **silently truncated
+      message** with plenty of terminal left. The footer (the
+      countdown baked into the bottom border) was also interleaved per
+      cell with the border dashes, which a multi-cell glyph would
+      desync; it is drawn as a full rule and overwritten now. The box
+      also clears its own three rows, since it is painted over the
+      sidebar and main content and an interior cell left unwritten
+      showed through (the box can be wider than its text, see the
+      `max(4)`).
 - [ ] **decompose main.rs** (~3.9k lines). a reviewed, ordered plan
       exists: extract focus/InputMode, then the playback free functions,
       then the sync/channel plumbing, then a `struct Ui` for the ~35
@@ -588,3 +824,11 @@ run that edits these files will collide.
       directly, because it runs once per command and must resolve
       against the duration as of now rather than the last pushed
       change.
+      **correction (perf/mpv):** the claim above that `audio_level` is
+      "inherently a per-frame sample" was wrong. `af-metadata` IS
+      observable (measured at 20 pushes/s with real data), so it is an
+      observed property now like the rest. worse, the old per-frame
+      round trip bought nothing at all: it asked for a property path
+      that does not resolve, and mpv hands af-metadata through as
+      strings so `as_f64()` would have read every reading as absent
+      anyway. the level meter had never worked.
