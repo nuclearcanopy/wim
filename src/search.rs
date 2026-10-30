@@ -693,6 +693,27 @@ impl Corpus {
         rank(scored)
     }
 
+    /// The primary names of the best matches, deduped and capped at
+    /// `cap`. Exactly `search`'s ranking and order, since it scores and
+    /// ranks through the same path; it just stops at `cap` names and
+    /// clones a name rather than a whole `SearchItem` per match, which
+    /// is what shellsong's completion wants on every keystroke.
+    pub fn search_names(&self, query: &str, cap: usize) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for item in rank_borrowed(self.score_all(query)) {
+            let name = item.primary_name();
+            if name.is_empty() || !seen.insert(name) {
+                continue;
+            }
+            names.push(name.to_string());
+            if names.len() >= cap {
+                break;
+            }
+        }
+        names
+    }
+
     /// Phase one of `search`: every item that either signal fired on,
     /// with its score, in corpus order. Split out from the ranking so
     /// the two can be benchmarked separately.
@@ -748,7 +769,10 @@ fn thread_count() -> usize {
 /// Phase two of `search`: sort, cut weak matches, group by category,
 /// materialize. Takes the scored candidates in corpus order, which the
 /// stable sort relies on for tie-breaking.
-fn rank(mut scored: Vec<(u32, &SearchItem)>) -> Vec<SearchItem> {
+/// `rank`, but borrowed. Split out so shellsong's completion can read
+/// the ranking without cloning a `SearchItem` per match; `rank` is
+/// this plus the clone, so the two cannot order differently.
+fn rank_borrowed(mut scored: Vec<(u32, &SearchItem)>) -> Vec<&SearchItem> {
     // relative score cutoff: nucleo's own subsequence matcher will
     // happily return *some* nonzero score for almost any haystack
     // against a short query (e.g. "crest" is a valid, if scattered,
@@ -801,10 +825,14 @@ fn rank(mut scored: Vec<(u32, &SearchItem)>) -> Vec<SearchItem> {
             scored
                 .iter()
                 .filter(|(_, item)| item.category() == cat)
-                .map(|(_, item)| (*item).clone()),
+                .map(|(_, item)| *item),
         );
     }
     out
+}
+
+fn rank(scored: Vec<(u32, &SearchItem)>) -> Vec<SearchItem> {
+    rank_borrowed(scored).into_iter().cloned().collect()
 }
 
 /// Scores one slice of the corpus against `pattern`, reusing a single
