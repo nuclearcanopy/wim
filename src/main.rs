@@ -1212,6 +1212,55 @@ fn start_session(
     Ok(status)
 }
 
+/// The name of the live eq curve, which the per-identity settings
+/// restore to. A hand-tuned curve has no name, so the configured preset
+/// stands in; that is better than leaving one track's curve applied for
+/// the rest of the session.
+fn current_eq_name(app: &app::App, cfg: &config::Config) -> String {
+    app.eq_source
+        .and_then(|s| eq::source_name(s, &cfg.eq_custom_presets))
+        .map(str::to_string)
+        .or_else(|| cfg.eq_preset.clone())
+        .unwrap_or_else(|| eq::PRESETS[0].name.to_string())
+}
+
+/// What the per-identity settings want for a track that just started:
+/// the ops to apply, and the one line to toast when the sound actually
+/// changed because of them.
+///
+/// The restore is the load-bearing half, and it lives in
+/// `shellsong_host::settle`: a setting the new track does not bind goes
+/// back to the value the user had chosen before any binding took over,
+/// rather than keeping the last bound one (which is what leaves
+/// everything quiet after one quiet song).
+fn identity_settings(
+    item: &SearchItem,
+    bindings: &shellsong_host::Bindings,
+    overridden: &mut shellsong_host::Overridden,
+    eq_now: String,
+    volume_now: f64,
+    speed_now: f64,
+) -> (Vec<Op>, Option<String>) {
+    let wanted = bindings.resolve(&shellsong_host::identity_of(item));
+    let mut ops = Vec::new();
+    if let Some(name) = shellsong_host::settle(&mut overridden.eq, wanted.eq.clone(), eq_now) {
+        ops.push(Op::SetEqPreset(name));
+    }
+    if let Some(v) = shellsong_host::settle(&mut overridden.volume, wanted.volume, volume_now) {
+        ops.push(Op::SetVolume(shellsong::Level::Absolute(v)));
+    }
+    if let Some(s) = shellsong_host::settle(&mut overridden.speed, wanted.speed, speed_now) {
+        ops.push(Op::SetSpeed(s));
+    }
+    // only when something moved, so a bound album says it once on its
+    // first track rather than on all twelve.
+    let note = (!ops.is_empty()).then(|| match wanted.summary() {
+        summary if summary.is_empty() => "settings restored".to_string(),
+        summary => format!("remembered: {summary}"),
+    });
+    (ops, note)
+}
+
 /// `main::Focus` is the host's, `shellsong::Focus` the language's
 /// mirror of it (kept separate so the language depends on nothing in
 /// the ui). One to one.
@@ -1403,6 +1452,8 @@ struct ShellsongCtx<'a, 'b> {
     /// The live `let` bindings. Held here rather than re-read per
     /// keystroke, and written back to disk by `define`/`unset`.
     vars: &'a mut shellsong::Scope,
+    /// The per-identity settings, written back by `remember`/`forget`.
+    bindings: &'a mut shellsong_host::Bindings,
 }
 
 /// What a term-taking op acts on. `Index` is a row of the results
@@ -1610,6 +1661,18 @@ fn open_shellsong_view(target: ViewTarget, ctx: &mut ShellsongCtx) -> (Dispatch,
                 ctx.console.note(name);
             }
             op_note(format!("{count} saved queues"))
+        }
+        ViewTarget::Bindings => {
+            let lines = ctx.bindings.lines();
+            let count = if ctx.bindings.is_empty() {
+                0
+            } else {
+                lines.len()
+            };
+            for line in lines {
+                ctx.console.note(line);
+            }
+            op_note(format!("{count} remembered"))
         }
         // the language generates these lines too, as `let` statements,
         // so the listing is also valid input to paste into a `.shg`.
@@ -2137,6 +2200,55 @@ fn run_shellsong_op(op: Op, ctx: &mut ShellsongCtx) -> (Dispatch, Report) {
             }
             shellsong_host::save_vars(ctx.vars);
             op_note(format!("unset {name}"))
+        }
+        Op::Remember { tier, setting } => {
+            let Some(item) = ctx.now_playing.as_ref() else {
+                return op_fail("nothing is playing to remember it for");
+            };
+            let id = shellsong_host::identity_of(item);
+            let Some(name) = shellsong_host::name_at(&id, tier) else {
+                return op_fail(format!(
+                    "this track has no {} to hang a setting off",
+                    tier.label()
+                ));
+            };
+            let report = format!(
+                "{} {} remembered for {} '{name}'",
+                setting.kind().label(),
+                setting.value(),
+                tier.label()
+            );
+            ctx.bindings.remember(tier, &name, &setting);
+            shellsong_host::save_bindings(ctx.bindings);
+            // applied now as well as remembered, through the same arm
+            // the typed command goes through, so remembering a setting
+            // and setting it cannot drift.
+            let (dispatch, _) = run_shellsong_op(setting.op(), ctx);
+            (dispatch, Report::Note(report))
+        }
+        Op::Forget { tier, setting } => {
+            let Some(item) = ctx.now_playing.as_ref() else {
+                return op_fail("nothing is playing to forget anything for");
+            };
+            let id = shellsong_host::identity_of(item);
+            let Some(name) = shellsong_host::name_at(&id, tier) else {
+                return op_fail(format!("this track has no {}", tier.label()));
+            };
+            if !ctx.bindings.forget(tier, &name, setting) {
+                return op_fail(match setting {
+                    Some(kind) => format!(
+                        "no {} was remembered for {} '{name}'",
+                        kind.label(),
+                        tier.label()
+                    ),
+                    None => format!("nothing was remembered for {} '{name}'", tier.label()),
+                });
+            }
+            shellsong_host::save_bindings(ctx.bindings);
+            op_note(match setting {
+                Some(kind) => format!("forgot {} for {} '{name}'", kind.label(), tier.label()),
+                None => format!("forgot everything for {} '{name}'", tier.label()),
+            })
         }
         Op::Quit => {
             let dispatch = dispatch_action(Action::Quit, ctx.actx);
@@ -3565,6 +3677,14 @@ fn main() -> anyhow::Result<()> {
     // `run(...)`'s completion candidates, snapshotted on console open
     // for the same reason the saved queues are.
     let mut shellsong_scripts: Vec<String> = Vec::new();
+    // the per-identity settings, and what they are currently
+    // overriding so it can be put back when an unbound track starts.
+    let mut shellsong_bindings = shellsong_host::load_bindings();
+    let mut shellsong_overridden = shellsong_host::Overridden::default();
+    // ops the host itself asked for, waiting for the step loop so they
+    // go through `apply_shellsong_op` like everything else. One slot:
+    // a newer track change supersedes an older pending settle.
+    let mut shellsong_queued: Option<Box<shellsong::Program>> = None;
     // `~/.config/wim/init.shg`, if there is one, as the first program
     // the step loop drives. Spelled as the language rather than wired
     // specially: it is one `run(init)` line through the same parse and
@@ -4819,6 +4939,23 @@ fn main() -> anyhow::Result<()> {
             };
             note_playback_started(&next, &mut dctx, &mut notifications);
             start_tracking_playback(&cfg, &next, &mut scrobble);
+            // per-identity settings. Queued rather than applied here,
+            // so they go through the step loop's `apply_shellsong_op`
+            // like every other op.
+            let (ops, bound) = identity_settings(
+                &next,
+                &shellsong_bindings,
+                &mut shellsong_overridden,
+                current_eq_name(&app, &cfg),
+                current_volume(&player).unwrap_or(base_volume),
+                app.speed,
+            );
+            if !ops.is_empty() {
+                shellsong_queued = Some(Box::new(shellsong::Program::of(ops)));
+            }
+            if let Some(bound) = bound {
+                notifications.push(Severity::Info, bound);
+            }
             previous_track = now_playing.replace(next);
             // a track just started: either start it quiet and ramp up
             // (crossfade on), or make sure it's at full volume
@@ -4862,6 +4999,22 @@ fn main() -> anyhow::Result<()> {
                     };
                     note_playback_started(&first, &mut dctx, &mut notifications);
                     start_tracking_playback(&cfg, &first, &mut scrobble);
+                    // same hook as the ordinary advance above: a
+                    // loop-all restart is a track change too.
+                    let (ops, bound) = identity_settings(
+                        &first,
+                        &shellsong_bindings,
+                        &mut shellsong_overridden,
+                        current_eq_name(&app, &cfg),
+                        current_volume(&player).unwrap_or(base_volume),
+                        app.speed,
+                    );
+                    if !ops.is_empty() {
+                        shellsong_queued = Some(Box::new(shellsong::Program::of(ops)));
+                    }
+                    if let Some(bound) = bound {
+                        notifications.push(Severity::Info, bound);
+                    }
                     previous_track = now_playing.replace(first);
                     if crossfade_enabled {
                         let _ = player.set_volume(0.0);
@@ -5250,7 +5403,17 @@ fn main() -> anyhow::Result<()> {
         // command that searches resumes on a later frame, once the
         // results for its query have settled.
         let mut shellsong_quit = false;
-        while let Some(program) = shellsong_program.as_mut() {
+        loop {
+            // a program the host synthesised (the per-identity settings
+            // a track change asked for) waits its turn behind a typed
+            // one, then goes through this very loop, so a per-track eq
+            // cannot behave differently from `eq(night)` typed in.
+            if shellsong_program.is_none() {
+                shellsong_program = shellsong_queued.take();
+            }
+            let Some(program) = shellsong_program.as_mut() else {
+                break;
+            };
             // recomputed every step, not once per frame: `search(...)`
             // makes the query unsettled again, and a `Resolve` reading
             // a stale `true` would act on the previous query's results,
@@ -5319,6 +5482,7 @@ fn main() -> anyhow::Result<()> {
                             settle: &mut settle,
                             saved_queues: &mut saved_queues,
                             vars: &mut shellsong_vars,
+                            bindings: &mut shellsong_bindings,
                         },
                     );
                     if dispatch == Dispatch::Quit {

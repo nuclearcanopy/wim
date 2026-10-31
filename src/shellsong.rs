@@ -148,6 +148,125 @@ pub enum Target {
     Selection,
 }
 
+/// Which identity a per-identity setting hangs off. Resolution runs
+/// track, then album, then artist, **per setting**: a track-level eq
+/// and an album-level volume both apply, because masking one with the
+/// other would make a single remembered eq silently drop a remembered
+/// volume. See docs/shellsong.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tier {
+    Track,
+    Album,
+    Artist,
+}
+
+impl Tier {
+    pub fn label(self) -> &'static str {
+        match self {
+            Tier::Track => "track",
+            Tier::Album => "album",
+            Tier::Artist => "artist",
+        }
+    }
+
+    fn of(word: &str) -> Option<Tier> {
+        [Tier::Track, Tier::Album, Tier::Artist]
+            .into_iter()
+            .find(|t| t.label() == word)
+    }
+}
+
+/// Which setting a binding is about, named for the command that sets
+/// it so there is no second vocabulary to keep in step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SettingKind {
+    Eq,
+    Volume,
+    Speed,
+}
+
+impl SettingKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingKind::Eq => "eq",
+            SettingKind::Volume => "volume",
+            SettingKind::Speed => "speed",
+        }
+    }
+
+    fn of(word: &str) -> Option<SettingKind> {
+        [SettingKind::Eq, SettingKind::Volume, SettingKind::Speed]
+            .into_iter()
+            .find(|k| k.label() == word)
+    }
+}
+
+/// A remembered setting and its value. Built from the inner call of
+/// `remember(tier, call)`, so the value went through that command's own
+/// parameter type and nothing here re-validates it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Setting {
+    Eq(String),
+    /// Absolute only: a nudge is a change, not a value to remember.
+    Volume(f64),
+    Speed(f64),
+}
+
+impl Setting {
+    pub fn kind(&self) -> SettingKind {
+        match self {
+            Setting::Eq(_) => SettingKind::Eq,
+            Setting::Volume(_) => SettingKind::Volume,
+            Setting::Speed(_) => SettingKind::Speed,
+        }
+    }
+
+    /// One line naming the value, for the listing and the reports.
+    pub fn value(&self) -> String {
+        match self {
+            Setting::Eq(name) => name.clone(),
+            Setting::Volume(v) => format!("{v}%"),
+            Setting::Speed(s) => format!("{s}x"),
+        }
+    }
+
+    /// The op that applies it. The binding therefore goes through the
+    /// very same host arm `eq(night)` typed into the console does.
+    pub fn op(&self) -> Op {
+        match self {
+            Setting::Eq(name) => Op::SetEqPreset(name.clone()),
+            Setting::Volume(v) => Op::SetVolume(Level::Absolute(*v)),
+            Setting::Speed(s) => Op::SetSpeed(*s),
+        }
+    }
+
+    /// What `remember(tier, call)` accepts, read off the inner call.
+    /// `Err` says what it would have taken, since this is the one place
+    /// that knows.
+    fn of_call(call: &Call) -> Result<Setting, String> {
+        match call.simple_op() {
+            Some(Op::SetEqPreset(name)) => Ok(Setting::Eq(name)),
+            Some(Op::SetVolume(Level::Absolute(v))) => Ok(Setting::Volume(v)),
+            Some(Op::SetVolume(Level::Delta(_))) => Err(
+                "remember takes a volume to settle on, not a nudge: write volume(40%)".to_string(),
+            ),
+            Some(Op::SetSpeed(s)) => Ok(Setting::Speed(s)),
+            Some(Op::SpeedUp) | Some(Op::SpeedDown) => {
+                Err("remember takes a speed to settle on, not a step: write speed(1.1)".to_string())
+            }
+            _ => Err(format!(
+                "remember takes {}; '{}' is not one of them",
+                SETTINGS.join(", "),
+                call.command.name
+            )),
+        }
+    }
+}
+
+/// The settable things a binding can hold, in the order `help` and the
+/// error messages list them.
+const SETTINGS: &[&str] = &["eq(...)", "volume(...)", "speed(...)"];
+
 /// Which pane owns the keyboard. `go()` means "what enter does", and
 /// what enter does depends on this, so the executor resolves it rather
 /// than making the host re-derive it.
@@ -189,6 +308,8 @@ pub enum ViewTarget {
     Playlists,
     /// The defined variables, listed as `let` lines.
     Vars,
+    /// The per-identity settings, listed.
+    Bindings,
     Eq,
     /// The command listing: the one target whose content is generated
     /// by the language itself (`help_lines`, off `COMMANDS`) rather than
@@ -210,6 +331,7 @@ impl ViewTarget {
                 | ViewTarget::History
                 | ViewTarget::Playlists
                 | ViewTarget::Vars
+                | ViewTarget::Bindings
                 | ViewTarget::Help
         )
     }
@@ -255,6 +377,7 @@ const VIEW_NAMES: &[ViewName] = &[
     view("playlists", ViewTarget::Playlists, true),
     view("vars", ViewTarget::Vars, true),
     view("variables", ViewTarget::Vars, false),
+    view("bindings", ViewTarget::Bindings, true),
     view("eq", ViewTarget::Eq, true),
     view("equalizer", ViewTarget::Eq, false),
     view("help", ViewTarget::Help, true),
@@ -337,6 +460,18 @@ pub enum Op {
         terms: Vec<String>,
     },
     Unset(String),
+    /// Bind a setting to whatever is playing, at `tier`. The identity
+    /// is read from the track by the host, since only it knows what is
+    /// playing; the language only says which tier and which value.
+    Remember {
+        tier: Tier,
+        setting: Setting,
+    },
+    /// Drop one setting's binding at `tier`, or every setting's.
+    Forget {
+        tier: Tier,
+        setting: Option<SettingKind>,
+    },
     /// the one screen-opening op; `ViewTarget::is_screen` says whether
     /// it takes over the screen or prints a listing.
     View(ViewTarget),
@@ -402,6 +537,22 @@ impl Op {
                 format!("let {name} = [{}]", terms.join(", "))
             }
             Op::Unset(name) => format!("unset {name}"),
+            Op::Remember { tier, setting } => format!(
+                "remembered {} {} for this {}",
+                setting.kind().label(),
+                setting.value(),
+                tier.label()
+            ),
+            Op::Forget {
+                tier,
+                setting: Some(kind),
+            } => format!("forgot this {}'s {}", tier.label(), kind.label()),
+            Op::Forget {
+                tier,
+                setting: None,
+            } => {
+                format!("forgot everything for this {}", tier.label())
+            }
             Op::View(t) => format!("viewing {}", view_name(*t)),
             Op::Rescan => "rescanning the library".into(),
             Op::Sleep(Some(s)) => format!("sleep in {s}s"),
@@ -477,6 +628,11 @@ pub enum Ty {
     Words(Words),
     /// a nested call, for the higher-order commands.
     Call,
+    /// a nested call that has to *be* a setting: `remember` can only
+    /// settle on an eq curve, an absolute volume or a fixed speed, so
+    /// offering it `clear_queue` would be offering something that does
+    /// not parse (R12).
+    SettingCall,
 }
 
 /// The enumerated keyword sets. `options` is what both the parser and
@@ -491,6 +647,10 @@ pub enum Words {
     /// its search form.
     ViewTarget,
     FadeDir,
+    /// which identity a `remember`/`forget` is about.
+    Tier,
+    /// which setting a `forget` drops.
+    Setting,
 }
 
 impl Words {
@@ -515,6 +675,8 @@ impl Words {
             Words::EqPreset => &EQ_PRESETS,
             Words::ViewTarget => &VIEW_TARGETS,
             Words::FadeDir => &["in", "out"],
+            Words::Tier => &["track", "album", "artist"],
+            Words::Setting => &["eq", "volume", "speed"],
         }
     }
 
@@ -554,6 +716,8 @@ pub enum Completes {
     Variables,
     /// the `.shg` scripts the host can see.
     Scripts,
+    /// the three commands `remember` accepts, with their parens.
+    SettingNames,
     /// command names.
     CommandNames,
     /// the host's saved queue names.
@@ -585,6 +749,7 @@ impl Ty {
             Ty::VarName => Completes::Variables,
             Ty::ScriptName => Completes::Scripts,
             Ty::CommandName | Ty::Call => Completes::CommandNames,
+            Ty::SettingCall => Completes::SettingNames,
             Ty::Words(w) => Completes::Words(w),
             Ty::NewName => Completes::Hint("a name to save it under"),
             Ty::Pos => Completes::Hint("10% / 90 / 1m20s"),
@@ -641,6 +806,7 @@ impl Ty {
                 }
             }
             Ty::Call => "a call like skip()".into(),
+            Ty::SettingCall => format!("one of {}", SETTINGS.join(", ")),
         }
     }
 }
@@ -912,6 +1078,29 @@ pub const COMMANDS: &[Command] = &[
         &[req("name", Ty::VarName)],
         &[],
         "drop a variable",
+    ),
+    // per-identity settings. Higher-order like `repeat` and `dry`: the
+    // setting is the inner call, so there is no parallel vocabulary of
+    // setting names and values to keep in step with the real commands.
+    cmd(
+        "remember",
+        &[],
+        &[
+            req("tier", Ty::Words(Words::Tier)),
+            req("call", Ty::SettingCall),
+        ],
+        &[],
+        "bind a setting to what is playing, by track, album or artist",
+    ),
+    cmd(
+        "forget",
+        &[],
+        &[
+            req("tier", Ty::Words(Words::Tier)),
+            opt("setting", Ty::Words(Words::Setting)),
+        ],
+        &[],
+        "drop what was remembered, for one setting or all of them",
     ),
     cmd(
         "star",
@@ -1509,6 +1698,21 @@ impl Program {
         })
     }
 
+    /// A program that is nothing but these ops, for the host's own
+    /// synthesised work (the per-identity settings a track change asks
+    /// for). It goes through the same stepper and therefore the same
+    /// `apply_shellsong_op`, which is what keeps a per-track eq from
+    /// behaving differently from `eq(night)` typed into the console.
+    pub fn of(ops: Vec<Op>) -> Program {
+        Program {
+            nodes: ops.into_iter().map(Node::Emit).collect(),
+            pc: 0,
+            pending: None,
+            groups: Vec::new(),
+            done: false,
+        }
+    }
+
     /// True once the program has nothing left to do; the host drops it.
     pub fn is_done(&self) -> bool {
         self.done || self.pc >= self.nodes.len()
@@ -1780,6 +1984,18 @@ impl<'a> Lowering<'a> {
             "run" => {
                 if let Some(Arg::Script { name, source }) = call.args.first() {
                     self.lower_script(name, source);
+                }
+            }
+            "remember" => {
+                // the shape is already checked at parse time
+                // (`check_remember`), so this cannot be reached with an
+                // inner call that is not a setting.
+                if let (Some(Arg::Word(w)), Some(Arg::Call(inner))) =
+                    (call.args.first(), call.args.get(1))
+                {
+                    if let (Some(tier), Ok(setting)) = (Tier::of(w), Setting::of_call(inner)) {
+                        self.nodes.push(Node::Emit(Op::Remember { tier, setting }));
+                    }
                 }
             }
             "help" => self.lower_help(call),
@@ -2145,6 +2361,10 @@ impl Call {
                 Some(Arg::Name(n)) => Op::Unset(n.clone()),
                 _ => return None,
             },
+            "forget" => Op::Forget {
+                tier: self.keyword(Words::Tier).and_then(Tier::of)?,
+                setting: self.keyword(Words::Setting).and_then(SettingKind::of),
+            },
             "up" => Op::MoveSelection(-1),
             "down" => Op::MoveSelection(1),
             "top" => Op::SelectTop,
@@ -2459,6 +2679,9 @@ fn parse_call(input: &str, offset: usize, text: &str, world: &World) -> Result<C
     if command.name == "view" {
         check_view(input, &args, &positional)?;
     }
+    if command.name == "remember" {
+        check_remember(input, &args, &positional)?;
+    }
     Ok(Call {
         command,
         args,
@@ -2488,6 +2711,30 @@ fn check_view(input: &str, args: &[Arg], positional: &[(usize, &str)]) -> Result
             "view(<target>) takes no terms; write view(q, terms) to search",
         )),
         _ => Ok(()),
+    }
+}
+
+/// `remember`'s inner call has to be one the host can actually settle
+/// on later: a named eq curve, an absolute volume, a fixed speed.
+/// Checked here rather than in `bind`, which only ever validates one
+/// parameter against its own type and cannot see that a `Call` is the
+/// wrong *kind* of call.
+fn check_remember(
+    input: &str,
+    args: &[Arg],
+    positional: &[(usize, &str)],
+) -> Result<(), ParseError> {
+    let Some(Arg::Call(inner)) = args.get(1) else {
+        return Ok(());
+    };
+    match Setting::of_call(inner) {
+        Ok(_) => Ok(()),
+        Err(why) => Err(err(
+            input,
+            positional.get(1).map(|(o, _)| *o).unwrap_or(0),
+            positional.get(1).map(|(_, t)| *t).unwrap_or(""),
+            why,
+        )),
     }
 }
 
@@ -2739,7 +2986,7 @@ fn coerce(
                 ),
             })),
         },
-        Ty::Call => {
+        Ty::Call | Ty::SettingCall => {
             if !text.contains('(') {
                 return Err(expected());
             }
@@ -3302,6 +3549,11 @@ impl Console {
                 cand.scripts().iter().map(String::as_str),
                 MAX_CANDIDATES,
             ),
+            Completes::SettingNames => keep_extensions(
+                &here.token,
+                Words::Setting.options().iter().copied(),
+                MAX_CANDIDATES,
+            ),
             Completes::SavedQueues => keep_extensions(
                 &here.token,
                 cand.saved_queues().iter().map(String::as_str),
@@ -3361,8 +3613,12 @@ impl Console {
             // every command needs parens, so a completed command name
             // gets them and lands the cursor inside, reusing the same
             // auto-pairing an explicitly typed '(' goes through.
-            if before.completes == Completes::CommandNames
-                && !self.input[self.cursor..].starts_with('(')
+            // a setting name is a command name too, so both classes
+            // land the cursor inside the parens they need.
+            if matches!(
+                before.completes,
+                Completes::CommandNames | Completes::SettingNames
+            ) && !self.input[self.cursor..].starts_with('(')
             {
                 edit_insert(&mut self.input, &mut self.cursor, '(');
             }
@@ -4313,6 +4569,7 @@ mod tests {
             Ty::Duration => "30m".into(),
             Ty::Words(w) => w.options()[0].to_string(),
             Ty::Call => "skip()".into(),
+            Ty::SettingCall => "speed(1.5)".into(),
         }
     }
 
@@ -4385,6 +4642,7 @@ mod tests {
             ViewTarget::History,
             ViewTarget::Playlists,
             ViewTarget::Vars,
+            ViewTarget::Bindings,
             ViewTarget::Eq,
             ViewTarget::Help,
         ];
@@ -4401,6 +4659,7 @@ mod tests {
                 ViewTarget::History => "history",
                 ViewTarget::Playlists => "playlists",
                 ViewTarget::Vars => "vars",
+                ViewTarget::Bindings => "bindings",
                 ViewTarget::Eq => "eq",
                 ViewTarget::Help => "help",
             }
@@ -5481,12 +5740,15 @@ mod tests {
             Ty::Speed,
             Ty::Duration,
             Ty::Call,
+            Ty::SettingCall,
             Ty::Words(Words::Position),
             Ty::Words(Words::LoopMode),
             Ty::Words(Words::Switch),
             Ty::Words(Words::EqPreset),
             Ty::Words(Words::ViewTarget),
             Ty::Words(Words::FadeDir),
+            Ty::Words(Words::Tier),
+            Ty::Words(Words::Setting),
         ];
         for ty in &every {
             match ty.completes() {
@@ -5533,6 +5795,12 @@ mod tests {
                     let mut args: Vec<String> =
                         c.params.iter().take(i).map(|p| sample_arg(p.ty)).collect();
                     args.push(option.to_string());
+                    // whatever is still required after it, or the call
+                    // would be short an argument rather than wrong
+                    // about the keyword, which is not what this pins.
+                    for p in c.params.iter().skip(i + 1).filter(|p| p.required) {
+                        args.push(sample_arg(p.ty));
+                    }
                     let call = format!("{}({}{extra})", c.name, args.join(", "));
                     assert!(
                         Program::parse(&call).is_ok(),
@@ -6221,6 +6489,118 @@ mod tests {
         assert_ne!(ops("clear()"), vec![Op::ClearQueue]);
     }
 
+    // -------------------------------------------- bound settings
+
+    #[test]
+    fn remember_takes_the_setting_as_a_call_so_there_is_no_second_vocabulary() {
+        let empty = Scope::default();
+        assert_eq!(
+            ops_in("remember(track, eq(night))", &empty),
+            vec![Op::Remember {
+                tier: Tier::Track,
+                setting: Setting::Eq("night".to_string()),
+            }]
+        );
+        assert_eq!(
+            ops_in("remember(album, volume(40%))", &empty),
+            vec![Op::Remember {
+                tier: Tier::Album,
+                setting: Setting::Volume(40.0),
+            }]
+        );
+        assert_eq!(
+            ops_in("remember(artist, speed(1.1))", &empty),
+            vec![Op::Remember {
+                tier: Tier::Artist,
+                setting: Setting::Speed(1.1),
+            }]
+        );
+    }
+
+    /// The value has to be one the host can settle on later, so a nudge
+    /// and a step are both refused at parse time with the call they
+    /// meant; otherwise `remember(track, volume(+10%))` would bind
+    /// "louder than whatever it happens to be", which is not a setting.
+    #[test]
+    fn remember_refuses_a_relative_value_and_a_call_that_is_not_a_setting() {
+        let empty = Scope::default();
+        let e = error_in("remember(track, volume(+10%))", &empty);
+        assert!(e.message.contains("volume(40%)"), "{}", e.message);
+        let e = error_in("remember(track, speed(up))", &empty);
+        assert!(e.message.contains("speed(1.1)"), "{}", e.message);
+        for bad in ["skip()", "clear_queue()", "play(crest)", "quit()"] {
+            let e = error_in(&format!("remember(track, {bad})"), &empty);
+            assert!(e.message.contains("remember takes"), "{bad}: {}", e.message);
+            assert!(e.message.contains("eq(...)"), "{bad}: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn forget_drops_one_setting_or_all_of_them() {
+        let empty = Scope::default();
+        assert_eq!(
+            ops_in("forget(track)", &empty),
+            vec![Op::Forget {
+                tier: Tier::Track,
+                setting: None,
+            }]
+        );
+        assert_eq!(
+            ops_in("forget(album, eq)", &empty),
+            vec![Op::Forget {
+                tier: Tier::Album,
+                setting: Some(SettingKind::Eq),
+            }]
+        );
+        let e = error_in("forget(track, loudness)", &empty);
+        assert!(e.message.contains("eq, volume, speed"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_remembered_setting_describes_itself_and_dry_plans_it() {
+        let empty = Scope::default();
+        assert_eq!(
+            Op::Remember {
+                tier: Tier::Track,
+                setting: Setting::Eq("night".to_string()),
+            }
+            .describe(),
+            "remembered eq night for this track"
+        );
+        let plan = notes_in("dry(remember(track, eq(night)))", &empty);
+        assert_eq!(plan[0], "would run: remember(track, eq(night))");
+        assert!(
+            plan.iter().any(|l| l.contains("remembered eq night")),
+            "{plan:?}"
+        );
+        assert!(ops_in("dry(remember(track, eq(night)))", &empty).is_empty());
+    }
+
+    /// The op a binding applies is the op the typed command lowers to,
+    /// which is what keeps a per-track eq from drifting from `eq(x)`.
+    #[test]
+    fn a_settings_op_is_the_same_op_the_typed_command_lowers_to() {
+        let empty = Scope::default();
+        assert_eq!(
+            Setting::Eq("night".to_string()).op(),
+            ops_in("eq(night)", &empty)[0]
+        );
+        assert_eq!(Setting::Volume(40.0).op(), ops_in("volume(40%)", &empty)[0]);
+        assert_eq!(Setting::Speed(1.1).op(), ops_in("speed(1.1)", &empty)[0]);
+    }
+
+    /// Synthesised ops go through the same stepper, so the host has one
+    /// dispatch point rather than a second table for its own work.
+    #[test]
+    fn a_host_built_program_steps_like_any_other() {
+        let mut program = Program::of(vec![Op::SetSpeed(1.1), Op::Mute(true)]);
+        assert_eq!(program.step(&SETTLED), Step::Emit(Op::SetSpeed(1.1)));
+        assert_eq!(program.step(&SETTLED), Step::Emit(Op::Mute(true)));
+        assert_eq!(program.step(&SETTLED), Step::Done);
+        assert!(program.is_done());
+        assert!(Program::of(Vec::new()).is_done());
+    }
+
     // ----------------------------------------------------- scripts
 
     const SCRIPT: &str = "\
@@ -6537,6 +6917,9 @@ queue(morning)
         "unset(bla",
         "play(bla",
         "run(",
+        "remember(",
+        "remember(track, ",
+        "forget(track, ",
         "loop(",
         "shuffle(",
         "eq(",
@@ -6621,6 +7004,7 @@ queue(morning)
                 "favorite",
                 "find",
                 "flush",
+                "forget",
                 "forward",
                 "fwd",
                 "go",
@@ -6646,7 +7030,6 @@ queue(morning)
                 "queue",
                 "quit",
                 "random",
-                "randomize",
             ],
         );
         pin(
@@ -6681,6 +7064,7 @@ queue(morning)
                 "history",
                 "playlists",
                 "vars",
+                "bindings",
                 "eq",
                 "help",
             ],
@@ -6808,6 +7192,7 @@ queue(morning)
                 "favorite",
                 "find",
                 "flush",
+                "forget",
                 "forward",
                 "fwd",
                 "go",
@@ -6833,7 +7218,6 @@ queue(morning)
                 "queue",
                 "quit",
                 "random",
-                "randomize",
             ],
         );
         pin(
@@ -6990,6 +7374,30 @@ queue(morning)
         );
         pin("run(", "run()", "", None, Some(("run(script)", 0)), &[]);
         pin(
+            "remember(",
+            "remember()",
+            "track",
+            None,
+            Some(("remember(tier, call)", 0)),
+            &["track", "album", "artist"],
+        );
+        pin(
+            "remember(track, ",
+            "remember(track, )",
+            "eq",
+            None,
+            Some(("remember(tier, call)", 1)),
+            &["eq", "volume", "speed"],
+        );
+        pin(
+            "forget(track, ",
+            "forget(track, )",
+            "eq",
+            None,
+            Some(("forget(tier, setting?)", 1)),
+            &["eq", "volume", "speed"],
+        );
+        pin(
             "loop(",
             "loop()",
             "one",
@@ -7067,6 +7475,7 @@ queue(morning)
                 "favorite",
                 "find",
                 "flush",
+                "forget",
                 "forward",
                 "fwd",
                 "go",
@@ -7092,7 +7501,6 @@ queue(morning)
                 "queue",
                 "quit",
                 "random",
-                "randomize",
             ],
         );
         pin(

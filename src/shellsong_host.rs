@@ -5,12 +5,15 @@
 //! state mutations. The per-op application table lives there, next to
 //! `dispatch_action`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::search::Corpus;
-use crate::shellsong::{Candidates, Level, Pos, Scope};
+use serde::{Deserialize, Serialize};
+
+use crate::search::{Corpus, SearchItem};
+use crate::shellsong::{Candidates, Level, Pos, Scope, Setting, SettingKind, Tier};
 use crate::subsonic::Client;
 
 // -------------------------------------------------------- variables
@@ -52,6 +55,313 @@ fn write_vars(path: &Path, scope: &Scope) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(body) = toml::to_string_pretty(scope) {
+        let _ = std::fs::write(path, body);
+    }
+}
+
+// ------------------------------------------------- bound settings
+
+/// Where the per-identity settings live. State rather than config:
+/// these are written by `remember(...)`, not hand-edited, same class as
+/// the saved queues.
+const BINDINGS_FILE: &str = "bindings.toml";
+
+/// One identity's remembered settings. Flat optionals rather than a
+/// map, so toml reads as `eq = "night"` and a setting that is not bound
+/// is simply absent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Bound {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eq: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f64>,
+}
+
+impl Bound {
+    fn set(&mut self, setting: &Setting) {
+        match setting {
+            Setting::Eq(name) => self.eq = Some(name.clone()),
+            Setting::Volume(v) => self.volume = Some(*v),
+            Setting::Speed(s) => self.speed = Some(*s),
+        }
+    }
+
+    fn clear(&mut self, kind: SettingKind) {
+        match kind {
+            SettingKind::Eq => self.eq = None,
+            SettingKind::Volume => self.volume = None,
+            SettingKind::Speed => self.speed = None,
+        }
+    }
+
+    fn has(&self, kind: SettingKind) -> bool {
+        match kind {
+            SettingKind::Eq => self.eq.is_some(),
+            SettingKind::Volume => self.volume.is_some(),
+            SettingKind::Speed => self.speed.is_some(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.eq.is_none() && self.volume.is_none() && self.speed.is_none()
+    }
+
+    /// One line naming what is bound, for the listing and the toast.
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(name) = &self.eq {
+            parts.push(format!("eq {name}"));
+        }
+        if let Some(v) = self.volume {
+            parts.push(format!("volume {v}%"));
+        }
+        if let Some(s) = self.speed {
+            parts.push(format!("speed {s}x"));
+        }
+        parts.join(", ")
+    }
+}
+
+/// The three names a binding can hang off, read straight off the item.
+///
+/// **Names, not ids**, deliberately, and for the reason `eq::resolve`
+/// gives for the same choice: an id points at a different thing the
+/// moment the library is rescanned, a server is swapped or the same
+/// track is played from a local copy instead of a stream, and a
+/// remembered eq should survive all three. The cost is that two
+/// genuinely different tracks sharing an artist and a title share a
+/// binding, which is the rarer problem.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Identity {
+    pub track: Option<String>,
+    pub album: Option<String>,
+    pub artist: Option<String>,
+}
+
+/// The identity's name at `tier`, which is the key a binding hangs
+/// off. `None` when the track has nothing there (a local file with no
+/// album tag), which is a refusal rather than an empty key.
+pub fn name_at(id: &Identity, tier: Tier) -> Option<String> {
+    id.at(tier).map(str::to_string)
+}
+
+impl Identity {
+    fn at(&self, tier: Tier) -> Option<&str> {
+        match tier {
+            Tier::Track => self.track.as_deref(),
+            Tier::Album => self.album.as_deref(),
+            Tier::Artist => self.artist.as_deref(),
+        }
+    }
+}
+
+fn key(text: &str) -> Option<String> {
+    let text = text.trim().to_lowercase();
+    (!text.is_empty()).then_some(text)
+}
+
+/// The identity of whatever is playing. A track's key carries its
+/// artist as well as its title, since a title alone collides across a
+/// library ("intro" is every third record).
+pub fn identity_of(item: &SearchItem) -> Identity {
+    let (title, artist, album) = match item {
+        SearchItem::LocalMusic {
+            title,
+            artist,
+            album,
+            ..
+        } => (title.clone(), artist.clone(), album.clone()),
+        SearchItem::LocalVideo { title, .. } => (title.clone(), None, None),
+        SearchItem::Song {
+            title,
+            artist,
+            album,
+            ..
+        } => (title.clone(), Some(artist.clone()), Some(album.clone())),
+        // never reaches the queue: `resolve_tracks` expands all three
+        // before anything is played.
+        SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => {
+            (String::new(), None, None)
+        }
+    };
+    let artist = artist.and_then(|a| key(&a));
+    Identity {
+        track: key(&title).map(|t| match &artist {
+            Some(a) => format!("{a} - {t}"),
+            None => t,
+        }),
+        album: album.and_then(|a| key(&a)),
+        artist,
+    }
+}
+
+/// Every per-identity setting, by tier then by identity. `BTreeMap`, so
+/// the listing and the toml are both in a stable order.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Bindings {
+    #[serde(default)]
+    track: BTreeMap<String, Bound>,
+    #[serde(default)]
+    album: BTreeMap<String, Bound>,
+    #[serde(default)]
+    artist: BTreeMap<String, Bound>,
+}
+
+impl Bindings {
+    fn tier(&self, tier: Tier) -> &BTreeMap<String, Bound> {
+        match tier {
+            Tier::Track => &self.track,
+            Tier::Album => &self.album,
+            Tier::Artist => &self.artist,
+        }
+    }
+
+    fn tier_mut(&mut self, tier: Tier) -> &mut BTreeMap<String, Bound> {
+        match tier {
+            Tier::Track => &mut self.track,
+            Tier::Album => &mut self.album,
+            Tier::Artist => &mut self.artist,
+        }
+    }
+
+    pub fn remember(&mut self, tier: Tier, name: &str, setting: &Setting) {
+        self.tier_mut(tier)
+            .entry(name.to_string())
+            .or_default()
+            .set(setting);
+    }
+
+    /// Drops one setting, or every setting, at `tier`. False when there
+    /// was nothing bound there to drop, so the host can say so rather
+    /// than reporting a no-op as a success (R9).
+    pub fn forget(&mut self, tier: Tier, name: &str, setting: Option<SettingKind>) -> bool {
+        let map = self.tier_mut(tier);
+        let Some(bound) = map.get_mut(name) else {
+            return false;
+        };
+        match setting {
+            None => {
+                map.remove(name);
+                true
+            }
+            Some(kind) => {
+                let had = bound.has(kind);
+                bound.clear(kind);
+                if bound.is_empty() {
+                    map.remove(name);
+                }
+                had
+            }
+        }
+    }
+
+    /// What applies to `id`. Precedence runs track, album, artist
+    /// **per setting**, not per identity: a track-level eq and an
+    /// album-level volume both apply, because letting the narrower tier
+    /// mask the wider one would make remembering an eq silently drop a
+    /// remembered volume.
+    pub fn resolve(&self, id: &Identity) -> Bound {
+        let mut out = Bound::default();
+        for tier in [Tier::Track, Tier::Album, Tier::Artist] {
+            let Some(bound) = id.at(tier).and_then(|name| self.tier(tier).get(name)) else {
+                continue;
+            };
+            out.eq = out.eq.or_else(|| bound.eq.clone());
+            out.volume = out.volume.or(bound.volume);
+            out.speed = out.speed.or(bound.speed);
+        }
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.track.is_empty() && self.album.is_empty() && self.artist.is_empty()
+    }
+
+    /// What `view(bindings)` prints: one line per bound identity.
+    pub fn lines(&self) -> Vec<String> {
+        if self.is_empty() {
+            return vec!["nothing is remembered; remember(track, eq(night)) binds one".to_string()];
+        }
+        let mut out = Vec::new();
+        for tier in [Tier::Track, Tier::Album, Tier::Artist] {
+            for (name, bound) in self.tier(tier) {
+                out.push(format!("{}: {name} -> {}", tier.label(), bound.summary()));
+            }
+        }
+        out
+    }
+}
+
+/// What the per-identity settings are currently overriding, holding the
+/// value that was in effect *before* each override so it can be put
+/// back. `None` means that setting is not overridden.
+///
+/// Putting it back is the whole reason this exists: leaving a bound
+/// track's volume applied to the next, unbound one is the bug that has
+/// the user wondering why everything went quiet after one song.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Overridden {
+    pub eq: Option<String>,
+    pub volume: Option<f64>,
+    pub speed: Option<f64>,
+}
+
+/// One setting's transition on a track change.
+///
+/// `active` is the value to restore and is updated in place, `wanted`
+/// is what the new track's bindings ask for, `current` is what is in
+/// effect right now. Returns the value to apply, or `None` for "leave
+/// it alone". Pure, so the restore rule is tested with no mpv.
+pub fn settle<T: Clone + PartialEq>(
+    active: &mut Option<T>,
+    wanted: Option<T>,
+    current: T,
+) -> Option<T> {
+    match wanted {
+        Some(want) => {
+            // the user's own value is captured the first time an
+            // override takes over, not on every bound track in a row,
+            // or a chain of them would restore to the previous binding
+            // instead of to what the user had chosen.
+            if active.is_none() {
+                *active = Some(current.clone());
+            }
+            (want != current).then_some(want)
+        }
+        None => active.take().filter(|previous| *previous != current),
+    }
+}
+
+fn bindings_path() -> Option<PathBuf> {
+    crate::shellsong::state_path(BINDINGS_FILE)
+}
+
+pub fn load_bindings() -> Bindings {
+    bindings_path()
+        .map(|p| read_bindings(&p))
+        .unwrap_or_default()
+}
+
+pub fn save_bindings(bindings: &Bindings) {
+    if let Some(path) = bindings_path() {
+        write_bindings(&path, bindings);
+    }
+}
+
+fn read_bindings(path: &Path) -> Bindings {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| toml::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn write_bindings(path: &Path, bindings: &Bindings) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(body) = toml::to_string_pretty(bindings) {
         let _ = std::fs::write(path, body);
     }
 }
@@ -380,6 +690,158 @@ mod tests {
 
     fn secs(s: u64) -> Duration {
         Duration::from_secs(s)
+    }
+
+    // ------------------------------------------------ bound settings
+
+    fn song(title: &str, artist: &str, album: &str) -> SearchItem {
+        SearchItem::LocalMusic {
+            path: PathBuf::from(format!("/music/{title}.flac")),
+            title: title.to_string(),
+            artist: Some(artist.to_string()),
+            album: Some(album.to_string()),
+        }
+    }
+
+    fn bound(eq: Option<&str>, volume: Option<f64>, speed: Option<f64>) -> Bound {
+        Bound {
+            eq: eq.map(str::to_string),
+            volume,
+            speed,
+        }
+    }
+
+    #[test]
+    fn an_identity_is_the_names_lowercased_with_the_artist_on_the_track() {
+        let id = identity_of(&song("Crest", "Bladee", "Icedancer"));
+        // artist on the track key, because a bare title collides
+        // across a library ("intro" is every third record).
+        assert_eq!(id.track.as_deref(), Some("bladee - crest"));
+        assert_eq!(id.album.as_deref(), Some("icedancer"));
+        assert_eq!(id.artist.as_deref(), Some("bladee"));
+        // a local file with no tags has only a title to hang off, and
+        // `remember(album, ...)` on it has to refuse rather than bind
+        // an empty key.
+        let bare = SearchItem::LocalVideo {
+            path: PathBuf::from("/v/x.mkv"),
+            title: "x".to_string(),
+        };
+        let id = identity_of(&bare);
+        assert_eq!(id.track.as_deref(), Some("x"));
+        assert_eq!(name_at(&id, Tier::Album), None);
+        assert_eq!(name_at(&id, Tier::Artist), None);
+    }
+
+    /// Precedence is per setting, not per identity: a track-level eq
+    /// and an album-level volume both apply. Masking one with the other
+    /// would make remembering an eq silently drop a remembered volume.
+    #[test]
+    fn precedence_runs_track_album_artist_one_setting_at_a_time() {
+        let item = song("crest", "bladee", "icedancer");
+        let id = identity_of(&item);
+        let mut b = Bindings::default();
+        b.remember(Tier::Artist, "bladee", &Setting::Eq("rock".into()));
+        b.remember(Tier::Artist, "bladee", &Setting::Speed(0.9));
+        b.remember(Tier::Album, "icedancer", &Setting::Eq("flat".into()));
+        b.remember(Tier::Album, "icedancer", &Setting::Volume(55.0));
+        b.remember(Tier::Track, "bladee - crest", &Setting::Eq("night".into()));
+        // track wins the eq, the album still supplies the volume, the
+        // artist still supplies the speed.
+        assert_eq!(b.resolve(&id), bound(Some("night"), Some(55.0), Some(0.9)));
+        // drop the narrowest and the next one down takes over.
+        assert!(b.forget(Tier::Track, "bladee - crest", Some(SettingKind::Eq)));
+        assert_eq!(b.resolve(&id), bound(Some("flat"), Some(55.0), Some(0.9)));
+        // an unrelated track gets only what its artist and album bind.
+        let other = identity_of(&song("hex", "ecco2k", "e"));
+        assert_eq!(b.resolve(&other), Bound::default());
+    }
+
+    #[test]
+    fn forget_reports_whether_there_was_anything_to_drop() {
+        let mut b = Bindings::default();
+        b.remember(Tier::Track, "a", &Setting::Eq("night".into()));
+        b.remember(Tier::Track, "a", &Setting::Volume(40.0));
+        assert!(!b.forget(Tier::Track, "nothing here", None));
+        assert!(!b.forget(Tier::Track, "a", Some(SettingKind::Speed)));
+        assert!(b.forget(Tier::Track, "a", Some(SettingKind::Eq)));
+        assert!(b.forget(Tier::Track, "a", None));
+        assert!(b.is_empty(), "the last setting going leaves no stub");
+    }
+
+    /// The guard for the whole stage. A setting the new track does not
+    /// bind goes back to what the *user* chose, not to the last bound
+    /// value; leaving it applied is what has everything quiet after one
+    /// quiet song.
+    #[test]
+    fn a_setting_is_restored_when_the_next_track_binds_nothing() {
+        let mut active: Option<f64> = None;
+        // user is at 80; a bound track wants 40.
+        assert_eq!(settle(&mut active, Some(40.0), 80.0), Some(40.0));
+        assert_eq!(active, Some(80.0), "the user's own value is held");
+        // an unbound track follows: back to 80, and nothing is held.
+        assert_eq!(settle(&mut active, None, 40.0), Some(80.0));
+        assert_eq!(active, None);
+        // and with nothing overridden, an unbound track changes nothing.
+        assert_eq!(settle(&mut active, None, 80.0), None);
+        assert_eq!(active, None);
+    }
+
+    /// A run of bound tracks must not ratchet the restore point along,
+    /// or the last one's value becomes "what the user chose".
+    #[test]
+    fn a_chain_of_bound_tracks_still_restores_to_the_users_own_value() {
+        let mut active: Option<f64> = None;
+        assert_eq!(settle(&mut active, Some(40.0), 80.0), Some(40.0));
+        assert_eq!(settle(&mut active, Some(30.0), 40.0), Some(30.0));
+        assert_eq!(settle(&mut active, Some(20.0), 30.0), Some(20.0));
+        assert_eq!(active, Some(80.0), "still the value from before the run");
+        assert_eq!(settle(&mut active, None, 20.0), Some(80.0));
+    }
+
+    #[test]
+    fn settling_on_a_value_that_is_already_in_effect_applies_nothing() {
+        // no op means no ipc write and no scrollback line for a
+        // setting that did not move.
+        let mut active: Option<String> = None;
+        assert_eq!(
+            settle(&mut active, Some("night".to_string()), "night".to_string()),
+            None
+        );
+        // held anyway, so the restore still knows where to go back to.
+        assert_eq!(active.as_deref(), Some("night"));
+        let mut active: Option<f64> = Some(80.0);
+        assert_eq!(settle(&mut active, None, 80.0), None);
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn bindings_round_trip_through_the_state_file() {
+        let path = temp_vars_path("bindings");
+        let mut b = Bindings::default();
+        b.remember(Tier::Track, "bladee - crest", &Setting::Eq("night".into()));
+        b.remember(Tier::Album, "icedancer", &Setting::Volume(55.0));
+        b.remember(Tier::Artist, "bladee", &Setting::Speed(0.9));
+        write_bindings(&path, &b);
+        assert_eq!(read_bindings(&path), b);
+        // and the listing names every tier, so `view(bindings)` shows
+        // the lot rather than only the narrowest.
+        let lines = b.lines();
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines[0].starts_with("track: bladee - crest -> eq night"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].starts_with("album: icedancer -> volume 55%"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].starts_with("artist: bladee -> speed 0.9x"),
+            "{lines:?}"
+        );
+        assert_eq!(Bindings::default().lines().len(), 1);
+        assert!(read_bindings(Path::new("/nonexistent/wim/bindings.toml")).is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 
     // ----------------------------------------------------- variables
