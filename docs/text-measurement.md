@@ -154,14 +154,20 @@ was the bug. `textfit::bench` compares the three models in one process
 batches rather than running them back to back is not optional here,
 sequential runs on this box came out 1.6x apart.
 
-## still per-char
+## the editing half, now done too
 
-`shellsong::Console`'s cursor is a byte offset moved by *chars*, so Left
-from the end of nfd `é` parks between the base and the mark. the render
-is correct either way (the cluster is still drawn in one cell), but the
-caret column is ambiguous for one keypress. fixing it means moving the
-editor to cluster boundaries, which is editing behaviour, not
-measurement.
+`shellsong::Console`'s cursor is a byte offset, and it used to move by
+*chars*. Two visible consequences with an nfd title: Left from the end
+of `é` parked the caret between the base and the mark, and backspace
+deleted the mark alone, so one visible glyph took two presses and the
+first appeared to do nothing.
+
+`prev_boundary`/`next_boundary` are cluster boundaries now, which is
+the whole fix: everything else in the editor already went through them.
+`eyeball_caret_walk` prints the caret at every stop walking Left across
+`play(Beyoncé ❤️ 👩‍👧)` and asserts no two stops share a column, since
+two stops on one column is exactly what parking inside a glyph looks
+like from the renderer's side.
 
 ## the test that holds the contract
 

@@ -1562,6 +1562,115 @@ a measurement.
       separate "still per-char" section is about the console's cursor
       and is accurate); and README gained the usage block `wim --help`
       makes true.
+- [x] **the console editor steps whole glyphs now**, the editing half
+      of the grapheme work and the last thing
+      docs/text-measurement.md listed as open. `Console`'s cursor is a
+      byte offset and it moved by *chars*, so with an nfd title (how
+      macOS and APFS store filenames, i.e. ordinary library content)
+      Left from the end of `é` parked the caret **between** the base
+      and its accent, and **backspace deleted the accent alone**, so
+      one visible glyph took two presses and the first looked like it
+      did nothing. the doc had only recorded the caret half.
+      `prev_boundary`/`next_boundary` became cluster boundaries, which
+      is the whole fix: every other editing path already went through
+      them. two tests, one for base-plus-mark and one for the other
+      shapes a cluster takes (zwj family, keycap, vs16, decomposed
+      hangul), mutation-checked by putting the char versions back.
+      and an eyeball printer walking Left across
+      `play(Beyoncé ❤️ 👩‍👧)`, printing the caret at every stop. its
+      floor is that **no two stops share a column**, because two stops
+      on one column is exactly what parking inside a glyph looks like
+      from the renderer's side. reading it confirmed the wide glyphs
+      step two columns and the `é` steps one, each in a single press.
+
+### the untracked-defect audit (2026-10-31)
+
+Ran once the roadmap was down to 8 unchecked items, 5 of them blocked,
+to answer "what is not written down". 55 findings, verified reachable
+(the auditor reproduced the three top panics with a standalone probe
+rather than reasoning about them). **`[profile.release]` sets no
+`overflow-checks`, so release wraps where debug panics**, which is why
+the arithmetic findings are not purely theoretical.
+
+Four are already fixed and are checked off in their own sections
+above: the cleared-queue-vs-loop-all bug, `Op::RemoveFromQueue`'s
+ordering, the header's blind truncation, and `ArtProbe`'s dead-probe
+arm. The rest are below, grouped by how bad they are rather than by
+file, because several span two files.
+
+**these abort the process from ordinary use.** in flight as of this
+writing (two agents, one per file).
+
+- [x] **`enclosing()`: a multibyte char before `(` aborted the
+      process on one keystroke.** the call-name range came from
+      `rfind(pred).map(|j| j + 1)`, and `rfind` returns the matched
+      char's *first* byte, so `rós(` built `name=(2,4)` and the slice
+      panicked inside the `ó`. autopair meant one `(` did it, and
+      `site()`/`enclosing()` run per keystroke, so it was an instant
+      crash while typing in either binary.
+      now `char_indices().rev().find(pred)` plus `len_utf8()`, so the
+      start lands after the char rather than inside it; the name is
+      still the ascii ident tail (`rós(` gives `s`, `é(` gives
+      nothing). the same `rfind`-plus-one shape appears nowhere else in
+      the file: every other `+ 1` is keyed off a single-byte ascii
+      literal found with `find` or a byte scan that only acts on ascii.
+      **the test whose name gave false confidence is renamed.**
+      `multibyte_input_never_slices_mid_character` only ever covered
+      `edit_insert`/`edit_backspace`, so it is now
+      `multibyte_editing_never_slices_mid_character` and
+      `the_site_never_slices_a_multibyte_call_name` is its sibling,
+      sweeping `site()` over every char boundary of each autopaired
+      form.
+- [x] **`parse_time`: `inf` was a valid duration, and the player had
+      no way to refuse it.** `parse_time`'s bare-number branch is
+      `rest.parse::<f64>()` with only a `< 0.0` check, so `inf` and
+      `1e30` become `Pos::Seconds`. `: sleep(inf)`, `: pause(inf)`,
+      `: fade(out, inf)`, `: silence(inf)` all reached
+      `Duration::from_secs_f64(inf)`, which panics *inside the draw
+      loop*; the hook tore the terminal down and the queue went with
+      it, and `secs.max(0.0)` launders NaN but not infinity.
+      every seconds-valued exit of `parse_time` (bare, colon and unit
+      forms) now goes through one `seconds()` gate that refuses
+      non-finite and anything over `MAX_TIME_HOURS`. **24h was chosen**
+      as past any real sleep timer, gap, silence, fade or seek position
+      while staying ~10^13 clear of `Duration`'s overflow, so the host
+      can convert unconditionally; refused with a message rather than
+      clamped, matching the file's existing habit for a count above
+      256.
+      same boundary, same class, all fixed with it: a bare-number
+      `volume` is held to the `0..=100` the `%` spelling always was,
+      which is what kept `volume(nan)` out of `remember`'s persisted
+      settings; and `silence` rounds with `s.round().max(1.0)` instead
+      of truncating, so `silence(0.4s)` is a one-second silence rather
+      than a zero-second one and `silence(1e20)` can no longer saturate
+      the `u64` into "5124095576030431h8m15s".
+      **the test aborts exactly where the app did**: it runs every
+      emitted op through core.rs's own
+      `Duration::from_secs_f64(secs.max(0.0))` rather than asserting on
+      the parse alone.
+- [x] **one rule for moving a cursor in a list**
+      (`main.rs::step_in_list`), and **the audit was wrong about this
+      one**, which is worth recording as loudly as the findings that
+      held. it called the suggestions branch a process abort
+      (`clamp(0, count - 1)` at count 0); it is not. that
+      `saturating_sub(1)` runs in **usize** and the `as i64` cast
+      follows it, so the max is 0 rather than -1, `clamp(0, 0)` never
+      panics, and `: bottom()` on an empty pane writes 0 rather than
+      `usize::MAX`. reproduced against the bug-intact body and the
+      empty-list test passed.
+      **a real bug was underneath it**: the `at as i64`, which reads a
+      cursor sitting at `usize::MAX` as -1, so a down-step from a stale
+      cursor landed on the top row instead of the last one. the three
+      copies of "step, then stay inside the list" (suggestions, queue
+      view, the keyboard j/k pane) now call one saturating usize
+      helper, and the queue branch's `len() as i64 - 1` (genuinely -1
+      when empty, and safe only because of the `is_empty` guard above
+      it) went with them. pinned on an empty list, both ends, a page
+      jump, and a cursor past the end; mutation-checked by restoring
+      the `as i64` body.
+      `hit::wheel_select` is a fourth copy of the same rule for the
+      mouse wheel. it guards `len == 0` explicitly and is safe, so it
+      was left alone, but it is a fourth copy.
 - [ ] **`view(suggestions)` on an empty corpus is a dead-end pane.**
       no longer a crash, but `main.rs` ~336 still installs
       `Some(suggestions)` and takes `Focus::Workspace` at zero

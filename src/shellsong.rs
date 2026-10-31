@@ -13,6 +13,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
 use serde::{Deserialize, Serialize};
 
 use crate::app::LoopMode;
@@ -4495,18 +4496,35 @@ pub fn edit_backspace(buf: &mut String, cursor: &mut usize) {
     *cursor = prev;
 }
 
+/// The two editing primitives, on **grapheme cluster** boundaries
+/// rather than char ones.
+///
+/// They stepped by char, which is one cell too fine for anything the
+/// terminal draws as a single glyph. Two visible consequences, both
+/// with an NFD title (which is how macOS and APFS store filenames, so
+/// ordinary library content): Left from the end of `é` parked the
+/// caret *between* the `e` and its accent, and backspace deleted the
+/// accent alone, so one visible glyph took two presses and the first
+/// one appeared to do nothing.
+///
+/// `unicode-segmentation` is already here for `ui::textfit`; this is
+/// the editing half of the same problem, and docs/text-measurement.md
+/// said so under "still per-char".
 fn prev_boundary(buf: &str, cursor: usize) -> Option<usize> {
     if cursor == 0 {
         return None;
     }
-    buf[..cursor].char_indices().next_back().map(|(i, _)| i)
+    buf[..cursor]
+        .grapheme_indices(true)
+        .next_back()
+        .map(|(i, _)| i)
 }
 
 fn next_boundary(buf: &str, cursor: usize) -> Option<usize> {
     buf[cursor.min(buf.len())..]
-        .chars()
+        .graphemes(true)
         .next()
-        .map(|c| cursor + c.len_utf8())
+        .map(|g| cursor + g.len())
 }
 
 // ------------------------------------------------------------- history
@@ -4986,6 +5004,39 @@ mod tests {
             Some("anu"),
             "the remainder comes off the real name"
         );
+    }
+
+    /// Walks Left across a line of awkward glyphs and prints the caret
+    /// where it lands, which is the only way to see that it never
+    /// stops somewhere the terminal draws nothing. Run with
+    /// `cargo test --lib eyeball_caret -- --nocapture`.
+    #[test]
+    fn eyeball_caret_walk() {
+        let line = "play(Beyonce\u{301} \u{2764}\u{FE0F} \u{1F469}\u{200D}\u{1F467})";
+        let mut cursor = line.len();
+        let mut stops = Vec::new();
+        while let Some(prev) = prev_boundary(line, cursor) {
+            cursor = prev;
+            // the caret column is the display width of what is behind
+            // it, which is what the renderer puts it at.
+            let col = crate::ui::textfit::width(&line[..cursor]);
+            stops.push((cursor, col));
+        }
+        println!("--- Left from the end of: {line}");
+        for (at, col) in &stops {
+            let mut row: String = line[..*at].to_string();
+            row.push('\u{2588}');
+            row.push_str(&line[*at..]);
+            println!("  byte {at:>3} col {col:>3}  : {row}");
+        }
+        // the floor: every stop is a cluster boundary, so no two stops
+        // may share a column (that is what parking inside a glyph
+        // looks like from the renderer's side).
+        let cols: Vec<usize> = stops.iter().map(|(_, c)| *c).collect();
+        let mut sorted = cols.clone();
+        sorted.dedup();
+        assert_eq!(cols.len(), sorted.len(), "two stops on one column: {stops:?}");
+        assert_eq!(cursor, 0, "it has to walk all the way out");
     }
 
     /// Prints the console row as the user would read it, which is the
@@ -6631,6 +6682,58 @@ mod tests {
         let mut cursor = cursor;
         edit_backspace(&mut buf, &mut cursor);
         assert_eq!(buf, "queue([日])");
+    }
+
+    /// Editing steps by what the terminal draws as one glyph.
+    ///
+    /// Both of these were off by a codepoint with an NFD title (how
+    /// macOS and APFS store filenames, so ordinary library content):
+    /// Left from the end of `é` parked the caret *between* the `e` and
+    /// its accent, and backspace deleted the accent alone, so one
+    /// visible glyph took two presses and the first appeared to do
+    /// nothing.
+    #[test]
+    fn editing_steps_whole_clusters_not_codepoints() {
+        // "e" + U+0301 COMBINING ACUTE: two codepoints, one glyph.
+        let nfd = "Beyonce\u{301}";
+        assert_eq!(nfd.chars().count(), 8, "eight codepoints");
+
+        let end = nfd.len();
+        let back = prev_boundary(nfd, end).expect("something behind the caret");
+        assert_eq!(
+            &nfd[back..end],
+            "e\u{301}",
+            "Left must clear the whole cluster, not park inside it"
+        );
+        assert_eq!(back, 6, "and land where the glyph starts");
+
+        // backspace takes the glyph the user can see, in one press.
+        let mut buf = nfd.to_string();
+        let mut cursor = buf.len();
+        edit_backspace(&mut buf, &mut cursor);
+        assert_eq!(buf, "Beyonc", "one press, one glyph");
+        assert_eq!(cursor, buf.len());
+
+        // forward, same rule.
+        let at = next_boundary(nfd, 6).expect("something ahead");
+        assert_eq!(at, nfd.len(), "Right steps over the cluster");
+    }
+
+    /// The nastier shapes, since a cluster is not just base-plus-mark.
+    #[test]
+    fn a_zwj_sequence_and_a_keycap_are_each_one_edit() {
+        for (glyph, name) in [
+            ("\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}", "zwj family"),
+            ("1\u{FE0F}\u{20E3}", "keycap"),
+            ("\u{2764}\u{FE0F}", "vs16 heart"),
+            ("\u{1100}\u{1161}\u{11A8}", "decomposed hangul"),
+        ] {
+            let mut buf = format!("play({glyph}");
+            let mut cursor = buf.len();
+            edit_backspace(&mut buf, &mut cursor);
+            assert_eq!(buf, "play(", "{name}: one press has to take all of it");
+            assert_eq!(cursor, buf.len(), "{name}: and leave the caret at the end");
+        }
     }
 
     /// The other half of the same hazard, and the one that actually
