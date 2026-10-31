@@ -12,7 +12,7 @@ use crate::ui::controlsbar::{
     GLYPH_PLAY, GLYPH_SHUFFLE, GLYPH_SPEED, SCRUB_BG, SELECT_BG, TRACK_MIN,
 };
 use crate::ui::draw;
-use crate::ui::progress::fmt_time;
+use crate::ui::progress::readouts;
 use crate::ui::textfit::{truncate_with_ellipsis, width};
 
 /// Rows at the bottom of the pane the level meter owns (main.rs draws
@@ -417,8 +417,10 @@ impl PlayerView<'_> {
     }
 
     fn scrubber(&self, avail: usize) -> Element {
-        let elapsed = fmt_time(self.elapsed_secs);
-        let total = fmt_time(self.duration_secs);
+        // padded to one width for the whole song, so neither the track
+        // nor this centred row shifts a column mid-drag; see
+        // `progress::readouts`.
+        let (elapsed, total) = readouts(self.elapsed_secs, self.duration_secs);
         let frac = match (self.elapsed_secs, self.duration_secs) {
             (Some(e), Some(d)) if d > 0.0 => (e / d).clamp(0.0, 1.0),
             _ => 0.0,
@@ -1082,6 +1084,47 @@ mod tests {
         assert_eq!(dragging.cell((head, y)).unwrap().bg, shade(SCRUB_BG));
         assert_eq!(dragging.cell((head, y)).unwrap().fg, shade(WHITE));
         const { assert!(SCRUB_BG > SELECT_BG) };
+    }
+
+    /// Same crossing as the bottom bar's, and worse here: this row is
+    /// centred on its own total width, so a readout that grew a cell
+    /// moved the track by the growth *and* by half of it again. A drag
+    /// resolves against the previous frame's rect, so that one frame
+    /// answered with the wrong cell's fraction.
+    #[test]
+    fn the_track_does_not_move_when_the_elapsed_readout_crosses_ten_minutes() {
+        let keymap = Keymap::default();
+        let cover = art();
+        for (w, h) in [(120u16, 40u16), (100, 30), (60, 20), (40, 8)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut rects = Vec::new();
+            for secs in [0.0, 598.0, 599.0, 599.9, 600.0, 601.0, 1799.0] {
+                let mut v = view(&keymap, Some(&cover));
+                v.elapsed_secs = Some(secs);
+                v.duration_secs = Some(1800.0);
+                let track = v.transport(area).track.expect("a track at this size");
+                let mut v = view(&keymap, Some(&cover));
+                v.elapsed_secs = Some(secs);
+                v.duration_secs = Some(1800.0);
+                let mut buf = buffer(w, h);
+                v.render(area, &mut buf);
+                for x in [track.x, track.x + track.width - 1] {
+                    let sym = buf.cell((x, track.y)).unwrap().symbol().to_string();
+                    assert!(
+                        ['━', '─', TRACK_HEAD].iter().any(|c| sym.starts_with(*c)),
+                        "at {secs}s column {x} of the track rect holds {sym:?} ({w}x{h})"
+                    );
+                }
+                rects.push((secs, track));
+            }
+            let (_, first) = rects[0];
+            for (secs, rect) in &rects {
+                assert_eq!(
+                    *rect, first,
+                    "the track moved to {rect:?} at {secs}s on a {w}x{h} pane"
+                );
+            }
+        }
     }
 
     #[test]

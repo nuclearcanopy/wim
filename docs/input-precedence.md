@@ -123,8 +123,13 @@ plumbing and is tested without a terminal.
 
 ## the wheel moves the selection, not a viewport
 
-a notch is `hit::WHEEL_ROWS` rows of selection movement, which makes
-one notch the same operation as one `j`. the alternative, an
+a notch is `hit::WHEEL_ROWS` steps of selection movement, which makes
+one notch the same operation as that many `j`. steps, not rows, despite
+the constant's name: `j` moves by item, so a surface that paints an
+item on more than one row travels further per notch. the suggestions
+menu draws a title and its reason under it, so three items there is six
+screen rows; by this rule that is right, not a notch to be scaled down.
+the alternative, an
 independent viewport offset, is more mouse-like but means the selection
 can leave the screen, and it is a second piece of scroll state for the
 keyboard to disagree with: these lists have none today, they derive the
