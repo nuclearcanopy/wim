@@ -313,6 +313,20 @@ pub fn fire_subtitle_fetch(
         });
     });
 }
+/// What a reply's text is, by the api's own `instrumental` flag rather
+/// than "both fields happened to be empty": a real track with missing
+/// lyrics data must not be mislabelled instrumental. Shared so wim's
+/// pane and shellswim's console cannot disagree about one reply.
+pub fn lyrics_text(l: &lyrics::Lyrics) -> String {
+    if l.instrumental {
+        return "(instrumental, no lyrics)".to_string();
+    }
+    l.plain
+        .clone()
+        .or_else(|| l.synced.clone())
+        .unwrap_or_else(|| "(no lyrics text available)".to_string())
+}
+
 /// (artist, title, album) for a lyrics lookup; only meaningful for
 /// local music; `SearchItem` doesn't carry duration, so lookups always
 /// fall through to lrclib's fuzzy `/search` rather than its exact
@@ -1066,6 +1080,10 @@ pub struct CoreCtx<'a> {
     pub favorites: &'a mut favorites::Favorites,
     pub remote_starred: &'a mut HashSet<String>,
     pub lyrics_client: &'a lyrics::Client,
+    /// Fetches off-thread. `lookup` is a round trip to lrclib, and
+    /// calling it from a key handler froze the whole ui until lrclib
+    /// answered; "nothing blocks" is the rule in both binaries.
+    pub lyrics_loader: &'a mut lyrics::Loader,
     // volume, and everything that ramps it.
     pub base_volume: &'a mut f64,
     pub crossfade_enabled: &'a mut bool,
@@ -2403,6 +2421,7 @@ mod seam_tests {
         favorites: favorites::Favorites,
         remote_starred: HashSet<String>,
         lyrics_client: lyrics::Client,
+        lyrics_loader: lyrics::Loader,
         base_volume: f64,
         crossfade_enabled: bool,
         fade_in_started_at: Option<Instant>,
@@ -2442,6 +2461,7 @@ mod seam_tests {
                 favorites: favorites::Favorites::default(),
                 remote_starred: HashSet::new(),
                 lyrics_client: lyrics::Client::new(),
+                lyrics_loader: lyrics::Loader::new(),
                 base_volume: 100.0,
                 crossfade_enabled: false,
                 fade_in_started_at: None,
@@ -2477,6 +2497,7 @@ mod seam_tests {
                 favorites: &mut self.favorites,
                 remote_starred: &mut self.remote_starred,
                 lyrics_client: &self.lyrics_client,
+                lyrics_loader: &mut self.lyrics_loader,
                 base_volume: &mut self.base_volume,
                 crossfade_enabled: &mut self.crossfade_enabled,
                 fade_in_started_at: &mut self.fade_in_started_at,
