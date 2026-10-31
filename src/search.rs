@@ -494,7 +494,7 @@ impl Corpus {
     fn warm_from_cache(servers: &[NavidromeConfig]) -> Corpus {
         let mut corpus = Corpus::new();
         for nav in servers {
-            let Some(catalog) = cache::load_catalog(nav) else {
+            let Some((catalog, album_artists)) = cache::load_catalog(nav) else {
                 continue;
             };
             if catalog.is_empty() {
@@ -505,6 +505,12 @@ impl Corpus {
             let Ok(client) = Client::new(nav) else {
                 continue;
             };
+            // the persisted album-to-artist links, so a cold start
+            // joins on ids before the first sync lands; see
+            // `subsonic::IdIndex`.
+            for (album_id, artist_id) in &album_artists {
+                client.remember_album_artist(album_id, artist_id);
+            }
             corpus.add_catalog(catalog, &Arc::new(client));
         }
         cache::sweep_foreign_catalogs(servers);
