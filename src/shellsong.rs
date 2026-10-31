@@ -5,7 +5,7 @@
 //! asynchronous, so `Program` is a resumable state machine rather than
 //! a loop. the full language reference is docs/shellsong.md.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
@@ -13,6 +13,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serde::{Deserialize, Serialize};
 
 use crate::app::LoopMode;
 use crate::eq;
@@ -147,6 +148,125 @@ pub enum Target {
     Selection,
 }
 
+/// Which identity a per-identity setting hangs off. Resolution runs
+/// track, then album, then artist, **per setting**: a track-level eq
+/// and an album-level volume both apply, because masking one with the
+/// other would make a single remembered eq silently drop a remembered
+/// volume. See docs/shellsong.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tier {
+    Track,
+    Album,
+    Artist,
+}
+
+impl Tier {
+    pub fn label(self) -> &'static str {
+        match self {
+            Tier::Track => "track",
+            Tier::Album => "album",
+            Tier::Artist => "artist",
+        }
+    }
+
+    fn of(word: &str) -> Option<Tier> {
+        [Tier::Track, Tier::Album, Tier::Artist]
+            .into_iter()
+            .find(|t| t.label() == word)
+    }
+}
+
+/// Which setting a binding is about, named for the command that sets
+/// it so there is no second vocabulary to keep in step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SettingKind {
+    Eq,
+    Volume,
+    Speed,
+}
+
+impl SettingKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingKind::Eq => "eq",
+            SettingKind::Volume => "volume",
+            SettingKind::Speed => "speed",
+        }
+    }
+
+    fn of(word: &str) -> Option<SettingKind> {
+        [SettingKind::Eq, SettingKind::Volume, SettingKind::Speed]
+            .into_iter()
+            .find(|k| k.label() == word)
+    }
+}
+
+/// A remembered setting and its value. Built from the inner call of
+/// `remember(tier, call)`, so the value went through that command's own
+/// parameter type and nothing here re-validates it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Setting {
+    Eq(String),
+    /// Absolute only: a nudge is a change, not a value to remember.
+    Volume(f64),
+    Speed(f64),
+}
+
+impl Setting {
+    pub fn kind(&self) -> SettingKind {
+        match self {
+            Setting::Eq(_) => SettingKind::Eq,
+            Setting::Volume(_) => SettingKind::Volume,
+            Setting::Speed(_) => SettingKind::Speed,
+        }
+    }
+
+    /// One line naming the value, for the listing and the reports.
+    pub fn value(&self) -> String {
+        match self {
+            Setting::Eq(name) => name.clone(),
+            Setting::Volume(v) => format!("{v}%"),
+            Setting::Speed(s) => format!("{s}x"),
+        }
+    }
+
+    /// The op that applies it. The binding therefore goes through the
+    /// very same host arm `eq(night)` typed into the console does.
+    pub fn op(&self) -> Op {
+        match self {
+            Setting::Eq(name) => Op::SetEqPreset(name.clone()),
+            Setting::Volume(v) => Op::SetVolume(Level::Absolute(*v)),
+            Setting::Speed(s) => Op::SetSpeed(*s),
+        }
+    }
+
+    /// What `remember(tier, call)` accepts, read off the inner call.
+    /// `Err` says what it would have taken, since this is the one place
+    /// that knows.
+    fn of_call(call: &Call) -> Result<Setting, String> {
+        match call.simple_op() {
+            Some(Op::SetEqPreset(name)) => Ok(Setting::Eq(name)),
+            Some(Op::SetVolume(Level::Absolute(v))) => Ok(Setting::Volume(v)),
+            Some(Op::SetVolume(Level::Delta(_))) => Err(
+                "remember takes a volume to settle on, not a nudge: write volume(40%)".to_string(),
+            ),
+            Some(Op::SetSpeed(s)) => Ok(Setting::Speed(s)),
+            Some(Op::SpeedUp) | Some(Op::SpeedDown) => {
+                Err("remember takes a speed to settle on, not a step: write speed(1.1)".to_string())
+            }
+            _ => Err(format!(
+                "remember takes {}; '{}' is not one of them",
+                SETTINGS.join(", "),
+                call.command.name
+            )),
+        }
+    }
+}
+
+/// The settable things a binding can hold, in the order `help` and the
+/// error messages list them.
+const SETTINGS: &[&str] = &["eq(...)", "volume(...)", "speed(...)"];
+
 /// Which pane owns the keyboard. `go()` means "what enter does", and
 /// what enter does depends on this, so the executor resolves it rather
 /// than making the host re-derive it.
@@ -186,6 +306,10 @@ pub enum ViewTarget {
     Index,
     History,
     Playlists,
+    /// The defined variables, listed as `let` lines.
+    Vars,
+    /// The per-identity settings, listed.
+    Bindings,
     Eq,
     /// The command listing: the one target whose content is generated
     /// by the language itself (`help_lines`, off `COMMANDS`) rather than
@@ -206,6 +330,8 @@ impl ViewTarget {
                 | ViewTarget::Index
                 | ViewTarget::History
                 | ViewTarget::Playlists
+                | ViewTarget::Vars
+                | ViewTarget::Bindings
                 | ViewTarget::Help
         )
     }
@@ -249,6 +375,9 @@ const VIEW_NAMES: &[ViewName] = &[
     view("index", ViewTarget::Index, true),
     view("history", ViewTarget::History, true),
     view("playlists", ViewTarget::Playlists, true),
+    view("vars", ViewTarget::Vars, true),
+    view("variables", ViewTarget::Vars, false),
+    view("bindings", ViewTarget::Bindings, true),
     view("eq", ViewTarget::Eq, true),
     view("equalizer", ViewTarget::Eq, false),
     view("help", ViewTarget::Help, true),
@@ -323,6 +452,26 @@ pub enum Op {
     ShuffleQueue,
     SaveQueue(String),
     LoadQueue(String),
+    /// bind a name to a list of search terms, persisted. The terms are
+    /// already expanded (a variable used inside another is resolved
+    /// while parsing), so the host only stores what it is given.
+    Define {
+        name: String,
+        terms: Vec<String>,
+    },
+    Unset(String),
+    /// Bind a setting to whatever is playing, at `tier`. The identity
+    /// is read from the track by the host, since only it knows what is
+    /// playing; the language only says which tier and which value.
+    Remember {
+        tier: Tier,
+        setting: Setting,
+    },
+    /// Drop one setting's binding at `tier`, or every setting's.
+    Forget {
+        tier: Tier,
+        setting: Option<SettingKind>,
+    },
     /// the one screen-opening op; `ViewTarget::is_screen` says whether
     /// it takes over the screen or prints a listing.
     View(ViewTarget),
@@ -384,6 +533,26 @@ impl Op {
             Op::ShuffleQueue => "queue shuffled".into(),
             Op::SaveQueue(n) => format!("saved queue as '{n}'"),
             Op::LoadQueue(n) => format!("loaded queue '{n}'"),
+            Op::Define { name, terms } => {
+                format!("let {name} = [{}]", terms.join(", "))
+            }
+            Op::Unset(name) => format!("unset {name}"),
+            Op::Remember { tier, setting } => format!(
+                "remembered {} {} for this {}",
+                setting.kind().label(),
+                setting.value(),
+                tier.label()
+            ),
+            Op::Forget {
+                tier,
+                setting: Some(kind),
+            } => format!("forgot this {}'s {}", tier.label(), kind.label()),
+            Op::Forget {
+                tier,
+                setting: None,
+            } => {
+                format!("forgot everything for this {}", tier.label())
+            }
             Op::View(t) => format!("viewing {}", view_name(*t)),
             Op::Rescan => "rescanning the library".into(),
             Op::Sleep(Some(s)) => format!("sleep in {s}s"),
@@ -433,6 +602,12 @@ pub enum Ty {
     /// than a `Words` set because the saved half only exists at
     /// runtime; see `Completes::EqPresets`.
     EqName,
+    /// a variable name. Completes from the defined ones even where a
+    /// new name is being invented (`define`), because redefining is the
+    /// common case: the name you want is usually already there.
+    VarName,
+    /// a `.shg` script: a bare name under the config dir, or a path.
+    ScriptName,
     /// unsigned time literal: absolute position.
     Pos,
     /// signed time literal: a relative offset.
@@ -453,6 +628,11 @@ pub enum Ty {
     Words(Words),
     /// a nested call, for the higher-order commands.
     Call,
+    /// a nested call that has to *be* a setting: `remember` can only
+    /// settle on an eq curve, an absolute volume or a fixed speed, so
+    /// offering it `clear_queue` would be offering something that does
+    /// not parse (R12).
+    SettingCall,
 }
 
 /// The enumerated keyword sets. `options` is what both the parser and
@@ -467,6 +647,10 @@ pub enum Words {
     /// its search form.
     ViewTarget,
     FadeDir,
+    /// which identity a `remember`/`forget` is about.
+    Tier,
+    /// which setting a `forget` drops.
+    Setting,
 }
 
 impl Words {
@@ -491,6 +675,8 @@ impl Words {
             Words::EqPreset => &EQ_PRESETS,
             Words::ViewTarget => &VIEW_TARGETS,
             Words::FadeDir => &["in", "out"],
+            Words::Tier => &["track", "album", "artist"],
+            Words::Setting => &["eq", "volume", "speed"],
         }
     }
 
@@ -521,8 +707,17 @@ impl Words {
 pub enum Completes {
     /// a fixed keyword set, from `COMMANDS` itself.
     Words(Words),
-    /// names from the host's local corpus.
+    /// the defined variables ahead of names from the host's local
+    /// corpus. One class, because both are things that legitimately go
+    /// in a terms slot; variables lead because naming one is the more
+    /// specific intent.
     CorpusTerms,
+    /// variable names only.
+    Variables,
+    /// the `.shg` scripts the host can see.
+    Scripts,
+    /// the three commands `remember` accepts, with their parens.
+    SettingNames,
     /// command names.
     CommandNames,
     /// the host's saved queue names.
@@ -551,7 +746,10 @@ impl Ty {
             Ty::Terms | Ty::Query => Completes::CorpusTerms,
             Ty::SavedName => Completes::SavedQueues,
             Ty::EqName => Completes::EqPresets,
+            Ty::VarName => Completes::Variables,
+            Ty::ScriptName => Completes::Scripts,
             Ty::CommandName | Ty::Call => Completes::CommandNames,
+            Ty::SettingCall => Completes::SettingNames,
             Ty::Words(w) => Completes::Words(w),
             Ty::NewName => Completes::Hint("a name to save it under"),
             Ty::Pos => Completes::Hint("10% / 90 / 1m20s"),
@@ -587,6 +785,8 @@ impl Ty {
             Ty::NewName => "a name".into(),
             Ty::SavedName => "the name of a saved queue".into(),
             Ty::EqName => "an eq preset name".into(),
+            Ty::VarName => "a variable name".into(),
+            Ty::ScriptName => "the name of a .shg script, or a path to one".into(),
             Ty::CommandName => "a command name".into(),
             Ty::Pos => "an unsigned position like 30s, 1m20s or 50%".into(),
             Ty::Offset => "a signed offset like +30s or -10s".into(),
@@ -606,6 +806,7 @@ impl Ty {
                 }
             }
             Ty::Call => "a call like skip()".into(),
+            Ty::SettingCall => format!("one of {}", SETTINGS.join(", ")),
         }
     }
 }
@@ -854,6 +1055,53 @@ pub const COMMANDS: &[Command] = &[
         &[],
         "replace the queue with a saved playlist",
     ),
+    // variables. `define` is canonical and `let name = [...]` is sugar
+    // for it, so R1 stays true of every lowered program; see
+    // docs/shellsong.md.
+    cmd(
+        "define",
+        &[],
+        &[
+            req_hint(
+                "name",
+                Ty::VarName,
+                "let name = [a, b] is the short way to write this",
+            ),
+            req("terms", Ty::Terms),
+        ],
+        &[],
+        "bind a name to a list of terms",
+    ),
+    cmd(
+        "unset",
+        &[],
+        &[req("name", Ty::VarName)],
+        &[],
+        "drop a variable",
+    ),
+    // per-identity settings. Higher-order like `repeat` and `dry`: the
+    // setting is the inner call, so there is no parallel vocabulary of
+    // setting names and values to keep in step with the real commands.
+    cmd(
+        "remember",
+        &[],
+        &[
+            req("tier", Ty::Words(Words::Tier)),
+            req("call", Ty::SettingCall),
+        ],
+        &[],
+        "bind a setting to what is playing, by track, album or artist",
+    ),
+    cmd(
+        "forget",
+        &[],
+        &[
+            req("tier", Ty::Words(Words::Tier)),
+            opt("setting", Ty::Words(Words::Setting)),
+        ],
+        &[],
+        "drop what was remembered, for one setting or all of them",
+    ),
     cmd(
         "star",
         &["favorite", "fav", "like"],
@@ -903,6 +1151,13 @@ pub const COMMANDS: &[Command] = &[
         "put something on screen; the only screen-opening command",
     ),
     cmd("rescan", &[], NONE, &[], "re-walk the local library"),
+    cmd(
+        "run",
+        &[],
+        &[req("script", Ty::ScriptName)],
+        &[],
+        "run a .shg script; dry(run(x)) previews it",
+    ),
     cmd(
         "sleep",
         &[],
@@ -1010,6 +1265,19 @@ fn did_you_mean(name: &str) -> Option<&'static str> {
     closest(name, every_name())
 }
 
+/// The "that is not a command" message. One special case: `let` is a
+/// real statement form, so writing it as a call points at the binding
+/// syntax rather than at whatever name happens to be nearest.
+fn unknown_name(name: &str) -> String {
+    if name == LET {
+        return "let is not a call: write let name = [a, b]".to_string();
+    }
+    match did_you_mean(name) {
+        Some(s) => format!("unknown command '{name}'; did you mean '{s}'?"),
+        None => format!("unknown command '{name}'"),
+    }
+}
+
 /// `strsim`, same dependency search.rs recovers typos with, but
 /// Jaro-Winkler rather than a plain edit distance: a candidate is often
 /// much longer than what was typed ("suggst" against "suggestions"),
@@ -1058,6 +1326,161 @@ fn help_line(c: &Command, width: usize) -> String {
         format!("  [{}]", c.aliases.join(", "))
     };
     format!("{sig}{:pad$}  {}{aliases}", "", c.help)
+}
+
+// ----------------------------------------------------------- variables
+
+/// Longest variable name accepted. A name is typed often and listed in
+/// one line, so it is a label rather than a sentence.
+const MAX_VAR_NAME: usize = 32;
+
+/// The variables a program is parsed against: a name standing for a
+/// list of **search terms**, not for resolved tracks. That choice is
+/// deliberate and documented in docs/shellsong.md: a variable is a vibe
+/// that follows the library, and `save_queue` already covers the frozen
+/// case.
+///
+/// Expansion happens while parsing, in `coerce`'s `Ty::Terms` arm, so
+/// every parameter that takes terms gets it with no per-command code and
+/// `dry()` prints the expanded form (the same property a kind suffix
+/// has, R6). Expansion is not recursive: a variable's own terms are
+/// expanded once, when it is defined, so composing variables cannot
+/// cycle.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Scope {
+    /// Sorted by name, which is the order the listing and the
+    /// completion candidates both want.
+    vars: BTreeMap<String, Vec<String>>,
+}
+
+impl Scope {
+    /// Binds `name`, replacing any previous binding. Returns whether
+    /// this replaced one, so the host can say which it did (R9).
+    pub fn define(&mut self, name: &str, terms: Vec<String>) -> bool {
+        self.vars.insert(name.to_string(), terms).is_some()
+    }
+
+    /// Drops `name`; false when there was nothing bound to it, which is
+    /// what sends the host to `namehint::unknown`.
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.vars.remove(name).is_some()
+    }
+
+    pub fn get(&self, name: &str) -> Option<&[String]> {
+        self.vars.get(name).map(Vec::as_slice)
+    }
+
+    /// Alphabetical, for completion and for the listing.
+    pub fn names(&self) -> Vec<&str> {
+        self.vars.keys().map(String::as_str).collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.vars.is_empty()
+    }
+
+    /// Replaces every item that names a variable with that variable's
+    /// terms, leaving everything else alone. A term is not a namespace,
+    /// so an item that matches nothing here is simply a search term;
+    /// that is the price of having no sigil (R1 allows no prefixes), and
+    /// `dry()` is how you check which happened.
+    fn expand(&self, items: &[String]) -> Vec<String> {
+        if self.vars.is_empty() {
+            return items.to_vec();
+        }
+        items
+            .iter()
+            .flat_map(|item| match self.get(item) {
+                Some(terms) => terms.to_vec(),
+                None => vec![item.clone()],
+            })
+            .collect()
+    }
+
+    /// What `view(vars)` prints: one `let` line each, so the listing is
+    /// also valid input you can paste into a `.shg` file.
+    pub fn lines(&self) -> Vec<String> {
+        if self.vars.is_empty() {
+            return vec!["no variables defined; let name = [a, b] defines one".to_string()];
+        }
+        self.vars
+            .iter()
+            .map(|(name, terms)| format!("let {name} = [{}]", terms.join(", ")))
+            .collect()
+    }
+}
+
+/// Whether `name` is usable as a variable name, and why not if it is
+/// not. Lowercase snake_case, matching R3's rule for command names, so
+/// a bare identifier reads as a name rather than as the free text a
+/// search term is.
+fn check_var_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("a variable needs a name".into());
+    }
+    if name.chars().count() > MAX_VAR_NAME {
+        return Err(format!("'{name}' is longer than {MAX_VAR_NAME} characters"));
+    }
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return Err(format!("'{name}' must start with a lowercase letter"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Err(format!("'{name}' is not lowercase snake_case"));
+    }
+    if lookup(name).is_some() {
+        return Err(format!("'{name}' is a command name; pick another"));
+    }
+    Ok(())
+}
+
+/// The empty scope, borrowed: `Candidates::scope` and `World::bare`
+/// both need one that outlives the call.
+fn empty_scope() -> &'static Scope {
+    static EMPTY: LazyLock<Scope> = LazyLock::new(Scope::default);
+    &EMPTY
+}
+
+// --------------------------------------------------------- the world
+
+/// Reads one `.shg` script by name. Borrowed rather than owned so the
+/// host can close over its own state and a test over a map.
+pub type ScriptReader<'a> = &'a dyn Fn(&str) -> Result<String, String>;
+
+/// What *parsing* may ask the host about: the variables a term might
+/// name, and the contents of a `.shg` file `run(...)` names. `Env` is
+/// the run-time counterpart; this one exists because both of these have
+/// to be known while the program is still being built, which is what
+/// lets `dry()` report a whole script's plan.
+pub struct World<'a> {
+    pub scope: &'a Scope,
+    /// Reads one script. `Err` carries a ready-to-print reason, because
+    /// only the host knows how a name resolves to a file and which
+    /// scripts exist (so the "did you mean" is its to build).
+    ///
+    /// `None` is "this context has no scripts", which is the truth for
+    /// a bare parse rather than a failure to look.
+    pub read: Option<ScriptReader<'a>>,
+}
+
+impl World<'_> {
+    /// No variables and no scripts.
+    pub fn bare() -> World<'static> {
+        World {
+            scope: empty_scope(),
+            read: None,
+        }
+    }
+
+    fn read_script(&self, name: &str) -> Result<String, String> {
+        match self.read {
+            Some(read) => read(name),
+            None => Err(format!("no scripts are available here ('{name}')")),
+        }
+    }
 }
 
 // ----------------------------------------------------------------- env
@@ -1188,6 +1611,11 @@ enum Node {
         prefs: Vec<Kind>,
         action: TermAction,
     },
+    /// A line of a script that did not parse. Reported and stepped
+    /// past rather than failing the program: a script is a list of
+    /// independent statements, and a typo on line 3 should not cost you
+    /// the other twenty.
+    Fail(String),
     /// end-of-group tally, so a multi-term call reports once overall
     /// rather than only per-term.
     Summary {
@@ -1210,6 +1638,10 @@ pub enum Step {
     Emit(Op),
     /// the host should push this into the console scrollback.
     Note(String),
+    /// the host should push this as an *error* line, and then carry on
+    /// stepping: a script's bad line, which is reported without
+    /// stopping the rest of the file.
+    Warn(String),
     /// results for `query` are not in yet; resume next frame.
     AwaitResults {
         query: String,
@@ -1238,11 +1670,23 @@ pub struct Program {
 }
 
 impl Program {
+    /// Parses against no variables. Every name therefore stays a search
+    /// term, which is what the language's own tests want and what a
+    /// host with nothing defined gets anyway; the host itself always
+    /// has a scope, so it goes through `parse_in`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn parse(input: &str) -> Result<Program, ParseError> {
-        let mut lowering = Lowering::default();
+        Program::parse_in(input, &World::bare())
+    }
+
+    /// Parses against `scope`, expanding any term that names a
+    /// variable. Parse time rather than run time on purpose: `dry()`
+    /// then reports the expanded plan, and the whole expansion is one
+    /// arm of `coerce` instead of a second code path per command.
+    pub fn parse_in(input: &str, world: &World) -> Result<Program, ParseError> {
+        let mut lowering = Lowering::new(world);
         for (offset, text) in statements(input) {
-            let call = parse_call(input, offset, text)?;
-            lowering.lower(&call, false);
+            lowering.absorb(input, offset, text)?;
         }
         let groups = vec![Group::default(); lowering.groups];
         Ok(Program {
@@ -1252,6 +1696,21 @@ impl Program {
             groups,
             done: false,
         })
+    }
+
+    /// A program that is nothing but these ops, for the host's own
+    /// synthesised work (the per-identity settings a track change asks
+    /// for). It goes through the same stepper and therefore the same
+    /// `apply_shellsong_op`, which is what keeps a per-track eq from
+    /// behaving differently from `eq(night)` typed into the console.
+    pub fn of(ops: Vec<Op>) -> Program {
+        Program {
+            nodes: ops.into_iter().map(Node::Emit).collect(),
+            pc: 0,
+            pending: None,
+            groups: Vec::new(),
+            done: false,
+        }
     }
 
     /// True once the program has nothing left to do; the host drops it.
@@ -1275,6 +1734,10 @@ impl Program {
             Node::Note(text) => {
                 self.pc += 1;
                 Step::Note(text)
+            }
+            Node::Fail(text) => {
+                self.pc += 1;
+                Step::Warn(text)
             }
             Node::Go => {
                 self.pc += 1;
@@ -1411,19 +1874,88 @@ fn best_match(results: &[Kind], prefs: &[Kind]) -> Option<usize> {
 
 // -------------------------------------------------------------- lowering
 
-#[derive(Default)]
-struct Lowering {
+/// How many `run(...)` frames deep a parse may go. A script that runs
+/// another is useful (a setup file calling a per-mood one); one that
+/// reaches itself is not, and this is the cheap bound that makes the
+/// difference without a visited set.
+const MAX_SCRIPT_DEPTH: usize = 8;
+
+struct Lowering<'a> {
     nodes: Vec<Node>,
     groups: usize,
+    /// The variables as they stand *at this point in the program*: a
+    /// `let` updates it, so a later statement sees a binding an earlier
+    /// one made. Owned rather than borrowed precisely so it can grow;
+    /// that is what makes a `.shg` file that defines a variable and
+    /// then uses it work, and it does the same for `let a = [x]; play(a)`
+    /// typed on one line.
+    scope: Scope,
+    read: Option<ScriptReader<'a>>,
+    /// How many `run(...)` frames are open, for `MAX_SCRIPT_DEPTH`.
+    depth: usize,
 }
 
-impl Lowering {
+impl<'a> Lowering<'a> {
+    fn new(world: &World<'a>) -> Lowering<'a> {
+        Lowering {
+            nodes: Vec::new(),
+            groups: 0,
+            scope: world.scope.clone(),
+            read: world.read,
+            depth: 0,
+        }
+    }
+
+    fn nested(&self) -> Lowering<'a> {
+        Lowering {
+            nodes: Vec::new(),
+            groups: 0,
+            scope: self.scope.clone(),
+            read: self.read,
+            depth: self.depth,
+        }
+    }
+
+    /// Parses one statement against the scope as it stands and lowers
+    /// it. The one entry point for both a typed line and a script line,
+    /// so they cannot diverge; the only difference between them is what
+    /// the caller does with the `Err`.
+    fn absorb(&mut self, input: &str, offset: usize, text: &str) -> Result<(), ParseError> {
+        let call = {
+            let world = World {
+                scope: &self.scope,
+                read: self.read,
+            };
+            parse_statement(input, offset, text, &world)?
+        };
+        self.track(&call);
+        self.lower(&call, false);
+        Ok(())
+    }
+
+    /// Keeps `scope` in step with the bindings the program makes, so
+    /// the expansion a later statement gets matches what will actually
+    /// be bound by the time it runs.
+    fn track(&mut self, call: &Call) {
+        match (call.command.name, call.args.first(), call.args.get(1)) {
+            ("define", Some(Arg::Name(name)), Some(Arg::Terms(terms))) => {
+                self.scope.define(name, terms.clone());
+            }
+            ("unset", Some(Arg::Name(name)), _) => {
+                self.scope.remove(name);
+            }
+            _ => {}
+        }
+    }
+
     /// `dry` lowers the same shape and then turns every node into a
     /// note, so the report is generated from the real plan rather than
-    /// a second description of it.
+    /// a second description of it. A script goes through here too,
+    /// which is the whole reason `dry(run(x))` can preview a file it
+    /// never executes: the plan is the real lowered program.
     fn lower(&mut self, call: &Call, dry: bool) {
         if dry {
-            let mut inner = Lowering::default();
+            let mut inner = self.nested();
             inner.lower(call, false);
             self.nodes.push(Node::Note(format!("would run: {}", call)));
             for node in inner.nodes {
@@ -1449,9 +1981,59 @@ impl Lowering {
                     self.lower(inner, false);
                 }
             }
+            "run" => {
+                if let Some(Arg::Script { name, source }) = call.args.first() {
+                    self.lower_script(name, source);
+                }
+            }
+            "remember" => {
+                // the shape is already checked at parse time
+                // (`check_remember`), so this cannot be reached with an
+                // inner call that is not a setting.
+                if let (Some(Arg::Word(w)), Some(Arg::Call(inner))) =
+                    (call.args.first(), call.args.get(1))
+                {
+                    if let (Some(tier), Ok(setting)) = (Tier::of(w), Setting::of_call(inner)) {
+                        self.nodes.push(Node::Emit(Op::Remember { tier, setting }));
+                    }
+                }
+            }
             "help" => self.lower_help(call),
             _ => self.lower_plain(call),
         }
+    }
+
+    /// Inlines a `.shg` file: every line is parsed on its own and
+    /// lowered into *this* program, so a script is run by the same
+    /// stepper a typed line is and suspends on a search exactly the
+    /// same way. One statement per line; a line that does not parse
+    /// becomes a `Node::Fail` naming the file and the line, and the
+    /// rest of the file carries on.
+    ///
+    /// The read already happened in `coerce`, so by here the contents
+    /// are in hand; this only splits and lowers them.
+    fn lower_script(&mut self, label: &str, source: &str) {
+        if self.depth >= MAX_SCRIPT_DEPTH {
+            self.nodes.push(Node::Fail(format!(
+                "{label}: scripts nest more than {MAX_SCRIPT_DEPTH} deep; stopped here"
+            )));
+            return;
+        }
+        self.depth += 1;
+        for (number, line) in source.lines().enumerate() {
+            let number = number + 1;
+            // `statements` strips the `#` comments and splits on `;`,
+            // so a line may still hold several statements; what it may
+            // not do is span lines, because continuing past a bad one
+            // needs a line to blame.
+            for (offset, text) in statements(line) {
+                if let Err(e) = self.absorb(line, offset, text) {
+                    self.nodes
+                        .push(Node::Fail(format!("{label}:{number}: {e}")));
+                }
+            }
+        }
+        self.depth -= 1;
     }
 
     fn lower_help(&mut self, call: &Call) {
@@ -1554,6 +2136,7 @@ fn describe_node(node: &Node) -> Option<String> {
     match node {
         Node::Emit(op) => Some(format!("  {}", op.describe())),
         Node::Note(text) => Some(format!("  {text}")),
+        Node::Fail(text) => Some(format!("  (skipped) {text}")),
         Node::Go => Some("  do what enter would do here".to_string()),
         Node::Search(q) => Some(format!("  search '{q}'")),
         Node::Resolve {
@@ -1580,6 +2163,13 @@ fn describe_node(node: &Node) -> Option<String> {
 enum Arg {
     Terms(Vec<String>),
     Name(String),
+    /// A `.shg` script plus its contents, read while parsing so a
+    /// missing file is a parse error the console can keep the line for,
+    /// and so `dry(run(x))` has the file in hand to plan from.
+    Script {
+        name: String,
+        source: String,
+    },
     Pos(Pos),
     Offset(f64),
     Level(Level),
@@ -1633,6 +2223,7 @@ fn render_arg(arg: &Arg) -> String {
         Arg::Terms(t) if t.len() == 1 => t[0].clone(),
         Arg::Terms(t) => format!("[{}]", t.join(", ")),
         Arg::Name(n) => n.clone(),
+        Arg::Script { name, .. } => name.clone(),
         Arg::Pos(Pos::Percent(p)) => format!("{p}%"),
         Arg::Pos(Pos::Seconds(s)) => format!("{s}s"),
         Arg::Offset(s) => format!("{s:+}s"),
@@ -1758,6 +2349,21 @@ impl Call {
             "load_queue" => match first {
                 Some(Arg::Name(n)) => Op::LoadQueue(n.clone()),
                 _ => return None,
+            },
+            "define" => match (first, self.args.get(1)) {
+                (Some(Arg::Name(n)), Some(Arg::Terms(t))) => Op::Define {
+                    name: n.clone(),
+                    terms: t.clone(),
+                },
+                _ => return None,
+            },
+            "unset" => match first {
+                Some(Arg::Name(n)) => Op::Unset(n.clone()),
+                _ => return None,
+            },
+            "forget" => Op::Forget {
+                tier: self.keyword(Words::Tier).and_then(Tier::of)?,
+                setting: self.keyword(Words::Setting).and_then(SettingKind::of),
             },
             "up" => Op::MoveSelection(-1),
             "down" => Op::MoveSelection(1),
@@ -1897,18 +2503,84 @@ fn piece(text: &str, from: usize, to: usize, base: usize) -> (usize, &str) {
     (base + from + lead, raw.trim())
 }
 
+/// The one statement form that is not written as a call. Sugar for
+/// `define`, desugared here so everything downstream only ever sees
+/// calls; `dry(let x = [a])` prints the `define(x, a)` form, exactly as
+/// a kind suffix prints its `kind=` form (R6).
+const LET: &str = "let";
+
+/// A statement: a call, or the `let` binding that desugars to one.
+fn parse_statement(
+    input: &str,
+    offset: usize,
+    text: &str,
+    world: &World,
+) -> Result<Call, ParseError> {
+    match text
+        .strip_prefix(LET)
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+    {
+        Some(rest) => parse_let(input, offset + LET.len(), rest, world),
+        None => parse_call(input, offset, text, world),
+    }
+}
+
+/// `let name = [a, b]`. Both halves go through `coerce` against
+/// `define`'s own parameters, so the typechecking, the error messages
+/// and the variable expansion are the ones the canonical call gets.
+fn parse_let(input: &str, offset: usize, text: &str, world: &World) -> Result<Call, ParseError> {
+    let lead = text.len() - text.trim_start().len();
+    let (offset, body) = (offset + lead, text.trim());
+    let Some(eq) = body.find('=') else {
+        return Err(err(
+            input,
+            offset,
+            body,
+            "let needs an '=': write let name = [a, b]",
+        ));
+    };
+    let command = lookup("define")
+        .map(|(c, _)| c)
+        .expect("define is in the table");
+    let name = body[..eq].trim();
+    let rest = &body[eq + 1..];
+    let value_offset = offset + eq + 1 + (rest.len() - rest.trim_start().len());
+    let value = rest.trim();
+    if value.is_empty() {
+        return Err(err(
+            input,
+            value_offset,
+            "",
+            missing(command, &command.params[1]),
+        ));
+    }
+    let args = vec![
+        coerce(input, command, &command.params[0], offset, name, world)?,
+        coerce(
+            input,
+            command,
+            &command.params[1],
+            value_offset,
+            value,
+            world,
+        )?,
+    ];
+    Ok(Call {
+        command,
+        args,
+        kind: None,
+    })
+}
+
 /// `name(args...)`. `input`/`offset` are only carried for error
 /// columns; `text` is the already-trimmed statement or nested call.
-fn parse_call(input: &str, offset: usize, text: &str) -> Result<Call, ParseError> {
+fn parse_call(input: &str, offset: usize, text: &str, world: &World) -> Result<Call, ParseError> {
     let Some(lp) = text.find('(') else {
         let name = text.split_whitespace().next().unwrap_or(text);
         let message = if lookup(name).is_some() {
             format!("{name} is a command: write {name}()")
         } else {
-            match did_you_mean(name) {
-                Some(s) => format!("unknown command '{name}'; did you mean '{s}'?"),
-                None => format!("unknown command '{name}'"),
-            }
+            unknown_name(name)
         };
         return Err(err(input, offset, name, message));
     };
@@ -1944,13 +2616,8 @@ fn parse_call(input: &str, offset: usize, text: &str) -> Result<Call, ParseError
             "unexpected text after the closing )",
         ));
     }
-    let (command, kind) = lookup(name).ok_or_else(|| {
-        let message = match did_you_mean(name) {
-            Some(s) => format!("unknown command '{name}'; did you mean '{s}'?"),
-            None => format!("unknown command '{name}'"),
-        };
-        err(input, offset, name, message)
-    })?;
+    let (command, kind) =
+        lookup(name).ok_or_else(|| err(input, offset, name, unknown_name(name)))?;
 
     let inner = &text[lp + 1..rp];
     let mut raw: Vec<(usize, &str)> = if inner.trim().is_empty() {
@@ -2008,9 +2675,12 @@ fn parse_call(input: &str, offset: usize, text: &str) -> Result<Call, ParseError
         }
     }
 
-    let args = bind(input, command, &positional)?;
+    let args = bind(input, command, &positional, world)?;
     if command.name == "view" {
         check_view(input, &args, &positional)?;
+    }
+    if command.name == "remember" {
+        check_remember(input, &args, &positional)?;
     }
     Ok(Call {
         command,
@@ -2041,6 +2711,30 @@ fn check_view(input: &str, args: &[Arg], positional: &[(usize, &str)]) -> Result
             "view(<target>) takes no terms; write view(q, terms) to search",
         )),
         _ => Ok(()),
+    }
+}
+
+/// `remember`'s inner call has to be one the host can actually settle
+/// on later: a named eq curve, an absolute volume, a fixed speed.
+/// Checked here rather than in `bind`, which only ever validates one
+/// parameter against its own type and cannot see that a `Call` is the
+/// wrong *kind* of call.
+fn check_remember(
+    input: &str,
+    args: &[Arg],
+    positional: &[(usize, &str)],
+) -> Result<(), ParseError> {
+    let Some(Arg::Call(inner)) = args.get(1) else {
+        return Ok(());
+    };
+    match Setting::of_call(inner) {
+        Ok(_) => Ok(()),
+        Err(why) => Err(err(
+            input,
+            positional.get(1).map(|(o, _)| *o).unwrap_or(0),
+            positional.get(1).map(|(_, t)| *t).unwrap_or(""),
+            why,
+        )),
     }
 }
 
@@ -2094,6 +2788,7 @@ fn bind(
     input: &str,
     command: &'static Command,
     given: &[(usize, &str)],
+    world: &World,
 ) -> Result<Vec<Arg>, ParseError> {
     let strict = given.len() == command.params.len();
     let mut args = Vec::new();
@@ -2110,7 +2805,7 @@ fn bind(
             }
             continue;
         };
-        match coerce(input, command, param, *off, text) {
+        match coerce(input, command, param, *off, text, world) {
             Ok(arg) => {
                 args.push(arg);
                 next += 1;
@@ -2154,6 +2849,7 @@ fn coerce(
     param: &Param,
     off: usize,
     text: &str,
+    world: &World,
 ) -> Result<Arg, ParseError> {
     let bad = |what: String| err(input, off, text, what);
     let expected = || {
@@ -2170,10 +2866,29 @@ fn coerce(
             if items.iter().any(String::is_empty) {
                 return Err(bad(format!("{}: an empty term", command.name)));
             }
-            Ok(Arg::Terms(items))
+            // the one place variables expand, which is why every
+            // terms-taking command gets them with no code of its own and
+            // why `dry()` reports the expanded plan.
+            Ok(Arg::Terms(world.scope.expand(&items)))
+        }
+        Ty::VarName => {
+            let name = unquote(text);
+            check_var_name(name).map_err(|why| bad(format!("{}: {why}", command.name)))?;
+            Ok(Arg::Name(name.to_string()))
         }
         // every free-text type parses identically; they differ only in
         // what they complete from (see `Ty::completes`).
+        // read here rather than at lowering time so a name that
+        // resolves to nothing is a parse error, which keeps the line in
+        // the console for you to fix.
+        Ty::ScriptName => {
+            let name = unquote(text);
+            let source = world.read_script(name).map_err(bad)?;
+            Ok(Arg::Script {
+                name: name.to_string(),
+                source,
+            })
+        }
         Ty::Query | Ty::NewName | Ty::SavedName | Ty::EqName | Ty::CommandName => {
             if text.starts_with('[') {
                 return Err(expected());
@@ -2271,11 +2986,11 @@ fn coerce(
                 ),
             })),
         },
-        Ty::Call => {
+        Ty::Call | Ty::SettingCall => {
             if !text.contains('(') {
                 return Err(expected());
             }
-            parse_call(input, off, text).map(|c| Arg::Call(Box::new(c)))
+            parse_call(input, off, text, world).map(|c| Arg::Call(Box::new(c)))
         }
     }
 }
@@ -2438,16 +3153,26 @@ pub enum ConsoleAction {
 
 const MAX_SCROLLBACK: usize = 200;
 const MAX_HISTORY: usize = 200;
-/// Completion runs on every keystroke, so the candidate list is capped
-/// rather than however many a wide query matches.
+/// Completion runs on every keystroke, so a candidate list that the
+/// *user* or the corpus can grow is capped rather than however many a
+/// wide query matches.
+///
+/// The lists the command table itself bounds (command names, a keyword
+/// set) are deliberately **not** capped: there are more than 50 written
+/// command names, so capping them made every name alphabetically past
+/// "random" unreachable by tab from an empty token, `view` and `volume`
+/// included. The overlay already ellipsis-truncates the row it draws
+/// them in, so a long list costs nothing on screen.
 const MAX_CANDIDATES: usize = 50;
 
-/// What completion may ask the host about the world, behind a trait so
-/// the completer itself stays pure: tests supply a fake, the host
-/// supplies the real corpus.
+/// What the console may ask the host about the world, behind a trait so
+/// the console itself stays pure: tests supply a fake, the host supplies
+/// the real corpus. Mostly completion, which is why it is named for
+/// that; `scope` is the one member a submitted line reads rather than a
+/// keystroke.
 ///
-/// Both methods are called per keystroke and must therefore be local
-/// only. `corpus` must never trigger a remote search: typing would
+/// Every completion method is called per keystroke and must therefore be
+/// local only. `corpus` must never trigger a remote search: typing would
 /// spam the server.
 pub trait Candidates {
     /// Primary names (song title, album name, artist name) of local
@@ -2464,6 +3189,26 @@ pub trait Candidates {
     /// alongside the built-ins.
     fn eq_presets(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// The variables a submitted line is parsed against, and what the
+    /// variable-name parameters complete from. Borrowed rather than
+    /// cloned because completion reads it per keystroke.
+    fn scope(&self) -> &Scope {
+        empty_scope()
+    }
+
+    /// Names of the `.shg` scripts `run(...)` could take. Snapshotted
+    /// by the host, since this is a directory read and completion runs
+    /// per keystroke.
+    fn scripts(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Reads one script for `run(...)`, at submit time rather than per
+    /// keystroke. `Err` is a ready-to-print reason.
+    fn read_script(&self, name: &str) -> Result<String, String> {
+        Err(format!("no scripts are available here ('{name}')"))
     }
 }
 
@@ -2585,7 +3330,7 @@ impl Console {
                     return ConsoleAction::Close;
                 }
             }
-            KeyCode::Enter => return self.submit(),
+            KeyCode::Enter => return self.submit(cand),
             // ctrl+f accepts wherever the cursor is, which is what
             // makes it the unambiguous accept key.
             KeyCode::Char('f') if ctrl => self.accept(cand),
@@ -2660,7 +3405,10 @@ impl Console {
         self.refresh(cand);
     }
 
-    fn submit(&mut self) -> ConsoleAction {
+    /// Takes the provider for the same reason `handle_key` does: a
+    /// submitted line is parsed against the live variables, so the scope
+    /// has to come from the host rather than from `Console`.
+    fn submit(&mut self, cand: &dyn Candidates) -> ConsoleAction {
         self.cycle = None;
         self.suggestion = Suggestion::default();
         let line = self.input.trim().to_string();
@@ -2668,7 +3416,12 @@ impl Console {
             return ConsoleAction::Close;
         }
         self.push(LineKind::Command, format!(": {line}"));
-        match Program::parse(&line) {
+        let read = |name: &str| cand.read_script(name);
+        let world = World {
+            scope: cand.scope(),
+            read: Some(&read),
+        };
+        match Program::parse_in(&line, &world) {
             Ok(program) => {
                 self.remember(line);
                 self.input.clear();
@@ -2773,20 +3526,42 @@ impl Console {
     fn candidates_at(&self, here: &Site, cand: &dyn Candidates) -> Vec<String> {
         let mut seen = match here.completes {
             Completes::Hint(_) => return Vec::new(),
+            // uncapped: bounded by the table, not by the library.
             Completes::Words(set) => {
-                keep_extensions(&here.token, set.options().iter().copied(), MAX_CANDIDATES)
+                keep_extensions(&here.token, set.options().iter().copied(), usize::MAX)
             }
             Completes::CommandNames => {
-                keep_extensions(&here.token, every_name().iter().copied(), MAX_CANDIDATES)
+                keep_extensions(&here.token, every_name().iter().copied(), usize::MAX)
             }
             // fuzzy discovery, so a subsequence or typo match surfaces
             // things a prefix scan would miss; the prefix filter below
             // then drops whatever could not be inserted without
             // overwriting what was typed.
-            Completes::CorpusTerms => keep_extensions(
+            Completes::CorpusTerms => {
+                let corpus = cand.corpus(&here.token);
+                keep_extensions(
+                    &here.token,
+                    cand.scope()
+                        .names()
+                        .into_iter()
+                        .chain(corpus.iter().map(String::as_str)),
+                    MAX_CANDIDATES,
+                )
+            }
+            Completes::Variables => keep_extensions(
                 &here.token,
-                cand.corpus(&here.token).iter().map(String::as_str),
+                cand.scope().names().into_iter(),
                 MAX_CANDIDATES,
+            ),
+            Completes::Scripts => keep_extensions(
+                &here.token,
+                cand.scripts().iter().map(String::as_str),
+                MAX_CANDIDATES,
+            ),
+            Completes::SettingNames => keep_extensions(
+                &here.token,
+                Words::Setting.options().iter().copied(),
+                usize::MAX,
             ),
             Completes::SavedQueues => keep_extensions(
                 &here.token,
@@ -2847,8 +3622,12 @@ impl Console {
             // every command needs parens, so a completed command name
             // gets them and lands the cursor inside, reusing the same
             // auto-pairing an explicitly typed '(' goes through.
-            if before.completes == Completes::CommandNames
-                && !self.input[self.cursor..].starts_with('(')
+            // a setting name is a command name too, so both classes
+            // land the cursor inside the parens they need.
+            if matches!(
+                before.completes,
+                Completes::CommandNames | Completes::SettingNames
+            ) && !self.input[self.cursor..].starts_with('(')
             {
                 edit_insert(&mut self.input, &mut self.cursor, '(');
             }
@@ -3272,7 +4051,7 @@ fn next_boundary(buf: &str, cursor: usize) -> Option<usize> {
 /// Alongside `persistence.rs`'s state file, but a plain newline-
 /// delimited list rather than toml: it is a shell history, appended to
 /// and read back in order, and nothing else needs to parse it.
-fn state_path(file: &str) -> Option<PathBuf> {
+pub(crate) fn state_path(file: &str) -> Option<PathBuf> {
     let dir = dirs::state_dir().or_else(dirs::data_dir)?;
     Some(dir.join("wim").join(file))
 }
@@ -3387,6 +4166,345 @@ mod tests {
         }
     }
 
+    // --------------------------------------------------- variables
+
+    fn scope_of(pairs: &[(&str, &[&str])]) -> Scope {
+        let mut scope = Scope::default();
+        for (name, terms) in pairs {
+            scope.define(name, terms.iter().map(|t| (*t).to_string()).collect());
+        }
+        scope
+    }
+
+    /// A parse context over `scope` and a fake set of scripts, so the
+    /// language's own tests never touch the disk.
+    fn world_of<'a>(scope: &'a Scope, read: ScriptReader<'a>) -> World<'a> {
+        World {
+            scope,
+            read: Some(read),
+        }
+    }
+
+    /// Scripts by name, for the `run(...)` tests.
+    fn scripts_of(files: &[(&str, &str)]) -> impl Fn(&str) -> Result<String, String> {
+        let files: Vec<(String, String)> = files
+            .iter()
+            .map(|(n, b)| ((*n).to_string(), (*b).to_string()))
+            .collect();
+        move |name: &str| {
+            files
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, b)| b.clone())
+                .ok_or_else(|| format!("no script '{name}'"))
+        }
+    }
+
+    fn no_scripts(name: &str) -> Result<String, String> {
+        Err(format!("no script '{name}'"))
+    }
+
+    /// The search terms a program lowered to, parsed against `scope`.
+    fn terms_in(input: &str, scope: &Scope) -> Vec<String> {
+        Program::parse_in(input, &world_of(scope, &no_scripts))
+            .expect("should parse")
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                Node::Search(q) => Some(q.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ops_in(input: &str, scope: &Scope) -> Vec<Op> {
+        ops_of(&Program::parse_in(input, &world_of(scope, &no_scripts)).expect("should parse"))
+    }
+
+    /// Every op a program emits, stepping past the reports. `Warn` is
+    /// a script's bad line, which by design does not stop the program.
+    fn ops_of(program: &Program) -> Vec<Op> {
+        let mut program = program.clone();
+        let mut env = Env {
+            results: vec![Kind::Song],
+            ..SETTLED.clone()
+        };
+        let mut ops = Vec::new();
+        for _ in 0..1024 {
+            match program.step(&env) {
+                Step::Emit(Op::Search(q)) => {
+                    env.query = q.clone();
+                    ops.push(Op::Search(q));
+                }
+                Step::Emit(op) => ops.push(op),
+                Step::Note(_) | Step::Warn(_) => {}
+                Step::Done => break,
+                other => panic!("unexpected step {other:?}"),
+            }
+        }
+        ops
+    }
+
+    fn notes_in(input: &str, scope: &Scope) -> Vec<String> {
+        reports_of(&Program::parse_in(input, &world_of(scope, &no_scripts)).expect("should parse"))
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect()
+    }
+
+    /// Every reported line a program produces, tagged with whether it
+    /// came out as a note or as an error (`Step::Warn`).
+    fn reports_of(program: &Program) -> Vec<(bool, String)> {
+        let mut program = program.clone();
+        let mut env = Env {
+            results: vec![Kind::Song],
+            ..SETTLED.clone()
+        };
+        let mut out = Vec::new();
+        for _ in 0..4096 {
+            match program.step(&env) {
+                Step::Note(text) => out.push((false, text)),
+                Step::Warn(text) => out.push((true, text)),
+                Step::Emit(Op::Search(q)) => env.query = q,
+                Step::Emit(_) => {}
+                Step::Done | Step::Failed(_) => break,
+                Step::AwaitResults { .. } => break,
+            }
+        }
+        out
+    }
+
+    fn error_in(input: &str, scope: &Scope) -> ParseError {
+        Program::parse_in(input, &world_of(scope, &no_scripts)).expect_err("should not parse")
+    }
+
+    /// The maintainer's own example, end to end.
+    #[test]
+    fn a_variable_expands_to_its_terms_wherever_terms_are_accepted() {
+        let scope = scope_of(&[("bladee_classics", &["crest", "icedancer", "gods"])]);
+        assert_eq!(
+            terms_in("play(bladee_classics)", &scope),
+            vec!["crest", "icedancer", "gods"]
+        );
+        assert_eq!(
+            terms_in("queue(bladee_classics)", &scope),
+            vec!["crest", "icedancer", "gods"]
+        );
+        // and it composes with everything else a terms slot takes:
+        // inside a list, and with a kind suffix.
+        assert_eq!(
+            terms_in("queue([hex, bladee_classics])", &scope),
+            vec!["hex", "crest", "icedancer", "gods"]
+        );
+        assert_eq!(
+            terms_in("star_aa(bladee_classics)", &scope),
+            vec!["crest", "icedancer", "gods"]
+        );
+        // play keeps its own rule: the first term plays, the rest queue.
+        let ops = ops_in("play(bladee_classics)", &scope);
+        assert_eq!(
+            ops.iter().filter(|o| matches!(o, Op::Play(_))).count(),
+            1,
+            "{ops:?}"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|o| matches!(o, Op::Enqueue { .. }))
+                .count(),
+            2,
+            "{ops:?}"
+        );
+    }
+
+    /// The guard for the whole feature: a name is not a namespace, so
+    /// anything undefined is still a plain search term. Reverting the
+    /// expansion makes the first assertion pass and the second fail.
+    #[test]
+    fn an_undefined_name_is_still_a_plain_search_term() {
+        let empty = Scope::default();
+        assert_eq!(
+            terms_in("play(bladee_classics)", &empty),
+            vec!["bladee_classics"]
+        );
+        let scope = scope_of(&[("bladee_classics", &["crest"])]);
+        assert_eq!(terms_in("play(bladee_classics)", &scope), vec!["crest"]);
+        // an unrelated term is untouched either way.
+        assert_eq!(terms_in("play(hex)", &scope), vec!["hex"]);
+    }
+
+    #[test]
+    fn let_is_sugar_for_define_and_dry_prints_the_desugared_form() {
+        let empty = Scope::default();
+        let want = vec![Op::Define {
+            name: "bladee_classics".to_string(),
+            terms: vec!["crest".into(), "icedancer".into(), "gods".into()],
+        }];
+        assert_eq!(
+            ops_in("let bladee_classics = [crest, icedancer, gods]", &empty),
+            want
+        );
+        assert_eq!(
+            ops_in("define(bladee_classics, [crest, icedancer, gods])", &empty),
+            want
+        );
+        // `let` is statement-level, so `dry` (which takes a call) takes
+        // the canonical spelling; its report is the same either way.
+        let plan = notes_in("dry(define(mix, [hex]))", &empty);
+        assert_eq!(plan[0], "would run: define(mix, hex)");
+        assert!(
+            plan.iter().any(|l| l.contains("let mix = [hex]")),
+            "{plan:?}"
+        );
+        assert!(ops_in("dry(define(mix, [hex]))", &empty).is_empty());
+        assert!(Program::parse_in("dry(let mix = [hex])", &World::bare()).is_err());
+    }
+
+    #[test]
+    fn a_single_term_needs_no_brackets_in_a_binding() {
+        let empty = Scope::default();
+        assert_eq!(
+            ops_in("let mix = hex", &empty),
+            vec![Op::Define {
+                name: "mix".to_string(),
+                terms: vec!["hex".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_binding_reports_where_it_broke() {
+        let empty = Scope::default();
+        assert!(error_in("let mix", &empty).message.contains("needs an '='"));
+        assert!(error_in("let mix =", &empty)
+            .message
+            .contains("missing terms"));
+        assert!(error_in("let  = [hex]", &empty)
+            .message
+            .contains("needs a name"));
+        // and `let` written as a call points at the binding form rather
+        // than at whatever command name happens to be nearest.
+        assert!(error_in("let(mix, [hex])", &empty)
+            .message
+            .contains("let is not a call"));
+    }
+
+    #[test]
+    fn a_variable_name_is_lowercase_snake_case_and_never_a_command() {
+        let empty = Scope::default();
+        for bad in ["4 star", "Mix", "my-mix", "_mix", "mix!"] {
+            let e = error_in(&format!("let {bad} = [hex]"), &empty);
+            assert!(
+                e.message.contains("lowercase") || e.message.contains("start with"),
+                "{bad}: {}",
+                e.message
+            );
+        }
+        // shadowing a command name would make the variable unusable,
+        // since a bare `play` in a terms slot would expand instead.
+        let e = error_in("let play = [hex]", &empty);
+        assert!(e.message.contains("is a command name"), "{}", e.message);
+        assert!(error_in("unset(play)", &empty)
+            .message
+            .contains("is a command name"));
+    }
+
+    /// Eager, which is why there is no recursion to bound and no cycle
+    /// to detect: `let b = [a]` stores whatever `a` held at that moment.
+    #[test]
+    fn composing_variables_snapshots_the_components_when_defined() {
+        let scope = scope_of(&[("a", &["crest", "hex"])]);
+        assert_eq!(
+            ops_in("let b = [a, gods]", &scope),
+            vec![Op::Define {
+                name: "b".to_string(),
+                terms: vec!["crest".into(), "hex".into(), "gods".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn unset_names_the_variable_it_drops() {
+        let scope = scope_of(&[("mix", &["hex"])]);
+        assert_eq!(
+            ops_in("unset(mix)", &scope),
+            vec![Op::Unset("mix".to_string())]
+        );
+        assert_eq!(Op::Unset("mix".to_string()).describe(), "unset mix");
+    }
+
+    /// The listing is `let` lines, so `view(vars)` output is also
+    /// something you can paste back in or into a `.shg` file.
+    #[test]
+    fn the_variable_listing_is_itself_valid_input() {
+        let scope = scope_of(&[
+            ("bladee_classics", &["crest", "gods"]),
+            ("quiet", &["mazzy star"]),
+        ]);
+        let lines = scope.lines();
+        assert_eq!(
+            lines,
+            vec![
+                "let bladee_classics = [crest, gods]".to_string(),
+                "let quiet = [mazzy star]".to_string(),
+            ]
+        );
+        let empty = Scope::default();
+        for line in &lines {
+            assert!(
+                Program::parse_in(line, &world_of(&empty, &no_scripts)).is_ok(),
+                "the listing printed something that does not parse: {line}"
+            );
+        }
+        assert_eq!(
+            Scope::default().lines().len(),
+            1,
+            "an empty scope still says so rather than printing nothing"
+        );
+    }
+
+    #[test]
+    fn variable_names_complete_in_a_terms_slot_and_in_their_own() {
+        let mut fake = Fake::new(&["bladee bootleg"]);
+        fake.vars = scope_of(&[("bladee_classics", &["crest"])]);
+        // ahead of the corpus: naming a variable is the more specific
+        // intent, and both are things a terms slot takes.
+        let c = console_with(&fake, "play(bla");
+        let here = site(&c.input, c.cursor);
+        assert_eq!(
+            c.candidates_at(&here, &fake),
+            vec!["bladee_classics".to_string(), "bladee bootleg".to_string()]
+        );
+        // a variable-name parameter offers only variables.
+        let c = console_with(&fake, "unset(bla");
+        let here = site(&c.input, c.cursor);
+        assert_eq!(here.completes, Completes::Variables);
+        assert_eq!(
+            c.candidates_at(&here, &fake),
+            vec!["bladee_classics".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_submitted_line_is_parsed_against_the_live_variables() {
+        let mut fake = Fake::new(&[]);
+        fake.vars = scope_of(&[("mix", &["crest", "hex"])]);
+        let mut c = console_with(&fake, "queue(mix)");
+        match press(&mut c, &fake, KeyCode::Enter) {
+            ConsoleAction::Run(program) => {
+                let searched: Vec<String> = program
+                    .nodes
+                    .iter()
+                    .filter_map(|n| match n {
+                        Node::Search(q) => Some(q.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(searched, vec!["crest", "hex"]);
+            }
+            other => panic!("expected a program, got {other:?}"),
+        }
+    }
+
     // ------------------------------------------------------- the table
 
     /// Drives straight off `COMMANDS`, so a command added without a
@@ -3410,10 +4528,15 @@ mod tests {
     /// lowering would parse and then silently do nothing.
     #[test]
     fn every_command_lowers_to_at_least_one_node() {
+        // one script in hand, since `run`'s own sample argument names
+        // one and the read happens while parsing.
+        let empty = Scope::default();
+        let read = scripts_of(&[("sample", "pause()")]);
+        let world = world_of(&empty, &read);
         for c in COMMANDS {
             let input = sample_call(c);
-            let program =
-                Program::parse(&input).unwrap_or_else(|e| panic!("{input} did not parse: {e}"));
+            let program = Program::parse_in(&input, &world)
+                .unwrap_or_else(|e| panic!("{input} did not parse: {e}"));
             assert!(
                 !program.nodes.is_empty(),
                 "{input} parsed but lowered to nothing"
@@ -3440,6 +4563,10 @@ mod tests {
             Ty::Words(Words::ViewTarget) => "queue".into(),
             Ty::Terms => "crest".into(),
             Ty::Query | Ty::NewName | Ty::SavedName | Ty::EqName => "crest".into(),
+            Ty::VarName => "mix".into(),
+            // the samples never touch the disk, so this one is a path
+            // that `scripts_of` in the `run` tests resolves.
+            Ty::ScriptName => "sample".into(),
             Ty::CommandName => "pause".into(),
             Ty::Pos => "30s".into(),
             Ty::Offset => "+30s".into(),
@@ -3451,6 +4578,7 @@ mod tests {
             Ty::Duration => "30m".into(),
             Ty::Words(w) => w.options()[0].to_string(),
             Ty::Call => "skip()".into(),
+            Ty::SettingCall => "speed(1.5)".into(),
         }
     }
 
@@ -3522,6 +4650,8 @@ mod tests {
             ViewTarget::Index,
             ViewTarget::History,
             ViewTarget::Playlists,
+            ViewTarget::Vars,
+            ViewTarget::Bindings,
             ViewTarget::Eq,
             ViewTarget::Help,
         ];
@@ -3537,6 +4667,8 @@ mod tests {
                 ViewTarget::Index => "index",
                 ViewTarget::History => "history",
                 ViewTarget::Playlists => "playlists",
+                ViewTarget::Vars => "vars",
+                ViewTarget::Bindings => "bindings",
                 ViewTarget::Eq => "eq",
                 ViewTarget::Help => "help",
             }
@@ -3981,10 +5113,12 @@ mod tests {
             let Some(terms) = c.params.iter().find(|p| p.ty == Ty::Terms) else {
                 continue;
             };
-            // the one documented exception: view's terms belong to its
-            // `q` form rather than being an operand, and `q` means
-            // "search for this", which has no selection reading.
-            if c.name == "view" {
+            // the two documented exceptions, both because the terms are
+            // not an operand. view's belong to its `q` form, and `q`
+            // means "search for this", which has no selection reading;
+            // define *stores* terms rather than acting on them, and the
+            // selection is a resolved row, not a term.
+            if c.name == "view" || c.name == "define" {
                 continue;
             }
             assert!(
@@ -4497,8 +5631,12 @@ mod tests {
     #[test]
     fn every_op_describes_itself_for_the_scrollback() {
         // R9: nothing is silent, so no op may describe itself as "".
+        let empty = Scope::default();
+        let read = scripts_of(&[("sample", "pause()")]);
+        let world = world_of(&empty, &read);
         for c in COMMANDS {
-            for op in ops(&sample_call(c)) {
+            let program = Program::parse_in(&sample_call(c), &world).expect("should parse");
+            for op in ops_of(&program) {
                 assert!(!op.describe().is_empty(), "{op:?} has no description");
             }
         }
@@ -4599,6 +5737,8 @@ mod tests {
             Ty::NewName,
             Ty::SavedName,
             Ty::EqName,
+            Ty::VarName,
+            Ty::ScriptName,
             Ty::CommandName,
             Ty::Pos,
             Ty::Offset,
@@ -4609,12 +5749,15 @@ mod tests {
             Ty::Speed,
             Ty::Duration,
             Ty::Call,
+            Ty::SettingCall,
             Ty::Words(Words::Position),
             Ty::Words(Words::LoopMode),
             Ty::Words(Words::Switch),
             Ty::Words(Words::EqPreset),
             Ty::Words(Words::ViewTarget),
             Ty::Words(Words::FadeDir),
+            Ty::Words(Words::Tier),
+            Ty::Words(Words::Setting),
         ];
         for ty in &every {
             match ty.completes() {
@@ -4643,6 +5786,34 @@ mod tests {
         }
     }
 
+    /// The command-name list is bounded by the table, not by the
+    /// library, so capping it only ever hides real commands: with more
+    /// than `MAX_CANDIDATES` written names, every one alphabetically
+    /// past the cut became unreachable by tab from an empty token,
+    /// `view` and `volume` among them.
+    #[test]
+    fn every_command_name_is_reachable_by_tab_from_an_empty_token() {
+        let fake = Fake::new(&[]);
+        let c = Console::empty();
+        let here = site("", 0);
+        let offered = c.candidates_at(&here, &fake);
+        assert!(
+            every_name().len() > MAX_CANDIDATES,
+            "the table no longer exceeds the cap, so this test is about nothing"
+        );
+        for name in every_name() {
+            assert!(
+                offered.contains(&(*name).to_string()),
+                "'{name}' cannot be reached by tab"
+            );
+        }
+        // the corpus is the half that still has to be capped: it is as
+        // long as the library.
+        let wide = Fake::new(&["flatline"]);
+        let here = site("play(", 5);
+        assert!(c.candidates_at(&here, &wide).len() <= MAX_CANDIDATES);
+    }
+
     #[test]
     fn a_keyword_set_only_ever_offers_something_that_parses() {
         for c in COMMANDS {
@@ -4661,6 +5832,12 @@ mod tests {
                     let mut args: Vec<String> =
                         c.params.iter().take(i).map(|p| sample_arg(p.ty)).collect();
                     args.push(option.to_string());
+                    // whatever is still required after it, or the call
+                    // would be short an argument rather than wrong
+                    // about the keyword, which is not what this pins.
+                    for p in c.params.iter().skip(i + 1).filter(|p| p.required) {
+                        args.push(sample_arg(p.ty));
+                    }
                     let call = format!("{}({}{extra})", c.name, args.join(", "));
                     assert!(
                         Program::parse(&call).is_ok(),
@@ -4723,6 +5900,7 @@ mod tests {
     struct Fake {
         names: Vec<&'static str>,
         queues: Vec<&'static str>,
+        vars: Scope,
     }
 
     impl Fake {
@@ -4730,6 +5908,7 @@ mod tests {
             Fake {
                 names: names.to_vec(),
                 queues: Vec::new(),
+                vars: Scope::default(),
             }
         }
     }
@@ -4740,6 +5919,9 @@ mod tests {
         }
         fn saved_queues(&self) -> Vec<String> {
             self.queues.iter().map(|s| s.to_string()).collect()
+        }
+        fn scope(&self) -> &Scope {
+            &self.vars
         }
     }
 
@@ -4989,6 +6171,7 @@ mod tests {
         let fake = Fake {
             names: vec!["flatline"],
             queues: vec!["gym", "gym 2024", "sleep"],
+            vars: Scope::default(),
         };
         let c = console_with(&fake, "load_queue(gym ");
         assert_eq!(c.suggestion.ghost, "2024");
@@ -5318,6 +6501,13 @@ mod tests {
 
         let _: Vec<String> = Candidates::corpus(&fake, "fl");
         let _: Vec<String> = Candidates::saved_queues(&fake);
+        let _: &Scope = Candidates::scope(&fake);
+
+        let scope = Scope::default();
+        let _: World = World::bare();
+        let _: Program = Program::parse_in("pause()", &World::bare()).expect("should parse");
+        let _: Vec<&str> = scope.names();
+        let _: Vec<String> = scope.lines();
     }
 
     #[test]
@@ -5334,6 +6524,363 @@ mod tests {
         // it used to be an alias of clear_queue; anyone typing clear()
         // expecting the terminal behaviour would have wiped the queue.
         assert_ne!(ops("clear()"), vec![Op::ClearQueue]);
+    }
+
+    // -------------------------------------------- bound settings
+
+    #[test]
+    fn remember_takes_the_setting_as_a_call_so_there_is_no_second_vocabulary() {
+        let empty = Scope::default();
+        assert_eq!(
+            ops_in("remember(track, eq(night))", &empty),
+            vec![Op::Remember {
+                tier: Tier::Track,
+                setting: Setting::Eq("night".to_string()),
+            }]
+        );
+        assert_eq!(
+            ops_in("remember(album, volume(40%))", &empty),
+            vec![Op::Remember {
+                tier: Tier::Album,
+                setting: Setting::Volume(40.0),
+            }]
+        );
+        assert_eq!(
+            ops_in("remember(artist, speed(1.1))", &empty),
+            vec![Op::Remember {
+                tier: Tier::Artist,
+                setting: Setting::Speed(1.1),
+            }]
+        );
+    }
+
+    /// The value has to be one the host can settle on later, so a nudge
+    /// and a step are both refused at parse time with the call they
+    /// meant; otherwise `remember(track, volume(+10%))` would bind
+    /// "louder than whatever it happens to be", which is not a setting.
+    #[test]
+    fn remember_refuses_a_relative_value_and_a_call_that_is_not_a_setting() {
+        let empty = Scope::default();
+        let e = error_in("remember(track, volume(+10%))", &empty);
+        assert!(e.message.contains("volume(40%)"), "{}", e.message);
+        let e = error_in("remember(track, speed(up))", &empty);
+        assert!(e.message.contains("speed(1.1)"), "{}", e.message);
+        for bad in ["skip()", "clear_queue()", "play(crest)", "quit()"] {
+            let e = error_in(&format!("remember(track, {bad})"), &empty);
+            assert!(e.message.contains("remember takes"), "{bad}: {}", e.message);
+            assert!(e.message.contains("eq(...)"), "{bad}: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn forget_drops_one_setting_or_all_of_them() {
+        let empty = Scope::default();
+        assert_eq!(
+            ops_in("forget(track)", &empty),
+            vec![Op::Forget {
+                tier: Tier::Track,
+                setting: None,
+            }]
+        );
+        assert_eq!(
+            ops_in("forget(album, eq)", &empty),
+            vec![Op::Forget {
+                tier: Tier::Album,
+                setting: Some(SettingKind::Eq),
+            }]
+        );
+        let e = error_in("forget(track, loudness)", &empty);
+        assert!(e.message.contains("eq, volume, speed"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_remembered_setting_describes_itself_and_dry_plans_it() {
+        let empty = Scope::default();
+        assert_eq!(
+            Op::Remember {
+                tier: Tier::Track,
+                setting: Setting::Eq("night".to_string()),
+            }
+            .describe(),
+            "remembered eq night for this track"
+        );
+        let plan = notes_in("dry(remember(track, eq(night)))", &empty);
+        assert_eq!(plan[0], "would run: remember(track, eq(night))");
+        assert!(
+            plan.iter().any(|l| l.contains("remembered eq night")),
+            "{plan:?}"
+        );
+        assert!(ops_in("dry(remember(track, eq(night)))", &empty).is_empty());
+    }
+
+    /// The op a binding applies is the op the typed command lowers to,
+    /// which is what keeps a per-track eq from drifting from `eq(x)`.
+    #[test]
+    fn a_settings_op_is_the_same_op_the_typed_command_lowers_to() {
+        let empty = Scope::default();
+        assert_eq!(
+            Setting::Eq("night".to_string()).op(),
+            ops_in("eq(night)", &empty)[0]
+        );
+        assert_eq!(Setting::Volume(40.0).op(), ops_in("volume(40%)", &empty)[0]);
+        assert_eq!(Setting::Speed(1.1).op(), ops_in("speed(1.1)", &empty)[0]);
+    }
+
+    /// Synthesised ops go through the same stepper, so the host has one
+    /// dispatch point rather than a second table for its own work.
+    #[test]
+    fn a_host_built_program_steps_like_any_other() {
+        let mut program = Program::of(vec![Op::SetSpeed(1.1), Op::Mute(true)]);
+        assert_eq!(program.step(&SETTLED), Step::Emit(Op::SetSpeed(1.1)));
+        assert_eq!(program.step(&SETTLED), Step::Emit(Op::Mute(true)));
+        assert_eq!(program.step(&SETTLED), Step::Done);
+        assert!(program.is_done());
+        assert!(Program::of(Vec::new()).is_done());
+    }
+
+    // ----------------------------------------------------- scripts
+
+    const SCRIPT: &str = "\
+# a morning routine
+let morning = [mazzy star, boards of canada]
+
+eq(flat)
+volume(40%)
+queue(morning)
+";
+
+    fn run_script(line: &str, files: &[(&str, &str)]) -> Program {
+        let empty = Scope::default();
+        let read = scripts_of(files);
+        Program::parse_in(line, &world_of(&empty, &read)).expect("should parse")
+    }
+
+    /// A `.shg` file is lowered into the very same program a typed line
+    /// becomes, which is the whole point: one interpreter, one stepper.
+    #[test]
+    fn a_script_lowers_into_the_same_program_its_lines_would() {
+        let program = run_script("run(morning)", &[("morning", SCRIPT)]);
+        let typed = Program::parse_in(
+            "eq(flat); volume(40%); queue([mazzy star, boards of canada])",
+            &World::bare(),
+        )
+        .expect("should parse");
+        // the `let` line is the one extra statement; everything after
+        // it is identical, expansion included.
+        let script_ops = ops_of(&program);
+        assert_eq!(
+            script_ops.first(),
+            Some(&Op::Define {
+                name: "morning".to_string(),
+                terms: vec!["mazzy star".into(), "boards of canada".into()],
+            })
+        );
+        assert_eq!(&script_ops[1..], &ops_of(&typed)[..]);
+    }
+
+    /// A script that searches has to suspend and resume exactly as a
+    /// typed line does, since it *is* one.
+    #[test]
+    fn a_script_that_searches_suspends_and_resumes_like_a_typed_line() {
+        let mut program = run_script("run(s)", &[("s", "play(crest)\nskip()\n")]);
+        let unsettled = Env {
+            search_settled: false,
+            results: vec![Kind::Song],
+            ..SETTLED.clone()
+        };
+        assert_eq!(
+            program.step(&unsettled),
+            Step::Emit(Op::Search("crest".to_string()))
+        );
+        // blocked, and blocked again, until the host says it settled.
+        assert_eq!(
+            program.step(&Env {
+                query: "crest".to_string(),
+                ..unsettled.clone()
+            }),
+            Step::AwaitResults {
+                query: "crest".to_string()
+            }
+        );
+        let settled = Env {
+            query: "crest".to_string(),
+            results: vec![Kind::Song],
+            ..SETTLED.clone()
+        };
+        assert_eq!(
+            program.step(&settled),
+            Step::Emit(Op::Play(Target::Index(0)))
+        );
+        assert_eq!(program.step(&settled), Step::Emit(Op::SkipNext));
+    }
+
+    /// The guard for the whole stage: a line that does not parse is
+    /// reported with its file and line number *and* the rest of the
+    /// file still runs. Reverting either half fails this.
+    #[test]
+    fn a_bad_line_names_the_file_and_the_rest_of_the_script_still_runs() {
+        let program = run_script(
+            "run(mix)",
+            &[(
+                "mix",
+                "pause()\nxyzzy()\nmute()\nvolume(nonsense)\nskip()\n",
+            )],
+        );
+        let reports = reports_of(&program);
+        let failures: Vec<&String> = reports
+            .iter()
+            .filter(|(is_error, _)| *is_error)
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(failures.len(), 2, "{reports:?}");
+        assert!(failures[0].starts_with("mix:2: "), "{}", failures[0]);
+        assert!(failures[0].contains("xyzzy"), "{}", failures[0]);
+        assert!(failures[1].starts_with("mix:4: "), "{}", failures[1]);
+        // and every good line still ran, in order, past both errors.
+        assert_eq!(
+            ops_of(&program),
+            vec![Op::TogglePause, Op::Mute(true), Op::SkipNext]
+        );
+    }
+
+    /// `dry(run(x))` matters more here than anywhere else: a file can
+    /// `clear_queue` or `download`, so you have to be able to read what
+    /// it will do before it does it.
+    #[test]
+    fn dry_previews_a_whole_script_and_runs_none_of_it() {
+        let program = run_script(
+            "dry(run(danger))",
+            &[("danger", "clear_queue()\ndownload(crest)\n")],
+        );
+        assert!(
+            ops_of(&program).is_empty(),
+            "dry(run(...)) must emit nothing at all"
+        );
+        let plan: Vec<String> = reports_of(&program).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(plan[0], "would run: run(danger)");
+        assert!(plan.iter().any(|l| l.contains("queue cleared")), "{plan:?}");
+        assert!(
+            plan.iter().any(|l| l.contains("search 'crest'")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().any(|l| l.contains("downloading the best")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn a_dry_script_still_shows_which_lines_it_would_skip() {
+        let program = run_script("dry(run(s))", &[("s", "pause()\nxyzzy()\n")]);
+        let plan: Vec<String> = reports_of(&program).into_iter().map(|(_, t)| t).collect();
+        assert!(
+            plan.iter().any(|l| l.contains("(skipped) s:2:")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn a_script_that_is_not_there_is_a_parse_error_naming_it() {
+        let empty = Scope::default();
+        let read = scripts_of(&[("morning", "pause()")]);
+        let e = Program::parse_in("run(evening)", &world_of(&empty, &read))
+            .expect_err("should not parse");
+        assert!(e.message.contains("evening"), "{}", e.message);
+        // a parse error keeps the line in the console, which is the
+        // point of reading the file while parsing rather than later.
+        assert_eq!(e.token, "evening");
+    }
+
+    #[test]
+    fn a_context_with_no_scripts_says_so_rather_than_guessing() {
+        let e = Program::parse_in("run(anything)", &World::bare()).expect_err("should not parse");
+        assert!(e.message.contains("no scripts"), "{}", e.message);
+    }
+
+    /// A script running another is useful; one reaching itself is not.
+    #[test]
+    fn script_nesting_is_bounded_rather_than_recursing_forever() {
+        let program = run_script("run(loop)", &[("loop", "pause()\nrun(loop)\n")]);
+        let reports = reports_of(&program);
+        assert!(
+            reports
+                .iter()
+                .any(|(is_error, t)| *is_error && t.contains("nest more than")),
+            "{reports:?}"
+        );
+        // and it stopped at the bound rather than growing without one.
+        assert_eq!(
+            ops_of(&program).len(),
+            MAX_SCRIPT_DEPTH,
+            "one pause() per frame, then the bound"
+        );
+    }
+
+    #[test]
+    fn a_script_line_may_hold_several_statements_but_not_span_lines() {
+        let program = run_script("run(s)", &[("s", "pause(); mute()\n")]);
+        assert_eq!(ops_of(&program), vec![Op::TogglePause, Op::Mute(true)]);
+        // a call split across lines cannot work in a file, because
+        // continuing past a bad line needs a line to blame; it reports
+        // rather than silently doing half.
+        let program = run_script("run(s)", &[("s", "queue([hex,\ncrest])\n")]);
+        let reports = reports_of(&program);
+        assert!(reports.iter().any(|(is_error, _)| *is_error), "{reports:?}");
+    }
+
+    /// Expansion happens while parsing, so a binding made earlier in
+    /// the same program has to be visible later in it; otherwise the
+    /// most obvious `.shg` file there is (define a vibe, then play it)
+    /// would quietly search for the variable's own name.
+    #[test]
+    fn a_binding_is_visible_to_everything_after_it_in_the_same_program() {
+        let empty = Scope::default();
+        assert_eq!(
+            terms_in("let a = [crest, hex]; play(a)", &empty),
+            vec!["crest", "hex"]
+        );
+        // and `unset` takes it back out again, so what the expansion
+        // assumed matches what will actually be bound by then.
+        assert_eq!(
+            terms_in("let a = [crest]; unset(a); play(a)", &empty),
+            vec!["a"]
+        );
+        let program = run_script("run(s)", &[("s", "let a = [crest]\nplay(a)\n")]);
+        assert_eq!(
+            ops_of(&program)
+                .into_iter()
+                .filter_map(|op| match op {
+                    Op::Search(q) => Some(q),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["crest".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_script_completes_from_the_hosts_shg_files() {
+        struct WithScripts;
+        impl Candidates for WithScripts {
+            fn corpus(&self, _token: &str) -> Vec<String> {
+                Vec::new()
+            }
+            fn scripts(&self) -> Vec<String> {
+                vec![
+                    "init".to_string(),
+                    "morning".to_string(),
+                    "mood".to_string(),
+                ]
+            }
+        }
+        let cand = WithScripts;
+        let c = console_with(&cand, "run(mo");
+        let here = site(&c.input, c.cursor);
+        assert_eq!(here.completes, Completes::Scripts);
+        assert_eq!(
+            c.candidates_at(&here, &cand),
+            vec!["morning".to_string(), "mood".to_string()]
+        );
     }
 
     // --------------------------------------------- pinned completion
@@ -5359,6 +6906,13 @@ mod tests {
     ];
 
     const PINNED_QUEUES: &[&str] = &["late-night", "late-bloom", "gym"];
+
+    /// Two variables, so the table pins both the variable-name class
+    /// and the ordering inside the terms class (variables, then corpus).
+    const PINNED_VARS: &[(&str, &[&str])] = &[
+        ("bladee_classics", &["crest", "icedancer"]),
+        ("quiet_hours", &["mazzy star"]),
+    ];
 
     const PINNED_INPUTS: &[&str] = &[
         "",
@@ -5394,6 +6948,15 @@ mod tests {
         "load_queue(late",
         "add_to_queue(",
         "add_to_queue(fr",
+        "define(",
+        "define(bla",
+        "unset(",
+        "unset(bla",
+        "play(bla",
+        "run(",
+        "remember(",
+        "remember(track, ",
+        "forget(track, ",
         "loop(",
         "shuffle(",
         "eq(",
@@ -5425,6 +6988,7 @@ mod tests {
     ) {
         let mut fake = Fake::new(PINNED_CORPUS);
         fake.queues = PINNED_QUEUES.to_vec();
+        fake.vars = scope_of(PINNED_VARS);
         let c = console_with(&fake, keys);
         let here = site(&c.input, c.cursor);
         assert_eq!(c.input, buffer, "buffer for {keys:?}");
@@ -5461,6 +7025,7 @@ mod tests {
                 "clear_queue",
                 "cls",
                 "crossfade",
+                "define",
                 "dl",
                 "down",
                 "download",
@@ -5476,6 +7041,7 @@ mod tests {
                 "favorite",
                 "find",
                 "flush",
+                "forget",
                 "forward",
                 "fwd",
                 "go",
@@ -5502,7 +7068,38 @@ mod tests {
                 "quit",
                 "random",
                 "randomize",
+                "remember",
                 "remove",
+                "repeat",
+                "repeat_mode",
+                "rescan",
+                "run",
+                "save_queue",
+                "search",
+                "seek",
+                "select",
+                "show",
+                "shuf",
+                "shuffle",
+                "shuffle_queue",
+                "skip",
+                "sleep",
+                "speed",
+                "star",
+                "tempo",
+                "toggle",
+                "top",
+                "unfav",
+                "unfavorite",
+                "unlike",
+                "unmute",
+                "unset",
+                "unstar",
+                "up",
+                "view",
+                "vol",
+                "volume",
+                "xfade",
             ],
         );
         pin(
@@ -5536,6 +7133,8 @@ mod tests {
                 "index",
                 "history",
                 "playlists",
+                "vars",
+                "bindings",
                 "eq",
                 "help",
             ],
@@ -5567,10 +7166,12 @@ mod tests {
         pin(
             "play(",
             "play()",
-            "flatline",
+            "bladee_classics",
             None,
             Some(("play(terms?)", 0)),
             &[
+                "bladee_classics",
+                "quiet_hours",
                 "flatline",
                 "Flatline (Remix)",
                 "floor",
@@ -5645,6 +7246,7 @@ mod tests {
                 "clear_queue",
                 "cls",
                 "crossfade",
+                "define",
                 "dl",
                 "down",
                 "download",
@@ -5660,6 +7262,7 @@ mod tests {
                 "favorite",
                 "find",
                 "flush",
+                "forget",
                 "forward",
                 "fwd",
                 "go",
@@ -5686,7 +7289,38 @@ mod tests {
                 "quit",
                 "random",
                 "randomize",
+                "remember",
                 "remove",
+                "repeat",
+                "repeat_mode",
+                "rescan",
+                "run",
+                "save_queue",
+                "search",
+                "seek",
+                "select",
+                "show",
+                "shuf",
+                "shuffle",
+                "shuffle_queue",
+                "skip",
+                "sleep",
+                "speed",
+                "star",
+                "tempo",
+                "toggle",
+                "top",
+                "unfav",
+                "unfavorite",
+                "unlike",
+                "unmute",
+                "unset",
+                "unstar",
+                "up",
+                "view",
+                "vol",
+                "volume",
+                "xfade",
             ],
         );
         pin(
@@ -5802,6 +7436,71 @@ mod tests {
             &["front"],
         );
         pin(
+            "define(",
+            "define()",
+            "bladee_classics",
+            None,
+            Some(("define(name, terms)", 0)),
+            &["bladee_classics", "quiet_hours"],
+        );
+        pin(
+            "define(bla",
+            "define(bla)",
+            "dee_classics",
+            None,
+            Some(("define(name, terms)", 0)),
+            &["bladee_classics"],
+        );
+        pin(
+            "unset(",
+            "unset()",
+            "bladee_classics",
+            None,
+            Some(("unset(name)", 0)),
+            &["bladee_classics", "quiet_hours"],
+        );
+        pin(
+            "unset(bla",
+            "unset(bla)",
+            "dee_classics",
+            None,
+            Some(("unset(name)", 0)),
+            &["bladee_classics"],
+        );
+        pin(
+            "play(bla",
+            "play(bla)",
+            "dee_classics",
+            None,
+            Some(("play(terms?)", 0)),
+            &["bladee_classics"],
+        );
+        pin("run(", "run()", "", None, Some(("run(script)", 0)), &[]);
+        pin(
+            "remember(",
+            "remember()",
+            "track",
+            None,
+            Some(("remember(tier, call)", 0)),
+            &["track", "album", "artist"],
+        );
+        pin(
+            "remember(track, ",
+            "remember(track, )",
+            "eq",
+            None,
+            Some(("remember(tier, call)", 1)),
+            &["eq", "volume", "speed"],
+        );
+        pin(
+            "forget(track, ",
+            "forget(track, )",
+            "eq",
+            None,
+            Some(("forget(tier, setting?)", 1)),
+            &["eq", "volume", "speed"],
+        );
+        pin(
             "loop(",
             "loop()",
             "one",
@@ -5863,6 +7562,7 @@ mod tests {
                 "clear_queue",
                 "cls",
                 "crossfade",
+                "define",
                 "dl",
                 "down",
                 "download",
@@ -5878,6 +7578,7 @@ mod tests {
                 "favorite",
                 "find",
                 "flush",
+                "forget",
                 "forward",
                 "fwd",
                 "go",
@@ -5904,7 +7605,38 @@ mod tests {
                 "quit",
                 "random",
                 "randomize",
+                "remember",
                 "remove",
+                "repeat",
+                "repeat_mode",
+                "rescan",
+                "run",
+                "save_queue",
+                "search",
+                "seek",
+                "select",
+                "show",
+                "shuf",
+                "shuffle",
+                "shuffle_queue",
+                "skip",
+                "sleep",
+                "speed",
+                "star",
+                "tempo",
+                "toggle",
+                "top",
+                "unfav",
+                "unfavorite",
+                "unlike",
+                "unmute",
+                "unset",
+                "unstar",
+                "up",
+                "view",
+                "vol",
+                "volume",
+                "xfade",
             ],
         );
         pin(
@@ -5957,6 +7689,7 @@ mod tests {
     fn gen_pinned() {
         let mut fake = Fake::new(PINNED_CORPUS);
         fake.queues = PINNED_QUEUES.to_vec();
+        fake.vars = scope_of(PINNED_VARS);
         for input in PINNED_INPUTS {
             let c = console_with(&fake, input);
             let here = site(&c.input, c.cursor);
