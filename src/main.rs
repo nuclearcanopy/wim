@@ -519,12 +519,6 @@ fn empty_results_message(app: &app::App) -> String {
     }
 }
 
-fn rebuild_corpus(cfg: &config::Config) -> search::Corpus {
-    let mut corpus = search::Corpus::new();
-    corpus.add_local_tracks(library::scan(&cfg.library_paths));
-    corpus
-}
-
 /// The results list as the ranked order it is, for the three draw-path
 /// readers that need its geometry or the rows on screen. None of them
 /// ever gets the whole list: `App` holds corpus indices, and this
@@ -602,7 +596,7 @@ fn main() -> anyhow::Result<()> {
     // scan thread signs off by dropping its sender, so a finished
     // channel can never be reused.
     let (scan_tx, mut scan_rx) = mpsc::channel::<library::ScanBatch>();
-    let scan_report = library::spawn_scan(cfg.library_paths.clone(), scan_tx);
+    let mut scan_report = library::spawn_scan(cfg.library_paths.clone(), scan_tx);
     // every configured server's catalog as of its last session, read
     // straight off the disk so the first frame has a full library
     // rather than "connecting to navidrome..."; started here so the
@@ -3033,7 +3027,25 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Enter | KeyCode::Esc => {
                                 cfg.library_paths = ob.library_paths.clone();
                                 config::save_or_warn(&cfg, &mut notifications);
-                                app.replace_corpus(rebuild_corpus(&cfg));
+                                // the same three steps `Op::Rescan`
+                                // takes, and for the same reasons: the
+                                // scan runs on a thread (this used to
+                                // scan inline and freeze the first-run
+                                // ui with no feedback), the receiver is
+                                // replaced so the startup scan's
+                                // in-flight batches cannot land in the
+                                // new corpus and list every track
+                                // twice, and only the *local* half is
+                                // dropped, or the navidrome catalog the
+                                // previous step just indexed goes with
+                                // it until the next 45s sync.
+                                scan_report = library::restart_scan(
+                                    cfg.library_paths.clone(),
+                                    &mut scan_rx,
+                                );
+                                app.corpus.drop_local();
+                                app.scanning_library = true;
+                                app.resync_results();
                                 ob.advance();
                             }
                             _ => {}

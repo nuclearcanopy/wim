@@ -1570,20 +1570,34 @@ do the wrong thing quietly, which is worse to diagnose.
       call site (`catalog.rs` ~60) reads a list that only ever grows,
       so the behaviour those three tests assert is unreachable in the
       binary.
-- [ ] **`main.rs` ~2990: onboarding replaces the corpus without
-      replacing the scan receiver.** `app.corpus = rebuild_corpus(&cfg)`
-      where `Op::Rescan` (`core.rs` ~2546) gets it right by swapping
-      the receiver *and* calling `drop_local`. press
-      enter/enter/esc/esc then enter on first run: the startup scan
-      thread's remaining batches drain into the fresh corpus (`push`
-      dedups remote keys only), so every local track is listed twice
-      for the session; the navidrome catalog the previous step just
-      indexed and the warm-from-cache corpus are both discarded until
-      the next 45s sync; and `library::scan` runs *synchronously on
-      the main loop*, freezing the first-run ui with no feedback.
-      **this one is also the trigger for the `Ranking` revision
-      guard** (see the search-cost item): it is merely stale today and
-      becomes wrong-rows the moment `App` holds the order.
+- [x] **onboarding's library-paths step did three wrong things at
+      once**, and `Op::Rescan` had been doing all three right next
+      door.
+      it ran `library::scan` **synchronously on the main loop**, so the
+      first-run ui froze with no feedback (that path had been threaded
+      everywhere else since the recorded "this used to run inline
+      before the first frame" fix). it never replaced `scan_rx`, so the
+      startup scan's in-flight batches drained into the new corpus
+      (`Corpus::push` dedups remote keys only) and **every local track
+      was listed twice for the rest of the session**. and it built a
+      whole new corpus rather than dropping the local half, so the
+      navidrome catalog the *previous* onboarding step had just indexed
+      went with it until the next 45s sync.
+      the rule that matters is the receiver, so it lives in one place
+      now: `library::restart_scan(paths, &mut rx)` makes the fresh
+      channel, spawns the thread and swaps the receiver, with the
+      reasoning in its doc. the caller keeps the corpus half
+      (`drop_local`, not a new corpus) because that is the part the two
+      call sites legitimately differ on.
+      the test pins the receiver swap rather than the thread, since
+      that is the half that was wrong: a batch queued on the old
+      channel must reach nobody, and the old sender must come back
+      `Err`. mutation-checked by dropping the swap, which is exactly
+      the shape someone "simplifying" it back would produce.
+      `rebuild_corpus` had that one caller and is gone.
+      **this was also the trigger named by the `Ranking` revision
+      guard**: stale rows today, wrong rows once `App` held the order,
+      which it now does.
 - [ ] **`main.rs` ~2297: a late subtitle lands on the wrong video.**
       `SubtitleReady` (`core.rs` ~753) carries only path/release/
       language, no track identity and no epoch, and the drain calls
