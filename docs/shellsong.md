@@ -28,8 +28,16 @@ should be added that breaks one.
   to it; see "variables".
 - **r2. a bare number means exactly one thing per parameter.**
   `speed(1.5)` is a multiplier, `volume(50%)` a level, `moveto(10s)` a
-  position. `skip(2)` is refused: it is ambiguous between "skip twice"
-  and "skip to track 2", so repetition is `repeat(2, skip())`.
+  position.
+
+  **`skip(2)` was the example of what this refuses and is now
+  allowed.** The rule stands; its example stopped applying. The
+  objection was that `skip(2)` is ambiguous between "skip twice" and
+  "skip to track 2" -- and `goto(2)` now owns absolute queue
+  positions, so the second reading is taken and only the relative one
+  is left. `repeat(2, skip())` still works and means the same thing.
+  The rule to keep is "one meaning per parameter", not the list of
+  commands that happened to have none.
 - **r3. canonical names are snake_case full words.** aliases are
   additive and never canonical; `help()` lists canonical names with
   aliases in a trailing column.
@@ -195,6 +203,19 @@ gap(10s)   ten seconds between tracks from now on
 gap(off)   back to gapless
 ```
 
+two more that take an optional argument rather than only toggling:
+
+```
+skip()     next track
+skip(3)    three tracks on; stops at the end rather than erroring
+pause()    the play/pause toggle
+pause(30s) pause now, resume by itself in thirty seconds
+```
+
+`pause(30s)` is not `sleep(30s)`: sleep fades *out* and stops after a
+delay, this stops now and starts again. it takes a `span`, so there is
+no `pause(off)`.
+
 `gap` takes a `duration`, not a `span`, which is the whole reason the
 two types exist separately: `off` is meaningful here and meaningless
 for `silence`.
@@ -239,7 +260,7 @@ resolution, not filtering (r7).
 | --- | --- |
 | `play` | song, album |
 | `queue` | song |
-| `queue_aa` | song, album |
+| `queue_aa` | **album**, song |
 | `star`, `unstar`, `download` | song, album |
 | `view(q, ...)` | artist, album, playlist, song |
 
@@ -255,6 +276,15 @@ start there.
 
 an album accepted by `_aa` expands to its tracks, the same way enter on
 an album does.
+
+**`_aa` prefers the album, not the song.** it read `song, album` at
+first, which made the rung close to useless: any library with a song
+whose title contains the album's name never resolved to the album.
+`queue_aa(crest)` queued the single song "5 Star Crest (4 Vattenrum)"
+and left the album Crest alone. reaching for `_aa` *is* the statement
+that an album is what you meant; the song-preferring reading is what
+bare `queue` already is. the rung still accepts songs, so a term with
+no album match behaves as before.
 
 ### suffixes and `kind=`
 

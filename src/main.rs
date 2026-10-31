@@ -1913,6 +1913,7 @@ fn main() -> anyhow::Result<()> {
     // cache is what makes evaluating it every frame free: mpv only
     // hears about it when the answer actually changes.
     let mut between_tracks = BetweenTracks::new();
+    let mut resume_due: Option<Duration> = None;
     let mut undo_tree = wim::undo::Recorder::default();
     let mut gap_secs = cfg.gap_seconds.max(0.0);
     let mut keep_open_held: Option<bool> = None;
@@ -3503,6 +3504,7 @@ fn main() -> anyhow::Result<()> {
                     fade_in_started_at: &mut fade_in_started_at,
                     fade: &mut shellsong_fade,
                     sleep_due: &mut sleep_due,
+                    resume_due: &mut resume_due,
                     scan_rx: &mut scan_rx,
                     remote_search_tx: &remote_search_tx,
                     settle: &mut settle,
@@ -3542,6 +3544,12 @@ fn main() -> anyhow::Result<()> {
             if ramp.finished(shellsong_now) {
                 shellsong_fade = None;
             }
+        }
+        // `pause(30s)` letting go. the mirror of `sleep_due` below,
+        // and checked first for no reason other than reading order.
+        if resume_due.is_some_and(|due| shellsong_now >= due) {
+            resume_due = None;
+            let _ = player.set_pause(false);
         }
         if let Some(due) = sleep_due {
             let fade_over = Duration::from_secs_f64(cfg.crossfade_seconds);

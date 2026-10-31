@@ -82,12 +82,24 @@ impl Kind {
     }
 }
 
-/// `kind=` ladder: every rung widens the one before it, so a suffix or
-/// keyword argument can only ever *add* acceptable kinds. One line per
-/// rung is the whole definition.
+/// `kind=` ladder: every rung accepts everything the one before it
+/// did, so a suffix or keyword argument can only ever *add* acceptable
+/// kinds. One line per rung is the whole definition.
+///
+/// **`album` prefers the album, which is the point of asking.** It
+/// used to read `[Song, Album]`, song first, and that made the rung
+/// close to useless: any library with a song whose title contains the
+/// album's name never resolved to the album at all. Reported from
+/// real use -- `queue_aa(crest)` queued the single song "5 Star Crest
+/// (4 Vattenrum)" and left the album Crest untouched.
+///
+/// Reaching for `_aa` or `kind=album` *is* the statement that an album
+/// is what you meant; the song-preferring reading is already what the
+/// bare command does. The rung still accepts songs, so a term with no
+/// album match behaves exactly as before.
 const KIND_LADDER: &[(&str, &[Kind])] = &[
     ("song", &[Kind::Song]),
-    ("album", &[Kind::Song, Kind::Album]),
+    ("album", &[Kind::Album, Kind::Song]),
     (
         "any",
         &[
@@ -413,12 +425,22 @@ fn view_name(target: ViewTarget) -> &'static str {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     TogglePause,
-    SkipNext,
+    /// Forward `n` tracks; `skip()` is one.
+    ///
+    /// **R2 refuses `skip(2)` as ambiguous** between "skip twice" and
+    /// "skip to track 2". That ambiguity is gone: `goto(2)` owns
+    /// absolute queue positions, so the only reading left is the
+    /// relative one. See the rule's own note in docs/shellsong.md.
+    SkipNext(usize),
     SkipBack,
     SeekAbsolute(Pos),
     SeekRelative(f64),
     SetVolume(Level),
     Mute(bool),
+    /// Pause, and resume by itself after `secs` if given. Distinct
+    /// from `sleep`, which fades *out* and stops after a delay; this
+    /// stops now and starts again.
+    PauseFor(f64),
     CycleLoop,
     SetLoop(LoopMode),
     ToggleShuffle,
@@ -520,7 +542,9 @@ impl Op {
     pub fn describe(&self) -> String {
         match self {
             Op::TogglePause => "pause toggled".into(),
-            Op::SkipNext => "skipped".into(),
+            Op::SkipNext(1) => "skipped".into(),
+            Op::SkipNext(n) => format!("skipped {n} tracks"),
+            Op::PauseFor(secs) => format!("paused for {secs}s"),
             Op::SkipBack => "back".into(),
             Op::SeekAbsolute(Pos::Percent(p)) => format!("moved to {p}%"),
             Op::SeekAbsolute(Pos::Seconds(s)) => format!("moved to {s}s"),
@@ -955,11 +979,17 @@ pub const COMMANDS: &[Command] = &[
     cmd(
         "pause",
         &["toggle", "play_pause"],
-        NONE,
+        &[opt("for", Ty::Span)],
         &[],
-        "play / pause",
+        "play / pause; pause(30s) resumes by itself",
     ),
-    cmd("skip", &["next", "forward", "fwd"], NONE, &[], "next track"),
+    cmd(
+        "skip",
+        &["next", "forward", "fwd"],
+        &[opt("tracks", Ty::Count)],
+        &[],
+        "next track, or skip(3) for three",
+    ),
     cmd("back", &["prev", "previous"], NONE, &[], "previous track"),
     cmd(
         "moveto",
@@ -2346,8 +2376,14 @@ impl Call {
     fn simple_op(&self) -> Option<Op> {
         let first = self.args.first();
         Some(match self.command.name {
-            "pause" => Op::TogglePause,
-            "skip" => Op::SkipNext,
+            "pause" => match first {
+                Some(Arg::Span(secs)) => Op::PauseFor(*secs),
+                _ => Op::TogglePause,
+            },
+            "skip" => match first {
+                Some(Arg::Count(n)) => Op::SkipNext(*n as usize),
+                _ => Op::SkipNext(1),
+            },
             "back" => Op::SkipBack,
             "moveto" => match first {
                 Some(Arg::Pos(p)) => Op::SeekAbsolute(*p),
@@ -4817,7 +4853,7 @@ mod tests {
     #[test]
     fn zero_argument_commands_need_empty_parens_and_nothing_else() {
         assert_eq!(ops("pause()"), vec![Op::TogglePause]);
-        assert_eq!(ops("skip()"), vec![Op::SkipNext]);
+        assert_eq!(ops("skip()"), vec![Op::SkipNext(1)]);
         assert_eq!(ops("back()"), vec![Op::SkipBack]);
         assert_eq!(ops("clear_queue()"), vec![Op::ClearQueue]);
         assert_eq!(ops("shuffle()"), vec![Op::ToggleShuffle]);
@@ -4828,7 +4864,7 @@ mod tests {
     #[test]
     fn transport_synonyms_all_reach_the_same_op() {
         for name in ["skip", "next", "forward", "fwd"] {
-            assert_eq!(ops(&format!("{name}()")), vec![Op::SkipNext], "{name}");
+            assert_eq!(ops(&format!("{name}()")), vec![Op::SkipNext(1)], "{name}");
         }
         for name in ["back", "prev", "previous"] {
             assert_eq!(ops(&format!("{name}()")), vec![Op::SkipBack], "{name}");
@@ -5012,14 +5048,17 @@ mod tests {
 
     #[test]
     fn statements_separate_on_semicolons_and_newlines_and_drop_comments() {
-        assert_eq!(ops("pause(); skip()"), vec![Op::TogglePause, Op::SkipNext]);
+        assert_eq!(
+            ops("pause(); skip()"),
+            vec![Op::TogglePause, Op::SkipNext(1)]
+        );
         assert_eq!(
             ops("pause()\nskip()\n"),
-            vec![Op::TogglePause, Op::SkipNext]
+            vec![Op::TogglePause, Op::SkipNext(1)]
         );
         assert_eq!(
             ops("pause() # this is a comment\nskip()"),
-            vec![Op::TogglePause, Op::SkipNext]
+            vec![Op::TogglePause, Op::SkipNext(1)]
         );
         assert_eq!(ops("# nothing but a comment"), Vec::<Op>::new());
     }
@@ -5035,7 +5074,7 @@ mod tests {
     fn repeat_expands_statically() {
         assert_eq!(
             ops("repeat(3, skip())"),
-            vec![Op::SkipNext, Op::SkipNext, Op::SkipNext]
+            vec![Op::SkipNext(1), Op::SkipNext(1), Op::SkipNext(1)]
         );
         assert_eq!(
             ops("repeat(2, seek(+10s))"),
@@ -5290,9 +5329,12 @@ mod tests {
     }
 
     #[test]
+    /// `rescan`, not `skip`: `skip(2)` was the example here and is a
+    /// valid call now (see `Op::SkipNext`), so it stopped testing
+    /// arity and started testing nothing.
     fn too_many_arguments_report_the_signature() {
-        let e = error("skip(2)");
-        assert!(e.message.contains("skip()"), "{}", e.message);
+        let e = error("rescan(2)");
+        assert!(e.message.contains("rescan()"), "{}", e.message);
     }
 
     #[test]
@@ -5316,17 +5358,36 @@ mod tests {
 
     // ---------------------------------------------- kind preferences
 
-    /// The ambiguous case the author described: "crest" matching both.
+    /// The ambiguous case: "crest" matching both a song and an album.
     /// `queue` prefers songs and never falls through to the album;
-    /// `queue_aa` still prefers the song when one exists.
+    /// `queue_aa` prefers the **album**.
+    ///
+    /// **This assertion is inverted from what it first pinned**, which
+    /// was "a song is still the best match even with albums allowed".
+    /// That shipped and then failed in real use: a library with "5
+    /// Star Crest (4 Vattenrum)" in it meant `queue_aa(crest)` queued
+    /// that one song and never the album Crest, which made the rung
+    /// close to useless. Reaching for `_aa` is the statement that an
+    /// album is what you meant; the song-preferring reading is what
+    /// the bare `queue` already is.
     #[test]
-    fn queue_prefers_a_song_when_a_term_matches_both_a_song_and_an_album() {
+    fn queue_aa_prefers_the_album_and_bare_queue_still_prefers_the_song() {
         let both = vec![Kind::Album, Kind::Song];
         assert_eq!(resolve_with("queue(crest)", both.clone()), vec![queued(1)]);
         assert_eq!(
             resolve_with("queue_aa(crest)", both),
-            vec![queued(1)],
-            "a song is still the best match even with albums allowed"
+            vec![queued(0)],
+            "asking for albums must actually reach the album"
+        );
+    }
+
+    /// And the fallback is intact: with no album in the results,
+    /// `_aa` still finds the song.
+    #[test]
+    fn queue_aa_falls_back_to_a_song_when_no_album_matches() {
+        assert_eq!(
+            resolve_with("queue_aa(crest)", vec![Kind::Song]),
+            vec![queued(0)]
         );
     }
 
@@ -5733,6 +5794,18 @@ mod tests {
         // and then done nothing whatsoever.
         assert!(!error("silence(off)").message.is_empty());
         assert!(error("silence(0s)").message.contains("needs a length"));
+
+        // `skip(n)` and `pause(for)`: both were arity-refused by r2,
+        // whose objection to `skip(2)` was ambiguity with "skip to
+        // track 2". `goto(2)` owns absolute positions, so the only
+        // reading left is the relative one.
+        assert_eq!(ops("skip()"), vec![Op::SkipNext(1)]);
+        assert_eq!(ops("skip(3)"), vec![Op::SkipNext(3)]);
+        assert_eq!(ops("pause()"), vec![Op::TogglePause]);
+        assert_eq!(ops("pause(30s)"), vec![Op::PauseFor(30.0)]);
+        assert_eq!(ops("pause(1m30s)"), vec![Op::PauseFor(90.0)]);
+        // a span, so there is no `pause(off)` to mean nothing.
+        assert!(!error("pause(off)").message.is_empty());
         // `wait` is the same command: the alias resolves before
         // lowering, so there is no second arm to keep in step.
         assert_eq!(ops("wait(15s)"), ops("silence(15s)"));
@@ -6850,7 +6923,7 @@ queue(morning)
             program.step(&settled),
             Step::Emit(Op::Play(Target::Index(0)))
         );
-        assert_eq!(program.step(&settled), Step::Emit(Op::SkipNext));
+        assert_eq!(program.step(&settled), Step::Emit(Op::SkipNext(1)));
     }
 
     /// The guard for the whole stage: a line that does not parse is
@@ -6878,7 +6951,7 @@ queue(morning)
         // and every good line still ran, in order, past both errors.
         assert_eq!(
             ops_of(&program),
-            vec![Op::TogglePause, Op::Mute(true), Op::SkipNext]
+            vec![Op::TogglePause, Op::Mute(true), Op::SkipNext(1)]
         );
     }
 

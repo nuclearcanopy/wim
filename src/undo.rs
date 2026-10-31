@@ -227,12 +227,13 @@ pub fn classify(op: &Op) -> Reversibility {
     match op {
         // --- plain state, restoring the snapshot is the whole story
         Op::TogglePause
-        | Op::SkipNext
+        | Op::SkipNext(_)
         | Op::SkipBack
         | Op::SeekAbsolute(_)
         | Op::SeekRelative(_)
         | Op::SetVolume(_)
         | Op::Mute(_)
+        | Op::PauseFor(_)
         | Op::CycleLoop
         | Op::SetLoop(_)
         | Op::ToggleShuffle

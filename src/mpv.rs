@@ -600,10 +600,17 @@ impl Mpv {
         self.set_property(PROP_PAUSE, json!(paused))
     }
 
-    /// `"weak"`: a no-op (not an error) if there's nothing further
-    /// along mpv's own playlist, since it already holds every queued
-    /// track (see `playlist_append`) and knows better than we do
-    /// whether there's anywhere to skip to.
+    /// `"weak"` means "do not stop playback if there is nowhere to
+    /// go", which is not the same as succeeding.
+    ///
+    /// **Measured, because the comment here used to claim the
+    /// opposite**: with a single entry loaded, `["playlist-next",
+    /// "weak"]` replies `{"error":"error running command"}`. It does
+    /// leave the track playing and `playlist-pos` where it was, so
+    /// nothing breaks, but the reply *is* an error and anything
+    /// surfacing it shows the user one. Callers that know whether
+    /// there is a next entry should say so themselves rather than let
+    /// this answer for them; see `Op::SkipNext`.
     pub fn playlist_next(&self) -> Result<()> {
         self.command(&[json!("playlist-next"), json!("weak")])
             .map(|_| ())
