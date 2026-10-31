@@ -2029,9 +2029,34 @@ the order below is not a preference, it is a dependency.
       locals, then the draw closure, and only then the input tiers
       (their ordering is load-bearing and heavily commented).
       **the "~3.9k lines" in this entry was stale: it was 6.2k when
-      the decomposition started.** down to 5.6k over three slices.
+      the decomposition started.** down to 5.3k over four slices.
       worth re-measuring rather than trusting, since every feature
       slice adds to it.
+      - [x] **catalog fetching and the sync thread -> `src/catalog.rs`**
+        (355 lines). `AUTO_SYNC_INTERVAL`, `BackgroundSyncResult`,
+        `spawn_background_sync`, `FetchedCatalog`, `fetched`,
+        `fetch_navidrome_catalog`, `merge_catalog_into_app`,
+        `fetch_navidrome_everything`, `index_navidrome_server`,
+        `test_navidrome_connectivity`, plus `catalog_fetch_tests`.
+        that finishes the channel plumbing step; `recompute_suggestions`
+        went to `enrich.rs` instead, since rebuilding the menu belongs
+        with the thing that enriches it rather than with fetching.
+        **main.rs 5622 -> 5267**, and 6.2k -> 5.3k over four slices.
+        **this one was messier than the three before it and the reason
+        is worth recording.** `catalog_fetch_tests` was not a clean
+        unit: it also held the two `graphics_plausible_in` tests,
+        which belong to the terminal probe and had to be split back
+        out into their own `graphics_probe_tests`. a test module named
+        after one subsystem containing another's tests is the kind of
+        thing only a move surfaces.
+        `cargo fix` made it worse rather than better: run with
+        `--bins --lib` it cannot see test code, so it stripped imports
+        (`CacheIndex`, `subsonic`) that only the tests used, and the
+        build then failed in the tests instead. two of those are
+        qualified at the use site now, because an import needed only
+        under `cfg(test)` is otherwise an unused-import error in the
+        binary. **do not reach for `cargo fix` on a file with inline
+        test modules**; fix the imports by hand.
       - [x] **background enrichment -> `src/enrich.rs`** (461 lines
         with its tests). the most self-contained part of the channel
         plumbing the plan calls for: one job goes out over `job_rx`,
