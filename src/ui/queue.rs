@@ -5,6 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
 use crate::anim;
+use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::search::SearchItem;
 use crate::theme::{shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
@@ -34,6 +35,11 @@ pub struct QueueView<'a> {
     /// convention as every other list, see `anim::selection_bg`).
     pub focused: bool,
     pub elapsed: Duration,
+    /// Read for the one remappable key this pane names: the empty
+    /// queue told you to press `'a'`, baked in, which is exactly the
+    /// lie `help::Key::Bound` exists to stop. Every other key named
+    /// here is a fixed convention main.rs hardcodes.
+    pub keymap: &'a Keymap,
 }
 
 /// Rows the view draws for one frame: either a dim section label or a
@@ -139,6 +145,15 @@ pub fn selectable(entries: &[SearchItem], pos: Option<usize>) -> Vec<usize> {
         .collect()
 }
 
+/// The header's key hint.
+///
+/// It read "J/K: move" while `K` moved nothing: main.rs tested
+/// `Char('K')` for the remap menu unconditionally, *before* this
+/// view's own handler, so the `Char('J') | Char('K')` arm here was
+/// dead for `K`. That precedence is fixed (the remap check now skips
+/// a focused queue view), so both directions are advertised again.
+const HEADER_HINT: &str = "enter: jump, d: remove, J/K: move, esc: close";
+
 impl Widget for QueueView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
@@ -158,7 +173,7 @@ impl Widget for QueueView<'_> {
             area,
             area.y,
             &title,
-            "enter: jump, d: remove, J/K: move, esc: close",
+            HEADER_HINT,
             shade(DIM),
             shade(NEAR_BLACK),
         );
@@ -185,7 +200,10 @@ impl Widget for QueueView<'_> {
                 buf,
                 area,
                 body_top.saturating_add(1),
-                "enter on a song to start, 'a' to add",
+                &format!(
+                    "enter on a song to start, {} to add",
+                    key_label(self.keymap.get(KeyAction::Enqueue))
+                ),
                 shade(DIM),
                 area.width as usize,
             );
@@ -287,6 +305,7 @@ mod tests {
             selected,
             focused: true,
             elapsed: Duration::ZERO,
+            keymap: &Keymap::default(),
         }
         .render(area, &mut buf);
         grid(&buf)
@@ -349,7 +368,7 @@ mod tests {
     fn an_empty_queue_explains_itself_instead_of_rendering_blank() {
         let out = render(&[], None, 0);
         assert!(out.contains("nothing queued"), "{out}");
-        assert!(out.contains("'a' to add"), "{out}");
+        assert!(out.contains("a to add"), "{out}");
     }
 
     #[test]
@@ -363,6 +382,7 @@ mod tests {
             selected: 1,
             focused: true,
             elapsed: Duration::ZERO,
+            keymap: &Keymap::default(),
         }
         .render(area, &mut buf);
         // find the row holding "bbb" and assert it, and only it, is plated
@@ -406,6 +426,7 @@ mod tests {
             selected,
             focused: true,
             elapsed: Duration::ZERO,
+            keymap: &Keymap::default(),
         }
         .render(area, &mut buf);
         let lines: Vec<String> = grid(&buf).lines().map(str::to_string).collect();
@@ -493,6 +514,7 @@ mod tests {
             selected: 0,
             focused: true,
             elapsed: Duration::ZERO,
+            keymap: &Keymap::default(),
         }
         .render(area, &mut buf);
         let body = body_rect(area);
@@ -537,8 +559,178 @@ mod tests {
                 selected: 0,
                 focused: false,
                 elapsed: Duration::ZERO,
+                keymap: &Keymap::default(),
             }
             .render(area, &mut buf);
+        }
+    }
+
+    /// The pane named one remappable key and baked its default in, so
+    /// anyone who had rebound enqueue was told to press a key that
+    /// does something else.
+    #[test]
+    fn the_empty_queue_hint_names_the_key_enqueue_is_actually_bound_to() {
+        use crossterm::event::KeyCode;
+        let mut km = Keymap::default();
+        km.set(KeyAction::Enqueue, KeyCode::F(5));
+        let area = Rect::new(0, 0, 44, 12);
+        let mut buf = buffer(44, 12);
+        QueueView {
+            entries: &[],
+            pos: None,
+            selected: 0,
+            focused: true,
+            elapsed: Duration::ZERO,
+            keymap: &km,
+        }
+        .render(area, &mut buf);
+        let g = grid(&buf);
+        assert!(g.contains("f5 to add"), "the live binding is missing:\n{g}");
+        assert!(
+            !g.contains("'a' to add") && !g.contains("a to add"),
+            "still teaching the default:\n{g}"
+        );
+    }
+
+    /// The hint must not advertise a key the app never delivers here.
+    /// Both reorder directions are advertised, and the host guard that
+    /// makes `K` reach this view at all is pinned here.
+    ///
+    /// `K` is reserved for the remap menu, and main.rs used to claim
+    /// it unconditionally *before* this view's handler, so the
+    /// `Char('J') | Char('K')` arm was dead and the hint taught a key
+    /// that did nothing. Reading main.rs is crude, but the alternative
+    /// is a hint that silently goes back to lying: the hint lives
+    /// here and the precedence lives there, and nothing else ties the
+    /// two together.
+    #[test]
+    fn the_header_hint_advertises_both_reorder_directions() {
+        assert_eq!(
+            crate::keymap::reserved_key_purpose(crossterm::event::KeyCode::Char('K')),
+            Some("the remap menu itself"),
+            "K stopped opening the remap menu; see HEADER_HINT"
+        );
+        let host = include_str!("../main.rs");
+        let at = host
+            .find("if key.code == KeyCode::Char('K')")
+            .expect("main.rs no longer claims K for the remap menu");
+        let check = &host[at..at + 200];
+        assert!(
+            check.contains("queue_view_open"),
+            "the remap menu claims K unconditionally again, so this \
+             view never receives it and the hint below is a lie:\n{check}"
+        );
+
+        assert!(HEADER_HINT.contains("J/K: move"), "{HEADER_HINT}");
+        // and on a pane wide enough to hold the whole hint, so this is
+        // the drawn text and not just the constant.
+        let e: Vec<_> = ["aaa"].iter().map(|t| song(t)).collect();
+        let mut buf = buffer(80, 8);
+        QueueView {
+            entries: &e,
+            pos: Some(0),
+            selected: 0,
+            focused: true,
+            elapsed: Duration::ZERO,
+            keymap: &Keymap::default(),
+        }
+        .render(Rect::new(0, 0, 80, 8), &mut buf);
+        let g = grid(&buf);
+        assert!(g.contains("J/K: move"), "{g}");
+    }
+}
+
+#[cfg(test)]
+mod eyeball {
+    use super::*;
+    use crate::ui::testbuf::{buffer, grid};
+    use crossterm::event::KeyCode;
+
+    fn song(title: &str) -> SearchItem {
+        SearchItem::LocalMusic {
+            path: format!("/music/{title}.flac").into(),
+            title: title.to_string(),
+            artist: Some("Artist".to_string()),
+            album: None,
+        }
+    }
+
+    /// What to draw and at what size: a label, the queue, the play
+    /// position, the cursor, the keymap the hint resolves against, and
+    /// the pane's cells.
+    type Case<'a> = (
+        &'a str,
+        &'a [SearchItem],
+        Option<usize>,
+        usize,
+        &'a Keymap,
+        u16,
+        u16,
+    );
+
+    /// The pane at the widths the workspace actually hands it, plus the
+    /// empty state a first-time user lands on and a rebound enqueue:
+    /// `cargo test --lib ui::queue::eyeball -- --nocapture`.
+    /// Asserts the floor too, so it is a test and not just a printer.
+    #[test]
+    fn print_the_queue_pane_and_its_empty_state() {
+        let mut rebound = Keymap::default();
+        rebound.set(KeyAction::Enqueue, KeyCode::F(5));
+        let full: Vec<SearchItem> = (0..12).map(|i| song(&format!("track {i}"))).collect();
+        let cases: [Case; 6] = [
+            (
+                "empty, default binding",
+                &[],
+                None,
+                0,
+                &Keymap::default(),
+                60,
+                10,
+            ),
+            (
+                "empty, enqueue rebound to f5",
+                &[],
+                None,
+                0,
+                &rebound,
+                60,
+                10,
+            ),
+            ("empty, narrow", &[], None, 0, &Keymap::default(), 30, 6),
+            ("mid queue", &full, Some(3), 3, &Keymap::default(), 60, 14),
+            (
+                "scrolled to the end",
+                &full,
+                Some(0),
+                11,
+                &Keymap::default(),
+                60,
+                10,
+            ),
+            (
+                "the hint's own width",
+                &full,
+                Some(3),
+                3,
+                &Keymap::default(),
+                48,
+                8,
+            ),
+        ];
+        for (what, entries, pos, selected, keymap, w, h) in cases {
+            let mut buf = buffer(w, h);
+            QueueView {
+                entries,
+                pos,
+                selected,
+                focused: true,
+                elapsed: Duration::ZERO,
+                keymap,
+            }
+            .render(Rect::new(0, 0, w, h), &mut buf);
+            let text = grid(&buf);
+            println!("--- {w}x{h} {what}\n{text}");
+            assert!(text.contains("queue"), "{what} lost its title:\n{text}");
         }
     }
 }
