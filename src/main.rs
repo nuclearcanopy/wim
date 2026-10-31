@@ -1,37 +1,12 @@
-mod anim;
-mod app;
-mod browse;
-mod cache;
-mod config;
-mod coverart;
-mod download;
-mod eq;
-mod favorites;
-mod hit;
-mod keymap;
-mod layout;
-mod library;
-mod listenbrainz;
-mod lyrics;
-mod mpv;
-mod namehint;
-mod navmanager;
-mod notify;
-mod onboarding;
-mod opensubtitles;
-mod persistence;
-mod playqueue;
-mod queues;
-mod search;
-mod shellsong;
-mod shellsong_host;
-mod subsonic;
-mod suggest;
-mod term;
-mod theme;
-mod trace;
-mod ui;
-mod video;
+//! `wim`: the full pane ui. One of two front-ends over the `wim`
+//! library; `shellswim` is the other. Everything not about panes,
+//! focus and menus lives in the library, not here.
+
+use wim::{
+    anim, app, browse, cache, config, coverart, download, eq, favorites, hit, keymap, library,
+    listenbrainz, lyrics, mpv, namehint, opensubtitles, persistence, queues, search, shellsong,
+    shellsong_host, subsonic, suggest, term, trace, ui, video,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
@@ -45,37 +20,40 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 
-use app::{Action, LoopMode};
-use cache::CacheIndex;
-use download::DownloadEvent;
-use keymap::{KeyAction, Keymap};
-use layout::{PanelLayout, ResizePanel};
-use navmanager::{NavManager, NavManagerStep};
-use notify::{Notifications, Severity};
-use onboarding::{Onboarding, Step};
-use playqueue::{PlayQueue, PosChange};
-use search::SearchItem;
-use shellsong::{Console, ConsoleAction, GoTarget, Op, Target, ViewTarget};
-use shellsong_host::{CorpusCandidates, Ramp, SearchSettle, SleepStep};
-use theme::{shade, NEAR_BLACK};
-use ui::albumart::AsciiArt;
-use ui::banner::Banner;
-use ui::browse::BrowseListView;
-use ui::controlsbar::{
+use wim::app::{Action, LoopMode};
+use wim::cache::CacheIndex;
+use wim::download::DownloadEvent;
+use wim::keymap::{KeyAction, Keymap};
+use wim::layout::{PanelLayout, ResizePanel};
+use wim::navmanager::{NavManager, NavManagerStep};
+use wim::notify::{Notifications, Severity};
+use wim::onboarding::{Onboarding, Step};
+use wim::playqueue::{PlayQueue, PosChange};
+use wim::search::SearchItem;
+use wim::shellsong::{Console, ConsoleAction, GoTarget, Op, Target, ViewTarget};
+use wim::shellsong_host::{CorpusCandidates, Ramp, SearchSettle, SleepStep};
+use wim::theme::{shade, NEAR_BLACK};
+use wim::ui::albumart::AsciiArt;
+use wim::ui::banner::Banner;
+use wim::ui::browse::BrowseListView;
+use wim::ui::controlsbar::{
     self, ControlsBar, Field, Nav, NavKeys, Scrub, SCRUB_STEP, SCRUB_STEP_COARSE,
 };
-use ui::divider::{HorizontalRule, VerticalRule};
-use ui::login::{LoginForm, LoginView};
-use ui::lyrics_view::LyricsView;
-use ui::miniplayer::MiniPlayerBar;
-use ui::nav_manager::NavManagerListView;
-use ui::notify::NotificationOverlay;
-use ui::onboarding::{ControlsView, DoneView, LibraryPathsView, ListenBrainzView, WelcomeView};
-use ui::player::PlayerView;
-use ui::results_list::{label, ResultsList};
-use ui::searchbox::SearchBox;
-use ui::shellsong::ShellsongConsole;
-use ui::visualizer::LevelMeter;
+use wim::ui::divider::{HorizontalRule, VerticalRule};
+use wim::ui::login::{LoginForm, LoginView};
+use wim::ui::lyrics_view::LyricsView;
+use wim::ui::miniplayer::MiniPlayerBar;
+use wim::ui::nav_manager::NavManagerListView;
+use wim::ui::notify::NotificationOverlay;
+use wim::ui::onboarding::{
+    ControlsView, DoneView, LibraryPathsView, ListenBrainzView, WelcomeView,
+};
+use wim::ui::player::PlayerView;
+use wim::ui::results_list::{label, ResultsList};
+use wim::ui::searchbox::SearchBox;
+use wim::ui::shellsong::ShellsongConsole;
+use wim::ui::visualizer::LevelMeter;
+use wim::Focus;
 
 /// Local items resolve straight to a file path mpv can load. A remote
 /// `Song` resolves straight to a stream url (mpv loads http urls the
@@ -3115,15 +3093,6 @@ fn rebuild_corpus(cfg: &config::Config) -> search::Corpus {
     let mut corpus = search::Corpus::new();
     corpus.add_local_tracks(library::scan(&cfg.library_paths));
     corpus
-}
-
-/// Which pane plain navigation (j/k/arrows/enter) currently targets.
-/// See where `focus` is declared in `main` for the full reasoning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Focus {
-    Sidebar,
-    Workspace,
-    BottomBar,
 }
 
 /// shift+<direction>'s sway/i3-style transition: which neighboring
@@ -7211,9 +7180,9 @@ mod download_policy_tests {
 #[cfg(test)]
 mod shellsong_wiring_tests {
     use super::*;
-    use crate::browse::tests::{test_client, test_songs, test_view};
-    use crate::library::{LocalTrack, MediaKind};
     use std::path::PathBuf;
+    use wim::browse::fixtures::{test_client, test_songs, test_view};
+    use wim::library::{LocalTrack, MediaKind};
 
     #[test]
     fn a_browse_session_runs_from_the_selected_row_to_the_end() {
@@ -7815,7 +7784,7 @@ mod catalog_fetch_tests {
 #[cfg(test)]
 mod enrichment_plumbing_tests {
     use super::*;
-    use crate::browse::tests::test_client;
+    use wim::browse::fixtures::test_client;
 
     /// `days` consecutive distinct days ending today, one play each.
     /// `CacheIndex::record_play` stamps `last_played_secs` off the wall
