@@ -43,6 +43,99 @@ pub fn playable_path(item: &SearchItem) -> Option<String> {
     }
 }
 
+/// What the host must do about the between-track gap this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapAction {
+    /// The gap starts now. mpv has already paused *itself* (that is
+    /// what `keep-open` does), so there is nothing to send; this is
+    /// only so the host can say so on screen.
+    Begin,
+    /// The gap is over: advance, and **unpause**, because mpv stays
+    /// paused across `playlist-next` once it has held.
+    Release,
+}
+
+/// The pause between tracks (`gap`), as a state machine over mpv's
+/// `eof-reached`.
+///
+/// Deliberately not "insert a silence entry between every track",
+/// which was considered and rejected: it doubles the queue's length,
+/// makes every index the user sees wrong, and leaves orphaned gaps
+/// behind every removal. This is a property of the session applied at
+/// the join instead, so the queue is exactly what the user put in it.
+///
+/// Pure apart from the `Instant` it is handed, so the whole of it is
+/// testable without mpv.
+#[derive(Debug, Default)]
+pub struct BetweenTracks {
+    until: Option<Instant>,
+    /// Whether an `eof` may still start a gap. Cleared when one
+    /// starts and set again only once mpv reports it has left the end.
+    ///
+    /// This is not bookkeeping for its own sake: `Release` sends
+    /// `playlist-next`, and `eof-reached` stays true locally until
+    /// mpv's own property change arrives a frame or two later. Without
+    /// the latch that stale `true` immediately starts a second gap,
+    /// and every track gets two.
+    rearmed: bool,
+}
+
+impl BetweenTracks {
+    pub fn new() -> Self {
+        BetweenTracks {
+            until: None,
+            rearmed: true,
+        }
+    }
+
+    /// `eof` is mpv's `eof-reached`, `gap` the configured pause,
+    /// `more_to_play` whether anything is queued after this.
+    pub fn tick(
+        &mut self,
+        eof: bool,
+        gap: Duration,
+        more_to_play: bool,
+        now: Instant,
+    ) -> Option<GapAction> {
+        if !eof {
+            self.rearmed = true;
+        }
+        if let Some(until) = self.until {
+            if now < until {
+                return None;
+            }
+            self.until = None;
+            return Some(GapAction::Release);
+        }
+        // `more_to_play` is the guard that keeps the end of the queue
+        // the end of the queue: holding there would wait out a gap and
+        // then skip into nothing.
+        if eof && self.rearmed && more_to_play && !gap.is_zero() {
+            self.until = Some(now + gap);
+            self.rearmed = false;
+            return Some(GapAction::Begin);
+        }
+        None
+    }
+
+    /// How much of the gap is left, for the countdown.
+    pub fn remaining(&self, now: Instant) -> Option<Duration> {
+        self.until.map(|until| until.saturating_duration_since(now))
+    }
+
+    /// Ends the gap immediately, without advancing. For "the user
+    /// asked to get on with it": the caller advances itself, so this
+    /// only drops the hold.
+    pub fn cancel(&mut self) {
+        self.until = None;
+        self.rearmed = false;
+    }
+
+    pub fn holding(&self) -> bool {
+        self.until.is_some()
+    }
+}
+
 /// How long what is playing actually is: the entry's own answer where
 /// it has one, mpv's reported `duration` otherwise.
 ///
@@ -3176,6 +3269,92 @@ mod seam_tests {
             "mpv reported {reported}s for a 600s silence; if this now \
              matches, the scrubber may read mpv's duration again"
         );
+    }
+
+    const GAP: Duration = Duration::from_secs(10);
+
+    fn at(base: Instant, secs: u64) -> Instant {
+        base + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn a_gap_begins_at_the_held_end_and_releases_when_it_is_up() {
+        let mut g = BetweenTracks::new();
+        let t0 = Instant::now();
+        assert_eq!(g.tick(false, GAP, true, t0), None, "mid-track, nothing");
+        assert_eq!(g.tick(true, GAP, true, t0), Some(GapAction::Begin));
+        assert_eq!(g.tick(true, GAP, true, at(t0, 5)), None, "still holding");
+        assert_eq!(
+            g.tick(true, GAP, true, at(t0, 10)),
+            Some(GapAction::Release)
+        );
+        assert!(!g.holding());
+    }
+
+    /// The latch, and the reason it exists. `Release` sends
+    /// `playlist-next`, but `eof-reached` stays true until mpv's own
+    /// property change lands a frame or two later. Without the latch
+    /// that stale `true` starts a second gap at once and every track
+    /// gets two of them.
+    #[test]
+    fn a_stale_eof_after_release_does_not_start_a_second_gap() {
+        let mut g = BetweenTracks::new();
+        let t0 = Instant::now();
+        g.tick(true, GAP, true, t0);
+        assert_eq!(
+            g.tick(true, GAP, true, at(t0, 10)),
+            Some(GapAction::Release)
+        );
+        // mpv has not caught up yet: still reporting the old end.
+        assert_eq!(g.tick(true, GAP, true, at(t0, 10)), None);
+        assert_eq!(g.tick(true, GAP, true, at(t0, 11)), None);
+        // and once it has, the next track's end gaps normally.
+        g.tick(false, GAP, true, at(t0, 12));
+        assert_eq!(g.tick(true, GAP, true, at(t0, 20)), Some(GapAction::Begin));
+    }
+
+    /// The end of the queue stays the end of the queue: holding there
+    /// would wait out a gap and then skip into nothing, and mpv under
+    /// `keep-open` never goes idle, so the end-of-playlist path would
+    /// never run either.
+    #[test]
+    fn the_last_track_does_not_gap() {
+        let mut g = BetweenTracks::new();
+        assert_eq!(g.tick(true, GAP, false, Instant::now()), None);
+        assert!(!g.holding());
+    }
+
+    #[test]
+    fn no_gap_configured_means_no_hold() {
+        let mut g = BetweenTracks::new();
+        assert_eq!(g.tick(true, Duration::ZERO, true, Instant::now()), None);
+    }
+
+    #[test]
+    fn the_countdown_counts_down_and_never_goes_negative() {
+        let mut g = BetweenTracks::new();
+        let t0 = Instant::now();
+        assert_eq!(g.remaining(t0), None, "no gap, nothing to count");
+        g.tick(true, GAP, true, t0);
+        assert_eq!(g.remaining(t0), Some(GAP));
+        assert_eq!(g.remaining(at(t0, 4)), Some(Duration::from_secs(6)));
+        assert_eq!(
+            g.remaining(at(t0, 99)),
+            Some(Duration::ZERO),
+            "saturating, not a panic"
+        );
+    }
+
+    /// "Get on with it" drops the hold without advancing, and must
+    /// not let the same still-true `eof` immediately re-gap.
+    #[test]
+    fn cancelling_a_gap_does_not_immediately_re_gap() {
+        let mut g = BetweenTracks::new();
+        let t0 = Instant::now();
+        g.tick(true, GAP, true, t0);
+        g.cancel();
+        assert!(!g.holding());
+        assert_eq!(g.tick(true, GAP, true, t0), None);
     }
 
     fn empty_cache() -> Arc<Mutex<CacheIndex>> {
