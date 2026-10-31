@@ -2032,6 +2032,21 @@ the order below is not a preference, it is a dependency.
       the decomposition started.** down to 4.9k over six slices.
       worth re-measuring rather than trusting, since every feature
       slice adds to it.
+      - [x] **the enrichment warm-up's four flags -> `enrich::Warmup`.**
+        `enrich_probe`, `enrich_job_in_flight`, `suggestions_stale`,
+        `suggestions_open_last_frame`.
+        the win here is not the line count (4836) but that **the one
+        real rule became a method**: at most one job in flight, and
+        only while the menu is open. that was previously spelled out
+        across three separate statements in the loop, and the ordering
+        between them was load-bearing -- the open-edge has to be seen
+        *before* the probe is consumed, or opening the menu fires
+        nothing until some unrelated poke. `should_fetch` holds that
+        ordering in one place.
+        five tests, two of which pin things the loose version could
+        get wrong silently: a second job waiting for the first, and a
+        *failed* send not counting as in-flight (otherwise one dropped
+        channel stops the warm-up forever).
       - [x] **the lyrics pane's four locals -> `LyricsPane`**
         (`src/lyricspane.rs`). the first `struct Ui` slice, and done
         as a **small cohesive group rather than one bag**: a single
