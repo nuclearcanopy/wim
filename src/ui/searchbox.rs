@@ -64,9 +64,13 @@ impl Widget for SearchBox<'_> {
 
         draw_border_label(buf, area, self.label, self.editing, border_color);
 
-        // the left border column always costs one, the right one only
-        // when it's actually drawn.
-        let inner_width = w.saturating_sub(if self.right_border { 2 } else { 1 }) as usize;
+        // the border columns (the left one always, the right one only
+        // when it's drawn) plus a cell of breathing room inside each:
+        // the same inset `draw::framed_inner` gives every other box in
+        // the ui, where the query used to sit flush against the `│`.
+        let text_x = area.x + 2;
+        let borders = if self.right_border { 2 } else { 1 };
+        let inner_width = w.saturating_sub(borders + 2) as usize;
         // the placeholder only makes sense when there's nothing typed
         // *and* nothing being typed; once editing starts on an empty
         // query, the cursor alone is the "you're in here" signal, not
@@ -82,18 +86,19 @@ impl Widget for SearchBox<'_> {
         // the writer returns where it stopped, which is exactly where
         // the cursor belongs; deriving it from a char count instead put
         // the block inside the last glyph for any wide character.
-        let text_end = crate::ui::draw::at(buf, area.x + 1, area.y + 1, &text, color, inner_width);
+        let text_end = crate::ui::draw::at(buf, text_x, area.y + 1, &text, color, inner_width);
 
-        if self.editing {
+        // no room inside at all means no cell the cursor could take
+        // that is not a border; it used to land on the right `│`.
+        if self.editing && inner_width > 0 {
             // never fully invisible: it dims on the off phase instead
             // of disappearing, so "is this box focused" is answerable
             // from any single frame.
-            let cursor_col =
-                (text_end.saturating_sub(area.x + 1) as usize).min(inner_width.saturating_sub(1));
+            let cursor_col = (text_end.saturating_sub(text_x) as usize).min(inner_width - 1);
             let level = if self.cursor_visible { 1.0 } else { 0.45 };
             put(
                 buf,
-                area.x + 1 + cursor_col as u16,
+                text_x + cursor_col as u16,
                 area.y + 1,
                 '█',
                 shade(lerp(NEAR_BLACK, NEAR_WHITE, level)),
@@ -102,9 +107,12 @@ impl Widget for SearchBox<'_> {
     }
 }
 
-/// `┤ label ├` set into the top border, left-aligned after the corner.
-/// Skipped entirely when the box is too narrow to hold it without
-/// eating the whole border, rather than truncating to a fragment.
+/// `┤ label ├` set into the top border, after a `─` lead-in whenever
+/// the box can afford one: `┌┤` butts two line-drawing glyphs straight
+/// against each other, and a dash either side reads as a label set
+/// into the line rather than wedged into the corner. Skipped entirely
+/// when the box is too narrow to hold it without eating the whole
+/// border, rather than truncating to a fragment.
 fn draw_border_label(
     buf: &mut Buffer,
     area: Rect,
@@ -115,25 +123,22 @@ fn draw_border_label(
     if label.is_empty() {
         return;
     }
-    let text: Vec<char> = label.chars().collect();
-    // "┤ " + label + " ├", starting one cell in from the corner.
-    let needed = text.len() + 4;
-    if (needed + 2) > area.width as usize {
+    // "┤ " + label + " ├", measured in cells rather than chars so a
+    // wide-glyph label is sized by what it occupies.
+    let bare = crate::ui::textfit::width(label) + 4;
+    let room = area.width as usize;
+    if bare + 2 > room {
         return;
     }
-    let mut x = area.x + 1;
-    put(buf, x, area.y, '┤', border_color);
-    x += 1;
-    put(buf, x, area.y, ' ', border_color);
-    x += 1;
+    // a spare cell each side of the bare form is what buys the lead-in;
+    // without it the label keeps its old flush-to-the-corner spot
+    // rather than being dropped.
+    let lead = u16::from(bare + 4 <= room);
+    let x = area.x + 1 + lead;
     let label_color = shade(if editing { NEAR_WHITE } else { DIM });
-    for ch in text {
-        put(buf, x, area.y, ch, label_color);
-        x += 1;
-    }
-    put(buf, x, area.y, ' ', border_color);
-    x += 1;
-    put(buf, x, area.y, '├', border_color);
+    let x = crate::ui::draw::at(buf, x, area.y, "┤ ", border_color, 2);
+    let x = crate::ui::draw::at(buf, x, area.y, label, label_color, bare - 4);
+    crate::ui::draw::at(buf, x, area.y, " ├", border_color, 2);
 }
 
 fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: ratatui::style::Color) {
@@ -294,11 +299,120 @@ mod tests {
         );
     }
 
+    /// A cell of breathing room each side, so the tail of the query
+    /// shown is two cells shorter than the box is wide; it used to run
+    /// straight into both `│`.
     #[test]
     fn closed_right_edge_keeps_the_query_inside_the_box() {
         assert_eq!(
             render("abcdefghij", true),
-            ["┌────────┐", "│cdefghij│", "└────────┘"].join("\n")
+            ["┌────────┐", "│.efghij.│", "└────────┘"].join("\n")
         );
+    }
+
+    /// `│bladee` had the query touching the border it was inside, the
+    /// one box in the ui without the inset `draw::framed_inner` gives
+    /// every other.
+    #[test]
+    fn the_query_keeps_a_cell_off_both_borders() {
+        for w in 5..=40u16 {
+            for right in [false, true] {
+                let mut buf = buffer(w, 3);
+                SearchBox {
+                    query: "a query long enough to fill any of these boxes",
+                    editing: true,
+                    label: "search",
+                    cursor_visible: true,
+                    right_border: right,
+                }
+                .render(Rect::new(0, 0, w, 3), &mut buf);
+                let row: Vec<char> = grid(&buf).lines().nth(1).unwrap().chars().collect();
+                assert_eq!(row[1], '.', "{w} cols: text against the left border");
+                let last = w as usize - 1;
+                assert_eq!(
+                    row[if right { last - 1 } else { last }],
+                    '.',
+                    "{w} cols (right_border={right}): text against the right edge"
+                );
+                // and the cursor is one of the cells between them.
+                assert!(
+                    row[2..last].contains(&'█'),
+                    "{w} cols: the cursor is not inside the box: {row:?}"
+                );
+            }
+        }
+    }
+
+    /// `┌┤ search ├` butted the label's own line-drawing glyph against
+    /// the corner's; a dash either side sets it into the border.
+    #[test]
+    fn a_box_with_room_sets_the_label_into_the_line() {
+        for w in 14..=40u16 {
+            let out = render_to_string(
+                SearchBox {
+                    query: "",
+                    editing: false,
+                    label: "search",
+                    cursor_visible: false,
+                    right_border: true,
+                },
+                w,
+                3,
+            );
+            let top = out.lines().next().unwrap();
+            assert!(
+                top.starts_with("┌─┤ search ├"),
+                "{w} cols wedged the label into the corner: {top}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod eyeball {
+    use super::*;
+    use crate::ui::testbuf::{buffer, grid};
+
+    /// Prints the box at the sidebar widths a resize actually produces
+    /// plus the degenerate ones:
+    /// `cargo test --lib ui::searchbox::eyeball -- --nocapture`.
+    /// Asserts the floor too, so it is a test and not just a printer.
+    #[test]
+    fn print_the_box() {
+        for (w, h, query, editing, label, right) in [
+            (28u16, 3u16, "", false, "search", false),
+            (28, 3, "bladee", true, "search", false),
+            (28, 3, "", true, "search", false),
+            (
+                28,
+                3,
+                "a query long enough to scroll past the box",
+                true,
+                "search",
+                false,
+            ),
+            (24, 3, "", false, "filter songs", true),
+            (18, 3, "", false, "filter songs", true),
+            (12, 3, "", false, "filter songs", true),
+            (6, 3, "ab", true, "search", true),
+            (28, 5, "bladee", false, "search", true),
+        ] {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = buffer(w, h);
+            SearchBox {
+                query,
+                editing,
+                label,
+                cursor_visible: true,
+                right_border: right,
+            }
+            .render(area, &mut buf);
+            let text = grid(&buf);
+            println!("--- {w}x{h} {label:?} query={query:?} editing={editing}\n{text}");
+            assert!(
+                text.chars().any(|c| c != '.' && c != '\n'),
+                "{w}x{h} drew nothing at all"
+            );
+        }
     }
 }

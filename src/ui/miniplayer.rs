@@ -3,9 +3,9 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
 use crate::keymap::{key_label, KeyAction, Keymap};
-use crate::theme::{shade, NEAR_BLACK, NEAR_WHITE};
+use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::controlsbar::{GLYPH_PAUSE, GLYPH_PLAY};
-use crate::ui::textfit::truncate_with_ellipsis;
+use crate::ui::textfit::{truncate_with_ellipsis, width as text_width};
 
 /// Thin ipod-style strip above the main bottom bar, spanning only
 /// `main_content`'s width (not the sidebar): shows while the full
@@ -28,26 +28,36 @@ pub struct MiniPlayerBar<'a> {
 /// progress bars on screen at once read as two players.
 pub const HEIGHT: u16 = 2;
 
+/// Cells the title keeps for itself before the key hints are allowed
+/// any of the row at all. Below this the hints are dropped whole
+/// rather than cut: half a hint ("(space: paus…") answers nothing, and
+/// the one thing the strip exists to say is what is playing.
+const TITLE_FLOOR: u16 = 18;
+
 impl Widget for MiniPlayerBar<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 {
+        if area.height == 0 || area.width == 0 {
             return;
         }
-        let width = area.width as usize;
 
-        // a rule of its own, not just relying on the text above it
-        // being a different brightness, so the strip reads as its own
-        // separated panel rather than text that happens to float above
-        // the bottom bar.
-        for col in 0..area.width {
-            if let Some(cell) = buf.cell_mut((area.x + col, area.y)) {
-                cell.set_char('─');
-                cell.set_fg(shade(NEAR_BLACK));
+        // squeezed to one row, that row goes to the title: the rule is
+        // decoration and the title is the information, and a lone rule
+        // said nothing about what was playing.
+        let text_y = if area.height == 1 {
+            area.y
+        } else {
+            // a rule of its own, not just relying on the text below it
+            // being a different brightness, so the strip reads as its
+            // own separated panel rather than text that happens to
+            // float above the bottom bar.
+            for col in 0..area.width {
+                if let Some(cell) = buf.cell_mut((area.x + col, area.y)) {
+                    cell.set_char('─');
+                    cell.set_fg(shade(NEAR_BLACK));
+                }
             }
-        }
-        if area.height == 1 {
-            return;
-        }
+            area.y + 1
+        };
 
         // the bar's own curated alphabet, not the emoji-presentation
         // pair this used to draw (U+23F8, U+25B6). a terminal with an
@@ -55,35 +65,140 @@ impl Widget for MiniPlayerBar<'_> {
         // neither of which `unicode-width` models: it calls both one
         // cell, so no width assertion can catch them. using the
         // alphabet is the guard, which is why the alphabet exists.
-        let state = if self.paused {
-            GLYPH_PAUSE.to_string()
-        } else {
-            GLYPH_PLAY.to_string()
-        };
-        let line1 = format!(
-            "{state} {} ({}: pause, {}: maximize)",
-            self.title,
+        let state = if self.paused { GLYPH_PAUSE } else { GLYPH_PLAY };
+        let hints = format!(
+            "({}: pause, {}: maximize)",
             key_label(self.keymap.get(KeyAction::TogglePause)),
             key_label(self.keymap.get(KeyAction::ToggleMinimize)),
         );
-        draw_line(
-            buf,
-            area,
-            area.y + 1,
-            &truncate_with_ellipsis(&line1, width),
-            shade(NEAR_WHITE),
-        );
-    }
-}
+        let hint_cells = text_width(&hints) as u16;
 
-fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
-    crate::ui::draw::line(buf, area, y, text, color);
+        // hints against the right edge, title against the left, so the
+        // strip reads as a bar with two ends instead of one sentence
+        // huddled left of 29 dead columns.
+        let hints_fit = area.width >= hint_cells + TITLE_FLOOR;
+        let title_budget = if hints_fit {
+            // a cell of clearance so a long title never touches the
+            // opening paren.
+            area.width - hint_cells - 1
+        } else {
+            area.width
+        } as usize;
+
+        // three tiers down from the glyph: it is the state, the title
+        // is the headline, the hints are chrome. one flat NEAR_WHITE
+        // across all three read as an undifferentiated sentence.
+        let x = crate::ui::draw::at(
+            buf,
+            area.x,
+            text_y,
+            &format!("{state} "),
+            shade(BRIGHT),
+            title_budget,
+        );
+        let left = (x - area.x) as usize;
+        let room = title_budget.saturating_sub(left);
+        crate::ui::draw::at(
+            buf,
+            x,
+            text_y,
+            &truncate_with_ellipsis(self.title, room),
+            shade(NEAR_WHITE),
+            room,
+        );
+        if hints_fit {
+            crate::ui::draw::at(
+                buf,
+                area.x + area.width - hint_cells,
+                text_y,
+                &hints,
+                shade(DIM),
+                hint_cells as usize,
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::testbuf::{buffer, grid};
     use crossterm::event::KeyCode;
+
+    fn strip(w: u16, h: u16, title: &str) -> Buffer {
+        let keymap = Keymap::default();
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = buffer(w, h);
+        MiniPlayerBar {
+            title,
+            paused: false,
+            keymap: &keymap,
+        }
+        .render(area, &mut buf);
+        buf
+    }
+
+    /// The strip used to be one left-aligned sentence, so a 72-cell
+    /// row was title, hints, then 29 dead columns. The hints are the
+    /// right end of a bar now.
+    #[test]
+    fn the_hints_end_on_the_right_edge() {
+        for w in [48u16, 60, 72, 120] {
+            let row = grid(&strip(w, HEIGHT, "Crest · Bladee"))
+                .lines()
+                .nth(1)
+                .unwrap()
+                .to_string();
+            assert!(
+                row.ends_with("maximize)"),
+                "{w} cols left the hints floating mid-row: {row:?}"
+            );
+        }
+    }
+
+    /// Cut to fit, the hints became "(space: paus…" while the title
+    /// beside them still had room: a half-hint answers nothing, so
+    /// they go whole or not at all and the title takes the row.
+    #[test]
+    fn a_hint_too_wide_for_the_row_is_dropped_whole_not_cut() {
+        for w in 1..=90u16 {
+            let buf = strip(w, HEIGHT, "Crest · Bladee");
+            let row = grid(&buf).lines().nth(1).unwrap().to_string();
+            assert_eq!(
+                row.contains('('),
+                row.contains(')'),
+                "{w} cols painted half a hint: {row:?}"
+            );
+            // and the title never loses the row to them.
+            assert!(
+                row.starts_with(GLYPH_PLAY),
+                "{w} cols dropped the state glyph: {row:?}"
+            );
+        }
+    }
+
+    /// One row is all the strip gets on a short terminal; it used to
+    /// spend it on the rule and say nothing about what was playing.
+    #[test]
+    fn a_single_row_strip_spends_it_on_the_title_not_the_rule() {
+        let row = grid(&strip(60, 1, "Crest · Bladee"));
+        assert!(row.contains("Crest · Bladee"), "{row:?}");
+        assert!(!row.contains('─'), "the rule ate the only row: {row:?}");
+    }
+
+    /// Hierarchy, not decoration: state, then headline, then chrome.
+    /// One flat NEAR_WHITE across all three read as a sentence.
+    #[test]
+    fn the_glyph_the_title_and_the_hints_are_three_brightnesses() {
+        let buf = strip(72, HEIGHT, "Crest · Bladee");
+        let fg = |x: u16| buf.cell((x, 1)).unwrap().fg;
+        assert_eq!(fg(0), shade(BRIGHT), "the state glyph");
+        assert_eq!(fg(2), shade(NEAR_WHITE), "the title");
+        assert_eq!(fg(71), shade(DIM), "the hints");
+        const {
+            assert!(DIM < NEAR_WHITE && NEAR_BLACK < DIM);
+        }
+    }
 
     #[test]
     fn the_hints_follow_the_live_keymap() {
@@ -169,6 +284,49 @@ mod tests {
             assert!(
                 row.contains(want),
                 "paused={paused} should use the shared alphabet's {want:?}: {row:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod eyeball {
+    use super::*;
+    use crate::ui::testbuf::{buffer, grid};
+
+    /// Prints the strip at the widths main_content actually takes,
+    /// including the narrow ones a wide sidebar leaves:
+    /// `cargo test --lib ui::miniplayer::eyeball -- --nocapture`.
+    /// Asserts the floor too, so it is a test and not just a printer.
+    #[test]
+    fn print_the_strip() {
+        let keymap = Keymap::default();
+        for (w, h, title) in [
+            (72u16, HEIGHT, "Crest · Bladee"),
+            (48, HEIGHT, "Crest · Bladee"),
+            (30, HEIGHT, "Crest · Bladee"),
+            (18, HEIGHT, "Crest · Bladee"),
+            (8, HEIGHT, "Crest · Bladee"),
+            (72, 1, "Crest · Bladee"),
+            (
+                72,
+                HEIGHT,
+                "A Very Long Track Title That Will Not Fit · Some Artist",
+            ),
+        ] {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = buffer(w, h);
+            MiniPlayerBar {
+                title,
+                paused: false,
+                keymap: &keymap,
+            }
+            .render(area, &mut buf);
+            let text = grid(&buf);
+            println!("--- {w}x{h} {title:?}\n{text}");
+            assert!(
+                text.chars().any(|c| c != '.' && c != '\n'),
+                "{w}x{h} drew nothing at all"
             );
         }
     }

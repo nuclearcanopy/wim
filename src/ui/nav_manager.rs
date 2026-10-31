@@ -140,7 +140,9 @@ mod tests {
 
     const SNAPSHOT: [&str; 10] = [
         "┌────────────────────────────────────────────────────┐",
-        "│ navidrome profiles │ enter: reconnect/add, d d: r… │",
+        // "d d: r…" is one cell of action (remove? rename?), so it
+        // drops back to the whole hint before it (ui::header).
+        "│ navidrome profiles │ enter: reconnect/add…         │",
         "│ ───────────────────┴────────────────────────────── │",
         "│                                                    │",
         "│ (no profiles yet)                                  │",
