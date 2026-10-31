@@ -1318,27 +1318,55 @@ do the wrong thing quietly, which is worse to diagnose.
       key. `undo_menu_open` is in `overlay` but has no `Tiers` entry,
       so with the undo tree drawn over the workspace a click or wheel
       notch resolves against the pane behind it.
-- [ ] **`core.rs` 2508/2780: `Op::Remember` never seeds
-      `overridden`,** which is written in exactly one place
-      (`core.rs` ~3063). at volume 80, `: remember(album, volume(25%))`
-      then `: skip()` onto another album: `settle` sees
-      `active == None` and restores nothing, so you stay at 25 for the
-      session, contradicting the documented rule.
-      **worse, `identity_settings` captures `current_volume` at a
-      track boundary**, i.e. mid crossfade fade-out, so with
-      `crossfade()` on the restore point is `Some(0.0)` and the next
-      unbound track is silently muted until you type `volume(50%)`.
-      same root cause at `core.rs` ~2072: `: volume(+10%)` in the last
-      three seconds of a track gives you 10, not 90, and that becomes
-      `base_volume`.
-- [ ] **`core.rs` ~154: `BetweenTracks::step` never retries a lost
-      keep-open write.** it does `let _ = player.set_keep_open(..)`
-      and then sets `self.keep_open` unconditionally, while the write
-      is gated on the field differing. with a gap configured and one
-      failed ipc write of `false`, mpv stays on `keep-open=always` and
-      never goes idle, which kills `PROP_IDLE_ACTIVE` and with it
-      end-of-playlist and loop-all handling for the rest of the
-      session.
+- [x] **a restore point taken mid fade-out muted the next track.**
+      `identity_settings` stores what it is handed as the level to
+      restore to when a binding stops applying, and `track_started`
+      handed it `current_volume(core.player)`. that runs at a track
+      boundary, i.e. mid crossfade fade-out, so a bound track captured
+      something near zero and **the next unbound track was restored to
+      that**: silent until you typed `volume(50%)`. same root cause at
+      `Op::SetVolume`, where a relative nudge measured against the live
+      reading made `: volume(+10%)` in the last seconds of a track give
+      10 instead of 90, and that became the new `base_volume`.
+      both sites take `*core.base_volume` now, which *is* the chosen
+      level by construction (every `SetVolume` writes it, and the code
+      already called it "the ceiling the crossfade and fade ramps scale
+      against"). the live reading survives in exactly one place,
+      `Op::Fade`'s starting point, where it is correct.
+      `identity_settings` had **no tests at all**; it has a module of
+      its own now rather than joining an existing one (see the accreted
+      -test-module item). the behavioural test is the two-track
+      sequence, because that is the only shape the bug appears in: a
+      single bound track looks fine, and it is the *next* one that goes
+      quiet. it keys the binding through `identity_of` so a change to
+      how a track identity is spelled cannot silently unbind it and
+      leave the test passing for nothing.
+      the call site itself needs a live mpv, so the guard on it reads
+      the source. **the first draft of that guard was worthless**: it
+      checked only the argument list, and the mutation that moved the
+      transient one line up into the local it reads passed happily. it
+      checks the whole function body now, and catches it.
+- [ ] **`Op::Remember` still never seeds `overridden`** (`core.rs`
+      2508/2780 against the single writer at ~3063). at volume 80,
+      `: remember(album, volume(25%))` then `: skip()` onto another
+      album: `settle` sees `active == None` and restores nothing, so
+      you stay at 25 for the session, contradicting the documented
+      rule. separate from the fix above, which was about *what* gets
+      captured rather than whether anything is.
+- [x] **`BetweenTracks::step` never retried a lost keep-open write.**
+      it did `let _ = player.set_keep_open(..)` and then set
+      `self.keep_open` unconditionally, while the write is gated on the
+      field differing. the field *is* "what mpv has been told", so
+      recording a failed write means it is never retried: one dropped
+      ipc message of `false` left `keep-open` pinned on, mpv never went
+      idle, and `idle-active` going quiet took end-of-playlist and
+      loop-all with it for the rest of the session.
+      the write needs a live mpv, so the memo rule is split into
+      `needs_keep_open` / `keep_open_written` and tested on its own;
+      `step` is three lines around them. the test covers both
+      directions, because the one that pins keep-open *on* is turning
+      it back off. mutation-checked by recording the write
+      unconditionally again.
 - [ ] **`core.rs` ~1101 and ~1539, `undo.rs` 61/95: four smaller
       ones.** `enqueue_track` moves the entry in `entries` and *then*
       does `let _ = player.playlist_move(..)`, so a failed move
