@@ -5,12 +5,56 @@
 //! state mutations. The per-op application table lives there, next to
 //! `dispatch_action`.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::search::Corpus;
-use crate::shellsong::{Candidates, Level, Pos};
+use crate::shellsong::{Candidates, Level, Pos, Scope};
 use crate::subsonic::Client;
+
+// -------------------------------------------------------- variables
+
+/// Where `let name = [...]` lives: one toml map, not a file each.
+/// `queues.rs` gives a saved queue its own document because an entry
+/// carries server credentials and a title; a variable is a handful of
+/// short strings, and the whole set is read on startup and written on
+/// every change, so one file is one read.
+const VARS_FILE: &str = "vars.toml";
+
+fn vars_path() -> Option<PathBuf> {
+    crate::shellsong::state_path(VARS_FILE)
+}
+
+/// Best-effort, the same leniency the history and rank files take: an
+/// unreadable state dir costs you your variables, not your session.
+pub fn load_vars() -> Scope {
+    vars_path().map(|p| read_vars(&p)).unwrap_or_default()
+}
+
+pub fn save_vars(scope: &Scope) {
+    if let Some(path) = vars_path() {
+        write_vars(&path, scope);
+    }
+}
+
+/// Split from `load_vars` so a test can point it at a temp file; the
+/// path resolution is the only part that is not testable.
+fn read_vars(path: &Path) -> Scope {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| toml::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn write_vars(path: &Path, scope: &Scope) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(body) = toml::to_string_pretty(scope) {
+        let _ = std::fs::write(path, body);
+    }
+}
 
 // ------------------------------------------------------- completion
 
@@ -27,6 +71,9 @@ pub struct CorpusCandidates<'a> {
     /// The user's saved eq curve names, so `eq()` completes to them as
     /// well as to the built-ins.
     pub eq_presets: Vec<String>,
+    /// The live variables: what a submitted line is expanded against,
+    /// and what the variable-name parameters complete from.
+    pub vars: &'a Scope,
 }
 
 /// Matches offered per keystroke. `Console` caps the list again at its
@@ -52,6 +99,10 @@ impl Candidates for CorpusCandidates<'_> {
 
     fn eq_presets(&self) -> Vec<String> {
         self.eq_presets.clone()
+    }
+
+    fn scope(&self) -> &Scope {
+        self.vars
     }
 }
 
@@ -220,8 +271,55 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
 
+    /// Borrowed rather than built per call site: `CorpusCandidates`
+    /// holds a `&Scope`, so a temporary would not outlive the literal.
+    fn no_vars() -> &'static Scope {
+        static EMPTY: std::sync::LazyLock<Scope> = std::sync::LazyLock::new(Scope::default);
+        &EMPTY
+    }
+
     fn secs(s: u64) -> Duration {
         Duration::from_secs(s)
+    }
+
+    // ----------------------------------------------------- variables
+
+    /// A temp path per run, the same way `persistence.rs`'s test does
+    /// it: the real `vars_path` is not injectable, so only the reader
+    /// and the writer are exercised here.
+    fn temp_vars_path(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("wim-vars-{tag}-{nanos}.toml"))
+    }
+
+    #[test]
+    fn variables_round_trip_through_the_state_file() {
+        let path = temp_vars_path("round-trip");
+        let mut scope = Scope::default();
+        scope.define(
+            "bladee_classics",
+            vec!["crest".into(), "icedancer".into(), "gods".into()],
+        );
+        scope.define("quiet", vec!["mazzy star".into()]);
+        write_vars(&path, &scope);
+        let back = read_vars(&path);
+        assert_eq!(back, scope);
+        assert_eq!(back.names(), vec!["bladee_classics", "quiet"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_vars_file_reads_as_no_variables() {
+        // best-effort, like the history file: an unreadable state dir
+        // costs you your variables, not your session.
+        assert!(read_vars(Path::new("/nonexistent/wim/vars.toml")).is_empty());
+        let path = temp_vars_path("corrupt");
+        std::fs::write(&path, "this is not toml [[[").expect("temp write");
+        assert!(read_vars(&path).is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 
     fn millis(ms: u64) -> Duration {
@@ -309,6 +407,7 @@ mod tests {
             corpus: &corpus,
             saved: &[],
             eq_presets: Vec::new(),
+            vars: no_vars(),
         };
         let got = cand.corpus("flat");
         // the bare title, not "flatline · bladee": a decorated label
@@ -331,6 +430,7 @@ mod tests {
             corpus: &corpus,
             saved: &[],
             eq_presets: Vec::new(),
+            vars: no_vars(),
         };
         assert_eq!(cand.corpus("hex"), vec!["hex".to_string()]);
     }
@@ -352,6 +452,7 @@ mod tests {
             corpus: &corpus,
             saved: &[],
             eq_presets: Vec::new(),
+            vars: no_vars(),
         };
         assert_eq!(cand.corpus("same"), vec!["same title".to_string()]);
     }
@@ -363,6 +464,7 @@ mod tests {
             corpus: &corpus,
             saved: &[],
             eq_presets: Vec::new(),
+            vars: no_vars(),
         };
         assert!(cand.corpus("").is_empty());
     }
@@ -375,6 +477,7 @@ mod tests {
             corpus: &corpus,
             saved: &saved,
             eq_presets: Vec::new(),
+            vars: no_vars(),
         };
         assert_eq!(cand.saved_queues(), saved);
     }
@@ -540,6 +643,7 @@ mod tests {
                 corpus: &corpus,
                 saved: &saved,
                 eq_presets: Vec::new(),
+                vars: no_vars(),
             };
             for line in ["play(blade r", "queue([bladee, obedient])", "volume(50%)"] {
                 let iters = if size >= 30_000 { 10u32 } else { 25 };

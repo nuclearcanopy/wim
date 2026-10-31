@@ -23,7 +23,9 @@ should be added that breaks one.
 
 - **r1. everything is a call.** no prefixes, no suffixes that carry
   behaviour, no bare words. repetition is `repeat(n, call)`; a dry run
-  is `dry(call)`.
+  is `dry(call)`. the one surface exception is `let name = [a, b]`,
+  which is sugar for `define(name, [a, b])` in the r6 sense and lowers
+  to it; see "variables".
 - **r2. a bare number means exactly one thing per parameter.**
   `speed(1.5)` is a multiplier, `volume(50%)` a level, `moveto(10s)` a
   position. `skip(2)` is refused: it is ambiguous between "skip twice"
@@ -49,9 +51,14 @@ should be added that breaks one.
   name for something a first name already does. every screen is a
   `view` target rather than its own verb.
 - **r11. omitting the terms means the current selection.** uniformly,
-  for every command that takes them: `star()` stars what is
+  for every command that *operates on* them: `star()` stars what is
   highlighted, `star(flatline)` stars what that finds. one meaning
   ("operate on terms, defaulting to the selection"), one code path.
+  `view(q, ...)` and `define` are the two exceptions, and both are
+  exceptions because their terms are not an operand: `q` means "search
+  for this", and `define` *stores* terms, where the selection (a
+  resolved row) is not a term at all. a test drives this off the table
+  and names both.
 - **r12. completion is driven by the declared parameter type.** a
   parameter either has a candidate list worth inserting or it has none
   and gets a hint. nothing is ever guessed.
@@ -61,7 +68,8 @@ should be added that breaks one.
 ```
 program    := statement (separator statement)*
 separator  := ';' | newline
-statement  := call
+statement  := call | binding
+binding    := 'let' name '=' terms
 call       := name '(' args? ')'
 args       := arg (',' arg)*
 arg        := call | list | keyword '=' value | value
@@ -74,6 +82,12 @@ comment    := '#' ... end of line
 - a call may span lines; splitting is nesting-aware.
 - a trailing comma is allowed in a list and in an argument list.
 - quotes are only needed for an item containing a literal comma.
+- `binding` is the only statement that is not a call, and it is pure
+  sugar: it is parsed straight into `define(name, terms)` through
+  `define`'s own parameters, so the typechecking, the error messages
+  and the variable expansion are all the canonical call's. `dry` takes
+  a *call*, so `dry(define(mix, [hex]))` is how you preview one;
+  `dry(let ...)` is an error rather than a second grammar for `dry`.
 - `q` is deliberately not an alias for anything at statement level: it
   is ambiguous between `queue` and `quit`, so neither claims it. it
   *is* the keyword that switches `view` into its search form, where
@@ -88,10 +102,11 @@ messages come from, and (r12) what completion offers.
 
 | type | accepts | completes from |
 | --- | --- | --- |
-| `terms` | a term, or `[a, b, c]` (r4, r5) | the local corpus |
+| `terms` | a term, or `[a, b, c]` (r4, r5) | the variables, then the local corpus |
 | `query` | free text to search for | the local corpus |
 | `new_name` | a name you are inventing | nothing; hint only |
 | `saved_name` | the name of a saved queue | the saved queues |
+| `var_name` | a variable name | the defined variables |
 | `command_name` | a command name | the command table |
 | `call` | a nested call | the command table |
 | keyword sets | one of an enumerated list | that list |
@@ -241,6 +256,7 @@ view(q, terms)     search, and open the best match's page
 | `index` | the corpus breakdown, listed | |
 | `history` | past shellsong commands, listed | |
 | `playlists` | saved queues, listed | |
+| `vars` | the defined variables, listed | `variables` |
 | `eq` | the eq menu | `equalizer` |
 | `help` | the command listing | |
 
@@ -248,8 +264,8 @@ an unknown target is matched against this list and suggests the closest
 real one; `view()` with nothing at all lists them.
 
 the screens take over the display and close the console behind them;
-the five listings (`queue`, `index`, `history`, `playlists`, `help`)
-print into the scrollback and leave it open. `view` means "put this on
+the six listings (`queue`, `index`, `history`, `playlists`, `vars`,
+`help`) print into the scrollback and leave it open. `view` means "put this on
 screen" either way, and a listing satisfies that; there is deliberately
 no second verb for the distinction.
 
@@ -337,6 +353,72 @@ download(terms?)        download for offline playback          [dl, offline, cac
 r10 does not allow; `front` is the capability `queue` genuinely lacks,
 so that is all the command is for. `add_to_queue(flatline)` is an error
 pointing at `queue(flatline)` or at a position.
+
+### variables
+
+a name for a list of track references, so a set of songs you keep
+coming back to is one word.
+
+```
+: let bladee_classics = [crest, icedancer, gods]
+: play(bladee_classics)
+: queue(bladee_classics)
+: view(vars)
+: unset(bladee_classics)
+```
+
+```
+define(name, terms)     bind a name to a list of terms
+unset(name)             drop a variable
+```
+
+**a variable stores the terms, not the tracks they resolve to.** that
+is the deliberate choice, and it is the whole point: `bladee_classics`
+is a vibe, so a track that joins the library later joins the variable
+too, and a term that stops matching reports itself the usual way (see
+"a term that matches nothing"). the frozen reading already exists and
+is spelled `save_queue(name)`, which stores resolved entries with their
+server ids; having both is one meaning each rather than one name with
+two behaviours.
+
+**`let` is a second statement form, and it is sugar.** r1 says
+everything is a call, so `define(name, terms)` is canonical and
+`let name = [a, b]` is parsed straight into it. that is the same deal
+r6 strikes for `queue_aa`: a shorter spelling that lowers to the long
+one, with `dry` printing the long one so you can check. it earns the
+exception because the maintainer's own example is written that way and
+because an assignment is the one thing every reader already knows how
+to spell. nothing else is getting a non-call form.
+
+**where a variable expands.** anywhere a `terms` parameter is accepted,
+which is every searching command, because expansion happens in the one
+place that parses a `terms` argument rather than per command. so it
+composes with lists, with the kind ladder and with `dry`:
+
+```
+: queue([hex, bladee_classics])
+: star_aa(bladee_classics)
+: dry(play(bladee_classics))
+would run: play([crest, icedancer, gods])
+```
+
+**a bare name that is not a variable is still a search term.** there is
+no sigil, because r1 allows no prefixes; the cost is that defining a
+variable named after a song shadows that song in a terms slot. three
+things keep that honest: a variable name must be lowercase snake_case
+(so it does not look like `4 star crest` or `Icedancer`), a name that
+collides with a command is refused outright, and `dry()` always shows
+which reading you got.
+
+**expansion is not recursive.** a `terms` argument expands when it is
+*written*, `define`'s included, so `let b = [a, gods]` stores whatever
+`a` held at that moment. composing variables therefore snapshots the
+components, there is no cycle to detect and no depth to bound, and the
+terms themselves stay terms and are still re-resolved against the
+library on every use.
+
+`view(vars)` prints one `let` line per variable, which means the
+listing is also valid input: paste it back in, or into a `.shg` file.
 
 ### selection
 
@@ -518,11 +600,19 @@ terminal.
 
 deliberately not built, so they do not creep in later:
 
-- variables, conditionals, loops, user-defined functions, pipelines.
+- conditionals, loops, user-defined functions, pipelines.
 
 this is a command language for a music player, not a general-purpose
-shell. statement sequencing plus `repeat` and `dry` covers the real
-use cases; anything more is scope that will rot.
+shell. statement sequencing plus `repeat`, `dry` and named lists of
+terms covers the real use cases; anything more is scope that will rot.
+
+variables used to be on this list. they came off it deliberately,
+because a name for a set of songs is a *listening* feature rather than
+a programming one, and because the shape it took (a name expanding to
+terms, at parse time, through the existing `terms` parameter type) adds
+no control flow and no second interpreter. conditionals stay off: a
+rules engine is a programmer's idea of a feature, and the queue
+timeline covers the real cases without one.
 
 ## how it runs
 
@@ -574,8 +664,17 @@ Console::cycle(&self) -> Option<&Cycle>
 // suggestion.
 
 Program::parse(input: &str) -> Result<Program, ParseError>
+Program::parse_in(input: &str, scope: &Scope)
+    -> Result<Program, ParseError>     // expands variables
 Program::step(&mut self, env: &Env) -> Step
 Program::is_done(&self) -> bool
+
+Scope::define(&mut self, name: &str, terms: Vec<String>) -> bool
+Scope::remove(&mut self, name: &str) -> bool
+Scope::get(&self, name: &str) -> Option<&[String]>
+Scope::names(&self) -> Vec<&str>        // alphabetical
+Scope::lines(&self) -> Vec<String>      // what view(vars) prints
+Scope::is_empty(&self) -> bool
 
 Op::describe(&self) -> String           // the one scrollback line (r9)
 Op::closes_console(&self) -> bool
@@ -586,6 +685,8 @@ help_lines() -> Vec<String>              // what view(help) prints
 trait Candidates {
     fn corpus(&self, token: &str) -> Vec<String>;
     fn saved_queues(&self) -> Vec<String> { Vec::new() }
+    fn eq_presets(&self) -> Vec<String> { Vec::new() }
+    fn scope(&self) -> &Scope;          // defaults to an empty one
 }
 ```
 
@@ -715,7 +816,14 @@ error beats a silent no-op:
 $XDG_STATE_HOME/wim/shellsong_history   the command history
 $XDG_STATE_HOME/wim/shellsong_ranks     the completion frequency store
 $XDG_STATE_HOME/wim/queues/<name>.toml  one saved queue each
+$XDG_STATE_HOME/wim/vars.toml           every variable, in one map
 ```
+
+the variables are one file rather than a file each, unlike the saved
+queues: a queue entry carries a server url, a song id and a title, so
+it is a document; a variable is a name and a handful of short strings,
+and the whole set is read once at startup and rewritten on every
+change, so one file is one read.
 
 a saved queue stores more than a path per entry: a remote song keeps
 its server url plus the server-side song id and is re-bound to a live
