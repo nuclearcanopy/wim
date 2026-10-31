@@ -175,7 +175,10 @@ fn is_starred(track: &SearchItem, favorites: &Favorites, remote_starred: &HashSe
             favorites.is_starred(&path.to_string_lossy())
         }
         SearchItem::Song { id, .. } => remote_starred.contains(id),
-        SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => false,
+        SearchItem::Silence { .. }
+        | SearchItem::Artist { .. }
+        | SearchItem::Album { .. }
+        | SearchItem::Playlist { .. } => false,
     }
 }
 

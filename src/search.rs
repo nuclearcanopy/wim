@@ -82,6 +82,25 @@ pub enum SearchItem {
         path: PathBuf,
         title: String,
     },
+    /// A timed silence in the queue: the maintainer's "let me put a 15m
+    /// pause in my queue and it'll just take that into account".
+    ///
+    /// A real entry rather than a flag beside the queue, because
+    /// `PlayQueue`'s invariant is that `entries` *is* mpv's playlist,
+    /// and mpv will load `av://lavfi:anullsrc=d=N` as a file like any
+    /// other. So every absolute-index path, the queue view, reordering,
+    /// removal and the desync guards all keep working with no notion of
+    /// this variant at all.
+    ///
+    /// It is deliberately a variant and not a `LocalMusic` with an
+    /// `av://` path, which would have cost no match arms: the sites
+    /// that must treat it differently are scrobbling, starring,
+    /// downloading and cover art, and each of those would have
+    /// silently done the wrong thing (a silence scrobbled to
+    /// listenbrainz) instead of failing to compile.
+    Silence {
+        secs: u64,
+    },
     // every remote variant carries the client it came from; with
     // multiple navidrome servers merged into one corpus and no "active
     // server" concept, this is the only way playback later knows which
@@ -136,6 +155,10 @@ impl SearchItem {
                 ..
             } => format!("{title} {artist} {album}"),
             SearchItem::Playlist { name, .. } => name.clone(),
+            // never in the corpus, so never scored; answered rather
+            // than left unreachable because a silence does have a
+            // name and this is where names live.
+            SearchItem::Silence { .. } => "silence".to_string(),
         }
     }
 
@@ -151,7 +174,9 @@ impl SearchItem {
             SearchItem::Album { id, .. } => Some((1, id.as_str())),
             SearchItem::Song { id, .. } => Some((2, id.as_str())),
             SearchItem::Playlist { id, .. } => Some((3, id.as_str())),
-            SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => None,
+            SearchItem::LocalMusic { .. }
+            | SearchItem::LocalVideo { .. }
+            | SearchItem::Silence { .. } => None,
         }
     }
 
@@ -169,6 +194,10 @@ impl SearchItem {
             SearchItem::Playlist { id, .. } => (3, Cow::Borrowed(id)),
             SearchItem::LocalMusic { path, .. } => (4, path.to_string_lossy()),
             SearchItem::LocalVideo { path, .. } => (5, path.to_string_lossy()),
+            // the duration is the identity: two silences of different
+            // lengths are different entries, and two of the same
+            // length are interchangeable.
+            SearchItem::Silence { secs } => (6, Cow::Owned(secs.to_string())),
         }
     }
 
@@ -185,6 +214,10 @@ impl SearchItem {
             SearchItem::Artist { name, .. }
             | SearchItem::Album { name, .. }
             | SearchItem::Playlist { name, .. } => name,
+            // bare on purpose: the duration is decoration and belongs
+            // in `results_list::label`, which is also the only form
+            // that can own a formatted string.
+            SearchItem::Silence { .. } => "silence",
         }
     }
 
@@ -199,6 +232,12 @@ impl SearchItem {
             SearchItem::LocalMusic { .. } | SearchItem::Song { .. } => Category::Songs,
             SearchItem::LocalVideo { .. } => Category::Videos,
             SearchItem::Playlist { .. } => Category::Playlists,
+            // unreachable: a silence is built into a queue, never
+            // added to the corpus, so it is never sectioned. songs
+            // rather than a new `Category` variant, which would add
+            // an empty heading to every sidebar for a row that cannot
+            // appear in it.
+            SearchItem::Silence { .. } => Category::Songs,
         }
     }
 
@@ -210,7 +249,9 @@ impl SearchItem {
             | SearchItem::Album { client, .. }
             | SearchItem::Song { client, .. }
             | SearchItem::Playlist { client, .. } => Some(client.base_url()),
-            SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => None,
+            SearchItem::LocalMusic { .. }
+            | SearchItem::LocalVideo { .. }
+            | SearchItem::Silence { .. } => None,
         }
     }
 
@@ -222,7 +263,9 @@ impl SearchItem {
             | SearchItem::Album { client, .. }
             | SearchItem::Song { client, .. }
             | SearchItem::Playlist { client, .. } => Some(client),
-            SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => None,
+            SearchItem::LocalMusic { .. }
+            | SearchItem::LocalVideo { .. }
+            | SearchItem::Silence { .. } => None,
         }
     }
 }

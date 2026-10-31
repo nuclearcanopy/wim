@@ -570,6 +570,9 @@ impl Catalog {
 
     fn ingest_item(&mut self, item: &SearchItem) {
         match item {
+            // never in the corpus, so never ingested; it has no
+            // artist or album to learn anything from either.
+            SearchItem::Silence { .. } => {}
             SearchItem::Artist { id, name, .. } => {
                 let slot = self.artist_slot(Some(id), name);
                 let artist = &mut self.artists[slot];

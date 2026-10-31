@@ -185,6 +185,11 @@ pub fn identity_of(item: &SearchItem) -> Identity {
         SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => {
             (String::new(), None, None)
         }
+        // a silence *does* reach the queue, unlike the three above, and
+        // deliberately has no identity: `key("")` is `None`, so every
+        // tier refuses and no per-identity eq or volume fires when one
+        // starts. a silence must not change how the next track sounds.
+        SearchItem::Silence { .. } => (String::new(), None, None),
     };
     let artist = artist.and_then(|a| key(&a));
     Identity {
