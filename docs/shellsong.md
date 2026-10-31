@@ -110,6 +110,7 @@ messages come from, and (r12) what completion offers.
 | `saved_name` | the name of a saved queue | the saved queues |
 | `var_name` | a variable name | the defined variables |
 | `script_name` | a `.shg` script, or a path to one | the scripts in the config dir |
+| `setting_call` | a call that *is* a setting | `eq` / `volume` / `speed` |
 | `command_name` | a command name | the command table |
 | `call` | a nested call | the command table |
 | keyword sets | one of an enumerated list | that list |
@@ -260,6 +261,7 @@ view(q, terms)     search, and open the best match's page
 | `history` | past shellsong commands, listed | |
 | `playlists` | saved queues, listed | |
 | `vars` | the defined variables, listed | `variables` |
+| `bindings` | the per-identity settings, listed | |
 | `eq` | the eq menu | `equalizer` |
 | `help` | the command listing | |
 
@@ -267,8 +269,8 @@ an unknown target is matched against this list and suggests the closest
 real one; `view()` with nothing at all lists them.
 
 the screens take over the display and close the console behind them;
-the six listings (`queue`, `index`, `history`, `playlists`, `vars`,
-`help`) print into the scrollback and leave it open. `view` means "put this on
+the seven listings (`queue`, `index`, `history`, `playlists`, `vars`,
+`bindings`, `help`) print into the scrollback and leave it open. `view` means "put this on
 screen" either way, and a listing satisfies that; there is deliberately
 no second verb for the distinction.
 
@@ -456,6 +458,84 @@ dead: the last `crossfade_seconds` of the wait fade the volume down,
 then it pauses and puts the level back so unpausing later is not
 silent. A toast says so when it fires; there is no countdown on the
 player screen yet.
+
+### per-identity settings
+
+a setting bound to a track, an album or an artist, applied by itself
+when that music starts. no other player does this.
+
+```
+: remember(track, eq(night))
+: remember(album, volume(55%))
+: remember(artist, speed(0.9))
+: view(bindings)
+: forget(track, eq)
+: forget(album)
+```
+
+```
+remember(tier, call)    bind a setting to what is playing
+forget(tier, setting?)  drop one setting, or all of them, for it
+```
+
+**the setting is a call**, so `remember` is higher-order the way
+`repeat` and `dry` are. that is the whole design: there is no parallel
+vocabulary of setting names and value formats to keep in step with the
+real commands, the value goes through `eq`/`volume`/`speed`'s own
+parameter type, the binding applies through the very same `Op` the typed
+command lowers to, and `dry(remember(track, eq(night)))` works for
+free. `remember` accepts exactly `eq(...)`, `volume(...)` and
+`speed(...)`; anything else is a parse error naming the three, and
+completion only offers those three (r12).
+
+a **relative** value is refused: `remember(track, volume(+10%))` would
+bind "louder than whatever it happens to be", which is not a setting to
+settle on. the error points at `volume(40%)`. same for `speed(up)`.
+
+**precedence is per setting**: track, then album, then artist, decided
+for each of eq, volume and speed independently. so a track-level eq and
+an album-level volume both apply. deciding it per *identity* instead
+would mean remembering an eq for one track silently dropped the volume
+its album remembered, which is not what anyone asked for.
+
+**a setting the new track does not bind is put back**, to the value you
+chose before any binding took over, not to the last bound one. that
+matters more than it sounds: leaving it applied is the bug where one
+quiet song makes everything after it quiet, and a run of bound tracks
+must not ratchet the restore point along either. the rule lives in one
+pure function (`shellsong_host::settle`) precisely so it is tested
+without mpv:
+
+| what the new track binds | what happens |
+| --- | --- |
+| a value, nothing overridden yet | hold the current value, apply the new one |
+| a value, already overriding | apply it; the held value does not move |
+| nothing, already overriding | apply the held value, stop overriding |
+| nothing, not overriding | nothing at all |
+
+a setting that is already in effect applies nothing, so a bound album
+writes to mpv once on its first track rather than on all twelve. the
+toast that names the binding follows the same rule.
+
+a hand-tuned eq curve has no name, so there is nothing to restore *to*;
+the configured preset stands in. that is deliberate, and better than
+leaving one track's curve on for the rest of the session.
+
+**identities are names, not ids.** a track's key is `artist - title`,
+an album's is its album name, an artist's is its name, all lowercased.
+the reason is the one `eq::resolve` already gives for resolving curves
+by name: an id points at something else the moment the library is
+rescanned, a server is swapped, or the same track plays from a local
+copy instead of a stream, and a remembered eq should survive all three.
+the cost is that two genuinely different tracks sharing an artist and a
+title share a binding, which is the rarer problem. a track with no
+album tag refuses `remember(album, ...)` rather than binding an empty
+key.
+
+the applied curve already shows by name in the player and the eq menu
+(`eq::applied_label`), so the eq half is visible without any new
+chrome; a toast on the track change says which identity asked for it,
+and `view(bindings)` lists the lot.
 
 ### scripts
 
@@ -718,8 +798,15 @@ whole `Op` -> host table and sits next to `dispatch_action`.
 `shellsong_host.rs` holds the host decisions worth having apart from
 the event loop (all pure, all tested): the completion provider, the
 `search_settled` state machine, percent-to-seconds resolution, the
-volume clamp and the fade/sleep ramps. `queues.rs` is the named-queue
-store behind `save_queue`/`load_queue`.
+volume clamp, the fade/sleep ramps, the variable and per-identity
+binding stores, `.shg` path resolution, and `settle`, which is the
+per-identity restore rule. `queues.rs` is the named-queue store behind
+`save_queue`/`load_queue`.
+
+the one place that reads live state is the track-change hook in
+`main.rs`: it hands `settle`'s answers to `Program::of(ops)`, which the
+step loop drives through `apply_shellsong_op` like every other op, so
+a per-track eq cannot behave differently from `eq(night)` typed in.
 
 ### the api a host calls
 
@@ -746,6 +833,7 @@ Program::parse(input: &str) -> Result<Program, ParseError>
 Program::parse_in(input: &str, world: &World)
     -> Result<Program, ParseError>     // expands variables, inlines run()
 World::bare() -> World<'static>        // no variables, no scripts
+Program::of(ops: Vec<Op>) -> Program   // the host's own synthesised work
 Program::step(&mut self, env: &Env) -> Step
 Program::is_done(&self) -> bool
 
@@ -899,6 +987,7 @@ $XDG_STATE_HOME/wim/shellsong_history   the command history
 $XDG_STATE_HOME/wim/shellsong_ranks     the completion frequency store
 $XDG_STATE_HOME/wim/queues/<name>.toml  one saved queue each
 $XDG_STATE_HOME/wim/vars.toml           every variable, in one map
+$XDG_STATE_HOME/wim/bindings.toml       the per-identity settings
 $XDG_CONFIG_HOME/wim/<name>.shg         one script each
 $XDG_CONFIG_HOME/wim/init.shg           the one that runs at startup
 ```
