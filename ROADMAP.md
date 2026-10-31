@@ -1416,6 +1416,66 @@ a measurement.
       with invented counts is not a repair anyone should make on
       someone else's behalf. see QUESTIONS.md.
 
+- [ ] **`Surface::queue_program` has no implementation in either
+      front-end**, found while fixing `go_to_previous`. the trait
+      default drops the ops. so every per-identity op `start_session`
+      hands over is silently discarded today for `play(x)`,
+      `Action::Play` and `Op::LoadQueue`, **while `identity_settings`
+      has already recorded them in `Overridden` as applied**: bind an
+      eq, type `eq(rock)` by hand, play an unbound track, and it
+      "restores" to the curve you replaced. that is exactly the
+      failure docs/undo.md warns about. both front-ends work only
+      because the advance and loop-all paths read `Started.ops` off the
+      return value directly. `WimSurface` now implements it (it had to,
+      for skip-back); **`SwimSurface` still does not.**
+- [ ] **`quantize` is now 73% of a mono painted cell** (5.8 of 7.8 ns),
+      which is where the frame budget goes next: a midpoint, four
+      compares and two reciprocal averages per cell. left alone on
+      purpose, because it decides every glyph and both shades and is
+      the riskiest thing in the rasterizer. `ui/visualizer.rs` also
+      still writes its meter with `set_char`, where the 8.9 -> 1.4
+      ns/cell finding applies; one row per frame and no bench, so it
+      was not touched blind.
+- [ ] **`framesource` does not turn the unsharp pass off yet.** it is
+      69% of a 1:1 resample and the video path is exactly 1:1, so
+      `render_with(.., Sharpen::Off, ..)` is a 3.21x win sitting
+      uncollected. it is a visible picture change on the video pane,
+      so it wants the maintainer's eye rather than a quiet flip.
+- [ ] **`cli.rs` wants to move to the library.** `wim --help` and
+      `wim [FILE...]` are implemented and tested in
+      `src/bin/shellswim/cli.rs`, but that is a private module of one
+      bin crate, so `src/main.rs` cannot `use` it and the five
+      `#[allow(dead_code)]`s are there for that reason. the move is
+      `git mv src/bin/shellswim/cli.rs src/cli.rs`, `pub mod cli;` in
+      lib.rs, `use wim::cli;` in shellswim's main, plus the main.rs
+      hunks the agent wrote out. **`wim song.mp3` plays it** (decided:
+      a positional path guesses nothing, mpv/vlc/mplayer all do it, and
+      it is what a desktop file association sends); several files are a
+      queue; a file replaces the resumed session rather than fighting
+      it for mpv's playlist; an unplayable path is refused with exit 2
+      rather than starting empty.
+- [ ] **`DownloadCtx` wants an injected `persist`**, the shape
+      `download::Sink` already uses. `note_playback_started` reaches
+      for `cache::cache_dir()` directly, which is how a test run
+      overwrote a real play index; `cache_dir` now refuses a non-temp
+      path under `cfg(test)`, but injecting the save is the fix that
+      removes the reach rather than guarding it.
+- [ ] **`append_resolved` reports a refusal as a success.** `core.rs`
+      ~593 checks only `starts_with("error")`, so a
+      "not directly playable" status reads as "queued 1 track", and the
+      count printed is the *requested* count rather than the appended
+      one. `enqueue_track`'s two callers already disagree about which
+      prefixes matter, which is pinned now but not unified.
+- [ ] **docs that went stale tonight.** `docs/text-measurement.md`
+      82-84 says `controlsbar` is "still per-char" and "the next one to
+      route"; it is routed, and the `char_cells` justification at 72-75
+      now applies to `ui/lyrics_view.rs` alone.
+      `docs/undo.md` 152-156 says there is no mute indicator; there is
+      one, and 148-150's "a host-side `muted` mirror would remove the
+      read entirely" is what the `PROP_MUTE` observer just did, so
+      `Snapshot::capture`'s per-op ipc read can go.
+      `README.md` has no usage section and `wim [FILE...]` wants a line.
+
 ### the untracked-defect audit (2026-10-31)
 
 Ran once the roadmap was down to 8 unchecked items, 5 of them blocked,
@@ -1584,7 +1644,7 @@ writing (two agents, one per file).
 **silent desync and stale replies.** none of these crash; all of them
 do the wrong thing quietly, which is worse to diagnose.
 
-- [ ] **`main.rs` ~2948 is the only `servers_tx.send` site** while
+- [x] ~~done in the overnight run~~ **`main.rs` ~2948 is the only `servers_tx.send` site** while
       `cfg.navidrome_servers` is mutated in three (~2946 onboarding,
       ~3023 nav-manager delete, ~3086 nav-manager add). press
       `n j d d`: the profile leaves config.toml and the list, but
@@ -1629,7 +1689,7 @@ do the wrong thing quietly, which is worse to diagnose.
       **this was also the trigger named by the `Ranking` revision
       guard**: stale rows today, wrong rows once `App` held the order,
       which it now does.
-- [ ] **`main.rs` ~2297: a late subtitle lands on the wrong video.**
+- [x] ~~done in the overnight run~~ **`main.rs` ~2297: a late subtitle lands on the wrong video.**
       `SubtitleReady` (`core.rs` ~753) carries only path/release/
       language, no track identity and no epoch, and the drain calls
       `sub_add` unconditionally with mpv's `select` flag. with an
@@ -1699,7 +1759,7 @@ do the wrong thing quietly, which is worse to diagnose.
       countdown keeps drawing, and nothing plays until the gap
       expires. clicking the bar's pause glyph in the same moment does
       the right thing.
-- [ ] **`main.rs` ~2421: the suggestions cursor is reconciled by
+- [x] ~~done in the overnight run~~ **`main.rs` ~2421: the suggestions cursor is reconciled by
       clamping a flat index** while `suggest_with` rebuilds and
       reorders every section ("best section first"). open suggestions,
       press `j` seven times, let an in-flight enrichment reply land,
@@ -1707,7 +1767,7 @@ do the wrong thing quietly, which is worse to diagnose.
       cursor and enter acts on the replacement (for a `Song` that is
       `start_session`, which clears the queue). `browse.rs` ~640
       already anchors its cursor on `song_id` for exactly this.
-- [ ] **`lyrics.rs` ~224: `Loader::invalidate` has no production
+- [x] ~~done in the overnight run~~ **`lyrics.rs` ~224: `Loader::invalidate` has no production
       caller.** only the test at ~333; `main.rs` ~4042 calls
       `lyrics.close()`, which drops lines only, and no track-change
       hook touches the loader. the
@@ -1779,7 +1839,7 @@ do the wrong thing quietly, which is worse to diagnose.
       checked only the argument list, and the mutation that moved the
       transient one line up into the local it reads passed happily. it
       checks the whole function body now, and catches it.
-- [ ] **`Op::Remember` still never seeds `overridden`** (`core.rs`
+- [x] ~~done in the overnight run~~ **`Op::Remember` still never seeds `overridden`** (`core.rs`
       2508/2780 against the single writer at ~3063). at volume 80,
       `: remember(album, volume(25%))` then `: skip()` onto another
       album: `settle` sees `active == None` and restores nothing, so
@@ -1853,7 +1913,7 @@ do the wrong thing quietly, which is worse to diagnose.
       `CoreCtx` test harness is likewise private to its own test
       module, so undo.rs carries a near-copy, and one shared `fixtures`
       harness is the obvious cleanup.
-- [ ] **`core.rs` ~1206: `go_to_previous` fires three of the five
+- [x] ~~done in the overnight run~~ **`core.rs` ~1206: `go_to_previous` fires three of the five
       track-start hooks by hand** instead of calling `track_started`,
       which is the exact parity bug `track_started` was created to
       close. enable crossfade, press skip-back during a fade-out: no
@@ -2055,7 +2115,7 @@ stray paint.
       the workers never ran. `persistence.rs` ~80 asserts
       `artist.is_none()`/`album.is_none()` on two hardcoded `None`s
       two lines apart and leaves the one computed field unasserted.
-- [ ] **`core.rs` ~838 `scrobble_metadata` has zero tests,** and its
+- [x] ~~done in the overnight run~~ **`core.rs` ~838 `scrobble_metadata` has zero tests,** and its
       own comment says `Silence` earned a `SearchItem` variant
       specifically so a 15-minute silence is not scrobbled as a track
       called "silence". move one variant into the `Some` arm and
@@ -2071,7 +2131,7 @@ stray paint.
       `!matches!(report, Report::Failed(_))` guard, or suspension
       around delegated ops. reading `core.rs` the seam looks covered;
       in a normal run it is not.
-- [ ] **three functions with no test call sites and stringly-typed
+- [x] ~~done in the overnight run~~ **three functions with no test call sites and stringly-typed
       contracts.** `core.rs` ~1082 `enqueue_track`: callers branch on
       `status.starts_with("error")` (~2386) versus
       `starts_with("error") || starts_with("not ")` (~2944), nothing
@@ -2217,7 +2277,7 @@ stray paint.
       records fixing in onboarding. **the keybinds menu's "k to close" is
       fixed** (it reads "shift+k or esc: close"); `queue.rs`'s
       hardcoded `'a'` is still open.
-- [ ] **`main.rs` ~556: `wim` has no `--help`.** it handles only
+- [x] ~~done in the overnight run~~ **`main.rs` ~556: `wim` has no `--help`.** it handles only
       `--version` and silently ignores every other argument, so
       `wim --help` and `wim song.mp3` both just start the TUI with no
       message. the sibling binary has a full `--help`, `-c`, script
