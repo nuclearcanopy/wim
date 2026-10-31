@@ -677,6 +677,31 @@ report, not in a batch at the end.
       also: the app had quietly supported `'foo`, `^foo` and `foo$`
       all along and said so nowhere, so the help overlay has a "search
       syntax" block now instead of leaving it folklore.
+- [ ] **pressing the lyrics key freezes the app on the network.**
+      `lyrics::Client::lookup` is a round trip to lrclib and it is
+      called **synchronously from the input path** at two sites in
+      `main.rs`: the `OpenLyrics` key handler and the shellsong op. the
+      same class of freeze as the album open fixed earlier today, and
+      just as visible.
+      `lyrics::Loader` is built and tested: one generation counter,
+      bumped on every request and on `invalidate`, checked by the
+      worker before it sends and again in `poll`, so a reply for a
+      track the user has moved past is dropped rather than appearing
+      over the new one. both stale paths pinned, and the guard
+      mutation-checked by deleting the check and watching exactly those
+      two tests fail. `cfg_attr(not(test), allow(dead_code))` until
+      wired.
+      **what is left is two call sites**: replace each `lookup` with
+      `request`, drain `poll` next to the other channel drains in the
+      main loop, and `invalidate` when the lyrics view closes or the
+      track changes. blocked only because `main.rs` is owned by the
+      library split tonight.
+      **while in there, audit the input path for the same pattern.**
+      the two found so far (album/artist open, lyrics) were both a
+      client call straight from a key handler, so grepping for network
+      calls reachable from `dispatch_action` and `run_shellsong_op` is
+      the cheap way to find the third.
+
 - [ ] **the remaining search cost is the result clone, and it needs an
       api change to fix.** for a broad query at 40k items, 3-5ms of a
       ~7ms search is `rank` cloning ~15k `SearchItem`s. cutting it
