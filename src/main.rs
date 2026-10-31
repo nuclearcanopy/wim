@@ -20,19 +20,18 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 
-use wim::app::LoopMode;
 use wim::cache::CacheIndex;
 use wim::core::{
     append_resolved, apply_eq_gains, apply_eq_row, apply_op, browse_session, client_for,
-    current_eq_name, current_volume, dispatch_action, download_resolved, download_tracks, drive,
-    enqueue_track, eq_preset_names, fire_scrobble, fire_subtitle_fetch, front_resolved,
+    current_eq_name, current_volume, dispatch_action, download_resolved, download_tracks, drained,
+    drive, enqueue_track, eq_preset_names, fire_scrobble, fire_subtitle_fetch, front_resolved,
     go_to_previous, identity_settings, load_playlist, lyrics_query, note_playback_started,
     notify_query_changed, op_done, op_fail, op_note, open_starred, playing_duration, print_listing,
     retain_live_clients, save_playback_state, set_vid_for_item, shellsong_focus,
     spawn_background_search, start_session, start_tracking_playback, suggestion_starred_keys,
-    sweep_cache, toggle_star, BetweenTracks, CoreCtx, Dispatch, DownloadCtx, Drive, GapAction,
-    Intent, RemoteSearchOutcome, RemoteSearchQuery, Report, Resolution, ScrobbleState, SelectStep,
-    SessionStart, StarFailed, SubtitleReady, Surface, TrackChangeCtx, TrackResolver,
+    sweep_cache, toggle_star, BetweenTracks, CoreCtx, Dispatch, DownloadCtx, Drained, Drive,
+    GapAction, Intent, RemoteSearchOutcome, RemoteSearchQuery, Report, Resolution, ScrobbleState,
+    SelectStep, SessionStart, StarFailed, SubtitleReady, Surface, TrackChangeCtx, TrackResolver,
 };
 use wim::download::DownloadEvent;
 use wim::keymap::{KeyAction, Keymap};
@@ -3027,23 +3026,15 @@ fn main() -> anyhow::Result<()> {
         // (unlike end-of-file, which also fires for a track that just
         // got replaced). The upcoming-empty check guards against
         // acting on a stale idle report from before something loaded.
-        if playlist_drained && play_queue.upcoming_len() == 0 {
-            // mpv has no concept of "the session we built", only its
-            // own now-empty playlist; "loop all" replaying from the top
-            // is purely our own bookkeeping (`PlayQueue::session`).
-            let session = play_queue.session().to_vec();
-            if app.loop_mode == LoopMode::All && !session.is_empty() {
-                let first = session[0].clone();
-                let (s, played) = load_playlist(
-                    &player,
-                    &cache_index,
-                    &mut play_queue,
-                    session,
-                    SessionStart::Keep,
-                );
-                if !played {
-                    notifications.push(Severity::Error, s);
-                } else {
+        if playlist_drained {
+            // the decision is `core::drained`, shared with shellswim;
+            // what stays here are wim's own track-change hooks for a
+            // loop-all restart.
+            match drained(&player, &cache_index, &mut play_queue, app.loop_mode) {
+                Drained::Stale => {}
+                Drained::Cleared => now_playing = None,
+                Drained::Failed(why) => notifications.push(Severity::Error, why),
+                Drained::Restarted(first) => {
                     fire_subtitle_fetch(&cfg, &subtitle_tx, &first);
                     let mut dctx = DownloadCtx {
                         cache: &cache_index,
@@ -3077,9 +3068,6 @@ fn main() -> anyhow::Result<()> {
                         let _ = player.set_volume(base_volume);
                     }
                 }
-            } else {
-                play_queue.clear();
-                now_playing = None;
             }
         }
 
