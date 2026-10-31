@@ -42,19 +42,24 @@ const MAX_ENTRIES: usize = 24;
 /// 28 MB. See docs/raster.md.
 const MAX_DECODED_EDGE: u32 = 640;
 
-/// What a cover is filed under. Album name plus artist, not an id,
-/// because `SearchItem::Song` carries neither an `album_id` nor an
-/// `artist_id` (see ROADMAP's name-based-identity item). For *art*
-/// that is a safe trade in a way it is not for play affinity: two
-/// same-titled albums by one artist are the same record in practice,
-/// and the cost of being wrong is a sibling album's cover rather than
-/// a mis-attributed listen.
+/// What a cover is filed under, in preference order: the server's own
+/// album id, the album's name plus artist, then the track's own
+/// identity.
 ///
-/// Falls back to the track's own identity when either name is blank,
-/// so an untagged file still gets its own slot instead of colliding
-/// with every other untagged file.
+/// The id is preferred because names are a lossy join. Two same-titled
+/// albums by one artist collapse into one cover, and a compilation's
+/// tracks each carry their own artist, so they key apart from the
+/// album they are on and that one cover gets fetched per track. The id
+/// comes off the client's id index (`subsonic::IdIndex`), because
+/// `SearchItem::Song` cannot carry it without widening every variant
+/// literal; see docs/identity.md.
+///
+/// The name form stays load-bearing, not legacy: local files have no
+/// ids at all, and neither does a song restored from a saved queue
+/// until some response mentions it again.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Key {
+    AlbumId(String),
     Album { artist: String, album: String },
     Track(String),
 }
@@ -65,7 +70,17 @@ impl Key {
     /// get a key: it is what the on-disk store and the protocol cache
     /// are named by, and both need an answer for everything.
     pub fn of(item: &SearchItem) -> Key {
-        if let SearchItem::Song { artist, album, .. } = item {
+        if let SearchItem::Song {
+            id,
+            artist,
+            album,
+            client,
+            ..
+        } = item
+        {
+            if let Some(key) = client.album_of_song(id).and_then(|id| Key::album_id(&id)) {
+                return key;
+            }
             if let Some(key) = Key::album(artist, album) {
                 return key;
             }
@@ -78,9 +93,19 @@ impl Key {
         Key::Track(format!("{kind}:{id}"))
     }
 
+    /// An album's key from the server's own id, or `None` for a blank
+    /// one. The browse view always has this; the player has it
+    /// whenever some response has mentioned the playing track, which
+    /// is what puts the two on the same key.
+    pub fn album_id(album_id: &str) -> Option<Key> {
+        let id = album_id.trim();
+        (!id.is_empty()).then(|| Key::AlbumId(id.to_string()))
+    }
+
     /// An album's key from its names, or `None` when either is blank
     /// (an untagged file needs its own slot rather than colliding with
-    /// every other untagged file).
+    /// every other untagged file). The fallback for everything with no
+    /// id: local files, and anything the server has not described yet.
     ///
     /// Public because the browse view reaches a cover by album id and
     /// the album's own names, with no `SearchItem` in hand; routing it
@@ -100,11 +125,12 @@ impl Key {
     /// The one canonical name for this key: the in-memory map, the
     /// `ratatui-image` protocol cache and the file on disk all derive
     /// from this single definition, so a cover cannot be written under
-    /// one name and read back under another. The `a:`/`t:` prefixes
-    /// keep an album key and a track key in separate namespaces, and
+    /// one name and read back under another. The `i:`/`a:`/`t:`
+    /// prefixes keep the three forms in separate namespaces, and
     /// U+0001 is the separator because it cannot occur in a tag.
     pub fn name(&self) -> String {
         match self {
+            Key::AlbumId(id) => format!("i:{id}"),
             Key::Album { artist, album } => format!("a:{artist}\u{1}{album}"),
             Key::Track(id) => format!("t:{id}"),
         }
@@ -117,8 +143,8 @@ impl Key {
 /// that are not songs.
 ///
 /// Subsonic's `getCoverArt` takes a song, album or artist id, so the
-/// song's own id is enough here; nothing needs the album id this
-/// codebase does not carry.
+/// song's own id is still what gets asked for; the album id only
+/// decides which slot the answer lands in.
 pub fn fetch_plan(item: &SearchItem) -> Option<(Key, String)> {
     match item {
         SearchItem::Song { id, .. } => Some((Key::of(item), id.clone())),
@@ -448,6 +474,38 @@ mod tests {
             artist: artist.to_string(),
             album: album.to_string(),
             client: crate::browse::tests::test_client(),
+        }
+    }
+
+    /// A client of this test's own. The id index is shared per server
+    /// url (see `subsonic::ID_INDEXES`), so a test that teaches one
+    /// would otherwise be teaching every other test's `test_client`.
+    fn client_for(tag: &str) -> std::sync::Arc<crate::subsonic::Client> {
+        std::sync::Arc::new(
+            crate::subsonic::Client::new(&crate::config::NavidromeConfig {
+                url: format!("https://{tag}.invalid"),
+                username: "test".into(),
+                password: Some("pw".into()),
+                password_file: None,
+                max_bitrate_kbps: None,
+                transcode_format: None,
+            })
+            .unwrap(),
+        )
+    }
+
+    fn song_on(
+        client: &std::sync::Arc<crate::subsonic::Client>,
+        id: &str,
+        artist: &str,
+        album: &str,
+    ) -> SearchItem {
+        SearchItem::Song {
+            id: id.to_string(),
+            title: format!("track {id}"),
+            artist: artist.to_string(),
+            album: album.to_string(),
+            client: client.clone(),
         }
     }
 
@@ -852,15 +910,98 @@ mod tests {
         assert!(Key::album("Bladee", "   ").is_none());
     }
 
-    /// Known limit of name keying, recorded as a test so it is a
-    /// decision rather than a surprise: a compilation's tracks each
-    /// carry their own artist, so they do not share the album's key.
-    /// Fixing it needs an album-artist or an album id on `SearchItem`
-    /// (see ROADMAP's name-based-identity item).
+    /// The bug name keying had: a compilation's tracks each carry
+    /// their own artist, so they keyed apart from the album they are
+    /// on and that one cover was fetched per track. With the server's
+    /// album id known, the track and the album are one key again.
     #[test]
-    fn a_compilation_track_does_not_share_the_albums_key() {
+    fn a_compilation_track_shares_the_albums_key_once_the_id_is_known() {
+        let client = client_for("comp");
+        client.remember_song("c1", "al-now42", "ar-bladee");
+        client.remember_song("c2", "al-now42", "ar-ecco");
+
+        let album = Key::album_id("al-now42").unwrap();
+        assert_eq!(Key::of(&song_on(&client, "c1", "Bladee", "Now 42")), album);
+        assert_eq!(Key::of(&song_on(&client, "c2", "Ecco2k", "Now 42")), album);
+    }
+
+    /// The name fallback, kept because it is the only thing local
+    /// files and queue-restored songs have: with no id reported, two
+    /// differently-credited tracks of one compilation still key apart
+    /// from the album. That is the old limit, now scoped to the case
+    /// where the server has told us nothing.
+    #[test]
+    fn a_compilation_track_with_no_known_id_still_falls_back_to_names() {
         let album = Key::album("Various Artists", "Now 42").unwrap();
-        let track = Key::of(&song("1", "Bladee", "Now 42"));
+        let track = Key::of(&song("nameonly-1", "Bladee", "Now 42"));
+        assert_eq!(
+            track,
+            Key::album("Bladee", "Now 42").unwrap(),
+            "with no id, the names are the key"
+        );
         assert_ne!(track, album);
+    }
+
+    /// The other half of the name join's loss: two records with the
+    /// same title by the same artist are one key by name and two by
+    /// id, which is two covers rather than one shown for both.
+    #[test]
+    fn two_same_titled_albums_by_one_artist_stop_sharing_a_key() {
+        let client = client_for("sametitle");
+        client.remember_song("re-1", "al-1994", "ar-1");
+        client.remember_song("re-2", "al-2024", "ar-1");
+        let first = song_on(&client, "re-1", "Bladee", "Crest");
+        let second = song_on(&client, "re-2", "Bladee", "Crest");
+
+        assert_eq!(
+            Key::album("Bladee", "Crest"),
+            Key::album("Bladee", "Crest"),
+            "precondition: by name these two are the same album"
+        );
+        assert_ne!(
+            Key::of(&first),
+            Key::of(&second),
+            "two albums, two covers: the id is what tells them apart"
+        );
+    }
+
+    /// An id, when there is one, beats the names; otherwise the browse
+    /// view (which always has the id) and the player (which usually
+    /// does) would file one album's cover under two names.
+    #[test]
+    fn the_key_prefers_a_known_id_over_the_names() {
+        let client = client_for("prefer");
+        client.remember_song("p1", "al-crest", "ar-1");
+        let item = song_on(&client, "p1", "Bladee", "Crest");
+        assert_eq!(Key::of(&item), Key::AlbumId("al-crest".to_string()));
+        assert!(art_key(&item).starts_with("i:"));
+        // and an album opened in the browse view reaches the same slot
+        assert_eq!(Key::album_id("al-crest").unwrap().name(), art_key(&item));
+    }
+
+    #[test]
+    fn a_blank_album_id_yields_no_id_key() {
+        assert!(Key::album_id("").is_none());
+        assert!(Key::album_id("   ").is_none());
+    }
+
+    /// The three key forms share one store directory, so none of them
+    /// may collide with another. Built to collide if any two shared a
+    /// prefix: the id is exactly the name form's own separator-joined
+    /// text, and the track form's is the same string again.
+    #[test]
+    fn the_three_key_forms_live_in_separate_namespaces() {
+        let dir = PathBuf::from("/tmp");
+        let by_id = Key::AlbumId("x\u{1}y".to_string());
+        let by_name = Key::Album {
+            artist: "x".to_string(),
+            album: "y".to_string(),
+        };
+        let by_track = Key::Track("x\u{1}y".to_string());
+        assert_ne!(by_id.name(), by_name.name());
+        assert_ne!(by_id.name(), by_track.name());
+        assert_ne!(store::path(&dir, &by_id), store::path(&dir, &by_name));
+        assert_ne!(store::path(&dir, &by_id), store::path(&dir, &by_track));
+        assert_ne!(store::path(&dir, &by_name), store::path(&dir, &by_track));
     }
 }
