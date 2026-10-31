@@ -1140,6 +1140,634 @@ above this line in the shellswim section is done.
       fixed rather than worked around again.
 
 
+### the untracked-defect audit (2026-10-31)
+
+Ran once the roadmap was down to 8 unchecked items, 5 of them blocked,
+to answer "what is not written down". 55 findings, verified reachable
+(the auditor reproduced the three top panics with a standalone probe
+rather than reasoning about them). **`[profile.release]` sets no
+`overflow-checks`, so release wraps where debug panics**, which is why
+the arithmetic findings are not purely theoretical.
+
+Four are already fixed and are checked off in their own sections
+above: the cleared-queue-vs-loop-all bug, `Op::RemoveFromQueue`'s
+ordering, the header's blind truncation, and `ArtProbe`'s dead-probe
+arm. The rest are below, grouped by how bad they are rather than by
+file, because several span two files.
+
+**these abort the process from ordinary use.** in flight as of this
+writing (two agents, one per file).
+
+- [ ] **`shellsong.rs` ~4088, root cause ~4067: one keystroke
+      crashes the console.** `enclosing()` builds a call-name range
+      with `rfind(pred).map(|j| j + 1)`, and `str::rfind` returns the
+      *first* byte of the matched char, so for a multi-byte char the
+      `+1` lands mid-codepoint and the slice panics. type any
+      non-ascii char immediately followed by `(`: `rós(`, `é(`,
+      `Țara(`. autopair means one keystroke does it, and
+      `site()`/`enclosing()` run on every keystroke, so it is an
+      instant crash while typing. hits both binaries. verified:
+      `"rós"` yields `name=(2,4)`, panic.
+      **`multibyte_input_never_slices_mid_character` (~6158) gives
+      false confidence**: it only covers `edit_insert`/`edit_backspace`.
+- [ ] **`shellsong.rs` ~3282 into `core.rs` 2555/2574/2024: `inf` is
+      a valid duration.** `parse_time`'s bare-number branch is
+      `rest.parse::<f64>()` with only a `< 0.0` check, so `inf` and
+      `1e30` become `Pos::Seconds`. `: sleep(inf)`, `: pause(inf)`,
+      `: fade(out, inf)`, `: silence(inf)` all reach
+      `Duration::from_secs_f64(inf)`, which panics *inside the draw
+      loop*; the hook tears the terminal down and the queue is lost.
+      `secs.max(0.0)` launders NaN but not infinity. same boundary:
+      `: volume(nan)` parses and is persistable into `bindings.toml`,
+      after which every later play of that track attempts a NaN
+      volume write; `: silence(0.4s)` truncates to a 0-second
+      `anullsrc` via `secs: *s as u64` and is reported as "a 0s
+      silence plays next"; `: silence(1e20)` reports
+      "5124095576030431h8m15s".
+- [ ] **`main.rs` ~274: `clamp(0, -1)` asserts.**
+      `move_wim_selection`'s suggestions branch is
+      `(at + d).clamp(0, count.saturating_sub(1) as i64)` and
+      `Ord::clamp` panics when `min > max`. run
+      `: view(suggestions)` on a cold or empty corpus (main.rs ~336
+      installs `Some(suggestions)` and takes focus even at zero) then
+      `: down()`. `: bottom()` instead writes `usize::MAX` into
+      `suggestions_selected`.
+      **this is the second copy of the rule and it is the unsafe
+      one**: the queue branch 15 lines below guards with
+      `if order.is_empty()`, and the keyboard j/k copy at ~4086 uses
+      `.min(...)`.
+- [ ] **`main.rs` ~2514: a config file can abort the app.**
+      `Duration::from_secs_f64(cfg.crossfade_seconds)` is the only
+      unguarded `from_secs_f64` in the tree (every other site uses
+      `.max(0.0)`), and `crossfade_seconds` is read straight from TOML
+      with no load-time validation. put `crossfade_seconds = -1` or
+      `= nan` in config.toml and set a sleep timer. the settings-menu
+      clamp at ~3347 bounds only the delta, not the loaded value.
+- [ ] **`shellsong.rs` ~2139: `repeat` nesting is an OOM abort.**
+      `repeat` expands statically and `MAX_REPEAT = 256` bounds one
+      level while `parse_call` recursion depth is unbounded.
+      `: repeat(256, repeat(256, repeat(256, skip())))` allocates
+      ~16.7M nodes (~1.2 GB) synchronously in `submit` with the ui
+      frozen; one more level is an unrecoverable
+      `handle_alloc_error`. `MAX_REPEAT`'s own doc claims this is
+      prevented, so the doc is currently a lie. the bound has to be on
+      the *total* expansion, not per level.
+
+**silent desync and stale replies.** none of these crash; all of them
+do the wrong thing quietly, which is worse to diagnose.
+
+- [ ] **`main.rs` ~2948 is the only `servers_tx.send` site** while
+      `cfg.navidrome_servers` is mutated in three (~2946 onboarding,
+      ~3023 nav-manager delete, ~3086 nav-manager add). press
+      `n j d d`: the profile leaves config.toml and the list, but
+      `spawn_background_sync`'s own `servers` vec never changes, so
+      that server keeps being polled every 45s, its catalog keeps
+      being re-merged, offline/online toasts keep firing for a profile
+      you removed, and its `Arc<Client>` is never dropped so the
+      superseded password is never zeroized. add a server instead and
+      it indexes once and is never auto-resynced, so new albums do not
+      appear until restart.
+      **and it is a pinned-the-function-not-the-wiring case**:
+      `catalog.rs` 308/325/335 pin `retain_live_clients` dropping an
+      edited or removed profile's client, but its single production
+      call site (`catalog.rs` ~60) reads a list that only ever grows,
+      so the behaviour those three tests assert is unreachable in the
+      binary.
+- [ ] **`main.rs` ~2990: onboarding replaces the corpus without
+      replacing the scan receiver.** `app.corpus = rebuild_corpus(&cfg)`
+      where `Op::Rescan` (`core.rs` ~2546) gets it right by swapping
+      the receiver *and* calling `drop_local`. press
+      enter/enter/esc/esc then enter on first run: the startup scan
+      thread's remaining batches drain into the fresh corpus (`push`
+      dedups remote keys only), so every local track is listed twice
+      for the session; the navidrome catalog the previous step just
+      indexed and the warm-from-cache corpus are both discarded until
+      the next 45s sync; and `library::scan` runs *synchronously on
+      the main loop*, freezing the first-run ui with no feedback.
+      **this one is also the trigger for the `Ranking` revision
+      guard** (see the search-cost item): it is merely stale today and
+      becomes wrong-rows the moment `App` holds the order.
+- [ ] **`main.rs` ~2297: a late subtitle lands on the wrong video.**
+      `SubtitleReady` (`core.rs` ~753) carries only path/release/
+      language, no track identity and no epoch, and the drain calls
+      `sub_add` unconditionally with mpv's `select` flag. with an
+      opensubtitles key set, play video A then immediately play B (or
+      let a queue auto-advance): A's three-round-trip fetch lands late
+      and becomes B's active subtitle track, with a toast naming A's
+      release. which wins is thread-completion order.
+      every other async reply path in the tree has a generation or
+      identity guard (`browse::Loader`, `coverart::Cache`,
+      `download::DownloadEvent`, `graphics::ArtProbe`, mpv ipc); this
+      is the one that does not.
+- [ ] **`undo.rs` ~182: one restore branch skips the resolver
+      invalidation.** ~159 and ~171 both call
+      `track_resolver.invalidate()` and this one does not, and it
+      calls `load_playlist` directly instead of `start_session`, so
+      none of the five track-start hooks fire. play a song, queue a
+      prolific artist, press next, open the undo menu, press `u`: the
+      restore rewrites the queue, then seconds later the artist
+      fan-out lands and appends the whole discography with a "queued
+      847 tracks" toast, visibly un-doing the undo. also no
+      playing-now submission, wrong `listened_at`, no bound
+      eq/volume/speed, no subtitle fetch. `Snapshot` carries no
+      `previous_track` either, so skip-back after an undo reloads the
+      track already playing.
+- [ ] **`undo.rs` ~128: `Snapshot::restore` breaks the `set_query`
+      contract.** it calls `App::set_query` without the mandatory
+      `notify_query_changed`, which `app.rs` ~349 states and every
+      other caller honours. `search(bladee)`, `search(drain)`,
+      `undo()`: the query text comes back but no debounced `search3`
+      fires, so remote titles are missing from the restored list while
+      `settle` still reports settled, and a following
+      `play(selection)` resolves against an incomplete list.
+- [ ] **`main.rs` ~4326: the pause keybind bypasses
+      `core::toggle_pause`,** whose doc at `core.rs` ~54 claims "the
+      keybind, the bar click and enter on the player cannot disagree".
+      set `gap(5s)`, let a track end, press space during the
+      countdown: mpv unpauses at an already-finished eof,
+      `between.cancel()` never runs so `holding()` stays true and the
+      countdown keeps drawing, and nothing plays until the gap
+      expires. clicking the bar's pause glyph in the same moment does
+      the right thing.
+- [ ] **`main.rs` ~2421: the suggestions cursor is reconciled by
+      clamping a flat index** while `suggest_with` rebuilds and
+      reorders every section ("best section first"). open suggestions,
+      press `j` seven times, let an in-flight enrichment reply land,
+      press enter: the highlighted row's content changed under the
+      cursor and enter acts on the replacement (for a `Song` that is
+      `start_session`, which clears the queue). `browse.rs` ~640
+      already anchors its cursor on `song_id` for exactly this.
+- [ ] **`lyrics.rs` ~224: `Loader::invalidate` has no production
+      caller.** only the test at ~333; `main.rs` ~4042 calls
+      `lyrics.close()`, which drops lines only, and no track-change
+      hook touches the loader. the
+      `#[cfg_attr(not(test), allow(dead_code))]` is why nothing
+      flagged it. press the lyrics key, press esc while lrclib is
+      still answering, wait: the pane reopens itself and swallows
+      j/k/esc again. or press it 3s before a track ends and let it
+      auto-advance: the pane opens unprompted over the next track.
+      the comment at `main.rs` ~2323 asserts the opposite of what the
+      code does.
+- [ ] **`main.rs` ~1209: `overlay` is a second hand-maintained copy
+      of the modal list** that already exists once in `hit::Tiers`,
+      and they disagree in both directions. `console_open` and
+      `subtitle_menu_open` are in `Tiers` but not `overlay`: play a
+      local video, press `v`, press the subtitle-menu key, and
+      `draw_unless_video` skips the draw entirely, so the one menu
+      that exists purely for video is invisible while claiming every
+      key. `undo_menu_open` is in `overlay` but has no `Tiers` entry,
+      so with the undo tree drawn over the workspace a click or wheel
+      notch resolves against the pane behind it.
+- [ ] **`core.rs` 2508/2780: `Op::Remember` never seeds
+      `overridden`,** which is written in exactly one place
+      (`core.rs` ~3063). at volume 80, `: remember(album, volume(25%))`
+      then `: skip()` onto another album: `settle` sees
+      `active == None` and restores nothing, so you stay at 25 for the
+      session, contradicting the documented rule.
+      **worse, `identity_settings` captures `current_volume` at a
+      track boundary**, i.e. mid crossfade fade-out, so with
+      `crossfade()` on the restore point is `Some(0.0)` and the next
+      unbound track is silently muted until you type `volume(50%)`.
+      same root cause at `core.rs` ~2072: `: volume(+10%)` in the last
+      three seconds of a track gives you 10, not 90, and that becomes
+      `base_volume`.
+- [ ] **`core.rs` ~154: `BetweenTracks::step` never retries a lost
+      keep-open write.** it does `let _ = player.set_keep_open(..)`
+      and then sets `self.keep_open` unconditionally, while the write
+      is gated on the field differing. with a gap configured and one
+      failed ipc write of `false`, mpv stays on `keep-open=always` and
+      never goes idle, which kills `PROP_IDLE_ACTIVE` and with it
+      end-of-playlist and loop-all handling for the rest of the
+      session.
+- [ ] **`core.rs` ~1101 and ~1539, `undo.rs` 61/95: four smaller
+      ones.** `enqueue_track` moves the entry in `entries` and *then*
+      does `let _ = player.playlist_move(..)`, so a failed move
+      permanently breaks the `playqueue.rs` invariant with no message.
+      `persist_eq` is the only writer of `cfg.eq_preset`/`eq_gains`
+      and all three call sites are inside the eq-menu key block, so
+      `e` to cycle the eq (or `: eq(rock)`) is lost on restart while
+      the identical change made from the menu persists. `mute` is
+      listed in docs/undo.md's snapshot contents but is not in
+      `Snapshot`, so `mute()` then `undo()` reports success and stays
+      muted (and there is no mute indicator anywhere). `eq_custom` is
+      not snapshotted either, so a restored flat curve reads "flat
+      (modified)".
+- [ ] **`core.rs` ~1206: `go_to_previous` fires three of the five
+      track-start hooks by hand** instead of calling `track_started`,
+      which is the exact parity bug `track_started` was created to
+      close. enable crossfade, press skip-back during a fade-out: no
+      bound eq/volume/speed, and the volume is left wherever the ramp
+      last wrote it for the whole track.
+- [ ] **`main.rs` ~2623 is the only queue-mutating site in the loop
+      with no undo hook** (`let _ = &mut surf;` at ~2650 is the tell).
+      queue an album, undo, redo: redo restores a snapshot that never
+      saw the tracks, so they vanish. relatedly `core.rs` ~450: the
+      resolver *reads* the epoch rather than bumping it, right for
+      `Intent::Back` but it means two `Intent::Front` batches fight
+      for the same insert slot, so queue-front album A then album B
+      and the order is nondeterministic run to run.
+- [ ] **`main.rs` ~2356 / `shellsong_host.rs` ~569: a settle can
+      answer the wrong query.** `SearchSettle::answered` clears
+      `pending_since` unconditionally and `RemoteSearchOutcome`
+      carries no query. type `cre`, then within the round trip type
+      `st`: "cre"'s answer settles "crest" before a request for it has
+      left the debounce window, so a shellsong program gated on
+      `search_settled` runs against the wrong result set.
+      `a_newer_query_restarts_the_window` covers notify-then-notify
+      only.
+
+**grapheme clusters, not wide glyphs.** the wide-glyph case is already
+right and must not be regressed (`textfit` exists, `ui/draw.rs` is a
+width-aware single writer, CJK does not shift). the open class is
+systemic: `Cargo.toml` has `unicode-width` but no
+`unicode-segmentation`, and **the repo's two width functions implement
+different models**: `textfit::width` uses `UnicodeWidthStr`
+(string-level ligature rules) while `textfit::char_cells` uses
+`UnicodeWidthChar` (no such rules), so every truncation mixes them.
+
+- [ ] **`ui/draw.rs` ~73: `cursor += cells.max(1)` gives a
+      zero-width codepoint its own cell.** measured in a real
+      `Buffer` with a `│` at column 8: `"❤️ love song"` returns x=9 and
+      overwrites the border; `"1️⃣ favourites"` x=10; `"👩‍👩‍👧 mix"` x=10
+      with the three faces in separate cells; NFD `"Beyoncé"` x=8 for
+      a 7-cell string; decomposed `"각 song"` (how macOS/APFS stores
+      hangul) x=9, painted as three loose jamo. a zero-width cell is
+      not skipped by `Buffer::diff`, so the terminal re-joins the
+      cluster and everything after it lands one column left of where
+      the buffer thinks. trigger: any NFD-tagged or emoji-containing
+      track name, which is ordinary library content.
+- [ ] **`ui/textfit.rs` 39/55/74: the doc contract "never wider than
+      asked for" is false.** `truncate_with_ellipsis("❤️ love song", 8)`
+      returns real width 9; `truncate_to_width("👩‍👩‍👧 mix", 8)` returns
+      real width 4 (ZWJ components double-counted). this feeds the
+      item above, and via `textfit::columns` it makes a console echo
+      line exceed `avail`, wrap, and break the grid.
+- [ ] **`swimconsole.rs` ~262 and `ui/shellsong.rs` ~303: two more
+      hand-rolled per-char writers with the same `.max(1)`,** measured
+      against `width()`-derived budgets. type `Beyoncé` NFD at the
+      shellswim prompt and the combining acute is written to the next
+      cell and then overwritten by the block caret, so an accent you
+      typed is invisible; type `star(❤️)` and the caret floats two
+      cells past the `)`. the overlay copy also paints past its own
+      `│` (no clipping of its own) and, because truncation is
+      width-based, never drops zero-width chars, so a pasted
+      combining-mark run drives `col: u16` past 65535 and wraps in
+      release.
+- [ ] **`ui/header.rs` ~61: the `│` separator column comes from an
+      advancing per-char `x`** while the `┴` junction uses the same
+      overcounted value, so with an NFD title the rule is painted at
+      buffer column 20 and renders at terminal column 19, a visible
+      one-column kink.
+      **fix direction for all four**: make `textfit` grapheme-based
+      (cluster iteration, `UnicodeWidthStr::width` per cluster, drop
+      zero-width clusters), have `draw::at_styled` write a cluster as
+      one `set_symbol`, delete the `.max(1)`, and route the three
+      hand-rolled writers through `draw::at`.
+- [ ] **`ui/shellsong.rs` ~181: the ghost completion is drawn
+      unconditionally at `cursor_col + 1`,** over cells the real text
+      was just written into. type `queue(fl, hexed` then press Left
+      seven times: the row renders `: queue(fl█atline)` with your
+      typed `, hexed` gone from the screen while still in the buffer.
+      `swimconsole.rs` ~157 guards exactly this with
+      `cursor_col != width(&window)`.
+
+**layout math and paint outside the rect.** root cause for several:
+`ui/draw.rs` ships two classes of writer and the asymmetry is
+undocumented. `put`/`at`/`at_styled` bounds-check the *buffer* only;
+`line`/`centered` also clamp y to the *area*. also
+`testbuf::assert_outside_untouched` exists and 12 widgets use it, but
+`browse`, `results_list`, `eq_menu`, `queue`, `suggestions`, `player`,
+`notify`, `miniplayer` and `shellsong` do not; several have
+`degenerate_sizes_do_not_panic` tests, which catch panics but not
+stray paint.
+
+- [ ] **three menus ignore `ui::scroll::offset_for`,** whose module
+      doc describes precisely this bug. `ui/keybinds_menu.rs` ~45 has
+      no scroll offset while `main.rs` ~3604 cycles the selection
+      modulo 32 actions; on a plain 80x24 only ~15 rows fit, so
+      pressing `K` and holding `j` puts the `>` marker, the
+      "press a key..." prompt and the footer hint all off-screen and
+      `r` rebinds an action you cannot see. no resize needed. same
+      missing offset in `ui/settings_menu.rs` ~56 (the listenbrainz
+      token row and its whole editor are invisible but selectable at
+      17 rows) and `ui/nav_manager.rs` ~45 (enter reconnects to a
+      profile you cannot see).
+- [ ] **`ui/results_list.rs` ~287: `draw_header_row` has no bounds
+      guard at all,** and `ui/browse.rs` 285/303 hand it zero-height
+      label rects. open an artist page on an 8-row terminal, or press
+      `r s` and grow the bottom bar to its max of 10 on a 14-row
+      terminal: `───── ALBUMS ───` paints across the bottom bar's rule
+      row, clobbering the `┴`/`┬` junctions, and it manufactures a
+      height-1 rect from a height-0 one, defeating `draw::centered`'s
+      own guard. its sibling `fill_row_bg` in the same module guards
+      (bottom edge only).
+- [ ] **`ui/browse.rs` ~229 and ~205: the bio rect and the top rule
+      ignore the area height.** `bio_rect` returns
+      `y: area.y + 4, height: 3` unconditionally, and the top-rule
+      loop writes `area.y` through raw `buf.cell_mut` with no
+      `height == 0` check. open an artist with a last.fm bio at
+      `main_content.height <= 6`, or a browse view on a 3-row
+      terminal: bio prose and a full row of `─` land on the bottom
+      bar's rule. `browse.rs` ~77's `rule_rows` already does
+      `rows.retain(|y| *y < area.y + area.height)`, so **the filter is
+      in the function that reports the rows and missing from the one
+      that paints them**.
+- [ ] **`ui/eq_menu.rs` 640/650/662: unguarded `draw::at`/`draw::put`
+      with `y = area.y + 2` unconditional.** enter on the bottom bar's
+      Eq field then shrink to 7 rows: "applied: flat" lands on the
+      bottom bar's rule row; press `s` and "save as: …█" lands one row
+      further. the sibling `None` arm at ~663 uses `draw::line` and is
+      safe.
+- [ ] **`ui/banner.rs` ~146: `arrow_y` is never clamped to the
+      rect.** both guards test x only, while the logo grid loop ten
+      lines below has exactly the `y >= area.y + area.height` check
+      the arrow row lacks. on a 60x7 terminal (or any
+      `main_content.height <= 3`) the `<` and `>` punch two holes
+      through the bottom bar's `HorizontalRule`, which is drawn
+      earlier and never repainted. worse with `figlet: doh` (50 rows)
+      at 90x29.
+- [ ] **`ui/shellsong.rs` ~69: the overlay console cannot scroll.**
+      it never calls `Console::saw_viewport(rows)` and never reads
+      `Console::scroll()`, so it always renders the live tail: open
+      `:` and press PageUp and the keys are visibly dead even though
+      `handle_key` moved `scroll`. knock-ons: `viewport` stays 0 so
+      `scroll_pages` pages by one line; `scroll > 0` makes
+      `following()` false so every later `push` increments `scroll`
+      with nothing resetting it; and `SCROLLBACK_ROWS = 8` hides
+      everything older with no indicator, where `swimconsole.rs` ~67
+      prints `^ N back · pgdn to catch up`. `Console::viewport`'s own
+      doc says the renderer must report this because it is the only
+      thing that knows.
+
+**tests that hide risk.** the pattern this repo keeps hitting
+("pinned the function not the wiring") plus two new ones.
+
+- [ ] **`core.rs` ~1012, tests at ~4198/~4217: the pairing is tested,
+      the wiring is not.** the `resolve_all` tests' doc claims to
+      cover "the latent desync at the seam where it lived", but
+      `load_playlist` and `resync_upcoming`, the two functions the
+      `core.rs` ~1035 "the pairing is the fix" comment names, have
+      **zero test call sites**. collapsing the `refused` loop back to
+      `map(|(i, _)| i).collect()` leaves both tests green and restores
+      the exact off-by-one (wrong title, wrong scrobble, wrong art)
+      the comment says shipped once.
+- [ ] **`subsonic.rs` 1845/1865/1880 test a dead function.**
+      `artist_albums_with_tracks` is `#[allow(dead_code)]` and its own
+      doc says nothing calls it; the live artist page uses
+      `stream_artist_tracks`, and the two are structurally different
+      (shared `AtomicUsize` vs `skip(worker).step_by(workers)`). the
+      connection-reuse assertion
+      (`connections() <= ALBUM_FETCH_CONCURRENCY + 1`) exists **only
+      on the dead path**, so a regression reinstating the recorded
+      "~16 handshakes" bug fails nothing.
+- [ ] **four assertions that cannot fail.** `shellsong.rs` ~6257
+      asserts `candidates_at(..).len() <= MAX_CANDIDATES` with a
+      one-item corpus against a cap of 50, while the comment two lines
+      up says "the corpus is the half that still has to be capped: it
+      is as long as the library"; the 50-name fixture that would
+      exercise it exists at ~8186 and is used only by an `#[ignore]`d
+      bench, so removing a `take(MAX_CANDIDATES)` and shipping a 20k
+      row completion popup fails no test. `shellsong_host.rs` ~952
+      hardcodes 300 instead of referencing
+      `core::REMOTE_SEARCH_DEBOUNCE`, so it couples neither constant.
+      `subsonic.rs` ~1925 sleeps 600ms and asserts only
+      `requests() <= 18` of 61 with no lower bound, so it passes if
+      the workers never ran. `persistence.rs` ~80 asserts
+      `artist.is_none()`/`album.is_none()` on two hardcoded `None`s
+      two lines apart and leaves the one computed field unasserted.
+- [ ] **`core.rs` ~838 `scrobble_metadata` has zero tests,** and its
+      own comment says `Silence` earned a `SearchItem` variant
+      specifically so a 15-minute silence is not scrobbled as a track
+      called "silence". move one variant into the `Some` arm and
+      garbage goes to a public ListenBrainz profile with no failing
+      test and, because `core.rs` 887/900 discard the submit result,
+      no runtime signal either.
+- [ ] **the undo seam is only covered by `#[ignore]`d tests.**
+      `core.rs` 3220/3759/3819/3954/3979/4021: six behavioural (not
+      benchmark) `seam_tests` need a live mpv, and they are the only
+      coverage of undo recording through the real `apply_op`
+      (`core.rs` ~3753 says so outright). a default `cargo test`
+      verifies none of `recordable`, `coalesce_kind(&op)`, the
+      `!matches!(report, Report::Failed(_))` guard, or suspension
+      around delegated ops. reading `core.rs` the seam looks covered;
+      in a normal run it is not.
+- [ ] **three functions with no test call sites and stringly-typed
+      contracts.** `core.rs` ~1082 `enqueue_track`: callers branch on
+      `status.starts_with("error")` (~2386) versus
+      `starts_with("error") || starts_with("not ")` (~2944), nothing
+      pins the prefixes, and the two sites disagree about which
+      matter. `core.rs` ~1350 `note_playback_started`: swapping one
+      argument at ~1375 reinstates the reported "pressing enter twice
+      downloads it" bug with all five `should_auto_download` tests
+      green. and `PlaybackState`'s serde shape has no round-trip test
+      at all while `load()` ends in `.ok()?`, so any field rename
+      silently turns every saved queue into "nothing to resume".
+- [ ] **accreted test modules, the recorded pattern, again.**
+      `catalog.rs` ~273 `catalog_fetch_tests` holds 3 fetch tests plus
+      4 client-lifetime/zeroize tests; `main.rs` 4637/4665/4680 are
+      `is_starred`/`album_page` tests inside `shellsong_wiring_tests`;
+      `main.rs` ~4497 is a serde-alias test inside
+      `download_policy_tests`. third occurrence, so it is worth a
+      convention rather than another cleanup.
+
+**silent failures and undiscoverable keys.**
+
+- [ ] **`main.rs` ~3588: the interactive remap accepts a key it will
+      then drop.** it never checks `reserved_key_purpose`, so a
+      binding onto a reserved key is accepted, displayed, written to
+      config.toml, and silently discarded by `keymap.rs` ~309 at the
+      next launch. press `K`, pick an action, `r`, `j`: the row
+      updates, no warning, `j` only moves the selection, the action is
+      dead, and on restart the menu shows the old key with nothing
+      said. `keymap.rs` 25/261 state the opposite contract ("refusing
+      the binding and saying why beats a key that silently does
+      nothing"); the refusal exists only in `from_overrides`, never in
+      the path most users will use.
+- [ ] **`main.rs` ~3631 shadows `main.rs` ~4199, so `K` is broken in
+      the queue view.** the unconditional
+      `if key.code == Char('K') { keybinds_menu_open = true; continue; }`
+      runs before the queue view's own handler, making the
+      `Char('J') | Char('K')` arm unreachable for `K`: `J` moves a
+      track down, `K` never moves one up, and `ui/queue.rs` ~161
+      prints "enter: jump, d: remove, J/K: move, esc: close",
+      teaching the broken half.
+- [ ] **`keymap.rs` ~300: every class of `[keybinds]` config error is
+      silent, and duplicates are not even detected.** a typo'd action
+      name, an unrepresentable key and a reserved key all fall back to
+      the default with no message; a collision (`quit = "a"`, which
+      collides with Enqueue's default) is applied and silently kills
+      `Quit`, since `Enqueue` is checked at `app.rs` ~295 and `Quit`
+      at ~314. the interactive path does warn
+      (`keybinds_menu.rs` ~84) but the warning is cleared by the next
+      `j`/`k` and the menu then lists the shadowed binding as if it
+      worked.
+- [ ] **`ui/help.rs` ~164: the shellsong console is absent from the
+      help pane entirely.** `:` opens a full command console with
+      completion and is in `reserved_key_purpose` as "the shellsong
+      console", but grepping `help.rs` for `console`/`shellsong`/`:`
+      returns nothing; it is also missing from onboarding's controls
+      table, the controls bar and the helpbox. an entire subsystem is
+      reachable only by guessing, while `K` is listed.
+- [ ] **`download.rs` ~155: one thread per track, no cap,** while
+      every other batch network operation in the tree caps
+      (`ALBUM_FETCH_CONCURRENCY`, `ENRICH_CONCURRENCY`). select an
+      artist and press the download key: `download_resolved` hands the
+      whole discography straight through, so 800 tracks means 800
+      threads and 800 simultaneous connections, most failing with a
+      storm of toasts. `ureq::get(url).call()` at ~82 also sets no
+      timeout, so a black-holing server pins a thread and a `.part`
+      file forever.
+- [ ] **nine shellsong commands with no error for the obvious wrong
+      input** (all `shellsong.rs`). ~2606 the `#` comment arm is the
+      only separator not guarded by `depth <= 0`, so
+      `: play(track #3)` truncates to `play(track` and reports
+      "play( is never closed" with no mention of `#` (verified). ~2657
+      the closer arm is `')' | ']'` with no opener match, so
+      `: play(crest]` is silently accepted and executed (verified).
+      ~2572 `fade`'s `over` is `Ty::Duration`, which accepts `off`,
+      but `simple_op` only matches `Some(s)`, so `: fade(out, off)`
+      silently fades over 5s. ~3325 the 0-100 ceiling lives only in
+      `parse_time`'s percent branch, so `: volume(150)` is accepted
+      and clamped while `: volume(150%)` errors. ~2865 a repeated
+      `kind=` last-wins with no error. ~2727 `: let a == [x]` binds
+      `a` to the literal `"= [x]"` and says "defined a: 1 terms".
+      ~3647 `Delete` clears `cycle` but not `self.error`, unlike
+      `Char` and `Backspace`.
+- [ ] **`shellsong_host.rs` 38/352/336/588: four silent or wrong
+      answers.** `save_vars`/`save_bindings` return `()` and discard
+      both "no state dir" and the `fs::write` error while callers
+      report success, so with an unwritable `$XDG_STATE_HOME`
+      `: let morning = [mazzy star, burial]` says "defined morning: 2
+      terms" and the variable is gone next launch (`queues::save` does
+      report this, so the two stores disagree about the same
+      failure). ~336 compares eq names with `PartialEq` instead of
+      `eq::same_name`, so `: remember(artist, eq(Night))` never
+      settles and every single track gets a redundant ipc write plus a
+      toast. ~588 `moveto`'s `Seconds` branch does `s.max(0.0)` while
+      the `Percent` branch on the next line clamps to the duration, so
+      `: moveto(1h)` on a three-minute track reports "moved to 3600s"
+      and skips the track.
+- [ ] **`shellsong_host.rs` ~490 vs `shellsong.rs` ~4103: completion
+      does not fold diacritics** while `Corpus::search_names` does.
+      with a romanian library, typing `: play(tara` for `Țara` gives
+      no ghost, no tab candidate, no listing and no message, even
+      though submitting the line resolves fine. this is the
+      diacritic-folding feature half-wired.
+- [ ] **nine discarded results the user would expect feedback from.**
+      `core.rs` 887/900 (every scrobble failure forever, so a revoked
+      token is indistinguishable from working); ~640 (a failed
+      favorites write while the star stays lit all session, where the
+      remote path next to it correctly reverts and reports); 784-797
+      (four consecutive silent returns in subtitle auto-fetch, so a
+      wrong key looks identical to "no subtitles exist"); ~735
+      (`open_starred` drops the `password_file` error `client_for`
+      returns a `Result` to preserve); `main.rs` ~2062 (the
+      restored-queue refill discards every per-track status, so a
+      moved library shows a full queue in the ui and an empty playlist
+      in mpv); `main.rs` ~4331 (skip-next has neither the last-track
+      guard nor the message `Op::SkipNext` has); `catalog.rs` ~188 /
+      `library.rs` ~392 / `core.rs` ~1150 (a full disk silently kills
+      the startup cache, the queue resume and download bookkeeping).
+      `config::save_or_warn` is the established pattern and is used
+      correctly at all 16 settings sites.
+- [ ] **two hardcoded keys in rendered text.** `ui/queue.rs` ~188
+      hardcodes `'a'` for the remappable `Enqueue` ("enter on a song
+      to start, 'a' to add"), the exact bug class
+      `help::Key::Bound` exists to prevent and that the roadmap
+      records fixing in onboarding. `ui/keybinds_menu.rs` ~34 says
+      "k to close" while lowercase `k` moves the selection (closing is
+      `K` or Esc) and the same screen's footer says "j/k select".
+- [ ] **`main.rs` ~556: `wim` has no `--help`.** it handles only
+      `--version` and silently ignores every other argument, so
+      `wim --help` and `wim song.mp3` both just start the TUI with no
+      message. the sibling binary has a full `--help`, `-c`, script
+      support and an explicit unknown-option refusal
+      (`bin/shellswim/cli.rs` ~48, with the comment "guessing at a
+      typo in something that controls playback is worse than saying
+      so").
+
+**checked and found fine; do not re-audit.** recorded so the next pass
+does not spend itself here.
+
+- **no reachable `usize`/`u16` underflow anywhere in `src/ui/*` or
+  `src/layout.rs`.** every raw `-` was traced case by case; nothing
+  wraps at 10x3 or at the 20-column sidebar minimum. the class that
+  actually bites the ui is out-of-rect paint and layout-versus-hitmap
+  disagreement, not wrapping arithmetic.
+- `hit.rs`, `scroll.rs`, `progress.rs`, `theme.rs`, `anim.rs`
+  (`clamp_hz` handles zero/negative/NaN/540Hz; every period guard is
+  there; both compositor parsers are wired and have garbage-input
+  tests), `controlsbar.rs`, `raster.rs`, `divider.rs`, `junctions.rs`,
+  `albumart.rs`, `logos.rs`, `visualizer.rs`, `help.rs`, `helpbox.rs`,
+  `login.rs`, `onboarding.rs`, `searchbox.rs`, `miniplayer.rs`,
+  `lyrics_view.rs`, `queue.rs`, `suggestions.rs`.
+- **every direct-index site in render code** (`results_list.rs` ~229,
+  `browse.rs` ~421, `queue.rs` ~218, `suggestions.rs` ~180, eq_menu's
+  `PRESETS`/`BAND_HZ`, `keybinds_menu.rs` ~59, `banner.rs` ~70)
+  indexes a collection built from the same slice inside the same
+  render call, so a corpus resync, a scan batch landing or a queue
+  mutation between keypress and render cannot land out of range.
+- **async paths with a correct guard**: `browse::Loader`'s generation
+  (checked pre-send and on arrival, structural across all seven `Load`
+  variants); `coverart::Cache` (identity by `Key`, not a counter, and
+  `ProtocolCache` holds key and protocol as one tuple so they cannot
+  desync); `download::DownloadEvent` (every variant id-tagged, looked
+  up rather than applied to "the current thing"); `graphics::ArtProbe`;
+  mpv ipc (per-request channel plus `request_id`, timed-out replies
+  removed from `pending`); `Op::Rescan`; the remote-search merge
+  (add-only, and `resync_results` re-finds the cursor by identity);
+  enrichment replies.
+- `PlayQueue`'s index arithmetic: `remove`/`move_entry` carry `pos`
+  correctly in all cases and refuse out of range; `set_pos` is
+  absolute so `-1` and over-range are `Unresolved` and a re-report is
+  `Unchanged`, so track-change hooks cannot double-fire;
+  `mpv::playlist_move` correctly converts mpv's displace-target
+  off-by-one.
+- `shellsong.rs` parsing beyond the findings above:
+  `statements`/`matching`/`split_commas` use `bytes[i] as char` but
+  only act on ascii bytes, so their offsets are always char
+  boundaries; `extension()`, `token_bounds`, `in_string` and the edit
+  primitives are char-aware and `Console::cursor` can only be a
+  boundary; `parse_time`'s percent, colon and unit forms reject NaN,
+  negatives, >3 parts and repeated units; `Ty::Count`/`Index`/
+  `Indices`/`Speed` all range-check; one `expect` in the whole
+  non-test half (a table invariant), no `unwrap`, no unchecked
+  indexing; `Program::guard` range-checks every queue index.
+- `eq.rs` (the Gaussian pivot in `compensated_gains` cannot be zero,
+  `clamp_gains` neutralises non-finite config input,
+  `build_af_filter`'s label matches `mpv::PROP_LEVEL_RMS`),
+  `queues::slug` (cannot escape the queues directory),
+  `Ramp::progress`/`sleep_step`/`seek_target`/`volume_target` (every
+  divisor guarded), `Bindings` (keys come only from `key()` so stored
+  and looked-up keys cannot drift), `identity_of` (`Silence` gets an
+  empty identity).
+- `term.rs`, including the panic hook: `restore()` emits no `?25h`,
+  but `TerminalGuard`'s drop order runs `restore()` and then ratatui's
+  `Terminal::drop`, which shows the cursor, on both the normal and the
+  unwinding path.
+- `notify.rs` mechanics (repeat coalescing with a refreshed timer,
+  `MAX_STACKED` on both push paths, progress boxes exempt from expiry,
+  `finish_progress` falling back to a fresh push so an outcome is
+  never lost).
+- **the wide-glyph handling that must not be regressed**:
+  `ui/draw.rs`'s advance-by-`char_cells` plus blank-the-trailing-cell
+  (and `Buffer::diff` skipping it), `banner::is_line_art` keeping the
+  2-cell `ＷＩＭ` logo out of the picker, `lyrics_view`'s wrap,
+  `browse::wrap_bio`, `searchbox`'s cursor from the writer's returned
+  x, and ~20 other measured sites. legitimate byte/char length at
+  `notify.rs` ~120, `core.rs` ~3009, `search.rs` ~476,
+  `queues.rs` ~194, `keymap.rs` ~247.
+- well-covered test areas: `eq.rs` (33, all wired to live call sites),
+  `cache.rs` (34, including the pre-play-days migration), `ui/*`
+  (~400, clean on the pinned-function pattern), `undo.rs`'s `Tree`
+  internals (21, injected clock), `config.rs` (8, every pre-rename
+  `album_art` alias). the 24 benchmark `#[ignore]`s are correctly
+  labelled measurements.
+- `src/mpv.rs` ~224 builds the ipc socket path under `/tmp` with pid
+  plus sequence. `XDG_RUNTIME_DIR` would be the right directory on a
+  multi-user box, but the remove-then-bind window is too narrow to
+  call a finding.
+
 ### stage 4: the queue timeline (started)
 
 - [x] **`wait(15s)` as an alias for `silence`** (maintainer, asked
