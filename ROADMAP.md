@@ -850,6 +850,15 @@ mpv loaded, a generated silence source included".
 
 ### stage 4: the queue timeline (started)
 
+- [x] **`wait(15s)` as an alias for `silence`** (maintainer, asked
+      mid-run). one line in the command table, because aliases resolve
+      before lowering, so there is no second arm to keep in step; a
+      test asserts `wait(15s)` and `silence(15s)` lower identically.
+      `silence` stays canonical: it names what actually plays, a
+      generated silent source rather than a suspended player, which
+      matters because `pause()` already exists and means something
+      else.
+
 - [x] **a silence is a real queue entry.** `SearchItem::Silence {
       secs }`, resolving to `av://lavfi:anullsrc=d=N`, so mpv loads it
       as a file like any other and `PlayQueue`'s invariant (`entries`
@@ -1504,10 +1513,12 @@ earlier) removes that for alacritty; elsewhere it still races.
       as far as the call site. worth remembering that a
       "insert before the next blank line" edit can land inside a
       function body.
-- [ ] **one commit on that branch should have been two** (`ede72c0`):
+- [x] **one commit on that branch should have been two** (`ede72c0`):
       the shellswim files were staged when the merge was resolved, so
-      they went in with it. The message says so. Nothing to fix, worth
-      not repeating.
+      they went in with it. The message says so. **Unactionable by
+      construction** -- the commit is published, and rewriting it is
+      not worth it -- so this is checked off rather than left looking
+      like outstanding work. Worth not repeating.
 
 ## shellswim and the undo tree (maintainer, 2026-10-31)
 
@@ -1539,7 +1550,7 @@ the order below is not a preference, it is a dependency.
       which until now had no motivation beyond tidiness. it has one
       now: the decomposition is what makes a second front-end possible,
       and shellswim is the proof the seam is in the right place.
-- [ ] **undo and redo as a tree, not a stack.** the maintainer's words:
+- [x] **undo and redo as a tree, not a stack.** the maintainer's words:
       "nice decision trees that should be super smart and dynamic". a
       tree rather than linear history means undoing three steps and
       then doing something new does not destroy the branch you left;
@@ -1613,8 +1624,8 @@ the order below is not a preference, it is a dependency.
       rather than an artifact the user now has, so restoring and
       re-writing leaves nothing behind. the price is that the snapshot
       must carry vars and bindings.
-- [ ] **wiring the undo tree**, which is what is left and is the
-      larger half. two pieces:
+- [x] **wiring the undo tree** -- done, in three slices; every
+      sub-item below is closed. two pieces as scoped:
       - ~~**the `Snapshot` type and where it is taken.**~~ **done,
         and the re-pricing changed the answer.** both recorded options
         (28 new `Action` variants, or a re-entrance guard) assumed the
