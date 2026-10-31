@@ -3562,6 +3562,28 @@ fn main() -> anyhow::Result<()> {
     // parsed against them, so they are read per line rather than per
     // keystroke, and `define`/`unset` write the file back.
     let mut shellsong_vars = shellsong_host::load_vars();
+    // `run(...)`'s completion candidates, snapshotted on console open
+    // for the same reason the saved queues are.
+    let mut shellsong_scripts: Vec<String> = Vec::new();
+    // `~/.config/wim/init.shg`, if there is one, as the first program
+    // the step loop drives. Spelled as the language rather than wired
+    // specially: it is one `run(init)` line through the same parse and
+    // the same stepper, so a startup script and a typed one cannot
+    // behave differently.
+    if shellsong_host::has_init_script() {
+        let read = |name: &str| shellsong_host::read_script(name);
+        let world = shellsong::World {
+            scope: &shellsong_vars,
+            read: Some(&read),
+        };
+        let line = format!("run({})", shellsong_host::INIT_SCRIPT);
+        match shellsong::Program::parse_in(&line, &world) {
+            Ok(program) => shellsong_program = Some(Box::new(program)),
+            // into the scrollback rather than a toast: it is a
+            // shellsong error and `:` is where you go to read them.
+            Err(e) => console.fail(format!("{}.shg: {e}", shellsong_host::INIT_SCRIPT)),
+        }
+    }
     // backs `Env::search_settled`; see `shellsong_host::SearchSettle`.
     let mut settle = SearchSettle::default();
     // the queue view owns main_content like the browse/lyrics views do;
@@ -5312,6 +5334,9 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 shellsong::Step::Note(text) => console.note(text),
+                // a script's bad line: reported as an error, but the
+                // rest of the file still runs.
+                shellsong::Step::Warn(text) => console.fail(text),
                 // the results this is waiting on are not in yet; resume
                 // next frame rather than spinning or blocking.
                 shellsong::Step::AwaitResults { .. } => break,
@@ -5404,6 +5429,7 @@ fn main() -> anyhow::Result<()> {
                             saved: &saved_queues,
                             eq_presets: eq_preset_names(&cfg.eq_custom_presets),
                             vars: &shellsong_vars,
+                            scripts: &shellsong_scripts,
                         },
                     );
                 } else if !help_open {
@@ -5869,6 +5895,7 @@ fn main() -> anyhow::Result<()> {
                         saved: &saved_queues,
                         eq_presets: eq_preset_names(&cfg.eq_custom_presets),
                         vars: &shellsong_vars,
+                        scripts: &shellsong_scripts,
                     };
                     // the whole `KeyEvent`, not just `key.code`: the
                     // console reads ctrl for its accept key, which no
@@ -5960,6 +5987,7 @@ fn main() -> anyhow::Result<()> {
                     // one disk read per open, so completion itself
                     // never touches it.
                     saved_queues = queues::list();
+                    shellsong_scripts = shellsong_host::script_names();
                     continue;
                 }
 

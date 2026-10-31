@@ -46,7 +46,9 @@ should be added that breaks one.
   both directions. `seek(30s)` and `moveto(+30s)` are both errors that
   tell you which one you meant.
 - **r9. nothing is silent.** every call reports one line into the
-  scrollback, including no-ops.
+  scrollback, including no-ops. a script's bad line reports as an error
+  line (`Step::Warn`) and the program carries on; everything else
+  reports as a note.
 - **r10. one name, one meaning.** no arity overloading, and no second
   name for something a first name already does. every screen is a
   `view` target rather than its own verb.
@@ -107,6 +109,7 @@ messages come from, and (r12) what completion offers.
 | `new_name` | a name you are inventing | nothing; hint only |
 | `saved_name` | the name of a saved queue | the saved queues |
 | `var_name` | a variable name | the defined variables |
+| `script_name` | a `.shg` script, or a path to one | the scripts in the config dir |
 | `command_name` | a command name | the command table |
 | `call` | a nested call | the command table |
 | keyword sets | one of an enumerated list | that list |
@@ -441,6 +444,7 @@ exactly, which is the point.
 ```
 view(target)            see above                              [show, ls]
 rescan()                re-walk the local library
+run(script)             run a .shg script; dry(run(x)) previews it
 sleep(after)            fade out and pause after a delay; sleep(off) cancels
 fade(direction, over?)  fade the volume in or out
 help(name?)             list every command, or one command's signature
@@ -452,6 +456,73 @@ dead: the last `crossfade_seconds` of the wait fade the volume down,
 then it pauses and puts the level back so unpausing later is not
 silent. A toast says so when it fires; there is no countdown on the
 player screen yet.
+
+### scripts
+
+a `.shg` file is shellsong, one statement per line, with `#` comments.
+
+```
+# ~/.config/wim/morning.shg
+let morning = [mazzy star, boards of canada]
+
+eq(flat)
+volume(40%)
+queue(morning)
+```
+
+```
+: run(morning)
+: dry(run(morning))
+```
+
+`~/.config/wim/init.shg` runs once at startup if it is there, as one
+`run(init)` through the same parse and the same stepper, so a startup
+script cannot behave differently from a typed one.
+
+**a script is not a second execution path.** `run(path)` is inlined
+while the line is parsed: the file's statements are lowered into the
+same `Program` the rest of the line lowers into, so a script that
+searches suspends on `AwaitResults` and resumes exactly as `play(crest)`
+typed by hand does. three things fall out of that for free rather than
+being written twice:
+
+- `dry(run(x))` previews the whole file, because the plan is the real
+  lowered program. this matters more here than anywhere: a file can
+  `clear_queue` or `download`, and you should be able to read what it
+  will do first.
+- a `let` on line 1 is visible on line 6, because the expansion scope
+  grows as statements are lowered. the same thing makes
+  `let a = [x]; play(a)` work typed on one line.
+- nothing new has to be told about `repeat`, the kind ladder or the
+  await, because none of them know a script happened.
+
+**one statement per line, and a bad line does not stop the file.** it
+is reported with the file and the line number, and the rest runs:
+
+```
+: run(mix)
+mix:2: col 1: unknown command 'xyzzy' (at 'xyzzy')
+mix:4: col 8: volume: 'nonsense' is not a time
+```
+
+that is the same stance a term that matches nothing already takes (one
+bad term never aborts a queue build), and for the same reason: the
+statements are independent, so a typo on line 3 should not cost you the
+other twenty. `;` still separates statements inside one line, but a
+call may **not** span lines in a file, because continuing past a bad
+line needs a line to blame. a *runtime* failure is unchanged and still
+stops the program, since that is `Program`'s existing contract.
+
+**naming one.** a bare name is a script in the config dir
+(`run(morning)` is `~/.config/wim/morning.shg`), the same shape
+`load_queue(name)` has; anything with a `/`, a leading `.` or a leading
+`~` is taken as a path, so a script can live wherever you keep it. a
+bare name that misses goes through the usual "did you mean". the file is
+read while the line is *parsed*, so a wrong name is a parse error and
+the console keeps your line for you to fix.
+
+a script may `run` another, up to 8 frames deep; past that it reports
+and stops rather than recursing.
 
 ### higher-order
 
@@ -624,6 +695,14 @@ blocks on `AwaitResults` until the host says the results for that
 query have settled. a search that never settles times out with an
 error rather than hanging.
 
+a `.shg` script is the same machine: `run(path)` inlines the file's
+statements into the program being built, so there is exactly one
+stepper, one await path and one `dry` for a typed line and for a file.
+`World` is the parse-time counterpart of `Env`: the variables a term
+might name and the contents of a script `run(...)` names, both of which
+have to be known while the program is still being built, which is what
+lets `dry()` report a whole file's plan.
+
 every `Op` is applied by the host through the same call its keybind
 already uses, so a shellsong command and a keypress can never drift
 apart. `Env` is the only thing the executor knows about the world,
@@ -664,8 +743,9 @@ Console::cycle(&self) -> Option<&Cycle>
 // suggestion.
 
 Program::parse(input: &str) -> Result<Program, ParseError>
-Program::parse_in(input: &str, scope: &Scope)
-    -> Result<Program, ParseError>     // expands variables
+Program::parse_in(input: &str, world: &World)
+    -> Result<Program, ParseError>     // expands variables, inlines run()
+World::bare() -> World<'static>        // no variables, no scripts
 Program::step(&mut self, env: &Env) -> Step
 Program::is_done(&self) -> bool
 
@@ -687,6 +767,8 @@ trait Candidates {
     fn saved_queues(&self) -> Vec<String> { Vec::new() }
     fn eq_presets(&self) -> Vec<String> { Vec::new() }
     fn scope(&self) -> &Scope;          // defaults to an empty one
+    fn scripts(&self) -> Vec<String> { Vec::new() }
+    fn read_script(&self, name: &str) -> Result<String, String>;
 }
 ```
 
@@ -817,7 +899,14 @@ $XDG_STATE_HOME/wim/shellsong_history   the command history
 $XDG_STATE_HOME/wim/shellsong_ranks     the completion frequency store
 $XDG_STATE_HOME/wim/queues/<name>.toml  one saved queue each
 $XDG_STATE_HOME/wim/vars.toml           every variable, in one map
+$XDG_CONFIG_HOME/wim/<name>.shg         one script each
+$XDG_CONFIG_HOME/wim/init.shg           the one that runs at startup
 ```
+
+the scripts are the one shellsong thing under the *config* dir rather
+than the state dir: a script is something you write and keep, which is
+the class of thing `config.toml` is; history, ranks, queues and
+variables are all things the app wrote for you.
 
 the variables are one file rather than a file each, unlike the saved
 queues: a queue entry carries a server url, a song id and a title, so
