@@ -591,21 +591,38 @@ impl TrackResolver {
 /// key's instant path and the drain that handles a fetched one, so the
 /// two cannot report differently.
 pub fn append_resolved(tracks: &[SearchItem], core: &mut CoreCtx) {
+    // counted, not assumed: the old version reported `tracks.len()`,
+    // the *requested* count, while silently dropping anything mpv
+    // cannot play directly, so a mixed album said "queued 12 tracks"
+    // after queueing nine and never mentioned the three.
+    let mut queued = 0usize;
+    let mut skipped = 0usize;
     for t in tracks {
-        let s = enqueue_track(core.player, t, core.cache, core.queue, core.app.shuffle);
-        if s.starts_with("error") {
-            core.notifications.push(Severity::Error, s);
+        match enqueue_track(core.player, t, core.cache, core.queue, core.app.shuffle) {
+            Enqueued::Queued { .. } => queued += 1,
+            Enqueued::NotPlayable => skipped += 1,
+            Enqueued::Failed(why) => {
+                skipped += 1;
+                core.notifications.push(Severity::Error, why);
+            }
         }
     }
-    let n = tracks.len();
-    core.notifications.push(
-        Severity::Info,
-        if n == 1 {
-            "queued 1 track".to_string()
-        } else {
-            format!("queued {n} tracks")
-        },
-    );
+    if queued == 0 {
+        // nothing went in, so "queued 0 tracks" would be the wrong
+        // shape of message entirely.
+        if skipped > 0 {
+            core.notifications
+                .push(Severity::Error, format!("queued nothing{}", lost_note(skipped)));
+        }
+        return;
+    }
+    let note = if queued == 1 {
+        "queued 1 track".to_string()
+    } else {
+        format!("queued {queued} tracks")
+    };
+    core.notifications
+        .push(Severity::Info, format!("{note}{}", lost_note(skipped)));
 }
 
 /// Inserts a resolved batch directly behind what is playing.
@@ -1218,18 +1235,46 @@ fn lost_note(lost: usize) -> String {
 /// is on the new entry is then moved into a random upcoming slot, which
 /// `App::enqueue` used to do to its own queue copy alone, desyncing it
 /// from mpv's strictly-appended playlist on the spot.
+/// What `enqueue_track` did, instead of a sentence its callers parse.
+///
+/// The prefixes used to be the contract, and the callers **disagreed
+/// about which ones mattered**: `append_resolved` tested only
+/// `starts_with("error")`, so a track mpv cannot play directly was
+/// swallowed *and* counted as queued, which is how "queued 12 tracks"
+/// could mean nine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Enqueued {
+    /// In both mpv's playlist and the index map. `note` is the label,
+    /// plus a caveat when the shuffle move was refused: the track is
+    /// still queued, just not shuffled in, so that is a warning rather
+    /// than a failure.
+    Queued { note: String },
+    /// Nothing mpv can play directly. `resolve_tracks` expands these,
+    /// so arriving here means a caller skipped that step; it is a skip
+    /// and not an error, and must not count as queued.
+    NotPlayable,
+    /// mpv or the index map refused.
+    Failed(String),
+}
+
+impl Enqueued {
+    pub fn is_queued(&self) -> bool {
+        matches!(self, Enqueued::Queued { .. })
+    }
+}
+
 pub fn enqueue_track(
     player: &mpv::Mpv,
     item: &SearchItem,
     cache: &Arc<Mutex<CacheIndex>>,
     queue: &mut PlayQueue,
     shuffle: bool,
-) -> String {
+) -> Enqueued {
     let Some(path) = resolve_playable(item, cache) else {
-        return "not directly playable (expand via resolve_tracks first)".to_string();
+        return Enqueued::NotPlayable;
     };
     if let Err(e) = player.playlist_append(&path) {
-        return format!("error queuing file: {e}");
+        return Enqueued::Failed(format!("error queuing file: {e}"));
     }
     let appended = queue.append(item.clone(), shuffle);
     if let Some(to) = appended.moved_to {
@@ -1240,10 +1285,14 @@ pub fn enqueue_track(
         // which broke the invariant permanently and said nothing.
         if let Err(e) = player.playlist_move(appended.appended_at, to) {
             queue.move_entry(to, appended.appended_at);
-            return format!("queued {}, but could not shuffle it in: {e}", label(item));
+            return Enqueued::Queued {
+                note: format!("queued {}, but could not shuffle it in: {e}", label(item)),
+            };
         }
     }
-    format!("queued: {}", label(item))
+    Enqueued::Queued {
+        note: format!("queued: {}", label(item)),
+    }
 }
 /// Resyncs mpv's upcoming playlist to `items` (after a shuffle)
 /// without disturbing whatever's currently playing; mpv's own
@@ -2523,11 +2572,16 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 // with shuffle on: a silence is positional by nature,
                 // and the one thing worse than a gap in the wrong
                 // place is a gap somewhere nobody chose.
-                let status = enqueue_track(core.player, &item, core.cache, core.queue, false);
-                if status.starts_with("error") {
-                    op_fail(status)
-                } else {
-                    op_note(format!("queued a {span} silence"))
+                match enqueue_track(core.player, &item, core.cache, core.queue, false) {
+                    Enqueued::Queued { .. } => op_note(format!("queued a {span} silence")),
+                    // a generated silence always resolves, so this
+                    // arm is a bug rather than a user mistake; say so
+                    // instead of reporting a queued gap that is not
+                    // there.
+                    Enqueued::NotPlayable => {
+                        op_fail("a silence did not resolve to a playable url")
+                    }
+                    Enqueued::Failed(why) => op_fail(why),
                 }
             }
         }
@@ -3107,9 +3161,12 @@ pub fn start_session(
 /// the same `move_entry` + `playlist_move` pairing the queue view's
 /// reorder uses. Appended unshuffled on purpose: `front` means front.
 pub fn enqueue_next(item: &SearchItem, core: &mut CoreCtx) -> Result<(), String> {
-    let status = enqueue_track(core.player, item, core.cache, core.queue, false);
-    if status.starts_with("error") || status.starts_with("not ") {
-        return Err(status);
+    match enqueue_track(core.player, item, core.cache, core.queue, false) {
+        Enqueued::Queued { .. } => {}
+        Enqueued::NotPlayable => {
+            return Err("not directly playable (expand via resolve_tracks first)".to_string())
+        }
+        Enqueued::Failed(why) => return Err(why),
     }
     let from = core.queue.entries().len().saturating_sub(1);
     let to = core.queue.pos().map_or(0, |p| p + 1);
@@ -3854,11 +3911,14 @@ mod seam_tests {
 
     /// Everything a `CoreCtx` needs that is not the mpv handle, owned,
     /// so a test can build one without a front-end in sight.
-    struct Harness {
+    /// `pub(super)` so sibling test modules can share it rather than
+    /// carrying a near-copy; `undo.rs` already has one, which the
+    /// audit recorded as wanting exactly this.
+    pub(super) struct Harness {
         cfg: config::Config,
         app: app::App,
-        notifications: Notifications,
-        queue: PlayQueue,
+        pub(super) notifications: Notifications,
+        pub(super) queue: PlayQueue,
         previous_track: Option<SearchItem>,
         cache: Arc<Mutex<CacheIndex>>,
         download_tx: mpsc::Sender<DownloadEvent>,
@@ -3896,7 +3956,7 @@ mod seam_tests {
     }
 
     impl Harness {
-        fn new() -> Harness {
+        pub(super) fn new() -> Harness {
             let (download_tx, _download_rx) = mpsc::channel();
             let (subtitle_tx, _subtitle_rx) = mpsc::channel();
             let (_scan_tx, scan_rx) = mpsc::channel();
@@ -3944,7 +4004,7 @@ mod seam_tests {
             }
         }
 
-        fn ctx<'a>(&'a mut self, player: &'a mpv::Mpv) -> CoreCtx<'a> {
+        pub(super) fn ctx<'a>(&'a mut self, player: &'a mpv::Mpv) -> CoreCtx<'a> {
             CoreCtx {
                 cfg: &self.cfg,
                 player,
@@ -5465,7 +5525,7 @@ mod index_map_tests {
         assert!(played, "{status}");
 
         let status = enqueue_track(&player, &silence(2), &cache, &mut queue, false);
-        assert!(status.starts_with("queued: "), "{status}");
+        assert!(status.is_queued(), "{status:?}");
         assert_both_sides_agree(&player, &queue, &cache);
         assert_eq!(lengths(&queue), vec![1, 2]);
     }
@@ -5490,7 +5550,7 @@ mod index_map_tests {
 
         for secs in [10, 20, 30] {
             let status = enqueue_track(&player, &silence(secs), &cache, &mut queue, true);
-            assert!(status.starts_with("queued: "), "{status}");
+            assert!(status.is_queued(), "{status:?}");
             assert_both_sides_agree(&player, &queue, &cache);
         }
         assert_eq!(queue.entries().len(), 7);
@@ -5508,7 +5568,79 @@ mod index_map_tests {
 /// refuses before touching it.
 #[cfg(test)]
 mod enqueue_status_tests {
+    use super::seam_tests::Harness;
     use super::*;
+
+    /// A batch reports what went in, not what was asked for.
+    ///
+    /// `append_resolved` used to push `tracks.len()` and test only
+    /// `starts_with("error")`, so an item mpv cannot play directly was
+    /// dropped *and* counted: a mixed album said "queued 12 tracks"
+    /// having queued nine, and never mentioned the three. the count is
+    /// the whole point of the message, so an inflated one is worse
+    /// than no message.
+    #[test]
+    #[ignore]
+    fn a_batch_counts_what_went_in_and_says_what_did_not() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+
+        // two playable, one that `resolve_tracks` should have expanded
+        // and nobody did, which is exactly the shape that lied.
+        let tracks = vec![
+            SearchItem::Silence { secs: 1 },
+            SearchItem::Album {
+                id: "al1".into(),
+                name: "crest".into(),
+                artist: "bladee".into(),
+                client: crate::browse::fixtures::test_client(),
+            },
+            SearchItem::Silence { secs: 2 },
+        ];
+        {
+            let mut core = h.ctx(&player);
+            append_resolved(&tracks, &mut core);
+        }
+
+        assert_eq!(h.queue.entries().len(), 2, "only the two that resolved");
+        let said = h.notifications.drain_text().join(" | ");
+        assert!(
+            said.contains("queued 2 tracks"),
+            "it must count what went in, not what was handed over: {said}"
+        );
+        assert!(
+            !said.contains("queued 3 tracks"),
+            "the requested count is the lie this fixed: {said}"
+        );
+        assert!(
+            said.contains("skipped"),
+            "and it must say something was dropped: {said}"
+        );
+    }
+
+    /// Nothing queued is not "queued 0 tracks".
+    #[test]
+    #[ignore]
+    fn a_batch_that_queued_nothing_does_not_claim_a_count() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let tracks = vec![SearchItem::Album {
+            id: "al1".into(),
+            name: "crest".into(),
+            artist: "bladee".into(),
+            client: crate::browse::fixtures::test_client(),
+        }];
+        {
+            let mut core = h.ctx(&player);
+            append_resolved(&tracks, &mut core);
+        }
+        assert!(h.queue.entries().is_empty());
+        let said = h.notifications.drain_text().join(" | ");
+        assert!(said.contains("queued nothing"), "{said}");
+        assert!(!said.contains("queued 0"), "{said}");
+    }
 
     #[test]
     #[ignore]
@@ -5525,12 +5657,14 @@ mod enqueue_status_tests {
         };
 
         let status = enqueue_track(&player, &album, &cache, &mut queue, false);
-        // the prefix is the contract: `enqueue_next` reads "not ",
-        // `append_resolved` reads only "error" and would report this
-        // album as queued.
-        assert!(
-            status.starts_with("not "),
-            "the refusal prefix both callers parse: {status}"
+        // this used to be a *prefix* contract, and the two callers
+        // disagreed about it: `enqueue_next` read "not " while
+        // `append_resolved` read only "error", so it reported this
+        // album as queued. a variant cannot be half-read.
+        assert_eq!(
+            status,
+            Enqueued::NotPlayable,
+            "a refusal both callers have to see"
         );
         assert!(
             queue.entries().is_empty(),
@@ -5549,7 +5683,7 @@ mod enqueue_status_tests {
 
     #[test]
     #[ignore]
-    fn a_queued_track_reports_the_success_prefix_neither_caller_treats_as_failure() {
+    fn a_queued_track_is_queued_and_not_a_refusal_or_a_failure() {
         let player = mpv::Mpv::spawn().expect("mpv on PATH");
         let _ = player.set_property("ao", serde_json::json!("null"));
         let cache = Arc::new(Mutex::new(CacheIndex::default()));
@@ -5562,9 +5696,9 @@ mod enqueue_status_tests {
             &mut queue,
             false,
         );
-        assert!(status.starts_with("queued: "), "{status}");
-        assert!(!status.starts_with("error"), "{status}");
-        assert!(!status.starts_with("not "), "{status}");
+        assert!(status.is_queued(), "{status:?}");
+        assert_ne!(status, Enqueued::NotPlayable);
+        assert!(!matches!(status, Enqueued::Failed(_)), "{status:?}");
         assert_eq!(queue.entries().len(), 1);
     }
 }
