@@ -918,10 +918,36 @@ third.
       other.** this one named a fix precisely enough to sound verified
       and would have had me build an intent, a resolver path and a
       drain for a call that cannot block.
-- [ ] **`trigger_downloads` resolves synchronously too** (download
-      selected on an album or artist). lowest of the three in felt
-      cost, since a download is already understood to take a while,
-      but it is the same freeze.
+- [x] **`trigger_downloads` resolved synchronously too** (download
+      selected on an album or artist) -- and with `Action::Play`
+      disproved above, this was the **last** blocking network call
+      reachable from a keypress.
+      it shares the resolver rather than growing a fourth loader,
+      because expanding an album is the same `resolve_tracks` fan-out
+      either way; `Enqueue` became `Intent` (`Back`, `Front`,
+      `Download`) and `EnqueueResolver` became `TrackResolver`, since
+      a variant called `Download` on an enum called `Enqueue` is a
+      lie. `trigger_downloads` split into `download_tracks` (the part
+      after resolution) and `download_resolved` (the same with the
+      `DownloadCtx` built from `CoreCtx`, so the three call sites do
+      not each write that literal).
+      **sharing it introduced a cross-concern worth knowing about**:
+      `invalidate` means "the queue these were resolved for is gone",
+      which is true of a queue batch and says nothing about a
+      download, whose tracks go to disk. unguarded, `Op::ClearQueue`
+      would have cancelled a download asked for seconds earlier. so
+      `Intent::queue_bound()` gates both the worker check and `poll`,
+      and a test pins it (fails if the gate is dropped).
+      **a ux bug found on the way**: both keypress sites did
+      `let _ = trigger_downloads(...)`, discarding the status, so
+      asking to download something already cached looked like a dead
+      key. they now report, but only when nothing started: each
+      started track already pushes a progress toast, so "downloading 3
+      track(s)" over three progress bars is noise. the drain always
+      reports, because its fetch already said "resolving ..." and
+      going quiet would leave that as the last word.
+      the two key sites also collapsed into one `download_selected`,
+      which they should have been from the start.
 - [x] **`open_starred_view` fetched starred songs from every configured
       server synchronously** -- fixed by routing it through
       `browse::Loader` rather than building a fourth loader, which is
@@ -979,7 +1005,7 @@ Checked and genuinely fine: `fetch_navidrome_everything` and
 enrichment and catalog fetches are background, `search3` runs in the
 debounced search thread, and the local-favorites path is a file write.
 
-- [ ] **pressing the lyrics key freezes the app on the network.**
+- [x] **pressing the lyrics key freezes the app on the network.**
       `lyrics::Client::lookup` is a round trip to lrclib and it is
       called **synchronously from the input path** at two sites in
       `main.rs`: the `OpenLyrics` key handler and the shellsong op. the
@@ -993,16 +1019,21 @@ debounced search thread, and the local-favorites path is a file write.
       mutation-checked by deleting the check and watching exactly those
       two tests fail. `cfg_attr(not(test), allow(dead_code))` until
       wired.
-      **what is left is two call sites**: replace each `lookup` with
-      `request`, drain `poll` next to the other channel drains in the
-      main loop, and `invalidate` when the lyrics view closes or the
-      track changes. blocked only because `main.rs` is owned by the
-      library split tonight.
-      **while in there, audit the input path for the same pattern.**
-      the two found so far (album/artist open, lyrics) were both a
-      client call straight from a key handler, so grepping for network
-      calls reachable from `dispatch_action` and `run_shellsong_op` is
-      the cheap way to find the third.
+      both call sites were wired in `15ea442`; there is no blocking
+      `lookup` left in either binary.
+      **the audit it asked for is finished, and the input path is
+      clean.** the guess that a third would turn up was low: there
+      were four more (star, starred, queueing, download selected),
+      every one of them the same shape, a client called straight from
+      a key handler. all fixed. the one it was most confident about,
+      `Action::Play` on an album, **was not real at all** (see above),
+      which is the more useful half of the lesson: the audit found
+      both more freezes than it expected and a freeze that did not
+      exist.
+      what the shape has in common, worth checking any new key
+      handler against: a `subsonic::Client` method, or anything
+      calling `resolve_tracks`, reachable from `dispatch_action` or
+      `run_shellsong_op` without a channel in between.
 
 - [ ] **the remaining search cost is the result clone, and it needs an
       api change to fix.** for a broad query at 40k items, 3-5ms of a

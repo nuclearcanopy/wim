@@ -36,7 +36,7 @@ macro_rules! core_ctx {
             lyrics_client: &$h.lyrics_client,
             lyrics_loader: &mut $h.lyrics_loader,
             star_tx: &$h.star_tx,
-            enqueue_resolver: &mut $h.enqueue_resolver,
+            track_resolver: &mut $h.track_resolver,
             base_volume: &mut $h.base_volume,
             crossfade_enabled: &mut $h.crossfade_enabled,
             fade_in_started_at: &mut $h.fade_in_started_at,
@@ -53,8 +53,8 @@ macro_rules! core_ctx {
 }
 
 use wim::core::{
-    self, drive, CoreCtx, Drive, Enqueue, EnqueueResolver, RemoteSearchOutcome, ScrobbleState,
-    StarFailed, SubtitleReady,
+    self, drive, CoreCtx, Drive, Intent, RemoteSearchOutcome, ScrobbleState, StarFailed,
+    SubtitleReady, TrackResolver,
 };
 use wim::download::DownloadEvent;
 use wim::notify::Notifications;
@@ -97,7 +97,7 @@ pub struct Host {
     pub remote_starred: HashSet<String>,
     pub lyrics_client: lyrics::Client,
     pub lyrics_loader: lyrics::Loader,
-    pub enqueue_resolver: EnqueueResolver,
+    pub track_resolver: TrackResolver,
     pub star_tx: mpsc::Sender<StarFailed>,
     pub star_rx: mpsc::Receiver<StarFailed>,
     pub base_volume: f64,
@@ -177,7 +177,7 @@ impl Host {
             remote_starred: HashSet::new(),
             lyrics_client: lyrics::Client::new(),
             lyrics_loader: lyrics::Loader::new(),
-            enqueue_resolver: EnqueueResolver::new(),
+            track_resolver: TrackResolver::new(),
             star_tx,
             star_rx,
             base_volume,
@@ -225,20 +225,24 @@ impl Host {
         // a queue batch resolved; the resolver already dropped any from
         // a superseded request, which here would append to the queue
         // rather than merely drawing something stale.
-        while let Some((into, label, tracks)) = self.enqueue_resolver.poll() {
+        while let Some((into, label, tracks)) = self.track_resolver.poll() {
             let now = self.start.elapsed();
             let now_playing = self.play_queue.current().cloned();
             let mut core = core_ctx!(self, now, now_playing);
             match tracks {
-                Ok(tracks) if tracks.is_empty() => {
-                    core.console.note(format!("nothing to queue in {label}"))
-                }
+                Ok(tracks) if tracks.is_empty() => core
+                    .console
+                    .note(format!("nothing to {} in {label}", into.verb())),
                 Ok(tracks) => match into {
-                    Enqueue::Back => core::append_resolved(&tracks, &mut core),
-                    Enqueue::Front => match core::front_resolved(&tracks, &mut core) {
+                    Intent::Back => core::append_resolved(&tracks, &mut core),
+                    Intent::Front => match core::front_resolved(&tracks, &mut core) {
                         Ok(n) => core.console.note(format!("queued {n} tracks next")),
                         Err(why) => core.console.note(why),
                     },
+                    Intent::Download => {
+                        let done = core::download_resolved(&tracks, &mut core);
+                        core.console.note(done.status);
+                    }
                 },
                 Err(why) => core.console.note(why),
             }
