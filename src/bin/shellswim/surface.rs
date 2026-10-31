@@ -6,11 +6,11 @@
 //! and `view(eq)` saying where the eq lives are very different
 //! answers, and only one of them is true. See docs/library-seam.md.
 
+use wim::core;
 use wim::core::{op_fail, op_note, CoreCtx, Dispatch, Report, SelectStep, Surface};
 use wim::search::SearchItem;
 use wim::shellsong::ViewTarget;
 use wim::ui::results_list::label;
-use wim::{core, lyrics};
 
 /// What shellswim keeps that the core does not. Almost nothing, which
 /// is the point: the list below is the entire difference between the
@@ -144,8 +144,9 @@ fn now_line(name: &str, upcoming: usize) -> String {
     }
 }
 
-/// `view(lyrics)`: wim opens a pane, shellswim prints them. Same
-/// lookup, so the two cannot report different things.
+/// `view(lyrics)`: wim opens a pane, shellswim prints them. Both ask
+/// the same loader and render the reply through `core::lyrics_text`,
+/// so the two cannot report different things, and neither blocks.
 fn print_lyrics(core: &mut CoreCtx) -> (Dispatch, Report) {
     let Some(item) = core.now_playing.clone() else {
         return op_fail("nothing is playing");
@@ -153,31 +154,16 @@ fn print_lyrics(core: &mut CoreCtx) -> (Dispatch, Report) {
     let Some((artist, title, album)) = core::lyrics_query(&item) else {
         return op_fail("no lyrics for this item");
     };
-    match core.lyrics_client.lookup(&artist, &title, &album, None) {
-        Ok(Some(l)) => {
-            let text = lyrics_text(&l);
-            let lines: Vec<&str> = text.lines().collect();
-            let count = lines.len();
-            for line in lines {
-                core.console.note(line);
-            }
-            op_note(format!("{count} lines for {}", label(&item)))
-        }
-        Ok(None) => op_fail("no lyrics found"),
-        Err(e) => op_fail(format!("lyrics lookup failed: {e}")),
-    }
-}
-
-/// The api's own `instrumental` flag, not "both fields happened to be
-/// empty"; same precedence wim's lyrics pane uses.
-fn lyrics_text(l: &lyrics::Lyrics) -> String {
-    if l.instrumental {
-        return "(instrumental, no lyrics)".to_string();
-    }
-    l.plain
-        .clone()
-        .or_else(|| l.synced.clone())
-        .unwrap_or_else(|| "(no lyrics text available)".to_string())
+    let name = label(&item);
+    core.lyrics_loader.request(
+        core.lyrics_client,
+        name.clone(),
+        &artist,
+        &title,
+        &album,
+        None,
+    );
+    op_note(format!("fetching lyrics for {name}"))
 }
 
 #[cfg(test)]

@@ -51,6 +51,7 @@ pub struct Host {
     pub favorites: favorites::Favorites,
     pub remote_starred: HashSet<String>,
     pub lyrics_client: lyrics::Client,
+    pub lyrics_loader: lyrics::Loader,
     pub base_volume: f64,
     pub crossfade_enabled: bool,
     pub fade_in_started_at: Option<Instant>,
@@ -126,6 +127,7 @@ impl Host {
             favorites: favorites::load(),
             remote_starred: HashSet::new(),
             lyrics_client: lyrics::Client::new(),
+            lyrics_loader: lyrics::Loader::new(),
             base_volume,
             crossfade_enabled,
             fade_in_started_at: None,
@@ -168,6 +170,24 @@ impl Host {
     /// Each one is a `try_recv`, so this is the whole reason nothing
     /// in shellswim blocks.
     pub fn pump(&mut self) {
+        // a lyrics fetch landed. the loader has already dropped any
+        // reply for a track the user moved past, so whatever arrives
+        // belongs to the request still standing.
+        if let Some((track, result)) = self.lyrics_loader.poll() {
+            match result {
+                Ok(Some(l)) => {
+                    let text = wim::core::lyrics_text(&l);
+                    let count = text.lines().count();
+                    for line in text.lines() {
+                        self.console.note(line.to_string());
+                    }
+                    self.console.note(format!("{count} lines for {track}"));
+                }
+                Ok(None) => self.console.note(format!("no lyrics for {track}")),
+                Err(e) => self.console.note(format!("lyrics lookup failed: {e}")),
+            }
+        }
+
         while let Ok(ev) = self.player.events().try_recv() {
             let mpv::Event::PropertyChange { name, value } = ev else {
                 continue;
@@ -268,6 +288,7 @@ impl Host {
             favorites: &mut self.favorites,
             remote_starred: &mut self.remote_starred,
             lyrics_client: &self.lyrics_client,
+            lyrics_loader: &mut self.lyrics_loader,
             base_volume: &mut self.base_volume,
             crossfade_enabled: &mut self.crossfade_enabled,
             fade_in_started_at: &mut self.fade_in_started_at,

@@ -1114,11 +1114,29 @@ earlier) removes that for alacritty; elsewhere it still races.
       per-identity eq binding would be synthesised on track change and
       then never run.
 
-- [ ] **wire `lyrics::Loader`.** It landed on master unwired and
-      shellswim's `view(lyrics)` uses the blocking lookup too, matching
-      wim. Now that `main.rs` is free this is the three-line change
-      recorded above, and "nothing blocks" is shellswim's stated rule,
-      so it is the first thing to do.
+- [x] **wire `lyrics::Loader`.** done, in both binaries. all three
+      blocking call sites are gone: wim's lyrics key, wim's
+      `view(lyrics)` op, and shellswim's `print_lyrics`. each now
+      requests and returns at once, and the reply lands in the per-frame
+      drain each binary already had (next to the subtitle drain in wim,
+      inside `Host::pump` in shellswim). `core::lyrics_text` is shared,
+      so the pane and the console cannot disagree about one reply, and
+      the api's own `instrumental` flag still decides rather than "both
+      fields happened to be empty".
+      **it surfaced a design smell worth not suppressing.** once the op
+      only *requests*, `WimSurface`'s `lyrics_lines`/`lyrics_track`/
+      `lyrics_scroll` became write-only: the drain sets the loop's own
+      locals directly, so routing the reply back through the surface
+      would have been indirection for its own sake. clippy caught them
+      as never-read; the three fields are removed and
+      `open_wim_lyrics` no longer takes a surface at all. the seam got
+      smaller, which is the right direction for it.
+      my first attempt also inserted the shared helper **into the middle
+      of `artist_tracks`**, splitting that function so the helper was a
+      nested item and unreachable from outside the module. it compiled
+      as far as the call site. worth remembering that a
+      "insert before the next blank line" edit can land inside a
+      function body.
 - [ ] **one commit on that branch should have been two** (`ede72c0`):
       the shellswim files were staged when the merge was resolved, so
       they went in with it. The message says so. Nothing to fix, worth
