@@ -8,7 +8,7 @@ use ratatui::widgets::Widget;
 
 use crate::app::LoopMode;
 use crate::theme::{lerp, shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE, WHITE};
-use crate::ui::progress::fmt_time;
+use crate::ui::progress::readouts;
 use crate::ui::textfit::{char_cells, truncate_to_width, truncate_with_ellipsis, width};
 
 /// Every glyph on this line is drawn from a block unicode never gave
@@ -378,6 +378,7 @@ impl ControlsBar<'_> {
             None => format!("{GLYPH_QUEUE}{}", self.queue_len),
         };
         let speed_changed = (self.speed - 1.0).abs() >= SPEED_EPSILON;
+        let readout = readouts(self.elapsed_secs, self.duration_secs);
         vec![
             Segment {
                 field: None,
@@ -436,8 +437,11 @@ impl ControlsBar<'_> {
                 field: Some(Field::Progress),
                 lit: self.elapsed_secs.is_some(),
                 body: Body::Track {
-                    elapsed: fmt_time(self.elapsed_secs),
-                    total: fmt_time(self.duration_secs),
+                    // padded to one width for the whole song, so the
+                    // track cannot shift a column mid-drag; see
+                    // `progress::readouts`.
+                    elapsed: readout.0,
+                    total: readout.1,
                     frac: match (self.elapsed_secs, self.duration_secs) {
                         (Some(e), Some(d)) if d > 0.0 => (e / d).clamp(0.0, 1.0),
                         _ => 0.0,
@@ -1325,6 +1329,49 @@ mod tests {
         // what keeps the bar flush with the right edge.
         for cells in 0..20 {
             assert_eq!(width(&track(0.5, cells, false)), cells.max(TRACK_MIN));
+        }
+    }
+
+    /// A drag resolves against the rect the *previous* frame recorded.
+    /// The elapsed readout used to grow from four cells to five at
+    /// 9:59 -> 10:00 and push the track one column right, so for that
+    /// one frame every cell of the track answered with its
+    /// neighbour's fraction. The readout reserves the total's width up
+    /// front now, so there is nothing left to shift.
+    #[test]
+    fn the_track_does_not_move_when_the_elapsed_readout_crosses_ten_minutes() {
+        // 43 cells is the narrowest bar that keeps a 30 minute song's
+        // scrubber at all; narrower than that the element is dropped,
+        // which the reserved width also makes a decision for the whole
+        // song rather than one the clock changes at 10:00.
+        for width_cells in [43u16, 60, 100, 160] {
+            let mut rects = Vec::new();
+            for secs in [0.0, 598.0, 599.0, 599.9, 600.0, 601.0, 1799.0] {
+                let (buf, layout) = bar_and_layout(width_cells, 2, |cb| {
+                    cb.elapsed_secs = Some(secs);
+                    cb.duration_secs = Some(1800.0);
+                });
+                let track = layout.track.expect("a 30 minute song has a scrubber");
+                // and the rect is track cells, not a readout that grew
+                // into them.
+                for x in [track.x, track.x + track.width - 1] {
+                    let sym = buf.cell((x, 1)).unwrap().symbol().to_string();
+                    assert!(
+                        [TRACK_DONE, TRACK_LEFT, TRACK_HEAD]
+                            .iter()
+                            .any(|c| sym.starts_with(*c)),
+                        "at {secs}s column {x} of the track rect holds {sym:?}"
+                    );
+                }
+                rects.push((secs, track));
+            }
+            let (_, first) = rects[0];
+            for (secs, rect) in &rects {
+                assert_eq!(
+                    *rect, first,
+                    "the track moved to {rect:?} at {secs}s on a {width_cells}-cell bar"
+                );
+            }
         }
     }
 

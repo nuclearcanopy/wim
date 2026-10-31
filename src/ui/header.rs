@@ -45,6 +45,13 @@ pub fn draw_header(
     // line's color throughout, not the surrounding title/instructions
     // text. mixing brightness along what's meant to read as one
     // continuous line is exactly what looked wrong both times before.
+    // the junction lines up with the cell the │ above it was actually
+    // painted on, taken from the drawing loop itself rather than
+    // recomputed: a char index would sit a cell left of the │ for every
+    // wide glyph in the title (album and artist names reach here), and
+    // the two lines that have to meet would not. if truncation ate the
+    // separator entirely there is no junction, just a plain rule.
+    let mut junction_col = None;
     if y < area.y + area.height {
         // written a glyph at a time because the │ takes rule_color
         // while the text around it does not, but the cursor still
@@ -56,6 +63,9 @@ pub fn draw_header(
                 break;
             }
             let color = if ch == '│' { rule_color } else { text_color };
+            if ch == '│' {
+                junction_col = Some((x - area.x) as usize);
+            }
             x = crate::ui::draw::at(
                 buf,
                 x,
@@ -66,12 +76,6 @@ pub fn draw_header(
             );
         }
     }
-
-    // the junction lines up with wherever │ actually landed in the
-    // (possibly truncated) fitted text, not a recomputed offset; if
-    // truncation ate the separator entirely, there's no junction, just
-    // a plain rule.
-    let junction_col = fitted.chars().position(|c| c == '│');
 
     let rule_y = y + 1;
     if rule_y < area.y + area.height {
@@ -127,6 +131,37 @@ mod tests {
             let body = body(area);
             assert_eq!(body.y, next, "{area:?}");
             assert_eq!(body.y + body.height, area.y + area.height, "{area:?}");
+        }
+    }
+
+    /// The whole point of the ┴: it is the rule meeting the │ above it.
+    /// A cjk album title (`browse` and `lyrics_view` both head their
+    /// pane with one) put the separator past where a char index said,
+    /// so the stem landed under plain `─` with a visible gap.
+    #[test]
+    fn the_junction_sits_under_the_separator_even_with_a_wide_title() {
+        for title in ["a title", "日本語", "日本語 · アーティスト", "ab日cd"] {
+            let area = Rect::new(2, 1, 50, 6);
+            let mut buf = buffer(area.x + area.width, area.y + area.height);
+            draw_header(
+                &mut buf,
+                area,
+                area.y,
+                title,
+                "some keys",
+                shade(DIM),
+                shade(NEAR_BLACK),
+            );
+            let col_of = |y: u16, want: &str| {
+                (area.x..area.x + area.width)
+                    .find(|x| buf.cell((*x, y)).unwrap().symbol() == want)
+                    .unwrap_or_else(|| panic!("no {want:?} on row {y} for {title:?}"))
+            };
+            assert_eq!(
+                col_of(area.y + 1, "┴"),
+                col_of(area.y, "│"),
+                "{title:?}: the rule's stem has to meet the separator"
+            );
         }
     }
 
