@@ -455,6 +455,8 @@ pub enum Ty {
     /// new name is being invented (`define`), because redefining is the
     /// common case: the name you want is usually already there.
     VarName,
+    /// a `.shg` script: a bare name under the config dir, or a path.
+    ScriptName,
     /// unsigned time literal: absolute position.
     Pos,
     /// signed time literal: a relative offset.
@@ -550,6 +552,8 @@ pub enum Completes {
     CorpusTerms,
     /// variable names only.
     Variables,
+    /// the `.shg` scripts the host can see.
+    Scripts,
     /// command names.
     CommandNames,
     /// the host's saved queue names.
@@ -579,6 +583,7 @@ impl Ty {
             Ty::SavedName => Completes::SavedQueues,
             Ty::EqName => Completes::EqPresets,
             Ty::VarName => Completes::Variables,
+            Ty::ScriptName => Completes::Scripts,
             Ty::CommandName | Ty::Call => Completes::CommandNames,
             Ty::Words(w) => Completes::Words(w),
             Ty::NewName => Completes::Hint("a name to save it under"),
@@ -616,6 +621,7 @@ impl Ty {
             Ty::SavedName => "the name of a saved queue".into(),
             Ty::EqName => "an eq preset name".into(),
             Ty::VarName => "a variable name".into(),
+            Ty::ScriptName => "the name of a .shg script, or a path to one".into(),
             Ty::CommandName => "a command name".into(),
             Ty::Pos => "an unsigned position like 30s, 1m20s or 50%".into(),
             Ty::Offset => "a signed offset like +30s or -10s".into(),
@@ -957,6 +963,13 @@ pub const COMMANDS: &[Command] = &[
     ),
     cmd("rescan", &[], NONE, &[], "re-walk the local library"),
     cmd(
+        "run",
+        &[],
+        &[req("script", Ty::ScriptName)],
+        &[],
+        "run a .shg script; dry(run(x)) previews it",
+    ),
+    cmd(
         "sleep",
         &[],
         &[req("after", Ty::Duration)],
@@ -1235,6 +1248,52 @@ fn check_var_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The empty scope, borrowed: `Candidates::scope` and `World::bare`
+/// both need one that outlives the call.
+fn empty_scope() -> &'static Scope {
+    static EMPTY: LazyLock<Scope> = LazyLock::new(Scope::default);
+    &EMPTY
+}
+
+// --------------------------------------------------------- the world
+
+/// Reads one `.shg` script by name. Borrowed rather than owned so the
+/// host can close over its own state and a test over a map.
+pub type ScriptReader<'a> = &'a dyn Fn(&str) -> Result<String, String>;
+
+/// What *parsing* may ask the host about: the variables a term might
+/// name, and the contents of a `.shg` file `run(...)` names. `Env` is
+/// the run-time counterpart; this one exists because both of these have
+/// to be known while the program is still being built, which is what
+/// lets `dry()` report a whole script's plan.
+pub struct World<'a> {
+    pub scope: &'a Scope,
+    /// Reads one script. `Err` carries a ready-to-print reason, because
+    /// only the host knows how a name resolves to a file and which
+    /// scripts exist (so the "did you mean" is its to build).
+    ///
+    /// `None` is "this context has no scripts", which is the truth for
+    /// a bare parse rather than a failure to look.
+    pub read: Option<ScriptReader<'a>>,
+}
+
+impl World<'_> {
+    /// No variables and no scripts.
+    pub fn bare() -> World<'static> {
+        World {
+            scope: empty_scope(),
+            read: None,
+        }
+    }
+
+    fn read_script(&self, name: &str) -> Result<String, String> {
+        match self.read {
+            Some(read) => read(name),
+            None => Err(format!("no scripts are available here ('{name}')")),
+        }
+    }
+}
+
 // ----------------------------------------------------------------- env
 
 /// What the host tells a running program about the world, rebuilt per
@@ -1363,6 +1422,11 @@ enum Node {
         prefs: Vec<Kind>,
         action: TermAction,
     },
+    /// A line of a script that did not parse. Reported and stepped
+    /// past rather than failing the program: a script is a list of
+    /// independent statements, and a typo on line 3 should not cost you
+    /// the other twenty.
+    Fail(String),
     /// end-of-group tally, so a multi-term call reports once overall
     /// rather than only per-term.
     Summary {
@@ -1385,6 +1449,10 @@ pub enum Step {
     Emit(Op),
     /// the host should push this into the console scrollback.
     Note(String),
+    /// the host should push this as an *error* line, and then carry on
+    /// stepping: a script's bad line, which is reported without
+    /// stopping the rest of the file.
+    Warn(String),
     /// results for `query` are not in yet; resume next frame.
     AwaitResults {
         query: String,
@@ -1419,18 +1487,17 @@ impl Program {
     /// has a scope, so it goes through `parse_in`.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn parse(input: &str) -> Result<Program, ParseError> {
-        Program::parse_in(input, &Scope::default())
+        Program::parse_in(input, &World::bare())
     }
 
     /// Parses against `scope`, expanding any term that names a
     /// variable. Parse time rather than run time on purpose: `dry()`
     /// then reports the expanded plan, and the whole expansion is one
     /// arm of `coerce` instead of a second code path per command.
-    pub fn parse_in(input: &str, scope: &Scope) -> Result<Program, ParseError> {
-        let mut lowering = Lowering::default();
+    pub fn parse_in(input: &str, world: &World) -> Result<Program, ParseError> {
+        let mut lowering = Lowering::new(world);
         for (offset, text) in statements(input) {
-            let call = parse_statement(input, offset, text, scope)?;
-            lowering.lower(&call, false);
+            lowering.absorb(input, offset, text)?;
         }
         let groups = vec![Group::default(); lowering.groups];
         Ok(Program {
@@ -1463,6 +1530,10 @@ impl Program {
             Node::Note(text) => {
                 self.pc += 1;
                 Step::Note(text)
+            }
+            Node::Fail(text) => {
+                self.pc += 1;
+                Step::Warn(text)
             }
             Node::Go => {
                 self.pc += 1;
@@ -1599,19 +1670,88 @@ fn best_match(results: &[Kind], prefs: &[Kind]) -> Option<usize> {
 
 // -------------------------------------------------------------- lowering
 
-#[derive(Default)]
-struct Lowering {
+/// How many `run(...)` frames deep a parse may go. A script that runs
+/// another is useful (a setup file calling a per-mood one); one that
+/// reaches itself is not, and this is the cheap bound that makes the
+/// difference without a visited set.
+const MAX_SCRIPT_DEPTH: usize = 8;
+
+struct Lowering<'a> {
     nodes: Vec<Node>,
     groups: usize,
+    /// The variables as they stand *at this point in the program*: a
+    /// `let` updates it, so a later statement sees a binding an earlier
+    /// one made. Owned rather than borrowed precisely so it can grow;
+    /// that is what makes a `.shg` file that defines a variable and
+    /// then uses it work, and it does the same for `let a = [x]; play(a)`
+    /// typed on one line.
+    scope: Scope,
+    read: Option<ScriptReader<'a>>,
+    /// How many `run(...)` frames are open, for `MAX_SCRIPT_DEPTH`.
+    depth: usize,
 }
 
-impl Lowering {
+impl<'a> Lowering<'a> {
+    fn new(world: &World<'a>) -> Lowering<'a> {
+        Lowering {
+            nodes: Vec::new(),
+            groups: 0,
+            scope: world.scope.clone(),
+            read: world.read,
+            depth: 0,
+        }
+    }
+
+    fn nested(&self) -> Lowering<'a> {
+        Lowering {
+            nodes: Vec::new(),
+            groups: 0,
+            scope: self.scope.clone(),
+            read: self.read,
+            depth: self.depth,
+        }
+    }
+
+    /// Parses one statement against the scope as it stands and lowers
+    /// it. The one entry point for both a typed line and a script line,
+    /// so they cannot diverge; the only difference between them is what
+    /// the caller does with the `Err`.
+    fn absorb(&mut self, input: &str, offset: usize, text: &str) -> Result<(), ParseError> {
+        let call = {
+            let world = World {
+                scope: &self.scope,
+                read: self.read,
+            };
+            parse_statement(input, offset, text, &world)?
+        };
+        self.track(&call);
+        self.lower(&call, false);
+        Ok(())
+    }
+
+    /// Keeps `scope` in step with the bindings the program makes, so
+    /// the expansion a later statement gets matches what will actually
+    /// be bound by the time it runs.
+    fn track(&mut self, call: &Call) {
+        match (call.command.name, call.args.first(), call.args.get(1)) {
+            ("define", Some(Arg::Name(name)), Some(Arg::Terms(terms))) => {
+                self.scope.define(name, terms.clone());
+            }
+            ("unset", Some(Arg::Name(name)), _) => {
+                self.scope.remove(name);
+            }
+            _ => {}
+        }
+    }
+
     /// `dry` lowers the same shape and then turns every node into a
     /// note, so the report is generated from the real plan rather than
-    /// a second description of it.
+    /// a second description of it. A script goes through here too,
+    /// which is the whole reason `dry(run(x))` can preview a file it
+    /// never executes: the plan is the real lowered program.
     fn lower(&mut self, call: &Call, dry: bool) {
         if dry {
-            let mut inner = Lowering::default();
+            let mut inner = self.nested();
             inner.lower(call, false);
             self.nodes.push(Node::Note(format!("would run: {}", call)));
             for node in inner.nodes {
@@ -1637,9 +1777,47 @@ impl Lowering {
                     self.lower(inner, false);
                 }
             }
+            "run" => {
+                if let Some(Arg::Script { name, source }) = call.args.first() {
+                    self.lower_script(name, source);
+                }
+            }
             "help" => self.lower_help(call),
             _ => self.lower_plain(call),
         }
+    }
+
+    /// Inlines a `.shg` file: every line is parsed on its own and
+    /// lowered into *this* program, so a script is run by the same
+    /// stepper a typed line is and suspends on a search exactly the
+    /// same way. One statement per line; a line that does not parse
+    /// becomes a `Node::Fail` naming the file and the line, and the
+    /// rest of the file carries on.
+    ///
+    /// The read already happened in `coerce`, so by here the contents
+    /// are in hand; this only splits and lowers them.
+    fn lower_script(&mut self, label: &str, source: &str) {
+        if self.depth >= MAX_SCRIPT_DEPTH {
+            self.nodes.push(Node::Fail(format!(
+                "{label}: scripts nest more than {MAX_SCRIPT_DEPTH} deep; stopped here"
+            )));
+            return;
+        }
+        self.depth += 1;
+        for (number, line) in source.lines().enumerate() {
+            let number = number + 1;
+            // `statements` strips the `#` comments and splits on `;`,
+            // so a line may still hold several statements; what it may
+            // not do is span lines, because continuing past a bad one
+            // needs a line to blame.
+            for (offset, text) in statements(line) {
+                if let Err(e) = self.absorb(line, offset, text) {
+                    self.nodes
+                        .push(Node::Fail(format!("{label}:{number}: {e}")));
+                }
+            }
+        }
+        self.depth -= 1;
     }
 
     fn lower_help(&mut self, call: &Call) {
@@ -1742,6 +1920,7 @@ fn describe_node(node: &Node) -> Option<String> {
     match node {
         Node::Emit(op) => Some(format!("  {}", op.describe())),
         Node::Note(text) => Some(format!("  {text}")),
+        Node::Fail(text) => Some(format!("  (skipped) {text}")),
         Node::Go => Some("  do what enter would do here".to_string()),
         Node::Search(q) => Some(format!("  search '{q}'")),
         Node::Resolve {
@@ -1768,6 +1947,13 @@ fn describe_node(node: &Node) -> Option<String> {
 enum Arg {
     Terms(Vec<String>),
     Name(String),
+    /// A `.shg` script plus its contents, read while parsing so a
+    /// missing file is a parse error the console can keep the line for,
+    /// and so `dry(run(x))` has the file in hand to plan from.
+    Script {
+        name: String,
+        source: String,
+    },
     Pos(Pos),
     Offset(f64),
     Level(Level),
@@ -1821,6 +2007,7 @@ fn render_arg(arg: &Arg) -> String {
         Arg::Terms(t) if t.len() == 1 => t[0].clone(),
         Arg::Terms(t) => format!("[{}]", t.join(", ")),
         Arg::Name(n) => n.clone(),
+        Arg::Script { name, .. } => name.clone(),
         Arg::Pos(Pos::Percent(p)) => format!("{p}%"),
         Arg::Pos(Pos::Seconds(s)) => format!("{s}s"),
         Arg::Offset(s) => format!("{s:+}s"),
@@ -2107,21 +2294,21 @@ fn parse_statement(
     input: &str,
     offset: usize,
     text: &str,
-    scope: &Scope,
+    world: &World,
 ) -> Result<Call, ParseError> {
     match text
         .strip_prefix(LET)
         .filter(|rest| rest.starts_with(char::is_whitespace))
     {
-        Some(rest) => parse_let(input, offset + LET.len(), rest, scope),
-        None => parse_call(input, offset, text, scope),
+        Some(rest) => parse_let(input, offset + LET.len(), rest, world),
+        None => parse_call(input, offset, text, world),
     }
 }
 
 /// `let name = [a, b]`. Both halves go through `coerce` against
 /// `define`'s own parameters, so the typechecking, the error messages
 /// and the variable expansion are the ones the canonical call gets.
-fn parse_let(input: &str, offset: usize, text: &str, scope: &Scope) -> Result<Call, ParseError> {
+fn parse_let(input: &str, offset: usize, text: &str, world: &World) -> Result<Call, ParseError> {
     let lead = text.len() - text.trim_start().len();
     let (offset, body) = (offset + lead, text.trim());
     let Some(eq) = body.find('=') else {
@@ -2148,14 +2335,14 @@ fn parse_let(input: &str, offset: usize, text: &str, scope: &Scope) -> Result<Ca
         ));
     }
     let args = vec![
-        coerce(input, command, &command.params[0], offset, name, scope)?,
+        coerce(input, command, &command.params[0], offset, name, world)?,
         coerce(
             input,
             command,
             &command.params[1],
             value_offset,
             value,
-            scope,
+            world,
         )?,
     ];
     Ok(Call {
@@ -2167,7 +2354,7 @@ fn parse_let(input: &str, offset: usize, text: &str, scope: &Scope) -> Result<Ca
 
 /// `name(args...)`. `input`/`offset` are only carried for error
 /// columns; `text` is the already-trimmed statement or nested call.
-fn parse_call(input: &str, offset: usize, text: &str, scope: &Scope) -> Result<Call, ParseError> {
+fn parse_call(input: &str, offset: usize, text: &str, world: &World) -> Result<Call, ParseError> {
     let Some(lp) = text.find('(') else {
         let name = text.split_whitespace().next().unwrap_or(text);
         let message = if lookup(name).is_some() {
@@ -2268,7 +2455,7 @@ fn parse_call(input: &str, offset: usize, text: &str, scope: &Scope) -> Result<C
         }
     }
 
-    let args = bind(input, command, &positional, scope)?;
+    let args = bind(input, command, &positional, world)?;
     if command.name == "view" {
         check_view(input, &args, &positional)?;
     }
@@ -2354,7 +2541,7 @@ fn bind(
     input: &str,
     command: &'static Command,
     given: &[(usize, &str)],
-    scope: &Scope,
+    world: &World,
 ) -> Result<Vec<Arg>, ParseError> {
     let strict = given.len() == command.params.len();
     let mut args = Vec::new();
@@ -2371,7 +2558,7 @@ fn bind(
             }
             continue;
         };
-        match coerce(input, command, param, *off, text, scope) {
+        match coerce(input, command, param, *off, text, world) {
             Ok(arg) => {
                 args.push(arg);
                 next += 1;
@@ -2415,7 +2602,7 @@ fn coerce(
     param: &Param,
     off: usize,
     text: &str,
-    scope: &Scope,
+    world: &World,
 ) -> Result<Arg, ParseError> {
     let bad = |what: String| err(input, off, text, what);
     let expected = || {
@@ -2435,7 +2622,7 @@ fn coerce(
             // the one place variables expand, which is why every
             // terms-taking command gets them with no code of its own and
             // why `dry()` reports the expanded plan.
-            Ok(Arg::Terms(scope.expand(&items)))
+            Ok(Arg::Terms(world.scope.expand(&items)))
         }
         Ty::VarName => {
             let name = unquote(text);
@@ -2444,6 +2631,17 @@ fn coerce(
         }
         // every free-text type parses identically; they differ only in
         // what they complete from (see `Ty::completes`).
+        // read here rather than at lowering time so a name that
+        // resolves to nothing is a parse error, which keeps the line in
+        // the console for you to fix.
+        Ty::ScriptName => {
+            let name = unquote(text);
+            let source = world.read_script(name).map_err(bad)?;
+            Ok(Arg::Script {
+                name: name.to_string(),
+                source,
+            })
+        }
         Ty::Query | Ty::NewName | Ty::SavedName | Ty::EqName | Ty::CommandName => {
             if text.starts_with('[') {
                 return Err(expected());
@@ -2545,7 +2743,7 @@ fn coerce(
             if !text.contains('(') {
                 return Err(expected());
             }
-            parse_call(input, off, text, scope).map(|c| Arg::Call(Box::new(c)))
+            parse_call(input, off, text, world).map(|c| Arg::Call(Box::new(c)))
         }
     }
 }
@@ -2742,8 +2940,20 @@ pub trait Candidates {
     /// variable-name parameters complete from. Borrowed rather than
     /// cloned because completion reads it per keystroke.
     fn scope(&self) -> &Scope {
-        static EMPTY: LazyLock<Scope> = LazyLock::new(Scope::default);
-        &EMPTY
+        empty_scope()
+    }
+
+    /// Names of the `.shg` scripts `run(...)` could take. Snapshotted
+    /// by the host, since this is a directory read and completion runs
+    /// per keystroke.
+    fn scripts(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Reads one script for `run(...)`, at submit time rather than per
+    /// keystroke. `Err` is a ready-to-print reason.
+    fn read_script(&self, name: &str) -> Result<String, String> {
+        Err(format!("no scripts are available here ('{name}')"))
     }
 }
 
@@ -2951,7 +3161,12 @@ impl Console {
             return ConsoleAction::Close;
         }
         self.push(LineKind::Command, format!(": {line}"));
-        match Program::parse_in(&line, cand.scope()) {
+        let read = |name: &str| cand.read_script(name);
+        let world = World {
+            scope: cand.scope(),
+            read: Some(&read),
+        };
+        match Program::parse_in(&line, &world) {
             Ok(program) => {
                 self.remember(line);
                 self.input.clear();
@@ -3080,6 +3295,11 @@ impl Console {
             Completes::Variables => keep_extensions(
                 &here.token,
                 cand.scope().names().into_iter(),
+                MAX_CANDIDATES,
+            ),
+            Completes::Scripts => keep_extensions(
+                &here.token,
+                cand.scripts().iter().map(String::as_str),
                 MAX_CANDIDATES,
             ),
             Completes::SavedQueues => keep_extensions(
@@ -3691,9 +3911,37 @@ mod tests {
         scope
     }
 
+    /// A parse context over `scope` and a fake set of scripts, so the
+    /// language's own tests never touch the disk.
+    fn world_of<'a>(scope: &'a Scope, read: ScriptReader<'a>) -> World<'a> {
+        World {
+            scope,
+            read: Some(read),
+        }
+    }
+
+    /// Scripts by name, for the `run(...)` tests.
+    fn scripts_of(files: &[(&str, &str)]) -> impl Fn(&str) -> Result<String, String> {
+        let files: Vec<(String, String)> = files
+            .iter()
+            .map(|(n, b)| ((*n).to_string(), (*b).to_string()))
+            .collect();
+        move |name: &str| {
+            files
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, b)| b.clone())
+                .ok_or_else(|| format!("no script '{name}'"))
+        }
+    }
+
+    fn no_scripts(name: &str) -> Result<String, String> {
+        Err(format!("no script '{name}'"))
+    }
+
     /// The search terms a program lowered to, parsed against `scope`.
     fn terms_in(input: &str, scope: &Scope) -> Vec<String> {
-        Program::parse_in(input, scope)
+        Program::parse_in(input, &world_of(scope, &no_scripts))
             .expect("should parse")
             .nodes
             .iter()
@@ -3705,7 +3953,13 @@ mod tests {
     }
 
     fn ops_in(input: &str, scope: &Scope) -> Vec<Op> {
-        let mut program = Program::parse_in(input, scope).expect("should parse");
+        ops_of(&Program::parse_in(input, &world_of(scope, &no_scripts)).expect("should parse"))
+    }
+
+    /// Every op a program emits, stepping past the reports. `Warn` is
+    /// a script's bad line, which by design does not stop the program.
+    fn ops_of(program: &Program) -> Vec<Op> {
+        let mut program = program.clone();
         let mut env = Env {
             results: vec![Kind::Song],
             ..SETTLED.clone()
@@ -3718,7 +3972,7 @@ mod tests {
                     ops.push(Op::Search(q));
                 }
                 Step::Emit(op) => ops.push(op),
-                Step::Note(_) => {}
+                Step::Note(_) | Step::Warn(_) => {}
                 Step::Done => break,
                 other => panic!("unexpected step {other:?}"),
             }
@@ -3727,24 +3981,36 @@ mod tests {
     }
 
     fn notes_in(input: &str, scope: &Scope) -> Vec<String> {
-        let mut program = Program::parse_in(input, scope).expect("should parse");
-        let env = Env {
+        reports_of(&Program::parse_in(input, &world_of(scope, &no_scripts)).expect("should parse"))
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect()
+    }
+
+    /// Every reported line a program produces, tagged with whether it
+    /// came out as a note or as an error (`Step::Warn`).
+    fn reports_of(program: &Program) -> Vec<(bool, String)> {
+        let mut program = program.clone();
+        let mut env = Env {
             results: vec![Kind::Song],
             ..SETTLED.clone()
         };
-        let mut notes = Vec::new();
-        for _ in 0..1024 {
+        let mut out = Vec::new();
+        for _ in 0..4096 {
             match program.step(&env) {
-                Step::Note(text) => notes.push(text),
-                Step::Done => break,
-                _ => {}
+                Step::Note(text) => out.push((false, text)),
+                Step::Warn(text) => out.push((true, text)),
+                Step::Emit(Op::Search(q)) => env.query = q,
+                Step::Emit(_) => {}
+                Step::Done | Step::Failed(_) => break,
+                Step::AwaitResults { .. } => break,
             }
         }
-        notes
+        out
     }
 
     fn error_in(input: &str, scope: &Scope) -> ParseError {
-        Program::parse_in(input, scope).expect_err("should not parse")
+        Program::parse_in(input, &world_of(scope, &no_scripts)).expect_err("should not parse")
     }
 
     /// The maintainer's own example, end to end.
@@ -3825,7 +4091,7 @@ mod tests {
             "{plan:?}"
         );
         assert!(ops_in("dry(define(mix, [hex]))", &empty).is_empty());
-        assert!(Program::parse_in("dry(let mix = [hex])", &empty).is_err());
+        assert!(Program::parse_in("dry(let mix = [hex])", &World::bare()).is_err());
     }
 
     #[test]
@@ -3920,7 +4186,7 @@ mod tests {
         let empty = Scope::default();
         for line in &lines {
             assert!(
-                Program::parse_in(line, &empty).is_ok(),
+                Program::parse_in(line, &world_of(&empty, &no_scripts)).is_ok(),
                 "the listing printed something that does not parse: {line}"
             );
         }
@@ -3997,10 +4263,15 @@ mod tests {
     /// lowering would parse and then silently do nothing.
     #[test]
     fn every_command_lowers_to_at_least_one_node() {
+        // one script in hand, since `run`'s own sample argument names
+        // one and the read happens while parsing.
+        let empty = Scope::default();
+        let read = scripts_of(&[("sample", "pause()")]);
+        let world = world_of(&empty, &read);
         for c in COMMANDS {
             let input = sample_call(c);
-            let program =
-                Program::parse(&input).unwrap_or_else(|e| panic!("{input} did not parse: {e}"));
+            let program = Program::parse_in(&input, &world)
+                .unwrap_or_else(|e| panic!("{input} did not parse: {e}"));
             assert!(
                 !program.nodes.is_empty(),
                 "{input} parsed but lowered to nothing"
@@ -4028,6 +4299,9 @@ mod tests {
             Ty::Terms => "crest".into(),
             Ty::Query | Ty::NewName | Ty::SavedName | Ty::EqName => "crest".into(),
             Ty::VarName => "mix".into(),
+            // the samples never touch the disk, so this one is a path
+            // that `scripts_of` in the `run` tests resolves.
+            Ty::ScriptName => "sample".into(),
             Ty::CommandName => "pause".into(),
             Ty::Pos => "30s".into(),
             Ty::Offset => "+30s".into(),
@@ -5089,8 +5363,12 @@ mod tests {
     #[test]
     fn every_op_describes_itself_for_the_scrollback() {
         // R9: nothing is silent, so no op may describe itself as "".
+        let empty = Scope::default();
+        let read = scripts_of(&[("sample", "pause()")]);
+        let world = world_of(&empty, &read);
         for c in COMMANDS {
-            for op in ops(&sample_call(c)) {
+            let program = Program::parse_in(&sample_call(c), &world).expect("should parse");
+            for op in ops_of(&program) {
                 assert!(!op.describe().is_empty(), "{op:?} has no description");
             }
         }
@@ -5192,6 +5470,7 @@ mod tests {
             Ty::SavedName,
             Ty::EqName,
             Ty::VarName,
+            Ty::ScriptName,
             Ty::CommandName,
             Ty::Pos,
             Ty::Offset,
@@ -5920,7 +6199,8 @@ mod tests {
         let _: &Scope = Candidates::scope(&fake);
 
         let scope = Scope::default();
-        let _: Program = Program::parse_in("pause()", &scope).expect("should parse");
+        let _: World = World::bare();
+        let _: Program = Program::parse_in("pause()", &World::bare()).expect("should parse");
         let _: Vec<&str> = scope.names();
         let _: Vec<String> = scope.lines();
     }
@@ -5939,6 +6219,251 @@ mod tests {
         // it used to be an alias of clear_queue; anyone typing clear()
         // expecting the terminal behaviour would have wiped the queue.
         assert_ne!(ops("clear()"), vec![Op::ClearQueue]);
+    }
+
+    // ----------------------------------------------------- scripts
+
+    const SCRIPT: &str = "\
+# a morning routine
+let morning = [mazzy star, boards of canada]
+
+eq(flat)
+volume(40%)
+queue(morning)
+";
+
+    fn run_script(line: &str, files: &[(&str, &str)]) -> Program {
+        let empty = Scope::default();
+        let read = scripts_of(files);
+        Program::parse_in(line, &world_of(&empty, &read)).expect("should parse")
+    }
+
+    /// A `.shg` file is lowered into the very same program a typed line
+    /// becomes, which is the whole point: one interpreter, one stepper.
+    #[test]
+    fn a_script_lowers_into_the_same_program_its_lines_would() {
+        let program = run_script("run(morning)", &[("morning", SCRIPT)]);
+        let typed = Program::parse_in(
+            "eq(flat); volume(40%); queue([mazzy star, boards of canada])",
+            &World::bare(),
+        )
+        .expect("should parse");
+        // the `let` line is the one extra statement; everything after
+        // it is identical, expansion included.
+        let script_ops = ops_of(&program);
+        assert_eq!(
+            script_ops.first(),
+            Some(&Op::Define {
+                name: "morning".to_string(),
+                terms: vec!["mazzy star".into(), "boards of canada".into()],
+            })
+        );
+        assert_eq!(&script_ops[1..], &ops_of(&typed)[..]);
+    }
+
+    /// A script that searches has to suspend and resume exactly as a
+    /// typed line does, since it *is* one.
+    #[test]
+    fn a_script_that_searches_suspends_and_resumes_like_a_typed_line() {
+        let mut program = run_script("run(s)", &[("s", "play(crest)\nskip()\n")]);
+        let unsettled = Env {
+            search_settled: false,
+            results: vec![Kind::Song],
+            ..SETTLED.clone()
+        };
+        assert_eq!(
+            program.step(&unsettled),
+            Step::Emit(Op::Search("crest".to_string()))
+        );
+        // blocked, and blocked again, until the host says it settled.
+        assert_eq!(
+            program.step(&Env {
+                query: "crest".to_string(),
+                ..unsettled.clone()
+            }),
+            Step::AwaitResults {
+                query: "crest".to_string()
+            }
+        );
+        let settled = Env {
+            query: "crest".to_string(),
+            results: vec![Kind::Song],
+            ..SETTLED.clone()
+        };
+        assert_eq!(
+            program.step(&settled),
+            Step::Emit(Op::Play(Target::Index(0)))
+        );
+        assert_eq!(program.step(&settled), Step::Emit(Op::SkipNext));
+    }
+
+    /// The guard for the whole stage: a line that does not parse is
+    /// reported with its file and line number *and* the rest of the
+    /// file still runs. Reverting either half fails this.
+    #[test]
+    fn a_bad_line_names_the_file_and_the_rest_of_the_script_still_runs() {
+        let program = run_script(
+            "run(mix)",
+            &[(
+                "mix",
+                "pause()\nxyzzy()\nmute()\nvolume(nonsense)\nskip()\n",
+            )],
+        );
+        let reports = reports_of(&program);
+        let failures: Vec<&String> = reports
+            .iter()
+            .filter(|(is_error, _)| *is_error)
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(failures.len(), 2, "{reports:?}");
+        assert!(failures[0].starts_with("mix:2: "), "{}", failures[0]);
+        assert!(failures[0].contains("xyzzy"), "{}", failures[0]);
+        assert!(failures[1].starts_with("mix:4: "), "{}", failures[1]);
+        // and every good line still ran, in order, past both errors.
+        assert_eq!(
+            ops_of(&program),
+            vec![Op::TogglePause, Op::Mute(true), Op::SkipNext]
+        );
+    }
+
+    /// `dry(run(x))` matters more here than anywhere else: a file can
+    /// `clear_queue` or `download`, so you have to be able to read what
+    /// it will do before it does it.
+    #[test]
+    fn dry_previews_a_whole_script_and_runs_none_of_it() {
+        let program = run_script(
+            "dry(run(danger))",
+            &[("danger", "clear_queue()\ndownload(crest)\n")],
+        );
+        assert!(
+            ops_of(&program).is_empty(),
+            "dry(run(...)) must emit nothing at all"
+        );
+        let plan: Vec<String> = reports_of(&program).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(plan[0], "would run: run(danger)");
+        assert!(plan.iter().any(|l| l.contains("queue cleared")), "{plan:?}");
+        assert!(
+            plan.iter().any(|l| l.contains("search 'crest'")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().any(|l| l.contains("downloading the best")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn a_dry_script_still_shows_which_lines_it_would_skip() {
+        let program = run_script("dry(run(s))", &[("s", "pause()\nxyzzy()\n")]);
+        let plan: Vec<String> = reports_of(&program).into_iter().map(|(_, t)| t).collect();
+        assert!(
+            plan.iter().any(|l| l.contains("(skipped) s:2:")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn a_script_that_is_not_there_is_a_parse_error_naming_it() {
+        let empty = Scope::default();
+        let read = scripts_of(&[("morning", "pause()")]);
+        let e = Program::parse_in("run(evening)", &world_of(&empty, &read))
+            .expect_err("should not parse");
+        assert!(e.message.contains("evening"), "{}", e.message);
+        // a parse error keeps the line in the console, which is the
+        // point of reading the file while parsing rather than later.
+        assert_eq!(e.token, "evening");
+    }
+
+    #[test]
+    fn a_context_with_no_scripts_says_so_rather_than_guessing() {
+        let e = Program::parse_in("run(anything)", &World::bare()).expect_err("should not parse");
+        assert!(e.message.contains("no scripts"), "{}", e.message);
+    }
+
+    /// A script running another is useful; one reaching itself is not.
+    #[test]
+    fn script_nesting_is_bounded_rather_than_recursing_forever() {
+        let program = run_script("run(loop)", &[("loop", "pause()\nrun(loop)\n")]);
+        let reports = reports_of(&program);
+        assert!(
+            reports
+                .iter()
+                .any(|(is_error, t)| *is_error && t.contains("nest more than")),
+            "{reports:?}"
+        );
+        // and it stopped at the bound rather than growing without one.
+        assert_eq!(
+            ops_of(&program).len(),
+            MAX_SCRIPT_DEPTH,
+            "one pause() per frame, then the bound"
+        );
+    }
+
+    #[test]
+    fn a_script_line_may_hold_several_statements_but_not_span_lines() {
+        let program = run_script("run(s)", &[("s", "pause(); mute()\n")]);
+        assert_eq!(ops_of(&program), vec![Op::TogglePause, Op::Mute(true)]);
+        // a call split across lines cannot work in a file, because
+        // continuing past a bad line needs a line to blame; it reports
+        // rather than silently doing half.
+        let program = run_script("run(s)", &[("s", "queue([hex,\ncrest])\n")]);
+        let reports = reports_of(&program);
+        assert!(reports.iter().any(|(is_error, _)| *is_error), "{reports:?}");
+    }
+
+    /// Expansion happens while parsing, so a binding made earlier in
+    /// the same program has to be visible later in it; otherwise the
+    /// most obvious `.shg` file there is (define a vibe, then play it)
+    /// would quietly search for the variable's own name.
+    #[test]
+    fn a_binding_is_visible_to_everything_after_it_in_the_same_program() {
+        let empty = Scope::default();
+        assert_eq!(
+            terms_in("let a = [crest, hex]; play(a)", &empty),
+            vec!["crest", "hex"]
+        );
+        // and `unset` takes it back out again, so what the expansion
+        // assumed matches what will actually be bound by then.
+        assert_eq!(
+            terms_in("let a = [crest]; unset(a); play(a)", &empty),
+            vec!["a"]
+        );
+        let program = run_script("run(s)", &[("s", "let a = [crest]\nplay(a)\n")]);
+        assert_eq!(
+            ops_of(&program)
+                .into_iter()
+                .filter_map(|op| match op {
+                    Op::Search(q) => Some(q),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["crest".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_script_completes_from_the_hosts_shg_files() {
+        struct WithScripts;
+        impl Candidates for WithScripts {
+            fn corpus(&self, _token: &str) -> Vec<String> {
+                Vec::new()
+            }
+            fn scripts(&self) -> Vec<String> {
+                vec![
+                    "init".to_string(),
+                    "morning".to_string(),
+                    "mood".to_string(),
+                ]
+            }
+        }
+        let cand = WithScripts;
+        let c = console_with(&cand, "run(mo");
+        let here = site(&c.input, c.cursor);
+        assert_eq!(here.completes, Completes::Scripts);
+        assert_eq!(
+            c.candidates_at(&here, &cand),
+            vec!["morning".to_string(), "mood".to_string()]
+        );
     }
 
     // --------------------------------------------- pinned completion
@@ -6011,6 +6536,7 @@ mod tests {
         "unset(",
         "unset(bla",
         "play(bla",
+        "run(",
         "loop(",
         "shuffle(",
         "eq(",
@@ -6462,6 +6988,7 @@ mod tests {
             Some(("play(terms?)", 0)),
             &["bladee_classics"],
         );
+        pin("run(", "run()", "", None, Some(("run(script)", 0)), &[]);
         pin(
             "loop(",
             "loop()",
