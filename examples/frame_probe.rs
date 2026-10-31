@@ -17,6 +17,16 @@
 //! ```text
 //! cargo run --example frame_probe -- /path/to/video.mp4 160 96
 //! ```
+//!
+//! **this is the prototype, not the thing.** `src/framesource.rs` is
+//! the real source and is what to read or copy; this file is kept
+//! because docs/video.md quotes its output. one difference matters if
+//! you do copy from here: the filter chain below letterboxes for
+//! *square* pixels, which is fine for printing pixel values and wrong
+//! on a terminal, where a cell is about twice as tall as it is wide.
+//! `framesource::Grid::vf` does it in two scales for that reason; see
+//! docs/video.md, "the filter chain is not the prototype's".
+//!
 //! see docs/video.md, "a frame source does exist".
 
 use std::ffi::CString;
