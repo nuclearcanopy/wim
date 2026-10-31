@@ -1351,27 +1351,55 @@ do the wrong thing quietly, which is worse to diagnose.
       identity guard (`browse::Loader`, `coverart::Cache`,
       `download::DownloadEvent`, `graphics::ArtProbe`, mpv ipc); this
       is the one that does not.
-- [ ] **`undo.rs` ~182: one restore branch skips the resolver
-      invalidation.** ~159 and ~171 both call
-      `track_resolver.invalidate()` and this one does not, and it
-      calls `load_playlist` directly instead of `start_session`, so
-      none of the five track-start hooks fire. play a song, queue a
-      prolific artist, press next, open the undo menu, press `u`: the
-      restore rewrites the queue, then seconds later the artist
-      fan-out lands and appends the whole discography with a "queued
-      847 tracks" toast, visibly un-doing the undo. also no
-      playing-now submission, wrong `listened_at`, no bound
-      eq/volume/speed, no subtitle fetch. `Snapshot` carries no
-      `previous_track` either, so skip-back after an undo reloads the
-      track already playing.
-- [ ] **`undo.rs` ~128: `Snapshot::restore` breaks the `set_query`
-      contract.** it calls `App::set_query` without the mandatory
-      `notify_query_changed`, which `app.rs` ~349 states and every
-      other caller honours. `search(bladee)`, `search(drain)`,
-      `undo()`: the query text comes back but no debounced `search3`
-      fires, so remote titles are missing from the restored list while
-      `settle` still reports settled, and a following
-      `play(selection)` resolves against an incomplete list.
+- [x] **undo's restart branch did not disown in-flight
+      resolutions.** queue a prolific artist, press next, undo: the
+      restore rewrote the queue and the artist fan-out landed seconds
+      later, appending the whole discography through `append_resolved`
+      with a "queued 847 tracks" toast, **visibly un-doing the undo**.
+      `invalidate()` was written per branch and the one branch of three
+      that reloads mpv's playlist did not have it; hoisted above the
+      branching, once, because a guard each branch has to remember is
+      a guard one branch forgets.
+      the behavioural test goes through the real `Snapshot::restore`
+      and **fires a control request first**, so a disowned batch is
+      distinguishable from no batch at all; that control is what keeps
+      it from passing for the wrong reason. a source-level `contract`
+      test pins "one call, before the branching" for ci, which cannot
+      run the mpv-gated half.
+      **still open on that branch**: it calls `load_playlist`, not
+      `start_session`, so none of the five track-start hooks fire (no
+      subtitle fetch, no playing-now submission, `listened_at` from the
+      previous track, no bound eq/volume/speed). that needs a `Surface`
+      threaded into `restore`, and the exact diff plus the two
+      behaviour changes riding along are written up in docs/undo.md.
+      worth reading before touching it: calling `track_started` without
+      a `Surface` would be **worse than the gap**, because
+      `identity_settings` mutates `Overridden` as it decides and
+      returns the changes as ops, so with nowhere to put them the ops
+      are dropped while `Overridden` has already recorded them as
+      applied, and the *next* unbound track restores to a value never
+      set.
+- [x] **skip-back after an undo reloaded the track already playing.**
+      `next` makes the track it left the previous one, and `Snapshot`
+      carried no `previous_track`, so an undo put the track back and
+      left back pointing at it. snapshotted, and restored *after*
+      `restore_queue`, because `start_session` owns that slot while it
+      rewrites the playlist. dropping the one assignment fails the test
+      with the restored track's own id, which states the bug exactly.
+- [x] **a restored query fired no remote search.** `search(bladee)`,
+      `search(drain)`, `undo()` brought the text back with every remote
+      title missing while `SearchSettle` still reported settled, so a
+      `play(selection)` right after resolved against the short list.
+      `App::set_query` only re-filters the corpus already indexed and
+      says so: kicking the debounced `search3` is the caller's job, and
+      `Op::Search` plus main.rs's two typing paths all do it while
+      `Snapshot::restore` did not. it runs the same three lines now.
+      the test **indexes a real server first**, since
+      `notify_query_changed` sends nothing without one and the test
+      would otherwise prove nothing, and asserts both the request going
+      out and settle going unsettled; the two halves have teeth
+      independently (dropping the notify failed the first, dropping
+      only `settle.notified` failed the second).
 - [ ] **`main.rs` ~4326: the pause keybind bypasses
       `core::toggle_pause`,** whose doc at `core.rs` ~54 claims "the
       keybind, the bar click and enter on the player cannot disagree".
@@ -1459,19 +1487,46 @@ do the wrong thing quietly, which is worse to diagnose.
       directions, because the one that pins keep-open *on* is turning
       it back off. mutation-checked by recording the write
       unconditionally again.
-- [ ] **`core.rs` ~1101 and ~1539, `undo.rs` 61/95: four smaller
-      ones.** `enqueue_track` moves the entry in `entries` and *then*
-      does `let _ = player.playlist_move(..)`, so a failed move
-      permanently breaks the `playqueue.rs` invariant with no message.
-      `persist_eq` is the only writer of `cfg.eq_preset`/`eq_gains`
-      and all three call sites are inside the eq-menu key block, so
-      `e` to cycle the eq (or `: eq(rock)`) is lost on restart while
-      the identical change made from the menu persists. `mute` is
-      listed in docs/undo.md's snapshot contents but is not in
-      `Snapshot`, so `mute()` then `undo()` reports success and stays
-      muted (and there is no mute indicator anywhere). `eq_custom` is
-      not snapshotted either, so a restored flat curve reads "flat
-      (modified)".
+- [x] **`mute` and `eq_custom` were in docs/undo.md's snapshot and
+      not in `Snapshot`.** `mute()` then `undo()` reported success over
+      music that was still silent, and a restored flat curve read "flat
+      (modified)". both snapshotted rather than struck from the doc.
+      `eq_custom` is free (an `App` field). `mute` has no host-side
+      mirror, `Op::Mute` being one `set_property` with mpv the only
+      place it lives, so `capture` makes one bounded `get_property`:
+      **the budget `paused` and the live volume were refused on**, and
+      the difference is that mute cannot drift out of band, since
+      `mute()`/`unmute()` are its only mutation and both are recorded
+      ops. stored as `Option<bool>`, so a read mpv refuses leaves the
+      restore alone instead of unmuting, and `capture`'s purity claim
+      was updated rather than quietly broken.
+      the tests read what the user reads: the mute one mutes with the
+      same single call `Op::Mute` makes and reads the property back,
+      and the eq one nudges a band through the real `adjust_eq_band`
+      and asserts on `eq_label`, failing "flat (modified)" against
+      "flat".
+      **docs/undo.md's list was wrong in two more places** and is
+      corrected: `paused` and a live fade are deliberately out. it also
+      now records that **there is no mute indicator anywhere in the
+      ui**, so muted is indistinguishable on screen from volume at
+      zero.
+- [ ] **three smaller ones from the same group are still open.**
+      `core.rs` ~1101 `enqueue_track` moves the entry in `entries` and
+      *then* does `let _ = player.playlist_move(..)`, so a failed move
+      permanently breaks the `playqueue.rs` invariant with no message
+      (the same ordering `Op::RemoveFromQueue` was just fixed for).
+      `core.rs` ~1539 `persist_eq` is the only writer of
+      `cfg.eq_preset`/`eq_gains` and all three call sites are inside
+      the eq-menu key block, so `e` to cycle the eq (or `: eq(rock)`)
+      is lost on restart while the identical change made from the menu
+      persists.
+      and two seams the undo work hit: `TrackResolver::deliver`/`epoch`
+      are `#[cfg(test)]` **private**, so undo.rs cannot inject a batch
+      and its test works around it with a real off-thread request plus
+      a positive control; `pub(crate)` would make it direct. core.rs's
+      `CoreCtx` test harness is likewise private to its own test
+      module, so undo.rs carries a near-copy, and one shared `fixtures`
+      harness is the obvious cleanup.
 - [ ] **`core.rs` ~1206: `go_to_previous` fires three of the five
       track-start hooks by hand** instead of calling `track_started`,
       which is the exact parity bug `track_started` was created to
