@@ -169,15 +169,41 @@ pub const MAX_ECHOED_RESULTS: usize = 30;
 /// Deliberately unnumbered, since no `Target` is addressable by
 /// result index from the language and a numbered list would advertise
 /// a `play(2)` that does not exist.
-pub fn result_lines(results: &[SearchItem], avail: usize) -> Vec<String> {
-    let shown = results.len().min(MAX_ECHOED_RESULTS);
-    let names: Vec<String> = results[..shown]
-        .iter()
-        .map(|i| i.primary_name().to_string())
-        .collect();
-    let mut lines = crate::ui::textfit::columns(&names, avail, 3);
-    if results.len() > shown {
-        lines.push(format!("+{} more", results.len() - shown));
+///
+/// **`shown` is what has already been printed for this query, and it
+/// is why this takes a set rather than a slice offset.** A remote
+/// server answering after the settle window enriches the corpus and
+/// the results are then *re-ranked*, so the late arrivals are not a
+/// tail that can be printed by index: a name can move anywhere in the
+/// list. Diffing by name is correct whatever the reordering, and it
+/// means the second batch prints only what is actually new instead of
+/// repeating the first.
+pub fn echo_lines(
+    results: &[SearchItem],
+    shown: &mut HashSet<String>,
+    avail: usize,
+) -> Vec<String> {
+    let room = MAX_ECHOED_RESULTS.saturating_sub(shown.len());
+    if room == 0 {
+        return Vec::new();
+    }
+    let mut fresh: Vec<String> = Vec::new();
+    let mut held = 0usize;
+    for item in results {
+        let name = item.primary_name();
+        if shown.contains(name) || fresh.iter().any(|f| f == name) {
+            continue;
+        }
+        if fresh.len() == room {
+            held += 1;
+            continue;
+        }
+        fresh.push(name.to_string());
+    }
+    shown.extend(fresh.iter().cloned());
+    let mut lines = crate::ui::textfit::columns(&fresh, avail, 3);
+    if held > 0 {
+        lines.push(format!("+{held} more"));
     }
     lines
 }
@@ -3908,7 +3934,7 @@ mod result_echo {
         ]);
         let results = c.search("si");
         for w in [72usize, 100, 40] {
-            let lines = result_lines(&results, w - 4);
+            let lines = echo_lines(&results, &mut HashSet::new(), w - 4);
             println!("--- {w} cells, {} results", results.len());
             for line in &lines {
                 println!("  [{line}]");
@@ -3928,7 +3954,53 @@ mod result_echo {
 
     #[test]
     fn nothing_found_prints_nothing() {
-        assert!(result_lines(&[], 76).is_empty());
+        assert!(echo_lines(&[], &mut HashSet::new(), 76).is_empty());
+    }
+
+    /// The point of diffing by name rather than by index: a server
+    /// answering late re-ranks the whole list, so the new matches are
+    /// not a tail. Only the genuinely new ones print, and never twice.
+    #[test]
+    fn a_late_batch_prints_only_what_is_new() {
+        let local = corpus(&["Rosu si Negru", "Zi de Zi"]);
+        let first = local.search("si");
+        let mut shown = HashSet::new();
+        let lines = echo_lines(&first, &mut shown, 76);
+        assert!(!lines.is_empty());
+        let before = shown.len();
+
+        // the same two, re-ranked, plus two that arrived later.
+        let later = corpus(&["Zi de Zi", "Alb si Negru", "Rosu si Negru", "Sus si Jos"]);
+        let second = later.search("si");
+        let fresh = echo_lines(&second, &mut shown, 76);
+        let printed = fresh.join(" ");
+        assert!(printed.contains("Alb si Negru"), "{printed:?}");
+        assert!(printed.contains("Sus si Jos"), "{printed:?}");
+        assert!(
+            !printed.contains("Rosu si Negru"),
+            "already shown, must not repeat: {printed:?}"
+        );
+        assert_eq!(shown.len(), before + 2);
+
+        // and nothing is left to say the third time.
+        assert!(echo_lines(&second, &mut shown, 76).is_empty());
+    }
+
+    /// The cap counts what has been printed across both batches, so a
+    /// late arrival cannot push the total past it.
+    #[test]
+    fn the_cap_spans_batches() {
+        let titles: Vec<String> = (0..40).map(|i| format!("song {i:02}")).collect();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let c = corpus(&refs);
+        let results = c.search("song");
+        let mut shown = HashSet::new();
+        echo_lines(&results, &mut shown, 76);
+        assert_eq!(shown.len(), MAX_ECHOED_RESULTS);
+        assert!(
+            echo_lines(&results, &mut shown, 76).is_empty(),
+            "the cap is already spent"
+        );
     }
 
     /// Past the cap the list is the flood it exists to avoid, so it
@@ -3940,7 +4012,7 @@ mod result_echo {
         let c = corpus(&refs);
         let results = c.search("song");
         assert!(results.len() > MAX_ECHOED_RESULTS);
-        let lines = result_lines(&results, 76);
+        let lines = echo_lines(&results, &mut HashSet::new(), 76);
         assert!(lines.last().unwrap().starts_with('+'), "{:?}", lines.last());
     }
 }

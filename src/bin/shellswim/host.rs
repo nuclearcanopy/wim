@@ -109,6 +109,11 @@ pub struct Host {
     /// session.
     pub gap_secs: f64,
     pub between_tracks: BetweenTracks,
+    /// The query whose results have been printed, and the names
+    /// already printed for it. Kept so a server answering after the
+    /// settle window prints only its *new* matches rather than
+    /// repeating the list or saying nothing at all.
+    echoed: Option<(String, HashSet<String>)>,
     pub undo: wim::undo::Recorder,
     /// Last `keep-open` written, so evaluating it every pump costs no
     /// ipc until the answer changes.
@@ -196,6 +201,7 @@ impl Host {
             crossfade_enabled,
             gap_secs,
             between_tracks: BetweenTracks::new(),
+            echoed: None,
             undo: wim::undo::Recorder::default(),
             keep_open_held: None,
             fade_in_started_at: None,
@@ -212,6 +218,15 @@ impl Host {
             swim: SwimSurface::default(),
             start: Instant::now(),
         })
+    }
+
+    /// The terminal's width, asked for when something is about to be
+    /// printed rather than carried on the console: the console is
+    /// handed a rect at draw time and the host never sees it.
+    fn console_width(&self) -> usize {
+        crossterm::terminal::size()
+            .map(|(w, _)| usize::from(w).saturating_sub(4))
+            .unwrap_or(76)
     }
 
     pub fn now(&self) -> Duration {
@@ -317,19 +332,15 @@ impl Host {
         // nothing else, which is no answer at all.
         if self.swim.echo_results && self.settle.settled(self.start.elapsed()) {
             self.swim.echo_results = false;
-            // the terminal's width, asked for once per search rather
-            // than carried on the console: the console is handed a
-            // rect at draw time and the host never sees it.
-            let avail = crossterm::terminal::size()
-                .map(|(w, _)| usize::from(w).saturating_sub(4))
-                .unwrap_or(76);
-            let lines = core::result_lines(&self.app.results, avail);
+            let mut shown = HashSet::new();
+            let lines = core::echo_lines(&self.app.results, &mut shown, self.console_width());
             if lines.is_empty() {
                 self.console.note("no matches".to_string());
             }
             for line in lines {
                 self.console.note(line);
             }
+            self.echoed = Some((self.app.query.clone(), shown));
         }
 
         // the between-track gap, same mechanism as wim's loop: mpv
@@ -373,6 +384,7 @@ impl Host {
             self.app.resync_results();
             self.settle.answered();
         }
+        let mut answered = false;
         while let Ok(outcome) = self.remote_search_result_rx.try_recv() {
             self.app
                 .corpus
@@ -381,6 +393,26 @@ impl Host {
             // an answer is in, so the results for whatever was asked
             // are as complete as a program should wait for.
             self.settle.answered();
+            answered = true;
+        }
+        // a server that answered *after* the settle window already
+        // missed the echo, so its matches are printed as they land
+        // rather than silently enriching a list that is on screen and
+        // now wrong. only for the query still being shown: anything
+        // else is an answer to a question nobody is looking at.
+        if answered {
+            let avail = self.console_width();
+            if let Some((query, shown)) = self.echoed.as_mut() {
+                if *query == self.app.query {
+                    let lines = core::echo_lines(&self.app.results, shown, avail);
+                    if !lines.is_empty() {
+                        self.console.note("...and from the servers:".to_string());
+                        for line in lines {
+                            self.console.note(line);
+                        }
+                    }
+                }
+            }
         }
         while let Ok(event) = self.download_rx.try_recv() {
             match event {
