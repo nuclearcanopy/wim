@@ -262,12 +262,39 @@ impl Widget for ResultsList<'_> {
     }
 }
 
+/// Whether `area` actually owns row `y`. Both painters below write raw
+/// cells, which `Buffer` bounds-checks and the rect does not: an
+/// unguarded row lands in whatever pane sits past this one, usually the
+/// bottom bar's rule. `draw::line`/`centered` carry the same check.
+fn owns_row(area: Rect, y: u16) -> bool {
+    y >= area.y && y < area.y + area.height
+}
+
+/// `▴`/`▾` in the last column of a list showing a window onto a longer
+/// one; without it a scrolled list reads as the whole list. Same
+/// glyphs `lyrics_view` puts in its gutter. `list` is the rows that
+/// were drawn, which callers narrow by this one column first so the
+/// cue never lands on text.
+pub(crate) fn scroll_cues(buf: &mut Buffer, list: Rect, offset: usize, total: usize) {
+    let shown = (total.saturating_sub(offset) as u16).min(list.height);
+    if list.width == 0 || shown == 0 {
+        return;
+    }
+    let x = list.x + list.width - 1;
+    if offset > 0 {
+        crate::ui::draw::put(buf, x, list.y, '▴', shade(DIM));
+    }
+    if offset + (shown as usize) < total {
+        crate::ui::draw::put(buf, x, list.y + shown - 1, '▾', shade(DIM));
+    }
+}
+
 /// Paints one row of `area` a flat background level across its whole
 /// width, so a selection highlight is a full bar rather than ending
 /// wherever that row's label happens to stop. Shared with
 /// `ui::browse`'s lists, same as `draw_header_row` below.
 pub(crate) fn fill_row_bg(buf: &mut Buffer, area: Rect, y: u16, level: f32) {
-    if y >= area.y + area.height {
+    if !owns_row(area, y) {
         return;
     }
     let bg = shade(level);
@@ -285,6 +312,12 @@ pub(crate) fn fill_row_bg(buf: &mut Buffer, area: Rect, y: u16, level: f32) {
 /// to its right (see main.rs's matching junction mark at this same
 /// row).
 pub(crate) fn draw_header_row(buf: &mut Buffer, area: Rect, y: u16, label: &str) {
+    // `ui::browse` hands this a height-0 label rect on a squeezed
+    // pane, and the height-1 row below would have smuggled it past
+    // `draw::centered`'s own guard onto the bottom bar's rule.
+    if !owns_row(area, y) {
+        return;
+    }
     let rule_color = shade(NEAR_BLACK);
     for col in 0..area.width {
         if let Some(cell) = buf.cell_mut((area.x + col, y)) {
@@ -304,7 +337,7 @@ pub(crate) fn draw_header_row(buf: &mut Buffer, area: Rect, y: u16, label: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::testbuf::buffer;
+    use crate::ui::testbuf::{assert_outside_untouched, buffer};
     use ratatui::style::Color;
 
     fn items(n: usize) -> Vec<SearchItem> {
@@ -443,5 +476,68 @@ mod tests {
             let buf = render(0, false, t);
             assert_eq!(row_bgs(&buf, FIRST_ITEM_ROW), vec![flat; 20]);
         }
+    }
+
+    /// Both shared painters write raw cells, which are bounds-checked
+    /// against the buffer and not against the rect; a row outside the
+    /// rect is a row of some other pane.
+    #[test]
+    fn a_section_rule_outside_its_rect_paints_nothing() {
+        for (h, y) in [(0u16, 2u16), (0, 3), (1, 3), (2, 9), (3, 1)] {
+            let area = Rect::new(1, 2, 18, h);
+            let mut buf = buffer(22, 10);
+            draw_header_row(&mut buf, area, y, "ALBUMS");
+            assert_outside_untouched(&buf, area);
+        }
+    }
+
+    /// Same for the selection plate, which sets only a background;
+    /// `assert_outside_untouched` reads chars, so the plate needs its
+    /// own sweep. The bottom edge was guarded, the top edge was not.
+    #[test]
+    fn a_selection_plate_outside_its_rect_paints_nothing() {
+        for (h, y) in [(0u16, 2u16), (1, 3), (3, 9), (3, 1)] {
+            let area = Rect::new(1, 2, 18, h);
+            let mut buf = buffer(22, 10);
+            fill_row_bg(&mut buf, area, y, 0.5);
+            for by in 0..10u16 {
+                for bx in 0..22u16 {
+                    let inside = (area.x..area.x + area.width).contains(&bx)
+                        && (area.y..area.y + area.height).contains(&by);
+                    if !inside {
+                        assert_eq!(
+                            buf.cell((bx, by)).unwrap().bg,
+                            Color::Reset,
+                            "plate at ({bx}, {by}) is outside rect {area:?} (row {y}, h {h})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod eyeball {
+    use super::*;
+    use crate::ui::testbuf::{buffer, grid};
+
+    /// The section rule, printed into a buffer taller than the rect it
+    /// was handed, so a rule that escaped reads as a line of `─` below
+    /// the rect rather than as a coordinate in a failure message:
+    /// `cargo test --lib ui::results_list::eyeball -- --nocapture`.
+    /// Asserts the floor too, so it is a test and not just a printer.
+    #[test]
+    fn print_the_section_rule_against_its_rect() {
+        for (h, y) in [(1u16, 2u16), (0, 2), (2, 4)] {
+            let area = Rect::new(0, 2, 20, h);
+            let mut buf = buffer(20, 6);
+            draw_header_row(&mut buf, area, y, "ALBUMS");
+            println!("--- rect y=2 h={h}, rule asked for row {y}\n{}", grid(&buf));
+        }
+        // the one case that must draw: a row the rect owns.
+        let mut buf = buffer(20, 6);
+        draw_header_row(&mut buf, Rect::new(0, 2, 20, 1), 2, "ALBUMS");
+        assert!(grid(&buf).contains("ALBUMS"), "{}", grid(&buf));
     }
 }

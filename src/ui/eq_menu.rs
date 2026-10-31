@@ -567,6 +567,12 @@ impl EqMenu<'_> {
     /// the menu has to say about it; an overwrite confirm belongs
     /// next to the name it is about to replace, not three rows away.
     fn draw_editor_row(&self, buf: &mut Buffer, area: Rect, y: u16, editor: &NameEditor) {
+        // this row sits a fixed two under the header, which a squeezed
+        // pane does not own; `draw::at`/`put` bounds-check the buffer
+        // only, so without this the editor painted over the bottom bar.
+        if y < area.y || y >= area.y + area.height {
+            return;
+        }
         let prompt = editor.prompt();
         let message_room = if self.state.message.is_empty() {
             0
@@ -635,26 +641,30 @@ impl Widget for EqMenu<'_> {
         );
 
         // which of the three applied states is live, spelled out
-        // rather than left to be inferred from which row is lit.
-        let label = eq::applied_label(self.source, self.modified, self.saved);
-        let after = draw::at(buf, area.x, y, "applied: ", shade(DIM), area.width as usize);
-        let end = draw::at(
-            buf,
-            after,
-            y,
-            &label,
-            shade(NEAR_WHITE),
-            (area.x + area.width).saturating_sub(after) as usize,
-        );
-        if self.source.is_none() {
-            draw::at(
+        // rather than left to be inferred from which row is lit. the
+        // row is a fixed two under the header, which a squeezed pane
+        // does not own, and these writers only check the buffer.
+        if y < area.y + area.height {
+            let label = eq::applied_label(self.source, self.modified, self.saved);
+            let after = draw::at(buf, area.x, y, "applied: ", shade(DIM), area.width as usize);
+            let end = draw::at(
                 buf,
-                end,
+                after,
                 y,
-                &format!(" (unsaved; {} names it)", keys(SAVE_KEY)),
-                shade(DIM),
-                (area.x + area.width).saturating_sub(end) as usize,
+                &label,
+                shade(NEAR_WHITE),
+                (area.x + area.width).saturating_sub(after) as usize,
             );
+            if self.source.is_none() {
+                draw::at(
+                    buf,
+                    end,
+                    y,
+                    &format!(" (unsaved; {} names it)", keys(SAVE_KEY)),
+                    shade(DIM),
+                    (area.x + area.width).saturating_sub(end) as usize,
+                );
+            }
         }
         y += 1;
 
@@ -1301,5 +1311,81 @@ mod eq_menu_state_tests {
     #[test]
     fn a_fresh_menu_is_closed() {
         assert!(!EqMenuPane::default().is_open());
+    }
+}
+
+#[cfg(test)]
+mod eyeball {
+    use super::*;
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
+
+    fn render_into(state: EqMenuState, area: Rect, buf: &mut Buffer) {
+        EqMenu {
+            gains: &[0.0; 10],
+            saved: &CustomPresets::default(),
+            source: Some(Source::Builtin(0)),
+            modified: false,
+            selected: 0,
+            state: &state,
+            elapsed: Duration::ZERO,
+        }
+        .render(area, buf);
+    }
+
+    fn print(label: &str, state: EqMenuState, w: u16, h: u16) {
+        // three rows taller than the rect: those rows belong to the
+        // bottom bar, which is where stray paint shows up.
+        let mut buf = buffer(w, h + 3);
+        render_into(state, Rect::new(0, 0, w, h), &mut buf);
+        println!(
+            "--- {label}: rect {w}x{h} in a {w}x{} buffer\n{}",
+            h + 3,
+            grid(&buf)
+        );
+    }
+
+    /// The menu owns `main_content`, so a 7-row terminal with the
+    /// default 4-row bottom bar leaves it three rows:
+    /// `cargo test --lib ui::eq_menu::eyeball -- --nocapture`.
+    /// Asserts the floor too, so it is a test and not just a printer.
+    #[test]
+    fn print_the_menu_at_the_squeezed_heights() {
+        for h in [3u16, 4, 5] {
+            print("closed editor", EqMenuState::default(), 60, h);
+            print(
+                "save-as editor",
+                EqMenuState {
+                    editor: Some(NameEditor::save()),
+                    ..EqMenuState::default()
+                },
+                60,
+                h,
+            );
+        }
+        let mut buf = buffer(60, 20);
+        render_into(EqMenuState::default(), Rect::new(0, 0, 60, 20), &mut buf);
+        assert!(grid(&buf).contains("applied: flat"), "{}", grid(&buf));
+    }
+
+    /// The status line and the name editor sit a fixed two rows under
+    /// the header, which a pane this short does not own.
+    #[test]
+    fn the_menu_stays_inside_its_rect_at_every_squeezed_height() {
+        for h in [0u16, 1, 2, 3, 4, 5, 6, 7] {
+            for editor in [None, Some(NameEditor::save())] {
+                let area = Rect::new(2, 1, 50, h);
+                let mut buf = buffer(56, 12);
+                render_into(
+                    EqMenuState {
+                        editor,
+                        message: "name taken".to_string(),
+                        ..EqMenuState::default()
+                    },
+                    area,
+                    &mut buf,
+                );
+                assert_outside_untouched(&buf, area);
+            }
+        }
     }
 }

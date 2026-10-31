@@ -1561,51 +1561,57 @@ undocumented. `put`/`at`/`at_styled` bounds-check the *buffer* only;
 `degenerate_sizes_do_not_panic` tests, which catch panics but not
 stray paint.
 
-- [ ] **three menus ignore `ui::scroll::offset_for`,** whose module
-      doc describes precisely this bug. `ui/keybinds_menu.rs` ~45 has
-      no scroll offset while `main.rs` ~3604 cycles the selection
-      modulo 32 actions; on a plain 80x24 only ~15 rows fit, so
-      pressing `K` and holding `j` puts the `>` marker, the
-      "press a key..." prompt and the footer hint all off-screen and
-      `r` rebinds an action you cannot see. no resize needed. same
-      missing offset in `ui/settings_menu.rs` ~56 (the listenbrainz
-      token row and its whole editor are invisible but selectable at
-      17 rows) and `ui/nav_manager.rs` ~45 (enter reconnects to a
-      profile you cannot see).
-- [ ] **`ui/results_list.rs` ~287: `draw_header_row` has no bounds
-      guard at all,** and `ui/browse.rs` 285/303 hand it zero-height
-      label rects. open an artist page on an 8-row terminal, or press
-      `r s` and grow the bottom bar to its max of 10 on a 14-row
-      terminal: `───── ALBUMS ───` paints across the bottom bar's rule
-      row, clobbering the `┴`/`┬` junctions, and it manufactures a
-      height-1 rect from a height-0 one, defeating `draw::centered`'s
-      own guard. its sibling `fill_row_bg` in the same module guards
-      (bottom edge only).
-- [ ] **`ui/browse.rs` ~229 and ~205: the bio rect and the top rule
-      ignore the area height.** `bio_rect` returns
-      `y: area.y + 4, height: 3` unconditionally, and the top-rule
-      loop writes `area.y` through raw `buf.cell_mut` with no
-      `height == 0` check. open an artist with a last.fm bio at
-      `main_content.height <= 6`, or a browse view on a 3-row
-      terminal: bio prose and a full row of `─` land on the bottom
-      bar's rule. `browse.rs` ~77's `rule_rows` already does
-      `rows.retain(|y| *y < area.y + area.height)`, so **the filter is
-      in the function that reports the rows and missing from the one
-      that paints them**.
-- [ ] **`ui/eq_menu.rs` 640/650/662: unguarded `draw::at`/`draw::put`
-      with `y = area.y + 2` unconditional.** enter on the bottom bar's
-      Eq field then shrink to 7 rows: "applied: flat" lands on the
-      bottom bar's rule row; press `s` and "save as: …█" lands one row
-      further. the sibling `None` arm at ~663 uses `draw::line` and is
-      safe.
-- [ ] **`ui/banner.rs` ~146: `arrow_y` is never clamped to the
-      rect.** both guards test x only, while the logo grid loop ten
-      lines below has exactly the `y >= area.y + area.height` check
-      the arrow row lacks. on a 60x7 terminal (or any
-      `main_content.height <= 3`) the `<` and `>` punch two holes
-      through the bottom bar's `HorizontalRule`, which is drawn
-      earlier and never repainted. worse with `figlet: doh` (50 rows)
-      at 90x29.
+- [x] **three menus ignored `ui::scroll::offset_for`**, whose module
+      doc describes precisely this bug: keybinds, settings and the
+      navidrome profile list drew their rows from a fixed top, so past
+      the pane height `j` moved a cursor nothing showed. on a plain
+      80x24 the keybinds `>` marker, the "press a key..." prompt and
+      the footer hint were all off-screen and `r` rebound an action you
+      could not see; a 14-row terminal hid the listenbrainz token row
+      and the add-new-profile row while both stayed selectable.
+      all three reserve their footer rows first, scroll the list
+      through `offset_for`, and mark a window onto a longer list with
+      `▴`/`▾` in a one-column gutter **claimed only while it actually
+      scrolls**, so a list that fits keeps the full width (pinned by
+      the untouched 17-row settings snapshot, whose last hint still
+      reaches the final column). the cue painter lives once, in
+      `results_list`, which already hosts the shared `draw_header_row`
+      and `fill_row_bg`; it is `lyrics_view`'s own glyph and shade, not
+      a new idiom. each mutation (`offset = 0`) failed exactly its own
+      menu's test.
+      **and printing it caught one more thing, in the header of the
+      very buffer being read**: the keybinds menu said "k to close"
+      while lowercase `k` moves the selection, which the footer two
+      rows down already contradicted. it reads "shift+k or esc: close"
+      now. that was a separate audit finding below; it got fixed
+      because the printed output put the contradiction side by side.
+- [x] **five widgets painted outside their rect**, because
+      `draw::put`/`at`/`at_styled` bounds-check the *buffer* and not
+      the *area*, an asymmetry with `line`/`centered` that was
+      undocumented.
+      `results_list::draw_header_row` had no guard at all and `browse`
+      fed it height-0 label rects, so `─── ALBUMS ───` landed on the
+      bottom bar's rule and wiped its `┬`/`┴` junctions. browse's
+      top-rule loop and its fixed three-row bio block did the same on a
+      pane of 0 to 6 rows. the eq menu's "applied:" line and
+      `save as: …█` row sat two under the header unconditionally and
+      ate the frame's own bottom edge at seven terminal rows. the
+      banner's `<`/`>` row was never clamped and punched holes through
+      the `HorizontalRule`, which is drawn earlier and never repainted
+      (far worse with `figlet: doh` at 90x29).
+      fixes: one `owns_row` predicate shared by both `results_list`
+      painters (`fill_row_bg` had guarded the bottom edge only); the
+      browse top rule painted only where `rule_rows` reports one,
+      **since the report already had the filter and the paint did
+      not**, which was the actual bug rather than a missing check; the
+      bio rect intersected with the pane before wrapping, so
+      `wrap_bio` gets the real line budget; both eq rows guarded like
+      their `draw::line` sibling in the same match; and the arrow row
+      checked exactly like the logo grid ten lines below it.
+      `assert_outside_untouched` now covers `browse`, `results_list`,
+      `eq_menu` and `banner`, the four that lacked it, each with an
+      eyeball printer at the broken sizes. every guard was
+      mutation-checked individually.
 - [ ] **`ui/shellsong.rs` ~69: the overlay console cannot scroll.**
       it never calls `Console::saw_viewport(rows)` and never reads
       `Console::scroll()`, so it always renders the live tail: open
@@ -1814,9 +1820,9 @@ stray paint.
       hardcodes `'a'` for the remappable `Enqueue` ("enter on a song
       to start, 'a' to add"), the exact bug class
       `help::Key::Bound` exists to prevent and that the roadmap
-      records fixing in onboarding. `ui/keybinds_menu.rs` ~34 says
-      "k to close" while lowercase `k` moves the selection (closing is
-      `K` or Esc) and the same screen's footer says "j/k select".
+      records fixing in onboarding. **the keybinds menu's "k to close" is
+      fixed** (it reads "shift+k or esc: close"); `queue.rs`'s
+      hardcoded `'a'` is still open.
 - [ ] **`main.rs` ~556: `wim` has no `--help`.** it handles only
       `--version` and silently ignores every other argument, so
       `wim --help` and `wim song.mp3` both just start the TUI with no
