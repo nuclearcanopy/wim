@@ -12,8 +12,9 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
@@ -300,7 +301,10 @@ struct Entry {
 
 impl Entry {
     fn new(item: SearchItem) -> Self {
-        let haystack = item.haystack();
+        // folded here, once per item at index time, rather than per
+        // keystroke. a folded Romanian haystack is pure ascii, so it
+        // also stops opting out of both prefilters below.
+        let haystack = fold_diacritics(&item.haystack()).into_owned();
         let haystack_lower = haystack.to_lowercase();
         let ascii = haystack_lower.is_ascii();
         Self {
@@ -318,6 +322,88 @@ impl Entry {
             haystack_lower,
         }
     }
+}
+
+/// Accented letters by the ascii letter they fold to, lowercase only;
+/// the uppercase half is derived, so the two can never disagree.
+///
+/// Latin-1 Supplement and Latin Extended-A, plus the Latin Extended-B
+/// letters Romanian actually uses. The multi-letter expansions are
+/// deliberately single letters (`ß` -> `s`, `æ` -> `a`, `œ` -> `o`):
+/// this feeds a *fuzzy* matcher, so "strasse" still finds "straße"
+/// through one inserted char, and a char-to-char fold keeps the
+/// haystack's length and word boundaries intact, which both prefilters
+/// depend on.
+const FOLD: &[(char, &str)] = &[
+    ('a', "àáâãäåāăąǎæ"),
+    ('c', "çćĉċč"),
+    ('d', "ďđð"),
+    ('e', "èéêëēĕėęě"),
+    ('g', "ĝğġģ"),
+    ('h', "ĥħ"),
+    ('i', "ìíîïĩīĭįıǐ"),
+    ('j', "ĵ"),
+    ('k', "ķ"),
+    ('l', "ĺļľŀł"),
+    ('n', "ñńņňŉ"),
+    ('o', "òóôõöøōŏőœǒ"),
+    ('r', "ŕŗř"),
+    // `ș` (U+0219, comma below) is the one that mattered: nucleo's own
+    // normalization covers Latin-1 and Extended-A but not these, so
+    // `si` scored `None` against `Și` before this existed.
+    ('s', "śŝşšșß"),
+    ('t', "ţťŧțþ"),
+    ('u', "ùúûüũūŭůűųǔ"),
+    ('w', "ŵ"),
+    ('y', "ýÿŷ"),
+    ('z', "źżž"),
+];
+
+static FOLDED: LazyLock<HashMap<char, char>> = LazyLock::new(|| {
+    let mut map = HashMap::new();
+    for (base, accents) in FOLD {
+        for accent in accents.chars() {
+            map.insert(accent, *base);
+            // `ß` uppercases to two chars and has no single-char
+            // capital, so there is nothing to insert for it.
+            let mut upper = accent.to_uppercase();
+            if let (Some(u), None) = (upper.next(), upper.next()) {
+                map.insert(u, base.to_ascii_uppercase());
+            }
+        }
+    }
+    map
+});
+
+/// Strips diacritics, preserving case and length.
+///
+/// **Why this exists rather than leaning on nucleo.** nucleo
+/// normalizes the haystack itself, so "blade" does find "blàde", and
+/// that covers Latin-1 and Latin Extended-A. It does **not** cover
+/// Latin Extended-B, which is exactly where Romanian's `ș` and `ț`
+/// live: measured, `Pattern::score("si", "Și")` is `None`, as are
+/// `tara`/`Țara` and `taranu`/`Țăranu`, while `imparat`/`Împărat`
+/// scores fine because `î` and `ă` are in the ranges nucleo does know.
+/// Short queries appeared to work only because the edit-distance
+/// fallback was absorbing them as typos.
+///
+/// Borrowed for ascii input, which is the overwhelming majority of
+/// both queries and haystacks, so the common path allocates nothing.
+pub fn fold_diacritics(text: &str) -> Cow<'_, str> {
+    if text.is_ascii() {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(
+        text.chars()
+            .map(|c| {
+                if c.is_ascii() {
+                    c
+                } else {
+                    FOLDED.get(&c).copied().unwrap_or(c)
+                }
+            })
+            .collect(),
+    )
 }
 
 /// One bit per character, `ch as u32 % 64`, which gives every ascii
@@ -382,6 +468,9 @@ fn split_exclusions(query: &str) -> (String, Vec<String>) {
 impl Needle {
     fn new(query: &str) -> Self {
         let (positive, excluded) = split_exclusions(query);
+        // the query is folded to match the folded haystacks; nucleo
+        // gets the folded text too, since it cannot fold these itself.
+        let positive = fold_diacritics(&positive).into_owned();
         let query = positive.as_str();
         let lower = query.to_lowercase();
         let len = lower.chars().count();
@@ -1988,7 +2077,13 @@ mod tests {
         // honoured, and `!blade` alone leaves nothing positive to rank.
         ("!blade", 0, 0xcbf2_9ce4_8422_2325),
         ("blade|runner", 0, 0xcbf2_9ce4_8422_2325),
-        ("bl\u{e0}d\u{e9}", 0, 0xcbf2_9ce4_8422_2325),
+        // was (0, 0xcbf2_9ce4_8422_2325): an accented query found
+        // *nothing*. now byte-identical to `blade`'s row above,
+        // because the query and every haystack are folded before
+        // matching. nucleo normalizes the haystack but not the
+        // pattern, and not Latin Extended-B either way; see
+        // `fold_diacritics`. the only row this changed, of 38.
+        ("bl\u{e0}d\u{e9}", 447, 0x162c_be8f_180a_1ccd),
     ];
 
     /// Membership and order are the product; speed is not allowed to
@@ -2582,5 +2677,112 @@ mod tests {
         let names = c.search_names("blade runner !live", 10);
         assert!(!names.is_empty(), "{names:?}");
         assert!(!names.iter().any(|n| n.contains("Live")), "{names:?}");
+    }
+}
+
+#[cfg(test)]
+mod diacritics {
+    use super::*;
+
+    fn one(title: &str, artist: &str, album: &str) -> Corpus {
+        let mut c = Corpus::new();
+        c.add_local_tracks([LocalTrack {
+            path: PathBuf::from("/music/x.flac"),
+            title: title.into(),
+            artist: Some(artist.into()),
+            album: Some(album.into()),
+            duration_secs: None,
+            kind: MediaKind::Music,
+        }]);
+        c
+    }
+
+    /// The reason `fold_diacritics` exists, pinned against nucleo
+    /// itself so an upstream fix is visible rather than silently
+    /// making the fold redundant.
+    ///
+    /// nucleo normalizes Latin-1 and Latin Extended-A, so
+    /// `imparat`/`Împărat` scores. It does **not** reach Latin
+    /// Extended-B, where Romanian's `ș` and `ț` live, so those score
+    /// `None`. If these start returning `Some`, the fold can shrink.
+    #[test]
+    fn nucleo_alone_cannot_match_romanian_comma_below() {
+        let mut m = Matcher::default();
+        let mut buf = Vec::new();
+        let score = |q: &str, hay: &str, m: &mut Matcher, buf: &mut Vec<char>| {
+            Pattern::parse(q, CaseMatching::Smart, Normalization::Smart)
+                .score(Utf32Str::new(hay, buf), m)
+        };
+        for (q, hay) in [("si", "Și"), ("tara", "Țara"), ("taranu", "Țăranu")] {
+            assert!(
+                score(q, hay, &mut m, &mut buf).is_none(),
+                "nucleo now folds {hay:?}; the table can lose those letters"
+            );
+        }
+        // and the half it does handle, for contrast.
+        assert!(score("imparat", "Împărat", &mut m, &mut buf).is_some());
+    }
+
+    /// What the maintainer asked for: an ascii letter matches its
+    /// accented form fully, not just as a one-char typo.
+    #[test]
+    fn ascii_finds_accented_text() {
+        let c = one("Și Dacă Țara", "Țăranu", "Împărat");
+        for q in [
+            "si daca tara",
+            "si",
+            "tara",
+            "daca",
+            // two diacritics in one word, which the edit-distance
+            // fallback could never absorb: its budget is one.
+            "taranu",
+            "imparat",
+        ] {
+            assert_eq!(c.search(q).len(), 1, "{q:?} found nothing");
+        }
+    }
+
+    /// And the other direction: typing the diacritic still works.
+    #[test]
+    fn accented_queries_still_match() {
+        let c = one("Și Dacă Țara", "Țăranu", "Împărat");
+        assert_eq!(c.search("și").len(), 1);
+        assert_eq!(c.search("țara").len(), 1);
+    }
+
+    #[test]
+    fn folding_keeps_case_and_length() {
+        assert_eq!(fold_diacritics("Șș Țț Ăă Îî Ââ"), "Ss Tt Aa Ii Aa");
+        // length is load-bearing: both prefilters key off word
+        // lengths and char counts.
+        let folded = fold_diacritics("Țăranu");
+        assert_eq!(folded.chars().count(), "Țăranu".chars().count());
+        assert_eq!(folded, "Taranu");
+    }
+
+    /// Ascii in, ascii out, with no allocation; the overwhelming
+    /// majority of queries and haystacks take this path.
+    #[test]
+    fn ascii_is_borrowed_not_rebuilt() {
+        assert!(matches!(
+            fold_diacritics("plain ascii"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// A European sweep, so the table is not quietly Romanian-only.
+    #[test]
+    fn the_table_covers_more_than_romanian() {
+        for (q, title) in [
+            ("bjork", "Björk"),
+            ("sigur ros", "Sigur Rós"),
+            ("motley crue", "Mötley Crüe"),
+            ("beyonce", "Beyoncé"),
+            ("zazdrosc", "Zazdrość"),
+            ("dvorak", "Dvořák"),
+        ] {
+            let c = one(title, "x", "y");
+            assert_eq!(c.search(q).len(), 1, "{q:?} did not find {title:?}");
+        }
     }
 }
