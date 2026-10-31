@@ -26,8 +26,8 @@ use wim::core::{
     apply_eq_gains, apply_eq_row, browse_session, client_for, current_eq_name, current_volume,
     dispatch_action, drive, enqueue_track, eq_preset_names, fire_scrobble, fire_subtitle_fetch,
     go_to_previous, identity_settings, load_playlist, lyrics_query, note_playback_started,
-    notify_query_changed, op_done, op_fail, op_note, open_starred_view, print_listing,
-    resync_upcoming, retain_live_clients, save_playback_state, set_vid_for_item, shellsong_focus,
+    notify_query_changed, op_done, op_fail, op_note, open_starred, print_listing, resync_upcoming,
+    retain_live_clients, save_playback_state, set_vid_for_item, shellsong_focus,
     spawn_background_search, start_session, start_tracking_playback, suggestion_starred_keys,
     sweep_cache, toggle_star, trigger_downloads, CoreCtx, Dispatch, DownloadCtx, Drive,
     RemoteSearchOutcome, RemoteSearchQuery, Report, ScrobbleState, SelectStep, SessionStart,
@@ -591,13 +591,15 @@ fn open_wim_screen(
         | ViewTarget::Help => print_listing(target, core),
         ViewTarget::Starred => {
             let live = core.app.corpus.remote_clients();
-            let bv = open_starred_view(&core.cfg.navidrome_servers, core.favorites, &live);
+            // the loader owns this view now, so its own generation bump
+            // disowns anything still in flight; no separate invalidate.
+            let bv = open_starred(
+                surf.browse_loader,
+                &core.cfg.navidrome_servers,
+                core.favorites,
+                &live,
+            );
             let count = bv.tracks.len();
-            // the protocol is built by the render loop's keyed
-            // rebuild, not here. this view isn't the loader's, so an
-            // album still loading behind it has to be disowned before
-            // it lands in here.
-            surf.browse_loader.invalidate();
             *surf.browse_view = Some(bv);
             // same as opening an album: the listing draws its own
             // cursor, so j/k have to move it rather than the hidden
@@ -5157,16 +5159,14 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if key.code == keymap.get(KeyAction::OpenStarredView) {
-                    let bv = open_starred_view(
+                    // the loader owns this view, so opening it bumps
+                    // the generation and disowns anything in flight.
+                    let bv = open_starred(
+                        &mut browse_loader,
                         &cfg.navidrome_servers,
                         &favorites,
                         &app.corpus.remote_clients(),
                     );
-                    // the render loop's keyed rebuild builds the
-                    // protocol. not the loader's view, so an album
-                    // still fetching behind it is disowned rather than
-                    // landing here.
-                    browse_loader.invalidate();
                     browse_view = Some(bv);
                     // same as opening an album: the starred list draws
                     // a selection cursor, so j/k have to move *it*
