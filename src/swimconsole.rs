@@ -17,12 +17,13 @@ use ratatui::widgets::Widget;
 use crate::shellsong::{Console, LineKind};
 use crate::theme::{lerp, shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE, WHITE};
 use crate::ui::controlsbar;
+use crate::ui::draw::{at as draw_at, put};
 /// Marks the scrolled-back notice. Ascii, like every other marker
 /// here: the alignment of this console depends on single cells.
 const SCROLL_MARK: char = '^';
 
 use crate::ui::progress;
-use crate::ui::textfit::{char_cells, truncate_to_width, truncate_with_ellipsis, width};
+use crate::ui::textfit::{tail_fit, truncate_to_width, truncate_with_ellipsis, width};
 
 /// How far in the prompt and every scrollback line sit, so there is a
 /// gutter to put the `:` and the `›` in.
@@ -142,7 +143,7 @@ impl SwimConsole<'_> {
         put(buf, x, row, ':', shade(DIM));
         let text_x = x + GUTTER;
         let (window, cursor_col) = split_at_cursor(&self.console.input, self.console.cursor, inner);
-        let used = draw_str(buf, text_x, row, &window, shade(NEAR_WHITE));
+        draw_str(buf, text_x, row, &window, shade(NEAR_WHITE), inner);
 
         // never fully invisible, so the caret is findable mid-blink.
         let level = if self.cursor_visible { 1.0 } else { 0.45 };
@@ -154,20 +155,27 @@ impl SwimConsole<'_> {
             shade(lerp(DIM, NEAR_WHITE, level)),
         );
 
+        // the ghost goes one cell past the caret, but only where that
+        // cannot land on a cell `window` was written into. the old
+        // guard was `cursor_col != width(&window)`, which the language
+        // never satisfies: it auto-closes `(`, so `queue(fl` is a
+        // 9-cell window with the caret at 8 and the ghost never drew.
         let ghost = &self.console.suggestion.ghost;
-        if ghost.is_empty() || cursor_col != width(&window) {
+        let at = cursor_col + 1;
+        if ghost.is_empty() || at < width(&window) {
             return;
         }
-        let budget = inner.saturating_sub(used + 1);
+        let budget = inner.saturating_sub(at);
         if budget == 0 {
             return;
         }
         draw_str(
             buf,
-            text_x + u16::try_from(used).unwrap_or(0) + 1,
+            text_x + u16::try_from(at).unwrap_or(0),
             row,
             &truncate_to_width(ghost, budget),
             shade(lerp(NEAR_BLACK, DIM, 0.75)),
+            budget,
         );
     }
 
@@ -230,49 +238,27 @@ fn cycle_line(items: &[String], at: usize) -> String {
 /// Cell-width aware: a wide glyph is two columns, and a cursor past
 /// the right edge scrolls the window rather than drawing off it.
 fn split_at_cursor(input: &str, cursor: usize, budget: usize) -> (String, usize) {
-    let before = &input[..cursor.min(input.len())];
+    let cursor = cursor.min(input.len());
+    let before = &input[..cursor];
     if width(input) <= budget {
         return (input.to_string(), width(before));
     }
     // keep the cursor one cell in from the right edge.
-    let keep = budget.saturating_sub(1);
-    let mut start = 0;
-    let mut w = 0;
-    for (i, ch) in before.char_indices().rev() {
-        w += char_cells(ch);
-        if w > keep {
-            break;
-        }
-        start = i;
-    }
-    let window = truncate_to_width(&input[start..], budget);
-    (
-        window.clone(),
-        width(&input[start..cursor.min(input.len())]).min(budget),
-    )
+    let left = tail_fit(before, budget.saturating_sub(1));
+    let used = width(&left);
+    let right = truncate_to_width(&input[cursor..], budget.saturating_sub(used));
+    (format!("{left}{right}"), used)
 }
 
 fn text_at(buf: &mut Buffer, x: u16, y: u16, s: &str, budget: usize, color: Color) {
-    draw_str(buf, x, y, &truncate_with_ellipsis(s, budget), color);
+    draw_str(buf, x, y, &truncate_with_ellipsis(s, budget), color, budget);
 }
 
-/// Writes `s` one cell at a time and returns the cells used, so a
-/// caller can place the next thing after it; wide glyphs advance by
-/// two the way the terminal will draw them.
-fn draw_str(buf: &mut Buffer, x: u16, y: u16, s: &str, color: Color) -> usize {
-    let mut used = 0usize;
-    for ch in s.chars() {
-        put(buf, x + u16::try_from(used).unwrap_or(0), y, ch, color);
-        used += char_cells(ch);
-    }
-    used
-}
-
-fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: Color) {
-    if let Some(cell) = buf.cell_mut((x, y)) {
-        cell.set_char(ch);
-        cell.set_fg(color);
-    }
+/// Writes `s` clipped to `budget` cells and returns the cells used, so
+/// a caller can place the next thing after it. `draw::at` is the one
+/// writer in the app; this only turns its x back into a count.
+fn draw_str(buf: &mut Buffer, x: u16, y: u16, s: &str, color: Color, budget: usize) -> usize {
+    usize::from(draw_at(buf, x, y, s, color, budget).saturating_sub(x))
 }
 
 /// The one row of chrome above the transport strip: what is playing,
@@ -334,6 +320,7 @@ impl Widget for SwimBar<'_> {
             area.y,
             &truncate_with_ellipsis(&left, usize::from(title_room)),
             shade(if dim { DIM } else { NEAR_WHITE }),
+            usize::from(title_room),
         );
 
         // the scrubber owns the right half: `elapsed <track> total`,
@@ -353,7 +340,7 @@ impl Widget for SwimBar<'_> {
             "{elapsed} {} {total}",
             controlsbar::track(frac, right_room - reserved, false)
         );
-        draw_str(buf, area.x + half, area.y, &line, shade(DIM));
+        draw_str(buf, area.x + half, area.y, &line, shade(DIM), right_room);
     }
 }
 
@@ -443,6 +430,82 @@ mod tests {
             ghost > cursor,
             "the ghost is what comes next, so it draws after the caret: {line:?}"
         );
+    }
+
+    /// The language auto-closes `(`, so the caret is never at the end
+    /// of the window for a call: `queue(fl` is a 9-cell window with the
+    /// caret at 8. A guard on `cursor_col == width(&window)` meant the
+    /// ghost, which is the whole point of the completer, never drew in
+    /// shellswim at all.
+    #[test]
+    fn the_ghost_draws_with_the_caret_before_an_auto_closed_paren() {
+        let mut console = Console::empty();
+        console.input = "queue(fl)".to_string();
+        console.cursor = 8;
+        console.suggestion.ghost = "atline".to_string();
+        let buf = draw(&console, 40, 3);
+        assert!(
+            row(&buf, 2).contains("atline"),
+            "the ghost never drew: {:?}",
+            row(&buf, 2)
+        );
+    }
+
+    /// And nowhere it would paint over what was typed: seven cells back
+    /// into the line, the ghost would land on `, hexed)`.
+    #[test]
+    fn the_ghost_is_not_drawn_over_text_the_caret_sits_inside() {
+        let mut console = Console::empty();
+        console.input = "queue(fl, hexed)".to_string();
+        console.cursor = 8;
+        console.suggestion.ghost = "atline".to_string();
+        let buf = draw(&console, 40, 3);
+        let line = row(&buf, 2);
+        assert!(line.contains("hexed"), "the ghost ate real text: {line:?}");
+        assert!(!line.contains("atline"), "{line:?}");
+    }
+
+    fn symbol(buf: &Buffer, x: u16, y: u16) -> String {
+        buf.cell((x, y)).unwrap().symbol().to_string()
+    }
+
+    /// nfd text, which is how apfs stores filenames. The accent shares
+    /// its base's cell, so the caret lands on the cell after the name;
+    /// per char the accent was written to the next cell and the caret
+    /// then painted over it, so an accent you typed was invisible.
+    #[test]
+    fn an_nfd_accent_keeps_its_base_cell_and_the_caret_follows_it() {
+        let mut console = Console::empty();
+        console.input = "Beyonce\u{301}".to_string();
+        console.cursor = console.input.len();
+        let buf = draw(&console, 24, 3);
+        assert_eq!(symbol(&buf, 8, 2), "e\u{301}", "{}", grid(&buf));
+        assert_eq!(symbol(&buf, 9, 2), "\u{2588}", "{}", grid(&buf));
+    }
+
+    /// The dual failure: `❤️` measures two cells but advanced one, so
+    /// `width` put the caret two columns past the `)` that was drawn.
+    #[test]
+    fn the_caret_lands_on_the_cell_after_the_text_not_past_it() {
+        let mut console = Console::empty();
+        console.input = "star(\u{2764}\u{FE0F})".to_string();
+        console.cursor = console.input.len();
+        let buf = draw(&console, 24, 3);
+        // `star(` fills 2..7, the heart owns 7 and 8, so `)` is at 9
+        assert_eq!(symbol(&buf, 7, 2), "\u{2764}\u{FE0F}", "{}", grid(&buf));
+        assert_eq!(symbol(&buf, 9, 2), ")", "{}", grid(&buf));
+        assert_eq!(symbol(&buf, 10, 2), "\u{2588}", "{}", grid(&buf));
+    }
+
+    /// A pasted run of combining marks with no base owns no cells, so
+    /// the caret stays where the text starts.
+    #[test]
+    fn a_baseless_combining_run_takes_no_cells() {
+        let mut console = Console::empty();
+        console.input = "\u{301}".repeat(300);
+        console.cursor = console.input.len();
+        let buf = draw(&console, 24, 3);
+        assert_eq!(row(&buf, 2).trim_end(), ": \u{2588}", "{}", grid(&buf));
     }
 
     #[test]
