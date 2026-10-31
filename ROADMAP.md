@@ -473,16 +473,75 @@ accident.
       subsystem, so none were built. `FramePump`'s public surface does
       not change under any replacement source, so this is a swap of the
       source only. see QUESTIONS.md.
-**the four items below are blocked, not merely unstarted**, which is
-worth saying so a build loop stops picking at them: `video plays as
-real video` needs someone at a real terminal, and the other three
-chain off an ascii video renderer that **has no frame source**.
-`screenshot-raw` cannot work over json ipc (measured; see the closed
-BLOCKER above) and `FramePump` is deleted, so "ascii video" needs a
-new frame subsystem before its layout and frame-budget items mean
-anything. `in-workspace (sub-rect) video` is the one with a real path
-(kitty-only, via `video::Hole`) and it also needs a real terminal to
-develop against.
+**the blocker on these is lifted; a frame source exists.** the old
+conclusion generalised one true fact into a false one. the true fact,
+re-measured on mpv 0.41.0 and still true: `screenshot-raw` cannot come
+over json ipc, because mpv emits a literal `"data":}` and no format or
+flag changes that (`bgr0`/`bgra` truncate the same way, `rgba` answers
+"error running command" under `--vo=null`, `jpg` is "invalid
+parameter"; the documented `format` argument is a *pixel* format, not
+an encoding). the false generalisation was "therefore there is no
+frame source". three working sources are measured in docs/video.md,
+and `examples/frame_probe.rs` pulls real pre-scaled rgb24 frames out
+of a second headless mpv at 38% of one core for 1080p.
+**the decisive thing every earlier measurement left out is
+`--vf=scale`**: mpv does the downscale, which is the expensive half,
+which is why every per-frame number in the old notes was an order of
+magnitude too pessimistic (113-396ms unscaled became 35-41ms, and the
+fifo path 144-290ms to *first* frame).
+two negatives worth keeping. the tempting single-process answer
+(`set_property vo image` at runtime, which mpv does accept mid-
+playback exactly like the existing `tct` flip) is disqualified by
+**pacing**, not cost: `vo_image` is an untimed vo, so against an
+identical realtime-emulating null ao, `vo=null` advances `time-pos`
+at 1.00x and `vo=image` at 0.44x. that is the user's audio at half
+speed. and libmpv's software render api does work (proven:
+`mpv_render_context_create` returns 0 and delivers a frame on the
+second render) but it is a rewrite rather than a feature, since the
+render context is only available to the process owning the
+`mpv_handle` and wim spawns mpv and talks over a socket; it also needs
+flake work the flake lacks (`pkg-config` is not in the dev shell and
+mpv's dev output is not on the include path).
+`video plays as real video` still needs someone at a real terminal,
+and `in-workspace (sub-rect) video` is still kitty-only via
+`video::Hole`, but **the ascii chain is now ordinary work.**
+
+- [ ] **frame source: a second mpv, rawvideo on a fifo.** spawn a
+      headless `--of=rawvideo --ovc=rawvideo --ovcopts=pix_fmt=rgb24`
+      instance with `--vf=scale` to the cell grid plus a `pad` so every
+      frame is the same size, and read exactly `w * h * 3` bytes per
+      frame off a fifo.
+      **the fifo is the clock**, which is the frame-budget item's
+      requirement for free: mpv blocks in `write(2)` once the pipe
+      fills, so wim's read rate *is* the decode rate, and pause is
+      "stop reading". measured: after a 1.0s stall only 5 frames were
+      waiting, not the 25 a free-running decoder would have made.
+      sync is read scheduling, not seeking: frame `n` is
+      `start + n / container-fps` (`container-fps` reads fine over the
+      existing socket), catching up is read-and-discard, waiting is
+      not reading, and there is no drift because the frame instance has
+      no clock of its own. put the audible instance on `vid=no` while
+      ascii mode is on (the `set_vid_for_item` machinery already
+      exists) so there is only ever one video decode.
+      costs: one extra process (134MB rss at 1080p, 74MB at 480p);
+      38% of a core to decode 1080p h264 and scale to 320x192 at 24fps
+      (36% to 160x96, so it is the decode not the scale; 10% for
+      480p); and **~180-550ms of black on a seek**, because encode mode
+      has no socket to seek over so the instance is restarted with
+      `--start=`. no new nix dependency and `src/mpv.rs` does not
+      change. prototype in `examples/frame_probe.rs`.
+      one gotcha the implementation will hit, documented in the
+      prototype: on a fifo with no writer attached yet, `read` returns
+      `Ok(0)` (a clean eof), **not** `WouldBlock`. zero has to mean
+      "wait"; child liveness, not the byte count, is what says it is
+      over.
+      two docs still carry the stale claim and are not this slice's to
+      fix: `src/video.rs`'s module doc reads broader than it is now,
+      and `src/mpv.rs` ~252 is stale the *other* way, calling
+      `screenshot-raw` "the embedded video pane's own frame source"
+      when it is unreachable over the socket wim uses (the clause
+      about screenshots coming from the decoded/filtered frame is
+      right, and is exactly why `vf=scale` works).
 
 - [ ] **video plays as real video in the workspace.** confirm the
       maximized-song path actually shows a real video surface for a

@@ -8,11 +8,16 @@ right before the one `terminal.draw` in `main.rs` all point here.
 the short version: **mpv draws the video, wim stops drawing.** no frame
 ever crosses the ipc socket.
 
-## why frames cannot be pulled out of mpv
+that last clause is about the *json ipc socket* and nothing wider. a
+frame source for an ascii renderer does exist; four of them do, three
+measured working on this machine. see "a frame source does exist"
+below, and `examples/frame_probe.rs` for one that runs.
 
-the previous design asked mpv for `screenshot-raw` and rasterized the
-result in wim. that is not possible over json ipc, and the failure is
-not a tuning problem.
+## why `screenshot-raw` cannot come over json ipc
+
+the previous design asked mpv for `screenshot-raw` on the ipc socket
+and rasterized the result in wim. that one command on that one
+transport is impossible, and the failure is not a tuning problem.
 
 mpv's own manual says `screenshot-raw` "can be used only through the
 client API or from a script using `mp.command_native`", and that is
@@ -28,15 +33,208 @@ the line does not parse as json at all. measured on mpv 0.41.0 for a
 real h264 file and for a lavfi source, with and without `--vo=null`, for
 every `flags` value.
 
+re-measured on 0.41.0 and it still holds exactly. the reply is
+
+```
+{"data":{"w":640,"h":480,"stride":2560,"format":"bgr0","data":},"request_id":0,"error":"success"}
+```
+
+and `json.loads` dies at column 63. the `format` argument the manual
+documents is a *pixel* format, not an encoding, so it cannot help:
+`bgr0` and `bgra` both produce the same truncated line, `rgba` and
+`rgba64` answer `"error running command"` under `--vo=null`, and a
+non-pixel-format name like `jpg` is an `"invalid parameter"`. there is
+no base64 path and no size limit involved; mpv's json writer simply has
+no encoding for an `MPV_FORMAT_BYTE_ARRAY`.
+
 the old code called it from the main loop, so each attempt cost the full
 10s reply timeout: the ui froze in 10-second blocks for as long as a
-local video played. `mpv::FramePump` now recognises an unparseable reply
-as `PumpState::Unsupported`, stops asking and says so once. **that path
-is a dead end; do not revive it.** the measured alternatives are all
-bad: `screenshot-to-file` plus a read-back is 200ms (480p) to 530ms
-(1080p) per frame, i.e. 2-5fps at best, and the others (an mpv lua
-script shipping frames out, or `--vo=image` writing every frame to a
-directory) are a second moving part each.
+local video played. `mpv::FramePump` recognised an unparseable reply
+as `PumpState::Unsupported`, stopped asking and said so once. **that
+one path is a dead end; do not revive it.**
+
+what does not follow is "so there is no frame source". the byte array
+is unreachable *over json ipc*; it is reachable from every other client
+surface mpv has, and mpv can also be made to write frames out without
+being asked for them one at a time.
+
+## a frame source does exist
+
+all of the below was measured on this machine, mpv 0.41.0 / ffmpeg
+8.1.2, against two h264 files generated with `mpv av://lavfi:testsrc2`
+(640x480@25 and 1920x1080@30).
+
+the thing that makes all of it cheap is the one the old measurements
+left out: **`--vf=scale` makes mpv do the downscale**, and every frame
+source below then carries cell-grid-sized frames rather than full
+resolution ones. `screenshot-to-file` on the 1080p file is 396ms per
+frame unscaled (which is where the recorded "530ms" came from) and
+35ms with `--vf=scale=320:192` in front of it. the expensive part was
+never the transport.
+
+| source | works | measured |
+| --- | --- | --- |
+| `screenshot-raw` over json ipc | **no** | unparseable reply, every flag and format |
+| `--vo=image` on the audible instance | **no** | untimed: playback runs at 0.44x |
+| second mpv, `--of=rawvideo` on a fifo | **yes** | 290ms to first frame, 38% of a core at 1080p |
+| mpv lua script, `mp.command_native` | yes | hands over 76800 real bytes as a lua string |
+| libmpv sw render api | yes | `mpv_render_context_create(sw) = 0`, frame on the 2nd render |
+| `screenshot-to-file` + `vf=scale` | yes, barely | 35-41ms per frame, 24-29fps ceiling |
+
+### `--vo=image` is out, and it is the non-obvious one
+
+the tempting single-process answer is to flip the *audible* instance's
+vo to `image` at runtime the way fullscreen flips it to `tct`, and read
+the files back. `set_property vf scale=160:96` and `set_property vo
+image` are both accepted mid-playback and it does write frames. it is
+still unusable: `vo_image` is an **untimed** vo, so mpv stops pacing
+playback against a clock. measured on the 480p file with the same
+realtime-emulating null ao in both cases:
+
+| vo | time-pos advance |
+| --- | --- |
+| `null` | 1.00x realtime |
+| `image` | 0.44x realtime |
+
+0.44x is the user's audio playing at half speed. /tmp here is tmpfs, so
+that is not disk latency, it is mpv no longer waiting for anything.
+`vo=image` can only ever be a *second* instance's vo, and as a second
+instance's vo it is strictly worse than rawvideo (a png encode and a
+file per frame instead of neither).
+
+### the recommended source: a second mpv writing rawvideo to a fifo
+
+```
+mpv --no-config --no-terminal
+    --vf=scale=W:H:force_original_aspect_ratio=decrease,pad=W:H:-1:-1:color=black,format=rgb24
+    --audio=no --sub=no --start=<time-pos>
+    --of=rawvideo --ovc=rawvideo --ovcopts=pix_fmt=rgb24
+    --o=<fifo> <file>
+```
+
+`examples/frame_probe.rs` is this, in 150 lines, and it prints a real
+frame:
+
+```
+source      /tmp/wimframe/big.mp4
+frame       320x192 rgb24, 184320 bytes (w*h*3 = 184320)
+first frame 144 ms after spawning mpv
+px(0,0)         (0, 0, 0)
+px(w/4,h/2)     (0, 216, 0)
+px(w/2,h/2)     (16, 30, 244)
+px(w-1,h-1)     (0, 0, 0)
+mean rgb        (116.9, 122.0, 118.7)
+non-black px    58239 of 61440
+```
+
+what that output is worth checking against: the byte count is exactly
+`w * h * 3` with no stride to interpret, the pixel values are
+testsrc2's own colour bars (green at a quarter across, blue at the
+centre), and 58239/61440 is 94.8% non-black, which is 16:9 letterboxed
+into a 5:3 grid to within the antialiased edge rows. the `pad` is what
+makes every frame the same size whatever the source aspect is, so the
+reader never renegotiates.
+
+three properties make this the recommendation rather than merely a
+thing that works.
+
+**the fifo is the clock.** mpv blocks in `write(2)` once the pipe
+fills, so the rate wim reads at *is* the rate mpv decodes at. measured:
+after a 1.0s stall only 5 frames were waiting, not the 25 a free-running
+decoder would have produced. pause is "stop reading" and costs nothing;
+there is no buffer to bound and no racing ahead. this is also exactly
+what the frame-budget roadmap item asks for, a frame rate wim picks
+rather than one it is handed.
+
+**sync is read scheduling, not seeking.** the frame instance has no
+clock of its own, so it never drifts on its own either. frame *n* is
+media time `start + n / container-fps`, and `container-fps` is already
+readable over the existing ipc socket (30.083565 on the 1080p file).
+wim knows the audible instance's `time-pos` because it already observes
+it, so "which frame should be on screen" is arithmetic: read and discard
+to catch up, stop reading to wait. only a user seek needs a restart,
+and a restart with `--start=` costs 178-545ms to first frame on the
+1080p file.
+
+**there is no second video decode if the audible instance stops doing
+one.** while ascii mode is on, the picture comes from the frame
+instance, so the audible instance can be put on `vid=no` through the
+`set_vid_for_item` machinery that already exists. one video decode, one
+audio decode, two processes.
+
+the costs, stated plainly:
+
+- **one extra process.** 134MB RSS for the 1080p file, 74MB for the
+  480p one.
+- **cpu.** 38% of one core to decode 1080p h264 and scale it to 320x192
+  at 24fps; 36% to 160x96 (so it is the decode, not the scale); 10% for
+  the 480p file. the decode-and-scale ceiling if read as fast as
+  possible is 76fps at 1080p and 297fps at 480p.
+- **~180-550ms of black on a seek**, because the frame instance is
+  restarted rather than seeked. encode mode has no ipc socket to seek
+  over.
+- **no new nix dependency.** mpv is already a runtime `PATH` dep via
+  the flake's `wrapProgram`, nothing is linked, and `src/mpv.rs` does
+  not change: mpv stays a subprocess.
+
+### the two that also work, and why they are not it
+
+**an mpv lua script** on the audible instance. this is the single
+most surprising result: `mp.command_native({"screenshot-raw","video"})`
+**does** hand the byte array over, as a plain lua string. with
+`--vf=scale=160:96` it returned `w=160 h=120 stride=640 format=bgr0`
+and a 76800-byte string, written out intact. so the manual's "client
+API or `mp.command_native`" is literal, and lua is a real surface. it
+is not the recommendation for one reason: lua's `io` is blocking and
+the script runs on mpv's main thread, so a wim that stops reading the
+fifo stalls the *audible* instance's playback. there is no non-blocking
+write available from mpv's lua (no luaposix, no socket api). trading "a
+slow reader slows a throwaway decoder" for "a slow reader stutters the
+user's audio" is the wrong trade. note also `screenshot video` reapplies
+aspect correction, so it answered 160x120 for a 160x96 filter chain,
+and it carries a stride.
+
+**libmpv's sw render api**, which is the proper answer and does work.
+verified with a 40-line C program against the dev shell's own libmpv:
+
+```
+mpv_render_context_create(sw) = 0 (success)
+frame after 2 renders: 160x96 rgb0, 30904 nonzero bytes of 61440
+  px(0,0)=(0,0,0) px(w/4,h/2)=(74,251,0) px(w/2,h/2)=(38,45,234)
+```
+
+mpv renders straight into a caller-supplied buffer at a
+caller-supplied size, which is every property wanted at once: one
+decoder, sync by construction, pull-based so wim picks the frame rate,
+and no transport at all.
+
+the cost is that it is not a feature, it is a rewrite. the render
+context is only available to the process that *owns* the `mpv_handle`,
+and wim does not own one: it spawns mpv and talks to it over a socket,
+which is the premise of all 951 lines of `src/mpv.rs` and of the
+flake's "mpv is a runtime subprocess dependency, not a linked library"
+comment. taking this path means wim becomes the mpv host. it also needs
+flake work the flake has not had: `pkg-config` is **not** in the dev
+shell (`nix develop --command pkg-config --libs mpv` is
+`exec: pkg-config: not found`) and mpv's dev output is not on the
+include path, so the C program above had to be pointed at the store
+paths by hand. and a new crate (`libmpv2`/`libmpv-sys`) has to go into
+`Cargo.lock`, for four platforms. mpv's own `render.h` calls the sw
+renderer "extremely simple (but slow)".
+
+so: rawvideo on a fifo now, because it unblocks the ascii renderer
+without touching the player layer, and libmpv later if wim ever stops
+treating mpv as a subprocess for other reasons. whatever replaces
+`FramePump` should keep a surface narrow enough that the source is a
+swap.
+
+**`screenshot-to-file` plus `vf=scale`** is the fallback, recorded
+because the number in this file used to be wrong. with the scale filter
+in front of it the per-frame round trip is 35-41ms median rather than
+113ms (480p) or 396ms (1080p) unscaled, so 24-29fps rather than 2-9fps.
+still not it: every frame is a blocking ipc round trip competing with
+wim's own property traffic, plus a png encode, a file write and a file
+read for data wim already had in raw form a step earlier.
 
 ## what mpv can do instead
 
