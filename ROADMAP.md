@@ -880,11 +880,25 @@ mpv loaded, a generated silence source included".
       list after both.
       `ui::textfit::columns` is the layout: up to three columns,
       column-major like `ls` so reading *down* keeps the ranking, each
-      item ellipsised to its column so every row is one line, and the
-      count drops to whatever keeps columns at least 18 cells -- so a
-      narrow terminal falls back to one column instead of shredding
-      every title. capped at 30 results with `+N more`, since the
-      point was not flooding the terminal.
+      item ellipsised rather than wrapped so one item is always one
+      row. capped at 30 results with `+N more`, since the point was
+      not flooding the terminal.
+      **each column is sized to its own contents**, which is the
+      algorithm rather than a detail of it. the first cut divided the
+      width evenly, which is wrong in both directions: a list of
+      eight-cell names wasted two thirds of every column, and long
+      titles got chopped at the same arbitrary place whether or not
+      there was room. it now tries three columns, then two, then one,
+      and takes the first whose *actual* widths fit -- so six 6-cell
+      names pack into a 24-cell terminal (22 used) where an even
+      division would have refused, and a 72-cell terminal truncates
+      nothing where it used to cut at 22.
+      only when nothing fits untruncated does it share the width out,
+      and then only while each column stays >= 18 cells, so a narrow
+      terminal with long titles drops to one column instead of three
+      unreadable slivers. the even-division behaviour had a test
+      asserting it; that test now asserts the packing instead, which
+      is how the improvement was confirmed rather than assumed.
       deliberately **unnumbered**: no `Target` is addressable by
       result index from the language (`Target::Index` is only ever
       produced internally by `best_match`), so a numbered list would
