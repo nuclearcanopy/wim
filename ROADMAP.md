@@ -1036,27 +1036,38 @@ above this line in the shellswim section is done.
       pinned including `LoopMode::One`, which does *not* replay a queue
       (it is mpv's own `loop-file`), and loop-all with an empty session
       clearing rather than restarting from nothing.
-- [ ] **track-change hooks are not at parity across the three paths
-      that start a track**, found while extracting the above and worth
-      fixing before it bites:
-      - wim's **ordinary advance** and its **loop-all restart** both
-        fire `fire_subtitle_fetch`, `note_playback_started`,
-        `start_tracking_playback`, `identity_settings` (per-identity
-        eq/volume) and the crossfade ramp.
-      - **`core::start_session`** -- which is what `play()` and
-        `Action::Play` go through -- fires the first three and
-        **not** `identity_settings` or the ramp. so per-identity eq
-        applies when a track arrives by advancing but not when you
-        ask for it by name, which is the kind of difference nobody
-        would guess at.
-      - **shellswim** fires none of them on an ordinary advance (it
-        prints a line), and now fires two on a restart.
-      the fix is one `track_started(track, core, surf)` in `core` that
-      every path calls, with the front-end-specific parts behind
-      `Surface`. `TrackChangeCtx` already exists and is the start of
-      this; `identity_settings` returning ops for the host to queue is
-      the part that needs a home, since `shellsong_queued` is a
-      main.rs local.
+- [x] **track-change hooks are at parity now: `core::track_started`.**
+      three paths started a track and fired different hooks. wim's
+      advance and its loop-all restart fired all five (subtitle fetch,
+      playback note, scrobble tracking, per-identity settings, the
+      volume ramp); **`core::start_session` -- which is what `play()`
+      and `Action::Play` go through -- fired three and not
+      per-identity settings or the ramp**, so a bound eq applied when
+      a track arrived by advancing and silently did nothing when you
+      asked for it by name. shellswim fired none of them at all.
+      all four sites call `track_started` now. it returns the
+      per-identity ops rather than applying them, because they *are*
+      ops: pushing them through the same `apply_shellsong_op` path is
+      what keeps a bound eq indistinguishable from a typed one, and
+      the pending-program slot differs between the hosts.
+      `Surface::queue_program` carries them, defaulting to dropping
+      them for a front-end with no step loop.
+      `Overridden` moved from a main.rs local into `CoreCtx`, since
+      the hook is shared; shellswim gained one, having never had any.
+      `set_vid_for_item` deliberately stayed at the call site: it is
+      about what mpv decodes when the file loads, not a consequence of
+      playback starting.
+      **the test was wrong on its first draft and the mutation check
+      caught it.** it called `track_started` directly, so gutting the
+      call inside `start_session` left it passing -- it pinned the
+      function, not the wiring. it goes through `start_session` with a
+      capturing `Surface` now, and fails when that call is removed.
+      wim's `core_ctx!`/`wim_surface!` macros moved to just after
+      `now_playing` is bound, with `shellsong_now` hoisted to join
+      them: a `macro_rules!` is only in scope after its definition,
+      and the event drain above them wants them too. this is the
+      second time that ordering has forced a workaround, so it is
+      fixed rather than worked around again.
 
 
 ### stage 4: the queue timeline (started)
