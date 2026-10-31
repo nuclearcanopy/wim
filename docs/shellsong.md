@@ -49,7 +49,11 @@ should be added that breaks one.
 - **r6. a name suffix is sugar for a keyword argument.**
   `queue_aa([x])` *is* `queue([x], kind=album)`, and `dry()` prints the
   desugared form so you can check.
-- **r7. kinds are a preference order, not a filter.** see below.
+- **r7. the bare command resolves ambiguity; `kind=` filters.** a term
+  matching both a song and an album resolves to whichever scored
+  better. `kind=`/`k=` asserts one and does not fall back. see below;
+  this rule read "kinds are a preference order, not a filter" until
+  real use showed the two halves want opposite things.
 - **r8. signed time is relative, unsigned is absolute**, enforced in
   both directions. `seek(30s)` and `moveto(+30s)` are both errors that
   tell you which one you meant.
@@ -251,22 +255,42 @@ which clips. ask for `volume(100%)` if you want the top.
 
 ## kinds and ambiguity
 
-searching "crest" can match a song *and* an album. a kind preference
-order decides which wins: a term resolves to the best-scoring result of
-the most-preferred kind that is actually present. this is ambiguity
-resolution, not filtering (r7).
+searching "crest" can match a song *and* an album. the better score
+wins, and `kind=` is how you overrule that.
 
-| command | preference |
-| --- | --- |
-| `play` | song, album |
-| `queue` | song |
-| `queue_aa` | **album**, song |
-| `star`, `unstar`, `download` | song, album |
-| `view(q, ...)` | artist, album, playlist, song |
+**r7 said "ambiguity resolution, not filtering" and that half is now
+wrong.** the bare command still resolves ambiguity -- it takes the
+best match of either kind -- but `kind=` filters, deliberately, because
+an assertion that silently accepts something else is not an assertion.
+the reasoning r7 recorded is still why the *default* is a resolution
+rather than a prompt; it just no longer describes `kind=`.
 
-`play` being wider than `queue` is deliberate: playing an album is an
-ordinary thing to want, building a *queue* out of albums is not. do not
-"fix" the asymmetry.
+| command | accepts | how it picks |
+| --- | --- | --- |
+| `play` | song, album | best score |
+| `queue` | song, album | best score |
+| `star`, `unstar`, `download` | song, album | best score |
+| `view(q, ...)` | artist, album, playlist, song | **in that order** |
+
+**`play` and `queue` accept the same kinds and let the scores decide.**
+a term naming an album queues the album; a term naming a song queues
+the song. `Corpus::search` sorts by score and then groups categories,
+keeping each category's first appearance, so "the acceptable result
+nearest the front" *is* "whichever kind matched better".
+
+this replaces a recorded asymmetry (`queue` was song-only, on the
+grounds that "playing an album is ordinary, building a queue out of
+albums is not"). it was overruled from real use: `queue(crest)`
+queueing one song off an album nobody named is not what anyone meant.
+`add_to_queue(back, x)` is still exactly `queue(x)`, and a test
+compares the two lowerings, which is what caught them diverging when
+only one was changed.
+
+`view` is the exception and keeps a real *order*: `view(q, bladee)`
+should open the artist's page even when some song scored higher,
+because an artist is the thing that most has a page. that is also why
+`kind=` does not apply to it -- the rungs below widen *from songs*,
+and `view` does not start there.
 
 `view` is wider still and in a different order, because it opens pages
 and an artist is the thing that most has one. being a different order
@@ -288,14 +312,22 @@ no album match behaves as before.
 
 ### suffixes and `kind=`
 
-suffixes are sugar (r6) for the `kind=` ladder. each rung only widens
-the one before it.
+suffixes are sugar (r6) for `kind=`.
+
+`kind=` is an **assertion**, not a widening: it says which kind you
+mean and does not fall back to another. `k=album` with no album match
+reports that rather than quietly queueing a song.
 
 | suffix | means | accepts |
 | --- | --- | --- |
-| none | `kind=song` | songs (remote and local music) |
-| `_aa` | `kind=album` | songs, albums ("allow album") |
+| none | -- | songs and albums, best score wins |
+| `_aa` | `kind=album` | albums only |
 | `_any` | `kind=any` | songs, albums, artists, playlists, local video |
+
+`_aa` reads as "allow album" and no longer describes what it does:
+albums are allowed by default now, and the suffix asserts. it is kept
+so existing scripts still parse rather than failing silently, but
+`k=a` is the spelling to reach for.
 
 `kind=` has a short spelling, `k=`, and the rung values have short
 spellings too. all of these are the same call:
