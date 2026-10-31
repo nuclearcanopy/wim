@@ -842,18 +842,41 @@ counter bumped per request and on `invalidate`, checked by the worker
 before it sends and again in `poll`. Copy that shape; do not invent a
 third.
 
-- [ ] **`resolve_tracks` (main.rs ~118) is the worst of the three.**
-      called from `dispatch_action`'s `Action::Play` and `Action::Queued`
-      arms (~1063, ~1099) and from shellsong (~1920). for an album it
-      is one `getAlbum`. **for an artist it calls `artist_tracks`,
-      which is a `getArtist` plus one `getAlbum` per album**, so
-      pressing enqueue on a prolific artist blocks the whole ui for as
-      long as that fan-out takes. the bounded pool made it 5x faster;
-      it is still seconds, and still synchronous.
-      note the irony: `browse::Loader` already streams exactly this
-      data album by album for the *browse* path. queueing it re-fetches
-      the same thing synchronously. the fix may be to route queueing
-      through the loader rather than to build a fourth one.
+- [x] **queueing an album or artist no longer blocks** (`Action::Queued`
+      and `add_to_queue(front, ...)`). `EnqueueResolver` resolves the
+      tracks off-thread; this was the case the audit named, since for
+      an artist `resolve_tracks` is a `getArtist` plus a `getAlbum` per
+      album.
+      **the commonest action stays instant**, which is the part worth
+      keeping: `request` answers `Resolution::Ready` for a local file
+      or a single song, because those are already their own track list
+      and making them wait a frame for a thread would be a regression
+      dressed as a fix. only an album, artist or playlist becomes
+      `Fetching`.
+      the stale guard matters more here than anywhere else it has been
+      used: elsewhere a late reply draws something out of date, but a
+      late batch **mutates the queue**, appending tracks against a
+      queue that is gone. pinned by two tests that both fail when the
+      generation check is disabled.
+      `append_resolved`/`front_resolved` are shared by the instant path
+      and the drain, so the two cannot report differently; `front`
+      still inserts reversed so a batch keeps its own order.
+      shellswim's `Host` grew a `core_ctx!` macro while wiring its
+      drain, for the same reason main.rs has one: the context borrows
+      most of `Host` plus two locals, and a method cannot return a
+      struct borrowing locals it just made.
+- [ ] **`Action::Play` on an album or artist still resolves
+      synchronously.** the same `EnqueueResolver` shape applies, but
+      playing has more to do on arrival than queueing (it loads the
+      playlist, remembers what it interrupted, and starts tracking
+      playback), so it wants its own intent and a `play_resolved`
+      extracted the way `append_resolved` was. starting playback does
+      inherently wait for the first track, so this is less felt than
+      queueing was.
+- [ ] **`trigger_downloads` resolves synchronously too** (download
+      selected on an album or artist). lowest of the three in felt
+      cost, since a download is already understood to take a while,
+      but it is the same freeze.
 - [x] **`open_starred_view` fetched starred songs from every configured
       server synchronously** -- fixed by routing it through
       `browse::Loader` rather than building a fourth loader, which is
