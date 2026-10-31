@@ -21,22 +21,45 @@ pub struct NotificationOverlay<'a> {
 /// the cells that were drawn.
 fn placed(items: &[Notification], area: Rect) -> Vec<(Rect, String, &Notification)> {
     let mut placed = Vec::new();
+    // narrower than a border on each side there is no box to draw, and
+    // reporting a one-cell rect to the hit map would claim a click for
+    // a toast nothing painted.
+    if area.width < 2 {
+        return placed;
+    }
     let mut y = area.y;
     for n in items.iter().rev() {
         if y + 3 > area.y + area.height {
             break;
         }
 
-        let text = format!("[{}] {}", n.severity.icon(), n.message);
-        let max_inner = (area.width as usize).saturating_sub(4);
-        let text = truncate_with_ellipsis(&text, max_inner.max(1));
+        let max_inner = ((area.width as usize).saturating_sub(4)).max(1);
+        // the count's cells come off the budget before the message is
+        // fitted, never after: appended to the text it was the first
+        // thing the ellipsis ate, so a batch of 800 failures read as
+        // one failure on any terminal narrow enough to cut the line.
+        let count = n.count_suffix();
+        let room = max_inner.saturating_sub(text_width(&count)).max(1);
+        let head = format!("[{}] {}", n.severity.icon(), n.message);
+        let text = truncate_with_ellipsis(&head, room);
+        // and if the count alone will not fit, the box keeps the
+        // message rather than growing past the rect it was given.
+        let text = if text_width(&text) + text_width(&count) <= max_inner {
+            format!("{text}{count}")
+        } else {
+            text
+        };
         // cells, not chars: a cjk or emoji track label in the
         // message measures wider than its char count, and sizing
         // the box by chars left the text overrunning its own right
         // border.
         let inner_width = (text_width(&text) as u16).max(4);
-        let box_width = inner_width + 2;
-        let start_x = area.x + area.width.saturating_sub(box_width);
+        // never wider than the rect it was handed: the `max(4)` made a
+        // six-cell box on a four-cell area, and `saturating_sub` then
+        // pinned it at the left edge and ran it off the right, over
+        // whatever pane sat there.
+        let box_width = (inner_width + 2).min(area.width);
+        let start_x = area.x + area.width - box_width;
 
         placed.push((Rect::new(start_x, y, box_width, 3), text, n));
         y += 4; // box height (3) + one row of gap before the next
@@ -138,7 +161,7 @@ fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: ratatui::style::Color)
 mod tests {
     use super::*;
     use crate::notify::{Notifications, Severity};
-    use crate::ui::testbuf::{buffer, char_at, grid, plated_buffer};
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, char_at, grid, plated_buffer};
 
     fn one(severity: Severity, message: &str) -> Notifications {
         let mut n = Notifications::default();
@@ -252,13 +275,86 @@ mod tests {
         }
     }
 
+    /// What `download.rs` does over `notify`'s api, replayed: a
+    /// progress box per track up front, then one outcome per track,
+    /// reusing the first one's text past `PER_TRACK_TOASTS` so the
+    /// pushes coalesce. The rule is private to `download.rs`, so this
+    /// restates it rather than importing it; `a_big_batch_is_one_box`
+    /// in `notify.rs` is the half that pins the counting.
+    fn failed_batch(tracks: usize) -> Notifications {
+        const PER_TRACK_TOASTS: usize = 5;
+        let mut n = Notifications::default();
+        let label = |i: usize| format!("Track {i} · Some Artist");
+        for i in 0..tracks {
+            n.push_progress(i.to_string(), label(i));
+        }
+        for i in 0..tracks {
+            // past the threshold every outcome carries track 0's text.
+            let named = if tracks > PER_TRACK_TOASTS { 0 } else { i };
+            n.finish_progress(
+                &i.to_string(),
+                Severity::Error,
+                format!(
+                    "download failed: {}: 500 internal server error",
+                    label(named)
+                ),
+            );
+        }
+        n
+    }
+
+    /// The count is the only thing a coalesced box says that a single
+    /// failure's box does not, and it used to be appended to the
+    /// message, so it was the first thing the fit cut: at 48 cells a
+    /// discography that failed entirely rendered as five identical
+    /// sentences with no number anywhere on screen.
+    #[test]
+    fn the_count_outlives_a_box_too_narrow_for_its_message() {
+        let n = failed_batch(800);
+        for w in [100u16, 80, 60, 48, 40, 34] {
+            let g = grid(&render(&n, w, 8));
+            assert!(g.contains("x800"), "{w} cells lost the count:\n{g}");
+        }
+    }
+
+    /// And the reservation does not push the box out of the rect it
+    /// was handed when there is no room for either piece.
+    #[test]
+    fn a_counted_box_stays_inside_its_rect_at_any_width() {
+        let n = failed_batch(800);
+        for w in [4u16, 6, 8, 12, 20, 30] {
+            let area = Rect::new(0, 0, w, 6);
+            let mut buf = buffer(w + 6, 6);
+            NotificationOverlay { items: n.visible() }.render(area, &mut buf);
+            assert_outside_untouched(&buf, area);
+        }
+    }
+
+    /// The batch coalescing, as the screen shows it. `MAX_STACKED`
+    /// bounds this at five boxes; the question is whether five boxes
+    /// about one failure read as one answer.
+    /// `cargo test --lib ui::notify::tests::print_the_batch -- --nocapture`
+    #[test]
+    fn print_the_batch_stack() {
+        for tracks in [1usize, 5, 6, 800] {
+            let n = failed_batch(tracks);
+            for w in [80u16, 48] {
+                let buf = render(&n, w, 24);
+                println!("--- {tracks} tracks, {w} cells\n{}", grid(&buf));
+            }
+        }
+    }
+
     #[test]
     fn renders_at_degenerate_sizes_without_panicking() {
         let n = one(Severity::Alert, "something happened");
         for (w, h) in [(1, 1), (2, 3), (0, 8), (40, 0), (5, 2), (6, 3)] {
             let area = Rect::new(0, 0, w, h);
-            let mut buf = buffer(w.max(1), h.max(1));
+            // room to the right and below, so a box that ran past the
+            // rect it was given has somewhere to be caught doing it.
+            let mut buf = buffer(w.max(1) + 8, h.max(1) + 4);
             NotificationOverlay { items: n.visible() }.render(area, &mut buf);
+            assert_outside_untouched(&buf, area);
         }
     }
 }

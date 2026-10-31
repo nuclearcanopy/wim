@@ -65,6 +65,11 @@ fn progress_suffix(p: Progress) -> String {
 
 pub struct Notification {
     pub severity: Severity,
+    /// The outcome text, without the repeat count. The count is a
+    /// separate piece on purpose: appended to this string it was the
+    /// first thing a box's fit cut off, so an 80-cell terminal showed
+    /// five identical sentences about 800 failures and no number
+    /// anywhere. See `count_suffix`.
     pub message: String,
     /// `Some` only for progress notifications (see the module doc);
     /// used both to find the right one to update/finish and to decide
@@ -90,6 +95,26 @@ impl Notification {
     /// `lifetime` and `expire()` running.
     pub fn remaining_secs(&self) -> u64 {
         crate::anim::countdown_secs(self.shown_at.elapsed(), self.lifetime)
+    }
+
+    /// How many times this exact message has fired, and how it reads
+    /// in a box: `" (x800)"`, or nothing at all for a one-off. The
+    /// renderer reserves these cells ahead of fitting the message,
+    /// which is the whole point of splitting them: the count is the
+    /// only thing a coalesced box says that the message does not, so
+    /// it is the one part that must never be the piece that gets cut.
+    pub fn count_suffix(&self) -> String {
+        if self.repeats > 1 {
+            format!(" (x{})", self.repeats)
+        } else {
+            String::new()
+        }
+    }
+
+    /// Message and count as one line, for a front-end with no box to
+    /// put the count in: shellswim's scrollback is its only output.
+    pub fn text(&self) -> String {
+        format!("{}{}", self.message, self.count_suffix())
     }
 
     /// Text for the bottom-border countdown/status: a live percentage
@@ -126,6 +151,13 @@ fn lifetime_for(message: &str) -> Duration {
 /// screen, the oldest just drops off.
 const MAX_STACKED: usize = 5;
 
+/// Whether `n` is a finished notification already saying this exact
+/// thing, i.e. one a repeat belongs on. A download still in flight is
+/// never one: its box is live and keyed by id.
+fn same_outcome(n: &Notification, severity: Severity, message: &str) -> bool {
+    n.progress.is_none() && n.severity == severity && n.label == message
+}
+
 #[derive(Default)]
 pub struct Notifications {
     items: Vec<Notification>,
@@ -142,12 +174,11 @@ impl Notifications {
         if let Some(existing) = self
             .items
             .iter_mut()
-            .find(|n| n.progress.is_none() && n.severity == severity && n.label == message)
+            .find(|n| same_outcome(n, severity, &message))
         {
             existing.repeats += 1;
-            existing.message = format!("{message} (x{})", existing.repeats);
             existing.shown_at = Instant::now();
-            existing.lifetime = lifetime_for(&existing.message);
+            existing.lifetime = lifetime_for(&existing.text());
             return;
         }
         let lifetime = lifetime_for(&message);
@@ -208,18 +239,34 @@ impl Notifications {
     /// so the outcome is never silently lost.
     pub fn finish_progress(&mut self, id: &str, severity: Severity, message: impl Into<String>) {
         let message = message.into();
-        if let Some(n) = self.items.iter_mut().find(|n| n.id.as_deref() == Some(id)) {
-            n.severity = severity;
-            n.label = message.clone();
-            n.message = message;
-            n.id = None;
-            n.repeats = 1;
-            n.progress = None;
-            n.shown_at = Instant::now();
-            n.lifetime = lifetime_for(&n.message);
-        } else {
+        let Some(at) = self.items.iter().position(|n| n.id.as_deref() == Some(id)) else {
             self.push(severity, message);
+            return;
+        };
+        // a batch past `download::PER_TRACK_TOASTS` hands every
+        // outcome the same text so these coalesce, and the ones whose
+        // live box was already evicted take the `push` above. a box
+        // still on the stack has to join that count rather than
+        // convert in place beside it: 800 failures ended as four
+        // identical uncounted boxes next to one reading "(x796)".
+        if self
+            .items
+            .iter()
+            .any(|n| same_outcome(n, severity, &message))
+        {
+            self.items.remove(at);
+            self.push(severity, message);
+            return;
         }
+        let n = &mut self.items[at];
+        n.severity = severity;
+        n.label = message.clone();
+        n.message = message;
+        n.id = None;
+        n.repeats = 1;
+        n.progress = None;
+        n.shown_at = Instant::now();
+        n.lifetime = lifetime_for(&n.message);
     }
 
     /// Drops anything past its lifetime; called once per render frame
@@ -237,10 +284,12 @@ impl Notifications {
     /// would cover the thing it is talking about; the scrollback is
     /// the only output it has.
     pub fn drain_text(&mut self) -> Vec<String> {
+        // `text`, not `message`: there is no box here to carry the
+        // count in a reserved corner, so it goes in the line.
         let out = self
             .items
             .iter()
-            .map(|n| n.message.clone())
+            .map(Notification::text)
             .collect::<Vec<_>>();
         self.items.clear();
         out
@@ -302,7 +351,89 @@ mod tests {
             n.push(Severity::Error, "writing to mpv ipc socket");
         }
         assert_eq!(n.visible().len(), 1, "repeats must not stack up");
-        assert_eq!(n.visible()[0].message, "writing to mpv ipc socket (x4)");
+        // the count is its own piece, so a narrow box reserves cells
+        // for it instead of fitting it off the end of the sentence.
+        assert_eq!(n.visible()[0].message, "writing to mpv ipc socket");
+        assert_eq!(n.visible()[0].count_suffix(), " (x4)");
+        assert_eq!(n.visible()[0].text(), "writing to mpv ipc socket (x4)");
+    }
+
+    /// A one-off says nothing about counts, so nothing is reserved
+    /// for it and the message gets the whole box.
+    #[test]
+    fn a_single_notification_carries_no_count_at_all() {
+        let mut n = Notifications::default();
+        n.push(Severity::Info, "starred");
+        assert_eq!(n.visible()[0].count_suffix(), "");
+        assert_eq!(n.visible()[0].text(), "starred");
+    }
+
+    /// What `download.rs` does over this api for a batch past its
+    /// `PER_TRACK_TOASTS`: a progress box per track, then one outcome
+    /// per track reusing the first one's text. `MAX_STACKED` evicts
+    /// most of the live boxes, so most outcomes take the `push`
+    /// fallback and coalesce; the handful whose box survived used to
+    /// convert in place and sit beside the counted one as uncounted
+    /// twins, so 800 failures rendered as five boxes, four of them
+    /// silent about the other 796.
+    fn failed_batch(tracks: usize, collapse: bool) -> Notifications {
+        let mut n = Notifications::default();
+        for i in 0..tracks {
+            n.push_progress(i.to_string(), format!("Track {i}"));
+        }
+        for i in 0..tracks {
+            let named = if collapse { 0 } else { i };
+            n.finish_progress(
+                &i.to_string(),
+                Severity::Error,
+                format!("download failed: Track {named}: 500"),
+            );
+        }
+        n
+    }
+
+    #[test]
+    fn a_coalesced_batch_is_one_box_counting_every_outcome() {
+        for tracks in [6usize, 7, 50, 800] {
+            let n = failed_batch(tracks, true);
+            assert_eq!(
+                n.visible().len(),
+                1,
+                "{tracks} identical outcomes left {} boxes",
+                n.visible().len()
+            );
+            assert_eq!(
+                n.visible()[0].count_suffix(),
+                format!(" (x{tracks})"),
+                "{tracks} outcomes"
+            );
+        }
+    }
+
+    /// Below the threshold every outcome still has its own text, so
+    /// they stay separate boxes and none of them counts.
+    #[test]
+    fn a_small_batch_keeps_a_box_per_track() {
+        let n = failed_batch(5, false);
+        assert_eq!(n.visible().len(), 5);
+        for item in n.visible() {
+            assert_eq!(item.count_suffix(), "");
+        }
+        let texts: Vec<String> = n.visible().iter().map(Notification::text).collect();
+        assert_eq!(texts.len(), 5, "and each names its own track");
+        for i in 0..5 {
+            assert!(
+                texts.iter().any(|t| t.contains(&format!("Track {i}:"))),
+                "track {i} is in no box: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_download_still_reports_once_with_no_count() {
+        let n = failed_batch(1, false);
+        assert_eq!(n.visible().len(), 1);
+        assert_eq!(n.visible()[0].text(), "download failed: Track 0: 500");
     }
 
     #[test]

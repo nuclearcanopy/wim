@@ -8,8 +8,9 @@ use ratatui::widgets::Widget;
 
 use crate::app::LoopMode;
 use crate::theme::{lerp, shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE, WHITE};
+use crate::ui::draw;
 use crate::ui::progress::readouts;
-use crate::ui::textfit::{char_cells, truncate_to_width, truncate_with_ellipsis, width};
+use crate::ui::textfit::{truncate_with_ellipsis, width};
 
 /// Every glyph on this line is drawn from a block unicode never gave
 /// an emoji presentation to (latin-1, box drawing, block elements,
@@ -26,6 +27,11 @@ pub const GLYPH_PAUSE: char = '‖'; // U+2016 double vertical line
 pub const GLYPH_LOOP: char = '↻'; // U+21BB clockwise open circle arrow
 pub const GLYPH_SHUFFLE: char = '⇄'; // U+21C4 rightwards arrow over leftwards arrow
 pub const GLYPH_SPEED: char = '×'; // U+00D7 multiplication sign
+/// Mute is two glyphs rather than two brightnesses of one, the same
+/// call `GLYPH_PLAY`/`GLYPH_PAUSE` makes: both answer "why is there no
+/// sound", and that is not a question to leave to a shade of grey.
+pub const GLYPH_AUDIBLE: char = '○'; // U+25CB white circle
+pub const GLYPH_MUTE: char = '⊘'; // U+2298 circled division slash
 pub const GLYPH_EQ: &str = "▂▅▃"; // U+2582/2585/2583 lower block eighths
 pub const GLYPH_CROSSFADE: &str = "◢◣"; // U+25E2/25E3 black lower right/left triangle
 const TRACK_DONE: char = '━'; // U+2501 box drawings heavy horizontal
@@ -232,6 +238,12 @@ pub struct ControlsBar<'a> {
     pub eq_active: bool,
     pub crossfade_on: bool,
     pub paused: bool,
+    /// Whether mpv's own `mute` is on. Its own glyph because muted
+    /// audio was visible nowhere: silence from `: mute()` read exactly
+    /// like silence from `volume(0%)`, a dead socket or a bad file.
+    /// Not in `Field`: nothing dispatches a mute yet, and a control
+    /// you can land on but not press would be the worse lie.
+    pub muted: bool,
     /// Seconds left of a between-track gap, if one is running.
     ///
     /// During a gap mpv really is paused, so without this the bar
@@ -436,6 +448,22 @@ impl ControlsBar<'_> {
                     None if self.paused => GLYPH_PAUSE.to_string(),
                     None => GLYPH_PLAY.to_string(),
                 }),
+            },
+            // second, right behind the transport: the fit drops whole
+            // elements from the right, and "you are muted" is the one
+            // answer to "why is there no sound" that nothing else on
+            // screen gives, so it must not be what a narrow bar loses.
+            Segment {
+                field: None,
+                lit: self.muted,
+                body: Body::Glyph(
+                    if self.muted {
+                        GLYPH_MUTE
+                    } else {
+                        GLYPH_AUDIBLE
+                    }
+                    .to_string(),
+                ),
             },
             Segment {
                 field: Some(Field::Loop),
@@ -725,9 +753,12 @@ pub fn fill_bg(buf: &mut Buffer, from_x: u16, to_x: u16, y: u16, bg: Color) {
 }
 
 /// Draws `text` from `start_x` up to (never past) `limit`, returning
-/// the next free column. Advances by each char's display width, not by
-/// one per char, so a double-width glyph owns the two cells it
-/// actually paints over.
+/// the next free column. A `limit`-and-cursor shape over `draw::at`,
+/// which is the one writer: this was the fifth hand-rolled per-char
+/// loop, and a per-char advance put a combining mark on top of its own
+/// base and gave a zwj family three cells of its own, six where the
+/// cluster is two, over whatever sat past the limit. See
+/// docs/text-measurement.md.
 fn draw_chars(
     buf: &mut Buffer,
     start_x: u16,
@@ -738,29 +769,7 @@ fn draw_chars(
     bg: Option<Color>,
 ) -> u16 {
     let budget = limit.saturating_sub(start_x) as usize;
-    let mut x = start_x;
-    for ch in truncate_to_width(text, budget).chars() {
-        let cells = char_cells(ch) as u16;
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_fg(color);
-            if let Some(bg) = bg {
-                cell.set_bg(bg);
-            }
-        }
-        // the trailing half of a wide glyph is blanked rather than
-        // left holding whatever was under it, which would print twice.
-        for off in 1..cells {
-            if let Some(cell) = buf.cell_mut((x + off, y)) {
-                cell.set_symbol("");
-                if let Some(bg) = bg {
-                    cell.set_bg(bg);
-                }
-            }
-        }
-        x += cells;
-    }
-    x
+    draw::at_styled(buf, start_x, y, text, color, bg, budget)
 }
 
 fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: Color) {
@@ -774,7 +783,8 @@ fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: Color) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::testbuf::{buffer, grid};
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
+    use crate::ui::textfit::char_cells;
 
     fn plain_bar() -> ControlsBar<'static> {
         ControlsBar {
@@ -788,6 +798,7 @@ mod tests {
             eq_active: false,
             crossfade_on: false,
             paused: false,
+            muted: false,
             gap_remaining: None,
             elapsed_secs: Some(30.0),
             duration_secs: Some(120.0),
@@ -840,6 +851,64 @@ mod tests {
 
     fn bg_of(buf: &Buffer, y: u16, ch: char) -> Color {
         buf.cell((col_of(buf, y, ch), y)).unwrap().bg
+    }
+
+    /// The measured failure this writer shared with the four that were
+    /// routed before it: a border at the limit column, a budget of 8,
+    /// and a per-char advance. A zero-width codepoint either
+    /// overwrote the cluster's own cell (nfd `é` left a bare accent
+    /// where the letter was) or bought the row extra cells past the
+    /// limit (a zwj family painted three faces at 6 cells for a
+    /// 2-cell cluster, over the border).
+    #[test]
+    fn no_text_paints_past_the_limit_column() {
+        for text in [
+            "\u{2764}\u{FE0F} love",
+            "1\u{FE0F}\u{20E3} fav",
+            "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467} mix",
+            "Beyonce\u{301}",
+            "\u{1100}\u{1161}\u{11A8} song",
+            "\u{65E5}\u{672C}\u{8A9E}\u{306E}\u{66F2}",
+            &"\u{301}".repeat(400),
+        ] {
+            let mut buf = buffer(16, 1);
+            put_border(&mut buf, 8);
+            let end = draw_chars(&mut buf, 0, 8, 0, text, shade(NEAR_WHITE), None);
+            assert!(end <= 8, "{text:?} returned {end}:\n{}", grid(&buf));
+            assert_eq!(
+                buf.cell((8u16, 0u16)).unwrap().symbol(),
+                "\u{2502}",
+                "{text:?} overwrote the border:\n{}",
+                grid(&buf)
+            );
+            assert_outside_untouched(&buf, Rect::new(0, 0, 9, 1));
+        }
+    }
+
+    /// And the cluster keeps its own cell: the combining mark must not
+    /// land on top of the letter it belongs to, which is what a
+    /// per-char `set_char` did (`Beyoncé` nfd drew `Beyonc` plus a
+    /// loose accent, with the `e` gone).
+    #[test]
+    fn a_combining_mark_does_not_overwrite_its_own_base() {
+        for (text, at, want) in [
+            ("Beyonce\u{301}", 6u16, "e\u{301}"),
+            ("\u{2764}\u{FE0F} love", 0, "\u{2764}\u{FE0F}"),
+            ("1\u{FE0F}\u{20E3} fav", 0, "1\u{FE0F}\u{20E3}"),
+        ] {
+            let mut buf = buffer(16, 1);
+            draw_chars(&mut buf, 0, 16, 0, text, shade(NEAR_WHITE), None);
+            assert_eq!(
+                buf.cell((at, 0u16)).unwrap().symbol(),
+                want,
+                "{text:?}:\n{}",
+                grid(&buf)
+            );
+        }
+    }
+
+    fn put_border(buf: &mut Buffer, x: u16) {
+        buf.cell_mut((x, 0u16)).unwrap().set_char('\u{2502}');
     }
 
     #[test]
@@ -910,6 +979,8 @@ mod tests {
             GLYPH_LOOP,
             GLYPH_SHUFFLE,
             GLYPH_SPEED,
+            GLYPH_AUDIBLE,
+            GLYPH_MUTE,
             TRACK_DONE,
             TRACK_LEFT,
             TRACK_HEAD,
@@ -1197,6 +1268,46 @@ mod tests {
         assert!(!grid(&dragging).contains(&hint), "{}", grid(&dragging));
     }
 
+    /// Mute had no glyph, no row and no readout anywhere in the ui, so
+    /// silence from `: mute()` was indistinguishable on screen from
+    /// silence from `: volume(0%)`, a dead socket or a bad file; and
+    /// `: undo()` on a mute reported success over a screen that never
+    /// changed. Brightness carries it, same as every other control.
+    #[test]
+    fn muting_shows_on_the_bar_at_all() {
+        let quiet = bar_at(100, 2, |cb| cb.muted = true);
+        let loud = bar_at(100, 2, |_| {});
+        // the glyph itself changes, so the state is readable without
+        // comparing one grey against another, same as play/pause.
+        assert!(grid(&quiet).contains(GLYPH_MUTE), "{}", grid(&quiet));
+        assert!(!grid(&quiet).contains(GLYPH_AUDIBLE));
+        assert!(grid(&loud).contains(GLYPH_AUDIBLE), "{}", grid(&loud));
+        assert!(!grid(&loud).contains(GLYPH_MUTE));
+        assert_eq!(fg_of(&quiet, 1, GLYPH_MUTE), shade(BRIGHT));
+        assert_eq!(fg_of(&loud, 1, GLYPH_AUDIBLE), shade(DIM));
+    }
+
+    /// And it survives every width that draws anything, because a bar
+    /// too narrow to say "you are muted" is the bug it was added for.
+    /// The fit drops from the right, so this is about its position in
+    /// the priority order, not about the glyph.
+    #[test]
+    fn the_mute_glyph_is_never_the_element_a_narrow_bar_drops() {
+        for width_cells in [8u16, 12, 20, 30, 60, 100, 160] {
+            let buf = bar_at(width_cells, 2, |cb| cb.muted = true);
+            let line = grid(&buf).lines().nth(1).unwrap().to_string();
+            // the queue counter and the transport glyph come first; if
+            // either of those fit, so does this.
+            if !line.contains(GLYPH_PLAY) {
+                continue;
+            }
+            assert!(
+                line.contains(GLYPH_MUTE),
+                "{width_cells} cells kept the transport but dropped mute:\n{line}"
+            );
+        }
+    }
+
     #[test]
     fn a_flash_lifts_only_its_own_element() {
         let buf = bar_at(100, 2, |cb| cb.flash = Some((Field::Shuffle, 1.0)));
@@ -1479,11 +1590,12 @@ mod tests {
     /// front now, so there is nothing left to shift.
     #[test]
     fn the_track_does_not_move_when_the_elapsed_readout_crosses_ten_minutes() {
-        // 43 cells is the narrowest bar that keeps a 30 minute song's
-        // scrubber at all; narrower than that the element is dropped,
-        // which the reserved width also makes a decision for the whole
-        // song rather than one the clock changes at 10:00.
-        for width_cells in [43u16, 60, 100, 160] {
+        // 46 cells is the narrowest bar that keeps a 30 minute song's
+        // scrubber at all (43 before the mute glyph took three of
+        // them); narrower than that the element is dropped, which the
+        // reserved width also makes a decision for the whole song
+        // rather than one the clock changes at 10:00.
+        for width_cells in [46u16, 60, 100, 160] {
             let mut rects = Vec::new();
             for secs in [0.0, 598.0, 599.0, 599.9, 600.0, 601.0, 1799.0] {
                 let (buf, layout) = bar_and_layout(width_cells, 2, |cb| {
@@ -1573,7 +1685,7 @@ mod tests {
 #[cfg(test)]
 mod eyeball {
     use super::*;
-    use crate::ui::testbuf::{buffer, grid};
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
 
     fn bar() -> ControlsBar<'static> {
         ControlsBar {
@@ -1587,6 +1699,7 @@ mod eyeball {
             eq_active: false,
             crossfade_on: false,
             paused: false,
+            muted: false,
             gap_remaining: None,
             elapsed_secs: Some(42.0),
             duration_secs: Some(214.0),
@@ -1624,6 +1737,52 @@ mod eyeball {
                 text.contains("--"),
                 "{w} cells lost the mode label:\n{text}"
             );
+        }
+    }
+
+    /// Muted against unmuted, side by side, at the widths where the
+    /// row starts dropping elements: the glyph has to be findable and
+    /// it has to still be there once the scrubber has gone.
+    #[test]
+    fn print_the_bar_muted_and_not() {
+        for w in [8u16, 12, 20, 30, 46, 72, 120] {
+            for muted in [false, true] {
+                let mut cb = bar();
+                cb.muted = muted;
+                let mut buf = buffer(w, 2);
+                let area = Rect::new(0, 0, w, 2);
+                cb.render(area, &mut buf);
+                println!("--- {w}x2 muted={muted}\n{}", grid(&buf));
+                assert_outside_untouched(&buf, area);
+            }
+        }
+    }
+
+    /// The mode label carries a pane name into the row's one writer, so
+    /// it is the bar's path for text it did not build out of its own
+    /// glyphs. Printed at a width where the label is most of the row,
+    /// which is where a wrong advance shows.
+    #[test]
+    fn print_the_mode_line_with_text_the_bar_did_not_build() {
+        for label in [
+            "sidebar",
+            "\u{2764}\u{FE0F} love",
+            "1\u{FE0F}\u{20E3} fav",
+            "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467} mix",
+            "Beyonce\u{301}",
+            "\u{1100}\u{1161}\u{11A8}",
+            "\u{65E5}\u{672C}\u{8A9E}",
+            &"\u{301}".repeat(12),
+        ] {
+            for w in [24u16, 40, 72] {
+                let mut cb = bar();
+                cb.focus_label = label;
+                let mut buf = buffer(w + 4, 3);
+                let area = Rect::new(0, 0, w, 2);
+                cb.render(area, &mut buf);
+                println!("--- {w}x2 label={label:?}\n{}", grid(&buf));
+                assert_outside_untouched(&buf, area);
+            }
         }
     }
 }
