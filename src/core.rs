@@ -1360,6 +1360,18 @@ pub struct DownloadCtx<'a> {
     /// Distinct play days a track needs before it auto-downloads; see
     /// `config::Config::cache_days_threshold`.
     pub day_threshold: u32,
+    /// How the play index reaches disk, **injected rather than reached
+    /// for**.
+    ///
+    /// `note_playback_started` used to call `CacheIndex::save`, which
+    /// resolves `cache::cache_dir()` itself. So a test harness
+    /// starting from `CacheIndex::default()` wrote the *user's real*
+    /// index, and did: it was replaced with the fixture's single row,
+    /// and the already-downloaded files under `tracks/` stopped being
+    /// referenced. `cache_dir` refuses a non-temp path under
+    /// `cfg(test)` now, but that is a tripwire; this removes the
+    /// reach, so a caller cannot write anywhere it did not name.
+    pub persist: fn(&CacheIndex) -> anyhow::Result<()>,
 }
 /// "Back" re-plays whatever was playing before the current track,
 /// putting the interrupted track right behind it so playback picks up
@@ -1559,14 +1571,22 @@ pub fn note_playback_started(
         return;
     };
     let today = cache::today();
-    let (days, already_cached) = match dctx.cache.lock() {
+    let (days, already_cached, saved) = match dctx.cache.lock() {
         Ok(mut idx) => {
             let days = idx.record_play(id, &today);
-            let _ = idx.save();
-            (days, idx.cached_path(id).is_some())
+            let saved = (dctx.persist)(&idx);
+            (days, idx.cached_path(id).is_some(), saved)
         }
         Err(_) => return,
     };
+    // said rather than discarded: this is the count the auto-download
+    // threshold reads, so losing the write silently means the feature
+    // quietly stops working. `Notifications::push` coalesces repeats,
+    // so a read-only cache dir is one counted box and not one per
+    // track.
+    if let Err(why) = saved {
+        notifications.push(Severity::Error, format!("couldn't save the play index: {why}"));
+    }
     if !should_auto_download(
         days,
         dctx.day_threshold,
@@ -1675,6 +1695,7 @@ pub fn download_resolved(tracks: &[SearchItem], core: &mut CoreCtx) -> Downloade
         download_tx: core.download_tx,
         downloading: core.downloading,
         day_threshold: core.cfg.cache_days_threshold,
+        persist: CacheIndex::save,
     };
     download_tracks(tracks, &mut dctx, core.notifications)
 }
@@ -2989,6 +3010,7 @@ pub fn track_started(track: &SearchItem, core: &mut CoreCtx) -> Started {
         download_tx: core.download_tx,
         downloading: core.downloading,
         day_threshold: core.cfg.cache_days_threshold,
+        persist: CacheIndex::save,
     };
     note_playback_started(track, &mut dctx, core.notifications);
     start_tracking_playback(core.cfg, track, core.scrobble);
@@ -5724,33 +5746,50 @@ mod enqueue_status_tests {
 mod auto_download_wiring_tests {
     use super::*;
 
-    /// `note_playback_started` saves the cache index through
-    /// `cache::cache_dir()` itself, so without redirecting that this
-    /// test would overwrite the real `~/.cache/wim/index.ndjson` with
-    /// its own fixture. Set once for the process and never put back:
-    /// any later test is safer pointing at a temp dir than at the real
-    /// cache. A `persist` hook on `DownloadCtx` (the shape
-    /// `download::Sink` already uses) would remove the need for this.
-    fn redirected_cache_dir() -> std::path::PathBuf {
-        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        DIR.get_or_init(|| {
-            let dir = std::env::temp_dir().join(format!("wim-core-cache-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).expect("a temp cache dir");
-            std::env::set_var("XDG_CACHE_HOME", &dir);
-            dir
-        })
-        .clone()
+    /// Writes nowhere.
+    ///
+    /// These tests used to redirect `XDG_CACHE_HOME` process-wide,
+    /// because `note_playback_started` reached `cache::cache_dir()`
+    /// through `CacheIndex::save` and would otherwise have overwritten
+    /// the real `~/.cache/wim/index.ndjson` with a fixture, **which is
+    /// exactly what happened**. `DownloadCtx::persist` is injected
+    /// now, so a test that names this cannot touch a real path at all
+    /// and nothing global is mutated to make that true.
+    fn persist_nowhere(_: &CacheIndex) -> anyhow::Result<()> {
+        Ok(())
     }
 
-    /// Fails loudly rather than writing the real cache, if the
-    /// redirect above ever stops being honoured.
-    fn assert_cache_is_redirected() {
-        let dir = redirected_cache_dir();
-        let live = cache::cache_dir().expect("a cache dir");
+    /// A play index that will not write says so.
+    ///
+    /// It used to be `let _ = idx.save()`. That discarded result is
+    /// why a test overwriting the real index was silent, and in normal
+    /// use it means a read-only cache dir quietly stops the
+    /// auto-download threshold working forever, since the day count it
+    /// reads is exactly what fails to persist.
+    #[test]
+    fn a_play_index_that_cannot_be_written_is_reported() {
+        fn refuse(_: &CacheIndex) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("read-only file system"))
+        }
+
+        let mut h = Hooks::new();
+        {
+            let mut dctx = DownloadCtx {
+                cache: &h.cache,
+                download_tx: &h.tx,
+                downloading: &mut h.downloading,
+                day_threshold: 3,
+                persist: refuse,
+            };
+            note_playback_started(&song("s1"), &mut dctx, &mut h.notifications);
+        }
+
+        let said = h.notifications.drain_text().join(" | ");
         assert!(
-            live.starts_with(&dir),
-            "a test must never write the real cache index: {live:?}"
+            said.contains("couldn't save the play index"),
+            "the failure has to reach the user: {said:?}"
         );
+        assert!(said.contains("read-only"), "and say why: {said:?}");
     }
 
     fn song(id: &str) -> SearchItem {
@@ -5789,6 +5828,7 @@ mod auto_download_wiring_tests {
                 download_tx: &self.tx,
                 downloading: &mut self.downloading,
                 day_threshold,
+                persist: persist_nowhere,
             };
             note_playback_started(item, &mut dctx, &mut self.notifications);
         }
@@ -5811,7 +5851,6 @@ mod auto_download_wiring_tests {
     /// downloads.
     #[test]
     fn four_plays_in_one_sitting_are_still_one_day() {
-        assert_cache_is_redirected();
         let mut hooks = Hooks::new();
         let track = song("auto-same-day");
         for _ in 0..4 {
@@ -5828,7 +5867,6 @@ mod auto_download_wiring_tests {
     /// cannot be passing because the whole path is dead.
     #[test]
     fn the_third_distinct_day_caches_the_track() {
-        assert_cache_is_redirected();
         let mut hooks = Hooks::new();
         let track = song("auto-third-day");
         {
@@ -5853,7 +5891,6 @@ mod auto_download_wiring_tests {
     /// than in the policy.
     #[test]
     fn a_track_already_downloading_is_not_started_twice() {
-        assert_cache_is_redirected();
         let mut hooks = Hooks::new();
         let track = song("auto-in-flight");
         {
