@@ -4197,7 +4197,15 @@ fn extension<'a>(token: &str, candidate: &'a str) -> Option<&'a str> {
     // `nth(keep)` landing means the head is exactly `keep` chars and
     // the remainder is not empty; missing means one or the other fails.
     let (at, _) = candidate.char_indices().nth(keep)?;
-    (candidate[..at].to_lowercase() == token.to_lowercase()).then(|| &candidate[at..])
+    // folded on both sides, because the corpus half of the completer
+    // already is: `search_names` folds, so it hands back `Țara` for
+    // `tara`, and this comparison then threw it away. the remainder is
+    // sliced out of the *original*, so what gets inserted keeps its
+    // diacritics; folding is char for char, so the index still lines
+    // up.
+    let head = crate::search::fold_diacritics(&candidate[..at]);
+    let token = crate::search::fold_diacritics(token);
+    (head.to_lowercase() == token.to_lowercase()).then(|| &candidate[at..])
 }
 
 fn extends(token: &str, candidate: &str) -> bool {
@@ -4834,6 +4842,95 @@ mod tests {
             1,
             "an empty scope still says so rather than printing nothing"
         );
+    }
+
+    /// The completer has to fold diacritics, because the corpus half
+    /// of it already does.
+    ///
+    /// `Corpus::search_names` folds (that is the whole point of
+    /// `fold_diacritics`, added so a romanian `ș`/`ț` matches an ascii
+    /// query), so it hands `Țara` back for `tara`; `extension` then
+    /// compared the unfolded head, `țar` against `tar`, and threw it
+    /// away. the result was the feature looking entirely absent in the
+    /// console: no ghost, no tab candidate, no listing and no message,
+    /// while submitting the same line resolved fine.
+    #[test]
+    fn completion_folds_diacritics_the_way_the_search_does() {
+        let fake = Fake::new(&["Țara", "Țăranu", "Tarantula"]);
+        let c = console_with(&fake, "play(tar");
+        let here = site(&c.input, c.cursor);
+        assert_eq!(
+            c.candidates_at(&here, &fake),
+            vec![
+                "Țara".to_string(),
+                "Țăranu".to_string(),
+                "Tarantula".to_string()
+            ],
+            "an ascii token must reach the diacritics"
+        );
+
+        // and the other direction, since someone with a romanian
+        // keyboard types the real letters.
+        let c = console_with(&fake, "play(țar");
+        let here = site(&c.input, c.cursor);
+        assert!(
+            c.candidates_at(&here, &fake)
+                .contains(&"Tarantula".to_string()),
+            "a folded token must reach the ascii names too"
+        );
+    }
+
+    /// What gets inserted keeps its diacritics: the remainder is
+    /// sliced out of the original candidate, not the folded copy, or
+    /// completing `Țara` would type `Tara` into the line and then
+    /// resolve against a library that has no such track.
+    #[test]
+    fn completing_a_folded_match_inserts_the_real_letters() {
+        let fake = Fake::new(&["Țăranu"]);
+        let c = console_with(&fake, "play(tar");
+        let here = site(&c.input, c.cursor);
+        let offered = c.candidates_at(&here, &fake);
+        assert_eq!(offered, vec!["Țăranu".to_string()]);
+        // three chars kept is `Țăr`, so the remainder is `anu`, and
+        // it carries the original bytes rather than the folded ones.
+        assert_eq!(
+            extension("tar", &offered[0]),
+            Some("anu"),
+            "the remainder comes off the real name"
+        );
+    }
+
+    /// Prints the console row as the user would read it, which is the
+    /// only way to see that the ghost reads as a continuation of what
+    /// was typed rather than as a correction of it. Run with
+    /// `cargo test --lib eyeball_completion -- --nocapture`.
+    #[test]
+    fn eyeball_completion_row() {
+        let fake = Fake::new(&["Țara", "Țăranu", "Tarantula"]);
+        for typed in ["play(t", "play(tar", "play(țar", "play(Tara"] {
+            let c = console_with(&fake, typed);
+            let here = site(&c.input, c.cursor);
+            let offered = c.candidates_at(&here, &fake);
+            // the ghost goes *at the cursor*, not after the line: the
+            // first draft appended it and printed `play(t)ara`, which
+            // read like a bug in the autopairing rather than in the
+            // print.
+            let mut row = c.input.clone();
+            row.insert_str(c.cursor, &c.suggestion.ghost);
+            println!(
+                ": {row}\n  {}",
+                if offered.is_empty() {
+                    "(no candidates)".to_string()
+                } else {
+                    offered.join("  ")
+                }
+            );
+        }
+        // the floor, so this is a test and not only a printer: the
+        // ascii token must reach the diacritic names.
+        let c = console_with(&fake, "play(tar");
+        let here = site(&c.input, c.cursor);
+        assert!(!c.candidates_at(&here, &fake).is_empty());
     }
 
     #[test]
