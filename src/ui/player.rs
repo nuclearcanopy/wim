@@ -1346,3 +1346,213 @@ mod tests {
         );
     }
 }
+
+/// Per-frame cost of the now-playing screen. Not pass/fail gates:
+/// absolute numbers are machine-dependent, so these print and the
+/// report compares runs.
+///
+/// `cargo test --release --lib -- --ignored --nocapture
+/// --test-threads=1 ui::player::bench`
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::ui::testbuf::buffer;
+    use image::DynamicImage;
+
+    /// Fastest per-iteration time over `batches` batches of `n`, the
+    /// same discipline `search::bench` and `raster::best` use: the
+    /// *minimum*, never the mean, because this machine's other cores
+    /// are not idle during a bench run and a mean measures their
+    /// scheduling as much as this code.
+    fn best(batches: u32, n: u32, mut f: impl FnMut()) -> std::time::Duration {
+        (0..batches)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                for _ in 0..n {
+                    f();
+                }
+                t.elapsed() / n
+            })
+            .min()
+            .unwrap_or_default()
+    }
+
+    /// A cover with structure in it, so the rasterizer's sharpen pass
+    /// does real work rather than hitting its uniform fixed point.
+    fn cover() -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(640, 640, |x, y| {
+            let v = ((x * 7 + y * 11) % 256) as u8;
+            image::Rgb([v, v.wrapping_add(40), 255 - v])
+        }))
+    }
+
+    /// The busiest realistic frame: every control in a non-default
+    /// state (so no label is the short one), a cursor on the row, a
+    /// prev/next line, and a cover.
+    fn busy<'a>(keymap: &'a Keymap, art: &'a DynamicImage) -> PlayerView<'a> {
+        PlayerView {
+            title: "Into Dust (Remastered) · Mazzy Star",
+            art: Some(art),
+            art_key: "a:mazzy star\u{1}so tonight that i might see",
+            art_mode: ArtMode::AsciiBw,
+            gap: None,
+            gap_remaining: None,
+            cell_aspect: 2.0,
+            elapsed_secs: Some(187.0),
+            duration_secs: Some(382.0),
+            paused: false,
+            loop_mode: LoopMode::All,
+            shuffle_on: true,
+            speed: 1.25,
+            eq_preset: "bass",
+            crossfade_on: true,
+            previous: Some("Fade Into You"),
+            next: Some("Bells Ring"),
+            selected: Some(Field::Progress),
+            scrubbing: false,
+            keymap,
+        }
+    }
+
+    const SIZES: [(u16, u16); 3] = [(80, 24), (120, 40), (200, 60)];
+
+    /// Variants timed with their batches alternating, minimum each.
+    /// Measuring them one after another is not a comparison on this
+    /// machine: back-to-back runs of the same binary came out 1.6x
+    /// apart with other builds running, which is larger than the
+    /// split being measured. Alternating makes all of them see the
+    /// same machine.
+    fn best_each<const N: usize>(
+        batches: u32,
+        n: u32,
+        mut f: impl FnMut(usize),
+    ) -> [std::time::Duration; N] {
+        let mut best = [std::time::Duration::MAX; N];
+        for _ in 0..batches {
+            for (i, slot) in best.iter_mut().enumerate() {
+                let t = std::time::Instant::now();
+                for _ in 0..n {
+                    f(i);
+                }
+                *slot = (*slot).min(t.elapsed() / n);
+            }
+        }
+        best
+    }
+
+    /// What the whole widget costs per frame, at the three sizes, and
+    /// what `transport` (which main.rs calls for the hit map on the
+    /// same frame, just before `render`) costs on top of it.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn frame_cost() {
+        let keymap = Keymap::default();
+        let art = cover();
+        for (w, h) in SIZES {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = buffer(w, h);
+            // warm the rasterizer's memo, so this measures a steady
+            // frame rather than the first one after a track change.
+            busy(&keymap, &art).render(area, &mut buf);
+            // 2 is the same frame with the cover panel off, so what is
+            // left is the text and the difference is the rasterizer's
+            // share of a frame.
+            let [render, transport, noart] = best_each::<3>(6, 200, |which| match which {
+                0 => busy(&keymap, &art).render(area, &mut buf),
+                1 => {
+                    std::hint::black_box(busy(&keymap, &art).transport(area));
+                }
+                _ => {
+                    let mut v = busy(&keymap, &art);
+                    v.art_mode = ArtMode::Off;
+                    v.render(area, &mut buf);
+                }
+            });
+            println!(
+                "{w}x{h}: frame {:>10.3?} = art {:>10.3?} + text {noart:>10.3?} \
+                 + transport {transport:>10.3?}   (render {render:>10.3?})",
+                render + transport,
+                render.saturating_sub(noart)
+            );
+        }
+    }
+
+    /// Where the time inside one frame goes. Each piece is timed on
+    /// its own with its inputs left outside the clock; subtracting two
+    /// independently-taken minima is not a measurement, so the pieces
+    /// are reported beside the whole rather than summed to it.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn frame_phases() {
+        let keymap = Keymap::default();
+        let art = cover();
+        for (w, h) in SIZES {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = buffer(w, h);
+            let v = busy(&keymap, &art);
+            let avail = w as usize;
+            let lay = best(5, 2000, || {
+                std::hint::black_box(layout(area, true, true, 2.0));
+            });
+            let controls = best(5, 2000, || {
+                std::hint::black_box(v.controls(avail));
+            });
+            let elements = best(5, 2000, || {
+                std::hint::black_box(v.elements(Detail::Full));
+            });
+            let scrubber = best(5, 2000, || {
+                std::hint::black_box(v.scrubber(avail));
+            });
+            let hint = best(5, 2000, || {
+                std::hint::black_box(v.hint(avail));
+            });
+            let context = best(5, 2000, || {
+                std::hint::black_box(v.context_line());
+            });
+            // painting the two rows, with the elements they paint
+            // built outside the clock.
+            let (items, sep) = v.controls(avail);
+            let y = layout(area, true, true, 2.0).unwrap().controls_y.unwrap();
+            let paint = best(5, 2000, || v.draw_row(&mut buf, area, y, &items, sep));
+            println!(
+                "{w}x{h}: layout {lay:>9.3?}  controls {controls:>9.3?} \
+                 (elements {elements:>9.3?})  scrubber {scrubber:>9.3?}  \
+                 hint {hint:>9.3?}  context {context:>9.3?}  draw_row {paint:>9.3?}"
+            );
+        }
+    }
+
+    /// The cover panel on its own, at the rect `layout` actually picks
+    /// for each size, so the rasterizer's per-frame share is a number
+    /// rather than a subtraction.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn art_cost() {
+        let art = cover();
+        let style = crate::ui::raster::Style {
+            fit: crate::ui::raster::Fit::Contain,
+            tone: crate::ui::raster::Tone::Mono,
+        };
+        for (w, h) in SIZES {
+            let area = Rect::new(0, 0, w, h);
+            let Some(rect) = layout(area, true, true, 2.0).and_then(|l| l.art) else {
+                println!("{w}x{h}: no art rect");
+                continue;
+            };
+            let mut buf = buffer(w, h);
+            let memoized = best(5, 200, || {
+                crate::ui::raster::with_memo(|m| {
+                    m.render("k", &art, rect, 2.0, style, &mut buf);
+                });
+            });
+            let resampled = best(5, 200, || {
+                crate::ui::raster::with_scratch(|r| r.render(&art, rect, 2.0, style, &mut buf));
+            });
+            println!(
+                "{w}x{h}: art rect {}x{} -> memoized {memoized:>10.3?}  \
+                 resampled {resampled:>10.3?}",
+                rect.width, rect.height
+            );
+        }
+    }
+}
