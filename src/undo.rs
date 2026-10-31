@@ -95,7 +95,7 @@ impl Snapshot {
             eq_source: core.app.eq_source,
             eq_gains: core.app.eq_gains,
             crossfade: *core.crossfade_enabled,
-            gap_secs: *core.gap_secs,
+            gap_secs: core.between_tracks.gap_secs(),
             query: core.app.query.clone(),
             sleep_due: *core.sleep_due,
             vars: core.vars.clone(),
@@ -122,7 +122,7 @@ impl Snapshot {
         core.app.eq_source = self.eq_source;
         core.app.eq_gains = self.eq_gains;
         *core.crossfade_enabled = self.crossfade;
-        *core.gap_secs = self.gap_secs;
+        core.between_tracks.set_gap(self.gap_secs);
         *core.sleep_due = self.sleep_due;
         *core.base_volume = self.base_volume;
         core.app.set_query(&self.query);
