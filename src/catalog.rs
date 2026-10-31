@@ -115,6 +115,11 @@ pub struct FetchedCatalog {
     artists: Vec<subsonic::Artist>,
     albums: Vec<subsonic::Album>,
     playlists: Vec<subsonic::Playlist>,
+    /// Why this catalog couldn't be written to the startup cache, if
+    /// it couldn't. Carried rather than reported here because this
+    /// runs on a thread with no notification area; `cache_warning` is
+    /// what `merge_catalog_into_app` hands the caller.
+    cache_warning: Option<String>,
 }
 
 impl FetchedCatalog {
@@ -184,30 +189,63 @@ pub fn fetch_navidrome_catalog(
     // persisted here, not where it gets merged: every caller of this
     // is already off the main thread (or already blocking on the
     // network), and serializing a catalog is not something to spend a
-    // frame on. best-effort, and a no-op when nothing changed.
-    let _ = cache::save_catalog(&client, &artists, &albums, &playlists);
+    // frame on. a no-op when nothing changed.
+    //
+    // not fatal to the fetch: this catalog is good, and refusing it
+    // over a cache write would leave the corpus with nothing. but not
+    // swallowed either, since the startup cache is the whole reason
+    // the next launch paints a library instead of "connecting...",
+    // and a read-only or full cache dir used to lose it in silence.
+    // same stance as `config::save_or_warn`.
+    let cache_warning = cache::save_catalog(&client, &artists, &albums, &playlists)
+        .err()
+        .map(|e| cache_warning_for(&nav.url, &e));
     Ok(FetchedCatalog {
         client,
         artists,
         albums,
         playlists,
+        cache_warning,
     })
+}
+
+/// One wording for the one failure, so the sync path and the
+/// add-a-profile path say the same thing. Names the server but
+/// nothing else about it; the error itself carries the path.
+fn cache_warning_for(url: &str, error: &impl std::fmt::Display) -> String {
+    format!(
+        "couldn't cache {url}'s library, so the next start has to wait on \
+         the network for it: {error}"
+    )
 }
 
 /// Merges a fetched catalog into the corpus and immediately resyncs
 /// whatever's displayed; the one place this happens, so every caller
 /// (startup, manual reconnect, add-profile, background auto-sync) gets
 /// it for free instead of having to remember it.
-pub fn merge_catalog_into_app(app: &mut app::App, catalog: FetchedCatalog) {
+///
+/// Returns the warning the caller owes the user, same idiom as
+/// `graphics::ArtProbe::poll`: this runs where there is an `App` but
+/// not always a notification area, and the fetch itself happened on a
+/// thread that had neither.
+pub fn merge_catalog_into_app(app: &mut app::App, catalog: FetchedCatalog) -> Option<String> {
+    let FetchedCatalog {
+        client,
+        artists,
+        albums,
+        playlists,
+        cache_warning,
+    } = catalog;
     app.corpus.reconcile_server(
         cache::ServerCatalog {
-            artists: catalog.artists,
-            albums: catalog.albums,
-            playlists: catalog.playlists,
+            artists,
+            albums,
+            playlists,
         },
-        &catalog.client,
+        &client,
     );
     app.resync_results();
+    cache_warning
 }
 
 type NavidromeEverything = Result<(FetchedCatalog, Vec<String>), String>;
@@ -243,8 +281,12 @@ pub fn index_navidrome_server(
     // carrying the old ones.
     let catalog = fetch_navidrome_catalog(nav, &[])?;
     let summary = catalog.summary();
-    merge_catalog_into_app(app, catalog);
-    Ok(summary)
+    // this path's `Ok` is shown to the user verbatim, so a failed
+    // cache write is said here rather than needing a channel.
+    Ok(match merge_catalog_into_app(app, catalog) {
+        Some(warning) => format!("{summary}; {warning}"),
+        None => summary,
+    })
 }
 
 /// Plain connectivity check (ping only, no catalog fetch) for every
@@ -269,10 +311,13 @@ pub fn test_navidrome_connectivity(
     })
 }
 
+/// What a fetch's outcome may and may not be read as. Named for what
+/// it tests and nothing else: this module used to also hold the
+/// `retain_live_clients` tests below, which are about a different
+/// function on a different thread.
 #[cfg(test)]
-mod catalog_fetch_tests {
+mod fetch_outcome_tests {
     use super::*;
-    use crate::subsonic;
 
     #[test]
     fn a_failed_fetch_is_an_error_not_an_empty_catalog() {
@@ -289,6 +334,100 @@ mod catalog_fetch_tests {
             Err(Box::new("thread died") as Box<dyn std::any::Any + Send>);
         assert!(fetched(panicked, "albums").is_err());
     }
+
+    /// A server that genuinely has nothing is still a legitimate answer
+    /// and must stay distinguishable from a failure, since that is the
+    /// case reconciliation exists to handle.
+    #[test]
+    fn a_genuinely_empty_server_still_succeeds() {
+        let empty: thread::Result<anyhow::Result<Vec<u8>>> = Ok(Ok(Vec::new()));
+        assert_eq!(fetched(empty, "playlists").unwrap(), Vec::<u8>::new());
+    }
+
+    /// A catalog can only *fail* to be cached behind a live server, so
+    /// what is reachable here is the carry: a fetch that could not be
+    /// persisted still reconciles into the corpus (refusing it would
+    /// leave the library empty over a cache write), and the warning
+    /// comes back out for the caller to push.
+    #[test]
+    fn a_catalog_that_could_not_be_cached_still_merges_and_hands_the_warning_back() {
+        let profile = nav_for_merge();
+        let client = Arc::new(subsonic::Client::new(&profile).unwrap());
+        let mut app = app::App::new(crate::search::Corpus::new());
+
+        let warning = merge_catalog_into_app(
+            &mut app,
+            FetchedCatalog {
+                client,
+                artists: vec![subsonic::Artist {
+                    id: "ar-1".into(),
+                    name: "Bladee".into(),
+                }],
+                albums: Vec::new(),
+                playlists: Vec::new(),
+                cache_warning: Some("disk full".to_string()),
+            },
+        );
+        assert_eq!(
+            warning.as_deref(),
+            Some("disk full"),
+            "a failed cache write must reach the caller, not stop at the merge"
+        );
+        app.query = "bladee".into();
+        app.resync_results();
+        assert_eq!(
+            app.result_count(),
+            1,
+            "the catalog itself is good; a cache write must not cost the library"
+        );
+    }
+
+    fn nav_for_merge() -> config::NavidromeConfig {
+        config::NavidromeConfig {
+            url: "https://example.invalid".into(),
+            username: "ana".into(),
+            password: Some("pw".into()),
+            password_file: None,
+            max_bitrate_kbps: None,
+            transcode_format: None,
+        }
+    }
+
+    /// And the wording itself, which both call sites share: the sync
+    /// path pushes it as a notification and `index_navidrome_server`
+    /// appends it to the summary it returns.
+    #[test]
+    fn a_catalog_that_could_not_be_cached_says_so() {
+        let warning = cache_warning_for(
+            "https://music.example.invalid",
+            &"No space left on device (os error 28)",
+        );
+        assert!(
+            warning.contains("https://music.example.invalid"),
+            "which server: {warning}"
+        );
+        assert!(warning.contains("next start"), "what it costs: {warning}");
+        assert!(warning.contains("os error 28"), "and the cause: {warning}");
+    }
+}
+
+/// The clients the sync thread keeps across passes, and when it has
+/// to let one go. Split out of the fetch tests above: this is
+/// `core::retain_live_clients`, which is also what zeroizes a
+/// superseded password when it drops the last `Arc` to a client.
+///
+/// **These pin behaviour that no path in the binary currently
+/// reaches.** `retain_live_clients`' single production call site is
+/// `spawn_background_sync`, whose `servers` list only ever grows (the
+/// main thread pushes an updated list over `servers_rx`, and nothing
+/// shrinks or edits it in place), so neither the edit nor the removal
+/// below can happen there today. The fix is in main.rs; the tests
+/// stay, because the function's contract is the thing that makes the
+/// fix safe.
+#[cfg(test)]
+mod kept_client_tests {
+    use super::*;
+    use crate::subsonic;
 
     fn nav(url: &str, user: &str) -> config::NavidromeConfig {
         config::NavidromeConfig {
@@ -342,14 +481,5 @@ mod catalog_fetch_tests {
         retain_live_clients(&mut clients, std::slice::from_ref(&a));
         assert_eq!(clients.len(), 1);
         assert!(clients[0].matches(&a));
-    }
-
-    /// A server that genuinely has nothing is still a legitimate answer
-    /// and must stay distinguishable from a failure, since that is the
-    /// case reconciliation exists to handle.
-    #[test]
-    fn a_genuinely_empty_server_still_succeeds() {
-        let empty: thread::Result<anyhow::Result<Vec<u8>>> = Ok(Ok(Vec::new()));
-        assert_eq!(fetched(empty, "playlists").unwrap(), Vec::<u8>::new());
     }
 }
