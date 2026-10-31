@@ -9,7 +9,7 @@
 use wim::core;
 use wim::core::{op_fail, op_note, CoreCtx, Dispatch, Report, SelectStep, Surface};
 use wim::search::SearchItem;
-use wim::shellsong::ViewTarget;
+use wim::shellsong::{Op, Program, ViewTarget};
 use wim::ui::results_list::label;
 
 /// What shellswim keeps that the core does not. Almost nothing, which
@@ -23,6 +23,16 @@ pub struct SwimSurface {
     /// Whether the last `view(now)` asked for the full readout, so a
     /// second one does not repeat itself. Purely cosmetic.
     pub verbose_now: bool,
+    /// Ops the core handed over to be run as a program, waiting for
+    /// the host to pick them up (`Host::step`).
+    ///
+    /// This slot is why `queue_program` is implemented at all: the
+    /// trait default **drops** the ops, and `identity_settings` has
+    /// already recorded them in `Overridden` as applied by then, so
+    /// binding an eq, changing it by hand and playing an unbound track
+    /// "restored" the curve that was replaced. wim's own surface holds
+    /// the same slot; see docs/library-seam.md.
+    pub queued: Option<Box<Program>>,
 }
 
 impl SwimSurface {
@@ -38,6 +48,15 @@ pub struct Borrowed<'a> {
 }
 
 impl Surface for Borrowed<'_> {
+    /// Held rather than run here: the host owns the program slot, and
+    /// `Host::step` only starts this once nothing else is running, so
+    /// a track change cannot cut a typed program short.
+    fn queue_program(&mut self, ops: Vec<Op>) {
+        if !ops.is_empty() {
+            self.state.queued = Some(Box::new(Program::of(ops)));
+        }
+    }
+
     fn show_results(&mut self) {
         // only a flag: the results are not in yet, and printing the
         // partial set would say "2 results" and then disagree with
@@ -230,5 +249,52 @@ mod tests {
             no_page("Working On Dying").contains("queue(Working On Dying)"),
             "it must name the command that gets you the tracks"
         );
+    }
+}
+
+/// `queue_program` is the one `Surface` method whose trait default
+/// loses data rather than merely declining.
+#[cfg(test)]
+mod queued_program {
+    use super::*;
+    use wim::shellsong::{Level, Op};
+
+    /// The gap this closed: the default implementation drops the ops,
+    /// and by the time it is called `identity_settings` has already
+    /// recorded them in `Overridden` as applied. So binding an eq,
+    /// changing it by hand and then playing an unbound track
+    /// "restored" the curve that had been replaced. Driven through the
+    /// trait, not the field, because the trait default was the bug.
+    #[test]
+    fn the_core_can_hand_a_program_over_to_the_host() {
+        let mut swim = SwimSurface::default();
+        assert!(swim.queued.is_none(), "nothing queued to begin with");
+
+        {
+            let mut surf: Box<dyn Surface> = Box::new(swim.borrowed());
+            surf.queue_program(vec![Op::SetVolume(Level::Absolute(25.0))]);
+        }
+
+        // `Program`'s node count is private, so what is asserted is
+        // the contract that was broken: the ops arrive somewhere the
+        // host can reach rather than being dropped on the floor.
+        assert!(
+            swim.queued.is_some(),
+            "the ops went nowhere, which is the trait default's behaviour"
+        );
+    }
+
+    /// An empty hand-over is not a program. `track_started` returns an
+    /// empty `ops` for every unbound track, which is almost all of
+    /// them, and a queued empty program would make `Host::step` run a
+    /// no-op frame on every single track change.
+    #[test]
+    fn nothing_bound_queues_nothing() {
+        let mut swim = SwimSurface::default();
+        {
+            let mut surf: Box<dyn Surface> = Box::new(swim.borrowed());
+            surf.queue_program(Vec::new());
+        }
+        assert!(swim.queued.is_none());
     }
 }
