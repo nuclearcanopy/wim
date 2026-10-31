@@ -986,17 +986,20 @@ mod tests {
     }
 
     /// The three key forms share one store directory, so none of them
-    /// may collide with another: an album id that reads like a track
-    /// identity, or like a name pair, still gets its own file.
+    /// may collide with another. Built to collide if any two shared a
+    /// prefix: the id is exactly the name form's own separator-joined
+    /// text, and the track form's is the same string again.
     #[test]
     fn the_three_key_forms_live_in_separate_namespaces() {
         let dir = PathBuf::from("/tmp");
-        let by_id = Key::AlbumId("x".to_string());
+        let by_id = Key::AlbumId("x\u{1}y".to_string());
         let by_name = Key::Album {
             artist: "x".to_string(),
-            album: String::new(),
+            album: "y".to_string(),
         };
-        let by_track = Key::Track("x".to_string());
+        let by_track = Key::Track("x\u{1}y".to_string());
+        assert_ne!(by_id.name(), by_name.name());
+        assert_ne!(by_id.name(), by_track.name());
         assert_ne!(store::path(&dir, &by_id), store::path(&dir, &by_name));
         assert_ne!(store::path(&dir, &by_id), store::path(&dir, &by_track));
         assert_ne!(store::path(&dir, &by_name), store::path(&dir, &by_track));
