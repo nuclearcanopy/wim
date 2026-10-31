@@ -121,6 +121,42 @@ impl PlayQueue {
         self.rebuild(next);
     }
 
+    /// Everything upcoming goes, and *stops counting* as part of the
+    /// session.
+    ///
+    /// `replace_upcoming(vec![])` looks like this and is not: it
+    /// relays the same session out again, which is right for a shuffle
+    /// (mpv is cleared and refilled with the same tracks) and wrong
+    /// here. the session is what loop-all restarts from, so clearing
+    /// the queue through that left loop-all replaying the tracks the
+    /// user had just deleted, seconds after deleting them.
+    ///
+    /// Already-played tracks stay in the session: the user emptied the
+    /// *queue*, not the history, so loop-all still restarts from what
+    /// actually played.
+    pub fn clear_upcoming(&mut self) {
+        let dropped: Vec<SearchItem> = self.upcoming().to_vec();
+        for item in &dropped {
+            self.forget(item);
+        }
+        let next: Vec<SearchItem> = self.current().cloned().into_iter().collect();
+        self.rebuild(next);
+    }
+
+    /// Drops one occurrence of `item` from the session.
+    ///
+    /// One, not all: a track queued twice and deleted once is still
+    /// queued once, and loop-all should still see it.
+    fn forget(&mut self, item: &SearchItem) {
+        let (tag, key) = item.identity();
+        if let Some(at) = self.session.iter().position(|other| {
+            let (t, k) = other.identity();
+            t == tag && k == key
+        }) {
+            self.session.remove(at);
+        }
+    }
+
     /// Drops the entry at `index`, keeping `pos` pointing at the same
     /// *track* rather than the same number. Removing the playing entry
     /// leaves `pos` where it is, which is correct: mpv moves on to the
@@ -131,6 +167,10 @@ impl PlayQueue {
         if index >= self.entries.len() {
             return false;
         }
+        // out of the session too, or loop-all restarts from a list
+        // still holding the track the user just deleted.
+        let gone = self.entries[index].clone();
+        self.forget(&gone);
         self.entries.remove(index);
         if let Some(p) = self.pos {
             if index < p {
@@ -436,6 +476,66 @@ mod tests {
         let mut q = queue_of(&["a"]);
         assert_eq!(q.append(song("b"), true).moved_to, None);
         assert_eq!(titles(q.upcoming()), vec!["b"]);
+    }
+
+    #[test]
+    /// The flip side of the test below, and the bug: clearing the
+    /// queue used to go through `replace_upcoming(vec![])`, which
+    /// relays the *same* session out again. so with loop-all on, the
+    /// tracks the user had just deleted came back the moment the
+    /// current one ended.
+    #[test]
+    fn clearing_the_queue_takes_those_tracks_out_of_the_session() {
+        let mut q = queue_of(&["a", "b", "c"]);
+        q.append(song("queued later"), false);
+        assert_eq!(q.set_pos(1), PosChange::Advanced(1));
+
+        q.clear_upcoming();
+
+        assert_eq!(q.upcoming_len(), 0, "nothing is queued any more");
+        let mut session = titles(q.session());
+        session.sort();
+        // "a" played and "b" is playing, so loop-all still restarts
+        // from those; the user emptied the queue, not the history.
+        assert_eq!(session, vec!["a", "b"], "c and queued later are gone");
+    }
+
+    /// Deleting one row in the queue view, same rule.
+    #[test]
+    fn removing_a_track_takes_it_out_of_the_session_too() {
+        let mut q = queue_of(&["a", "b", "c"]);
+        assert!(q.remove(2));
+        let mut session = titles(q.session());
+        session.sort();
+        assert_eq!(session, vec!["a", "b"]);
+    }
+
+    /// One occurrence, not every match: a track queued twice and
+    /// deleted once is still queued once, and loop-all must still see
+    /// it.
+    #[test]
+    fn deleting_one_copy_of_a_twice_queued_track_leaves_the_other() {
+        let mut q = queue_of(&["a"]);
+        q.append(song("twice"), false);
+        q.append(song("twice"), false);
+        assert_eq!(
+            titles(q.session())
+                .iter()
+                .filter(|t| **t == "twice")
+                .count(),
+            2
+        );
+
+        assert!(q.remove(1));
+
+        assert_eq!(
+            titles(q.session())
+                .iter()
+                .filter(|t| **t == "twice")
+                .count(),
+            1,
+            "forgot both copies"
+        );
     }
 
     #[test]
