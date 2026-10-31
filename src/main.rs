@@ -145,14 +145,12 @@ struct WimSurface<'a> {
     settings_menu_open: &'a mut bool,
     keybinds_menu_open: &'a mut bool,
     keybinds_menu_selected: &'a mut usize,
-    eq_menu_open: &'a mut bool,
-    eq_menu_selected: &'a mut usize,
+    eq_menu: &'a mut ui::eq_menu::EqMenuPane,
     /// Reset when the menu opens, so a half-typed name editor or an
     /// armed delete cannot survive a close and reopen. The click path
     /// always did this; `view(eq)` did not, and routing the click
     /// through the op made that difference visible. Fixed here rather
     /// than preserved, since opening fresh is right either way.
-    eq_menu: &'a mut ui::eq_menu::EqMenuState,
     undo_menu_open: &'a mut bool,
     bottombar_selected: Field,
 }
@@ -356,12 +354,11 @@ fn open_wim_screen(
             op_done()
         }
         ViewTarget::Eq => {
-            *surf.eq_menu_open = true;
-            *surf.eq_menu = ui::eq_menu::EqMenuState::default();
-            *surf.eq_menu_selected = ui::eq_menu::opening_selection(
-                core.app.eq_source,
-                core.cfg.eq_custom_presets.len(),
-            );
+            // one call: open, reset, and place the cursor on the
+            // curve in use. those were three statements and the other
+            // opener forgot the middle one.
+            surf.eq_menu
+                .open(core.app.eq_source, core.cfg.eq_custom_presets.len());
             op_done()
         }
         ViewTarget::Undo => {
@@ -1021,13 +1018,11 @@ fn main() -> anyhow::Result<()> {
     // enter on the bottom bar's Eq field opens this instead of just
     // cycling presets like the bare 'e' key does; full-workspace, same
     // treatment as the settings/keybinds menus.
-    let mut eq_menu_open = false;
+    // open/selected/editor-state used to be three loose locals, and
+    // two openers had to remember to reset all three; `EqMenuPane`
+    // makes that one call.
+    let mut eq_menu = ui::eq_menu::EqMenuPane::default();
     let mut undo_menu_open = false;
-    let mut eq_menu_selected: usize = 0;
-    // the eq menu's name editor, armed delete and message line; the
-    // selection stays a loose `usize` above because the shellsong
-    // `view(eq)` path writes it too.
-    let mut eq_menu = ui::eq_menu::EqMenuState::default();
 
     let mut panels = PanelLayout::from_sizes(cfg.sidebar_width, cfg.bottom_bar_height);
     let start = Instant::now();
@@ -1158,8 +1153,6 @@ fn main() -> anyhow::Result<()> {
                     settings_menu_open: &mut settings_menu_open,
                     keybinds_menu_open: &mut keybinds_menu_open,
                     keybinds_menu_selected: &mut keybinds_menu_selected,
-                    eq_menu_open: &mut eq_menu_open,
-                    eq_menu_selected: &mut eq_menu_selected,
                     eq_menu: &mut eq_menu,
                     undo_menu_open: &mut undo_menu_open,
                     bottombar_selected,
@@ -1246,7 +1239,7 @@ fn main() -> anyhow::Result<()> {
             || help_open
             || settings_menu_open
             || keybinds_menu_open
-            || eq_menu_open
+            || eq_menu.is_open()
             // not only for the animation gate: `overlay` also feeds
             // `video::wanted`, and without it mpv would keep drawing
             // a video straight over this modal.
@@ -1319,7 +1312,7 @@ fn main() -> anyhow::Result<()> {
                 browse_filter: browse_view.as_ref().is_some_and(|bv| bv.filtering),
                 subtitle_menu: subtitle_menu_open,
                 settings_menu: settings_menu_open,
-                eq_menu: eq_menu_open,
+                eq_menu: eq_menu.is_open(),
                 keybinds_menu: keybinds_menu_open,
             }),
             ..Default::default()
@@ -1925,15 +1918,15 @@ fn main() -> anyhow::Result<()> {
 
             // enter on the bottom bar's Eq field, same full-workspace
             // treatment.
-            if eq_menu_open {
+            if eq_menu.is_open() {
                 f.render_widget(
                     ui::eq_menu::EqMenu {
                         gains: &app.eq_gains,
                         saved: &cfg.eq_custom_presets,
                         source: app.eq_source,
                         modified: app.eq_custom,
-                        selected: eq_menu_selected,
-                        state: &eq_menu,
+                        selected: eq_menu.selected(),
+                        state: eq_menu.state(),
                         elapsed: frame_elapsed,
                     },
                     top,
@@ -3511,18 +3504,18 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                if eq_menu_open {
+                if eq_menu.is_open() {
                     // the name editor owns every key while it's up, so
                     // a letter types instead of firing a menu action.
-                    if eq_menu.editor.is_some() {
+                    if eq_menu.state().editor.is_some() {
                         if let Some(mode) = eq_menu_editor_key(
                             key.code,
-                            &mut eq_menu,
+                            eq_menu.state_mut(),
                             &mut cfg.eq_custom_presets,
                             &mut app,
                         ) {
                             persist_eq(&mut cfg, &app, &mut notifications);
-                            eq_menu_selected = match mode {
+                            eq_menu.set_selected(match mode {
                                 // a save lands the cursor on the row
                                 // the curve now lives on; a rename
                                 // leaves it on the row it renamed.
@@ -3531,42 +3524,42 @@ fn main() -> anyhow::Result<()> {
                                     cfg.eq_custom_presets.len(),
                                 ),
                                 ui::eq_menu::EditorMode::Rename(i) => ui::eq_menu::PRESET_COUNT + i,
-                            };
+                            });
                         }
                         continue;
                     }
                     let saved_len = cfg.eq_custom_presets.len();
-                    let at = ui::eq_menu::cursor(eq_menu_selected, saved_len);
+                    let at = eq_menu.cursor(saved_len);
                     // any key other than a second delete cancels a
                     // pending one, including moving off its row; same
                     // rule the navidrome profile manager follows.
                     if key.code != ui::eq_menu::DELETE_KEY {
-                        eq_menu.disarm_delete();
+                        eq_menu.state_mut().disarm_delete();
                     }
                     if key.code == KeyCode::Esc {
-                        eq_menu_open = false;
-                        eq_menu = ui::eq_menu::EqMenuState::default();
+                        eq_menu.close();
                         persist_eq(&mut cfg, &app, &mut notifications);
                         continue;
                     }
                     if key.code == ui::eq_menu::SAVE_KEY {
-                        eq_menu.editor = Some(ui::eq_menu::NameEditor::save());
-                        eq_menu.message.clear();
+                        eq_menu.state_mut().editor = Some(ui::eq_menu::NameEditor::save());
+                        eq_menu.state_mut().message.clear();
                         continue;
                     }
                     if key.code == ui::eq_menu::RENAME_KEY {
                         if let ui::eq_menu::Cursor::Saved(i) = at {
                             let current = cfg.eq_custom_presets.name_at(i).unwrap_or("");
-                            eq_menu.editor = Some(ui::eq_menu::NameEditor::rename(i, current));
-                            eq_menu.message.clear();
+                            eq_menu.state_mut().editor =
+                                Some(ui::eq_menu::NameEditor::rename(i, current));
+                            eq_menu.state_mut().message.clear();
                         } else {
-                            eq_menu.message = eq_saved_row_hint(&cfg, "rename");
+                            eq_menu.state_mut().message = eq_saved_row_hint(&cfg, "rename");
                         }
                         continue;
                     }
                     if key.code == ui::eq_menu::DELETE_KEY {
                         let ui::eq_menu::Cursor::Saved(i) = at else {
-                            eq_menu.message = eq_saved_row_hint(&cfg, "delete");
+                            eq_menu.state_mut().message = eq_saved_row_hint(&cfg, "delete");
                             continue;
                         };
                         let name = cfg
@@ -3577,7 +3570,7 @@ fn main() -> anyhow::Result<()> {
                         // first press arms, a second on the same row
                         // commits; this rewrites config.toml and the
                         // curve is gone.
-                        if eq_menu.delete.press(i) {
+                        if eq_menu.state_mut().delete.press(i) {
                             cfg.eq_custom_presets.remove(i);
                             // the applied curve stays audible either
                             // way, it just loses its name when the
@@ -3585,12 +3578,12 @@ fn main() -> anyhow::Result<()> {
                             app.eq_source = eq::source_after_removal(app.eq_source, i);
                             app.eq_custom = app.eq_source.is_some() && app.eq_custom;
                             persist_eq(&mut cfg, &app, &mut notifications);
-                            eq_menu_selected = eq_menu_selected.min(
+                            eq_menu.set_selected(eq_menu.selected().min(
                                 ui::eq_menu::selectable_count(cfg.eq_custom_presets.len()) - 1,
-                            );
-                            eq_menu.message = format!("deleted '{name}'");
+                            ));
+                            eq_menu.state_mut().message = format!("deleted '{name}'");
                         } else {
-                            eq_menu.message = format!(
+                            eq_menu.state_mut().message = format!(
                                 "press {} again to delete '{name}'",
                                 keymap::key_label(ui::eq_menu::DELETE_KEY)
                             );
@@ -3605,11 +3598,13 @@ fn main() -> anyhow::Result<()> {
                         // silently overwrote all ten hand-tuned gains,
                         // which esc then saved.
                         KeyCode::Char('j') | KeyCode::Down => {
-                            eq_menu_selected = (eq_menu_selected + 1)
-                                .min(ui::eq_menu::selectable_count(saved_len) - 1);
+                            eq_menu.set_selected(
+                                (eq_menu.selected() + 1)
+                                    .min(ui::eq_menu::selectable_count(saved_len) - 1),
+                            );
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
-                            eq_menu_selected = eq_menu_selected.saturating_sub(1);
+                            eq_menu.set_selected(eq_menu.selected().saturating_sub(1));
                         }
                         KeyCode::Enter => {
                             apply_eq_row(
@@ -3617,7 +3612,7 @@ fn main() -> anyhow::Result<()> {
                                 &player,
                                 &mut notifications,
                                 &cfg.eq_custom_presets,
-                                eq_menu_selected,
+                                eq_menu.selected(),
                             );
                         }
                         KeyCode::Char('h') | KeyCode::Left => {

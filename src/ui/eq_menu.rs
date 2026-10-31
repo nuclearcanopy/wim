@@ -213,6 +213,68 @@ impl EqMenuState {
     }
 }
 
+/// The eq menu as the host holds it: whether it is up, where its
+/// cursor is, and the editor/confirm state inside it.
+///
+/// A `struct Ui` slice (see ROADMAP). These were three loose locals,
+/// and the rule they encode is **opening resets everything and places
+/// the cursor on the curve in use**. That rule was already broken
+/// once: clicking the eq glyph reset `EqMenuState` while `view(eq)`
+/// did not, so a half-typed name or an armed delete could survive a
+/// close and reopen. It was fixed by adding the reset to the second
+/// site; `open` makes it structural instead, so a third opener cannot
+/// get it wrong.
+#[derive(Debug, Default)]
+pub struct EqMenuPane {
+    open: bool,
+    selected: usize,
+    state: EqMenuState,
+}
+
+impl EqMenuPane {
+    /// Opens fresh, with the cursor on whichever curve is in use.
+    pub fn open(&mut self, source: Option<Source>, saved: usize) {
+        self.open = true;
+        self.state = EqMenuState::default();
+        self.selected = opening_selection(source, saved);
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+        // the editor and any armed delete go with it: reopening is a
+        // fresh start, and `open` would reset them anyway. doing it
+        // here too means a caller that only closes cannot leave a
+        // confirm armed against a row it can no longer see.
+        self.state = EqMenuState::default();
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    pub fn set_selected(&mut self, at: usize) {
+        self.selected = at;
+    }
+
+    pub fn state(&self) -> &EqMenuState {
+        &self.state
+    }
+
+    pub fn state_mut(&mut self) -> &mut EqMenuState {
+        &mut self.state
+    }
+
+    /// Where the cursor actually is, resolved against how many saved
+    /// curves there are; see `cursor`.
+    pub fn cursor(&self, saved: usize) -> Cursor {
+        cursor(self.selected, saved)
+    }
+}
+
 /// Rows above and below the zero line. Seven rows at 4 dB each covers
 /// the full ±12 dB without pushing the preset lists off a normal
 /// terminal, and the half-block glyphs halve that again so a single
@@ -1175,5 +1237,69 @@ mod tests {
             editor.push('x');
         }
         assert_eq!(editor.text.chars().count(), MAX_NAME_LEN);
+    }
+}
+
+#[cfg(test)]
+mod eq_menu_state_tests {
+    use super::*;
+
+    /// The bug `open` exists to make impossible: a half-typed name or
+    /// an armed delete surviving into the next opening. It happened
+    /// for real, because one of the two openers reset the state and
+    /// the other did not.
+    ///
+    /// Opens over an already-open menu on purpose, with no `close` in
+    /// between: `close` resets too, so a close-then-open sequence
+    /// passes even when `open` resets nothing, and would not pin this.
+    /// `view(eq)` reaching an open menu is also a real path.
+    #[test]
+    fn opening_is_always_a_fresh_start() {
+        let mut m = EqMenuPane::default();
+        m.open(None, 0);
+        m.state_mut().editor = Some(NameEditor::save());
+        m.state_mut().message = "half typed".into();
+        m.open(None, 0);
+        assert!(m.state().editor.is_none(), "a name editor must not survive");
+        assert!(m.state().message.is_empty());
+    }
+
+    /// Closing alone also clears it, so a caller that only closes
+    /// cannot leave a confirm armed against a row it can no longer
+    /// see.
+    #[test]
+    fn closing_clears_the_editor_too() {
+        let mut m = EqMenuPane::default();
+        m.open(None, 0);
+        m.state_mut().editor = Some(NameEditor::save());
+        m.close();
+        assert!(!m.is_open());
+        assert!(m.state().editor.is_none());
+    }
+
+    /// The cursor lands on the curve in use, which is the whole point
+    /// of taking `source` at open time rather than defaulting to row
+    /// zero.
+    #[test]
+    fn opening_lands_on_the_curve_in_use() {
+        let mut m = EqMenuPane::default();
+        m.open(Some(Source::Builtin(2)), 3);
+        assert_eq!(m.selected(), 2);
+        m.open(Some(Source::Saved(1)), 3);
+        assert_eq!(m.selected(), PRESET_COUNT + 1);
+    }
+
+    /// A saved index past the end cannot select a row that is not
+    /// there; it falls back to the bands like any unknown curve.
+    #[test]
+    fn a_stale_saved_index_does_not_select_a_missing_row() {
+        let mut m = EqMenuPane::default();
+        m.open(Some(Source::Saved(9)), 2);
+        assert_eq!(m.selected(), opening_selection(None, 2));
+    }
+
+    #[test]
+    fn a_fresh_menu_is_closed() {
+        assert!(!EqMenuPane::default().is_open());
     }
 }
