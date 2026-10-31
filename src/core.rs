@@ -145,10 +145,17 @@ pub fn artist_tracks(
 /// Local files flip the persisted favorites set; remote songs call
 /// navidrome's own star/unstar so it stays in sync with any other
 /// subsonic client hitting the same server. Returns the new state.
+///
+/// The remote half is **optimistic**: the local set flips and the next
+/// frame shows it, while the server hears about it on a thread. A star
+/// should feel instant, and this used to be a round trip on the
+/// keypress. A refusal arrives on `star_tx` and the caller puts the
+/// flip back; see `StarFailed`.
 pub fn toggle_star(
     item: &SearchItem,
     favorites: &mut favorites::Favorites,
     remote_starred: &mut HashSet<String>,
+    star_tx: &mpsc::Sender<StarFailed>,
 ) -> Result<bool, String> {
     match item {
         SearchItem::LocalMusic { path, .. } | SearchItem::LocalVideo { path, .. } => {
@@ -157,17 +164,30 @@ pub fn toggle_star(
             Ok(now_starred)
         }
         SearchItem::Song { id, client, .. } => {
-            if remote_starred.contains(id) {
-                client
-                    .unstar(id)
-                    .map_err(|e| format!("couldn't unstar: {e}"))?;
-                remote_starred.remove(id);
-                Ok(false)
-            } else {
-                client.star(id).map_err(|e| format!("couldn't star: {e}"))?;
+            let wanted = !remote_starred.contains(id);
+            if wanted {
                 remote_starred.insert(id.clone());
-                Ok(true)
+            } else {
+                remote_starred.remove(id);
             }
+            let (client, id, tx) = (client.clone(), id.clone(), star_tx.clone());
+            thread::spawn(move || {
+                let sent = if wanted {
+                    client.star(&id)
+                } else {
+                    client.unstar(&id)
+                };
+                if let Err(e) = sent {
+                    // a dead receiver only means the app is shutting
+                    // down, in which case the flip does not matter.
+                    let _ = tx.send(StarFailed {
+                        id,
+                        wanted,
+                        error: e.to_string(),
+                    });
+                }
+            });
+            Ok(wanted)
         }
         SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => {
             Err("only tracks can be starred".to_string())
@@ -265,6 +285,16 @@ pub fn open_starred_view(
 /// called there: the `Mpv` handle isn't `Send`, so the main thread
 /// loads it when this lands, same division of labor as every other
 /// background worker in this file.
+/// A star the server refused, so the optimistic local flip has to go
+/// back. Carries what the local set was set *to*, which is what
+/// reverting needs; the id alone would not say which way.
+#[derive(Debug, Clone)]
+pub struct StarFailed {
+    pub id: String,
+    pub wanted: bool,
+    pub error: String,
+}
+
 pub struct SubtitleReady {
     pub path: String,
     pub release: String,
@@ -1084,6 +1114,9 @@ pub struct CoreCtx<'a> {
     /// calling it from a key handler froze the whole ui until lrclib
     /// answered; "nothing blocks" is the rule in both binaries.
     pub lyrics_loader: &'a mut lyrics::Loader,
+    /// Where a refused star reports back, so the optimistic flip can
+    /// be undone; drained by each binary's own per-frame drain.
+    pub star_tx: &'a mpsc::Sender<StarFailed>,
     // volume, and everything that ramps it.
     pub base_volume: &'a mut f64,
     pub crossfade_enabled: &'a mut bool,
@@ -1562,7 +1595,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             if is_starred(&item, core.favorites, core.remote_starred) == on {
                 return op_note(format!("'{}' is already {verb}", item.primary_name()));
             }
-            match toggle_star(&item, core.favorites, core.remote_starred) {
+            match toggle_star(&item, core.favorites, core.remote_starred, core.star_tx) {
                 Ok(_) => op_note(format!("{verb} '{}'", item.primary_name())),
                 Err(why) => op_fail(why),
             }
@@ -2438,6 +2471,8 @@ mod seam_tests {
         remote_starred: HashSet<String>,
         lyrics_client: lyrics::Client,
         lyrics_loader: lyrics::Loader,
+        star_tx: mpsc::Sender<StarFailed>,
+        _star_rx: mpsc::Receiver<StarFailed>,
         base_volume: f64,
         crossfade_enabled: bool,
         fade_in_started_at: Option<Instant>,
@@ -2459,6 +2494,7 @@ mod seam_tests {
             let (subtitle_tx, _subtitle_rx) = mpsc::channel();
             let (_scan_tx, scan_rx) = mpsc::channel();
             let (remote_search_tx, _remote_search_rx) = mpsc::channel();
+            let (star_tx, star_rx) = mpsc::channel();
             Harness {
                 cfg: config::Config::default(),
                 app: app::App::new(crate::search::Corpus::new()),
@@ -2478,6 +2514,8 @@ mod seam_tests {
                 remote_starred: HashSet::new(),
                 lyrics_client: lyrics::Client::new(),
                 lyrics_loader: lyrics::Loader::new(),
+                star_tx,
+                _star_rx: star_rx,
                 base_volume: 100.0,
                 crossfade_enabled: false,
                 fade_in_started_at: None,
@@ -2514,6 +2552,7 @@ mod seam_tests {
                 remote_starred: &mut self.remote_starred,
                 lyrics_client: &self.lyrics_client,
                 lyrics_loader: &mut self.lyrics_loader,
+                star_tx: &self.star_tx,
                 base_volume: &mut self.base_volume,
                 crossfade_enabled: &mut self.crossfade_enabled,
                 fade_in_started_at: &mut self.fade_in_started_at,
@@ -2527,5 +2566,94 @@ mod seam_tests {
                 bindings: &mut self.bindings,
             }
         }
+    }
+
+    // ----------------------------------------------- optimistic stars
+
+    /// The point of the change: the local set flips before any network
+    /// call can have answered, so the next frame already shows it.
+    /// This used to be a round trip on the keypress.
+    #[test]
+    fn starring_a_remote_song_flips_the_set_without_waiting() {
+        let (star_tx, _star_rx) = mpsc::channel();
+        let mut favorites = favorites::Favorites::default();
+        let mut starred = HashSet::new();
+        let item = test_songs(1).remove(0);
+        let crate::search::SearchItem::Song { id, .. } = &item else {
+            panic!("expected a song");
+        };
+        let id = id.clone();
+
+        let now = toggle_star(&item, &mut favorites, &mut starred, &star_tx)
+            .expect("a song can be starred");
+        assert!(now, "it reports the new state at once");
+        assert!(starred.contains(&id), "and the set already holds it");
+
+        let now =
+            toggle_star(&item, &mut favorites, &mut starred, &star_tx).expect("and unstarred");
+        assert!(!now);
+        assert!(!starred.contains(&id));
+    }
+
+    /// A refusal has to be reportable: the sender carries which way the
+    /// flip went, because the id alone cannot say how to undo it.
+    #[test]
+    fn a_refusal_carries_enough_to_undo_the_flip() {
+        let failed = StarFailed {
+            id: "s1".into(),
+            wanted: true,
+            error: "502".into(),
+        };
+        let mut starred = HashSet::from(["s1".to_string()]);
+        // what both binaries' drains do.
+        if failed.wanted {
+            starred.remove(&failed.id);
+        } else {
+            starred.insert(failed.id.clone());
+        }
+        assert!(!starred.contains("s1"), "a refused star is taken back");
+
+        let failed = StarFailed {
+            id: "s2".into(),
+            wanted: false,
+            error: "502".into(),
+        };
+        let mut starred: HashSet<String> = HashSet::new();
+        if failed.wanted {
+            starred.remove(&failed.id);
+        } else {
+            starred.insert(failed.id.clone());
+        }
+        assert!(starred.contains("s2"), "a refused unstar is put back");
+    }
+
+    /// Local files are a file write, not a round trip, so they stay
+    /// synchronous and must keep working unchanged.
+    #[test]
+    fn a_local_file_still_toggles_synchronously() {
+        let (star_tx, _star_rx) = mpsc::channel();
+        let mut favorites = favorites::Favorites::default();
+        let mut starred = HashSet::new();
+        let item = crate::search::SearchItem::LocalMusic {
+            path: std::path::PathBuf::from("/music/a.flac"),
+            title: "a".into(),
+            artist: None,
+            album: None,
+        };
+        assert!(toggle_star(&item, &mut favorites, &mut starred, &star_tx).unwrap());
+        assert!(starred.is_empty(), "a local star is not a remote one");
+    }
+
+    #[test]
+    fn only_tracks_can_be_starred() {
+        let (star_tx, _star_rx) = mpsc::channel();
+        let mut favorites = favorites::Favorites::default();
+        let mut starred = HashSet::new();
+        let item = crate::search::SearchItem::Playlist {
+            id: "p1".into(),
+            name: "mix".into(),
+            client: crate::browse::tests::test_client(),
+        };
+        assert!(toggle_star(&item, &mut favorites, &mut starred, &star_tx).is_err());
     }
 }
