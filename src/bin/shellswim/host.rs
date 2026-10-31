@@ -45,6 +45,7 @@ macro_rules! core_ctx {
             fade_in_started_at: &mut $h.fade_in_started_at,
             fade: &mut $h.fade,
             sleep_due: &mut $h.sleep_due,
+            resume_due: &mut $h.resume_due,
             scan_rx: &mut $h.scan_rx,
             remote_search_tx: &$h.remote_search_tx,
             settle: &mut $h.settle,
@@ -109,6 +110,7 @@ pub struct Host {
     /// session.
     pub gap_secs: f64,
     pub between_tracks: BetweenTracks,
+    pub resume_due: Option<Duration>,
     /// The query whose results have been printed, and the names
     /// already printed for it. Kept so a server answering after the
     /// settle window prints only its *new* matches rather than
@@ -201,6 +203,7 @@ impl Host {
             crossfade_enabled,
             gap_secs,
             between_tracks: BetweenTracks::new(),
+            resume_due: None,
             echoed: None,
             undo: wim::undo::Recorder::default(),
             keep_open_held: None,
@@ -341,6 +344,16 @@ impl Host {
                 self.console.note(line);
             }
             self.echoed = Some((self.app.query.clone(), shown));
+        }
+
+        // `pause(30s)` letting go.
+        if self
+            .resume_due
+            .is_some_and(|due| self.start.elapsed() >= due)
+        {
+            self.resume_due = None;
+            let _ = self.player.set_pause(false);
+            self.console.note("resumed".to_string());
         }
 
         // the between-track gap, same mechanism as wim's loop: mpv
