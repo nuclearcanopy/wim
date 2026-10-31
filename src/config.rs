@@ -251,25 +251,169 @@ fn default_cache_eviction_days() -> u64 {
     7
 }
 
+/// The fade span every reader agrees on: the range the settings menu
+/// steps through, with a non-finite value (toml parses `nan` and
+/// `inf`, and `Duration::from_secs_f64` aborts on both) falling back
+/// to the default. The menu's steps, load-time validation and the
+/// sleep-timer fade all go through here.
+pub fn crossfade_seconds(secs: f64) -> f64 {
+    if secs.is_finite() {
+        secs.clamp(CROSSFADE_MIN, CROSSFADE_MAX)
+    } else {
+        default_crossfade_seconds()
+    }
+}
+
+pub const CROSSFADE_MIN: f64 = 1.0;
+pub const CROSSFADE_MAX: f64 = 15.0;
+
 impl Config {
-    pub fn resolve_opensubtitles_api_key(&self) -> Option<String> {
+    /// `Ok(None)` means no key was configured at all; an `Err` means
+    /// one was and the file would not read. Same shape as
+    /// `NavidromeConfig::resolve_password`, and for the same reason:
+    /// one typo'd path used to silently disable the feature forever,
+    /// with the settings menu still showing the row.
+    pub fn read_opensubtitles_api_key(&self) -> Result<Option<String>> {
         if let Some(k) = &self.opensubtitles_api_key {
-            return Some(k.clone());
+            return Ok(Some(k.clone()));
         }
-        let path = self.opensubtitles_api_key_file.as_ref()?;
-        fs::read_to_string(path)
-            .ok()
-            .map(|s| s.trim_end_matches('\n').to_string())
+        let Some(path) = self.opensubtitles_api_key_file.as_ref() else {
+            return Ok(None);
+        };
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("reading opensubtitles_api_key_file at {path}"))?;
+        Ok(Some(contents.trim_end_matches('\n').to_string()))
+    }
+
+    pub fn read_listenbrainz_user_token(&self) -> Result<Option<String>> {
+        if let Some(t) = &self.listenbrainz_user_token {
+            return Ok(Some(t.clone()));
+        }
+        let Some(path) = self.listenbrainz_user_token_file.as_ref() else {
+            return Ok(None);
+        };
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("reading listenbrainz_user_token_file at {path}"))?;
+        Ok(Some(contents.trim_end_matches('\n').to_string()))
+    }
+
+    /// The same two reads as "is this feature on", for callers with
+    /// nowhere to put an error; load time reports the failure once
+    /// through `credential_warnings`, so this staying `Option` no
+    /// longer loses it.
+    pub fn resolve_opensubtitles_api_key(&self) -> Option<String> {
+        self.read_opensubtitles_api_key().ok().flatten()
     }
 
     pub fn resolve_listenbrainz_user_token(&self) -> Option<String> {
-        if let Some(t) = &self.listenbrainz_user_token {
-            return Some(t.clone());
+        self.read_listenbrainz_user_token().ok().flatten()
+    }
+
+    /// Pulls every hand-editable number into the range its reader can
+    /// act on, naming each correction: the settings menu only ever
+    /// bounded its own steps, so a number typed into the file reached
+    /// mpv and `Duration::from_secs_f64` unchecked. Panel sizes and eq
+    /// gains are left to `layout::from_sizes`/`eq::clamp_gains`.
+    fn sanitize(&mut self) -> Vec<String> {
+        let mut w = Vec::new();
+        let fade = crossfade_seconds(self.crossfade_seconds);
+        if fade.to_bits() != self.crossfade_seconds.to_bits() {
+            w.push(format!(
+                "crossfade_seconds = {} is outside {CROSSFADE_MIN} to {CROSSFADE_MAX}; using {fade}",
+                self.crossfade_seconds
+            ));
+            self.crossfade_seconds = fade;
         }
-        let path = self.listenbrainz_user_token_file.as_ref()?;
-        fs::read_to_string(path)
-            .ok()
-            .map(|s| s.trim_end_matches('\n').to_string())
+        fix_f64("gap_seconds", &mut self.gap_seconds, 0.0, 60.0, 0.0, &mut w);
+        fix_f64(
+            "scrobble.threshold_percent",
+            &mut self.scrobble.threshold_percent,
+            5.0,
+            100.0,
+            default_scrobble_threshold_percent(),
+            &mut w,
+        );
+        fix_f64(
+            "scrobble.threshold_seconds",
+            &mut self.scrobble.threshold_seconds,
+            15.0,
+            600.0,
+            default_scrobble_threshold_seconds(),
+            &mut w,
+        );
+        let sub = &mut self.subtitles;
+        fix_f64(
+            "subtitles.delay_secs",
+            &mut sub.delay_secs,
+            -600.0,
+            600.0,
+            0.0,
+            &mut w,
+        );
+        fix_f64(
+            "subtitles.outline_size",
+            &mut sub.outline_size,
+            0.0,
+            10.0,
+            default_sub_outline_size(),
+            &mut w,
+        );
+        fix_f64(
+            "subtitles.background_opacity",
+            &mut sub.background_opacity,
+            0.0,
+            1.0,
+            0.0,
+            &mut w,
+        );
+        fix_f64("subtitles.blur", &mut sub.blur, 0.0, 20.0, 0.0, &mut w);
+        // the one f32 in the file; same rule, widened to share the
+        // helper rather than growing a second copy of it.
+        let mut level = f64::from(sub.color_level);
+        fix_f64(
+            "subtitles.color_level",
+            &mut level,
+            0.0,
+            1.0,
+            f64::from(default_sub_color_level()),
+            &mut w,
+        );
+        sub.color_level = level as f32;
+        fix_int("subtitles.font_size", &mut sub.font_size, 8, 400, &mut w);
+        fix_int("subtitles.position", &mut sub.position, 0, 150, &mut w);
+        fix_int(
+            "cache_days_threshold",
+            &mut self.cache_days_threshold,
+            1,
+            20,
+            &mut w,
+        );
+        fix_int(
+            "cache_eviction_days",
+            &mut self.cache_eviction_days,
+            1,
+            90,
+            &mut w,
+        );
+        w
+    }
+
+    /// Credential files that were configured and would not read, each
+    /// named with the path and the io error. Separate from `sanitize`
+    /// because this is the only part of validation that touches the
+    /// disk.
+    fn credential_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Err(e) = self.read_listenbrainz_user_token() {
+            out.push(format!("scrobbling is off: {e:#}"));
+        }
+        if let Err(e) = self.read_opensubtitles_api_key() {
+            out.push(format!("subtitle fetching is off: {e:#}"));
+        }
+        // a navidrome `password_file` that will not read is not listed
+        // here: that one already surfaces at connect time, since
+        // `resolve_password` returns the error to the caller.
+        out
     }
 }
 
@@ -395,21 +539,195 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(dir.join("wim").join("config.toml"))
 }
 
+/// A loaded config plus what is worth saying out loud once: a key
+/// nobody reads, a number that had to be corrected, a credential file
+/// that would not open. All three used to be silent, and a negative
+/// `crossfade_seconds` was worse than silent (it aborted the process
+/// on the first sleep timer).
+pub struct Loaded {
+    pub cfg: Config,
+    pub warnings: Vec<String>,
+}
+
 /// Loads config.toml, or starts with defaults on first run; never
 /// bails out to a cli error. A missing navidrome section just means
 /// the in-app login prompt (main.rs) offers to set one up; forcing
 /// people to hand-edit a toml file before they can even see the app
 /// once was a bad first-run experience, not a reasonable default.
-pub fn load_or_init() -> Result<Config> {
+///
+/// Corrects rather than refuses, and never writes back: `save`
+/// regenerates the file from the struct, which would drop a
+/// hand-edited one's comments. A correction holds for the session, and
+/// the next settings-menu save persists it through `save_or_warn`.
+pub fn load_reporting() -> Result<Loaded> {
     let path = config_path()?;
     if !path.exists() {
         save(&Config::default())?;
-        return Ok(Config::default());
+        return Ok(Loaded {
+            cfg: Config::default(),
+            warnings: Vec::new(),
+        });
     }
     let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let cfg: Config =
-        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-    Ok(cfg)
+    let mut loaded = validate(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    loaded.warnings.extend(loaded.cfg.credential_warnings());
+    Ok(loaded)
+}
+
+/// `load_reporting` minus the disk, so validation itself is testable
+/// without a real config.toml.
+fn validate(raw: &str) -> Result<Loaded> {
+    let mut cfg: Config = toml::from_str(raw)?;
+    let mut warnings = unknown_keys(raw);
+    warnings.extend(cfg.sanitize());
+    Ok(Loaded { cfg, warnings })
+}
+
+/// The config, with the warnings printed instead of shown: for a
+/// front-end with no notification area of its own (shellswim), which
+/// already talks to the user over stderr.
+pub fn load_or_init() -> Result<Config> {
+    let loaded = load_reporting()?;
+    for w in &loaded.warnings {
+        eprintln!("config: {w}");
+    }
+    Ok(loaded.cfg)
+}
+
+/// Corrects one number in place, and says nothing when it was already
+/// fine. Non-finite is handled apart from out-of-range: `clamp`
+/// propagates a nan rather than bounding it, so `nan`/`inf` (which
+/// toml parses) take the field's default instead.
+fn fix_f64(key: &str, v: &mut f64, lo: f64, hi: f64, fallback: f64, w: &mut Vec<String>) {
+    let was = *v;
+    let fixed = if was.is_finite() {
+        was.clamp(lo, hi)
+    } else {
+        fallback
+    };
+    if fixed.to_bits() == was.to_bits() {
+        return;
+    }
+    *v = fixed;
+    w.push(format!(
+        "{key} = {was} is outside {lo} to {hi}; using {fixed}"
+    ));
+}
+
+fn fix_int<T: Ord + Copy + std::fmt::Display>(
+    key: &str,
+    v: &mut T,
+    lo: T,
+    hi: T,
+    w: &mut Vec<String>,
+) {
+    let was = *v;
+    let fixed = was.clamp(lo, hi);
+    if fixed == was {
+        return;
+    }
+    *v = fixed;
+    w.push(format!(
+        "{key} = {was} is outside {lo} to {hi}; using {fixed}"
+    ));
+}
+
+/// Every top-level key this build reads, aliases included (an older
+/// config still says `cache_listens_threshold`). By hand rather than
+/// through serde, for the reason in `unknown_keys`; the
+/// `every_config_field_is_a_known_key` test pins the list against the
+/// struct.
+const KNOWN_KEYS: &[&str] = &[
+    "navidrome_servers",
+    "album_art",
+    "library_paths",
+    "crossfade_enabled",
+    "crossfade_seconds",
+    "gap_seconds",
+    "subtitles",
+    "opensubtitles_api_key",
+    "opensubtitles_api_key_file",
+    "subtitle_language",
+    "listenbrainz_user_token",
+    "listenbrainz_user_token_file",
+    "scrobble",
+    "logo_style",
+    "eq_preset",
+    "eq_gains",
+    "eq_custom_presets",
+    "keybinds",
+    "cache_days_threshold",
+    "cache_listens_threshold",
+    "sidebar_width",
+    "bottom_bar_height",
+    "cache_eviction_days",
+    "mouse",
+    "video_output",
+];
+
+const SUBTITLE_KEYS: &[&str] = &[
+    "delay_secs",
+    "font_size",
+    "position",
+    "outline_size",
+    "background_opacity",
+    "blur",
+    "color_level",
+];
+
+const SCROBBLE_KEYS: &[&str] = &["threshold_percent", "threshold_seconds"];
+
+const NAVIDROME_KEYS: &[&str] = &[
+    "url",
+    "username",
+    "password",
+    "password_file",
+    "max_bitrate_kbps",
+    "transcode_format",
+];
+
+/// Keys nothing reads, each with the nearest real name when one is
+/// close (`libary_paths` parsed clean and was never used, so the
+/// library just looked empty). A warning and not
+/// `deny_unknown_fields`: refusing to start over one stray key in a
+/// hand-edited file is the worse failure. Nested tables included,
+/// which that attribute would not have covered.
+fn unknown_keys(raw: &str) -> Vec<String> {
+    let Ok(table) = raw.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_unknown(&table, "", KNOWN_KEYS, &mut out);
+    if let Some(toml::Value::Table(t)) = table.get("subtitles") {
+        collect_unknown(t, "subtitles.", SUBTITLE_KEYS, &mut out);
+    }
+    if let Some(toml::Value::Table(t)) = table.get("scrobble") {
+        collect_unknown(t, "scrobble.", SCROBBLE_KEYS, &mut out);
+    }
+    if let Some(toml::Value::Array(servers)) = table.get("navidrome_servers") {
+        for server in servers {
+            if let toml::Value::Table(t) = server {
+                collect_unknown(t, "navidrome_servers.", NAVIDROME_KEYS, &mut out);
+            }
+        }
+    }
+    out
+}
+
+fn collect_unknown(table: &toml::Table, prefix: &str, known: &[&str], out: &mut Vec<String>) {
+    for key in table.keys() {
+        if known.contains(&key.as_str()) {
+            continue;
+        }
+        out.push(match crate::namehint::closest(key, known.iter().copied()) {
+            Some(near) => {
+                format!(
+                    "unknown config key '{prefix}{key}', ignored; did you mean '{prefix}{near}'?"
+                )
+            }
+            None => format!("unknown config key '{prefix}{key}', ignored"),
+        });
+    }
 }
 
 pub fn save(cfg: &Config) -> Result<()> {
@@ -451,6 +769,270 @@ pub fn save_or_warn(cfg: &Config, notifications: &mut Notifications) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A number straight out of the file used to reach every reader
+    /// unchecked, and this one reached `Duration::from_secs_f64`,
+    /// which aborts the process on a negative, nan or infinite value;
+    /// `crossfade_seconds = -1` plus a sleep timer was a crash in a
+    /// config file.
+    #[test]
+    fn a_crossfade_no_duration_can_hold_is_corrected_at_load() {
+        for raw in [
+            "crossfade_seconds = -1\n",
+            "crossfade_seconds = nan\n",
+            "crossfade_seconds = inf\n",
+            "crossfade_seconds = -inf\n",
+            "crossfade_seconds = 1e300\n",
+            "crossfade_seconds = 900\n",
+        ] {
+            let loaded = validate(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            let secs = loaded.cfg.crossfade_seconds;
+            assert!(
+                (CROSSFADE_MIN..=CROSSFADE_MAX).contains(&secs),
+                "{raw} left {secs}"
+            );
+            // the use site itself, which is what aborted.
+            let _ = std::time::Duration::from_secs_f64(secs);
+            assert!(
+                loaded
+                    .warnings
+                    .iter()
+                    .any(|w| w.starts_with("crossfade_seconds =")),
+                "{raw} was corrected in silence: {:?}",
+                loaded.warnings
+            );
+        }
+    }
+
+    /// Out of range is not always a crash; `threshold_percent = 5000`
+    /// just meant nothing ever scrobbled, with the settings menu
+    /// showing 5000% and no complaint anywhere.
+    #[test]
+    fn an_impossible_scrobble_threshold_is_corrected_at_load() {
+        let loaded = validate("scrobble = { threshold_percent = 5000 }\n").expect("parsing");
+        assert_eq!(loaded.cfg.scrobble.threshold_percent, 100.0);
+        assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+        // and the whole point of the number: a track played to the end
+        // now scrobbles, where before it could not.
+        assert!(crate::listenbrainz::should_scrobble(
+            &loaded.cfg.scrobble,
+            200.0,
+            200.0
+        ));
+
+        let loaded = validate("scrobble = { threshold_seconds = -3 }\n").expect("parsing");
+        assert_eq!(loaded.cfg.scrobble.threshold_seconds, 15.0);
+    }
+
+    /// Every other hand-editable number, each held to the range its
+    /// reader (mpv, the cache sweep) can act on.
+    #[test]
+    fn the_rest_of_the_out_of_range_numbers_are_corrected_too() {
+        let loaded = validate(
+            r#"
+gap_seconds = -5
+cache_days_threshold = 0
+cache_eviction_days = 4000
+[subtitles]
+position = 900
+background_opacity = 4
+color_level = -1
+font_size = 0
+blur = nan
+"#,
+        )
+        .expect("parsing");
+        let cfg = &loaded.cfg;
+        assert_eq!(cfg.gap_seconds, 0.0);
+        assert_eq!(cfg.cache_days_threshold, 1);
+        assert_eq!(cfg.cache_eviction_days, 90);
+        assert_eq!(cfg.subtitles.position, 150);
+        assert_eq!(cfg.subtitles.background_opacity, 1.0);
+        assert_eq!(cfg.subtitles.color_level, 0.0);
+        assert_eq!(cfg.subtitles.font_size, 8);
+        assert_eq!(cfg.subtitles.blur, 0.0);
+        assert_eq!(loaded.warnings.len(), 8, "{:?}", loaded.warnings);
+    }
+
+    /// `libary_paths` parsed clean and was read by nothing, so the
+    /// library came up empty with nothing said about why. Named and
+    /// ignored rather than refused: see `unknown_keys`.
+    #[test]
+    fn a_key_nothing_reads_is_named_with_the_name_it_missed() {
+        let loaded = validate("libary_paths = [\"/music\"]\n").expect("parsing");
+        assert!(loaded.cfg.library_paths.is_empty());
+        assert_eq!(
+            loaded.warnings,
+            vec![
+                "unknown config key 'libary_paths', ignored; did you mean 'library_paths'?"
+                    .to_string()
+            ]
+        );
+
+        // nested tables too, which a `deny_unknown_fields` on `Config`
+        // alone would have missed.
+        let loaded = validate(
+            r#"
+[scrobble]
+threshhold_percent = 70
+
+[[navidrome_servers]]
+url = "https://music.example"
+username = "me"
+pasword = "x"
+"#,
+        )
+        .expect("parsing");
+        assert_eq!(loaded.warnings.len(), 2, "{:?}", loaded.warnings);
+        assert!(loaded.warnings[0].contains("'scrobble.threshhold_percent'"));
+        assert!(loaded.warnings[0].contains("'scrobble.threshold_percent'"));
+        assert!(loaded.warnings[1].contains("'navidrome_servers.pasword'"));
+        assert!(loaded.warnings[1].contains("'navidrome_servers.password'"));
+
+        // a key with nothing close by still gets named, just without
+        // a guess.
+        let loaded = validate("shuffle = true\n").expect("parsing");
+        assert_eq!(
+            loaded.warnings,
+            vec!["unknown config key 'shuffle', ignored".to_string()]
+        );
+    }
+
+    /// `KNOWN_KEYS` is written by hand, so this is what keeps it
+    /// honest: a field added to `Config` and not listed there would
+    /// start warning about itself. The literal is exhaustive on
+    /// purpose; a new field breaks this test's compile until it is
+    /// accounted for.
+    #[test]
+    fn every_config_field_is_a_known_key() {
+        let full = Config {
+            navidrome_servers: vec![NavidromeConfig {
+                url: "https://music.example".into(),
+                username: "me".into(),
+                password: Some("x".into()),
+                password_file: Some("/run/secret".into()),
+                max_bitrate_kbps: Some(320),
+                transcode_format: Some("opus".into()),
+            }],
+            album_art: AlbumArtMode::Auto,
+            library_paths: vec!["/music".into()],
+            crossfade_enabled: true,
+            crossfade_seconds: 3.0,
+            gap_seconds: 1.0,
+            subtitles: SubtitleConfig::default(),
+            opensubtitles_api_key: Some("k".into()),
+            opensubtitles_api_key_file: Some("/run/secret".into()),
+            subtitle_language: "en".into(),
+            listenbrainz_user_token: Some("t".into()),
+            listenbrainz_user_token_file: Some("/run/secret".into()),
+            scrobble: ScrobbleConfig::default(),
+            logo_style: Some("ANSI Shadow".into()),
+            eq_preset: Some("flat".into()),
+            eq_gains: Some([0.0; 10]),
+            eq_custom_presets: eq::CustomPresets::default(),
+            keybinds: HashMap::new(),
+            cache_days_threshold: 2,
+            sidebar_width: 40,
+            bottom_bar_height: 8,
+            cache_eviction_days: 7,
+            mouse: true,
+            video_output: VideoOutput::Auto,
+        };
+        let text = toml::to_string_pretty(&full).expect("serializing");
+        let table: toml::Table = text.parse().expect("parsing back");
+        for key in table.keys() {
+            assert!(
+                KNOWN_KEYS.contains(&key.as_str()),
+                "'{key}' is a real field but not in KNOWN_KEYS"
+            );
+        }
+        // and nothing written by this build is ever reported as
+        // unknown, aliases aside.
+        assert!(unknown_keys(&text).is_empty(), "{text}");
+        for key in KNOWN_KEYS {
+            assert!(
+                table.contains_key(*key) || *key == "cache_listens_threshold",
+                "'{key}' is in KNOWN_KEYS but is not a field (nor the alias)"
+            );
+        }
+        // the nested lists, checked the same way.
+        let nested = |section: &str, known: &[&str]| {
+            let table: toml::Table = text.parse().unwrap();
+            let sub = match table.get(section) {
+                Some(toml::Value::Table(t)) => t.clone(),
+                Some(toml::Value::Array(a)) => match &a[0] {
+                    toml::Value::Table(t) => t.clone(),
+                    other => panic!("{section} is {other:?}"),
+                },
+                other => panic!("{section} is {other:?}"),
+            };
+            for key in sub.keys() {
+                assert!(known.contains(&key.as_str()), "{section}.{key} unlisted");
+            }
+        };
+        nested("subtitles", SUBTITLE_KEYS);
+        nested("scrobble", SCROBBLE_KEYS);
+        nested("navidrome_servers", NAVIDROME_KEYS);
+    }
+
+    /// A config this build wrote has nothing to say about itself; the
+    /// warnings are only ever about what the user typed.
+    #[test]
+    fn a_config_this_build_wrote_loads_without_a_word() {
+        let text = toml::to_string_pretty(&Config::default()).expect("serializing");
+        let loaded = validate(&text).expect("parsing");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        // including the pre-rename names an older config still uses.
+        let loaded = validate("cache_listens_threshold = 4\nalbum_art = \"blocks\"\n")
+            .expect("an older config still loads");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert_eq!(loaded.cfg.cache_days_threshold, 4);
+    }
+
+    /// A token file that will not read used to mean scrobbling was
+    /// off forever while onboarding said it was set up and the
+    /// settings menu still showed the row. Same treatment as
+    /// `resolve_password`: the io error is kept, and load reports it.
+    #[test]
+    fn an_unreadable_token_file_is_reported_rather_than_silently_ignored() {
+        let dir = std::env::temp_dir().join(format!("wim-tokentest-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("token");
+        fs::write(&good, "tok-123\n").unwrap();
+        let missing = dir.join("typo").display().to_string();
+
+        let cfg = Config {
+            listenbrainz_user_token_file: Some(good.display().to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.read_listenbrainz_user_token().unwrap().as_deref(),
+            Some("tok-123")
+        );
+        assert!(cfg.credential_warnings().is_empty());
+
+        let cfg = Config {
+            listenbrainz_user_token_file: Some(missing.clone()),
+            opensubtitles_api_key_file: Some(missing.clone()),
+            ..Default::default()
+        };
+        assert!(cfg.read_listenbrainz_user_token().is_err());
+        assert!(cfg.resolve_listenbrainz_user_token().is_none());
+        let warnings = cfg.credential_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("scrobbling is off") && warnings[0].contains(&missing),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("subtitle fetching is off") && warnings[1].contains(&missing),
+            "{warnings:?}"
+        );
+
+        // nothing configured is not a failure, it is the default.
+        assert!(Config::default().credential_warnings().is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
 
     /// The saved eq presets are an array of tables, which toml can
     /// only emit after every plain key; serializing the whole struct
