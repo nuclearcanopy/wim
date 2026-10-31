@@ -5,6 +5,7 @@ use ratatui::widgets::Widget;
 use crate::keymap::ALL_ACTIONS;
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
+use crate::ui::results_list::scroll_cues;
 
 /// Every remappable action and its current key, full-workspace like
 /// the settings menu (this effectively *is* one of its settings,
@@ -31,7 +32,10 @@ impl Widget for KeybindsMenu<'_> {
             area,
             area.y,
             "keybinds",
-            "k to close",
+            // shift+k or esc, not "k": lowercase k moves the
+            // selection here, as the footer says two rows down, and
+            // this header contradicted it.
+            "shift+k or esc: close",
             shade(DIM),
             shade(NEAR_BLACK),
         );
@@ -42,10 +46,30 @@ impl Widget for KeybindsMenu<'_> {
             .map(|a| a.label().len())
             .max()
             .unwrap_or(0);
-        for (i, action) in ALL_ACTIONS.iter().enumerate() {
-            if y >= area.y + area.height {
-                break;
-            }
+        // the hint row (and the conflict notice while there is one)
+        // claim their rows before the list does, then the list scrolls
+        // inside what is left: it had no offset at all, so past the
+        // pane height `j` moved an invisible cursor and `r` rebound a
+        // row nobody could see.
+        let footer = 2 + u16::from(self.conflict.is_some());
+        let list_top = y;
+        let room = (area.y + area.height).saturating_sub(list_top);
+        let rows = room.saturating_sub(footer).min(ALL_ACTIONS.len() as u16);
+        let offset = crate::ui::scroll::offset_for(self.selected, rows as usize);
+        // one column of gutter for the scroll cue, and only while
+        // there is one: a list that fits keeps its full width.
+        let scrolls = ALL_ACTIONS.len() > rows as usize;
+        let text = Rect {
+            width: area.width.saturating_sub(u16::from(scrolls)),
+            ..area
+        };
+        for (row, (i, action)) in ALL_ACTIONS
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(rows as usize)
+            .enumerate()
+        {
             let is_selected = i == self.selected;
             let color = if is_selected {
                 shade(NEAR_WHITE)
@@ -60,14 +84,24 @@ impl Widget for KeybindsMenu<'_> {
             };
             draw_line(
                 buf,
-                area,
-                y,
+                text,
+                list_top + row as u16,
                 &format!("{marker} {:<label_width$}  {key_text}", action.label(),),
                 color,
             );
-            y += 1;
         }
-        y += 1;
+        scroll_cues(
+            buf,
+            Rect {
+                y: list_top,
+                height: rows,
+                ..area
+            },
+            offset,
+            ALL_ACTIONS.len(),
+        );
+
+        y = list_top + rows + 1;
         draw_line(
             buf,
             area,
@@ -228,6 +262,119 @@ mod tests {
         for (w, h) in [(1, 1), (1, 40), (2, 1), (40, 0), (0, 0), (3, 2)] {
             let mut buf = buffer(w.max(1), h.max(1));
             render(Rect::new(0, 0, w, h), &mut buf, &keys(), Some("quit"));
+        }
+    }
+
+    /// The host cycles the selection over every action, so every one
+    /// of them has to be reachable on a pane that holds a fraction of
+    /// them: 80x24 with the default 4-row bottom bar leaves 20 rows,
+    /// and `r` rebinding a row nobody can see is the actual hazard.
+    #[test]
+    fn the_selected_action_and_the_prompt_are_on_screen_at_every_selection() {
+        for (selected, action) in ALL_ACTIONS.iter().enumerate() {
+            let area = Rect::new(0, 0, 80, 20);
+            let mut buf = buffer(80, 20);
+            KeybindsMenu {
+                keys: &keys(),
+                selected,
+                capturing: true,
+                conflict: None,
+            }
+            .render(area, &mut buf);
+            let g = grid(&buf);
+            let label = action.label();
+            assert!(
+                g.contains(&format!("> {label}")),
+                "selection {selected} ({label}) is off screen:\n{g}"
+            );
+            assert!(
+                g.contains("press a key..."),
+                "the capture prompt went with it:\n{g}"
+            );
+            assert!(
+                g.contains("j/k select, r rebind selected"),
+                "the footer hint went with it:\n{g}"
+            );
+        }
+    }
+
+    /// The conflict notice is the one row that explains what a rebind
+    /// just did, so it claims its row from the list rather than being
+    /// pushed off the bottom by it.
+    #[test]
+    fn the_conflict_notice_survives_a_pane_the_list_overflows() {
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = buffer(80, 20);
+        render(area, &mut buf, &keys(), Some("quit"));
+        assert!(
+            grid(&buf).contains("already bound to \"quit\""),
+            "{}",
+            grid(&buf)
+        );
+    }
+
+    /// A window onto a longer list has to say so, or 29 actions read
+    /// as however many fit; same `▴`/`▾` gutter cue `lyrics_view` uses.
+    #[test]
+    fn a_scrolled_list_cues_what_is_off_each_edge() {
+        let cue = |selected: usize, h: u16| {
+            let mut buf = buffer(80, h);
+            render_at(Rect::new(0, 0, 80, h), &mut buf, selected);
+            let g = grid(&buf);
+            (g.contains('▴'), g.contains('▾'))
+        };
+        assert_eq!(cue(0, 20), (false, true), "more below only");
+        assert_eq!(cue(ALL_ACTIONS.len() - 1, 20), (true, false), "above only");
+        assert_eq!(cue(13, 20), (true, true), "both edges");
+        // tall enough for every action: no cue at all.
+        assert_eq!(cue(0, 40), (false, false), "nothing is off screen");
+    }
+
+    fn render_at(area: Rect, buf: &mut Buffer, selected: usize) {
+        KeybindsMenu {
+            keys: &keys(),
+            selected,
+            capturing: false,
+            conflict: None,
+        }
+        .render(area, buf);
+    }
+}
+
+#[cfg(test)]
+mod eyeball {
+    use super::*;
+    use crate::ui::testbuf::{buffer, grid};
+
+    /// The menu at the rows `main_content` actually gets (80x24 with
+    /// the default 4-row bottom bar leaves 20), with the selection on
+    /// the last action, which is where it ends up after holding `j`:
+    /// `cargo test --lib ui::keybinds_menu::eyeball -- --nocapture`.
+    /// Asserts the floor too, so it is a test and not just a printer.
+    #[test]
+    fn print_the_menu_with_the_selection_at_the_end() {
+        let keys: Vec<String> = ALL_ACTIONS.iter().map(|_| "x".to_string()).collect();
+        for (w, h, selected, capturing, conflict) in [
+            (80u16, 20u16, ALL_ACTIONS.len() - 1, true, None),
+            (80, 20, 0, false, None),
+            (80, 20, 13, false, None),
+            (80, 20, ALL_ACTIONS.len() - 1, false, Some("quit")),
+            (80, 8, ALL_ACTIONS.len() - 1, true, None),
+        ] {
+            let mut buf = buffer(w, h);
+            KeybindsMenu {
+                keys: &keys,
+                selected,
+                capturing,
+                conflict,
+            }
+            .render(Rect::new(0, 0, w, h), &mut buf);
+            let text = grid(&buf);
+            println!("--- {w}x{h} selected={selected} capturing={capturing} conflict={conflict:?}\n{text}");
+            assert!(
+                text.chars().any(|c| c != '.' && c != '\n'),
+                "{w}x{h} drew nothing at all"
+            );
         }
     }
 }

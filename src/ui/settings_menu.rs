@@ -5,6 +5,7 @@ use ratatui::widgets::Widget;
 use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
+use crate::ui::results_list::scroll_cues;
 
 pub const FIELD_COUNT: usize = 8;
 pub const FIELD_LABELS: [&str; FIELD_COUNT] = [
@@ -53,10 +54,31 @@ impl Widget for SettingsMenu<'_> {
         y += 1;
 
         let key_width = FIELD_LABELS.iter().map(|l| l.len()).max().unwrap_or(0);
-        for (i, (label, value)) in FIELD_LABELS.iter().zip(self.values.iter()).enumerate() {
-            if y >= area.y + area.height {
-                break;
-            }
+        // the hint naming the key that opens the token editor claims
+        // its row before the list does, then the list scrolls inside
+        // what is left: it had no offset at all, so on a short pane
+        // the last fields were selectable but never drawn. the second
+        // hint is a pointer elsewhere and is left to clip.
+        let footer = 2;
+        let list_top = y;
+        let room = (area.y + area.height).saturating_sub(list_top);
+        let rows = room.saturating_sub(footer).min(FIELD_COUNT as u16);
+        let offset = crate::ui::scroll::offset_for(self.selected, rows as usize);
+        // one column of gutter for the scroll cue, and only while
+        // there is one: a list that fits keeps its full width.
+        let scrolls = FIELD_COUNT > rows as usize;
+        let text = Rect {
+            width: area.width.saturating_sub(u16::from(scrolls)),
+            ..area
+        };
+        for (row, (i, (label, value))) in FIELD_LABELS
+            .iter()
+            .zip(self.values.iter())
+            .enumerate()
+            .skip(offset)
+            .take(rows as usize)
+            .enumerate()
+        {
             let color = if i == self.selected {
                 shade(NEAR_WHITE)
             } else {
@@ -65,14 +87,24 @@ impl Widget for SettingsMenu<'_> {
             let marker = if i == self.selected { '>' } else { ' ' };
             draw_line(
                 buf,
-                area,
-                y,
+                text,
+                list_top + row as u16,
                 &format!("{marker} {label:<key_width$}  {value}"),
                 color,
             );
-            y += 1;
         }
-        y += 1;
+        scroll_cues(
+            buf,
+            Rect {
+                y: list_top,
+                height: rows,
+                ..area
+            },
+            offset,
+            FIELD_COUNT,
+        );
+
+        y = list_top + rows + 1;
         draw_line(
             buf,
             area,
@@ -217,6 +249,62 @@ mod tests {
         }
     }
 
+    fn render_at(area: Rect, buf: &mut Buffer, selected: usize) {
+        SettingsMenu {
+            values: ["on"; FIELD_COUNT],
+            selected,
+            keymap: &Keymap::default(),
+        }
+        .render(area, buf);
+    }
+
+    /// j/k walks every field, so every field has to be reachable on a
+    /// pane that holds a fraction of them; enter on a row nobody can
+    /// see opens the token editor blind.
+    #[test]
+    fn the_selected_field_is_on_screen_at_every_selection() {
+        for h in [8u16, 10, 12, 17] {
+            for (selected, label) in FIELD_LABELS.iter().enumerate() {
+                let mut buf = buffer(80, h);
+                render_at(Rect::new(0, 0, 80, h), &mut buf, selected);
+                let g = grid(&buf);
+                assert!(
+                    g.contains(&format!("> {label}")),
+                    "field {selected} ({label}) is off a {h}-row pane:\n{g}"
+                );
+            }
+        }
+    }
+
+    /// The hint naming the one key that opens the token editor is the
+    /// row that explains the row below it, so it claims its own row
+    /// rather than being pushed off by the list.
+    #[test]
+    fn the_primary_hint_survives_a_pane_the_list_overflows() {
+        let mut buf = buffer(80, 10);
+        render_at(Rect::new(0, 0, 80, 10), &mut buf, FIELD_COUNT - 1);
+        assert!(
+            grid(&buf).contains("j/k select, h/l adjust"),
+            "{}",
+            grid(&buf)
+        );
+    }
+
+    /// Same `▴`/`▾` gutter cue `lyrics_view` uses, so a window onto
+    /// eight fields does not read as all of them.
+    #[test]
+    fn a_scrolled_list_cues_what_is_off_each_edge() {
+        let cue = |selected: usize, h: u16| {
+            let mut buf = buffer(80, h);
+            render_at(Rect::new(0, 0, 80, h), &mut buf, selected);
+            let g = grid(&buf);
+            (g.contains('▴'), g.contains('▾'))
+        };
+        assert_eq!(cue(0, 10), (false, true), "more below only");
+        assert_eq!(cue(FIELD_COUNT - 1, 10), (true, false), "above only");
+        assert_eq!(cue(0, 17), (false, false), "every field fits");
+    }
+
     #[test]
     fn the_hints_follow_the_live_keymap_but_keep_the_fixed_keys() {
         let mut keymap = Keymap::default();
@@ -248,5 +336,50 @@ mod tests {
         // the reserved navigation keys are not remappable and must
         // not start following the keymap.
         assert!(out.contains("j/k select, h/l adjust"), "got:\n{out}");
+    }
+}
+
+#[cfg(test)]
+mod eyeball {
+    use super::*;
+    use crate::ui::testbuf::{buffer, grid};
+
+    /// The menu at the rows `main_content` actually gets: a 14-row
+    /// terminal with the default 4-row bottom bar leaves 10, and the
+    /// listenbrainz token is the last of the eight fields:
+    /// `cargo test --lib ui::settings_menu::eyeball -- --nocapture`.
+    /// Asserts the floor too, so it is a test and not just a printer.
+    #[test]
+    fn print_the_menu_with_the_token_row_selected() {
+        let values = [
+            "balanced ('i' also cycles this)",
+            "off",
+            "3.0s",
+            "7 days played",
+            "30 days",
+            "50%",
+            "240s",
+            "not set (enter to add)",
+        ];
+        for (w, h, selected) in [
+            (80u16, 10u16, 7usize),
+            (80, 10, 0),
+            (80, 12, 7),
+            (80, 17, 7),
+        ] {
+            let mut buf = buffer(w, h);
+            SettingsMenu {
+                values,
+                selected,
+                keymap: &Keymap::default(),
+            }
+            .render(Rect::new(0, 0, w, h), &mut buf);
+            let text = grid(&buf);
+            println!("--- {w}x{h} selected={selected}\n{text}");
+            assert!(
+                text.chars().any(|c| c != '.' && c != '\n'),
+                "{w}x{h} drew nothing at all"
+            );
+        }
     }
 }

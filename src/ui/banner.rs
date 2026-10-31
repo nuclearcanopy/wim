@@ -143,13 +143,19 @@ impl Widget for Banner<'_> {
         // a blank column of breathing room on each side; sitting
         // right up against the logo's own edge read as touching it.
         const ARROW_GAP: u16 = 2;
+        // the row is the middle of a logo block centred from a frame
+        // taller than the pane, so it can land below it; both guards
+        // tested x only and the arrows punched holes in the bottom
+        // bar's rule. same check the logo grid below already has.
         let arrow_y = logo_start_y + glyph_height / 2;
-        if start_x >= area.x + ARROW_GAP {
-            put(buf, start_x - ARROW_GAP, arrow_y, '<', shade(NEAR_WHITE));
-        }
-        let right_x = start_x + total_width + ARROW_GAP - 1;
-        if right_x < area.x + area.width {
-            put(buf, right_x, arrow_y, '>', shade(NEAR_WHITE));
+        if arrow_y < area.y + area.height {
+            if start_x >= area.x + ARROW_GAP {
+                put(buf, start_x - ARROW_GAP, arrow_y, '<', shade(NEAR_WHITE));
+            }
+            let right_x = start_x + total_width + ARROW_GAP - 1;
+            if right_x < area.x + area.width {
+                put(buf, right_x, arrow_y, '>', shade(NEAR_WHITE));
+            }
         }
 
         for (row_idx, row) in lines.iter().enumerate() {
@@ -456,5 +462,72 @@ mod tests {
             let mut buf = buffer(w.max(1), h.max(1));
             render(Rect::new(0, 0, w, h), &mut buf, &Keymap::default());
         }
+    }
+
+    /// The whole banner, arrows included, at the heights `main_content`
+    /// actually gets on a short terminal; the rows under the pane are
+    /// the bottom bar's, whose rule is drawn before this and never
+    /// repainted.
+    #[test]
+    fn nothing_including_the_arrows_leaves_the_rect() {
+        for logo in [0, logo_index_for_name(Some("figlet: doh"))] {
+            for h in [0u16, 1, 2, 3, 4, 5, 6, 7, 25] {
+                let area = Rect::new(2, 1, 60, h);
+                let mut buf = buffer(66, 30);
+                Banner {
+                    elapsed: Duration::ZERO,
+                    logo_index: logo,
+                    keymap: &Keymap::default(),
+                }
+                .render(area, &mut buf);
+                assert_outside_untouched(&buf, area);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod eyeball {
+    use super::*;
+    use crate::ui::testbuf::{buffer, grid};
+
+    fn print(label: &str, logo_index: usize, w: u16, h: u16) {
+        // three rows taller than the rect: those rows belong to the
+        // bottom bar, which is where stray paint shows up.
+        let mut buf = buffer(w, h + 3);
+        Banner {
+            elapsed: Duration::ZERO,
+            logo_index,
+            keymap: &Keymap::default(),
+        }
+        .render(Rect::new(0, 0, w, h), &mut buf);
+        println!(
+            "--- {label}: rect {w}x{h} in a {w}x{} buffer\n{}",
+            h + 3,
+            grid(&buf)
+        );
+    }
+
+    /// A 60x7 terminal with the default 4-row bottom bar leaves the
+    /// banner three rows; `figlet: doh` is 50 rows of art, so a 29-row
+    /// terminal centres its block far below the pane:
+    /// `cargo test --lib ui::banner::eyeball -- --nocapture`.
+    /// Asserts the floor too, so it is a test and not just a printer.
+    #[test]
+    fn print_the_banner_at_the_squeezed_heights() {
+        print("default logo", 0, 60, 3);
+        print("default logo", 0, 60, 4);
+        let doh = logo_index_for_name(Some("figlet: doh"));
+        assert_ne!(doh, 0, "figlet: doh is gone, so this case is stale");
+        print("figlet: doh", doh, 90, 25);
+
+        let mut buf = buffer(44, 18);
+        Banner {
+            elapsed: Duration::ZERO,
+            logo_index: 0,
+            keymap: &Keymap::default(),
+        }
+        .render(Rect::new(0, 0, 44, 18), &mut buf);
+        assert!(grid(&buf).contains('<'), "{}", grid(&buf));
     }
 }
