@@ -57,6 +57,10 @@ already carries.
   every song of a 40k-track library costs single-digit MB, less than
   the corpus rows for the same songs. eviction is deliberately absent:
   dropping an entry would silently move a cover's key.
+- **a one-time cover refetch.** every cover already on disk is filed
+  under a name key, so the first play of each album after this change
+  fetches it once more and writes it under the id key. the old files
+  age out through the sweep `coverart::Cache::new` already runs.
 - **a key can sharpen mid-session.** a song restored from a saved
   queue has no index entry until some response mentions it, so its
   cover key is the name form until then and the id form afterwards.
