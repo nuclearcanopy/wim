@@ -10,8 +10,51 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// The one `CoreCtx` literal, as a macro rather than a method: it
+/// borrows most of `Host` plus two locals (`now`, `now_playing`),
+/// and a method cannot return a struct borrowing locals it made.
+/// Same reason `main.rs` keeps its own `core_ctx!`.
+macro_rules! core_ctx {
+    ($h:expr, $now:expr, $np:expr) => {
+        CoreCtx {
+            cfg: &$h.cfg,
+            player: &$h.player,
+            app: &mut $h.app,
+            notifications: &mut $h.notifications,
+            queue: &mut $h.play_queue,
+            previous_track: &mut $h.previous_track,
+            cache: &$h.cache_index,
+            download_tx: &$h.download_tx,
+            downloading: &mut $h.downloading,
+            scrobble: &mut $h.scrobble,
+            subtitle_tx: &$h.subtitle_tx,
+            console: &mut $h.console,
+            now: $now,
+            now_playing: &$np,
+            favorites: &mut $h.favorites,
+            remote_starred: &mut $h.remote_starred,
+            lyrics_client: &$h.lyrics_client,
+            lyrics_loader: &mut $h.lyrics_loader,
+            star_tx: &$h.star_tx,
+            enqueue_resolver: &mut $h.enqueue_resolver,
+            base_volume: &mut $h.base_volume,
+            crossfade_enabled: &mut $h.crossfade_enabled,
+            fade_in_started_at: &mut $h.fade_in_started_at,
+            fade: &mut $h.fade,
+            sleep_due: &mut $h.sleep_due,
+            scan_rx: &mut $h.scan_rx,
+            remote_search_tx: &$h.remote_search_tx,
+            settle: &mut $h.settle,
+            saved_queues: &mut $h.saved_queues,
+            vars: &mut $h.vars,
+            bindings: &mut $h.bindings,
+        }
+    };
+}
+
 use wim::core::{
-    self, drive, CoreCtx, Drive, RemoteSearchOutcome, ScrobbleState, StarFailed, SubtitleReady,
+    self, drive, CoreCtx, Drive, Enqueue, EnqueueResolver, RemoteSearchOutcome, ScrobbleState,
+    StarFailed, SubtitleReady,
 };
 use wim::download::DownloadEvent;
 use wim::notify::Notifications;
@@ -54,6 +97,7 @@ pub struct Host {
     pub remote_starred: HashSet<String>,
     pub lyrics_client: lyrics::Client,
     pub lyrics_loader: lyrics::Loader,
+    pub enqueue_resolver: EnqueueResolver,
     pub star_tx: mpsc::Sender<StarFailed>,
     pub star_rx: mpsc::Receiver<StarFailed>,
     pub base_volume: f64,
@@ -133,6 +177,7 @@ impl Host {
             remote_starred: HashSet::new(),
             lyrics_client: lyrics::Client::new(),
             lyrics_loader: lyrics::Loader::new(),
+            enqueue_resolver: EnqueueResolver::new(),
             star_tx,
             star_rx,
             base_volume,
@@ -177,6 +222,28 @@ impl Host {
     /// Each one is a `try_recv`, so this is the whole reason nothing
     /// in shellswim blocks.
     pub fn pump(&mut self) {
+        // a queue batch resolved; the resolver already dropped any from
+        // a superseded request, which here would append to the queue
+        // rather than merely drawing something stale.
+        while let Some((into, label, tracks)) = self.enqueue_resolver.poll() {
+            let now = self.start.elapsed();
+            let now_playing = self.play_queue.current().cloned();
+            let mut core = core_ctx!(self, now, now_playing);
+            match tracks {
+                Ok(tracks) if tracks.is_empty() => {
+                    core.console.note(format!("nothing to queue in {label}"))
+                }
+                Ok(tracks) => match into {
+                    Enqueue::Back => core::append_resolved(&tracks, &mut core),
+                    Enqueue::Front => match core::front_resolved(&tracks, &mut core) {
+                        Ok(n) => core.console.note(format!("queued {n} tracks next")),
+                        Err(why) => core.console.note(why),
+                    },
+                },
+                Err(why) => core.console.note(why),
+            }
+        }
+
         // the server refused a star, so the optimistic flip goes back.
         while let Ok(failed) = self.star_rx.try_recv() {
             if failed.wanted {
@@ -289,38 +356,7 @@ impl Host {
         let now = self.start.elapsed();
         let now_playing = self.play_queue.current().cloned();
         let mut surf = self.swim.borrowed();
-        let mut core = CoreCtx {
-            cfg: &self.cfg,
-            player: &self.player,
-            app: &mut self.app,
-            notifications: &mut self.notifications,
-            queue: &mut self.play_queue,
-            previous_track: &mut self.previous_track,
-            cache: &self.cache_index,
-            download_tx: &self.download_tx,
-            downloading: &mut self.downloading,
-            scrobble: &mut self.scrobble,
-            subtitle_tx: &self.subtitle_tx,
-            console: &mut self.console,
-            now,
-            now_playing: &now_playing,
-            favorites: &mut self.favorites,
-            remote_starred: &mut self.remote_starred,
-            lyrics_client: &self.lyrics_client,
-            lyrics_loader: &mut self.lyrics_loader,
-            star_tx: &self.star_tx,
-            base_volume: &mut self.base_volume,
-            crossfade_enabled: &mut self.crossfade_enabled,
-            fade_in_started_at: &mut self.fade_in_started_at,
-            fade: &mut self.fade,
-            sleep_due: &mut self.sleep_due,
-            scan_rx: &mut self.scan_rx,
-            remote_search_tx: &self.remote_search_tx,
-            settle: &mut self.settle,
-            saved_queues: &mut self.saved_queues,
-            vars: &mut self.vars,
-            bindings: &mut self.bindings,
-        };
+        let mut core = core_ctx!(self, now, now_playing);
         let outcome = drive(program, &mut core, &mut surf, |c| c.settle.settled(c.now));
         if outcome != Drive::Await {
             self.program = None;

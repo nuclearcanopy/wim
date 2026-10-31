@@ -4,6 +4,7 @@
 //! docs/library-seam.md before moving anything across that line.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -60,6 +61,171 @@ pub fn resolve_playable(item: &SearchItem, cache: &Arc<Mutex<CacheIndex>>) -> Op
 /// means playing/queuing every (actual, see `artist_tracks`) song,
 /// not the entity itself. Local items and remote songs are already
 /// exactly one track, so they pass through unchanged.
+/// Where a resolved batch goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enqueue {
+    /// Appended, which is what the queue key does.
+    Back,
+    /// Inserted directly behind what is playing
+    /// (`add_to_queue(front, ...)`).
+    Front,
+}
+
+/// What `EnqueueResolver::request` could answer with.
+pub enum Resolution {
+    /// No round trip was needed, so the caller acts now. A local file
+    /// or a single song is already its own track list, and making the
+    /// commonest action wait a frame for a thread would be a
+    /// regression dressed as a fix.
+    Ready(Vec<SearchItem>),
+    /// A fetch is running; the label is what to tell the user it is
+    /// waiting on. The batch arrives through `poll`.
+    Fetching(String),
+}
+
+/// Resolves an album, artist or playlist into tracks off-thread, for
+/// queueing.
+///
+/// `resolve_tracks` is a network call, and queueing used to make it on
+/// the input path. For an album that is one `getAlbum`; **for an artist
+/// it is a `getArtist` plus a `getAlbum` per album**, so pressing the
+/// queue key on a prolific artist froze the whole ui for the length of
+/// that fan-out.
+///
+/// Same generation guard as `browse::Loader` and `lyrics::Loader`:
+/// bumped per request and on `invalidate`, checked by the worker before
+/// it sends and again in `poll`, so a batch the user has moved on from
+/// is dropped rather than landing in the queue behind their back. That
+/// last part matters more here than elsewhere: a late arrival does not
+/// just draw something stale, it *mutates the queue*.
+pub struct EnqueueResolver {
+    generation: Arc<AtomicU64>,
+    tx: mpsc::Sender<ResolvedBatch>,
+    rx: mpsc::Receiver<ResolvedBatch>,
+}
+
+struct ResolvedBatch {
+    generation: u64,
+    into: Enqueue,
+    label: String,
+    tracks: Result<Vec<SearchItem>, String>,
+}
+
+impl Default for EnqueueResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EnqueueResolver {
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        EnqueueResolver {
+            generation: Arc::new(AtomicU64::new(0)),
+            tx,
+            rx,
+        }
+    }
+
+    /// Resolves `item` for `into`, instantly where no request is
+    /// needed.
+    pub fn request(&mut self, item: &SearchItem, into: Enqueue) -> Resolution {
+        if matches!(
+            item,
+            SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } | SearchItem::Song { .. }
+        ) {
+            // `resolve_tracks` cannot fail for these, but it owns the
+            // rule about what they resolve to, so it stays the one
+            // place that says so.
+            return Resolution::Ready(resolve_tracks(item).unwrap_or_else(|_| vec![item.clone()]));
+        }
+        let label = item.primary_name().to_string();
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let (item, tx, shared) = (item.clone(), self.tx.clone(), Arc::clone(&self.generation));
+        let sent = label.clone();
+        thread::spawn(move || {
+            let tracks = resolve_tracks(&item);
+            if shared.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let _ = tx.send(ResolvedBatch {
+                generation,
+                into,
+                label: sent,
+                tracks,
+            });
+        });
+        Resolution::Fetching(label)
+    }
+
+    /// Disowns anything in flight. Called when the queue is cleared or
+    /// replaced, so a batch requested against the old queue cannot
+    /// append itself to the new one.
+    pub fn invalidate(&mut self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The next batch belonging to the current request, if one landed.
+    pub fn poll(&mut self) -> Option<(Enqueue, String, Result<Vec<SearchItem>, String>)> {
+        let current = self.generation.load(Ordering::SeqCst);
+        loop {
+            match self.rx.try_recv() {
+                Ok(batch) if batch.generation != current => continue,
+                Ok(batch) => return Some((batch.into, batch.label, batch.tracks)),
+                Err(_) => return None,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn deliver(&self, generation: u64, into: Enqueue, tracks: Vec<SearchItem>) {
+        let _ = self.tx.send(ResolvedBatch {
+            generation,
+            into,
+            label: "test".into(),
+            tracks: Ok(tracks),
+        });
+    }
+
+    #[cfg(test)]
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+}
+
+/// Appends a resolved batch and says how many. Shared by the queue
+/// key's instant path and the drain that handles a fetched one, so the
+/// two cannot report differently.
+pub fn append_resolved(tracks: &[SearchItem], core: &mut CoreCtx) {
+    for t in tracks {
+        let s = enqueue_track(core.player, t, core.cache, core.queue, core.app.shuffle);
+        if s.starts_with("error") {
+            core.notifications.push(Severity::Error, s);
+        }
+    }
+    let n = tracks.len();
+    core.notifications.push(
+        Severity::Info,
+        if n == 1 {
+            "queued 1 track".to_string()
+        } else {
+            format!("queued {n} tracks")
+        },
+    );
+}
+
+/// Inserts a resolved batch directly behind what is playing.
+///
+/// Reversed so the batch keeps its own order: each track goes in right
+/// after the current one, so inserting them front-to-back would play
+/// them backwards.
+pub fn front_resolved(tracks: &[SearchItem], core: &mut CoreCtx) -> Result<usize, String> {
+    for track in tracks.iter().rev() {
+        enqueue_next(track, core)?;
+    }
+    Ok(tracks.len())
+}
+
 pub fn resolve_tracks(item: &SearchItem) -> Result<Vec<SearchItem>, String> {
     match item {
         SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } | SearchItem::Song { .. } => {
@@ -1095,6 +1261,9 @@ pub struct CoreCtx<'a> {
     /// Where a refused star reports back, so the optimistic flip can
     /// be undone; drained by each binary's own per-frame drain.
     pub star_tx: &'a mpsc::Sender<StarFailed>,
+    /// Resolves an album or artist into tracks off the input path; see
+    /// `EnqueueResolver`.
+    pub enqueue_resolver: &'a mut EnqueueResolver,
     // volume, and everything that ramps it.
     pub base_volume: &'a mut f64,
     pub crossfade_enabled: &'a mut bool,
@@ -1188,26 +1357,15 @@ pub fn dispatch_action(action: Action, core: &mut CoreCtx, surf: &mut dyn Surfac
             // queue count on the bottom bar moves, but that's easy to
             // miss), so this is one of the few things worth an actual
             // toast.
-            match resolve_tracks(&item) {
-                Ok(tracks) => {
-                    for t in &tracks {
-                        let s =
-                            enqueue_track(core.player, t, core.cache, core.queue, core.app.shuffle);
-                        if s.starts_with("error") {
-                            core.notifications.push(Severity::Error, s);
-                        }
-                    }
-                    let n = tracks.len();
-                    core.notifications.push(
-                        Severity::Info,
-                        if n == 1 {
-                            "queued 1 track".to_string()
-                        } else {
-                            format!("queued {n} tracks")
-                        },
-                    );
-                }
-                Err(msg) => core.notifications.push(Severity::Error, msg),
+            // an album is one round trip and an artist is a fan-out
+            // over its albums, so this no longer happens on the input
+            // path; a single song still queues instantly, since it
+            // needs no request at all.
+            match core.enqueue_resolver.request(&item, Enqueue::Back) {
+                Resolution::Ready(tracks) => append_resolved(&tracks, core),
+                Resolution::Fetching(label) => core
+                    .notifications
+                    .push(Severity::Info, format!("queueing {label}...")),
             }
         }
         Action::ShuffleToggled(on) => {
@@ -1549,21 +1707,16 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 let dispatch = dispatch_action(Action::Queued(item), core, surf);
                 return (dispatch, Report::Described);
             }
-            let tracks = match resolve_tracks(&item) {
-                Ok(tracks) => tracks,
-                Err(why) => return op_fail(why),
-            };
-            if tracks.is_empty() {
-                return op_fail("nothing to queue (empty album or playlist)");
-            }
-            // reversed so the batch keeps its own order: each one is
-            // inserted directly behind what is playing.
-            for track in tracks.iter().rev() {
-                if let Err(why) = enqueue_next(track, core) {
-                    return op_fail(why);
+            match core.enqueue_resolver.request(&item, Enqueue::Front) {
+                Resolution::Ready(tracks) if tracks.is_empty() => {
+                    op_fail("nothing to queue (empty album or playlist)")
                 }
+                Resolution::Ready(tracks) => match front_resolved(&tracks, core) {
+                    Ok(n) => op_note(format!("queued {n} tracks next")),
+                    Err(why) => op_fail(why),
+                },
+                Resolution::Fetching(label) => op_note(format!("queueing {label} next...")),
             }
-            op_note(format!("queued {} tracks next", tracks.len()))
         }
         Op::Star { target, on } => {
             let Some(item) = shellsong_item(target, core, surf) else {
@@ -2449,6 +2602,7 @@ mod seam_tests {
         remote_starred: HashSet<String>,
         lyrics_client: lyrics::Client,
         lyrics_loader: lyrics::Loader,
+        enqueue_resolver: EnqueueResolver,
         star_tx: mpsc::Sender<StarFailed>,
         _star_rx: mpsc::Receiver<StarFailed>,
         base_volume: f64,
@@ -2492,6 +2646,7 @@ mod seam_tests {
                 remote_starred: HashSet::new(),
                 lyrics_client: lyrics::Client::new(),
                 lyrics_loader: lyrics::Loader::new(),
+                enqueue_resolver: EnqueueResolver::new(),
                 star_tx,
                 _star_rx: star_rx,
                 base_volume: 100.0,
@@ -2531,6 +2686,7 @@ mod seam_tests {
                 lyrics_client: &self.lyrics_client,
                 lyrics_loader: &mut self.lyrics_loader,
                 star_tx: &self.star_tx,
+                enqueue_resolver: &mut self.enqueue_resolver,
                 base_volume: &mut self.base_volume,
                 crossfade_enabled: &mut self.crossfade_enabled,
                 fade_in_started_at: &mut self.fade_in_started_at,
@@ -2633,5 +2789,112 @@ mod seam_tests {
             client: crate::browse::tests::test_client(),
         };
         assert!(toggle_star(&item, &mut favorites, &mut starred, &star_tx).is_err());
+    }
+
+    // ------------------------------------------- the enqueue resolver
+
+    /// The commonest action must not pay a frame for a thread: a
+    /// single song is already its own track list, so it resolves
+    /// instantly and the caller queues it in the same keypress.
+    #[test]
+    fn a_single_song_resolves_without_a_request() {
+        let mut r = EnqueueResolver::new();
+        let song = test_songs(1).remove(0);
+        match r.request(&song, Enqueue::Back) {
+            Resolution::Ready(tracks) => assert_eq!(tracks.len(), 1),
+            Resolution::Fetching(_) => panic!("a song needs no round trip"),
+        }
+    }
+
+    #[test]
+    fn a_local_file_resolves_without_a_request() {
+        let mut r = EnqueueResolver::new();
+        let item = crate::search::SearchItem::LocalMusic {
+            path: std::path::PathBuf::from("/music/a.flac"),
+            title: "a".into(),
+            artist: None,
+            album: None,
+        };
+        assert!(matches!(
+            r.request(&item, Enqueue::Back),
+            Resolution::Ready(_)
+        ));
+    }
+
+    /// An album needs a round trip, so the keypress returns at once
+    /// with something to say rather than blocking on it.
+    #[test]
+    fn an_album_is_fetched_and_names_what_it_is_waiting_on() {
+        let mut r = EnqueueResolver::new();
+        let album = crate::search::SearchItem::Album {
+            id: "al1".into(),
+            name: "crest".into(),
+            artist: "bladee".into(),
+            client: crate::browse::tests::test_client(),
+        };
+        match r.request(&album, Enqueue::Back) {
+            Resolution::Fetching(label) => assert_eq!(label, "crest"),
+            Resolution::Ready(_) => panic!("an album is a round trip"),
+        }
+    }
+
+    /// The guard that matters most here. Elsewhere a stale reply draws
+    /// something out of date; a stale batch would **mutate the queue**,
+    /// appending tracks the user asked for against a queue that is
+    /// gone.
+    #[test]
+    fn a_batch_from_a_superseded_request_never_arrives() {
+        let mut r = EnqueueResolver::new();
+        let album = crate::search::SearchItem::Album {
+            id: "al1".into(),
+            name: "first".into(),
+            artist: "a".into(),
+            client: crate::browse::tests::test_client(),
+        };
+        r.request(&album, Enqueue::Back);
+        let stale = r.generation();
+        r.request(&album, Enqueue::Back);
+
+        r.deliver(stale, Enqueue::Back, test_songs(3));
+        assert!(
+            r.poll().is_none(),
+            "a batch for a superseded request would append to the queue"
+        );
+    }
+
+    /// Clearing or replacing the queue has to disown anything in
+    /// flight, or a batch requested against the old queue lands in the
+    /// new one.
+    #[test]
+    fn invalidate_disowns_a_batch_in_flight() {
+        let mut r = EnqueueResolver::new();
+        let album = crate::search::SearchItem::Album {
+            id: "al1".into(),
+            name: "x".into(),
+            artist: "a".into(),
+            client: crate::browse::tests::test_client(),
+        };
+        r.request(&album, Enqueue::Back);
+        let gen = r.generation();
+        r.invalidate();
+        r.deliver(gen, Enqueue::Back, test_songs(2));
+        assert!(r.poll().is_none());
+    }
+
+    #[test]
+    fn a_current_batch_arrives_with_its_destination() {
+        let mut r = EnqueueResolver::new();
+        let album = crate::search::SearchItem::Album {
+            id: "al1".into(),
+            name: "x".into(),
+            artist: "a".into(),
+            client: crate::browse::tests::test_client(),
+        };
+        r.request(&album, Enqueue::Front);
+        let gen = r.generation();
+        r.deliver(gen, Enqueue::Front, test_songs(2));
+        let (into, _, tracks) = r.poll().expect("a current batch lands");
+        assert_eq!(into, Enqueue::Front, "it must queue where it was asked to");
+        assert_eq!(tracks.unwrap().len(), 2);
     }
 }
