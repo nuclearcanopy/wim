@@ -2329,7 +2329,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                     // or a batch in flight refills the queue the user
                     // just emptied, seconds after they emptied it.
                     core.track_resolver.invalidate();
-                    core.queue.replace_upcoming(Vec::new());
+                    core.queue.clear_upcoming();
                     if let Some(cursor) = surf.queue_cursor() {
                         *cursor = 0;
                     }
@@ -2342,13 +2342,21 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             // 1-based and descending, so removing one can't reindex
             // the next; the same `remove` + `playlist_remove` pairing
             // the queue view's 'd' uses.
+            // mpv first, then the index map, which is the ordering
+            // `resync_upcoming` documents: the other way round, a
+            // refused `playlist-remove` returns with `entries` already
+            // one shorter than mpv's playlist and every later index
+            // off by one, and the cursor clamp below never runs.
             let mut removed = 0;
             for position in &positions {
                 let index = position.saturating_sub(1);
+                if index >= core.queue.entries().len() {
+                    continue;
+                }
+                if let Err(e) = core.player.playlist_remove(index) {
+                    return op_fail(format!("error removing: {e}"));
+                }
                 if core.queue.remove(index) {
-                    if let Err(e) = core.player.playlist_remove(index) {
-                        return op_fail(format!("error removing: {e}"));
-                    }
                     removed += 1;
                 }
             }
