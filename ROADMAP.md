@@ -2029,9 +2029,22 @@ the order below is not a preference, it is a dependency.
       locals, then the draw closure, and only then the input tiers
       (their ordering is load-bearing and heavily commented).
       **the "~3.9k lines" in this entry was stale: it was 6.2k when
-      the decomposition started.** down to 5.0k over five slices.
+      the decomposition started.** down to 4.9k over six slices.
       worth re-measuring rather than trusting, since every feature
       slice adds to it.
+      - [x] **the eq menu's keys and persistence ->
+        `src/eq_menu_keys.rs`** (136 lines). `adjust_eq_band`,
+        `eq_label`, `persist_eq`, `eq_saved_row_hint`,
+        `eq_menu_editor_key`, `eq_commit_name`. the seam is the menu:
+        each one answers a key it owns, names the curve on screen, or
+        writes the live curve back to config.toml. the curve maths is
+        `eq.rs`; this is the menu around it. main.rs 4985 -> 4855.
+        `save_config` moved to `config::save_or_warn` rather than into
+        this module: both main.rs and the eq menu call it, and its
+        home is the thing it saves. that gives `config` a dependency
+        on `notify`, which is fine (notify is a leaf) and is the
+        honest shape -- "persist, and say so if you cannot" is one
+        operation.
       - [x] **terminal graphics capability -> `src/graphics.rs`** (304
         lines). `wants_full_art`, `has_real_protocol`, `real_graphics`,
         `art_mode_for_picker`, `warn_no_graphics`, `protocol_image`,

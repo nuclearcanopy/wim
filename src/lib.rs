@@ -14,6 +14,7 @@ pub mod coverart;
 pub mod download;
 pub mod enrich;
 pub mod eq;
+pub mod eq_menu_keys;
 pub mod favorites;
 pub mod focus;
 pub mod graphics;
