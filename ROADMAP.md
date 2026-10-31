@@ -1670,10 +1670,34 @@ the order below is not a preference, it is a dependency.
         long-planned `Action` variants -- which is still the better
         structure but now buys only this one path, a much weaker case
         than when it was also going to fix the shellsong path.
-      - [ ] **the view is built but not opened by anything.**
-        `ui::undo_tree::UndoTreeView` and `Recorder::rows` are ready;
-        what is missing is a `view(undo)` target and a pane to draw it
-        in.
+      - [x] ~~**the view is built but not opened by anything.**~~
+        **`view(undo)` opens it** (alias `view(tree)`), drawn over the
+        workspace like the eq menu, because a fork is unreadable in a
+        sidebar-sized column. `u`/`r` step, `h`/`l` cross a fork,
+        `esc` closes; `k`/`j` and the arrows are undocumented
+        synonyms. undo and redo go through `apply_op` rather than the
+        recorder directly, so there stays exactly one path that
+        records, refuses at a barrier and reports.
+        opening an empty tree **fails with "nothing has been done
+        yet"** rather than showing a blank frame that reads as broken.
+        `undo_menu_open` joins main.rs's `overlay` flag, which is not
+        only the animation gate: it also feeds `video::wanted`, and
+        without it mpv would have kept drawing a video straight over
+        the modal.
+        **two things the first draft got wrong, both caught by the ux
+        self-check rather than by a test.** it drew a bare frame
+        instead of `draw::overlay`, so the workspace showed through
+        the gaps between branch lines; `overlay` scrims every cell, and
+        `assert_no_bleed_through` now pins it. and it had **no key
+        hint at all**, which for a modal whose verbs are `u`/`r`/`h`/
+        `l` is the definition of undiscoverable. the hint and
+        main.rs's handler read the same `UNDO_KEY`/`REDO_KEY`/
+        `LEFT_KEY`/`RIGHT_KEY` constants, which is the lesson
+        `eq_menu` already recorded: a hint that spells its own letter
+        can otherwise advertise a key nothing acts on.
+        still wants a human at a real terminal for the thing a buffer
+        cannot show: whether a fork is legible at a glance when the
+        tree is twenty nodes deep rather than five.
       - ~~**the tree view**~~ **built: `src/ui/undo_tree.rs`.**
         box-drawing spines (not ascii pipes), the current row plated
         with `anim::selection_bg` like every other selection in the
