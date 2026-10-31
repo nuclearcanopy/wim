@@ -8,15 +8,22 @@
 //! already width-aware; the *drawing* was not, which is the half that
 //! actually shows.
 //!
-//! These advance by `char_cells` and blank the trailing cell of a wide
-//! glyph, so what was underneath cannot show through beside it.
+//! These advance by cluster width and blank the trailing cell of a
+//! wide glyph, so what was underneath cannot show through beside it.
+//!
+//! One *grapheme cluster* per cell, not one char: `set_symbol` takes
+//! the whole cluster, so nfd text and emoji sequences stay joined and
+//! a zero-width codepoint never gets a cell of its own. See
+//! docs/text-measurement.md.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
 use crate::theme::{shade, NEAR_BLACK};
-use crate::ui::textfit::{char_cells, truncate_to_width, width};
+use crate::ui::textfit::{
+    cluster_cells, clusters, one_cell_chars, plain_ascii, truncate_to_width, width,
+};
 
 /// One cell, bounds-checked by `Buffer` itself.
 pub fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: Color) {
@@ -30,9 +37,8 @@ pub fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: Color) {
 /// one past the last cell written. The core of this module; everything
 /// else here is a convenience over it.
 ///
-/// `truncate_to_width` drops a double-width char that would straddle
-/// the budget rather than half-drawing it, so the result is never
-/// wider than asked for.
+/// Drops a double-width cluster that would straddle the budget rather
+/// than half-drawing it, so the result is never wider than asked for.
 pub fn at(buf: &mut Buffer, x: u16, y: u16, text: &str, color: Color, budget: usize) -> u16 {
     at_styled(buf, x, y, text, color, None, budget)
 }
@@ -49,11 +55,46 @@ pub fn at_styled(
     bg: Option<Color>,
     budget: usize,
 ) -> u16 {
+    // one cell per char means nothing in `text` can be wide and nothing
+    // zero, so a char goes in a cell and the cursor steps by one: the
+    // same thing the cluster loop below does, minus the grapheme walk,
+    // which is ~180ns a cluster in this profile. nearly every row in a
+    // frame is this. the one thing it gives up is drawing a flag's two
+    // regional indicators as a single cluster; the column count is the
+    // same either way, and it is what every terminal app does.
+    if plain_ascii(text) || one_cell_chars(text) {
+        let mut cursor = x;
+        for ch in text.chars().take(budget) {
+            if let Some(cell) = buf.cell_mut((cursor, y)) {
+                cell.set_char(ch);
+                cell.set_fg(color);
+                if let Some(bg) = bg {
+                    cell.set_bg(bg);
+                }
+            }
+            cursor = cursor.saturating_add(1);
+        }
+        return cursor;
+    }
+
     let mut cursor = x;
-    for ch in truncate_to_width(text, budget).chars() {
-        let cells = char_cells(ch) as u16;
+    let mut left = budget;
+    for glyph in clusters(text) {
+        let cells = cluster_cells(glyph) as u16;
+        // no cell, no advance: a cursor stepped past a zero-width
+        // cluster lands a column right of where the terminal puts the
+        // rest of the row.
+        if cells == 0 {
+            continue;
+        }
+        // a cluster that would straddle the right edge is dropped
+        // rather than half-drawn, same rule as `truncate_to_width`.
+        if usize::from(cells) > left {
+            break;
+        }
+        left -= usize::from(cells);
         if let Some(cell) = buf.cell_mut((cursor, y)) {
-            cell.set_char(ch);
+            cell.set_symbol(glyph);
             cell.set_fg(color);
             if let Some(bg) = bg {
                 cell.set_bg(bg);
@@ -62,7 +103,7 @@ pub fn at_styled(
         // a wide glyph owns the cell after it; leaving whatever was
         // there visible is how half-overwritten text appears.
         for off in 1..cells {
-            if let Some(cell) = buf.cell_mut((cursor + off, y)) {
+            if let Some(cell) = buf.cell_mut((cursor.saturating_add(off), y)) {
                 cell.set_char(' ');
                 cell.set_fg(color);
                 if let Some(bg) = bg {
@@ -70,7 +111,7 @@ pub fn at_styled(
                 }
             }
         }
-        cursor += cells.max(1);
+        cursor = cursor.saturating_add(cells);
     }
     cursor
 }
@@ -281,6 +322,74 @@ mod tests {
         let end = at(&mut buf, 0, 0, "a日日", shade(NEAR_WHITE), 3);
         assert_eq!(end, 3);
         assert_eq!(row(&buf, 0, 8), "a日 .....", "{}", row(&buf, 0, 8));
+    }
+
+    /// One grapheme cluster, one cell. nfd `é` is two codepoints and
+    /// a keycap three; a per-char cursor gave each of them a cell and
+    /// everything after shifted right of where the terminal draws it.
+    #[test]
+    fn a_cluster_takes_one_cell_however_many_codepoints_it_has() {
+        for (text, end, at_x) in [
+            ("Beyonce\u{301}", 7u16, "e\u{301}"),
+            ("\u{2764}\u{FE0F}x", 3, "x"),
+            ("1\u{FE0F}\u{20E3}x", 3, "x"),
+            ("\u{1100}\u{1161}\u{11A8}x", 3, "x"),
+        ] {
+            let mut buf = buffer(12, 1);
+            let got = at(&mut buf, 0, 0, text, shade(NEAR_WHITE), 12);
+            assert_eq!(got, end, "{text:?} advanced to {got}");
+            let x = end - u16::try_from(width(at_x)).unwrap();
+            assert_eq!(
+                buf.cell((x, 0u16)).unwrap().symbol(),
+                at_x,
+                "{text:?}:\n{}",
+                grid(&buf)
+            );
+        }
+    }
+
+    /// The measured failure: with a border at column 8 and a budget of
+    /// 8, a zero-width codepoint bought a cell and the text ran over
+    /// the border.
+    #[test]
+    fn a_zero_width_codepoint_does_not_buy_a_cell_past_the_budget() {
+        for text in [
+            "\u{2764}\u{FE0F} love song",
+            "1\u{FE0F}\u{20E3} favourites",
+            "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467} mix",
+            "Beyonce\u{301}",
+            "\u{1100}\u{1161}\u{11A8} song",
+        ] {
+            let mut buf = buffer(16, 1);
+            put(&mut buf, 8, 0, '│', shade(NEAR_WHITE));
+            let end = at(&mut buf, 0, 0, text, shade(NEAR_WHITE), 8);
+            assert!(end <= 8, "{text:?} returned {end}:\n{}", grid(&buf));
+            assert_eq!(
+                buf.cell((8u16, 0u16)).unwrap().symbol(),
+                "│",
+                "{text:?} overwrote the border:\n{}",
+                grid(&buf)
+            );
+        }
+    }
+
+    /// A pasted run of combining marks with no base: 70000 codepoints,
+    /// zero cells. Stepping a column each ran the cursor off the end of
+    /// a `u16`, which wraps in release (`[profile.release]` sets no
+    /// `overflow-checks`) and panics here.
+    #[test]
+    fn a_baseless_combining_run_paints_nothing() {
+        let mut buf = buffer(8, 1);
+        let end = at(
+            &mut buf,
+            0,
+            0,
+            &"\u{301}".repeat(70_000),
+            shade(NEAR_WHITE),
+            8,
+        );
+        assert_eq!(end, 0);
+        assert_eq!(row(&buf, 0, 8), "........");
     }
 
     #[test]
