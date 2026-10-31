@@ -1114,7 +1114,15 @@ pub fn enqueue_track(
     }
     let appended = queue.append(item.clone(), shuffle);
     if let Some(to) = appended.moved_to {
-        let _ = player.playlist_move(appended.appended_at, to);
+        // the shuffle slot was already taken locally, so a refused
+        // move has to be put back: `entries` and mpv's playlist agree
+        // by index, and one disagreement makes every later operation
+        // address the wrong track. this used to be fire and forget,
+        // which broke the invariant permanently and said nothing.
+        if let Err(e) = player.playlist_move(appended.appended_at, to) {
+            queue.move_entry(to, appended.appended_at);
+            return format!("queued {}, but could not shuffle it in: {e}", label(item));
+        }
     }
     format!("queued: {}", label(item))
 }
@@ -2505,7 +2513,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
         Op::Define { name, terms } => {
             let count = terms.len();
             let replaced = core.vars.define(&name, terms);
-            shellsong_host::save_vars(core.vars);
+            shellsong_host::save_vars_or_warn(core.vars, core.notifications);
             let verb = if replaced { "redefined" } else { "defined" };
             op_note(format!("{verb} {name}: {count} terms"))
         }
@@ -2513,7 +2521,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             if !core.vars.remove(&name) {
                 return op_fail(namehint::unknown("variable", &name, core.vars.names()));
             }
-            shellsong_host::save_vars(core.vars);
+            shellsong_host::save_vars_or_warn(core.vars, core.notifications);
             op_note(format!("unset {name}"))
         }
         Op::Remember { tier, setting } => {
@@ -2534,7 +2542,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 tier.label()
             );
             core.bindings.remember(tier, &name, &setting);
-            shellsong_host::save_bindings(core.bindings);
+            shellsong_host::save_bindings_or_warn(core.bindings, core.notifications);
             // applied now as well as remembered, through the same arm
             // the typed command goes through, so remembering a setting
             // and setting it cannot drift.
@@ -2559,7 +2567,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                     None => format!("nothing was remembered for {} '{name}'", tier.label()),
                 });
             }
-            shellsong_host::save_bindings(core.bindings);
+            shellsong_host::save_bindings_or_warn(core.bindings, core.notifications);
             op_note(match setting {
                 Some(kind) => format!("forgot {} for {} '{name}'", kind.label(), tier.label()),
                 None => format!("forgot everything for {} '{name}'", tier.label()),

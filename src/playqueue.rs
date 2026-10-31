@@ -483,6 +483,56 @@ mod tests {
     /// relays the *same* session out again. so with loop-all on, the
     /// tracks the user had just deleted came back the moment the
     /// current one ended.
+    /// Reversing a shuffle insert restores the queue exactly.
+    ///
+    /// `enqueue_track` appends, lets `append` pick a shuffle slot, and
+    /// only then asks mpv to make the same move. that ask can be
+    /// refused, and it used to be fire and forget: `entries` and mpv's
+    /// playlist agree by *index*, so one silent disagreement makes
+    /// every later remove, move and jump address the wrong track, with
+    /// no message. the recovery is this move, so it has to be exact
+    /// including the play position.
+    #[test]
+    fn reversing_a_shuffle_insert_restores_the_queue() {
+        for pos in [0i64, 1, 2] {
+            let mut q = queue_of(&["a", "b", "c", "d"]);
+            // not asserted on: a fresh queue already sits at 0, so
+            // `set_pos(0)` is `Unchanged` and only the later positions
+            // report `Advanced`. what matters here is where it lands.
+            let _ = q.set_pos(pos);
+            let before = titles(q.entries());
+            let playing = q.current().cloned();
+            assert_eq!(
+                playing.as_ref().map(|i| i.primary_name()),
+                Some(before[pos as usize].as_str()),
+                "set_pos({pos}) did not land where the test assumes"
+            );
+
+            let appended = q.append(song("late"), true);
+            let Some(to) = appended.moved_to else {
+                // nowhere else for it to go at this position, so there
+                // is nothing to reverse.
+                continue;
+            };
+            let mut expected = before.clone();
+            expected.push("late".to_string());
+            assert_ne!(
+                titles(q.entries()),
+                expected,
+                "the shuffle did move it, so there is something to undo"
+            );
+
+            assert!(q.move_entry(to, appended.appended_at), "the reversal ran");
+
+            assert_eq!(titles(q.entries()), expected, "order at pos {pos}");
+            assert_eq!(
+                q.current().map(|i| i.primary_name().to_string()),
+                playing.map(|i| i.primary_name().to_string()),
+                "the playing track moved at pos {pos}"
+            );
+        }
+    }
+
     #[test]
     fn clearing_the_queue_takes_those_tracks_out_of_the_session() {
         let mut q = queue_of(&["a", "b", "c"]);
