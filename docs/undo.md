@@ -133,27 +133,33 @@ wrong; each would make undo worse.
   restoring the live value captures a ramp artefact as if it were a
   decision. Same reasoning as `track_started`'s restore point.
 
-**`mute` is in, and it is the one ipc read `capture` makes.** It has no
-host-side mirror: `Op::Mute` is a single `set_property` and mpv is the
-only place the state lives, so capturing it means a blocking
-`get_property`. That read is what `paused` and the live volume were
-refused on, and the difference is that mute cannot drift: `mute()` and
-`unmute()` are its only mutation and both are recorded ops, so one read
-per recorded op (not per frame) buys a value that is always the one the
-user chose. The cost is one round trip, which `src/mpv.rs` puts at
-~2ms and `Mpv::command` bounds with `REPLY_TIMEOUT`, so a wedged mpv
-costs the timeout once and not a hang. It is an `Option<bool>`, so a
-read mpv would not answer leaves the restore alone rather than guessing
-"unmuted" and unmuting.
-A host-side `muted` mirror on `CoreCtx` would remove the read
-entirely and is the better shape if anything else ever needs the
-state; it is a core.rs change, so it is not done here.
+**`mute` is in, and `capture` now asks mpv for nothing at all.** It
+used to be the one ipc read: `Op::Mute` is a single `set_property` and
+mpv was the only place the state lived, so capturing it meant a
+blocking `get_property` on the *input* path, once per recorded op. It
+was allowed where `paused` and the live volume were refused because
+mute cannot drift (`mute()` and `unmute()` are its only mutation and
+both are recorded ops), but it was still a round trip.
 
-Unrelated and worth writing down somewhere: **there is no mute
-indicator anywhere in the ui.** `mute` appears in no widget, so muted
-and "volume is at zero for some other reason" are indistinguishable on
-screen, and undoing a mute has no visible confirmation beyond the
-sound coming back.
+`mpv::PROP_MUTE` is observed now, which the mute indicator needed
+anyway, so `CoreCtx::muted` is that mirror and `capture` is pure. The
+mirror is also **less racy than the read was**: a snapshot is taken
+before its op is applied, and the mirror still holds the pre-op value,
+where a `get_property` issued after the apply could come back with the
+post-op one. `capturing_a_snapshot_makes_no_ipc_call` reads the source
+to keep it that way, the same technique `track_started` uses, because
+`CoreCtx` holds a live handle and a test cannot count its round trips.
+
+It stays an `Option<bool>` rather than a `bool`: the field predates the
+mirror, and `None` still means "do not touch mute on restore", which a
+snapshot taken before the first property event legitimately wants.
+
+**The mute indicator exists now** (`ui/controlsbar.rs`, `○` audible and
+`⊘` muted, second in priority after the transport so a narrow bar never
+drops the glyph that answers "why is there no sound"). Before it, muted
+and "volume is at zero for some other reason" were indistinguishable on
+screen, and undoing a mute had no visible confirmation beyond the sound
+coming back.
 
 The snapshot is the state **after** the op applied, and the root holds
 the state the session started in.
