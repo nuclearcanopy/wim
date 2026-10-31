@@ -109,6 +109,15 @@ pub struct Config {
     pub crossfade_enabled: bool,
     #[serde(default = "default_crossfade_seconds")]
     pub crossfade_seconds: f64,
+    /// Seconds of silence between tracks; 0 (the default) is mpv's own
+    /// gapless advance, untouched.
+    ///
+    /// Not implemented by putting a silence entry between every track:
+    /// that doubles the queue's length and makes every index the user
+    /// sees wrong. mpv holds at the end of each file instead and wim
+    /// waits out the gap before advancing; see `core::BetweenTracks`.
+    #[serde(default)]
+    pub gap_seconds: f64,
     #[serde(default)]
     pub subtitles: SubtitleConfig,
     /// Neither set (the default): opensubtitles auto-fetch never runs.
@@ -357,6 +366,7 @@ impl Default for Config {
             library_paths: Vec::new(),
             crossfade_enabled: false,
             crossfade_seconds: default_crossfade_seconds(),
+            gap_seconds: 0.0,
             subtitles: SubtitleConfig::default(),
             opensubtitles_api_key: None,
             opensubtitles_api_key_file: None,
