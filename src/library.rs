@@ -49,7 +49,7 @@ pub struct LocalTrack {
     pub kind: MediaKind,
 }
 
-pub(crate) fn classify(ext: &str) -> Option<MediaKind> {
+pub fn classify(ext: &str) -> Option<MediaKind> {
     let ext = ext.to_ascii_lowercase();
     if MUSIC_EXTENSIONS.contains(&ext.as_str()) {
         Some(MediaKind::Music)
