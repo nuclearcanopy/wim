@@ -1514,7 +1514,10 @@ earlier) removes that for alacritty; elsewhere it still races.
 Two features the maintainer asked for that share one prerequisite, so
 the order below is not a preference, it is a dependency.
 
-- [ ] **`shellswim`: a second binary that is just the shell.** the
+- [x] **`shellswim`: a second binary that is just the shell** --
+      shipped; `src/lib.rs` plus `src/core.rs` are the seam and
+      `src/bin/shellswim/{main,host,surface,cli}.rs` the front-end, so
+      the "what is missing" below is history now. the
       maintainer's shape: no panes, no sidebar, no results list. a
       full-screen shellsong console with **only the bottom bar** kept,
       showing the track and its scrubber:
@@ -1577,6 +1580,56 @@ the order below is not a preference, it is a dependency.
       - the tree view is a real layout problem (branch glyphs,
         timestamps, labels from `describe()`), and it is the part most
         likely to end up barebones; it deserves the ux self-check.
+      **the tree itself is built: `src/undo.rs`.** generic over the
+      snapshot (`Tree<S>`), deliberately, so none of the semantics
+      depend on what wim's undoable state turns out to be; that type
+      gets defined when this is wired, where it can be built from a
+      real `CoreCtx` instead of guessed at. 18 tests.
+      **two corrections to docs/undo.md, both found by writing the
+      code rather than reading it again.**
+      the doc specified the snapshot as the state *before* the op.
+      that works for undo alone and **leaves redo with nothing to
+      restore**, because the state after an op is recorded nowhere; a
+      tree whose redo cannot move is a stack with extra steps. they
+      are after-states now, the root holds the session's starting
+      state, and undo/redo are symmetric (parent's snapshot /
+      child's).
+      that inverted the coalescing rule too. the doc said keep the
+      *first* snapshot of a run "since that is the state the user
+      wants back"; correct, and with after-states that state is the
+      *parent's*, which coalescing never touches. so a run keeps its
+      **latest** snapshot, or redo drops you back into the middle of a
+      volume walk.
+      two coalescing rules that were not in the design at all, both
+      found by testing: it must not fold into a node that already has
+      **children** (that silently rewrites a state redo can reach),
+      and a **barrier never coalesces**, since undo has to name the
+      one irreversible effect it stopped at.
+      `classify` is an exhaustive match over all 44 ops, so a new op
+      cannot be added without being filed into one of the three
+      classes. the six ops added since the design was written are
+      filed; `Define`/`Unset`/`Remember`/`Forget` are deliberately
+      **class 1, not barriers**, because they are wim's own state
+      rather than an artifact the user now has, so restoring and
+      re-writing leaves nothing behind. the price is that the snapshot
+      must carry vars and bindings.
+- [ ] **wiring the undo tree**, which is what is left and is the
+      larger half. two pieces:
+      - **the `Snapshot` type and where it is taken.** the recorded
+        plan is still to give the direct op arms `Action` variants so
+        there is one choke point by construction. that was costed as
+        "cheapest during the library split"; **the split has landed
+        and it was not done**, so that window is closed and the
+        re-entrance-guard alternative (record at the outermost entry,
+        one depth counter) is worth re-pricing against it rather than
+        inheriting the earlier verdict. current measurement: 44 `Op`
+        variants, 47 arms in `core::run_op`, 12 `dispatch_action`
+        call sites.
+      - **the tree view**, which `Tree::rows` already feeds: depth,
+        label, age, current marker, and a fork count per node. the ux
+        self-check applies hardest here, and the monochrome rule means
+        brightness carries the hierarchy (current brightest, ancestors
+        mid, other branches dim) since there is no colour to spend.
 
 - [ ] **decompose main.rs** (~3.9k lines). a reviewed, ordered plan
       exists: extract focus/InputMode, then the playback free functions,
