@@ -673,10 +673,12 @@ impl Catalog {
         songs: &[Song],
         client: &Arc<Client>,
     ) {
-        // no album id here: the host fetched for a row it knows by
-        // name (`album_targets`), so this resolves through the name
-        // index to whatever slot that row's id already built.
-        let slot = self.album_slot(None, album_artist, album_name);
+        // the host fetched by album id (`AlbumTarget::id`) but passes
+        // the names, so the id comes back off the tracks: it lands on
+        // the exact record fetched rather than on whichever
+        // same-titled sibling holds the name index.
+        let id = songs.first().and_then(|s| client.album_of_song(&s.id));
+        let slot = self.album_slot(id.as_deref(), album_artist, album_name);
         self.albums[slot].track_total = Some(songs.len());
         self.albums[slot].asked = true;
         for (position, song) in songs.iter().enumerate() {
@@ -698,6 +700,10 @@ impl Catalog {
     /// Records that a tracklist fetch was attempted and produced
     /// nothing usable, so `album_targets` stops offering it. Without
     /// this a server that 404s one album re-offers it forever.
+    /// Names only, deliberately: this is the empty-tracklist case, so
+    /// there is no song to read an album id off. Between two
+    /// same-titled records it marks whichever holds the name index,
+    /// and the other is re-offered once more.
     pub fn mark_album_asked(&mut self, album_artist: &str, album_name: &str) {
         let slot = self.album_slot(None, album_artist, album_name);
         self.albums[slot].asked = true;
@@ -3440,6 +3446,33 @@ mod tests {
             catalog.by_artist["crisis"], catalog.by_artist_id["ar-1"],
             "the first row keeps the name"
         );
+    }
+
+    /// A tracklist must land on the record it was fetched for, which
+    /// between two same-titled albums by one artist the names cannot
+    /// say; the songs that came back carry the album id, so it can.
+    #[test]
+    fn a_tracklist_lands_on_the_same_titled_record_it_was_fetched_for() {
+        let client = client_for("twinfetch");
+        client.remember_song("t-1", "al-2024", "ar-1");
+        let mut catalog = Catalog::new();
+        catalog.ingest_item(&album_item_on(&client, "al-1994", "Crest", "Bladee"));
+        catalog.ingest_item(&album_item_on(&client, "al-2024", "Crest", "Bladee"));
+        catalog.ingest_album(
+            "Bladee",
+            "Crest",
+            &[song("t-1", "Drama", "Bladee", "Crest", &[])],
+            &client,
+        );
+
+        let reissue = catalog.by_album_id["al-2024"];
+        let original = catalog.by_album_id["al-1994"];
+        assert_eq!(catalog.albums[reissue].track_total, Some(1));
+        assert_eq!(
+            catalog.albums[original].track_total, None,
+            "the tracklist landed on the wrong pressing"
+        );
+        assert_eq!(catalog.albums[reissue].tracks, vec![0]);
     }
 
     /// A compilation's tracks each carry their own artist, so by name
