@@ -47,23 +47,29 @@ const SAMPLES_Y: u32 = 2;
 /// All of these live in Unicode's Block Elements (U+2580..U+259F), the
 /// same block as the half-block this used to draw with, so a font that
 /// could render the old output can render this.
-const QUADRANTS: [char; 16] = [
-    '\u{2588}', // 0000 all background, drawn as a solid in the bg shade
-    '\u{2598}', // 0001 upper left
-    '\u{259d}', // 0010 upper right
-    HALF_BLOCK, // 0011 upper half, the glyph this used to draw with
-    '\u{2596}', // 0100 lower left
-    '\u{258c}', // 0101 left half
-    '\u{259e}', // 0110 upper right + lower left
-    '\u{259b}', // 0111 all but lower right
-    '\u{2597}', // 1000 lower right
-    '\u{259a}', // 1001 upper left + lower right
-    '\u{2590}', // 1010 right half
-    '\u{259c}', // 1011 all but lower left
-    '\u{2584}', // 1100 lower half
-    '\u{2599}', // 1101 all but upper right
-    '\u{259f}', // 1110 all but upper left
-    '\u{2588}', // 1111 full block
+///
+/// Already-encoded `&str` rather than `char`, because `paint` hands
+/// them to `Cell::set_symbol`: `set_char` re-encodes to utf-8 per
+/// cell, and the glyph write is a third of the per-cell cost (see
+/// `probe_paint_floor`). `every_quadrant_is_one_block_glyph` keeps the
+/// table honest.
+const QUADRANTS: [&str; 16] = [
+    "\u{2588}", // 0000 all background, drawn as a solid in the bg shade
+    "\u{2598}", // 0001 upper left
+    "\u{259d}", // 0010 upper right
+    "\u{2580}", // 0011 upper half, the glyph this used to draw with
+    "\u{2596}", // 0100 lower left
+    "\u{258c}", // 0101 left half
+    "\u{259e}", // 0110 upper right + lower left
+    "\u{259b}", // 0111 all but lower right
+    "\u{2597}", // 1000 lower right
+    "\u{259a}", // 1001 upper left + lower right
+    "\u{2590}", // 1010 right half
+    "\u{259c}", // 1011 all but lower left
+    "\u{2584}", // 1100 lower half
+    "\u{2599}", // 1101 all but upper right
+    "\u{259f}", // 1110 all but upper left
+    "\u{2588}", // 1111 full block
 ];
 
 /// Sharpen strength at `SHARPEN_REF_SPAN` samples across, scaled
@@ -197,9 +203,6 @@ pub struct Raster {
     /// Source byte offset-within-row per (output column, tap), built
     /// once per `sample` so the inner loop is a read and an add.
     xs: Vec<u32>,
-    /// One output row's running sums, so the source is walked row by
-    /// row instead of re-entered per output sample.
-    acc: Vec<u32>,
     /// The pre-sharpen grid, so the pass reads neighbours that have
     /// not already been rewritten. Reused, like every other buffer
     /// here, so a frame still allocates nothing.
@@ -323,13 +326,12 @@ impl Raster {
 
     fn fill(&mut self, px: &Pixels, cell_aspect: f32, style: Style) {
         // field-wise borrows: the inner loop reads `xs` while writing
-        // `acc`, which it cannot do through `self`.
+        // `luma`, which it cannot do through `self`.
         let Self {
             luma,
             cols,
             rows,
             xs,
-            acc,
             rgb,
             ..
         } = self;
@@ -358,70 +360,66 @@ impl Raster {
             }
         }
 
-        acc.clear();
-        // three slots per output sample in colour, one in mono.
-        acc.resize(ow as usize * if colour { 3 } else { 1 }, 0);
         let count = taps_x * taps_y;
         let taps_x = taps_x as usize;
 
         for oy in 0..oh {
             let (s0, s1) = span(oy, oh, px.h);
-            acc.fill(0);
-            for t in 0..taps_y {
-                let y = (s0 + (s1 - s0) * t / taps_y).min(px.h - 1);
-                // the row as one slice and the taps as fixed-size
-                // chunks, so the whole inner loop carries one bounds
-                // check per tap instead of one per channel, and the
-                // gray/colour branch is hoisted out of it entirely.
-                let row = &px.data[y as usize * px.stride..][..px.stride];
-                let taps = xs.chunks_exact(taps_x);
-                if colour {
-                    for (slot, taps) in acc.as_chunks_mut::<3>().0.iter_mut().zip(taps) {
-                        for &dx in taps {
-                            let p = &row[dx as usize..dx as usize + 3];
-                            slot[0] += p[0] as u32;
-                            slot[1] += p[1] as u32;
-                            slot[2] += p[2] as u32;
-                        }
-                    }
-                } else if px.gray {
-                    for (slot, taps) in acc.iter_mut().zip(taps) {
-                        for &dx in taps {
-                            *slot += row[dx as usize] as u32;
-                        }
-                    }
-                } else {
-                    for (slot, taps) in acc.iter_mut().zip(taps) {
-                        for &dx in taps {
-                            *slot += rgb_luma(&row[dx as usize..dx as usize + 3]);
-                        }
-                    }
-                }
+            // the source rows this output row averages, resolved once
+            // as slices. summing per output sample rather than per
+            // source row keeps the accumulator in registers; the old
+            // shape read-modify-wrote a `Vec` slot per tap, and that
+            // dependency through memory was most of a tap's cost.
+            let mut rows: [&[u8]; MAX_TAPS as usize] = [&[]; MAX_TAPS as usize];
+            for (t, slot) in rows.iter_mut().enumerate().take(taps_y as usize) {
+                let y = (s0 + (s1 - s0) * t as u32 / taps_y).min(px.h - 1);
+                *slot = &px.data[y as usize * px.stride..][..px.stride];
             }
+            let rows = &rows[..taps_y as usize];
             let base = (off_y + oy) as usize * grid_w as usize + off_x as usize;
             if colour {
-                // luma derived from the averaged rgb rather than
-                // accumulated beside it: `rgb_luma` is linear in the
-                // channels, so this is the same number the mono path
-                // computes, and the two grids cannot disagree.
-                for (ox, c) in acc.as_chunks::<3>().0.iter().enumerate() {
+                for (ox, taps) in xs.chunks_exact(taps_x).enumerate() {
+                    let mut s = [0u32; 3];
+                    for row in rows {
+                        for &dx in taps {
+                            let p = &row[dx as usize..dx as usize + 3];
+                            s[0] += p[0] as u32;
+                            s[1] += p[1] as u32;
+                            s[2] += p[2] as u32;
+                        }
+                    }
+                    // luma derived from the averaged rgb rather than
+                    // accumulated beside it: `rgb_luma` is linear in
+                    // the channels, so this is the same number the
+                    // mono path computes, and the two grids cannot
+                    // disagree.
                     let p = [
-                        (c[0] / count) as u8,
-                        (c[1] / count) as u8,
-                        (c[2] / count) as u8,
+                        div_taps(s[0], count) as u8,
+                        div_taps(s[1], count) as u8,
+                        div_taps(s[2], count) as u8,
                     ];
                     rgb[base + ox] = p;
                     luma[base + ox] = rgb_luma(&p) as u8;
                 }
-            } else {
-                for (ox, &sum) in acc.iter().enumerate() {
-                    let v = (sum / count) as u8;
-                    luma[base + ox] = v;
-                    // a grey source asked for in colour: the grid
-                    // still has to be filled, with the grey itself.
-                    if let Some(slot) = rgb.get_mut(base + ox) {
-                        *slot = [v; 3];
+            } else if px.gray {
+                for (ox, taps) in xs.chunks_exact(taps_x).enumerate() {
+                    let mut s = 0u32;
+                    for row in rows {
+                        for &dx in taps {
+                            s += row[dx as usize] as u32;
+                        }
                     }
+                    write_luma(luma, rgb, base + ox, div_taps(s, count) as u8);
+                }
+            } else {
+                for (ox, taps) in xs.chunks_exact(taps_x).enumerate() {
+                    let mut s = 0u32;
+                    for row in rows {
+                        for &dx in taps {
+                            s += rgb_luma(&row[dx as usize..dx as usize + 3]);
+                        }
+                    }
+                    write_luma(luma, rgb, base + ox, div_taps(s, count) as u8);
                 }
             }
         }
@@ -452,38 +450,44 @@ impl Raster {
             let top = cell_row * 2 * grid_w;
             let bottom = top + grid_w;
             let start = (y - buf.area.y) as usize * buf_w + (vis.x - buf.area.x) as usize;
-            let row = &mut buf.content[start..start + vis.width as usize];
-            for (i, cell) in row.iter_mut().enumerate() {
-                let col = first_col + i;
-                if col >= self.cols as usize {
-                    break;
-                }
-                // the cell's four samples, clockwise from upper left.
-                let gx = col * 2;
-                let q = [
-                    self.luma[top + gx],
-                    self.luma[top + gx + 1],
-                    self.luma[bottom + gx],
-                    self.luma[bottom + gx + 1],
-                ];
-                let (mask, fg, bg) = quantize(q);
-                cell.set_char(QUADRANTS[mask]);
-                if colour {
-                    // the same split `quantize` made, applied to the
+            // how many cells this row really covers, clipped against
+            // the buffer and the grid once rather than per cell: the
+            // inner loop is then a zip over slices of known length,
+            // with no bounds check and no column test in it.
+            let cells = (vis.width as usize).min((self.cols as usize).saturating_sub(first_col));
+            if cells == 0 {
+                continue;
+            }
+            let row = &mut buf.content[start..start + cells];
+            let gx = first_col * 2;
+            let span = cells * 2;
+            // the two sub-rows, as pairs: one pair per cell, which is
+            // the cell's four samples clockwise from upper left.
+            let tops = self.luma[top + gx..top + gx + span].as_chunks::<2>().0;
+            let bots = self.luma[bottom + gx..bottom + gx + span]
+                .as_chunks::<2>()
+                .0;
+            if colour {
+                let trgb = self.rgb[top + gx..top + gx + span].as_chunks::<2>().0;
+                let brgb = self.rgb[bottom + gx..bottom + gx + span].as_chunks::<2>().0;
+                let samples = tops.iter().zip(bots).zip(trgb.iter().zip(brgb));
+                for (cell, ((t, b), (tc, bc))) in row.iter_mut().zip(samples) {
+                    // only the mask: in colour the two shades come
+                    // from the rgb grid, so averaging luma for them
+                    // was work thrown away.
+                    let mask = mask_of([t[0], t[1], b[0], b[1]]);
+                    cell.set_symbol(QUADRANTS[mask]);
+                    // the same split the mask made, applied to the
                     // cell's own rgb: the glyph and the two colours
                     // are then describing one grouping, not two.
-                    let (f, b) = group_rgb(
-                        mask,
-                        [
-                            self.rgb[top + gx],
-                            self.rgb[top + gx + 1],
-                            self.rgb[bottom + gx],
-                            self.rgb[bottom + gx + 1],
-                        ],
-                    );
+                    let (f, b) = group_rgb(mask, [tc[0], tc[1], bc[0], bc[1]]);
                     cell.set_fg(Color::Rgb(f[0], f[1], f[2]));
                     cell.set_bg(Color::Rgb(b[0], b[1], b[2]));
-                } else {
+                }
+            } else {
+                for (cell, (t, b)) in row.iter_mut().zip(tops.iter().zip(bots)) {
+                    let (mask, fg, bg) = quantize([t[0], t[1], b[0], b[1]]);
+                    cell.set_symbol(QUADRANTS[mask]);
                     cell.set_fg(shades[fg as usize]);
                     cell.set_bg(shades[bg as usize]);
                 }
@@ -519,15 +523,13 @@ impl Raster {
 /// and draws a full block, which is the crispest thing available and
 /// avoids inventing an edge inside flat colour.
 fn quantize(q: [u8; 4]) -> (usize, u8, u8) {
-    let lo = q.iter().copied().min().unwrap_or(0);
-    let hi = q.iter().copied().max().unwrap_or(0);
-    let mid = (lo as u16 + hi as u16).div_ceil(2) as u8;
-
+    let mid = midpoint(q);
+    // one pass for the mask and both sums: splitting it cost a second
+    // walk over the four samples and bought nothing.
     let mut mask = 0usize;
     let mut fg_sum = 0u32;
     let mut fg_n = 0u32;
     let mut bg_sum = 0u32;
-    let mut bg_n = 0u32;
     for (i, &v) in q.iter().enumerate() {
         if v >= mid {
             mask |= 1 << i;
@@ -535,15 +537,73 @@ fn quantize(q: [u8; 4]) -> (usize, u8, u8) {
             fg_n += 1;
         } else {
             bg_sum += v as u32;
-            bg_n += 1;
         }
     }
     // `mid` is inside the range, so at least one sample is always in
     // the foreground; the background can be empty when the cell is
     // flat, and then both shades are that one level.
-    let fg = fg_sum.checked_div(fg_n).map_or(lo, |v| v as u8);
-    let bg = bg_sum.checked_div(bg_n).map_or(fg, |v| v as u8);
+    let fg = div_small(fg_sum, fg_n) as u8;
+    let bg = if fg_n >= 4 {
+        fg
+    } else {
+        div_small(bg_sum, 4 - fg_n) as u8
+    };
     (mask, fg, bg)
+}
+
+/// The level the cell's own range splits at: the midpoint of its
+/// darkest and brightest sample, rounded up, so the brightest sample
+/// is always on the foreground side and a mask is never empty.
+#[inline]
+fn midpoint(q: [u8; 4]) -> u8 {
+    let lo = q[0].min(q[1]).min(q[2].min(q[3]));
+    let hi = q[0].max(q[1]).max(q[2].max(q[3]));
+    (lo as u16 + hi as u16).div_ceil(2) as u8
+}
+
+/// Which of a cell's four samples take the foreground. Split out of
+/// `quantize` because `paint`'s colour path needs only this: there the
+/// two shades come from the rgb grid, so averaging luma for them was
+/// work thrown away.
+#[inline]
+fn mask_of(q: [u8; 4]) -> usize {
+    let mid = midpoint(q);
+    let mut mask = 0usize;
+    for (i, &v) in q.iter().enumerate() {
+        if v >= mid {
+            mask |= 1 << i;
+        }
+    }
+    mask
+}
+
+/// `sum / n` as a multiply and a shift, for the only divisors a cell
+/// can have. A hardware integer divide is tens of cycles and `paint`
+/// did eight of them per cell in colour; these are exact over the
+/// whole range a four-sample sum reaches, which
+/// `the_small_divide_is_exact` pins down. Index 0 is unreachable (a
+/// mask is never empty) and answers 0 rather than dividing by zero.
+const RECIP: [u32; 5] = [0, 2048, 1024, 683, 512];
+
+#[inline]
+fn div_small(sum: u32, n: u32) -> u32 {
+    (sum * RECIP[(n as usize).min(4)]) >> 11
+}
+
+/// `sum / count` for the tap counts `fill` can produce, `1..=MAX_TAPS
+/// * MAX_TAPS`. Same reason as `div_small`: `count` is loop-invariant
+/// but a runtime value, so this was a real hardware divide once per
+/// output sample in mono and three times in colour, which is a third
+/// of what the colour walk cost. `ceil(65536 / n)`, exact for every
+/// sum sixteen samples can reach; `the_tap_divide_is_exact` pins it.
+const TAP_RECIP: [u32; 17] = [
+    0, 65536, 32768, 21846, 16384, 13108, 10923, 9363, 8192, 7282, 6554, 5958, 5462, 5042, 4682,
+    4370, 4096,
+];
+
+#[inline]
+fn div_taps(sum: u32, count: u32) -> u32 {
+    (sum * TAP_RECIP[(count as usize).min(16)]) >> 16
 }
 
 /// The two colours a cell's four rgb samples reduce to, split by the
@@ -551,26 +611,32 @@ fn quantize(q: [u8; 4]) -> (usize, u8, u8) {
 /// rather than taking one sample's colour keeps a cell straddling an
 /// edge from flipping hue with the glyph.
 fn group_rgb(mask: usize, q: [[u8; 3]; 4]) -> ([u8; 3], [u8; 3]) {
+    // both groups accumulated without branching on the mask: every
+    // sample goes into the total, and only the foreground is also
+    // added separately, so the background is the difference. the old
+    // form picked one of two `&mut` accumulators per sample, which
+    // the optimiser could not keep in registers.
+    let mut all = [0u32; 3];
     let mut fg = [0u32; 3];
-    let mut bg = [0u32; 3];
     let mut fg_n = 0u32;
-    let mut bg_n = 0u32;
     for (i, p) in q.iter().enumerate() {
-        let (sum, n) = if mask & (1 << i) != 0 {
-            (&mut fg, &mut fg_n)
-        } else {
-            (&mut bg, &mut bg_n)
-        };
-        for (s, &v) in sum.iter_mut().zip(p.iter()) {
-            *s += v as u32;
+        let on = ((mask >> i) & 1) as u32;
+        fg_n += on;
+        for c in 0..3 {
+            let v = p[c] as u32;
+            all[c] += v;
+            fg[c] += v * on;
         }
-        *n += 1;
     }
-    let avg = |s: [u32; 3], n: u32| std::array::from_fn(|i| (s[i] / n.max(1)) as u8);
-    // `quantize` always leaves at least one sample in the foreground;
+    let avg = |s: [u32; 3], n: u32| std::array::from_fn(|i| div_small(s[i], n) as u8);
+    // `mask_of` always leaves at least one sample in the foreground;
     // an empty background (a flat cell) takes the foreground's colour.
-    let f = avg(fg, fg_n);
-    (f, if bg_n == 0 { f } else { avg(bg, bg_n) })
+    let f = avg(fg, fg_n.max(1));
+    if fg_n >= 4 {
+        return (f, f);
+    }
+    let bg = std::array::from_fn(|i| all[i] - fg[i]);
+    (f, avg(bg, 4 - fg_n))
 }
 
 /// Reading the grid back without a `Buffer`: what the tests assert
@@ -668,6 +734,17 @@ fn place(
     let ow = ((draw_w * SAMPLES_X as f32).round() as u32).clamp(1, grid_w);
     let oh = ((draw_h * SAMPLES_Y as f32 / aspect).round() as u32).clamp(1, grid_h);
     (ow, oh, (grid_w - ow) / 2, (grid_h - oh) / 2)
+}
+
+/// One grid slot: the luma level, plus the same level as a grey in
+/// the rgb grid when there is one. A grey source asked for in colour
+/// still has to fill that grid, with the grey itself.
+#[inline]
+fn write_luma(luma: &mut [u8], rgb: &mut [[u8; 3]], at: usize, v: u8) {
+    luma[at] = v;
+    if let Some(slot) = rgb.get_mut(at) {
+        *slot = [v; 3];
+    }
 }
 
 /// `theme::shade` memoized over the 256 luma levels. Every colour the
@@ -816,7 +893,7 @@ mod tests {
     /// this rather than one specific glyph, since which one a cell
     /// gets depends on its own four samples.
     fn is_block(c: char) -> bool {
-        QUADRANTS.contains(&c)
+        QUADRANTS.iter().any(|q| q.starts_with(c))
     }
 
     use super::*;
@@ -853,6 +930,410 @@ mod tests {
 
     fn levels(r: &Raster) -> Vec<u8> {
         r.luma().to_vec()
+    }
+
+    /// The pre-optimisation `paint`, verbatim, including the per-cell
+    /// branch on tone and the four bounds-checked grid reads. Kept so
+    /// "the rewrite draws the same thing" is a comparison against the
+    /// code it replaced, not against a re-derivation of it; same
+    /// reason `legacy_raster_cost` keeps the old sampler.
+    fn reference_paint(r: &Raster, area: Rect, buf: &mut Buffer) {
+        let vis = area.intersection(buf.area);
+        if vis.is_empty() || r.cols == 0 || r.rows == 0 {
+            return;
+        }
+        let colour = r.tone == Tone::Color && r.rgb.len() == r.luma.len();
+        let shades = shades();
+        let grid_w = r.cols as usize * 2;
+        let buf_w = buf.area.width as usize;
+        let first_col = (vis.x - area.x) as usize;
+        for y in vis.y..vis.y + vis.height {
+            let cell_row = (y - area.y) as usize;
+            if cell_row >= r.rows as usize {
+                break;
+            }
+            let top = cell_row * 2 * grid_w;
+            let bottom = top + grid_w;
+            let start = (y - buf.area.y) as usize * buf_w + (vis.x - buf.area.x) as usize;
+            let row = &mut buf.content[start..start + vis.width as usize];
+            for (i, cell) in row.iter_mut().enumerate() {
+                let col = first_col + i;
+                if col >= r.cols as usize {
+                    break;
+                }
+                let gx = col * 2;
+                let q = [
+                    r.luma[top + gx],
+                    r.luma[top + gx + 1],
+                    r.luma[bottom + gx],
+                    r.luma[bottom + gx + 1],
+                ];
+                let (mask, fg, bg) = reference_quantize(q);
+                // the old call, deliberately: this is also what makes
+                // the comparison prove `set_symbol` of an encoded
+                // glyph is the same cell as `set_char` of it.
+                cell.set_char(QUADRANTS[mask].chars().next().unwrap());
+                if colour {
+                    let (f, b) = reference_group_rgb(
+                        mask,
+                        [
+                            r.rgb[top + gx],
+                            r.rgb[top + gx + 1],
+                            r.rgb[bottom + gx],
+                            r.rgb[bottom + gx + 1],
+                        ],
+                    );
+                    cell.set_fg(Color::Rgb(f[0], f[1], f[2]));
+                    cell.set_bg(Color::Rgb(b[0], b[1], b[2]));
+                } else {
+                    cell.set_fg(shades[fg as usize]);
+                    cell.set_bg(shades[bg as usize]);
+                }
+            }
+        }
+    }
+
+    /// The pre-optimisation `fill`, verbatim: byte offsets in `xs` and
+    /// a three-byte sub-slice per tap. Kept for the same reason
+    /// `reference_paint` is, and because the two have to be timed
+    /// against each other in one process to mean anything.
+    fn reference_fill(r: &mut Raster, px: &Pixels, cell_aspect: f32, style: Style) {
+        let Raster {
+            luma,
+            cols,
+            rows,
+            xs,
+            rgb,
+            ..
+        } = r;
+        // the row accumulator the struct used to carry, now a local:
+        // getting it out of `Raster` is part of what is being
+        // measured, so the old shape keeps its own.
+        let acc = &mut Vec::<u32>::new();
+        let colour = style.tone == Tone::Color && !px.gray;
+        let grid_w = *cols as u32 * SAMPLES_X;
+        let grid_h = *rows as u32 * SAMPLES_Y;
+        let (ow, oh, off_x, off_y) = place(px.w, px.h, grid_w, grid_h, cell_aspect, style.fit);
+        if ow == 0 || oh == 0 {
+            return;
+        }
+        let taps_x = px.w.div_ceil(ow).clamp(1, MAX_TAPS);
+        let taps_y = px.h.div_ceil(oh).clamp(1, MAX_TAPS);
+        xs.clear();
+        xs.reserve(ow as usize * taps_x as usize);
+        for ox in 0..ow {
+            let (s0, s1) = span(ox, ow, px.w);
+            for t in 0..taps_x {
+                let x = (s0 + (s1 - s0) * t / taps_x).min(px.w - 1);
+                xs.push(x * px.step as u32);
+            }
+        }
+        acc.clear();
+        acc.resize(ow as usize * if colour { 3 } else { 1 }, 0);
+        let count = taps_x * taps_y;
+        let taps_x = taps_x as usize;
+        for oy in 0..oh {
+            let (s0, s1) = span(oy, oh, px.h);
+            acc.fill(0);
+            for t in 0..taps_y {
+                let y = (s0 + (s1 - s0) * t / taps_y).min(px.h - 1);
+                let row = &px.data[y as usize * px.stride..][..px.stride];
+                let taps = xs.chunks_exact(taps_x);
+                if colour {
+                    for (slot, taps) in acc.as_chunks_mut::<3>().0.iter_mut().zip(taps) {
+                        for &dx in taps {
+                            let p = &row[dx as usize..dx as usize + 3];
+                            slot[0] += p[0] as u32;
+                            slot[1] += p[1] as u32;
+                            slot[2] += p[2] as u32;
+                        }
+                    }
+                } else if px.gray {
+                    for (slot, taps) in acc.iter_mut().zip(taps) {
+                        for &dx in taps {
+                            *slot += row[dx as usize] as u32;
+                        }
+                    }
+                } else {
+                    for (slot, taps) in acc.iter_mut().zip(taps) {
+                        for &dx in taps {
+                            *slot += rgb_luma(&row[dx as usize..dx as usize + 3]);
+                        }
+                    }
+                }
+            }
+            let base = (off_y + oy) as usize * grid_w as usize + off_x as usize;
+            if colour {
+                for (ox, c) in acc.as_chunks::<3>().0.iter().enumerate() {
+                    let p = [
+                        (c[0] / count) as u8,
+                        (c[1] / count) as u8,
+                        (c[2] / count) as u8,
+                    ];
+                    rgb[base + ox] = p;
+                    luma[base + ox] = rgb_luma(&p) as u8;
+                }
+            } else {
+                for (ox, &sum) in acc.iter().enumerate() {
+                    let v = (sum / count) as u8;
+                    luma[base + ox] = v;
+                    if let Some(slot) = rgb.get_mut(base + ox) {
+                        *slot = [v; 3];
+                    }
+                }
+            }
+        }
+    }
+
+    /// The rewritten `fill` samples the same grid the old one did,
+    /// for every pixel layout `Pixels` reads in place: the fast path
+    /// indexes `[u8; 3]` chunks and the general one multiplies by the
+    /// step, and a mismatch between them would show as a cover that
+    /// changes when its source happens to carry an alpha channel.
+    #[test]
+    fn filling_samples_the_same_grid_as_before() {
+        let hues = hued(97, 61);
+        let rgba = DynamicImage::ImageRgba8(hues.to_rgba8());
+        let lum = DynamicImage::ImageLuma8(hues.to_luma8());
+        let luma_a = DynamicImage::ImageLumaA8(hues.to_luma_alpha8());
+        for img in [&hues, &rgba, &lum, &luma_a] {
+            let px = Pixels::of(img).expect("8 bits per channel");
+            for tone in [Tone::Mono, Tone::Color] {
+                for fit in [Fit::Contain, Fit::Stretch] {
+                    for (w, h) in [(26u16, 13u16), (7, 3), (120, 60), (1, 1)] {
+                        let style = Style { fit, tone };
+                        let rect = Rect::new(0, 0, w, h);
+                        let mut want = Raster::new();
+                        want.sample(img, rect, 2.0, style);
+                        reference_fill(&mut want, &px, 2.0, style);
+                        let mut got = Raster::new();
+                        got.sample(img, rect, 2.0, style);
+                        got.fill(&px, 2.0, style);
+                        assert_eq!(
+                            got.luma, want.luma,
+                            "{tone:?} {fit:?} {w}x{h} luma grid differs"
+                        );
+                        assert_eq!(got.rgb, want.rgb, "{tone:?} {fit:?} {w}x{h} rgb grid differs");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every cell, both colours and the glyph, identical to what the
+    /// old per-cell loop produced: the grids read the same in an
+    /// eyeball print, but a shade off by one is invisible there and is
+    /// exactly what a reciprocal multiply would get wrong.
+    ///
+    /// Rects deliberately larger and smaller than the buffer, and
+    /// offset inside it, since the rewrite moved the clipping out of
+    /// the inner loop.
+    #[test]
+    fn painting_is_cell_for_cell_what_it_replaced() {
+        let sources = [hued(64, 48), ramp(200, 200), flat(8, 8, 128), split(4, 4)];
+        for img in &sources {
+            for tone in [Tone::Mono, Tone::Color] {
+                for fit in [Fit::Contain, Fit::Stretch] {
+                    let style = Style { fit, tone };
+                    for (rect, bw, bh) in [
+                        (Rect::new(0, 0, 26, 13), 26, 13),
+                        (Rect::new(0, 0, 40, 20), 40, 20),
+                        // rect wider and taller than the buffer.
+                        (Rect::new(0, 0, 30, 14), 12, 6),
+                        // offset inside a bigger buffer, and running
+                        // off its right and bottom edges.
+                        (Rect::new(3, 2, 20, 10), 16, 8),
+                        (Rect::new(5, 1, 9, 5), 30, 12),
+                        (Rect::new(0, 0, 1, 1), 4, 4),
+                    ] {
+                        let mut r = Raster::new();
+                        r.sample(img, rect, 2.0, style);
+                        let mut want = buffer(bw, bh);
+                        reference_paint(&r, rect, &mut want);
+                        let mut got = buffer(bw, bh);
+                        r.paint(rect, &mut got);
+                        assert_eq!(
+                            got,
+                            want,
+                            "{tone:?} {fit:?} {rect:?} into {bw}x{bh}:\ngot\n{}\nwant\n{}",
+                            crate::ui::testbuf::grid(&got),
+                            crate::ui::testbuf::grid(&want)
+                        );
+
+                        // painted at a rect *bigger* than the grid was
+                        // sampled for, which is the case the inner
+                        // loop's old `col >= cols` break existed for;
+                        // the rewrite hoisted that into the row's
+                        // length, so the grid's own edge has to clip
+                        // it and not only the buffer's.
+                        let wider = Rect {
+                            width: rect.width + 7,
+                            height: rect.height + 3,
+                            ..rect
+                        };
+                        let mut want = buffer(bw + 9, bh + 5);
+                        reference_paint(&r, wider, &mut want);
+                        let mut got = buffer(bw + 9, bh + 5);
+                        r.paint(wider, &mut got);
+                        assert_eq!(
+                            got,
+                            want,
+                            "{tone:?} {fit:?} {wider:?} is past a {}x{} grid:\ngot\n{}\nwant\n{}",
+                            r.cols,
+                            r.rows,
+                            crate::ui::testbuf::grid(&got),
+                            crate::ui::testbuf::grid(&want)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The glyph table is pre-encoded `&str` so `paint` can skip
+    /// `set_char`'s utf-8 encode, which means nothing is checking the
+    /// entries are single characters any more. This is.
+    #[test]
+    fn every_quadrant_is_one_block_glyph() {
+        for (mask, s) in QUADRANTS.iter().enumerate() {
+            let mut chars = s.chars();
+            let ch = chars.next().expect("a glyph per mask");
+            assert_eq!(chars.next(), None, "mask {mask} is more than one char");
+            assert!(
+                ('\u{2580}'..='\u{259f}').contains(&ch),
+                "mask {mask} is {ch:?}, outside Unicode's Block Elements"
+            );
+        }
+        assert_eq!(
+            QUADRANTS[0b0011], "\u{2580}",
+            "the upper half is the glyph this module started as"
+        );
+        assert_eq!(QUADRANTS[0b0011].chars().next(), Some(HALF_BLOCK));
+    }
+
+    /// `div_small` replaces a hardware divide in the per-cell loop, so
+    /// it has to be exact over every sum/count a cell can produce: four
+    /// samples of at most 255 each, grouped one to four at a time.
+    #[test]
+    fn the_small_divide_is_exact() {
+        for n in 1..=4u32 {
+            for sum in 0..=4 * 255u32 {
+                assert_eq!(
+                    div_small(sum, n),
+                    sum / n,
+                    "div_small({sum}, {n}) is not {sum} / {n}"
+                );
+            }
+        }
+    }
+
+    /// And the same for the tap average, over every count `fill` can
+    /// reach (`MAX_TAPS` per axis) and every sum that many samples can
+    /// add up to.
+    #[test]
+    fn the_tap_divide_is_exact() {
+        let max = MAX_TAPS * MAX_TAPS;
+        for count in 1..=max {
+            for sum in 0..=count * 255 {
+                assert_eq!(
+                    div_taps(sum, count),
+                    sum / count,
+                    "div_taps({sum}, {count}) is not {sum} / {count}"
+                );
+            }
+        }
+        assert_eq!(
+            TAP_RECIP.len() - 1,
+            max as usize,
+            "the table has to cover every tap count MAX_TAPS allows"
+        );
+    }
+
+    /// The pre-optimisation `quantize`/`group_rgb`, verbatim, so the
+    /// rewrite is checked against what it replaced rather than against
+    /// a re-derivation of it.
+    fn reference_quantize(q: [u8; 4]) -> (usize, u8, u8) {
+        let lo = q.iter().copied().min().unwrap_or(0);
+        let hi = q.iter().copied().max().unwrap_or(0);
+        let mid = (lo as u16 + hi as u16).div_ceil(2) as u8;
+        let mut mask = 0usize;
+        let (mut fg_sum, mut fg_n, mut bg_sum, mut bg_n) = (0u32, 0u32, 0u32, 0u32);
+        for (i, &v) in q.iter().enumerate() {
+            if v >= mid {
+                mask |= 1 << i;
+                fg_sum += v as u32;
+                fg_n += 1;
+            } else {
+                bg_sum += v as u32;
+                bg_n += 1;
+            }
+        }
+        let fg = fg_sum.checked_div(fg_n).map_or(lo, |v| v as u8);
+        let bg = bg_sum.checked_div(bg_n).map_or(fg, |v| v as u8);
+        (mask, fg, bg)
+    }
+
+    fn reference_group_rgb(mask: usize, q: [[u8; 3]; 4]) -> ([u8; 3], [u8; 3]) {
+        let mut fg = [0u32; 3];
+        let mut bg = [0u32; 3];
+        let (mut fg_n, mut bg_n) = (0u32, 0u32);
+        for (i, p) in q.iter().enumerate() {
+            let (sum, n) = if mask & (1 << i) != 0 {
+                (&mut fg, &mut fg_n)
+            } else {
+                (&mut bg, &mut bg_n)
+            };
+            for (s, &v) in sum.iter_mut().zip(p.iter()) {
+                *s += v as u32;
+            }
+            *n += 1;
+        }
+        let avg =
+            |s: [u32; 3], n: u32| -> [u8; 3] { std::array::from_fn(|i| (s[i] / n.max(1)) as u8) };
+        let f = avg(fg, fg_n);
+        (f, if bg_n == 0 { f } else { avg(bg, bg_n) })
+    }
+
+    /// A deterministic walk over the whole input space rather than a
+    /// sample of it: `quantize` and `group_rgb` decide every glyph and
+    /// every colour the module emits, so "same output as before" is
+    /// the entire claim the paint rewrite rests on.
+    #[test]
+    fn the_rewritten_cell_math_matches_what_it_replaced() {
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 32) as u8
+        };
+        // every all-equal cell (the flat fixed point, where the
+        // background group is empty) plus a wide pseudo-random sweep.
+        for v in 0..=255u8 {
+            assert_eq!(quantize([v; 4]), reference_quantize([v; 4]), "flat {v}");
+        }
+        for _ in 0..200_000 {
+            let q = [next(), next(), next(), next()];
+            let got = quantize(q);
+            assert_eq!(got, reference_quantize(q), "quantize {q:?}");
+            assert_eq!(
+                got.0,
+                mask_of(q),
+                "mask_of disagrees with quantize on {q:?}"
+            );
+            let rgb = [
+                [next(), next(), next()],
+                [next(), next(), next()],
+                [next(), next(), next()],
+                [next(), next(), next()],
+            ];
+            assert_eq!(
+                group_rgb(got.0, rgb),
+                reference_group_rgb(got.0, rgb),
+                "group_rgb mask {} {rgb:?}",
+                got.0
+            );
+        }
     }
 
     #[test]
@@ -1418,6 +1899,38 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Two implementations timed in one process, batches alternating,
+    /// minimum each. Sequential before/after runs are not a
+    /// measurement on this machine: back-to-back runs of the *same*
+    /// binary came out 1.6x apart while other builds ran, which is
+    /// larger than most of what is being measured. Alternating makes
+    /// both see the same machine, and the minimum then means
+    /// something.
+    #[cfg(test)]
+    fn head_to_head<T>(
+        batches: u32,
+        n: u32,
+        target: &mut T,
+        mut new: impl FnMut(&mut T),
+        mut old: impl FnMut(&mut T),
+    ) -> (std::time::Duration, std::time::Duration) {
+        use std::time::{Duration, Instant};
+        let (mut a, mut b) = (Duration::MAX, Duration::MAX);
+        for _ in 0..batches {
+            let t = Instant::now();
+            for _ in 0..n {
+                new(target);
+            }
+            a = a.min(t.elapsed() / n);
+            let t = Instant::now();
+            for _ in 0..n {
+                old(target);
+            }
+            b = b.min(t.elapsed() / n);
+        }
+        (a, b)
+    }
+
     /// Numbers for the report, not a pass/fail gate; `cargo test
     /// --release -- --ignored --nocapture raster_cost` prints them.
     #[test]
@@ -1463,6 +1976,140 @@ mod tests {
                 assert!(!m.render("k", img, rect, 2.0, mono(Fit::Contain), &mut buf));
             });
             println!("{name}: render {each:?} (sample {sample:?}, memoized {memoized:?})");
+        }
+    }
+
+    /// Painting alone, per cell, at the art-panel sizes the player and
+    /// browse layouts actually pick. `paint` is the half a memo cannot
+    /// skip, so this is the per-frame floor of any art panel; the
+    /// per-cell column is what an optimisation has to move.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn paint_cost() {
+        // structure in both axes, so cells straddle edges and the
+        // quadrant masks vary instead of all landing on a full block.
+        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(640, 640, |x, y| {
+            let v = ((x * 7 + y * 11) % 256) as u8;
+            Rgb([v, v.wrapping_add(40), 255 - v])
+        }));
+        for (w, h) in [(26u16, 13u16), (46, 23), (70, 35), (120, 60), (400, 200)] {
+            let rect = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
+            for tone in [Tone::Mono, Tone::Color] {
+                let style = Style {
+                    fit: Fit::Contain,
+                    tone,
+                };
+                let mut r = Raster::new();
+                r.sample(&img, rect, 2.0, style);
+                // one closure per implementation taking the buffer as
+                // an argument, since both want it mutably.
+                let (each, was) = head_to_head(
+                    6,
+                    200,
+                    &mut buf,
+                    |b| r.paint(rect, b),
+                    |b| reference_paint(&r, rect, b),
+                );
+                let cells = w as u32 * h as u32;
+                let per = |d: std::time::Duration| d.as_nanos() as f64 / cells as f64;
+                println!(
+                    "{w}x{h} {tone:?}: paint {each:>10.3?} ({:>5.2} ns/cell)  \
+                     was {was:>10.3?} ({:>5.2} ns/cell)  {:.2}x",
+                    per(each),
+                    per(was),
+                    was.as_secs_f64() / each.as_secs_f64().max(f64::MIN_POSITIVE)
+                );
+            }
+        }
+    }
+
+    /// Throwaway probe: of `paint`'s per-cell cost, how much is the
+    /// cell math and how much is writing a `ratatui::Cell` at all?
+    /// The second number is a floor no rewrite in here can move.
+    #[test]
+    #[ignore = "diagnostic probe, run manually"]
+    fn probe_paint_floor() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(640, 640, |x, y| {
+            let v = ((x * 7 + y * 11) % 256) as u8;
+            Rgb([v, v.wrapping_add(40), 255 - v])
+        }));
+        let (w, h) = (70u16, 35u16);
+        let rect = Rect::new(0, 0, w, h);
+        let cells = w as u32 * h as u32;
+        let mut buf = Buffer::empty(rect);
+        let mut r = Raster::new();
+        let style = Style {
+            fit: Fit::Contain,
+            tone: Tone::Mono,
+        };
+        r.sample(&img, rect, 2.0, style);
+        let per = |d: std::time::Duration| d.as_nanos() as f64 / cells as f64;
+
+        let whole = best(5, 200, || r.paint(rect, &mut buf));
+        // the glyph alone, and the two colours alone.
+        let glyph = best(5, 200, || {
+            for cell in buf.content.iter_mut() {
+                cell.set_char('\u{2588}');
+            }
+        });
+        // `set_char` encodes to utf-8 first; `set_symbol` takes the
+        // already-encoded bytes, and the glyph set here is fixed.
+        let symbol = best(5, 200, || {
+            for cell in buf.content.iter_mut() {
+                cell.set_symbol("\u{2588}");
+            }
+        });
+        let colours = best(5, 200, || {
+            for cell in buf.content.iter_mut() {
+                cell.set_fg(Color::Indexed(7));
+                cell.set_bg(Color::Indexed(0));
+            }
+        });
+        // and the math alone, over the same grid, writing nothing.
+        let math = best(5, 200, || {
+            let mut acc = 0u32;
+            for pair in r.luma.as_chunks::<4>().0 {
+                let (mask, fg, bg) = quantize(*pair);
+                acc = acc.wrapping_add(mask as u32 + fg as u32 + bg as u32);
+            }
+            std::hint::black_box(acc);
+        });
+        println!(
+            "{w}x{h} mono: paint {:.2} ns/cell = glyph {:.2} (set_symbol {:.2}) \
+             + colours {:.2} + math {:.2}",
+            per(whole),
+            per(glyph),
+            per(symbol),
+            per(colours),
+            per(math)
+        );
+
+        // and the other half: `sample`, which the memo skips for a
+        // static cover but a resize and a video pane both pay every
+        // frame. split into the source walk and the unsharp mask, and
+        // the walk timed head to head with the one it replaced.
+        for tone in [Tone::Mono, Tone::Color] {
+            let style = Style {
+                fit: Fit::Contain,
+                tone,
+            };
+            let px = Pixels::of(&img).expect("rgb8");
+            r.sample(&img, rect, 2.0, style);
+            let whole = best(5, 100, || r.sample(&img, rect, 2.0, style));
+            let sharpen = best(5, 100, || r.sharpen());
+            let (fill, was) = head_to_head(
+                6,
+                100,
+                &mut r,
+                |r| r.fill(&px, 2.0, style),
+                |r| reference_fill(r, &px, 2.0, style),
+            );
+            println!(
+                "{w}x{h} {tone:?}: sample {whole:>10.3?} = fill {fill:>10.3?} \
+                 (was {was:>10.3?}, {:.2}x) + sharpen {sharpen:>10.3?}",
+                was.as_secs_f64() / fill.as_secs_f64().max(f64::MIN_POSITIVE)
+            );
         }
     }
 
@@ -1626,5 +2273,111 @@ mod tests {
         let mut r = grid_raster(4, 1, short.clone());
         r.sharpen_with(1.0);
         assert_eq!(r.luma, short);
+    }
+}
+
+/// Read the pictures, not the assertions: the glyph a cell picks and
+/// the two shades it splits into are the whole output of this module,
+/// and a wrong split reads as mush long before any coordinate assert
+/// catches it.
+///
+/// `cargo test --lib ui::raster::eyeball -- --nocapture`
+#[cfg(test)]
+mod eyeball {
+    use super::*;
+    use crate::ui::testbuf::{buffer, grid};
+    use image::{Rgb, RgbImage};
+
+    /// A disc on a gradient: curved edges at every angle, a flat
+    /// interior and a flat exterior, so both the uniform fixed point
+    /// and every partial cell show up in one picture.
+    fn disc(w: u32, h: u32) -> DynamicImage {
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        let r = w.min(h) as f32 * 0.35;
+        DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
+            let d = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
+            if d < r {
+                Rgb([240, 230, 210])
+            } else {
+                let v = (x * 90 / w.max(1)) as u8;
+                Rgb([v, v / 2, 20 + v])
+            }
+        }))
+    }
+
+    /// Prints the quadrant grid at the art-panel sizes the player
+    /// layout picks, in both tones. Asserts the floor as well, so it
+    /// is a test and not only a printer.
+    #[test]
+    fn print_a_rasterized_cover() {
+        let img = disc(256, 256);
+        for (w, h) in [(26u16, 13u16), (46, 23)] {
+            for tone in [Tone::Mono, Tone::Color] {
+                let rect = Rect::new(0, 0, w, h);
+                let mut buf = buffer(w, h);
+                let mut r = Raster::new();
+                r.render(
+                    &img,
+                    rect,
+                    2.0,
+                    Style {
+                        fit: Fit::Contain,
+                        tone,
+                    },
+                    &mut buf,
+                );
+                let text = grid(&buf);
+                println!("--- {w}x{h} {tone:?}\n{text}");
+                assert!(
+                    !text.contains('.'),
+                    "{tone:?} left a cell unpainted at {w}x{h}:\n{text}"
+                );
+                assert!(
+                    text.chars()
+                        .filter(|c| *c != '\n')
+                        .all(|c| QUADRANTS.iter().any(|q| q.starts_with(c))),
+                    "a glyph from outside the quadrant set:\n{text}"
+                );
+            }
+        }
+    }
+
+    /// The same picture as a map of which quadrants took the
+    /// foreground, printed as the mask's hex digit: the glyph alphabet
+    /// is hard to read an *edge* out of, and this is what a wrong
+    /// split looks like.
+    #[test]
+    fn print_the_quadrant_masks() {
+        let img = disc(256, 256);
+        let (w, h) = (26u16, 13u16);
+        let rect = Rect::new(0, 0, w, h);
+        let mut r = Raster::new();
+        r.sample(
+            &img,
+            rect,
+            2.0,
+            Style {
+                fit: Fit::Contain,
+                tone: Tone::Mono,
+            },
+        );
+        let mut out = String::new();
+        for row in 0..h {
+            for col in 0..w {
+                let q = [
+                    r.at(col * 2, row * 2),
+                    r.at(col * 2 + 1, row * 2),
+                    r.at(col * 2, row * 2 + 1),
+                    r.at(col * 2 + 1, row * 2 + 1),
+                ];
+                out.push(char::from_digit(mask_of(q) as u32, 16).unwrap_or('?'));
+            }
+            out.push('\n');
+        }
+        println!("--- {w}x{h} quadrant masks (hex, bit 0 = upper left)\n{out}");
+        assert!(
+            !out.contains('0'),
+            "a mask of zero means no sample reached the midpoint:\n{out}"
+        );
     }
 }
