@@ -151,9 +151,9 @@ impl BetweenTracks {
         now: Instant,
     ) -> Option<GapAction> {
         let want_hold = !self.gap.is_zero() && more_to_play;
-        if self.keep_open != Some(want_hold) {
-            let _ = player.set_keep_open(want_hold);
-            self.keep_open = Some(want_hold);
+        if self.needs_keep_open(want_hold) {
+            let ok = player.set_keep_open(want_hold).is_ok();
+            self.keep_open_written(want_hold, ok);
         }
         let action = self.tick(eof, self.gap, more_to_play, now);
         if action == Some(GapAction::Release) {
@@ -164,6 +164,26 @@ impl BetweenTracks {
             let _ = player.set_pause(false);
         }
         action
+    }
+
+    /// Whether mpv still needs telling, i.e. `want` differs from what
+    /// it was last *successfully* told.
+    fn needs_keep_open(&self, want: bool) -> bool {
+        self.keep_open != Some(want)
+    }
+
+    /// Records the outcome of that write.
+    ///
+    /// Only a successful one updates the memo, and that is the whole
+    /// point: the field *is* "what mpv has been told", so recording a
+    /// failed write means it is never retried. one dropped ipc message
+    /// of `false` then leaves `keep-open` pinned on, mpv never goes
+    /// idle, and `idle-active` going quiet takes end-of-playlist and
+    /// loop-all with it for the rest of the session.
+    fn keep_open_written(&mut self, want: bool, ok: bool) {
+        if ok {
+            self.keep_open = Some(want);
+        }
     }
 
     /// `eof` is mpv's `eof-reached`, `gap` the configured pause,
@@ -2069,7 +2089,12 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
         }
         Op::SeekRelative(delta) => op_ipc(core.player.seek(delta, true)),
         Op::SetVolume(level) => {
-            let current = current_volume(core.player).unwrap_or(*core.base_volume);
+            // the chosen level, not mpv's live reading: a relative
+            // nudge means "10% louder than the volume i set", and in
+            // the last seconds of a track with crossfade on the live
+            // value is most of the way through a fade-out, so
+            // `volume(+10%)` gave 10 instead of 90.
+            let current = *core.base_volume;
             let target = shellsong_host::volume_target(level, current);
             match core.player.set_volume(target) {
                 // the new level becomes the ceiling the crossfade and
@@ -2781,12 +2806,20 @@ pub fn track_started(track: &SearchItem, core: &mut CoreCtx) -> Started {
     note_playback_started(track, &mut dctx, core.notifications);
     start_tracking_playback(core.cfg, track, core.scrobble);
 
+    // `base_volume`, not mpv's live reading, and this one is not a
+    // nicety: `identity_settings` stores what it is given as the
+    // *restore point* for when a binding stops applying, and this
+    // runs at a track boundary, i.e. mid crossfade fade-out. the live
+    // value there is near zero, so a bound track captured ~0 and the
+    // next unbound track was silently muted. see
+    // `a_restore_point_taken_mid_fade_mutes_the_next_track`.
+    let volume_setting = *core.base_volume;
     let (ops, bound) = identity_settings(
         track,
         core.bindings,
         core.overridden,
         current_eq_name(core.app, core.cfg),
-        current_volume(core.player).unwrap_or(*core.base_volume),
+        volume_setting,
         core.app.speed,
     );
 
@@ -3087,6 +3120,107 @@ pub fn identity_settings(
 }
 
 // MOVED_ITEMS_MARKER
+
+#[cfg(test)]
+mod identity_settings_tests {
+    use super::*;
+    use crate::shellsong::Tier;
+    use crate::shellsong::{Level, Setting};
+    use crate::shellsong_host::{Bindings, Overridden};
+
+    fn song(title: &str, artist: &str) -> SearchItem {
+        SearchItem::LocalMusic {
+            path: std::path::PathBuf::from(format!("/music/{title}.flac")),
+            title: title.to_string(),
+            artist: Some(artist.to_string()),
+            album: Some("an album".to_string()),
+        }
+    }
+
+    fn restored_volume(ops: &[Op]) -> Option<f64> {
+        ops.iter().find_map(|op| match op {
+            Op::SetVolume(Level::Absolute(v)) => Some(*v),
+            _ => None,
+        })
+    }
+
+    /// The restore point must be the level the user *chose*, never
+    /// mpv's live reading.
+    ///
+    /// `settle` captures `volume_now` the first time a binding takes
+    /// over and hands it back when the binding stops applying. this
+    /// runs at a track boundary, i.e. mid crossfade fade-out, so
+    /// reading the live value captured something near zero and the
+    /// next unbound track was restored to *that*: silently muted
+    /// until you typed `volume(50%)`.
+    ///
+    /// Written as the two-track sequence because that is the only
+    /// shape the bug appears in; a single bound track looks fine.
+    #[test]
+    fn a_restore_point_taken_mid_fade_mutes_the_next_track() {
+        let bound = song("bound", "an artist");
+        let plain = song("plain", "another artist");
+        let mut bindings = Bindings::default();
+        // keyed through the same function the player uses, so a change
+        // to how a track identity is spelled cannot quietly unbind
+        // this and leave the test passing for the wrong reason.
+        let key = shellsong_host::name_at(&shellsong_host::identity_of(&bound), Tier::Track)
+            .expect("a titled track has a track identity");
+        bindings.remember(Tier::Track, &key, &Setting::Volume(25.0));
+
+        // what the bug did: 0.6 is where a fade-out had the volume
+        // when the bound track started.
+        let mut overridden = Overridden::default();
+        let (_, _) = identity_settings(&bound, &bindings, &mut overridden, "flat".into(), 0.6, 1.0);
+        let (ops, _) =
+            identity_settings(&plain, &bindings, &mut overridden, "flat".into(), 25.0, 1.0);
+        assert_eq!(
+            restored_volume(&ops),
+            Some(0.6),
+            "a transient restore point comes back as the restore"
+        );
+
+        // and what the chosen level does instead.
+        let mut overridden = Overridden::default();
+        let (_, _) =
+            identity_settings(&bound, &bindings, &mut overridden, "flat".into(), 80.0, 1.0);
+        let (ops, _) =
+            identity_settings(&plain, &bindings, &mut overridden, "flat".into(), 25.0, 1.0);
+        assert_eq!(restored_volume(&ops), Some(80.0), "back to what was chosen");
+    }
+
+    /// `track_started` is the one caller, and it must not read mpv's
+    /// live volume at all.
+    ///
+    /// Pinned by reading the source, because the call needs a live
+    /// mpv (`CoreCtx` holds the handle) and the behavioural seam tests
+    /// that could reach it are `#[ignore]`d for that reason. the test
+    /// above shows what passing a transient costs; this one is the
+    /// only available guard that it is not passed.
+    ///
+    /// Checks the whole function body, not the argument list: the
+    /// first draft checked only the call and passed happily when the
+    /// transient was moved one line up into the local it reads.
+    #[test]
+    fn track_started_never_reads_mpvs_live_volume() {
+        let src = include_str!("core.rs");
+        let at = src
+            .find("pub fn track_started(")
+            .expect("track_started moved or was renamed");
+        let body = &src[at..];
+        let end = body.find("\n}\n").expect("an unterminated fn");
+        let body = &body[..end];
+        assert!(
+            !body.contains("current_volume("),
+            "track_started reads mpv's live volume, which at a track \
+             boundary is mid fade-out and becomes a restore point:\n{body}"
+        );
+        assert!(
+            body.contains("*core.base_volume"),
+            "it has to take the chosen level from somewhere:\n{body}"
+        );
+    }
+}
 
 /// What the core could not do by itself. Every method has a default
 /// that declines with a one-line reason, so a front-end opts in to
@@ -4147,6 +4281,37 @@ mod seam_tests {
         // negative is nonsense, not a reverse gap.
         g.set_gap(-5.0);
         assert_eq!(g.gap_secs(), 0.0);
+    }
+
+    /// A dropped `keep-open` write is retried, because `keep_open` is
+    /// the memo of what mpv has been *told*, not of what was wanted.
+    ///
+    /// `step` recorded the write unconditionally, so one failed ipc
+    /// message of `false` left `keep-open` pinned on for good: mpv
+    /// then never goes idle, and `idle-active` going quiet takes
+    /// end-of-playlist and loop-all with it for the rest of the
+    /// session. the write itself needs a live mpv, so the memo rule is
+    /// split out and tested here; `step` is three lines around it.
+    #[test]
+    fn a_failed_keep_open_write_is_retried_next_frame() {
+        let mut g = BetweenTracks::new(10.0);
+        assert!(g.needs_keep_open(true), "mpv has not been told anything");
+
+        g.keep_open_written(true, false);
+        assert!(
+            g.needs_keep_open(true),
+            "a refused write must leave the memo alone, or it never retries"
+        );
+
+        g.keep_open_written(true, true);
+        assert!(!g.needs_keep_open(true), "told, and it took");
+
+        // and the dangerous direction, which is the one that pins
+        // keep-open on: turning it back off must also retry.
+        g.keep_open_written(false, false);
+        assert!(g.needs_keep_open(false), "still has to be turned off");
+        g.keep_open_written(false, true);
+        assert!(!g.needs_keep_open(false));
     }
 
     #[test]
