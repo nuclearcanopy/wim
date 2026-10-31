@@ -677,6 +677,43 @@ report, not in a batch at the end.
       also: the app had quietly supported `'foo`, `^foo` and `foo$`
       all along and said so nowhere, so the help overlay has a "search
       syntax" block now instead of leaving it folklore.
+- [x] **the ui defect batch, and the char-versus-cell class is now at
+      eight instances.** merged. the four recorded defects were all
+      real; more usefully, the sweep found **four more char-versus-cell
+      bugs and one more emoji glyph**, which is why that sweep was
+      worth asking for rather than assuming the class was closed:
+      - `lyrics_view` wrapped on chars, so a CJK song put up to twice
+        the pane width on a row and `wrapped_len` under-counted, which
+        put the end of the song outside the scroll clamp. lyrics are
+        arbitrary utf-8 from lrclib, so this was live.
+      - `header::junction_col` compared a **char index against a cell
+        column**, so a wide glyph in a title moved the `T` junction a
+        cell left per glyph and the two lines that must meet did not.
+        live for any CJK library, since browse heads its pane with an
+        album name.
+      - `banner`'s logo box was sized by `chars().count()`, mis-centring
+        the wordmark and putting the right arrow inside it.
+      - a bonus defect the new invariant test turned up: the lyrics
+        hard-split only ran when the over-long word was **first** on
+        its row, so a long word after a flush overflowed on its own.
+      the emoji one: `logos.rs` has a logo drawing circled capitals,
+      and U+24C2 is `Emoji=Yes` with no non-emoji equivalent to swap
+      in. since that file is generated, the fix was to filter the logo
+      table to codepoints the art is actually built from (ascii, box
+      drawing, block elements, braille), which drops exactly 2 of 178
+      entries, and to make a config naming a dropped one fall back to
+      the default rather than to whichever logo took its index.
+      **the sharpest thing in the report, worth keeping:** the
+      render-versus-map agreement test alone does *not* catch a
+      mis-numbering, because the render and the map read the same wrong
+      index and agree with each other. consistency and correctness need
+      two different tests. that generalises well beyond this one case.
+      two intended user-visible changes: 176 logo alternatives instead
+      of 178, and the scrubber's track is a cell shorter for the first
+      ten minutes of a song longer than ten minutes, which is the cost
+      of reserving the readout width to kill the drag-jump class
+      outright rather than handling the one crossing.
+
 - [ ] **pressing the lyrics key freezes the app on the network.**
       `lyrics::Client::lookup` is a round trip to lrclib and it is
       called **synchronously from the input path** at two sites in
