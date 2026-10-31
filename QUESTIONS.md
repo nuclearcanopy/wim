@@ -45,6 +45,28 @@ it.
 
 ## defaults taken, recorded so they are not re-litigated
 
+### a completion matched by folding types the ascii, not the diacritics
+
+`Corpus::search_names` folds diacritics, so typing `tar` in the console
+offers `Țara`. Accepting it appends the *remainder* (`a`), so the line
+becomes `play(tara)` rather than `play(Țara)`.
+
+Left that way on purpose. `Suggestion`'s own doc states the invariant
+("Always a pure extension of what was typed, never a replacement") and
+a test enforces it, because a completion that rewrites what you already
+typed is the thing that invariant exists to prevent. The folded line
+also resolves: the resolver folds on the same table, which is why
+submitting `play(tara)` always worked even while the completer showed
+nothing.
+
+**If you would rather accepting a folded match replace the token with
+the real title**, that is a deliberate break in that invariant and
+needs your call, since it changes what every completion is allowed to
+do and not just this case. The narrow version (replace only when the
+match required folding) is doable but means the invariant becomes
+"pure extension, except when folded", which is harder to reason about
+than either rule on its own.
+
 ### navidrome password storage
 
 It cannot be hashed away: subsonic auth is `md5(password + salt)` with
