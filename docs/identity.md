@@ -75,19 +75,23 @@ four edits in main.rs, after which `IdIndex`'s song maps can go (the
 `album -> artist` map is still the only home for an album row's artist
 id until `SearchItem::Album` carries one too):
 
+line numbers are as of the merge of master into feat/identity; grep
+the pattern rather than trusting them.
+
 | site | change |
 | --- | --- |
 | `main.rs:179` (`artist_tracks`, `SearchItem::Album` literal) | add `artist_id: artist_album.artist_id` |
 | `main.rs:190` (`artist_tracks`, `SearchItem::Song` literal) | add `album_id: s.album_id, artist_id: s.artist_id` |
-| `main.rs:7343` (test, `SearchItem::Album`) | add `artist_id: None` |
-| `main.rs:131` (`resolve_tracks`, `SearchItem::Artist { id, name, client }`) | add `..` if `Artist` is widened |
+| `main.rs:7572` (test, `SearchItem::Album`) | add `artist_id: None` |
+| `main.rs:131` (`resolve_tracks`, `SearchItem::Artist { id, name, client }`) | add `..`, only if `Artist` is widened too |
 
-plus, if the subsonic row types are widened to carry the ids through
-rather than the index: `main.rs:7832` (`subsonic::Song`),
-`main.rs:7363`/`7885`/`7999` (`subsonic::Album`),
-`main.rs:7862`/`7866`/`7995` (`subsonic::Artist`),
-`main.rs:7361`/`7849` (`subsonic::SearchResult`), and
-`main.rs:2984` (`cache::ServerCatalog`).
+the ids have to reach those literals, which means the subsonic row
+types carry them rather than the index, which is another nine
+literals, all in main.rs's own tests: `main.rs:8061`
+(`subsonic::Song`), `8114`/`8228`/`7592` (`subsonic::Album`),
+`8091`/`8095`/`8224` (`subsonic::Artist`), `7590`/`8078`
+(`subsonic::SearchResult`), and `main.rs:3126`
+(`cache::ServerCatalog`, if the persisted link moves onto the rows).
 
 ## the rule every join follows
 
