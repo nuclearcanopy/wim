@@ -53,7 +53,7 @@ impl Surface for Borrowed<'_> {
     /// the current result set; that is where wim's highlight starts,
     /// so `play()` after a `search()` means the same thing in both.
     fn selection(&self, core: &CoreCtx) -> Option<SearchItem> {
-        core.app.results.first().cloned()
+        core.app.result(0).cloned()
     }
 
     /// `view(now)` and `view(lyrics)` are honoured as text; the rest
