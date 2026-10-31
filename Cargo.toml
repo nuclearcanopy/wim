@@ -5,9 +5,17 @@ edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "terminal omniplayer for music and video"
 
+[lib]
+name = "wim"
+path = "src/lib.rs"
+
 [[bin]]
 name = "wim"
 path = "src/main.rs"
+
+[[bin]]
+name = "shellswim"
+path = "src/bin/shellswim/main.rs"
 
 [dependencies]
 ratatui = "0.29"
