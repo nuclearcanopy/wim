@@ -38,8 +38,24 @@ pub fn playable_path(item: &SearchItem) -> Option<String> {
             Some(path.to_string_lossy().into_owned())
         }
         SearchItem::Song { id, client, .. } => Some(client.stream_url(id)),
+        SearchItem::Silence { secs } => Some(silence_url(*secs)),
         SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => None,
     }
+}
+
+/// The ffmpeg source mpv loads for a timed silence.
+///
+/// **Measured, because the obvious reading of this is wrong.** mpv
+/// plays it for exactly `secs` (timed: a `d=3` source and a `d=6` one
+/// differ by three seconds of wall clock), but it reports
+/// `duration` as `00:00:01` whatever `d` says, at every spelling
+/// tried (`d=`, `duration=`, with and without explicit rate and
+/// channel layout). So playback and ordering are correct and
+/// **anything drawing the length of a silence must take it from the
+/// entry, not from mpv's `duration` property**, or a 15m gap draws as
+/// a one-second track.
+pub fn silence_url(secs: u64) -> String {
+    format!("av://lavfi:anullsrc=d={secs}")
 }
 /// Same as `playable_path`, but checks the local cache (see `cache.rs`)
 /// for a remote `Song` first: a valid cached file plays back instantly
@@ -271,9 +287,10 @@ pub fn front_resolved(tracks: &[SearchItem], core: &mut CoreCtx) -> Result<usize
 
 pub fn resolve_tracks(item: &SearchItem) -> Result<Vec<SearchItem>, String> {
     match item {
-        SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } | SearchItem::Song { .. } => {
-            Ok(vec![item.clone()])
-        }
+        SearchItem::LocalMusic { .. }
+        | SearchItem::LocalVideo { .. }
+        | SearchItem::Song { .. }
+        | SearchItem::Silence { .. } => Ok(vec![item.clone()]),
         SearchItem::Album { id, client, .. } => client
             .get_album(id)
             .map(|details| browse::songs_to_items(details.songs, client))
@@ -367,6 +384,7 @@ pub fn toggle_star(
     star_tx: &mpsc::Sender<StarFailed>,
 ) -> Result<bool, String> {
     match item {
+        SearchItem::Silence { .. } => Err("a silence cannot be starred".to_string()),
         SearchItem::LocalMusic { path, .. } | SearchItem::LocalVideo { path, .. } => {
             let now_starred = favorites.toggle(&path.to_string_lossy());
             let _ = favorites::save(favorites);
@@ -593,7 +611,12 @@ pub fn scrobble_metadata(item: &SearchItem) -> Option<listenbrainz::TrackMetadat
                 Some(album.clone())
             },
         }),
-        SearchItem::LocalVideo { .. }
+        // the site that earned `Silence` its own variant rather than a
+        // `LocalMusic` with an `av://` path: that spelling costs no
+        // match arms and would have scrobbled a silence to
+        // listenbrainz as a track called "silence".
+        SearchItem::Silence { .. }
+        | SearchItem::LocalVideo { .. }
         | SearchItem::Artist { .. }
         | SearchItem::Album { .. }
         | SearchItem::Playlist { .. } => None,
@@ -986,7 +1009,10 @@ pub fn is_starred(
             favorites.is_starred(&path.to_string_lossy())
         }
         SearchItem::Song { id, .. } => remote_starred.contains(id),
-        SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => false,
+        SearchItem::Silence { .. }
+        | SearchItem::Artist { .. }
+        | SearchItem::Album { .. }
+        | SearchItem::Playlist { .. } => false,
     }
 }
 /// The album page a song belongs to. A `Song` carries its album's
@@ -1883,7 +1909,9 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 SearchItem::Song { album, client, .. } => {
                     album_page(&core.app.corpus, album, client)
                 }
-                SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => None,
+                SearchItem::LocalMusic { .. }
+                | SearchItem::LocalVideo { .. }
+                | SearchItem::Silence { .. } => None,
             };
             match page {
                 Some(page) => {
@@ -3046,6 +3074,56 @@ mod seam_tests {
         r.deliver(before, Intent::Back, test_songs(2));
         r.deliver(before, Intent::Front, test_songs(4));
         assert!(r.poll().is_none());
+    }
+
+    /// The two measured facts `silence_url` rests on, against a real
+    /// mpv, so an mpv or ffmpeg upgrade cannot quietly change either.
+    ///
+    /// `#[ignore]` per the repo convention for anything needing mpv
+    /// (~400ms to spawn): `cargo test --lib seam -- --ignored`.
+    #[test]
+    #[ignore]
+    fn mpv_loads_a_silence_but_misreports_its_length() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        // never the user's speakers, same as the other mpv test here.
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let _ = player.set_property("vo", serde_json::json!("null"));
+
+        player
+            .load_file(&silence_url(600))
+            .expect("mpv accepts the lavfi source as a file");
+
+        // it has to actually become the playing file, not merely be
+        // accepted: a source mpv fails to open would leave the queue
+        // holding an entry that never plays.
+        let mut loaded = false;
+        for _ in 0..50 {
+            if player
+                .get_property("audio-codec-name")
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .is_some()
+            {
+                loaded = true;
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(40));
+        }
+        assert!(loaded, "the silence never became the playing file");
+
+        // the lie, pinned. mpv reports ~1s whatever `d` says, at every
+        // spelling tried, which is why anything drawing the length of
+        // a silence must read `Silence { secs }` instead.
+        let reported = player
+            .get_property("duration")
+            .ok()
+            .and_then(|v| v.as_f64())
+            .expect("a duration is reported, it is just wrong");
+        assert!(
+            reported < 600.0 * 0.5,
+            "mpv reported {reported}s for a 600s silence; if this now \
+             matches, the scrubber may read mpv's duration again"
+        );
     }
 
     fn empty_cache() -> Arc<Mutex<CacheIndex>> {

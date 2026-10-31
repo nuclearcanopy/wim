@@ -9,6 +9,7 @@ use crate::anim;
 use crate::favorites::Favorites;
 use crate::search::{group_boundaries, Category, SearchItem};
 use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK};
+use crate::ui::progress::fmt_span;
 use crate::ui::textfit::truncate_with_ellipsis;
 
 /// One rendered row: either a section header or an actual result,
@@ -100,12 +101,17 @@ pub(crate) fn kind_code(item: &SearchItem) -> char {
         SearchItem::Artist { .. } => 'a',
         SearchItem::Album { .. } => 'l',
         SearchItem::Playlist { .. } => 'p',
+        // 'z' for a silence: alphabetic like the rest, and the one
+        // letter nobody reads as a media kind.
+        SearchItem::Silence { .. } => 'z',
     }
 }
 
-/// 'n' for navidrome (remote), 'f' for file (local).
+/// 'n' for navidrome (remote), 'f' for file (local), 'g' for generated
+/// (a silence, which came from neither).
 pub(crate) fn source_code(item: &SearchItem) -> char {
     match item {
+        SearchItem::Silence { .. } => 'g',
         SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => 'f',
         SearchItem::Artist { .. }
         | SearchItem::Album { .. }
@@ -132,6 +138,7 @@ pub fn label(item: &SearchItem) -> String {
             ..
         } => format!("{title} · {artist} ({album})"),
         SearchItem::Playlist { name, .. } => name.clone(),
+        SearchItem::Silence { secs } => format!("silence · {}", fmt_span(*secs)),
     }
 }
 
@@ -149,6 +156,11 @@ fn row_label(item: &SearchItem, hovered: bool) -> String {
         SearchItem::Album { name, .. } => name.clone(),
         SearchItem::Song { title, .. } => title.clone(),
         SearchItem::Playlist { name, .. } => name.clone(),
+        // the one row that keeps its metadata unhovered. for every
+        // other item the title is the identity and the artist is
+        // decoration; for a silence the *duration* is the identity,
+        // and a column of bare "silence" rows would be unreadable.
+        SearchItem::Silence { .. } => label(item),
     }
 }
 
@@ -161,7 +173,10 @@ fn is_starred(item: &SearchItem, favorites: &Favorites, remote_starred: &HashSet
             favorites.is_starred(&path.to_string_lossy())
         }
         SearchItem::Song { id, .. } => remote_starred.contains(id),
-        SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => false,
+        SearchItem::Silence { .. }
+        | SearchItem::Artist { .. }
+        | SearchItem::Album { .. }
+        | SearchItem::Playlist { .. } => false,
     }
 }
 

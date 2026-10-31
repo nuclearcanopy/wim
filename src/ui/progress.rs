@@ -5,6 +5,30 @@
 
 use crate::ui::textfit::width;
 
+/// A span as spoken rather than clocked: "15m", "1h30m", "1m30s".
+///
+/// Distinct from `fmt_time`, which is a *position* in a track and
+/// wants fixed-width `m:ss` so the scrubber never shifts. A span is a
+/// length someone chose ("put a 15m pause in my queue") and reads
+/// better in the units they chose it in; it is also never adjacent to
+/// a scrubber, so it has no alignment to keep.
+pub fn fmt_span(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let mut out = String::new();
+    if h > 0 {
+        out.push_str(&format!("{h}h"));
+    }
+    if m > 0 {
+        out.push_str(&format!("{m}m"));
+    }
+    // a bare "0s" for zero, rather than an empty string that would
+    // read as a missing field.
+    if s > 0 || out.is_empty() {
+        out.push_str(&format!("{s}s"));
+    }
+    out
+}
+
 pub fn fmt_time(secs: Option<f64>) -> String {
     match secs {
         Some(s) => {
@@ -38,6 +62,19 @@ pub fn readouts(elapsed_secs: Option<f64>, duration_secs: Option<f64>) -> (Strin
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_span_reads_in_the_units_it_was_chosen_in() {
+        use super::fmt_span;
+        assert_eq!(fmt_span(900), "15m");
+        assert_eq!(fmt_span(10), "10s");
+        assert_eq!(fmt_span(90), "1m30s");
+        assert_eq!(fmt_span(3600), "1h");
+        assert_eq!(fmt_span(5400), "1h30m");
+        assert_eq!(fmt_span(3661), "1h1m1s");
+        // not an empty string, which would read as a missing field.
+        assert_eq!(fmt_span(0), "0s");
+    }
+
     use super::*;
 
     #[test]

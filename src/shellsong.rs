@@ -50,6 +50,9 @@ pub enum Kind {
     Artist,
     Playlist,
     Video,
+    /// Never resolved from a search term (no silence is in the
+    /// corpus); reachable only by asking a queue entry what it is.
+    Silence,
 }
 
 impl Kind {
@@ -63,6 +66,7 @@ impl Kind {
             SearchItem::Artist { .. } => Kind::Artist,
             SearchItem::Playlist { .. } => Kind::Playlist,
             SearchItem::LocalVideo { .. } => Kind::Video,
+            SearchItem::Silence { .. } => Kind::Silence,
         }
     }
 
@@ -73,6 +77,7 @@ impl Kind {
             Kind::Artist => "artist",
             Kind::Playlist => "playlist",
             Kind::Video => "video",
+            Kind::Silence => "silence",
         }
     }
 }

@@ -39,6 +39,11 @@ use crate::subsonic::Client;
 pub enum Kind {
     Local,
     Remote,
+    /// A timed silence. Has neither a path nor a server, so it is the
+    /// one kind `kind()`'s pre-kinds inference can never guess; a
+    /// queue holding one is only loadable because the discriminant is
+    /// written explicitly now.
+    Silence,
 }
 
 /// Why an entry in a saved queue did not come back, so the caller can
@@ -132,6 +137,11 @@ pub struct Entry {
     /// infers it then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<Kind>,
+    /// A silence's length. `None` for every other kind, and absent
+    /// from the toml for them, so an existing saved queue is byte
+    /// identical to what it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secs: Option<u64>,
 }
 
 impl Entry {
@@ -259,7 +269,11 @@ fn rebuild(saved: &SavedQueue, clients: &[Arc<Client>]) -> Loaded {
             None => out.dropped.push(match entry.kind() {
                 Some(Kind::Local) => Dropped::Moved(entry.label()),
                 Some(Kind::Remote) => Dropped::ServerGone(entry.label()),
-                None => Dropped::Unrecognised(entry.label()),
+                // a silence always rebuilds (it needs nothing from
+                // the filesystem or a server), so this is
+                // unreachable; grouped with the unknown kind rather
+                // than claiming a reason it cannot have.
+                Some(Kind::Silence) | None => Dropped::Unrecognised(entry.label()),
             }),
         }
     }
@@ -290,6 +304,14 @@ fn entry_of(item: &SearchItem) -> Option<Entry> {
             kind: Some(Kind::Local),
             ..Entry::default()
         }),
+        // saved rather than dropped: a silence is part of the shape of
+        // a queue, and losing it on save would reorder what plays.
+        SearchItem::Silence { secs } => Some(Entry {
+            title: "silence".to_string(),
+            kind: Some(Kind::Silence),
+            secs: Some(*secs),
+            ..Entry::default()
+        }),
         SearchItem::Song {
             id,
             title,
@@ -314,6 +336,14 @@ fn entry_of(item: &SearchItem) -> Option<Entry> {
 /// knows how to classify a file; a remote song needs its server to
 /// still be connected, since the client is what builds a stream url.
 fn item_of(entry: &Entry, clients: &[Arc<Client>]) -> Option<SearchItem> {
+    // checked before the path, because a silence has no path and
+    // would otherwise fall through to the remote branch and fail on a
+    // missing server.
+    if entry.kind == Some(Kind::Silence) {
+        return Some(SearchItem::Silence {
+            secs: entry.secs.unwrap_or_default(),
+        });
+    }
     if let Some(path) = &entry.path {
         return crate::persistence::item_from_path(path);
     }
@@ -354,6 +384,41 @@ mod tests {
         assert_eq!(entry.path.as_deref(), Some("/music/hex.flac"));
         assert_eq!(entry.artist, "bladee");
         assert!(entry.server.is_none());
+    }
+
+    /// A silence is part of the shape of a queue, so saving one and
+    /// loading it back has to give the same queue; dropping it would
+    /// silently reorder what plays.
+    #[test]
+    fn a_silence_round_trips_through_an_entry() {
+        let entry = entry_of(&SearchItem::Silence { secs: 900 }).expect("a silence is savable");
+        assert_eq!(entry.kind, Some(Kind::Silence));
+        assert_eq!(entry.secs, Some(900));
+        assert!(
+            entry.path.is_none() && entry.server.is_none(),
+            "a silence has neither"
+        );
+
+        let back = item_of(&entry, &[]).expect("and loads with no clients at all");
+        assert!(matches!(back, SearchItem::Silence { secs: 900 }));
+    }
+
+    /// The compatibility half: a silence adds no keys to an entry that
+    /// is not one, so every queue saved before this is byte identical.
+    #[test]
+    fn secs_is_absent_from_a_track_entry() {
+        let item = SearchItem::LocalMusic {
+            path: PathBuf::from("/music/hex.flac"),
+            title: "hex".into(),
+            artist: None,
+            album: None,
+        };
+        let entry = entry_of(&item).expect("a local track is one track");
+        let toml = toml::to_string(&SavedQueue {
+            entries: vec![entry],
+        })
+        .expect("serialises");
+        assert!(!toml.contains("secs"), "{toml}");
     }
 
     #[test]
