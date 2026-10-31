@@ -45,7 +45,6 @@ use wim::search::SearchItem;
 use wim::shellsong::{Console, ConsoleAction, ViewTarget};
 use wim::shellsong_host::{CorpusCandidates, Ramp, SearchSettle, SleepStep};
 use wim::theme::{shade, NEAR_BLACK};
-use wim::ui::albumart::AsciiArt;
 use wim::ui::banner::Banner;
 use wim::ui::browse::BrowseListView;
 use wim::ui::controlsbar::{
@@ -623,19 +622,6 @@ const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(45);
 /// sweep that always runs once at startup; cheap local filesystem
 /// work, not worth its own background thread the way network sync is.
 const CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
-
-/// How often the frame pump pulls a fresh frame from mpv; each pull is
-/// an IPC round-trip plus a base64 decode, all of it on the pump's own
-/// thread, so this only sets how smooth the pane looks, never whether
-/// the UI stalls.
-const VIDEO_FRAME_INTERVAL: Duration = Duration::from_millis(150);
-
-/// Longest edge the pump scales a captured frame down to, or `None` for
-/// the source resolution. `None` today because the pane's rasterizer
-/// averages over every source pixel, and changing that changes what is
-/// drawn; the knob is here for the renderer being built on `perf/art`,
-/// which will want the frame already near its cell grid.
-const VIDEO_FRAME_MAX_EDGE: Option<u32> = None;
 
 fn now_playing_is_video(now_playing: &Option<SearchItem>) -> bool {
     matches!(now_playing, Some(SearchItem::LocalVideo { .. }))
@@ -1610,7 +1596,6 @@ fn main() -> anyhow::Result<()> {
     // playing or a capture hasn't landed yet. 'v' expands its pane
     // from main_content to the whole workspace (sidebar included),
     // never the bottom bar.
-    let mut video_frame: Option<std::sync::Arc<image::DynamicImage>> = None;
     // 'v': hands the whole terminal to mpv, which draws the video with
     // a terminal video output of its own while wim stops drawing
     // entirely. `video_vo` is the vo mpv is drawing with *right now*
@@ -1620,11 +1605,6 @@ fn main() -> anyhow::Result<()> {
     let mut video_fullscreen = false;
     let mut video_vo: Option<video::Vo> = None;
     let mut video_geometry: (u16, u16) = (0, 0);
-    // captures and decodes frames on its own thread and its own ipc
-    // connection, so the render path only ever reads the newest one
-    // (see `mpv::FramePump`).
-    let frame_pump = player.frame_pump().ok();
-    let mut video_frames_unsupported = false;
     // full keybind reference, opened with '?'; takes over the whole
     // screen the same way onboarding/the nav manager do.
     let mut help_open = false;
@@ -2492,24 +2472,16 @@ fn main() -> anyhow::Result<()> {
                 results_rect,
             );
 
-            if show_full_player && now_playing_is_video(&now_playing) {
-                // the video pane itself: rendered through the same
-                // ascii/halfblock pipeline as album art rather than
-                // leaving it to mpv's own window (see
-                // `mpv::screenshot_raw`/`VIDEO_FRAME_INTERVAL` above).
-                // no level meter here; it'd just be noise over a
-                // picture that's already moving.
-                f.render_widget(
-                    AsciiArt {
-                        image: video_frame.as_deref(),
-                        cell_aspect: aspect,
-                        // the video pane stays monochrome with the rest
-                        // of the ui; album art is the one exception.
-                        tone: ui::raster::Tone::Mono,
-                    },
-                    main_content,
-                );
-            } else if show_full_player {
+            // a video file gets the ordinary player (title, scrubber,
+            // controls) when ratatui is drawing at all. it used to get
+            // its own branch rasterizing a frame pulled off mpv, which
+            // **could never produce one**: `screenshot-raw` does not
+            // work over json ipc, and mpv draws video with its own
+            // terminal vo now. `draw_unless_video` means this only
+            // runs when mpv is *not* drawing (`video_output = "off"`,
+            // or mid-handover), where that branch painted an empty
+            // rect instead of the player.
+            if show_full_player {
                 let item = now_playing.as_ref().expect("show_full_player implies Some");
                 let previous_label = previous_track.as_ref().map(label);
                 let next_label = play_queue.peek_next().map(label);
@@ -3186,29 +3158,6 @@ fn main() -> anyhow::Result<()> {
                         scrobble.scrobbled = true;
                     }
                 }
-            }
-        }
-
-        // pulling a frame regardless of whether the video pane is
-        // actually on screen right now would be wasted IPC/decode
-        // work the moment it's covered by the browse view or help
-        // overlay; only bother while it'd actually be visible.
-        if let Some(pump) = &frame_pump {
-            pump.set_capture(mpv::Capture {
-                on: now_playing_is_video(&now_playing) && !help_open,
-                interval: VIDEO_FRAME_INTERVAL,
-                max_edge: VIDEO_FRAME_MAX_EDGE,
-            });
-            video_frame = pump.latest().map(|f| f.image);
-            // said once per session: this mpv cannot hand frames over
-            // json ipc at all, so the pane would otherwise just stay
-            // empty with no explanation.
-            if pump.state() == mpv::PumpState::Unsupported && !video_frames_unsupported {
-                video_frames_unsupported = true;
-                notifications.push(
-                    Severity::Alert,
-                    "video frames: this mpv won't return screenshot-raw over ipc",
-                );
             }
         }
 
