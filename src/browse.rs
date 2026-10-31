@@ -876,15 +876,15 @@ pub fn songs_to_items(songs: Vec<crate::subsonic::Song>, client: &Arc<Client>) -
         .collect()
 }
 
-// `pub(crate)` purely so `ui::browse`'s own render tests can reuse
-// these fixtures instead of keeping a second copy of them.
-#[cfg(test)]
-pub(crate) mod tests {
+/// Fixtures shared across crates, so not `#[cfg(test)]`: the `wim`
+/// binary's own tests build `SearchItem`s and `BrowseView`s too, and a
+/// bin crate cannot see a test-gated module in the library.
+pub mod fixtures {
     use super::*;
 
     /// A client that never talks to anything; remote `SearchItem`s all
     /// carry one, and building it is offline (no ping on construct).
-    pub(crate) fn test_client() -> Arc<Client> {
+    pub fn test_client() -> Arc<Client> {
         Arc::new(
             Client::new(&crate::config::NavidromeConfig {
                 url: "https://example.invalid".into(),
@@ -898,7 +898,7 @@ pub(crate) mod tests {
         )
     }
 
-    pub(crate) fn test_songs(n: usize) -> Vec<SearchItem> {
+    pub fn test_songs(n: usize) -> Vec<SearchItem> {
         let client = test_client();
         (0..n)
             .map(|i| SearchItem::Song {
@@ -911,7 +911,7 @@ pub(crate) mod tests {
             .collect()
     }
 
-    pub(crate) fn test_view(tracks: Vec<SearchItem>) -> BrowseView {
+    pub fn test_view(tracks: Vec<SearchItem>) -> BrowseView {
         BrowseView {
             title: "album".to_string(),
             subtitle: String::new(),
@@ -930,6 +930,14 @@ pub(crate) mod tests {
             loading: false,
         }
     }
+}
+
+// re-exported under the old path so `ui::browse`'s render tests and
+// this module's own keep reaching them the way they always did.
+#[cfg(test)]
+pub(crate) mod tests {
+    pub(crate) use super::fixtures::{test_client, test_songs, test_view};
+    use super::*;
 
     /// An opened album and the same album's tracks playing from the
     /// player have to reach one key, or each fetches the cover

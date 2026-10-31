@@ -114,7 +114,7 @@ pub(crate) fn source_code(item: &SearchItem) -> char {
     }
 }
 
-pub(crate) fn label(item: &SearchItem) -> String {
+pub fn label(item: &SearchItem) -> String {
     // "·" (middle dot), not an em dash, for title/artist metadata
     // separators; same convention most music apps use.
     match item {
