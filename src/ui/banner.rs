@@ -1,3 +1,4 @@
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use ratatui::buffer::Buffer;
@@ -29,17 +30,44 @@ const LOGO: &[&str] = &[
     r" ╚══╝╚══╝ ╚═╝╚═╝     ╚═╝",
 ];
 
+/// Codepoints figlet/toilet line art is built from: ascii, box
+/// drawing, block elements, braille. Every one is a single cell and
+/// none has an emoji presentation, which is what the logo grid below
+/// assumes when it paints one char per cell in one shade.
+fn is_line_art(ch: char) -> bool {
+    ch.is_ascii() || matches!(ch as u32, 0x2500..=0x257F | 0x2580..=0x259F | 0x2800..=0x28FF)
+}
+
+/// The alternatives `<`/`>` can reach. Two of `LOGOS`' 178 entries are
+/// not line art and are dropped here: `toilet: circle` draws circled
+/// capitals, and U+24C2 Ⓜ has an emoji presentation, so an emoji font
+/// paints it coloured and often double width against a monochrome ui
+/// (exactly the hazard `controlsbar`'s glyph alphabet exists for, and
+/// one `unicode-width` calls a single cell, so no width assertion
+/// catches it); `toilet: wideterm` draws fullwidth forms, two cells
+/// each, which the one-cell-per-char grid overlaps into each other.
+/// Filtered rather than deleted from the generated table, which says
+/// not to hand-edit it and would bring both back on the next
+/// regeneration.
+static ALTERNATIVES: LazyLock<Vec<&'static (&'static str, &'static [&'static str])>> =
+    LazyLock::new(|| {
+        LOGOS
+            .iter()
+            .filter(|(_, lines)| lines.iter().all(|l| l.chars().all(is_line_art)))
+            .collect()
+    });
+
 /// 1 (the default) plus every alternative; `logo_index` cycles
 /// `0..logo_count()`.
 pub fn logo_count() -> usize {
-    1 + LOGOS.len()
+    1 + ALTERNATIVES.len()
 }
 
 pub fn logo_lines(index: usize) -> &'static [&'static str] {
     if index == 0 {
         LOGO
     } else {
-        LOGOS[index - 1].1
+        ALTERNATIVES[index - 1].1
     }
 }
 
@@ -49,13 +77,13 @@ pub fn logo_lines(index: usize) -> &'static [&'static str] {
 /// list is ever regenerated with different fonts in a different
 /// order).
 pub fn logo_name(index: usize) -> Option<&'static str> {
-    (index != 0).then(|| LOGOS[index - 1].0)
+    (index != 0).then(|| ALTERNATIVES[index - 1].0)
 }
 
 pub fn logo_index_for_name(name: Option<&str>) -> usize {
     match name {
         None => 0,
-        Some(name) => LOGOS
+        Some(name) => ALTERNATIVES
             .iter()
             .position(|(n, _)| *n == name)
             .map(|i| i + 1)
@@ -99,7 +127,10 @@ impl Widget for Banner<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let lines = logo_lines(self.logo_index);
         let glyph_height = lines.len() as u16;
-        let total_width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+        // display width, like every other measurement on this screen;
+        // `is_line_art` keeps the two measures equal for the art the
+        // picker can reach, and this does not depend on that holding.
+        let total_width = lines.iter().map(|l| width(l)).max().unwrap_or(0) as u16;
         let start_x = area.x + area.width.saturating_sub(total_width) / 2;
 
         // logo, one gap row, the menu.
@@ -196,7 +227,8 @@ fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: ratatui::style::Color)
 }
 
 /// Menu rows only. The logo grid above keeps its own loop on purpose:
-/// it is figlet art, one cell per char by construction.
+/// it is figlet art, one cell per char, which `is_line_art` enforces
+/// rather than assumes.
 fn draw_left(
     buf: &mut Buffer,
     area: Rect,
@@ -241,6 +273,62 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The grid paints one char per cell in one shade, so every logo
+    /// the picker can reach has to be art that survives that: one cell
+    /// per char, and no codepoint an emoji font would take over.
+    #[test]
+    fn every_logo_the_picker_can_reach_is_one_cell_per_char_line_art() {
+        for index in 0..logo_count() {
+            let name = logo_name(index).unwrap_or("default");
+            for line in logo_lines(index) {
+                assert_eq!(
+                    width(line),
+                    line.chars().count(),
+                    "{name:?} has a wide glyph in {line:?}"
+                );
+                for ch in line.chars() {
+                    assert!(is_line_art(ch), "{name:?} draws U+{:04X}", ch as u32);
+                }
+            }
+        }
+    }
+
+    /// The test with teeth for the emoji half of that: U+24C2 Ⓜ is one
+    /// cell by `unicode-width` and an emoji font still paints it
+    /// coloured, so only naming the codepoints that are allowed catches
+    /// it. Both entries stay in the generated table on purpose; what is
+    /// asserted is that the picker cannot land on them.
+    #[test]
+    fn the_two_entries_that_are_not_line_art_are_unreachable() {
+        for name in ["toilet: circle", "toilet: wideterm"] {
+            assert!(
+                LOGOS.iter().any(|(n, _)| *n == name),
+                "{name:?} is gone from the generated table, so this test is stale"
+            );
+            assert!(
+                !(0..logo_count()).any(|i| logo_name(i) == Some(name)),
+                "{name:?} is reachable from the picker"
+            );
+            // a config still naming one falls back to the default
+            // rather than to whichever logo took its index.
+            assert_eq!(logo_index_for_name(Some(name)), 0);
+        }
+        // and nothing else was dropped along with them.
+        assert_eq!(logo_count(), LOGOS.len() - 1);
+    }
+
+    /// A name persisted in config.toml has to come back as the same
+    /// logo, which is why the index is not what is stored.
+    #[test]
+    fn every_reachable_name_round_trips_through_the_index() {
+        for index in 1..logo_count() {
+            let name = logo_name(index).expect("every alternative is named");
+            assert_eq!(logo_index_for_name(Some(name)), index, "{name:?}");
+        }
+        assert_eq!(logo_index_for_name(None), 0);
+        assert_eq!(logo_name(0), None);
     }
 
     #[test]
