@@ -1,24 +1,25 @@
-//! Image to half-block cells: the one rasterizer behind album art and
-//! anything else that paints a picture in a cell grid.
+//! Image to block-glyph cells: the one rasterizer behind album art
+//! and anything else that paints a picture in a cell grid.
 //!
-//! The upper half block (U+2580) carries two luma samples per cell,
-//! foreground for the top sub-row and background for the bottom, so a
-//! `w x h` cell rect samples a `w x 2h` grid: twice the vertical
-//! resolution a full block gives for the same cells.
+//! The sixteen 2x2 quadrant glyphs (U+2580..U+259F) carry four luma
+//! samples per cell, grouped into the two colours a terminal cell can
+//! hold, so a `w x h` cell rect samples a `2w x 2h` grid: twice the
+//! resolution on *both* axes that a full block would give.
 //!
 //! Nothing here assumes the source is a static cover, and it is built
 //! to stand up at video frame rates over a big grid: the source is
 //! read as one contiguous slice rather than through `get_pixel`, the
 //! luma grid and the tap table are kept and resized in place rather
-//! than allocated per call, and the work per output sample is bounded
-//! instead of averaging the full-resolution source per cell. See
-//! docs/raster.md.
+//! than allocated per call, the work per output sample is bounded
+//! instead of averaging the full-resolution source per cell, and a
+//! cell's glyph is cloned from a prebuilt `Cell` rather than rebuilt
+//! as a `CompactString`. See docs/raster.md.
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use image::DynamicImage;
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
@@ -48,11 +49,10 @@ const SAMPLES_Y: u32 = 2;
 /// same block as the half-block this used to draw with, so a font that
 /// could render the old output can render this.
 ///
-/// Already-encoded `&str` rather than `char`, because `paint` hands
-/// them to `Cell::set_symbol`: `set_char` re-encodes to utf-8 per
-/// cell, and the glyph write is a third of the per-cell cost (see
-/// `probe_paint_floor`). `every_quadrant_is_one_block_glyph` keeps the
-/// table honest.
+/// Already-encoded `&'static str` rather than `char`: the glyph write
+/// is most of the per-cell cost (see `probe_paint_floor`), so `paint`
+/// goes through `QUADRANT_CELLS`, which these build at compile time.
+/// `every_quadrant_is_one_block_glyph` keeps the table honest.
 const QUADRANTS: [&str; 16] = [
     "\u{2588}", // 0000 all background, drawn as a solid in the bg shade
     "\u{2598}", // 0001 upper left
@@ -71,6 +71,59 @@ const QUADRANTS: [&str; 16] = [
     "\u{259f}", // 1110 all but upper left
     "\u{2588}", // 1111 full block
 ];
+
+/// The same sixteen glyphs as whole `Cell`s, built at compile time.
+///
+/// `Cell::set_symbol` rebuilds the cell's `CompactString` from a
+/// `&str` of runtime length: a 24-byte zero-init plus a `memcpy` call,
+/// which measured 8.9 of `paint`'s 13.8 ns/cell. Cloning an inline
+/// `CompactString` is `ptr::read` of those 24 bytes with no call, so
+/// `put` clones one of these instead, at 1.4 ns/cell.
+///
+/// A `static` and not a `const`: a `const` of a type with a `Drop`
+/// impl is materialized at each use site, so indexing one built all
+/// sixteen cells on the stack per call and dropped fifteen, which
+/// measured *slower* than `set_symbol`. The table has to stay in step
+/// with `QUADRANTS`; `the_cell_table_is_the_glyph_table` checks it.
+static QUADRANT_CELLS: [Cell; 16] = [
+    Cell::new(QUADRANTS[0]),
+    Cell::new(QUADRANTS[1]),
+    Cell::new(QUADRANTS[2]),
+    Cell::new(QUADRANTS[3]),
+    Cell::new(QUADRANTS[4]),
+    Cell::new(QUADRANTS[5]),
+    Cell::new(QUADRANTS[6]),
+    Cell::new(QUADRANTS[7]),
+    Cell::new(QUADRANTS[8]),
+    Cell::new(QUADRANTS[9]),
+    Cell::new(QUADRANTS[10]),
+    Cell::new(QUADRANTS[11]),
+    Cell::new(QUADRANTS[12]),
+    Cell::new(QUADRANTS[13]),
+    Cell::new(QUADRANTS[14]),
+    Cell::new(QUADRANTS[15]),
+];
+
+/// One painted cell: the glyph for `mask` plus its two colours.
+///
+/// Cell-for-cell what `set_symbol` then `set_fg` then `set_bg` wrote,
+/// which means carrying over the fields a glyph write does not touch:
+/// the modifier, the underline colour and `skip`. The test
+/// `painting_keeps_the_fields_a_glyph_write_leaves_alone` pins that,
+/// since writing the whole cell from a template is exactly the way to
+/// lose them.
+#[inline]
+fn put(cell: &mut Cell, mask: usize, fg: Color, bg: Color) {
+    let mut next = QUADRANT_CELLS[mask].clone();
+    // `style()` carries the modifier and the underline colour without
+    // naming the latter, so this stands up to ratatui's
+    // `underline-color` feature being off.
+    next.set_style(cell.style());
+    next.skip = cell.skip;
+    next.fg = fg;
+    next.bg = bg;
+    *cell = next;
+}
 
 /// Sharpen strength at `SHARPEN_REF_SPAN` samples across, scaled
 /// inversely with resolution by `sharpen_amount`.
@@ -115,6 +168,26 @@ pub enum Tone {
 pub struct Style {
     pub fit: Fit,
     pub tone: Tone,
+}
+
+/// Whether a resample runs the unsharp mask over the grid it sampled.
+///
+/// `On` for anything scaled *down*, which is every cover: each output
+/// sample is a box average over many source pixels, so it lands
+/// softer than the picture is and the pass puts the definition back.
+///
+/// `Off` is for a source that already is the grid's size, where there
+/// is no box average to compensate for. `framesource::Grid` asks mpv
+/// for exactly `2cols x 2rows` pixels, so its `Fit::Stretch` is a 1:1
+/// copy and the pass is pure cost there: ~6 ns per sample, which at
+/// one sample per source pixel is most of what a video frame costs
+/// (see `probe_paint_floor`'s 1:1 line). Off is not the same picture,
+/// so it is the caller's call, never inferred from the geometry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Sharpen {
+    #[default]
+    On,
+    Off,
 }
 
 /// How the image is mapped onto the cell rect.
@@ -189,14 +262,14 @@ fn rgb_luma(p: &[u8]) -> u32 {
     (54 * p[0] as u32 + 183 * p[1] as u32 + 19 * p[2] as u32) >> 8
 }
 
-/// A reusable half-block rasterizer. Owns its scratch buffers, so
+/// A reusable quadrant rasterizer. Owns its scratch buffers, so
 /// rasterizing the same grid again (the next video frame, the next
 /// render of a cover) allocates nothing.
 #[derive(Debug, Default)]
 pub struct Raster {
-    /// Luma per half-cell, row-major over sub-rows, `cols * rows * 2`
-    /// long. Sub-row `2r` is cell row `r`'s foreground, `2r + 1` its
-    /// background.
+    /// Luma per sample, row-major over sub-rows, `cols * rows * 4`
+    /// long and `cols * 2` wide. Sub-row `2r` holds cell row `r`'s
+    /// upper two quadrants, `2r + 1` its lower two.
     luma: Vec<u8>,
     cols: u16,
     rows: u16,
@@ -207,7 +280,7 @@ pub struct Raster {
     /// not already been rewritten. Reused, like every other buffer
     /// here, so a frame still allocates nothing.
     flat: Vec<u8>,
-    /// Rgb per half-cell, parallel to `luma`, and empty unless the
+    /// Rgb per sample, parallel to `luma`, and empty unless the
     /// last `sample` asked for `Tone::Color`; a mono rasterization
     /// pays nothing for it. `luma` is kept either way: it is what
     /// picks the glyph and drives the sharpen pass.
@@ -220,10 +293,24 @@ impl Raster {
         Self::default()
     }
 
+    /// `sample_with` and the unsharp pass on, which is what every
+    /// downscale wants; a caller handing over a source that is already
+    /// the grid's size says so with `Sharpen::Off`.
+    pub fn sample(&mut self, img: &DynamicImage, area: Rect, cell_aspect: f32, style: Style) {
+        self.sample_with(img, area, cell_aspect, style, Sharpen::On);
+    }
+
     /// Samples `img` into the half-cell grid for an `area`-shaped cell
     /// rect. `area`'s position is ignored here (only `paint` needs
     /// it), so the same sampling is reusable wherever it lands.
-    pub fn sample(&mut self, img: &DynamicImage, area: Rect, cell_aspect: f32, style: Style) {
+    pub fn sample_with(
+        &mut self,
+        img: &DynamicImage,
+        area: Rect,
+        cell_aspect: f32,
+        style: Style,
+        sharpen: Sharpen,
+    ) {
         self.cols = area.width;
         self.rows = area.height;
         self.tone = style.tone;
@@ -243,10 +330,10 @@ impl Raster {
         if samples == 0 {
             return;
         }
-        match Pixels::of(img) {
+        let filled = match Pixels::of(img) {
             Some(px) => {
                 self.fill(&px, cell_aspect, style);
-                self.sharpen();
+                true
             }
             None => {
                 // not 8 bits per channel (a 16-bit or float png).
@@ -258,19 +345,31 @@ impl Raster {
                 if style.tone == Tone::Color {
                     let rgb = img.to_rgb8();
                     let (w, h) = rgb.dimensions();
-                    if let Some(px) = Pixels::new(rgb.as_raw(), w, h, 3, false) {
-                        self.fill(&px, cell_aspect, style);
-                        self.sharpen();
+                    match Pixels::new(rgb.as_raw(), w, h, 3, false) {
+                        Some(px) => {
+                            self.fill(&px, cell_aspect, style);
+                            true
+                        }
+                        None => false,
                     }
                 } else {
                     let lum = img.to_luma8();
                     let (w, h) = lum.dimensions();
-                    if let Some(px) = Pixels::new(lum.as_raw(), w, h, 1, true) {
-                        self.fill(&px, cell_aspect, style);
-                        self.sharpen();
+                    match Pixels::new(lum.as_raw(), w, h, 1, true) {
+                        Some(px) => {
+                            self.fill(&px, cell_aspect, style);
+                            true
+                        }
+                        None => false,
                     }
                 }
             }
+        };
+        // an unfillable source leaves the grid black, and sharpening a
+        // flat grid is its fixed point anyway; skipping it there keeps
+        // the two `Sharpen` settings identical on that path.
+        if filled && sharpen == Sharpen::On {
+            self.sharpen();
         }
     }
 
@@ -360,68 +459,23 @@ impl Raster {
             }
         }
 
-        let count = taps_x * taps_y;
-        let taps_x = taps_x as usize;
-
-        for oy in 0..oh {
-            let (s0, s1) = span(oy, oh, px.h);
-            // the source rows this output row averages, resolved once
-            // as slices. summing per output sample rather than per
-            // source row keeps the accumulator in registers; the old
-            // shape read-modify-wrote a `Vec` slot per tap, and that
-            // dependency through memory was most of a tap's cost.
-            let mut rows: [&[u8]; MAX_TAPS as usize] = [&[]; MAX_TAPS as usize];
-            for (t, slot) in rows.iter_mut().enumerate().take(taps_y as usize) {
-                let y = (s0 + (s1 - s0) * t as u32 / taps_y).min(px.h - 1);
-                *slot = &px.data[y as usize * px.stride..][..px.stride];
-            }
-            let rows = &rows[..taps_y as usize];
-            let base = (off_y + oy) as usize * grid_w as usize + off_x as usize;
-            if colour {
-                for (ox, taps) in xs.chunks_exact(taps_x).enumerate() {
-                    let mut s = [0u32; 3];
-                    for row in rows {
-                        for &dx in taps {
-                            let p = &row[dx as usize..dx as usize + 3];
-                            s[0] += p[0] as u32;
-                            s[1] += p[1] as u32;
-                            s[2] += p[2] as u32;
-                        }
-                    }
-                    // luma derived from the averaged rgb rather than
-                    // accumulated beside it: `rgb_luma` is linear in
-                    // the channels, so this is the same number the
-                    // mono path computes, and the two grids cannot
-                    // disagree.
-                    let p = [
-                        div_taps(s[0], count) as u8,
-                        div_taps(s[1], count) as u8,
-                        div_taps(s[2], count) as u8,
-                    ];
-                    rgb[base + ox] = p;
-                    luma[base + ox] = rgb_luma(&p) as u8;
-                }
-            } else if px.gray {
-                for (ox, taps) in xs.chunks_exact(taps_x).enumerate() {
-                    let mut s = 0u32;
-                    for row in rows {
-                        for &dx in taps {
-                            s += row[dx as usize] as u32;
-                        }
-                    }
-                    write_luma(luma, rgb, base + ox, div_taps(s, count) as u8);
-                }
-            } else {
-                for (ox, taps) in xs.chunks_exact(taps_x).enumerate() {
-                    let mut s = 0u32;
-                    for row in rows {
-                        for &dx in taps {
-                            s += rgb_luma(&row[dx as usize..dx as usize + 3]);
-                        }
-                    }
-                    write_luma(luma, rgb, base + ox, div_taps(s, count) as u8);
-                }
-            }
+        let plan = Plan {
+            oh,
+            off_x,
+            off_y,
+            grid_w,
+            taps_y,
+            count: taps_x * taps_y,
+            colour,
+        };
+        // the one runtime value the inner loop's trip count depends
+        // on, turned into a type parameter so the four taps unroll
+        // (`MAX_TAPS` instantiations, picked here once per resample).
+        match taps_x {
+            1 => fill_taps::<1>(luma, rgb, xs, px, &plan),
+            2 => fill_taps::<2>(luma, rgb, xs, px, &plan),
+            3 => fill_taps::<3>(luma, rgb, xs, px, &plan),
+            _ => fill_taps::<4>(luma, rgb, xs, px, &plan),
         }
     }
 
@@ -476,20 +530,21 @@ impl Raster {
                     // from the rgb grid, so averaging luma for them
                     // was work thrown away.
                     let mask = mask_of([t[0], t[1], b[0], b[1]]);
-                    cell.set_symbol(QUADRANTS[mask]);
                     // the same split the mask made, applied to the
                     // cell's own rgb: the glyph and the two colours
                     // are then describing one grouping, not two.
                     let (f, b) = group_rgb(mask, [tc[0], tc[1], bc[0], bc[1]]);
-                    cell.set_fg(Color::Rgb(f[0], f[1], f[2]));
-                    cell.set_bg(Color::Rgb(b[0], b[1], b[2]));
+                    put(
+                        cell,
+                        mask,
+                        Color::Rgb(f[0], f[1], f[2]),
+                        Color::Rgb(b[0], b[1], b[2]),
+                    );
                 }
             } else {
                 for (cell, (t, b)) in row.iter_mut().zip(tops.iter().zip(bots)) {
                     let (mask, fg, bg) = quantize([t[0], t[1], b[0], b[1]]);
-                    cell.set_symbol(QUADRANTS[mask]);
-                    cell.set_fg(shades[fg as usize]);
-                    cell.set_bg(shades[bg as usize]);
+                    put(cell, mask, shades[fg as usize], shades[bg as usize]);
                 }
             }
         }
@@ -504,7 +559,21 @@ impl Raster {
         style: Style,
         buf: &mut Buffer,
     ) {
-        self.sample(img, area, cell_aspect, style);
+        self.render_with(img, area, cell_aspect, style, Sharpen::On, buf);
+    }
+
+    /// `render` with the unsharp pass spelled out. `Sharpen::Off` is
+    /// for a source already the size of the grid; see `Sharpen`.
+    pub fn render_with(
+        &mut self,
+        img: &DynamicImage,
+        area: Rect,
+        cell_aspect: f32,
+        style: Style,
+        sharpen: Sharpen,
+        buf: &mut Buffer,
+    ) {
+        self.sample_with(img, area, cell_aspect, style, sharpen);
         self.paint(area, buf);
     }
 }
@@ -736,6 +805,97 @@ fn place(
     (ow, oh, (grid_w - ow) / 2, (grid_h - oh) / 2)
 }
 
+/// Where the image lands in the sample grid and how many taps an
+/// output sample averages: the part of a resample `fill` works out
+/// once and `fill_taps` only reads.
+struct Plan {
+    oh: u32,
+    off_x: u32,
+    off_y: u32,
+    grid_w: u32,
+    taps_y: u32,
+    count: u32,
+    colour: bool,
+}
+
+/// The tap loop. `TX` is the horizontal tap count as a type parameter
+/// rather than a value, so the innermost loop has a known trip count
+/// and unrolls; `fill` picks one of `MAX_TAPS` instantiations once per
+/// resample. `the_tap_loop_specialises_without_changing_the_grid`
+/// pins every instantiation against the runtime-count shape.
+fn fill_taps<const TX: usize>(
+    luma: &mut [u8],
+    rgb: &mut [[u8; 3]],
+    xs: &[u32],
+    px: &Pixels,
+    plan: &Plan,
+) {
+    // one chunk per output column, each `TX` byte offsets long. the
+    // remainder is always empty: `fill` pushed exactly `ow * TX`.
+    let xs = xs.as_chunks::<TX>().0;
+    let count = plan.count;
+    for oy in 0..plan.oh {
+        let (s0, s1) = span(oy, plan.oh, px.h);
+        // the source rows this output row averages, resolved once
+        // as slices. summing per output sample rather than per
+        // source row keeps the accumulator in registers; the old
+        // shape read-modify-wrote a `Vec` slot per tap, and that
+        // dependency through memory was most of a tap's cost.
+        let mut rows: [&[u8]; MAX_TAPS as usize] = [&[]; MAX_TAPS as usize];
+        for (t, slot) in rows.iter_mut().enumerate().take(plan.taps_y as usize) {
+            let y = (s0 + (s1 - s0) * t as u32 / plan.taps_y).min(px.h - 1);
+            *slot = &px.data[y as usize * px.stride..][..px.stride];
+        }
+        let rows = &rows[..plan.taps_y as usize];
+        let base = (plan.off_y + oy) as usize * plan.grid_w as usize + plan.off_x as usize;
+        if plan.colour {
+            for (ox, taps) in xs.iter().enumerate() {
+                let mut s = [0u32; 3];
+                for row in rows {
+                    for &dx in taps {
+                        let p = &row[dx as usize..dx as usize + 3];
+                        s[0] += p[0] as u32;
+                        s[1] += p[1] as u32;
+                        s[2] += p[2] as u32;
+                    }
+                }
+                // luma derived from the averaged rgb rather than
+                // accumulated beside it: `rgb_luma` is linear in
+                // the channels, so this is the same number the
+                // mono path computes, and the two grids cannot
+                // disagree.
+                let p = [
+                    div_taps(s[0], count) as u8,
+                    div_taps(s[1], count) as u8,
+                    div_taps(s[2], count) as u8,
+                ];
+                rgb[base + ox] = p;
+                luma[base + ox] = rgb_luma(&p) as u8;
+            }
+        } else if px.gray {
+            for (ox, taps) in xs.iter().enumerate() {
+                let mut s = 0u32;
+                for row in rows {
+                    for &dx in taps {
+                        s += row[dx as usize] as u32;
+                    }
+                }
+                write_luma(luma, rgb, base + ox, div_taps(s, count) as u8);
+            }
+        } else {
+            for (ox, taps) in xs.iter().enumerate() {
+                let mut s = 0u32;
+                for row in rows {
+                    for &dx in taps {
+                        s += rgb_luma(&row[dx as usize..dx as usize + 3]);
+                    }
+                }
+                write_luma(luma, rgb, base + ox, div_taps(s, count) as u8);
+            }
+        }
+    }
+}
+
 /// One grid slot: the luma level, plus the same level as a grey in
 /// the rgb grid when there is one. A grey source asked for in colour
 /// still has to fill that grid, with the grey itself.
@@ -770,6 +930,10 @@ struct Sampled {
     /// Bitwise, since this is an identity check and not a measurement.
     aspect: u32,
     style: Style,
+    /// Part of the key, not a side setting: the two settings sample
+    /// different grids, so a hit under the other one would hand back a
+    /// picture the caller did not ask for.
+    sharpen: Sharpen,
 }
 
 /// A `Raster` plus what it was last sampled from, so a picture that
@@ -785,20 +949,33 @@ struct Sampled {
 /// cache is already invalidated by.
 ///
 /// Invalidated by any change to the key, the target size, the cell
-/// aspect or the style. Worst-case staleness is unbounded in *time* and
-/// zero in content: an entry lives until one of those changes, and
-/// while none of them has changed there is nothing new to compute.
+/// aspect, the style or the unsharp setting. Worst-case staleness is
+/// unbounded in *time* and zero in content: an entry lives until one
+/// of those changes, and while none of them has changed there is
+/// nothing new to compute.
 #[derive(Debug, Default)]
 pub struct Memo {
     raster: Raster,
     /// `None` before the first sample, i.e. always a miss.
     last: Option<Sampled>,
+    /// State rather than a `render` argument: that call is already at
+    /// clippy's argument limit, which is why `Style` exists. It is
+    /// still part of the key, so flipping it resamples.
+    sharpen: Sharpen,
 }
 
 impl Memo {
-    /// Samples `img` only if `key`, the rect's size, `cell_aspect` or
-    /// `style` differ from the last call, then paints. Returns whether
-    /// it had to resample, which is what the tests assert on.
+    /// The unsharp setting every later `render` samples with. Part of
+    /// the key, so flipping it invalidates rather than handing back
+    /// the other setting's grid.
+    pub fn set_sharpen(&mut self, sharpen: Sharpen) {
+        self.sharpen = sharpen;
+    }
+
+    /// Samples `img` only if `key`, the rect's size, `cell_aspect`,
+    /// `style` or the unsharp setting differ from the last call, then
+    /// paints. Returns whether it had to resample, which is what the
+    /// tests assert on.
     pub fn render(
         &mut self,
         key: &str,
@@ -809,6 +986,7 @@ impl Memo {
         buf: &mut Buffer,
     ) -> bool {
         let aspect = cell_aspect.to_bits();
+        let sharpen = self.sharpen;
         // compared field by field rather than against a built
         // `Sampled`, so a hit (the common case, every frame) does not
         // allocate a copy of the key just to throw it away.
@@ -818,15 +996,18 @@ impl Memo {
                 && l.height == area.height
                 && l.aspect == aspect
                 && l.style == style
+                && l.sharpen == sharpen
         });
         if resampled {
-            self.raster.sample(img, area, cell_aspect, style);
+            self.raster
+                .sample_with(img, area, cell_aspect, style, sharpen);
             self.last = Some(Sampled {
                 key: key.to_string(),
                 width: area.width,
                 height: area.height,
                 aspect,
                 style,
+                sharpen,
             });
         }
         self.raster.paint(area, buf);
@@ -993,6 +1174,60 @@ mod tests {
         }
     }
 
+    /// `paint` with the glyph written by `Cell::set_symbol`, verbatim
+    /// as it stood before `QUADRANT_CELLS`: everything else about the
+    /// loop is the current code, so a head to head against it measures
+    /// the glyph write and nothing else, and a `Buffer` comparison
+    /// against it is the whole output-identical claim.
+    fn legacy_paint(r: &Raster, area: Rect, buf: &mut Buffer) {
+        let vis = area.intersection(buf.area);
+        if vis.is_empty() || r.cols == 0 || r.rows == 0 {
+            return;
+        }
+        let colour = r.tone == Tone::Color && r.rgb.len() == r.luma.len();
+        let shades = shades();
+        let grid_w = r.cols as usize * 2;
+        let buf_w = buf.area.width as usize;
+        let first_col = (vis.x - area.x) as usize;
+        for y in vis.y..vis.y + vis.height {
+            let cell_row = (y - area.y) as usize;
+            if cell_row >= r.rows as usize {
+                break;
+            }
+            let top = cell_row * 2 * grid_w;
+            let bottom = top + grid_w;
+            let start = (y - buf.area.y) as usize * buf_w + (vis.x - buf.area.x) as usize;
+            let cells = (vis.width as usize).min((r.cols as usize).saturating_sub(first_col));
+            if cells == 0 {
+                continue;
+            }
+            let row = &mut buf.content[start..start + cells];
+            let gx = first_col * 2;
+            let span = cells * 2;
+            let tops = r.luma[top + gx..top + gx + span].as_chunks::<2>().0;
+            let bots = r.luma[bottom + gx..bottom + gx + span].as_chunks::<2>().0;
+            if colour {
+                let trgb = r.rgb[top + gx..top + gx + span].as_chunks::<2>().0;
+                let brgb = r.rgb[bottom + gx..bottom + gx + span].as_chunks::<2>().0;
+                let samples = tops.iter().zip(bots).zip(trgb.iter().zip(brgb));
+                for (cell, ((t, b), (tc, bc))) in row.iter_mut().zip(samples) {
+                    let mask = mask_of([t[0], t[1], b[0], b[1]]);
+                    cell.set_symbol(QUADRANTS[mask]);
+                    let (f, b) = group_rgb(mask, [tc[0], tc[1], bc[0], bc[1]]);
+                    cell.set_fg(Color::Rgb(f[0], f[1], f[2]));
+                    cell.set_bg(Color::Rgb(b[0], b[1], b[2]));
+                }
+            } else {
+                for (cell, (t, b)) in row.iter_mut().zip(tops.iter().zip(bots)) {
+                    let (mask, fg, bg) = quantize([t[0], t[1], b[0], b[1]]);
+                    cell.set_symbol(QUADRANTS[mask]);
+                    cell.set_fg(shades[fg as usize]);
+                    cell.set_bg(shades[bg as usize]);
+                }
+            }
+        }
+    }
+
     /// The pre-optimisation `fill`, verbatim: byte offsets in `xs` and
     /// a three-byte sub-slice per tap. Kept for the same reason
     /// `reference_paint` is, and because the two have to be timed
@@ -1082,6 +1317,141 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// `fill` with the tap count a runtime value, verbatim as it stood
+    /// before `fill_taps` was a const generic: the geometry and the
+    /// accumulators are the current code, so a head to head against it
+    /// measures the specialisation and nothing else.
+    fn legacy_fill(r: &mut Raster, px: &Pixels, cell_aspect: f32, style: Style) {
+        let Raster {
+            luma,
+            cols,
+            rows,
+            xs,
+            rgb,
+            ..
+        } = r;
+        let colour = style.tone == Tone::Color && !px.gray;
+        let grid_w = *cols as u32 * SAMPLES_X;
+        let grid_h = *rows as u32 * SAMPLES_Y;
+        let (ow, oh, off_x, off_y) = place(px.w, px.h, grid_w, grid_h, cell_aspect, style.fit);
+        if ow == 0 || oh == 0 {
+            return;
+        }
+        let taps_x = px.w.div_ceil(ow).clamp(1, MAX_TAPS);
+        let taps_y = px.h.div_ceil(oh).clamp(1, MAX_TAPS);
+        xs.clear();
+        xs.reserve(ow as usize * taps_x as usize);
+        for ox in 0..ow {
+            let (s0, s1) = span(ox, ow, px.w);
+            for t in 0..taps_x {
+                let x = (s0 + (s1 - s0) * t / taps_x).min(px.w - 1);
+                xs.push(x * px.step as u32);
+            }
+        }
+        let count = taps_x * taps_y;
+        let taps_x = taps_x as usize;
+        for oy in 0..oh {
+            let (s0, s1) = span(oy, oh, px.h);
+            let mut rows: [&[u8]; MAX_TAPS as usize] = [&[]; MAX_TAPS as usize];
+            for (t, slot) in rows.iter_mut().enumerate().take(taps_y as usize) {
+                let y = (s0 + (s1 - s0) * t as u32 / taps_y).min(px.h - 1);
+                *slot = &px.data[y as usize * px.stride..][..px.stride];
+            }
+            let rows = &rows[..taps_y as usize];
+            let base = (off_y + oy) as usize * grid_w as usize + off_x as usize;
+            if colour {
+                for (ox, taps) in xs.chunks_exact(taps_x).enumerate() {
+                    let mut s = [0u32; 3];
+                    for row in rows {
+                        for &dx in taps {
+                            let p = &row[dx as usize..dx as usize + 3];
+                            s[0] += p[0] as u32;
+                            s[1] += p[1] as u32;
+                            s[2] += p[2] as u32;
+                        }
+                    }
+                    let p = [
+                        div_taps(s[0], count) as u8,
+                        div_taps(s[1], count) as u8,
+                        div_taps(s[2], count) as u8,
+                    ];
+                    rgb[base + ox] = p;
+                    luma[base + ox] = rgb_luma(&p) as u8;
+                }
+            } else if px.gray {
+                for (ox, taps) in xs.chunks_exact(taps_x).enumerate() {
+                    let mut s = 0u32;
+                    for row in rows {
+                        for &dx in taps {
+                            s += row[dx as usize] as u32;
+                        }
+                    }
+                    write_luma(luma, rgb, base + ox, div_taps(s, count) as u8);
+                }
+            } else {
+                for (ox, taps) in xs.chunks_exact(taps_x).enumerate() {
+                    let mut s = 0u32;
+                    for row in rows {
+                        for &dx in taps {
+                            s += rgb_luma(&row[dx as usize..dx as usize + 3]);
+                        }
+                    }
+                    write_luma(luma, rgb, base + ox, div_taps(s, count) as u8);
+                }
+            }
+        }
+    }
+
+    /// Every `fill_taps` instantiation fills the grid the one runtime
+    /// loop did. The sizes are picked to hit each horizontal tap count
+    /// `MAX_TAPS` allows, since a wrong `as_chunks` width would only
+    /// show up at the one it got wrong; `tap_counts_cover_the_range`
+    /// asserts the coverage rather than trusting the arithmetic here.
+    #[test]
+    fn the_tap_loop_specialises_without_changing_the_grid() {
+        let hues = hued(97, 61);
+        let lum = DynamicImage::ImageLuma8(hues.to_luma8());
+        for img in [&hues, &lum] {
+            let px = Pixels::of(img).expect("8 bits per channel");
+            for tone in [Tone::Mono, Tone::Color] {
+                for fit in [Fit::Contain, Fit::Stretch] {
+                    for (w, h) in [(49u16, 25u16), (26, 13), (20, 10), (13, 7), (7, 3), (1, 1)] {
+                        let style = Style { fit, tone };
+                        let rect = Rect::new(0, 0, w, h);
+                        let mut want = Raster::new();
+                        want.sample(img, rect, 2.0, style);
+                        legacy_fill(&mut want, &px, 2.0, style);
+                        let mut got = Raster::new();
+                        got.sample(img, rect, 2.0, style);
+                        got.fill(&px, 2.0, style);
+                        assert_eq!(
+                            got.luma, want.luma,
+                            "{tone:?} {fit:?} {w}x{h} luma grid differs"
+                        );
+                        assert_eq!(got.rgb, want.rgb, "{tone:?} {fit:?} {w}x{h} rgb grid differs");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The sizes above really do exercise every tap count, so the
+    /// comparison is not quietly running one instantiation six times.
+    #[test]
+    fn tap_counts_cover_the_range() {
+        let mut seen = [false; MAX_TAPS as usize + 1];
+        for (w, h) in [(49u16, 25u16), (26, 13), (20, 10), (13, 7), (7, 3), (1, 1)] {
+            let grid_w = w as u32 * SAMPLES_X;
+            let grid_h = h as u32 * SAMPLES_Y;
+            let (ow, _, _, _) = place(97, 61, grid_w, grid_h, 2.0, Fit::Stretch);
+            seen[97u32.div_ceil(ow).clamp(1, MAX_TAPS) as usize] = true;
+        }
+        // index 0 is unreachable: a tap count is clamped to at least 1.
+        for (taps, hit) in seen.iter().enumerate().skip(1) {
+            assert!(hit, "no case samples with {taps} taps across");
         }
     }
 
@@ -1209,6 +1579,59 @@ mod tests {
             "the upper half is the glyph this module started as"
         );
         assert_eq!(QUADRANTS[0b0011].chars().next(), Some(HALF_BLOCK));
+    }
+
+    /// The cell table is the glyph table, and nothing else: `paint`
+    /// clones these instead of writing `QUADRANTS[mask]`, so a slipped
+    /// entry would draw the wrong quadrant with nothing else noticing.
+    #[test]
+    fn the_cell_table_is_the_glyph_table() {
+        for (mask, glyph) in QUADRANTS.iter().enumerate() {
+            let cell = &QUADRANT_CELLS[mask];
+            assert_eq!(cell.symbol(), *glyph, "cell {mask} is not its glyph");
+            assert_eq!(cell.fg, Color::Reset, "cell {mask} carries a colour");
+            assert_eq!(cell.bg, Color::Reset, "cell {mask} carries a colour");
+            assert_eq!(cell.modifier, ratatui::style::Modifier::empty());
+            assert!(!cell.skip);
+        }
+    }
+
+    /// A glyph write replaces the symbol and nothing else, so painting
+    /// over a decorated cell has to leave its modifier, its underline
+    /// colour and its `skip` alone. `put` writes the whole cell from a
+    /// template, which is exactly the way to lose them; this is the
+    /// same `Buffer` comparison as `painting_is_cell_for_cell_what_it
+    /// _replaced`, over cells that are not freshly blank.
+    #[test]
+    fn painting_keeps_the_fields_a_glyph_write_leaves_alone() {
+        use ratatui::style::Modifier;
+        let decorate = |buf: &mut Buffer| {
+            for (i, cell) in buf.content.iter_mut().enumerate() {
+                cell.modifier = if i % 3 == 0 {
+                    Modifier::BOLD | Modifier::ITALIC
+                } else {
+                    Modifier::DIM
+                };
+                cell.skip = i % 2 == 0;
+                cell.underline_color = Color::Indexed(5);
+            }
+        };
+        for tone in [Tone::Mono, Tone::Color] {
+            let style = Style {
+                fit: Fit::Contain,
+                tone,
+            };
+            let rect = Rect::new(1, 1, 9, 5);
+            let mut r = Raster::new();
+            r.sample(&hued(64, 48), rect, 2.0, style);
+            let mut want = buffer(12, 8);
+            decorate(&mut want);
+            legacy_paint(&r, rect, &mut want);
+            let mut got = buffer(12, 8);
+            decorate(&mut got);
+            r.paint(rect, &mut got);
+            assert_eq!(got, want, "{tone:?} lost what a glyph write preserves");
+        }
     }
 
     /// `div_small` replaces a hardware divide in the per-cell loop, so
@@ -1899,36 +2322,31 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// Two implementations timed in one process, batches alternating,
+    /// `N` implementations timed in one process, batches alternating,
     /// minimum each. Sequential before/after runs are not a
     /// measurement on this machine: back-to-back runs of the *same*
     /// binary came out 1.6x apart while other builds ran, which is
     /// larger than most of what is being measured. Alternating makes
-    /// both see the same machine, and the minimum then means
-    /// something.
+    /// every variant see the same machine, and the minimum then means
+    /// something. Same shape as `ui::player::bench::best_each`.
     #[cfg(test)]
-    fn head_to_head<T>(
+    fn best_each<const N: usize>(
         batches: u32,
         n: u32,
-        target: &mut T,
-        mut new: impl FnMut(&mut T),
-        mut old: impl FnMut(&mut T),
-    ) -> (std::time::Duration, std::time::Duration) {
+        mut f: impl FnMut(usize),
+    ) -> [std::time::Duration; N] {
         use std::time::{Duration, Instant};
-        let (mut a, mut b) = (Duration::MAX, Duration::MAX);
+        let mut best = [Duration::MAX; N];
         for _ in 0..batches {
-            let t = Instant::now();
-            for _ in 0..n {
-                new(target);
+            for (i, slot) in best.iter_mut().enumerate() {
+                let t = Instant::now();
+                for _ in 0..n {
+                    f(i);
+                }
+                *slot = (*slot).min(t.elapsed() / n);
             }
-            a = a.min(t.elapsed() / n);
-            let t = Instant::now();
-            for _ in 0..n {
-                old(target);
-            }
-            b = b.min(t.elapsed() / n);
         }
-        (a, b)
+        best
     }
 
     /// Numbers for the report, not a pass/fail gate; `cargo test
@@ -2002,23 +2420,28 @@ mod tests {
                 };
                 let mut r = Raster::new();
                 r.sample(&img, rect, 2.0, style);
-                // one closure per implementation taking the buffer as
-                // an argument, since both want it mutably.
-                let (each, was) = head_to_head(
-                    6,
-                    200,
-                    &mut buf,
-                    |b| r.paint(rect, b),
-                    |b| reference_paint(&r, rect, b),
-                );
+                // three implementations, batches alternating: the
+                // current one, the same loop writing its glyph with
+                // `set_symbol`, and the pre-rewrite per-cell loop.
+                let [each, sym, was] = best_each::<3>(6, 200, |which| match which {
+                    0 => r.paint(rect, &mut buf),
+                    1 => legacy_paint(&r, rect, &mut buf),
+                    _ => reference_paint(&r, rect, &mut buf),
+                });
                 let cells = w as u32 * h as u32;
                 let per = |d: std::time::Duration| d.as_nanos() as f64 / cells as f64;
+                let x = |d: std::time::Duration| {
+                    d.as_secs_f64() / each.as_secs_f64().max(f64::MIN_POSITIVE)
+                };
                 println!(
                     "{w}x{h} {tone:?}: paint {each:>10.3?} ({:>5.2} ns/cell)  \
-                     was {was:>10.3?} ({:>5.2} ns/cell)  {:.2}x",
+                     set_symbol {sym:>10.3?} ({:>5.2} ns/cell, {:.2}x)  \
+                     was {was:>10.3?} ({:>5.2} ns/cell, {:.2}x)",
                     per(each),
+                    per(sym),
+                    x(sym),
                     per(was),
-                    was.as_secs_f64() / each.as_secs_f64().max(f64::MIN_POSITIVE)
+                    x(was),
                 );
             }
         }
@@ -2047,17 +2470,34 @@ mod tests {
         let per = |d: std::time::Duration| d.as_nanos() as f64 / cells as f64;
 
         let whole = best(5, 200, || r.paint(rect, &mut buf));
-        // the glyph alone, and the two colours alone.
-        let glyph = best(5, 200, || {
-            for cell in buf.content.iter_mut() {
-                cell.set_char('\u{2588}');
+        // the glyph alone, four ways, batches alternating. `set_char`
+        // encodes to utf-8 first and `set_symbol` takes the encoded
+        // bytes, but both then build a `CompactString` from a `&str`
+        // of runtime length: a 24-byte zero-init plus a `memcpy` call.
+        // cloning a const `Cell` copies the inline repr outright, and
+        // `put` is that plus carrying over what a glyph write leaves
+        // alone.
+        let mask = std::hint::black_box(0b1011usize);
+        let [chr, symbol, cloned, glyph] = best_each::<4>(5, 200, |which| match which {
+            0 => {
+                for cell in buf.content.iter_mut() {
+                    cell.set_char('\u{2588}');
+                }
             }
-        });
-        // `set_char` encodes to utf-8 first; `set_symbol` takes the
-        // already-encoded bytes, and the glyph set here is fixed.
-        let symbol = best(5, 200, || {
-            for cell in buf.content.iter_mut() {
-                cell.set_symbol("\u{2588}");
+            1 => {
+                for cell in buf.content.iter_mut() {
+                    cell.set_symbol(QUADRANTS[mask]);
+                }
+            }
+            2 => {
+                for cell in buf.content.iter_mut() {
+                    *cell = QUADRANT_CELLS[mask].clone();
+                }
+            }
+            _ => {
+                for cell in buf.content.iter_mut() {
+                    put(cell, mask, Color::Indexed(7), Color::Indexed(0));
+                }
             }
         });
         let colours = best(5, 200, || {
@@ -2076,13 +2516,16 @@ mod tests {
             std::hint::black_box(acc);
         });
         println!(
-            "{w}x{h} mono: paint {:.2} ns/cell = glyph {:.2} (set_symbol {:.2}) \
-             + colours {:.2} + math {:.2}",
+            "{w}x{h} mono: paint {:.2} ns/cell = put {:.2} + math {:.2}  \
+             (colours alone {:.2}; glyph alone: set_char {:.2}, \
+             set_symbol {:.2}, clone {:.2})",
             per(whole),
             per(glyph),
-            per(symbol),
+            per(math),
             per(colours),
-            per(math)
+            per(chr),
+            per(symbol),
+            per(cloned),
         );
 
         // and the other half: `sample`, which the memo skips for a
@@ -2098,19 +2541,46 @@ mod tests {
             r.sample(&img, rect, 2.0, style);
             let whole = best(5, 100, || r.sample(&img, rect, 2.0, style));
             let sharpen = best(5, 100, || r.sharpen());
-            let (fill, was) = head_to_head(
-                6,
-                100,
-                &mut r,
-                |r| r.fill(&px, 2.0, style),
-                |r| reference_fill(r, &px, 2.0, style),
-            );
+            let [fill, runtime, was] = best_each::<3>(6, 100, |which| match which {
+                0 => r.fill(&px, 2.0, style),
+                1 => legacy_fill(&mut r, &px, 2.0, style),
+                _ => reference_fill(&mut r, &px, 2.0, style),
+            });
+            let x = |d: std::time::Duration| {
+                d.as_secs_f64() / fill.as_secs_f64().max(f64::MIN_POSITIVE)
+            };
             println!(
                 "{w}x{h} {tone:?}: sample {whole:>10.3?} = fill {fill:>10.3?} \
-                 (was {was:>10.3?}, {:.2}x) + sharpen {sharpen:>10.3?}",
-                was.as_secs_f64() / fill.as_secs_f64().max(f64::MIN_POSITIVE)
+                 (runtime taps {runtime:>10.3?} {:.2}x, row accumulator \
+                 {was:>10.3?} {:.2}x) + sharpen {sharpen:>10.3?}",
+                x(runtime),
+                x(was),
             );
         }
+
+        // the video path's shape: `framesource::Grid` asks mpv for
+        // exactly `2cols x 2rows` pixels, so `Fit::Stretch` is a 1:1
+        // copy, one tap per sample and no box average to compensate
+        // for. The unsharp pass is then most of a frame's resample.
+        let frame = DynamicImage::ImageRgb8(RgbImage::from_fn(w as u32 * 2, h as u32 * 2, |x, y| {
+            let v = ((x * 7 + y * 11) % 256) as u8;
+            Rgb([v, v.wrapping_add(40), 255 - v])
+        }));
+        let style = Style {
+            fit: Fit::Stretch,
+            tone: Tone::Mono,
+        };
+        let [on, off] = best_each::<2>(6, 200, |which| match which {
+            0 => r.sample_with(&frame, rect, 2.0, style, Sharpen::On),
+            _ => r.sample_with(&frame, rect, 2.0, style, Sharpen::Off),
+        });
+        println!(
+            "{w}x{h} 1:1 Mono: sample {on:>10.3?} ({:>5.2} ns/cell) -> \
+             {off:>10.3?} ({:>5.2} ns/cell) with the unsharp pass off, {:.2}x",
+            per(on),
+            per(off),
+            on.as_secs_f64() / off.as_secs_f64().max(f64::MIN_POSITIVE),
+        );
     }
 
     /// The cost the old sampler had, for the same cases, so the report
@@ -2233,6 +2703,73 @@ mod tests {
         );
         assert!(r.luma[3] < 60, "the dark side should darken");
         assert!(r.luma[4] > 200, "the bright side should brighten");
+    }
+
+    /// `Sharpen::Off` is exactly "the grid before the unsharp pass",
+    /// and the pass is really what the two differ by: a source already
+    /// the grid's size (the video path) has no box average to
+    /// compensate for, and the pass costs more there than the copy.
+    #[test]
+    fn sharpen_off_is_the_grid_before_the_pass() {
+        let rect = Rect::new(0, 0, 13, 7);
+        for (w, h) in [(26u32, 14u32), (320, 240), (1, 1)] {
+            let img = DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
+                let v = ((x * 37 + y * 53) % 256) as u8;
+                Rgb([v, v.wrapping_add(90), 255 - v])
+            }));
+            for tone in [Tone::Mono, Tone::Color] {
+                let style = Style {
+                    fit: Fit::Stretch,
+                    tone,
+                };
+                let mut off = Raster::new();
+                off.sample_with(&img, rect, 2.0, style, Sharpen::Off);
+                let mut on = Raster::new();
+                on.sample(&img, rect, 2.0, style);
+                if w > 1 {
+                    assert_ne!(
+                        off.luma, on.luma,
+                        "{tone:?} {w}x{h}: the pass changed nothing, so this proves nothing"
+                    );
+                }
+                // the rgb grid is never sharpened, in either setting.
+                assert_eq!(off.rgb, on.rgb, "{tone:?} {w}x{h}: rgb must not move");
+                off.sharpen();
+                assert_eq!(
+                    off.luma, on.luma,
+                    "{tone:?} {w}x{h}: off plus the pass is not on"
+                );
+            }
+        }
+    }
+
+    /// The unsharp setting is part of the memo's key: the two sample
+    /// different grids, so a hit under the other one would paint a
+    /// picture the caller did not ask for.
+    #[test]
+    fn the_memo_invalidates_on_a_new_sharpen_setting() {
+        let rect = Rect::new(0, 0, 8, 4);
+        let img = ramp(200, 200);
+        let mut buf = buffer(8, 4);
+        let mut m = Memo::default();
+        assert!(m.render("a:x", &img, rect, 2.0, mono(Fit::Stretch), &mut buf));
+        assert!(!m.render("a:x", &img, rect, 2.0, mono(Fit::Stretch), &mut buf));
+        m.set_sharpen(Sharpen::Off);
+        assert!(
+            m.render("a:x", &img, rect, 2.0, mono(Fit::Stretch), &mut buf),
+            "flipping the unsharp pass must resample"
+        );
+        assert!(
+            !m.render("a:x", &img, rect, 2.0, mono(Fit::Stretch), &mut buf),
+            "and then settle again"
+        );
+        // and it is the new setting's grid that got painted, not the
+        // old one's: the bool alone would pass with the flag ignored.
+        let mut want = buffer(8, 4);
+        let mut r = Raster::new();
+        r.sample_with(&img, rect, 2.0, mono(Fit::Stretch), Sharpen::Off);
+        r.paint(rect, &mut want);
+        assert_eq!(buf, want, "the memo painted the sharpened grid");
     }
 
     #[test]
