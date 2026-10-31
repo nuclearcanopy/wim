@@ -43,6 +43,25 @@ pub fn playable_path(item: &SearchItem) -> Option<String> {
     }
 }
 
+/// Play/pause, with the one case where it does not mean that.
+///
+/// During a between-track gap mpv is paused at the end of a track that
+/// has already finished, so unpausing resumes nothing: mpv would sit
+/// at the same end and immediately report it again. Pressing play
+/// there plainly means "get on with it", so the gap is dropped and the
+/// next track starts.
+///
+/// Shared so the keybind, the bar click and enter on the player cannot
+/// disagree; `activate_transport` is the one place that calls it.
+pub fn toggle_pause(player: &mpv::Mpv, between: &mut BetweenTracks) -> anyhow::Result<()> {
+    if between.holding() {
+        between.cancel();
+        player.playlist_next()?;
+        return player.set_pause(false);
+    }
+    player.toggle_pause()
+}
+
 /// What the host must do about the between-track gap this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GapAction {
@@ -1561,6 +1580,14 @@ pub struct CoreCtx<'a> {
     // volume, and everything that ramps it.
     pub base_volume: &'a mut f64,
     pub crossfade_enabled: &'a mut bool,
+    /// Seconds between tracks, live. `config::gap_seconds` is only the
+    /// value this starts at; `gap()` changes it for the session, the
+    /// same split `crossfade_enabled` already has.
+    pub gap_secs: &'a mut f64,
+    /// The gap currently being waited out, so `gap(off)` can drop a
+    /// hold instead of leaving it to expire, and play/pause can skip
+    /// one.
+    pub between_tracks: &'a mut BetweenTracks,
     pub fade_in_started_at: &'a mut Option<Instant>,
     /// `fade(in|out)`'s ramp; `sleep_due` is its deadline-driven
     /// cousin. Both reuse the crossfade ramp's shape rather than
@@ -1749,7 +1776,9 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             if core.now_playing.is_none() {
                 return op_fail("nothing is playing");
             }
-            op_ipc(core.player.toggle_pause())
+            // skips the rest of a gap rather than unpausing into a
+            // track that has already ended; see `core::toggle_pause`.
+            op_ipc(toggle_pause(core.player, core.between_tracks))
         }
         Op::SkipNext => {
             if core.now_playing.is_none() {
@@ -1877,6 +1906,20 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             };
             apply_eq_row(core.app, core.player, core.notifications, saved, row);
             op_done()
+        }
+        Op::SetGap(secs) => {
+            *core.gap_secs = secs.unwrap_or(0.0).max(0.0);
+            if *core.gap_secs == 0.0 {
+                // a gap being waited out right now is dropped rather
+                // than left to expire: "off" should mean off, not
+                // "off after this one".
+                core.between_tracks.cancel();
+                let _ = core.player.set_pause(false);
+            }
+            match secs {
+                Some(s) if *core.gap_secs > 0.0 => op_note(format!("{s}s between tracks")),
+                _ => op_note("no gap between tracks".to_string()),
+            }
         }
         Op::ToggleCrossfade => {
             *core.crossfade_enabled = !*core.crossfade_enabled;
@@ -2912,6 +2955,8 @@ mod seam_tests {
         _star_rx: mpsc::Receiver<StarFailed>,
         base_volume: f64,
         crossfade_enabled: bool,
+        gap_secs: f64,
+        between_tracks: BetweenTracks,
         fade_in_started_at: Option<Instant>,
         fade: Option<Ramp>,
         sleep_due: Option<Duration>,
@@ -2956,6 +3001,8 @@ mod seam_tests {
                 _star_rx: star_rx,
                 base_volume: 100.0,
                 crossfade_enabled: false,
+                gap_secs: 0.0,
+                between_tracks: BetweenTracks::new(),
                 fade_in_started_at: None,
                 fade: None,
                 sleep_due: None,
@@ -2994,6 +3041,8 @@ mod seam_tests {
                 track_resolver: &mut self.track_resolver,
                 base_volume: &mut self.base_volume,
                 crossfade_enabled: &mut self.crossfade_enabled,
+                gap_secs: &mut self.gap_secs,
+                between_tracks: &mut self.between_tracks,
                 fade_in_started_at: &mut self.fade_in_started_at,
                 fade: &mut self.fade,
                 sleep_due: &mut self.sleep_due,

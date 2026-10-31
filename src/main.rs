@@ -261,6 +261,9 @@ struct TransportCtx<'a> {
     /// frame by the loop rather than asked for again here.
     elapsed_secs: Option<f64>,
     duration_secs: Option<f64>,
+    /// So pressing play during a between-track gap skips the rest of
+    /// it instead of unpausing a track that has already ended.
+    between_tracks: &'a mut BetweenTracks,
 }
 
 /// The one place a transport control is acted on. Enter on the bottom
@@ -269,7 +272,7 @@ struct TransportCtx<'a> {
 /// same glyph; `controlsbar::Field` is the whole alphabet.
 fn activate_transport(field: Field, at: ScrubAt, ctx: &mut TransportCtx) {
     match field {
-        Field::Pause => match ctx.player.toggle_pause() {
+        Field::Pause => match wim::core::toggle_pause(ctx.player, ctx.between_tracks) {
             Ok(()) => *ctx.flash = Some((Field::Pause, Instant::now())),
             Err(e) => ctx
                 .notifications
@@ -1968,6 +1971,7 @@ fn main() -> anyhow::Result<()> {
     // cache is what makes evaluating it every frame free: mpv only
     // hears about it when the answer actually changes.
     let mut between_tracks = BetweenTracks::new();
+    let mut gap_secs = cfg.gap_seconds.max(0.0);
     let mut keep_open_held: Option<bool> = None;
     // shellsong's `fade(in|out)` ramp and `sleep(...)` deadline, both
     // off the same `start.elapsed()` clock `Env::now` carries so an op
@@ -2074,6 +2078,12 @@ fn main() -> anyhow::Result<()> {
         // reads this, so none of them can show a track mpv isn't
         // actually playing.
         let mut now_playing = play_queue.current().cloned();
+        // read before this frame's `tick` (which runs after the draw),
+        // so the countdown is at most one frame behind. it is a
+        // seconds-resolution readout, so that is invisible.
+        let gap_left = between_tracks
+            .remaining(Instant::now())
+            .map(|d| d.as_secs_f64());
         // mpv misreports a generated silence's length, so the entry is
         // asked first; see `core::playing_duration`.
         let duration_secs = playing_duration(now_playing.as_ref(), playback.duration_secs);
@@ -2550,6 +2560,7 @@ fn main() -> anyhow::Result<()> {
                     // screen while one plays. elapsed is the scrub
                     // target mid-drag, so the countdown follows a drag
                     // too rather than fighting it.
+                    gap_remaining: gap_left,
                     gap: match item {
                         SearchItem::Silence { secs } => Some(Gap {
                             remaining_secs: *secs as f64
@@ -2890,6 +2901,7 @@ fn main() -> anyhow::Result<()> {
                 eq_active: !eq::is_flat(&app.eq_gains),
                 crossfade_on: crossfade_enabled,
                 paused,
+                gap_remaining: gap_left,
                 // mid-drag the bar draws the pending target, not
                 // mpv's position: the seek is throttled, the
                 // keypress shouldn't look like it was.
@@ -3130,7 +3142,7 @@ fn main() -> anyhow::Result<()> {
         // quiet would take the end-of-playlist and loop-all handling
         // above with it. so it is only on while a gap is wanted *and*
         // something is queued after this track.
-        let gap = Duration::from_secs_f64(cfg.gap_seconds.max(0.0));
+        let gap = Duration::from_secs_f64(gap_secs.max(0.0));
         let more_to_play = play_queue.upcoming_len() > 0;
         let want_hold = !gap.is_zero() && more_to_play;
         if keep_open_held != Some(want_hold) {
@@ -3553,6 +3565,8 @@ fn main() -> anyhow::Result<()> {
                     track_resolver: &mut track_resolver,
                     base_volume: &mut base_volume,
                     crossfade_enabled: &mut crossfade_enabled,
+                    gap_secs: &mut gap_secs,
+                    between_tracks: &mut between_tracks,
                     fade_in_started_at: &mut fade_in_started_at,
                     fade: &mut shellsong_fade,
                     sleep_due: &mut sleep_due,
@@ -3675,6 +3689,10 @@ fn main() -> anyhow::Result<()> {
                 || browse_view.as_ref().is_some_and(|bv| bv.loading)
                 || (now_playing.is_some() && !player_minimized)
                 || scrub.is_some()
+                // a gap counts down on screen, and mpv is paused
+                // through it, so none of the playback-driven
+                // conditions above would keep the frame rate up.
+                || between_tracks.holding()
                 || input_mode == InputMode::Move
                 || flash.is_some_and(|(_, at)| at.elapsed() < FLASH_DURATION));
         let timeout = if animating {
@@ -3904,6 +3922,7 @@ fn main() -> anyhow::Result<()> {
                                     now_playing.as_ref(),
                                     playback.duration_secs,
                                 ),
+                                between_tracks: &mut between_tracks,
                             },
                         );
                     }
@@ -4828,6 +4847,7 @@ fn main() -> anyhow::Result<()> {
                                         now_playing.as_ref(),
                                         playback.duration_secs,
                                     ),
+                                    between_tracks: &mut between_tracks,
                                 },
                             );
                             continue;

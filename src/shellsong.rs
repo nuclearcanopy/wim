@@ -455,6 +455,10 @@ pub enum Op {
     RemoveFromQueue(Vec<usize>),
     GotoQueue(usize),
     ShuffleQueue,
+    /// The pause between tracks. `None` turns it off, which is why
+    /// this takes `Ty::Duration` where `silence` needed `Ty::Span`:
+    /// here `off` means something.
+    SetGap(Option<f64>),
     /// A timed silence in the queue. `front` inserts it next, matching
     /// `add_to_queue`'s position parameter rather than inventing a
     /// second way to say the same thing.
@@ -543,6 +547,8 @@ impl Op {
             Op::RemoveFromQueue(v) => format!("removed {} from the queue", v.len()),
             Op::GotoQueue(n) => format!("jumped to queue {n}"),
             Op::ShuffleQueue => "queue shuffled".into(),
+            Op::SetGap(Some(s)) => format!("gap {s}s between tracks"),
+            Op::SetGap(None) => "gap off".into(),
             Op::Silence { secs, front } => format!(
                 "{} a {} silence",
                 if *front { "inserted next" } else { "queued" },
@@ -1023,6 +1029,13 @@ pub const COMMANDS: &[Command] = &[
         &[opt("terms", Ty::Terms)],
         SONG,
         "append each term to the queue",
+    ),
+    cmd(
+        "gap",
+        &[],
+        &[req("between", Ty::Duration)],
+        &[],
+        "pause between every track: gap(10s), gap(off)",
     ),
     cmd(
         "silence",
@@ -2342,6 +2355,10 @@ impl Call {
                 _ => Op::ToggleShuffle,
             },
             "shuffle_queue" => Op::ShuffleQueue,
+            "gap" => match first {
+                Some(Arg::Duration(d)) => Op::SetGap(*d),
+                _ => return None,
+            },
             "silence" => match first {
                 // rounded to whole seconds: the lavfi source takes an
                 // integer and nobody queues a 1.5 second gap.
@@ -5692,6 +5709,12 @@ mod tests {
         // and then done nothing whatsoever.
         assert!(!error("silence(off)").message.is_empty());
         assert!(error("silence(0s)").message.contains("needs a length"));
+        // `gap` is the contrast: it takes `Ty::Duration`, where `off`
+        // is meaningful, because turning the gap off is a thing you
+        // want to say. `silence(off)` is not.
+        assert_eq!(ops("gap(10s)"), vec![Op::SetGap(Some(10.0))]);
+        assert_eq!(ops("gap(off)"), vec![Op::SetGap(None)]);
+        assert_eq!(ops("gap(1m30s)"), vec![Op::SetGap(Some(90.0))]);
         assert_eq!(ops("sleep(off)"), vec![Op::Sleep(None)]);
         assert_eq!(
             ops("fade(out, 10s)"),
@@ -7126,6 +7149,7 @@ queue(morning)
                 "forget",
                 "forward",
                 "fwd",
+                "gap",
                 "go",
                 "goto",
                 "grep",
@@ -7348,6 +7372,7 @@ queue(morning)
                 "forget",
                 "forward",
                 "fwd",
+                "gap",
                 "go",
                 "goto",
                 "grep",
@@ -7665,6 +7690,7 @@ queue(morning)
                 "forget",
                 "forward",
                 "fwd",
+                "gap",
                 "go",
                 "goto",
                 "grep",
