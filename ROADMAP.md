@@ -1342,6 +1342,32 @@ above this line in the shellswim section is done.
       looked at, not just tested: `controlsbar::tests::print_the_gap_bar`
       prints the bar both ways, which is how the spacing and the
       scrubber absorbing the three extra cells were checked.
+- [x] **clearing the queue was undone by loop-all.** `Op::ClearQueue`
+      went through `PlayQueue::replace_upcoming(vec![])`, which relays
+      the *same* session out again. that is right for a shuffle (mpv is
+      cleared and refilled with the same tracks) and wrong here,
+      because the session is what loop-all restarts from: with
+      `loop(all)` on, `clear_queue()` (or deleting rows with `d` in the
+      queue view, which never touched the session either) left
+      `drain_decision(0, All, false)` returning `Restart`, so
+      everything the user had just deleted came back the moment the
+      current track ended.
+      `clear_upcoming` and a `forget` helper now take the dropped
+      tracks out of the session. **already-played tracks stay**: the
+      user emptied the queue, not the history, so loop-all still
+      restarts from what actually played. and `forget` drops *one*
+      occurrence, because a track queued twice and deleted once is
+      still queued once.
+      three tests, three mutations: restoring `replace_upcoming`,
+      dropping the forget from `remove`, and making `forget` a
+      `retain` that takes every copy.
+      **`Op::RemoveFromQueue` also had the ordering backwards.** it
+      mutated `entries` and then asked mpv, so a refused
+      `playlist-remove` returned with the index map one shorter than
+      mpv's playlist, every later index off by one, and the cursor
+      clamp (which sits after the early return) never running. mpv
+      first now, which is the ordering `resync_upcoming` documents.
+      found by an audit, not by use; see the audit section below.
 - [ ] **`gap` is unverified end to end against real playback.** the
       mpv mechanism was measured on its own (hold, advance, unpause,
       and `idle-active` going quiet), and the state machine and both
