@@ -1416,18 +1416,30 @@ a measurement.
       with invented counts is not a repair anyone should make on
       someone else's behalf. see QUESTIONS.md.
 
-- [ ] **`Surface::queue_program` has no implementation in either
-      front-end**, found while fixing `go_to_previous`. the trait
-      default drops the ops. so every per-identity op `start_session`
-      hands over is silently discarded today for `play(x)`,
-      `Action::Play` and `Op::LoadQueue`, **while `identity_settings`
-      has already recorded them in `Overridden` as applied**: bind an
-      eq, type `eq(rock)` by hand, play an unbound track, and it
-      "restores" to the curve you replaced. that is exactly the
-      failure docs/undo.md warns about. both front-ends work only
-      because the advance and loop-all paths read `Started.ops` off the
-      return value directly. `WimSurface` now implements it (it had to,
-      for skip-back); **`SwimSurface` still does not.**
+- [x] **`Surface::queue_program` had no implementation in either
+      front-end.** the trait default *drops* the ops, which is the one
+      method whose default loses data rather than merely declining. so
+      every per-identity op `start_session` handed over was discarded
+      for `play(x)`, `Action::Play`, `Op::LoadQueue` and skip-back,
+      **while `identity_settings` had already recorded them in
+      `Overridden` as applied**: bind an eq, change it by hand, play an
+      unbound track, and it "restored" the curve that was replaced.
+      exactly the failure docs/undo.md warns about. both front-ends
+      only appeared to work because the advance and loop-all paths read
+      `Started.ops` off the return value directly.
+      `SwimSurface` holds the slot now and `Host::step` picks it up,
+      **with wim's `is_none()` guard rather than the host's old
+      unconditional assign**: a program the core queued starts only
+      once nothing else is running, so bound settings cannot cut short
+      something the user typed. the advance path at host.rs ~386 was
+      doing that assign and now goes through the same slot, so the two
+      routes cannot diverge again.
+      tested through the trait rather than the field, because the trait
+      default was the bug; mutation-checked both ways (restoring the
+      default, and queueing an empty program, which would run a no-op
+      frame on every unbound track change, i.e. almost all of them).
+      `Program`'s node count is private, so what the test asserts is
+      that the ops reach somewhere the host can see at all.
 - [ ] **`quantize` is now 73% of a mono painted cell** (5.8 of 7.8 ns),
       which is where the frame budget goes next: a midpoint, four
       compares and two reciprocal averages per cell. left alone on
