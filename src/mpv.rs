@@ -22,6 +22,7 @@ const OBS_DURATION: u64 = 4;
 const OBS_PAUSE: u64 = 5;
 const OBS_LEVEL_RMS: u64 = 6;
 const OBS_EOF_REACHED: u64 = 7;
+const OBS_MUTE: u64 = 8;
 
 /// How long any one blocking command waits for mpv's reply.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -41,6 +42,10 @@ pub const PROP_IDLE_ACTIVE: &str = "idle-active";
 pub const PROP_TIME_POS: &str = "time-pos";
 pub const PROP_DURATION: &str = "duration";
 pub const PROP_PAUSE: &str = "pause";
+/// mpv's own mute. Observed alongside `pause` because muted and
+/// "volume happens to be zero" are the same silence on screen, so the
+/// bar needs to be able to tell them apart.
+pub const PROP_MUTE: &str = "mute";
 /// True while mpv is sitting at the end of a file it has decided not
 /// to close, which only happens under `keep-open`. That is the hook
 /// the between-track gap hangs off: mpv stops *before* loading the
@@ -100,6 +105,7 @@ pub struct Playback {
     pub elapsed_secs: Option<f64>,
     pub duration_secs: Option<f64>,
     pub paused: bool,
+    pub muted: bool,
     /// mpv is holding at the end of a file under `keep-open`; see
     /// `PROP_EOF_REACHED`.
     pub eof_reached: bool,
@@ -120,6 +126,7 @@ impl Playback {
             // an absent `pause` means nothing is loaded, which reads
             // as not-paused everywhere downstream.
             PROP_PAUSE => self.paused = value.as_bool().unwrap_or(false),
+            PROP_MUTE => self.muted = value.as_bool().unwrap_or(false),
             // absent reads as "not at a held end", same as `pause`.
             PROP_EOF_REACHED => self.eof_reached = value.as_bool().unwrap_or(false),
             PROP_LEVEL_RMS => {
@@ -516,6 +523,7 @@ impl Mpv {
             (OBS_TIME_POS, PROP_TIME_POS),
             (OBS_DURATION, PROP_DURATION),
             (OBS_PAUSE, PROP_PAUSE),
+            (OBS_MUTE, PROP_MUTE),
             (OBS_LEVEL_RMS, PROP_LEVEL_RMS),
             (OBS_EOF_REACHED, PROP_EOF_REACHED),
         ]
