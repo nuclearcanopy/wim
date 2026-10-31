@@ -24,15 +24,15 @@ use wim::app::LoopMode;
 use wim::cache::CacheIndex;
 use wim::core::{
     append_resolved, apply_eq_gains, apply_eq_row, browse_session, client_for, current_eq_name,
-    current_volume, dispatch_action, drive, enqueue_track, eq_preset_names, fire_scrobble,
-    fire_subtitle_fetch, front_resolved, go_to_previous, identity_settings, load_playlist,
-    lyrics_query, note_playback_started, notify_query_changed, op_done, op_fail, op_note,
-    open_starred, print_listing, resync_upcoming, retain_live_clients, save_playback_state,
-    set_vid_for_item, shellsong_focus, spawn_background_search, start_session,
-    start_tracking_playback, suggestion_starred_keys, sweep_cache, toggle_star, trigger_downloads,
-    CoreCtx, Dispatch, DownloadCtx, Drive, Enqueue, EnqueueResolver, RemoteSearchOutcome,
-    RemoteSearchQuery, Report, ScrobbleState, SelectStep, SessionStart, StarFailed, SubtitleReady,
-    Surface, TrackChangeCtx,
+    current_volume, dispatch_action, download_resolved, download_tracks, drive, enqueue_track,
+    eq_preset_names, fire_scrobble, fire_subtitle_fetch, front_resolved, go_to_previous,
+    identity_settings, load_playlist, lyrics_query, note_playback_started, notify_query_changed,
+    op_done, op_fail, op_note, open_starred, print_listing, resync_upcoming, retain_live_clients,
+    save_playback_state, set_vid_for_item, shellsong_focus, spawn_background_search, start_session,
+    start_tracking_playback, suggestion_starred_keys, sweep_cache, toggle_star, CoreCtx, Dispatch,
+    DownloadCtx, Drive, Intent, RemoteSearchOutcome, RemoteSearchQuery, Report, Resolution,
+    ScrobbleState, SelectStep, SessionStart, StarFailed, SubtitleReady, Surface, TrackChangeCtx,
+    TrackResolver,
 };
 use wim::download::DownloadEvent;
 use wim::keymap::{KeyAction, Keymap};
@@ -1459,6 +1459,38 @@ fn eq_commit_name(
     }
 }
 
+/// `KeyAction::DownloadSelected`, for both the browse view and the
+/// sidebar, so the two cannot drift.
+///
+/// An album or artist expands through a network fan-out, so it goes to
+/// the resolver and the batch arrives in the drain; a single song
+/// starts downloading in this keypress.
+///
+/// Only speaks up when nothing started. Each started track pushes its
+/// own progress toast, so saying "downloading 3 track(s)" on top of
+/// three progress bars is noise, but "already cached" has nothing else
+/// to show it. Both of these sites used to discard the message, so
+/// asking to download something already on disk looked like a dead
+/// key.
+fn download_selected(
+    item: &SearchItem,
+    resolver: &mut TrackResolver,
+    dctx: &mut DownloadCtx,
+    notifications: &mut Notifications,
+) {
+    match resolver.request(item, Intent::Download) {
+        Resolution::Ready(tracks) => {
+            let done = download_tracks(&tracks, dctx, notifications);
+            if done.started == 0 {
+                notifications.push(Severity::Info, done.status);
+            }
+        }
+        Resolution::Fetching(label) => {
+            notifications.push(Severity::Info, format!("resolving {label}..."));
+        }
+    }
+}
+
 /// Whether this terminal could plausibly answer a graphics-capability
 /// query, so the probe is worth the stdin race it costs.
 ///
@@ -1691,7 +1723,7 @@ fn main() -> anyhow::Result<()> {
     // a refused star comes back here so the optimistic flip can be put
     // back; see `toggle_star`.
     let (star_tx, star_rx) = mpsc::channel::<StarFailed>();
-    let mut enqueue_resolver = EnqueueResolver::new();
+    let mut track_resolver = TrackResolver::new();
     // the shellsong console: ':' opens it, and while it is open it
     // claims every key and every paste (see its input tier, which sits
     // at the same tier `editing_query` does and for the same reason).
@@ -3471,7 +3503,7 @@ fn main() -> anyhow::Result<()> {
                     lyrics_client: &lyrics_client,
                     lyrics_loader: &mut lyrics_loader,
                     star_tx: &star_tx,
-                    enqueue_resolver: &mut enqueue_resolver,
+                    track_resolver: &mut track_resolver,
                     base_volume: &mut base_volume,
                     crossfade_enabled: &mut crossfade_enabled,
                     fade_in_started_at: &mut fade_in_started_at,
@@ -3608,21 +3640,30 @@ fn main() -> anyhow::Result<()> {
         // belonging to a superseded request, which matters more here
         // than elsewhere: a late arrival would not just draw something
         // stale, it would append to the queue behind the user's back.
-        while let Some((into, label, tracks)) = enqueue_resolver.poll() {
+        while let Some((into, label, tracks)) = track_resolver.poll() {
             let mut surf = wim_surface!();
             let mut core = core_ctx!();
             match tracks {
-                Ok(tracks) if tracks.is_empty() => core
-                    .notifications
-                    .push(Severity::Info, format!("nothing to queue in {label}")),
+                Ok(tracks) if tracks.is_empty() => core.notifications.push(
+                    Severity::Info,
+                    format!("nothing to {} in {label}", into.verb()),
+                ),
                 Ok(tracks) => match into {
-                    Enqueue::Back => append_resolved(&tracks, &mut core),
-                    Enqueue::Front => match front_resolved(&tracks, &mut core) {
+                    Intent::Back => append_resolved(&tracks, &mut core),
+                    Intent::Front => match front_resolved(&tracks, &mut core) {
                         Ok(n) => core
                             .notifications
                             .push(Severity::Info, format!("queued {n} tracks next")),
                         Err(why) => core.notifications.push(Severity::Error, why),
                     },
+                    // unlike the queue arms, this one always reports:
+                    // the fetch already said "resolving ...", so going
+                    // quiet on "already cached" would leave that as the
+                    // last word.
+                    Intent::Download => {
+                        let done = download_resolved(&tracks, &mut core);
+                        core.notifications.push(Severity::Info, done.status);
+                    }
                 },
                 Err(why) => core.notifications.push(Severity::Error, why),
             }
@@ -4913,7 +4954,12 @@ fn main() -> anyhow::Result<()> {
                                     downloading: &mut downloading,
                                     day_threshold: cfg.cache_days_threshold,
                                 };
-                                let _ = trigger_downloads(&item, &mut dctx, &mut notifications);
+                                download_selected(
+                                    &item,
+                                    &mut track_resolver,
+                                    &mut dctx,
+                                    &mut notifications,
+                                );
                             }
                         }
                         _ => handled = false,
@@ -5324,7 +5370,12 @@ fn main() -> anyhow::Result<()> {
                             downloading: &mut downloading,
                             day_threshold: cfg.cache_days_threshold,
                         };
-                        let _ = trigger_downloads(&item, &mut dctx, &mut notifications);
+                        download_selected(
+                            &item,
+                            &mut track_resolver,
+                            &mut dctx,
+                            &mut notifications,
+                        );
                     }
                     continue;
                 }

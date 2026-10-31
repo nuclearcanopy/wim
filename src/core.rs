@@ -63,15 +63,46 @@ pub fn resolve_playable(item: &SearchItem, cache: &Arc<Mutex<CacheIndex>>) -> Op
 /// exactly one track, so they pass through unchanged.
 /// Where a resolved batch goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Enqueue {
+pub enum Intent {
     /// Appended, which is what the queue key does.
     Back,
     /// Inserted directly behind what is playing
     /// (`add_to_queue(front, ...)`).
     Front,
+    /// Cached to disk rather than queued (`KeyAction::DownloadSelected`,
+    /// `Op::Download`). Not a queue destination, but it expands an
+    /// album or artist through the very same `resolve_tracks`, so it
+    /// shares the resolver rather than growing a fourth one.
+    Download,
 }
 
-/// What `EnqueueResolver::request` could answer with.
+impl Intent {
+    /// For "nothing to {verb} in {album}", so an empty album says
+    /// which thing it failed to be.
+    pub fn verb(self) -> &'static str {
+        match self {
+            Intent::Back | Intent::Front => "queue",
+            Intent::Download => "download",
+        }
+    }
+
+    /// Whether replacing the queue makes this batch meaningless.
+    ///
+    /// It does for the queue destinations, which is the whole point of
+    /// `invalidate`. It does not for a download: the tracks go to disk,
+    /// and clearing the queue says nothing about whether you still
+    /// want them cached. Sharing one resolver across both would
+    /// otherwise have made `Op::ClearQueue` quietly cancel a download
+    /// someone asked for seconds earlier.
+    pub fn queue_bound(self) -> bool {
+        match self {
+            Intent::Back | Intent::Front => true,
+            Intent::Download => false,
+        }
+    }
+}
+
+/// What `TrackResolver::request` could answer with.
 pub enum Resolution {
     /// No round trip was needed, so the caller acts now. A local file
     /// or a single song is already its own track list, and making the
@@ -106,7 +137,7 @@ pub enum Resolution {
 /// queue disowns all of them. That last part matters more here than
 /// elsewhere: a late arrival does not just draw something stale, it
 /// *mutates the queue*.
-pub struct EnqueueResolver {
+pub struct TrackResolver {
     epoch: Arc<AtomicU64>,
     tx: mpsc::Sender<ResolvedBatch>,
     rx: mpsc::Receiver<ResolvedBatch>,
@@ -114,21 +145,21 @@ pub struct EnqueueResolver {
 
 struct ResolvedBatch {
     epoch: u64,
-    into: Enqueue,
+    into: Intent,
     label: String,
     tracks: Result<Vec<SearchItem>, String>,
 }
 
-impl Default for EnqueueResolver {
+impl Default for TrackResolver {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl EnqueueResolver {
+impl TrackResolver {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        EnqueueResolver {
+        TrackResolver {
             epoch: Arc::new(AtomicU64::new(0)),
             tx,
             rx,
@@ -137,7 +168,7 @@ impl EnqueueResolver {
 
     /// Resolves `item` for `into`, instantly where no request is
     /// needed.
-    pub fn request(&mut self, item: &SearchItem, into: Enqueue) -> Resolution {
+    pub fn request(&mut self, item: &SearchItem, into: Intent) -> Resolution {
         if matches!(
             item,
             SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } | SearchItem::Song { .. }
@@ -155,7 +186,7 @@ impl EnqueueResolver {
         let sent = label.clone();
         thread::spawn(move || {
             let tracks = resolve_tracks(&item);
-            if shared.load(Ordering::SeqCst) != epoch {
+            if into.queue_bound() && shared.load(Ordering::SeqCst) != epoch {
                 return;
             }
             let _ = tx.send(ResolvedBatch {
@@ -178,11 +209,11 @@ impl EnqueueResolver {
 
     /// The next batch still belonging to the current queue, if one
     /// landed.
-    pub fn poll(&mut self) -> Option<(Enqueue, String, Result<Vec<SearchItem>, String>)> {
+    pub fn poll(&mut self) -> Option<(Intent, String, Result<Vec<SearchItem>, String>)> {
         let current = self.epoch.load(Ordering::SeqCst);
         loop {
             match self.rx.try_recv() {
-                Ok(batch) if batch.epoch != current => continue,
+                Ok(batch) if batch.into.queue_bound() && batch.epoch != current => continue,
                 Ok(batch) => return Some((batch.into, batch.label, batch.tracks)),
                 Err(_) => return None,
             }
@@ -190,7 +221,7 @@ impl EnqueueResolver {
     }
 
     #[cfg(test)]
-    fn deliver(&self, epoch: u64, into: Enqueue, tracks: Vec<SearchItem>) {
+    fn deliver(&self, epoch: u64, into: Intent, tracks: Vec<SearchItem>) {
         let _ = self.tx.send(ResolvedBatch {
             epoch,
             into,
@@ -1005,28 +1036,28 @@ pub fn note_playback_started(
         dctx.download_tx.clone(),
     );
 }
-/// Backs the manual download keybind (`KeyAction::DownloadSelected`):
-/// expands `item` the same way playing it would (`resolve_tracks`, so
-/// an album/playlist/artist downloads every song in it), downloads
-/// every remote song in the result concurrently (one thread each, see
-/// `download::spawn_tracks`), and skips anything already cached,
+/// Backs the manual download keybind (`KeyAction::DownloadSelected`)
+/// once its tracks are in hand: downloads every remote song in
+/// `tracks` concurrently (one thread each, see
+/// `download::spawn_tracks`), skipping anything already cached,
 /// already downloading, or not actually a remote track (local files
 /// are already local, nothing to cache). Deliberately ignores
 /// `day_threshold`: asking for a download outright is explicit, and
 /// has no business waiting on a listening-habit heuristic.
-pub fn trigger_downloads(
-    item: &SearchItem,
+///
+/// Expanding an album or artist into those tracks is `resolve_tracks`,
+/// which is a network fan-out and so happens in `TrackResolver` rather
+/// than here; this used to begin with that call and was the last
+/// blocking request left on the input path.
+pub fn download_tracks(
+    tracks: &[SearchItem],
     dctx: &mut DownloadCtx,
     notifications: &mut Notifications,
-) -> String {
-    let tracks = match resolve_tracks(item) {
-        Ok(t) => t,
-        Err(msg) => return msg,
-    };
+) -> Downloaded {
     let mut batch = Vec::new();
     let mut already_cached = 0;
     let mut in_flight = 0;
-    for t in &tracks {
+    for t in tracks {
         let SearchItem::Song {
             id,
             title,
@@ -1055,19 +1086,49 @@ pub fn trigger_downloads(
         notifications.push_progress(id.clone(), track_label.clone());
         batch.push((id.clone(), track_label, client.stream_url(id)));
     }
-    let queued = batch.len();
-    if queued > 0 {
+    let started = batch.len();
+    if started > 0 {
         download::spawn_tracks(batch, dctx.cache.clone(), dctx.download_tx.clone());
     }
-    if queued > 0 {
-        format!("downloading {queued} track(s)")
+    let status = if started > 0 {
+        format!("downloading {started} track(s)")
     } else if already_cached > 0 {
         "already cached".to_string()
     } else if in_flight > 0 {
         "already downloading".to_string()
     } else {
         "nothing to download (local files are already local)".to_string()
-    }
+    };
+    Downloaded { started, status }
+}
+
+/// What a resolved download batch did.
+///
+/// The count is separate from the message because the two keypress
+/// paths want different things from it: every started track already
+/// pushes its own progress toast, so repeating "downloading 3
+/// track(s)" over the top of three progress bars is noise, while
+/// "already cached" has nothing else to show it and used to be
+/// dropped on the floor (both key sites did `let _ =`, so asking to
+/// download something already on disk looked like the key did
+/// nothing). `Op::Download` reports the message either way, since a
+/// console line is the whole answer there.
+pub struct Downloaded {
+    pub started: usize,
+    pub status: String,
+}
+
+/// `download_tracks` with the bundle built from `core`, so the three
+/// call sites that have a `CoreCtx` do not each write the same
+/// `DownloadCtx` literal.
+pub fn download_resolved(tracks: &[SearchItem], core: &mut CoreCtx) -> Downloaded {
+    let mut dctx = DownloadCtx {
+        cache: core.cache,
+        download_tx: core.download_tx,
+        downloading: core.downloading,
+        day_threshold: core.cfg.cache_days_threshold,
+    };
+    download_tracks(tracks, &mut dctx, core.notifications)
 }
 /// Deletes every cached file past `cfg.cache_eviction_days` unplayed;
 /// best-effort, same as every other cache operation (a failed save
@@ -1274,8 +1335,8 @@ pub struct CoreCtx<'a> {
     /// be undone; drained by each binary's own per-frame drain.
     pub star_tx: &'a mpsc::Sender<StarFailed>,
     /// Resolves an album or artist into tracks off the input path; see
-    /// `EnqueueResolver`.
-    pub enqueue_resolver: &'a mut EnqueueResolver,
+    /// `TrackResolver`.
+    pub track_resolver: &'a mut TrackResolver,
     // volume, and everything that ramps it.
     pub base_volume: &'a mut f64,
     pub crossfade_enabled: &'a mut bool,
@@ -1349,7 +1410,7 @@ pub fn dispatch_action(action: Action, core: &mut CoreCtx, surf: &mut dyn Surfac
             // over its albums, so this no longer happens on the input
             // path; a single song still queues instantly, since it
             // needs no request at all.
-            match core.enqueue_resolver.request(&item, Enqueue::Back) {
+            match core.track_resolver.request(&item, Intent::Back) {
                 Resolution::Ready(tracks) => append_resolved(&tracks, core),
                 Resolution::Fetching(label) => core
                     .notifications
@@ -1695,7 +1756,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 let dispatch = dispatch_action(Action::Queued(item), core, surf);
                 return (dispatch, Report::Described);
             }
-            match core.enqueue_resolver.request(&item, Enqueue::Front) {
+            match core.track_resolver.request(&item, Intent::Front) {
                 Resolution::Ready(tracks) if tracks.is_empty() => {
                     op_fail("nothing to queue (empty album or playlist)")
                 }
@@ -1723,14 +1784,13 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             let Some(item) = shellsong_item(target, core, surf) else {
                 return op_fail("nothing is selected");
             };
-            let mut dctx = DownloadCtx {
-                cache: core.cache,
-                download_tx: core.download_tx,
-                downloading: core.downloading,
-                day_threshold: core.cfg.cache_days_threshold,
-            };
-            let status = trigger_downloads(&item, &mut dctx, core.notifications);
-            op_note(status)
+            // an album or artist is a fan-out to expand, so it is
+            // resolved off-thread like queueing one; a single song
+            // needs no request and starts in this op.
+            match core.track_resolver.request(&item, Intent::Download) {
+                Resolution::Ready(tracks) => op_note(download_resolved(&tracks, core).status),
+                Resolution::Fetching(label) => op_note(format!("resolving {label}...")),
+            }
         }
         Op::OpenPage(target) => {
             let Some(item) = shellsong_item(target, core, surf) else {
@@ -1773,7 +1833,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 Ok(()) => {
                     // or a batch in flight refills the queue the user
                     // just emptied, seconds after they emptied it.
-                    core.enqueue_resolver.invalidate();
+                    core.track_resolver.invalidate();
                     core.queue.replace_upcoming(Vec::new());
                     if let Some(cursor) = surf.queue_cursor() {
                         *cursor = 0;
@@ -2154,7 +2214,7 @@ pub fn start_session(
     // whatever was being resolved for the old queue has nowhere to go
     // now; without this a slow artist fan-out would land in a session
     // started after it was asked for.
-    core.enqueue_resolver.invalidate();
+    core.track_resolver.invalidate();
     let interrupted = core.queue.current().cloned();
     let (status, played) = load_playlist(
         core.player,
@@ -2601,7 +2661,7 @@ mod seam_tests {
         remote_starred: HashSet<String>,
         lyrics_client: lyrics::Client,
         lyrics_loader: lyrics::Loader,
-        enqueue_resolver: EnqueueResolver,
+        track_resolver: TrackResolver,
         star_tx: mpsc::Sender<StarFailed>,
         _star_rx: mpsc::Receiver<StarFailed>,
         base_volume: f64,
@@ -2645,7 +2705,7 @@ mod seam_tests {
                 remote_starred: HashSet::new(),
                 lyrics_client: lyrics::Client::new(),
                 lyrics_loader: lyrics::Loader::new(),
-                enqueue_resolver: EnqueueResolver::new(),
+                track_resolver: TrackResolver::new(),
                 star_tx,
                 _star_rx: star_rx,
                 base_volume: 100.0,
@@ -2685,7 +2745,7 @@ mod seam_tests {
                 lyrics_client: &self.lyrics_client,
                 lyrics_loader: &mut self.lyrics_loader,
                 star_tx: &self.star_tx,
-                enqueue_resolver: &mut self.enqueue_resolver,
+                track_resolver: &mut self.track_resolver,
                 base_volume: &mut self.base_volume,
                 crossfade_enabled: &mut self.crossfade_enabled,
                 fade_in_started_at: &mut self.fade_in_started_at,
@@ -2797,9 +2857,9 @@ mod seam_tests {
     /// instantly and the caller queues it in the same keypress.
     #[test]
     fn a_single_song_resolves_without_a_request() {
-        let mut r = EnqueueResolver::new();
+        let mut r = TrackResolver::new();
         let song = test_songs(1).remove(0);
-        match r.request(&song, Enqueue::Back) {
+        match r.request(&song, Intent::Back) {
             Resolution::Ready(tracks) => assert_eq!(tracks.len(), 1),
             Resolution::Fetching(_) => panic!("a song needs no round trip"),
         }
@@ -2807,7 +2867,7 @@ mod seam_tests {
 
     #[test]
     fn a_local_file_resolves_without_a_request() {
-        let mut r = EnqueueResolver::new();
+        let mut r = TrackResolver::new();
         let item = crate::search::SearchItem::LocalMusic {
             path: std::path::PathBuf::from("/music/a.flac"),
             title: "a".into(),
@@ -2815,7 +2875,7 @@ mod seam_tests {
             album: None,
         };
         assert!(matches!(
-            r.request(&item, Enqueue::Back),
+            r.request(&item, Intent::Back),
             Resolution::Ready(_)
         ));
     }
@@ -2824,14 +2884,14 @@ mod seam_tests {
     /// with something to say rather than blocking on it.
     #[test]
     fn an_album_is_fetched_and_names_what_it_is_waiting_on() {
-        let mut r = EnqueueResolver::new();
+        let mut r = TrackResolver::new();
         let album = crate::search::SearchItem::Album {
             id: "al1".into(),
             name: "crest".into(),
             artist: "bladee".into(),
             client: crate::browse::tests::test_client(),
         };
-        match r.request(&album, Enqueue::Back) {
+        match r.request(&album, Intent::Back) {
             Resolution::Fetching(label) => assert_eq!(label, "crest"),
             Resolution::Ready(_) => panic!("an album is a round trip"),
         }
@@ -2848,19 +2908,19 @@ mod seam_tests {
     /// still be running.
     #[test]
     fn two_albums_queued_in_a_row_both_arrive() {
-        let mut r = EnqueueResolver::new();
+        let mut r = TrackResolver::new();
         let album = crate::search::SearchItem::Album {
             id: "al1".into(),
             name: "first".into(),
             artist: "a".into(),
             client: crate::browse::tests::test_client(),
         };
-        r.request(&album, Enqueue::Back);
+        r.request(&album, Intent::Back);
         let first = r.epoch();
-        r.request(&album, Enqueue::Back);
+        r.request(&album, Intent::Back);
 
-        r.deliver(first, Enqueue::Back, test_songs(3));
-        r.deliver(r.epoch(), Enqueue::Back, test_songs(2));
+        r.deliver(first, Intent::Back, test_songs(3));
+        r.deliver(r.epoch(), Intent::Back, test_songs(2));
         let landed: Vec<usize> = std::iter::from_fn(|| r.poll())
             .map(|(_, _, tracks)| tracks.unwrap().len())
             .collect();
@@ -2876,17 +2936,17 @@ mod seam_tests {
     /// new one. The only thing that bumps the epoch.
     #[test]
     fn invalidate_disowns_a_batch_in_flight() {
-        let mut r = EnqueueResolver::new();
+        let mut r = TrackResolver::new();
         let album = crate::search::SearchItem::Album {
             id: "al1".into(),
             name: "x".into(),
             artist: "a".into(),
             client: crate::browse::tests::test_client(),
         };
-        r.request(&album, Enqueue::Back);
+        r.request(&album, Intent::Back);
         let before = r.epoch();
         r.invalidate();
-        r.deliver(before, Enqueue::Back, test_songs(2));
+        r.deliver(before, Intent::Back, test_songs(2));
         assert!(r.poll().is_none());
     }
 
@@ -2896,35 +2956,87 @@ mod seam_tests {
     /// all.
     #[test]
     fn invalidate_disowns_every_batch_in_flight_not_just_the_last() {
-        let mut r = EnqueueResolver::new();
+        let mut r = TrackResolver::new();
         let album = crate::search::SearchItem::Album {
             id: "al1".into(),
             name: "x".into(),
             artist: "a".into(),
             client: crate::browse::tests::test_client(),
         };
-        r.request(&album, Enqueue::Back);
-        r.request(&album, Enqueue::Front);
+        r.request(&album, Intent::Back);
+        r.request(&album, Intent::Front);
         let before = r.epoch();
         r.invalidate();
-        r.deliver(before, Enqueue::Back, test_songs(2));
-        r.deliver(before, Enqueue::Front, test_songs(4));
+        r.deliver(before, Intent::Back, test_songs(2));
+        r.deliver(before, Intent::Front, test_songs(4));
         assert!(r.poll().is_none());
+    }
+
+    /// Downloading an album is the same fan-out as queueing one, so it
+    /// shares the resolver instead of growing a fourth loader, and so
+    /// it must not block either.
+    #[test]
+    fn downloading_an_album_is_fetched_and_a_song_is_not() {
+        let mut r = TrackResolver::new();
+        let album = crate::search::SearchItem::Album {
+            id: "al1".into(),
+            name: "crest".into(),
+            artist: "a".into(),
+            client: crate::browse::tests::test_client(),
+        };
+        assert!(matches!(
+            r.request(&album, Intent::Download),
+            Resolution::Fetching(_)
+        ));
+        let song = test_songs(1).remove(0);
+        assert!(matches!(
+            r.request(&song, Intent::Download),
+            Resolution::Ready(_)
+        ));
+    }
+
+    /// The cost of sharing one resolver: `invalidate` means "the queue
+    /// those tracks were for is gone", which is true of a queue batch
+    /// and says nothing about a download. Clearing the queue must not
+    /// cancel a download asked for seconds earlier.
+    #[test]
+    fn invalidate_does_not_cancel_an_in_flight_download() {
+        let mut r = TrackResolver::new();
+        let album = crate::search::SearchItem::Album {
+            id: "al1".into(),
+            name: "x".into(),
+            artist: "a".into(),
+            client: crate::browse::tests::test_client(),
+        };
+        r.request(&album, Intent::Download);
+        r.request(&album, Intent::Back);
+        let before = r.epoch();
+        r.invalidate();
+        r.deliver(before, Intent::Back, test_songs(2));
+        r.deliver(before, Intent::Download, test_songs(5));
+        let landed: Vec<(Intent, usize)> = std::iter::from_fn(|| r.poll())
+            .map(|(into, _, tracks)| (into, tracks.unwrap().len()))
+            .collect();
+        assert_eq!(
+            landed,
+            vec![(Intent::Download, 5)],
+            "the queue batch is disowned, the download is not"
+        );
     }
 
     #[test]
     fn a_current_batch_arrives_with_its_destination() {
-        let mut r = EnqueueResolver::new();
+        let mut r = TrackResolver::new();
         let album = crate::search::SearchItem::Album {
             id: "al1".into(),
             name: "x".into(),
             artist: "a".into(),
             client: crate::browse::tests::test_client(),
         };
-        r.request(&album, Enqueue::Front);
-        r.deliver(r.epoch(), Enqueue::Front, test_songs(2));
+        r.request(&album, Intent::Front);
+        r.deliver(r.epoch(), Intent::Front, test_songs(2));
         let (into, _, tracks) = r.poll().expect("a current batch lands");
-        assert_eq!(into, Enqueue::Front, "it must queue where it was asked to");
+        assert_eq!(into, Intent::Front, "it must queue where it was asked to");
         assert_eq!(tracks.unwrap().len(), 2);
     }
 }
