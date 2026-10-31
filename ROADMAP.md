@@ -792,15 +792,36 @@ path keeps working untouched, and the desync regression tests at
 *stronger*: "`entries` is mpv's playlist, and every entry is something
 mpv loaded, a generated silence source included".
 
-- [ ] **two latent bugs that must be fixed as part of the timeline**,
+- [x] **two latent bugs that must be fixed as part of the timeline**,
       both found during that survey and both currently unreachable only
       by luck:
-      - `load_playlist` (~main.rs:691) and `resync_upcoming` (~743)
-        skip an item whose `resolve_playable` returns `None` when
-        appending to mpv **but still store the full vec in
-        `PlayQueue`**. Callers pre-run `resolve_tracks` today, so it
-        cannot fire; a new entry kind that fails to resolve hits it and
-        puts every later index off by one.
+      - ~~`load_playlist` and `resync_upcoming` skip an item whose
+        `resolve_playable` returns `None` when appending to mpv but
+        still store the full vec in `PlayQueue`~~ **fixed.** both now
+        go through `core::resolve_all`, which returns each kept item
+        **paired with the path mpv is handed** plus the ones that did
+        not resolve, so storing a list mpv did not get is no longer
+        expressible rather than merely avoided. `load_playlist` stores
+        only what mpv took, counting index 0 as taken because
+        `try_play` loaded it, and an `is_ok()` on each append, so a
+        *refused* append cannot desync either (it was `let _ =`).
+        the status line gains " (n skipped)" and nothing at all when
+        none were, since otherwise every ordinary play would end in
+        "(0 skipped)"; pinned by a test, as is order preservation,
+        which the length fix could otherwise have traded for a
+        different mapping bug.
+        **a worse sibling turned up next door**: `resync_upcoming`
+        returned early when an append failed, *after* `playlist_clear`
+        had already emptied mpv and before touching `PlayQueue`, so a
+        mid-shuffle failure left mpv empty and `entries` full. every
+        index wrong, not just the ones after a gap. it updates the
+        queue on the partial-append path too now, which is the only
+        answer that keeps the invariant.
+        `playqueue.rs`'s invariant doc now also states the rule in the
+        form that catches this: **every entry is something mpv
+        accepted**, not merely "same length".
+        still wants a human or an `--ignored` mpv test for the full
+        path; the pure seam is covered, the ipc pairing is not.
       - ~~`queues.rs`'s `Entry` has no discriminant~~ **fixed.**
         `Entry::kind` is explicit now and written on save, optional on
         load, with `Entry::kind()` falling back to exactly the old rule

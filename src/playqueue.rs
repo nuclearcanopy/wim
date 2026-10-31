@@ -8,9 +8,20 @@
 //! resolves to the item mpv actually loaded there. Every rewrite of
 //! mpv's playlist goes through `reset`/`rebuild`/`append`/
 //! `replace_upcoming`, each paired with its ipc call in exactly one
-//! place (`main::load_playlist`, `main::enqueue_track`,
-//! `main::resync_upcoming`), so the two sides can only diverge for the
+//! place (`core::load_playlist`, `core::enqueue_track`,
+//! `core::resync_upcoming`), so the two sides can only diverge for the
 //! length of one of those calls.
+//!
+//! Stated the other way round, which is the form that actually caught
+//! a bug: **every entry here is something mpv accepted.** An item mpv
+//! was never given, or refused, must not be stored, however harmless
+//! it looks; it shifts every later index and `playlist-pos` then
+//! resolves to the wrong track (wrong title, wrong scrobble, wrong
+//! art). Two of those three callers used to append what resolved and
+//! store what did not, which was unreachable only because every call
+//! site pre-expanded its items. `core::resolve_all` pairs each item
+//! with the path mpv is handed, so the caller cannot store a list mpv
+//! did not get.
 
 use rand::Rng;
 

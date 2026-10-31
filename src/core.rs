@@ -718,23 +718,86 @@ pub fn load_playlist(
     items: Vec<SearchItem>,
     session: SessionStart,
 ) -> (String, bool) {
-    let Some(first) = items.first() else {
-        return ("nothing to play".to_string(), false);
+    let total = items.len();
+    let (playable, dropped) = resolve_all(items, cache);
+    let Some((first, _)) = playable.first() else {
+        return (
+            if total == 0 {
+                "nothing to play".to_string()
+            } else {
+                format!("nothing playable here ({total} entries could not be resolved)")
+            },
+            false,
+        );
     };
     let (status, played) = try_play(player, first, cache);
     if !played {
         return (status, false);
     }
-    for item in &items[1..] {
-        if let Some(path) = resolve_playable(item, cache) {
-            let _ = player.playlist_append(&path);
+    // only what mpv actually took is stored, which is the whole point:
+    // storing an item mpv refused puts every later index off by one.
+    let mut kept = Vec::with_capacity(playable.len());
+    let mut refused = 0;
+    for (i, (item, path)) in playable.into_iter().enumerate() {
+        // index 0 is already loaded, by `try_play` above.
+        if i == 0 || player.playlist_append(&path).is_ok() {
+            kept.push(item);
+        } else {
+            refused += 1;
         }
     }
     match session {
-        SessionStart::New => queue.reset(items),
-        SessionStart::Keep => queue.rebuild(items),
+        SessionStart::New => queue.reset(kept),
+        SessionStart::Keep => queue.rebuild(kept),
     }
-    (status, true)
+    (
+        format!("{status}{}", lost_note(dropped.len() + refused)),
+        true,
+    )
+}
+
+/// Splits `items` into the ones mpv can be handed a path for, paired
+/// with that path, and the ones it cannot.
+///
+/// **The pairing is the fix.** `load_playlist` and `resync_upcoming`
+/// each used to skip an unresolvable item while appending to mpv and
+/// then store the *whole* vec in `PlayQueue`, breaking the one
+/// invariant the index map has (`entries` is mpv's playlist: same
+/// items, same order, same length). Every index after the skipped one
+/// is then off by one, so an mpv `playlist-pos` resolves to the wrong
+/// track: wrong title on the bar, wrong scrobble, wrong art.
+///
+/// It was unreachable only by luck, because every caller pre-ran
+/// `resolve_tracks`; a queue entry kind that does not resolve reaches
+/// it immediately, which the timeline's `silence(15m)` would have
+/// been.
+fn resolve_all(
+    items: Vec<SearchItem>,
+    cache: &Arc<Mutex<CacheIndex>>,
+) -> (Vec<(SearchItem, String)>, Vec<SearchItem>) {
+    let mut playable = Vec::with_capacity(items.len());
+    let mut dropped = Vec::new();
+    for item in items {
+        match resolve_playable(&item, cache) {
+            Some(path) => playable.push((item, path)),
+            None => dropped.push(item),
+        }
+    }
+    (playable, dropped)
+}
+
+/// " (n skipped)", or nothing at all when none were.
+///
+/// Same reasoning as `queues::summarise`: a silently shortened queue is
+/// the bug, so the count is always said, but it is a suffix on a status
+/// line rather than its own toast, because in the normal case there is
+/// nothing to say and the useful half of the message is what played.
+fn lost_note(lost: usize) -> String {
+    if lost == 0 {
+        String::new()
+    } else {
+        format!(" ({lost} skipped)")
+    }
 }
 /// Appends `item` to mpv's own playlist and to the index map together
 /// (plays immediately if nothing was loaded, otherwise queues
@@ -775,15 +838,28 @@ pub fn resync_upcoming(
     if let Err(e) = player.playlist_clear() {
         return format!("error resyncing queue: {e}");
     }
-    for item in &items {
-        if let Some(path) = resolve_playable(item, cache) {
-            if let Err(e) = player.playlist_append(&path) {
-                return format!("error resyncing queue: {e}");
+    let (playable, dropped) = resolve_all(items, cache);
+    let mut kept = Vec::with_capacity(playable.len());
+    let mut failure = None;
+    for (item, path) in playable {
+        match player.playlist_append(&path) {
+            Ok(()) => kept.push(item),
+            Err(e) => {
+                failure = Some(e.to_string());
+                break;
             }
         }
     }
-    queue.replace_upcoming(items);
-    "shuffled".to_string()
+    // updated even when an append failed partway, because mpv has
+    // *already been cleared*: returning early and leaving `entries` as
+    // it was would be exactly the desync this function exists to
+    // prevent, and a worse one than the skip bug (every index wrong,
+    // not just the ones after a gap).
+    queue.replace_upcoming(kept);
+    match failure {
+        Some(e) => format!("error resyncing queue: {e}"),
+        None => format!("shuffled{}", lost_note(dropped.len())),
+    }
 }
 /// Snapshots now-playing/queue/position/volume for next launch to
 /// resume. Best-effort: a failed save just means nothing to resume
@@ -2970,6 +3046,69 @@ mod seam_tests {
         r.deliver(before, Intent::Back, test_songs(2));
         r.deliver(before, Intent::Front, test_songs(4));
         assert!(r.poll().is_none());
+    }
+
+    fn empty_cache() -> Arc<Mutex<CacheIndex>> {
+        Arc::new(Mutex::new(CacheIndex::default()))
+    }
+
+    fn an_album() -> SearchItem {
+        crate::search::SearchItem::Album {
+            id: "al1".into(),
+            name: "crest".into(),
+            artist: "bladee".into(),
+            client: crate::browse::tests::test_client(),
+        }
+    }
+
+    /// The latent desync, at the seam where it lived.
+    ///
+    /// `load_playlist` and `resync_upcoming` skipped an unresolvable
+    /// item when appending to mpv but stored the whole vec in
+    /// `PlayQueue`, so every index after it pointed at the wrong
+    /// track. Pairing each kept item with the path mpv was actually
+    /// given is what makes storing the wrong list impossible.
+    #[test]
+    fn an_unplayable_entry_is_separated_rather_than_skipped() {
+        let cache = empty_cache();
+        let mut items = test_songs(2);
+        // an album has no path of its own: the exact shape that
+        // reached mpv as 2 entries and `PlayQueue` as 3.
+        items.insert(1, an_album());
+
+        let (playable, dropped) = resolve_all(items, &cache);
+        assert_eq!(playable.len(), 2, "two songs resolve");
+        assert_eq!(dropped.len(), 1, "the album does not, and is reported");
+        assert!(
+            playable.iter().all(|(_, path)| !path.is_empty()),
+            "every kept item carries the path mpv will be given"
+        );
+    }
+
+    /// Order has to survive, or the pairing fixes the length and
+    /// breaks the mapping a different way.
+    #[test]
+    fn resolving_preserves_order() {
+        let cache = empty_cache();
+        let songs = test_songs(3);
+        let titles: Vec<String> = songs.iter().map(|s| s.primary_name().to_string()).collect();
+        let mut items = songs;
+        items.insert(2, an_album());
+
+        let (playable, _) = resolve_all(items, &cache);
+        let kept: Vec<String> = playable
+            .iter()
+            .map(|(i, _)| i.primary_name().to_string())
+            .collect();
+        assert_eq!(kept, titles);
+    }
+
+    /// The normal case must stay silent: every play would otherwise
+    /// end in "(0 skipped)".
+    #[test]
+    fn nothing_lost_says_nothing() {
+        assert_eq!(lost_note(0), "");
+        assert_eq!(lost_note(3), " (3 skipped)");
     }
 
     /// Downloading an album is the same fan-out as queueing one, so it
