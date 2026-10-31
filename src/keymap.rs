@@ -243,7 +243,10 @@ fn name_to_key(name: &str) -> Option<KeyCode> {
         "down" => Some(KeyCode::Down),
         "tab" => Some(KeyCode::Tab),
         "backspace" => Some(KeyCode::Backspace),
-        _ if name.len() == 1 => name.chars().next().map(KeyCode::Char),
+        // chars, not bytes: a key rebound to a wide char ("日") wrote
+        // a three-byte name that `len() == 1` then refused to read
+        // back, so the menu accepted it and the next launch lost it.
+        _ if name.chars().count() == 1 => name.chars().next().map(KeyCode::Char),
         _ if name.starts_with('f') && name[1..].parse::<u8>().is_ok() => {
             name[1..].parse().ok().map(KeyCode::F)
         }
@@ -258,24 +261,49 @@ pub fn key_label(key: KeyCode) -> String {
     key_to_name(key).unwrap_or_else(|| "?".to_string())
 }
 
+/// Every key the fixed conventions permanently own, and what for.
+/// A table rather than a `match` arm so the help overlay can walk it:
+/// these are the keys no remap can ever reach, which makes the help
+/// pane the only place to find out what they do, and `:` sat here
+/// naming a whole command console the reference never mentioned.
+pub const RESERVED_KEYS: &[(KeyCode, &str)] = &[
+    (KeyCode::Char('j'), "move selection"),
+    (KeyCode::Char('k'), "move selection"),
+    (KeyCode::Char('g'), "jump to top / bottom"),
+    (KeyCode::Char('G'), "jump to top / bottom"),
+    (KeyCode::Char('K'), "the remap menu itself"),
+    (KeyCode::Char(':'), "the shellsong console"),
+    (KeyCode::Enter, "play / open"),
+    (KeyCode::Esc, "back / close"),
+    (KeyCode::Tab, "move mode"),
+    (KeyCode::Left, "navigation"),
+    (KeyCode::Right, "navigation"),
+    (KeyCode::Up, "navigation"),
+    (KeyCode::Down, "navigation"),
+    (KeyCode::Backspace, "editing a query"),
+];
+
 /// What a key is permanently used for, if it's one of the fixed
 /// navigation conventions rather than a remappable action. These are
 /// checked before every input handler that consults the keymap, so an
 /// action bound to one of them would simply never fire; refusing the
 /// binding and saying why beats a key that silently does nothing.
 pub fn reserved_key_purpose(key: KeyCode) -> Option<&'static str> {
-    Some(match key {
-        KeyCode::Char('j') | KeyCode::Char('k') => "move selection",
-        KeyCode::Char('g') | KeyCode::Char('G') => "jump to top / bottom",
-        KeyCode::Char('K') => "the remap menu itself",
-        KeyCode::Char(':') => "the shellsong console",
-        KeyCode::Enter => "play / open",
-        KeyCode::Esc => "back / close",
-        KeyCode::Tab => "move mode",
-        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => "navigation",
-        KeyCode::Backspace => "editing a query",
-        _ => return None,
-    })
+    RESERVED_KEYS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, purpose)| *purpose)
+}
+
+/// One `[keybinds]` warning, in the shape config.rs's own corrections
+/// use: name the entry, say why it could not be honoured, then say
+/// what is in force instead.
+fn refused(action: KeyAction, reason: &str) -> String {
+    format!(
+        "keybinds.{}: {reason}; using \"{}\"",
+        action.name(),
+        key_label(action.default_key())
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -292,27 +320,104 @@ impl Default for Keymap {
 }
 
 impl Keymap {
+    /// `from_overrides_reporting` with the warnings dropped, for the
+    /// callers that have nowhere to show one (tests, and the
+    /// round-trip through `overrides()`, which can only produce
+    /// entries this module wrote itself).
+    pub fn from_overrides(overrides: &HashMap<String, String>) -> Self {
+        Self::from_overrides_reporting(overrides).0
+    }
+
     /// Starts from every default, then applies whatever `overrides`
     /// (config.toml's `[keybinds]` table, action name -> key name)
-    /// parses successfully; an unrecognized action name or key name
-    /// is silently ignored rather than failing the whole config load,
-    /// same leniency as every other best-effort config field.
-    pub fn from_overrides(overrides: &HashMap<String, String>) -> Self {
-        let mut map = Self::default();
-        for action in ALL_ACTIONS {
-            if let Some(name) = overrides.get(action.name()) {
-                if let Some(key) = name_to_key(name) {
-                    // a key the fixed conventions already own would be
-                    // shadowed by them at runtime, leaving the action
-                    // permanently unreachable with nothing to explain
-                    // why; keep the default instead.
-                    if reserved_key_purpose(key).is_none() {
-                        map.bindings.insert(*action, key);
-                    }
-                }
-            }
+    /// wim can actually honour, **and says which entries it could
+    /// not**, in the same `(value, warnings)` shape
+    /// `config::load_reporting` uses so main.rs can push them into the
+    /// notification area.
+    ///
+    /// Four classes, all of them silent before: an action name nothing
+    /// reads, a key name that does not round-trip, a key the fixed
+    /// conventions own, and a key another action already holds. The
+    /// last one was the worst: `quit = "a"` was *applied*, and since
+    /// `app.rs` tests `Enqueue` before `Quit`, the first match won and
+    /// `Quit` was simply dead.
+    pub fn from_overrides_reporting(overrides: &HashMap<String, String>) -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
+
+        // a `HashMap` has no order, so the warnings are sorted by the
+        // key nobody reads; the same config has to produce the same
+        // lines in the same order every launch.
+        let mut unknown: Vec<&str> = overrides
+            .keys()
+            .map(String::as_str)
+            .filter(|name| !ALL_ACTIONS.iter().any(|a| a.name() == *name))
+            .collect();
+        unknown.sort_unstable();
+        for name in unknown {
+            warnings.push(format!("keybinds.{name} is not an action; ignored"));
         }
-        map
+
+        // the entries that name a real action and parse to a key wim
+        // can both store and reach, in `ALL_ACTIONS` order so a
+        // collision between two of them resolves the same way twice.
+        let mut wanted: Vec<(KeyAction, KeyCode)> = Vec::new();
+        for action in ALL_ACTIONS {
+            let Some(name) = overrides.get(action.name()) else {
+                continue;
+            };
+            let Some(key) = name_to_key(name) else {
+                warnings.push(refused(
+                    *action,
+                    &format!("\"{name}\" is not a key wim can bind"),
+                ));
+                continue;
+            };
+            if let Some(purpose) = reserved_key_purpose(key) {
+                warnings.push(refused(
+                    *action,
+                    &format!("\"{}\" is reserved for {purpose}", key_label(key)),
+                ));
+                continue;
+            }
+            if let Some((owner, _)) = wanted.iter().find(|(_, k)| *k == key) {
+                warnings.push(refused(
+                    *action,
+                    &format!("\"{}\" is already {}", key_label(key), owner.label()),
+                ));
+                continue;
+            }
+            wanted.push((*action, key));
+        }
+
+        // then the collisions against the actions still sitting on
+        // their defaults. one at a time, because refusing an override
+        // puts its own default back and that can collide in turn; the
+        // loop ends because every pass either returns or shortens
+        // `wanted`, and an empty `wanted` is `default()`, whose keys
+        // are all distinct (pinned by a test).
+        loop {
+            let mut map = Self::default();
+            for (action, key) in &wanted {
+                map.bindings.insert(*action, *key);
+            }
+            // one side of any collision is always an override: no two
+            // overrides share a key (deduped above) and no two
+            // defaults do.
+            let clash = wanted.iter().enumerate().find_map(|(i, (action, key))| {
+                ALL_ACTIONS
+                    .iter()
+                    .find(|other| *other != action && map.bindings[other] == *key)
+                    .map(|owner| (i, *owner))
+            });
+            let Some((i, owner)) = clash else {
+                return (map, warnings);
+            };
+            let (action, key) = wanted.remove(i);
+            warnings.push(refused(
+                action,
+                &format!("\"{}\" is already {}", key_label(key), owner.label()),
+            ));
+        }
     }
 
     /// The non-default entries, for persisting back to config.toml;
@@ -349,6 +454,35 @@ impl Keymap {
         *self = Self::default();
     }
 
+    /// Why `key` cannot be bound to `action`, as the one line the
+    /// remap menu puts up; `None` means take it.
+    ///
+    /// Exactly what `from_overrides_reporting` refuses, which is the
+    /// point: the menu used to accept a reserved or already-taken key,
+    /// write it to config.toml and show the row as rebound, and the
+    /// next launch threw it away without a word. A key that does not
+    /// round-trip through `key_to_name` is refused for the same
+    /// reason: `overrides()` drops it on save.
+    pub fn refusal(&self, action: KeyAction, key: KeyCode) -> Option<String> {
+        if let Some(purpose) = reserved_key_purpose(key) {
+            return Some(format!(
+                "{} is reserved for {purpose}; not bound",
+                key_label(key)
+            ));
+        }
+        if key_to_name(key).is_none() {
+            return Some("that key cannot be stored in config.toml; not bound".to_string());
+        }
+        match self.action_bound_to(key) {
+            Some(owner) if owner != action => Some(format!(
+                "{} is already {}; not bound",
+                key_label(key),
+                owner.label()
+            )),
+            _ => None,
+        }
+    }
+
     /// Whichever action (if any) is already bound to `key`; the remap
     /// menu shows this as a warning rather than silently creating a
     /// second action that answers to the same key.
@@ -376,14 +510,18 @@ mod tests {
     fn overrides_round_trip_through_name_strings() {
         let mut map = Keymap::default();
         map.set(KeyAction::SkipNext, KeyCode::F(5));
-        map.set(KeyAction::ToggleShuffle, KeyCode::Char(' '));
+        // not space: that is `TogglePause`'s default, and two actions
+        // on one key is now refused rather than applied and left for
+        // `app.rs`'s check order to decide (see
+        // `every_class_of_bad_keybind_entry_is_both_refused_and_reported`).
+        map.set(KeyAction::ToggleShuffle, KeyCode::Char('z'));
 
         let overrides = map.overrides();
         assert_eq!(overrides.len(), 2);
 
         let restored = Keymap::from_overrides(&overrides);
         assert_eq!(restored.get(KeyAction::SkipNext), KeyCode::F(5));
-        assert_eq!(restored.get(KeyAction::ToggleShuffle), KeyCode::Char(' '));
+        assert_eq!(restored.get(KeyAction::ToggleShuffle), KeyCode::Char('z'));
         // everything untouched is still default.
         assert_eq!(
             restored.get(KeyAction::CycleLoop),
@@ -457,5 +595,219 @@ mod tests {
         overrides.insert(KeyAction::Quit.name().to_string(), "x".to_string());
         let map = Keymap::from_overrides(&overrides);
         assert_eq!(map.get(KeyAction::Quit), KeyCode::Char('x'));
+    }
+
+    /// `from_overrides_reporting`'s collision pass assumes one side of
+    /// any clash is an override, which is only true while the defaults
+    /// themselves are distinct.
+    #[test]
+    fn no_two_actions_share_a_default_key() {
+        for (i, a) in ALL_ACTIONS.iter().enumerate() {
+            for b in &ALL_ACTIONS[i + 1..] {
+                assert_ne!(
+                    a.default_key(),
+                    b.default_key(),
+                    "{} and {} both default to {}",
+                    a.name(),
+                    b.name(),
+                    key_label(a.default_key())
+                );
+            }
+        }
+    }
+
+    fn warnings_for(entries: &[(&str, &str)]) -> Vec<String> {
+        let overrides: HashMap<String, String> = entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Keymap::from_overrides_reporting(&overrides).1
+    }
+
+    /// The collision that shipped: `quit = "a"` was applied, and since
+    /// `app.rs` checks `Enqueue` before `Quit`, the first match won and
+    /// quit was dead with nothing said. Every other refusal was silent
+    /// too.
+    #[test]
+    fn every_class_of_bad_keybind_entry_is_both_refused_and_reported() {
+        let cases: [(&str, &str, &str); 4] = [
+            ("quit", "a", "already enqueue selected"),
+            ("quit", "j", "reserved for move selection"),
+            ("quit", "not_a_key", "is not a key wim can bind"),
+            ("quti", "x", "not an action"),
+        ];
+        for (name, value, expected) in cases {
+            let (map, warnings) = {
+                let mut overrides = HashMap::new();
+                overrides.insert(name.to_string(), value.to_string());
+                Keymap::from_overrides_reporting(&overrides)
+            };
+            assert_eq!(
+                map.get(KeyAction::Quit),
+                KeyAction::Quit.default_key(),
+                "{name} = {value:?} should have fallen back to the default"
+            );
+            assert_eq!(warnings.len(), 1, "{name} = {value:?}: {warnings:?}");
+            assert!(
+                warnings[0].contains(expected),
+                "{name} = {value:?} said {:?}, wanted {expected:?}",
+                warnings[0]
+            );
+        }
+    }
+
+    /// Two entries asking for the same key is the one collision both
+    /// sides of which are overrides; the earlier action in
+    /// `ALL_ACTIONS` keeps it, deterministically.
+    #[test]
+    fn two_overrides_onto_one_key_keep_the_first_and_report_the_second() {
+        let mut overrides = HashMap::new();
+        overrides.insert(KeyAction::Enqueue.name().to_string(), "z".to_string());
+        overrides.insert(KeyAction::Quit.name().to_string(), "z".to_string());
+        let (map, warnings) = Keymap::from_overrides_reporting(&overrides);
+        assert_eq!(map.get(KeyAction::Enqueue), KeyCode::Char('z'));
+        assert_eq!(map.get(KeyAction::Quit), KeyAction::Quit.default_key());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("keybinds.quit"), "{warnings:?}");
+    }
+
+    /// Nothing may be refused for colliding with a default the very
+    /// same table moved out of the way: swapping two keys is the
+    /// obvious thing to write in a config and has to work.
+    #[test]
+    fn a_swap_between_two_actions_is_honoured_without_a_warning() {
+        let mut overrides = HashMap::new();
+        overrides.insert(KeyAction::Quit.name().to_string(), "l".to_string());
+        overrides.insert(KeyAction::CycleLoop.name().to_string(), "q".to_string());
+        let (map, warnings) = Keymap::from_overrides_reporting(&overrides);
+        assert_eq!(map.get(KeyAction::Quit), KeyCode::Char('l'));
+        assert_eq!(map.get(KeyAction::CycleLoop), KeyCode::Char('q'));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Refusing an override hands its own default back, which can
+    /// collide with an override that was already accepted; the pass
+    /// has to keep going until the whole map is one key per action.
+    #[test]
+    fn a_refusal_that_frees_a_default_cannot_leave_a_second_collision() {
+        let mut overrides = HashMap::new();
+        // quit wants enqueue's default and loses; that puts "q" back,
+        // which is what cycle_loop was given.
+        overrides.insert(KeyAction::Quit.name().to_string(), "a".to_string());
+        overrides.insert(KeyAction::CycleLoop.name().to_string(), "q".to_string());
+        let (map, warnings) = Keymap::from_overrides_reporting(&overrides);
+        let mut keys: Vec<String> = ALL_ACTIONS.iter().map(|a| key_label(map.get(*a))).collect();
+        keys.sort();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(
+            before,
+            keys.len(),
+            "two actions answer to one key: {keys:?}"
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+    }
+
+    #[test]
+    fn a_clean_keybinds_table_says_nothing() {
+        assert!(warnings_for(&[("quit", "x"), ("enqueue", "f5")]).is_empty());
+    }
+
+    /// `HashMap` iteration order is not stable, so two launches off the
+    /// same config.toml must not shuffle the warnings.
+    #[test]
+    fn the_warnings_come_out_in_the_same_order_every_time() {
+        let entries = [("zzz_bogus", "x"), ("aaa_bogus", "y"), ("quit", "j")];
+        let first = warnings_for(&entries);
+        for _ in 0..8 {
+            assert_eq!(warnings_for(&entries), first);
+        }
+        assert!(first[0].contains("aaa_bogus"), "{first:?}");
+        assert!(first[1].contains("zzz_bogus"), "{first:?}");
+    }
+
+    /// The interactive remap wrote these to config.toml and showed the
+    /// row as rebound; `from_overrides` then dropped them at the next
+    /// launch. The menu refuses on a `Some` instead.
+    #[test]
+    fn the_remap_refusal_covers_exactly_what_a_config_load_would_drop() {
+        let map = Keymap::default();
+        assert!(map
+            .refusal(KeyAction::Quit, KeyCode::Char('j'))
+            .is_some_and(|m| m.contains("reserved for move selection")));
+        assert!(map
+            .refusal(KeyAction::Quit, KeyCode::Char(':'))
+            .is_some_and(|m| m.contains("the shellsong console")));
+        assert!(map
+            .refusal(KeyAction::Quit, KeyCode::Char('a'))
+            .is_some_and(|m| m.contains("already enqueue selected")));
+        // representable and free.
+        assert_eq!(map.refusal(KeyAction::Quit, KeyCode::Char('x')), None);
+        // rebinding an action to the key it already has is a no-op, not
+        // a conflict with itself.
+        assert_eq!(map.refusal(KeyAction::Quit, KeyCode::Char('q')), None);
+        // `overrides()` cannot store this one, so accepting it would
+        // last exactly one session.
+        assert!(map
+            .refusal(KeyAction::Quit, KeyCode::Home)
+            .is_some_and(|m| m.contains("cannot be stored")));
+    }
+
+    /// Whatever the menu accepts has to survive a save/load round
+    /// trip, which is the whole contract the two halves broke.
+    #[test]
+    fn anything_the_remap_accepts_survives_a_round_trip() {
+        let candidates = [
+            KeyCode::Char('x'),
+            KeyCode::Char(' '),
+            KeyCode::F(5),
+            KeyCode::Char('日'),
+            KeyCode::Char('j'),
+            KeyCode::Char(':'),
+            KeyCode::Char('a'),
+            KeyCode::Home,
+            KeyCode::Delete,
+            KeyCode::Tab,
+        ];
+        for key in candidates {
+            let mut map = Keymap::default();
+            if map.refusal(KeyAction::Quit, key).is_some() {
+                continue;
+            }
+            map.set(KeyAction::Quit, key);
+            let (reloaded, warnings) = Keymap::from_overrides_reporting(&map.overrides());
+            assert_eq!(
+                reloaded.get(KeyAction::Quit),
+                key,
+                "the menu accepted {key:?} and the next launch lost it: {warnings:?}"
+            );
+            assert!(warnings.is_empty(), "{key:?}: {warnings:?}");
+        }
+    }
+
+    /// The help pane, onboarding and the bottom bar all spell the
+    /// console's key out of this entry; it has to be the key the
+    /// console really opens on.
+    #[test]
+    fn the_console_is_reserved_under_the_key_it_actually_opens_on() {
+        assert_eq!(
+            reserved_key_purpose(crate::shellsong::OPEN_KEY),
+            Some("the shellsong console")
+        );
+        assert_eq!(key_label(crate::shellsong::OPEN_KEY), ":");
+    }
+
+    #[test]
+    fn every_reserved_key_names_a_purpose_and_no_duplicates() {
+        for (key, purpose) in RESERVED_KEYS {
+            assert_eq!(reserved_key_purpose(*key), Some(*purpose));
+        }
+        for (i, (key, _)) in RESERVED_KEYS.iter().enumerate() {
+            assert!(
+                !RESERVED_KEYS[i + 1..].iter().any(|(k, _)| k == key),
+                "{} is listed twice",
+                key_label(*key)
+            );
+        }
     }
 }
