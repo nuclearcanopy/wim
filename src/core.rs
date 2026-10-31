@@ -1650,6 +1650,10 @@ pub struct CoreCtx<'a> {
     /// cutting the audio dead.
     pub fade: &'a mut Option<Ramp>,
     pub sleep_due: &'a mut Option<Duration>,
+    /// When a `pause(30s)` should let go again. The mirror of
+    /// `sleep_due`: that one stops playback at a time, this one starts
+    /// it.
+    pub resume_due: &'a mut Option<Duration>,
     /// Replaced wholesale by `rescan()`, which needs a fresh channel:
     /// the scan thread signs off by dropping its sender.
     pub scan_rx: &'a mut mpsc::Receiver<library::ScanBatch>,
@@ -1914,11 +1918,51 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             // track that has already ended; see `core::toggle_pause`.
             op_ipc(toggle_pause(core.player, core.between_tracks))
         }
-        Op::SkipNext => {
+        Op::SkipNext(n) => {
             if core.now_playing.is_none() {
                 return op_fail("nothing is playing");
             }
-            op_ipc(core.player.playlist_next())
+            // asked here rather than left to mpv: `playlist-next
+            // weak` on the last entry replies with an error (measured;
+            // see `Mpv::playlist_next`), so without this, skipping the
+            // only track in the queue reported "error running
+            // command" at the user for doing something reasonable.
+            //
+            // the queue is the right authority: `entries` *is* mpv's
+            // playlist by invariant, so if nothing is upcoming here,
+            // there is nothing for mpv to skip to either.
+            let upcoming = core.queue.upcoming_len();
+            if upcoming == 0 {
+                return op_fail("nothing to skip to; this is the last track");
+            }
+            // a skip past the end lands on the last track rather than
+            // refusing the whole thing: asking to go forward four with
+            // two left plainly means "the end", and mpv would error on
+            // the overshoot.
+            let steps = n.min(upcoming);
+            for _ in 0..steps {
+                if let Err(e) = core.player.playlist_next() {
+                    return op_fail(format!("error skipping: {e}"));
+                }
+            }
+            if steps < n {
+                return op_note(format!("skipped {steps}, which is all there was"));
+            }
+            op_done()
+        }
+        Op::PauseFor(secs) => {
+            if core.now_playing.is_none() {
+                return op_fail("nothing is playing");
+            }
+            // one timer, reused: `sleep_due` already means "do
+            // something to playback at this time", and the step loop
+            // already polls it. this is the other direction, so it is
+            // its own field rather than overloading that one.
+            if let Err(e) = core.player.set_pause(true) {
+                return op_fail(format!("error pausing: {e}"));
+            }
+            *core.resume_due = Some(core.now + Duration::from_secs_f64(secs.max(0.0)));
+            op_done()
         }
         Op::SkipBack => {
             if core.previous_track.is_none() {
@@ -3121,6 +3165,7 @@ mod seam_tests {
         fade_in_started_at: Option<Instant>,
         fade: Option<Ramp>,
         sleep_due: Option<Duration>,
+        resume_due: Option<Duration>,
         scan_rx: mpsc::Receiver<library::ScanBatch>,
         _scan_tx: mpsc::Sender<library::ScanBatch>,
         remote_search_tx: mpsc::Sender<RemoteSearchQuery>,
@@ -3168,6 +3213,7 @@ mod seam_tests {
                 fade_in_started_at: None,
                 fade: None,
                 sleep_due: None,
+                resume_due: None,
                 scan_rx,
                 _scan_tx,
                 remote_search_tx,
@@ -3209,6 +3255,7 @@ mod seam_tests {
                 fade_in_started_at: &mut self.fade_in_started_at,
                 fade: &mut self.fade,
                 sleep_due: &mut self.sleep_due,
+                resume_due: &mut self.resume_due,
                 scan_rx: &mut self.scan_rx,
                 remote_search_tx: &self.remote_search_tx,
                 settle: &mut self.settle,
