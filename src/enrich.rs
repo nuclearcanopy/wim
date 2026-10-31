@@ -9,10 +9,11 @@
 
 use std::collections::HashSet;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::cache::{self, CacheIndex};
+use crate::search;
 use crate::subsonic;
 use crate::suggest;
 
@@ -256,6 +257,26 @@ pub fn next_enrichment_job(
         artists,
         albums: plan.albums,
     }
+}
+
+/// Rebuilds the menu from everything known right now. The catalog is
+/// kept across opens rather than rebuilt per open, because the fetched
+/// tracklists and top songs live in it; re-ingesting the corpus is an
+/// upsert, so newly indexed library rows still land.
+pub fn recompute_suggestions(
+    catalog: &mut suggest::Catalog,
+    corpus: &search::Corpus,
+    cache: &Arc<Mutex<CacheIndex>>,
+    starred: &HashSet<String>,
+    enrichment: &suggest::EnrichmentCache,
+) -> suggest::Suggestions {
+    catalog.ingest_corpus(corpus);
+    let guard = cache.lock().expect("cache mutex poisoned");
+    let request = suggest::Request {
+        enrichment,
+        ..suggest::Request::new(catalog, &guard, starred, cache::now_secs())
+    };
+    suggest::suggest(&request)
 }
 
 #[cfg(test)]
