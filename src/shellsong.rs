@@ -1054,7 +1054,12 @@ pub const COMMANDS: &[Command] = &[
     ),
     cmd(
         "silence",
-        &[],
+        // `wait` because that is what the maintainer reached for, and
+        // it reads better in a queue ("wait 15s, then the next
+        // track"). `silence` stays canonical, since it also names
+        // what actually plays: a generated silent source, not a
+        // suspended player.
+        &["wait"],
         &[
             req("length", Ty::Span),
             opt("position", Ty::Words(Words::Position)),
@@ -5728,6 +5733,16 @@ mod tests {
         // and then done nothing whatsoever.
         assert!(!error("silence(off)").message.is_empty());
         assert!(error("silence(0s)").message.contains("needs a length"));
+        // `wait` is the same command: the alias resolves before
+        // lowering, so there is no second arm to keep in step.
+        assert_eq!(ops("wait(15s)"), ops("silence(15s)"));
+        assert_eq!(
+            ops("wait(15s, front)"),
+            vec![Op::Silence {
+                secs: 900 / 60,
+                front: true
+            }]
+        );
         // `gap` is the contrast: it takes `Ty::Duration`, where `off`
         // is meaningful, because turning the gap off is a thing you
         // want to say. `silence(off)` is not.
@@ -7227,6 +7242,7 @@ queue(morning)
                 "view",
                 "vol",
                 "volume",
+                "wait",
                 "xfade",
             ],
         );
@@ -7453,6 +7469,7 @@ queue(morning)
                 "view",
                 "vol",
                 "volume",
+                "wait",
                 "xfade",
             ],
         );
@@ -7773,6 +7790,7 @@ queue(morning)
                 "view",
                 "vol",
                 "volume",
+                "wait",
                 "xfade",
             ],
         );

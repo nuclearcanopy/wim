@@ -169,7 +169,11 @@ in it:
 silence(15m)          append a 15 minute silence
 silence(10s, front)   insert one next, same position parameter as
                       add_to_queue
+wait(15s)             the same command; `wait` reads better in a queue
 ```
+
+`silence` stays the canonical spelling because it also names what
+actually plays: a generated silent source, not a suspended player.
 
 it is a *real* entry, not a flag beside the queue: mpv loads
 `av://lavfi:anullsrc=d=N` as a file, so the silence occupies an index,
