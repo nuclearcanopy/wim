@@ -9,19 +9,19 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::app;
+use crate::app::{self, Action, LoopMode};
 use crate::cache::{self, CacheIndex};
 use crate::download::{self, DownloadEvent};
 use crate::notify::{Notifications, Severity};
 use crate::playqueue::PlayQueue;
 use crate::search::SearchItem;
-use crate::shellsong::{self, Console, ViewTarget};
+use crate::shellsong::{self, Console, GoTarget, Op, Program, Target, ViewTarget};
 use crate::shellsong_host::{Ramp, SearchSettle};
 use crate::ui::controlsbar::Field;
 use crate::ui::results_list::label;
 use crate::{
-    browse, config, eq, favorites, library, listenbrainz, lyrics, mpv, opensubtitles, persistence,
-    search, subsonic, ui, Focus,
+    browse, config, eq, favorites, library, listenbrainz, lyrics, mpv, namehint, opensubtitles,
+    persistence, queues, search, shellsong_host, subsonic, ui, Focus,
 };
 
 /// Local items resolve straight to a file path mpv can load. A remote
@@ -1085,6 +1085,855 @@ pub struct CoreCtx<'a> {
     pub saved_queues: &'a mut Vec<String>,
 }
 
+/// The one place an `Action` from `app.handle_key` is acted on. Both
+/// key paths route through here (ordinary keys, and a query being
+/// typed); the typing path used to discard its action, which is why
+/// the first enter after a search only closed the text box.
+pub fn dispatch_action(action: Action, core: &mut CoreCtx, surf: &mut dyn Surface) -> Dispatch {
+    match action {
+        Action::Quit => {
+            save_playback_state(core.player, core.queue);
+            return Dispatch::Quit;
+        }
+        // albums/playlists/artists open a track-listing view instead
+        // of playing immediately ("let me scroll through the songs"
+        // first); songs/local files still play straight away.
+        Action::Play(item @ SearchItem::Album { .. })
+        | Action::Play(item @ SearchItem::Playlist { .. })
+        | Action::Play(item @ SearchItem::Artist { .. }) => {
+            // the view itself (title, and "loading..." until the
+            // tracks land) is the confirmation; no status line echo.
+            // nothing here waits on the network: the loader answers at
+            // once and fills the view in from `Loader::poll`.
+            // declined rather than opened by a front-end with no
+            // pane to open it in; the report is dropped here because
+            // this is the keypress path. `Op::Play` routes a page
+            // through `Surface::open_browse` itself so the shell can
+            // say why it will not.
+            surf.open_browse(&item, core);
+        }
+        Action::Play(item) => {
+            match resolve_tracks(&item) {
+                Ok(tracks) if tracks.is_empty() => core
+                    .notifications
+                    .push(Severity::Info, "nothing to play (empty album or playlist)"),
+                Ok(tracks) => {
+                    let first = tracks[0].clone();
+                    let interrupted = core.queue.current().cloned();
+                    let (s, played) = load_playlist(
+                        core.player,
+                        core.cache,
+                        core.queue,
+                        tracks,
+                        SessionStart::New,
+                    );
+                    if played {
+                        fire_subtitle_fetch(core.cfg, core.subtitle_tx, &first);
+                        let mut dctx = DownloadCtx {
+                            cache: core.cache,
+                            download_tx: core.download_tx,
+                            downloading: core.downloading,
+                            day_threshold: core.cfg.cache_days_threshold,
+                        };
+                        note_playback_started(&first, &mut dctx, core.notifications);
+                        start_tracking_playback(core.cfg, &first, core.scrobble);
+                        *core.previous_track = interrupted;
+                        // a standalone play (not from an open
+                        // album/playlist) takes over the full player
+                        // by default.
+                        surf.minimize_player(false);
+                    } else {
+                        core.notifications.push(Severity::Error, s);
+                    }
+                }
+                Err(msg) => core.notifications.push(Severity::Error, msg),
+            }
+        }
+        Action::Queued(item) => {
+            // queueing has no on-screen consequence of its own (the
+            // queue count on the bottom bar moves, but that's easy to
+            // miss), so this is one of the few things worth an actual
+            // toast.
+            match resolve_tracks(&item) {
+                Ok(tracks) => {
+                    for t in &tracks {
+                        let s =
+                            enqueue_track(core.player, t, core.cache, core.queue, core.app.shuffle);
+                        if s.starts_with("error") {
+                            core.notifications.push(Severity::Error, s);
+                        }
+                    }
+                    let n = tracks.len();
+                    core.notifications.push(
+                        Severity::Info,
+                        if n == 1 {
+                            "queued 1 track".to_string()
+                        } else {
+                            format!("queued {n} tracks")
+                        },
+                    );
+                }
+                Err(msg) => core.notifications.push(Severity::Error, msg),
+            }
+        }
+        Action::ShuffleToggled(on) => {
+            // turning it off leaves the order alone (nothing to put
+            // back); turning it on reshuffles what's still upcoming so
+            // it takes effect now, not only on later additions.
+            if on {
+                let shuffled = core.queue.shuffled_upcoming();
+                let msg = resync_upcoming(core.player, core.cache, core.queue, shuffled);
+                if msg.starts_with("error") {
+                    core.notifications.push(Severity::Error, msg);
+                    return Dispatch::Continue;
+                }
+            }
+            surf.flash(Field::Shuffle);
+        }
+        Action::SetLoop(mode) => {
+            // "loop all" isn't an mpv concept; it's tracked ourselves
+            // (see `PlayQueue::session`) and acted on once mpv's
+            // playlist drains, not here. mpv only ever needs to know
+            // about single-file loop.
+            let mpv_loop = if mode == LoopMode::One { "inf" } else { "no" };
+            match core.player.set_loop_file(mpv_loop) {
+                Ok(()) => surf.flash(Field::Loop),
+                Err(e) => core
+                    .notifications
+                    .push(Severity::Error, format!("error setting loop: {e}")),
+            }
+        }
+        Action::SetSpeed(speed) => match core.player.set_speed(speed) {
+            Ok(()) => surf.flash(Field::Speed),
+            Err(e) => core
+                .notifications
+                .push(Severity::Error, format!("error setting speed: {e}")),
+        },
+        Action::SetEq(_name, gains) => {
+            let filter = eq::build_af_filter(&gains);
+            match core.player.set_af(&filter) {
+                Ok(()) => surf.flash(Field::Eq),
+                Err(e) => core
+                    .notifications
+                    .push(Severity::Error, format!("error setting eq: {e}")),
+            }
+        }
+        Action::None => {}
+    }
+    Dispatch::Continue
+}
+/// Everything a running program knows about the world, rebuilt from
+/// live state before every `step`. `queue_len` counts the whole
+/// playlist, played prefix included, because that is what the queue
+/// view numbers and therefore what `goto(n)`/`remove(n)` mean.
+/// Takes its pieces rather than a whole `CoreCtx` for one reason: a
+/// `CoreCtx` holds a live mpv handle, and the env has nothing to do
+/// with mpv. One builder either way, so the two front-ends cannot
+/// disagree about what a program can see.
+pub fn shellsong_env(
+    app: &app::App,
+    queue: &PlayQueue,
+    surf: &dyn Surface,
+    settled: bool,
+    now: Duration,
+) -> shellsong::Env {
+    shellsong::Env {
+        now,
+        query: app.query.clone(),
+        results: app.results.iter().map(shellsong::Kind::of).collect(),
+        search_settled: settled,
+        queue_len: queue.entries().len(),
+        browsing: surf.browsing(),
+        focus: surf.focus(),
+    }
+}
+/// What a term-taking op acts on. `Index` is a row of the results
+/// list; `Selection` is whatever is highlighted, resolved exactly the
+/// way the keyboard's star/download keys resolve it (a focused browse
+/// view owns the highlight, otherwise the sidebar does).
+fn shellsong_item(target: Target, core: &CoreCtx, surf: &dyn Surface) -> Option<SearchItem> {
+    match target {
+        Target::Index(i) => core.app.results.get(i).cloned(),
+        Target::Selection => surf.selection(core),
+    }
+}
+/// Applies one op and reports exactly one line into the scrollback.
+/// The report is `Op::describe()` unless the host knew something
+/// better; `Op::closes_console` is consulted here, in one place,
+/// rather than by each view-opener remembering to.
+pub fn apply_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> Dispatch {
+    let described = op.describe();
+    let closes = op.closes_console();
+    let (dispatch, report) = run_op(op, core, surf);
+    // only on success: closing the console to make room for a screen
+    // that then failed to open would take the error message with it.
+    if closes && !matches!(report, Report::Failed(_)) {
+        surf.close_console();
+    }
+    match report {
+        Report::Described => core.console.note(described),
+        Report::Note(text) => core.console.note(text),
+        Report::Failed(text) => core.console.fail(text),
+    }
+    dispatch
+}
+/// The `Op` -> host table. Every arm goes through the call the matching
+/// keypress already makes (`dispatch_action` wherever an `Action`
+/// exists), so a shellsong command and a keybind can never diverge in
+/// behaviour; see docs/shellsong.md.
+fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Report) {
+    match op {
+        Op::TogglePause => {
+            if core.now_playing.is_none() {
+                return op_fail("nothing is playing");
+            }
+            op_ipc(core.player.toggle_pause())
+        }
+        Op::SkipNext => {
+            if core.now_playing.is_none() {
+                return op_fail("nothing is playing");
+            }
+            op_ipc(core.player.playlist_next())
+        }
+        Op::SkipBack => {
+            if core.previous_track.is_none() {
+                return op_fail("no previous track");
+            }
+            let mut dctx = DownloadCtx {
+                cache: core.cache,
+                download_tx: core.download_tx,
+                downloading: core.downloading,
+                day_threshold: core.cfg.cache_days_threshold,
+            };
+            let mut hooks = TrackChangeCtx {
+                dctx: &mut dctx,
+                scrobble: core.scrobble,
+                subtitle_tx: core.subtitle_tx,
+            };
+            let status = go_to_previous(
+                core.cfg,
+                core.player,
+                core.notifications,
+                core.previous_track,
+                core.queue,
+                &mut hooks,
+            );
+            op_note(status)
+        }
+        Op::SeekAbsolute(pos) => {
+            // asked for directly rather than read from the observed
+            // cache: this runs once per command, not per frame, and a
+            // percent target must resolve against the duration as of
+            // now rather than whatever the last pushed change said.
+            let duration = core
+                .player
+                .get_property(mpv::PROP_DURATION)
+                .ok()
+                .and_then(|v| v.as_f64());
+            match shellsong_host::seek_target(pos, duration) {
+                Ok(secs) => match core.player.seek(secs, false) {
+                    Ok(()) => op_note(format!("moved to {secs:.0}s")),
+                    Err(e) => op_fail(e.to_string()),
+                },
+                Err(why) => op_fail(why),
+            }
+        }
+        Op::SeekRelative(delta) => op_ipc(core.player.seek(delta, true)),
+        Op::SetVolume(level) => {
+            let current = current_volume(core.player).unwrap_or(*core.base_volume);
+            let target = shellsong_host::volume_target(level, current);
+            match core.player.set_volume(target) {
+                // the new level becomes the ceiling the crossfade and
+                // fade ramps scale against, or the next fade-in would
+                // snap the volume back to whatever it was at startup.
+                Ok(()) => {
+                    *core.base_volume = target;
+                    op_note(format!("volume: {target:.0}%"))
+                }
+                Err(e) => op_fail(format!("error setting volume: {e}")),
+            }
+        }
+        // mpv's own `mute`, not volume 0: it is reversible without
+        // having to remember the level, and `volume(...)` stays the one
+        // thing that moves the level.
+        Op::Mute(on) => op_ipc(core.player.set_property("mute", serde_json::json!(on))),
+        Op::CycleLoop => {
+            let mode = core.app.cycle_loop();
+            let dispatch = dispatch_action(Action::SetLoop(mode), core, surf);
+            (dispatch, Report::Note(format!("loop: {}", mode.label())))
+        }
+        Op::SetLoop(mode) => {
+            core.app.loop_mode = mode;
+            let dispatch = dispatch_action(Action::SetLoop(mode), core, surf);
+            (dispatch, Report::Described)
+        }
+        Op::ToggleShuffle => {
+            let on = core.app.toggle_shuffle();
+            let dispatch = dispatch_action(Action::ShuffleToggled(on), core, surf);
+            (
+                dispatch,
+                Report::Note(format!("shuffle: {}", if on { "on" } else { "off" })),
+            )
+        }
+        Op::SetShuffle(want) => {
+            if core.app.shuffle == want {
+                return op_note(format!(
+                    "shuffle is already {}",
+                    if want { "on" } else { "off" }
+                ));
+            }
+            let on = core.app.toggle_shuffle();
+            let dispatch = dispatch_action(Action::ShuffleToggled(on), core, surf);
+            (dispatch, Report::Described)
+        }
+        Op::SetSpeed(speed) => {
+            core.app.speed = speed;
+            let dispatch = dispatch_action(Action::SetSpeed(speed), core, surf);
+            (dispatch, Report::Described)
+        }
+        Op::SpeedUp | Op::SpeedDown => {
+            let dir = if matches!(op, Op::SpeedUp) { 1.0 } else { -1.0 };
+            let speed = core.app.bump_speed(dir);
+            let dispatch = dispatch_action(Action::SetSpeed(speed), core, surf);
+            (dispatch, Report::Note(format!("speed: {speed}x")))
+        }
+        Op::SetEqPreset(name) => {
+            // resolved here rather than at lowering time, because the
+            // saved curves only exist at runtime; `eq::resolve` reads
+            // built-ins first, then the saved list, same precedence the
+            // eq menu shows them in.
+            let saved = &core.cfg.eq_custom_presets;
+            let Some((source, _)) = eq::resolve(&name, saved) else {
+                return op_fail(eq::resolve_failure(&name, saved));
+            };
+            // `apply_eq_row` speaks eq-menu rows, which is exactly
+            // built-ins then saved; `eq_menu::cursor` is the inverse of
+            // this and a test pins the two agreeing.
+            let row = match source {
+                eq::Source::Builtin(i) => i,
+                eq::Source::Saved(i) => ui::eq_menu::PRESET_COUNT + i,
+            };
+            apply_eq_row(core.app, core.player, core.notifications, saved, row);
+            op_done()
+        }
+        Op::ToggleCrossfade => {
+            *core.crossfade_enabled = !*core.crossfade_enabled;
+            if !*core.crossfade_enabled {
+                *core.fade_in_started_at = None;
+                let _ = core.player.set_volume(*core.base_volume);
+            }
+            surf.flash(Field::Crossfade);
+            op_note(format!(
+                "crossfade: {}",
+                if *core.crossfade_enabled { "on" } else { "off" }
+            ))
+        }
+        Op::Search(query) => {
+            core.app.set_query(&query);
+            let fired = notify_query_changed(core.app, core.remote_search_tx);
+            core.settle.notified(fired, core.now);
+            op_note(format!(
+                "search: {query} ({} results so far)",
+                core.app.results.len()
+            ))
+        }
+        Op::MoveSelection(delta) => surf.move_selection(SelectStep::By(delta), core),
+        Op::SelectTop => surf.move_selection(SelectStep::Top, core),
+        Op::SelectBottom => surf.move_selection(SelectStep::Bottom, core),
+        Op::Go(GoTarget::Result) => {
+            let Some(item) = surf.selection(core) else {
+                return op_fail("nothing is selected");
+            };
+            let name = label(&item);
+            let dispatch = dispatch_action(Action::Play(item), core, surf);
+            (dispatch, Report::Note(format!("enter on {name}")))
+        }
+        Op::Go(GoTarget::BrowseRow) => surf.go_browse_row(core),
+        Op::Go(GoTarget::BottomBarField) => {
+            // enter on the bottom bar tweaks whichever field is
+            // selected, and every one of those fields already has its
+            // own command; reuse them rather than keeping a second
+            // copy of the bar's own match.
+            let Some(field) = surf.bar_field() else {
+                return surf.decline("bar control to press");
+            };
+            let field_op = match field {
+                Field::Pause => Op::TogglePause,
+                Field::Loop => Op::CycleLoop,
+                Field::Shuffle => Op::ToggleShuffle,
+                Field::Speed => Op::SpeedUp,
+                Field::Eq => Op::View(ViewTarget::Eq),
+                Field::Crossfade => Op::ToggleCrossfade,
+                // enter on the scrubber opens a keyboard drag, which
+                // the open console would swallow every key of; the
+                // language has real seek commands instead.
+                Field::Progress => {
+                    return op_fail("use moveto(1m20s) or seek(+30s) to scrub from here")
+                }
+            };
+            let closes = field_op.closes_console();
+            let result = run_op(field_op, core, surf);
+            if closes && !matches!(result.1, Report::Failed(_)) {
+                surf.close_console();
+            }
+            result
+        }
+        Op::Play(target) => {
+            // `go()`'s browse-row reading, for the same reason: with a
+            // browse view focused, the selection *is* a row of it, and
+            // playing one plays through to the end of the listing.
+            if target == Target::Selection
+                && surf.focus() == shellsong::Focus::Workspace
+                && surf.browsing()
+            {
+                return run_op(Op::Go(GoTarget::BrowseRow), core, surf);
+            }
+            let Some(item) = shellsong_item(target, core, surf) else {
+                return op_fail("nothing is selected");
+            };
+            // a page is opened, not played, and opening one needs a
+            // pane the core does not have; asked through the surface
+            // so a front-end without panes declines by name.
+            if matches!(
+                item,
+                SearchItem::Album { .. } | SearchItem::Playlist { .. } | SearchItem::Artist { .. }
+            ) {
+                return surf.open_browse(&item, core);
+            }
+            let name = label(&item);
+            let dispatch = dispatch_action(Action::Play(item), core, surf);
+            (dispatch, Report::Note(format!("playing: {name}")))
+        }
+        Op::Enqueue { target, front } => {
+            let Some(item) = shellsong_item(target, core, surf) else {
+                return op_fail("nothing is selected");
+            };
+            if !front {
+                // `Action::Queued` expands an album/playlist itself and
+                // reports its own count; resolving here as well would
+                // cost a second fetch of the very same track list.
+                let dispatch = dispatch_action(Action::Queued(item), core, surf);
+                return (dispatch, Report::Described);
+            }
+            let tracks = match resolve_tracks(&item) {
+                Ok(tracks) => tracks,
+                Err(why) => return op_fail(why),
+            };
+            if tracks.is_empty() {
+                return op_fail("nothing to queue (empty album or playlist)");
+            }
+            // reversed so the batch keeps its own order: each one is
+            // inserted directly behind what is playing.
+            for track in tracks.iter().rev() {
+                if let Err(why) = enqueue_next(track, core) {
+                    return op_fail(why);
+                }
+            }
+            op_note(format!("queued {} tracks next", tracks.len()))
+        }
+        Op::Star { target, on } => {
+            let Some(item) = shellsong_item(target, core, surf) else {
+                return op_fail("nothing is selected");
+            };
+            let verb = if on { "starred" } else { "unstarred" };
+            if is_starred(&item, core.favorites, core.remote_starred) == on {
+                return op_note(format!("'{}' is already {verb}", item.primary_name()));
+            }
+            match toggle_star(&item, core.favorites, core.remote_starred) {
+                Ok(_) => op_note(format!("{verb} '{}'", item.primary_name())),
+                Err(why) => op_fail(why),
+            }
+        }
+        Op::Download(target) => {
+            let Some(item) = shellsong_item(target, core, surf) else {
+                return op_fail("nothing is selected");
+            };
+            let mut dctx = DownloadCtx {
+                cache: core.cache,
+                download_tx: core.download_tx,
+                downloading: core.downloading,
+                day_threshold: core.cfg.cache_days_threshold,
+            };
+            let status = trigger_downloads(&item, &mut dctx, core.notifications);
+            op_note(status)
+        }
+        Op::OpenPage(target) => {
+            let Some(item) = shellsong_item(target, core, surf) else {
+                return op_fail("nothing is selected");
+            };
+            // an album/artist/playlist *is* a page, and
+            // `Action::Play` on one opens it rather than playing it; a
+            // song has no page of its own, so the page it belongs to
+            // is its album's. A local file has neither.
+            let page = match &item {
+                SearchItem::Album { .. }
+                | SearchItem::Artist { .. }
+                | SearchItem::Playlist { .. } => Some(item.clone()),
+                SearchItem::Song { album, client, .. } => {
+                    album_page(&core.app.corpus, album, client)
+                }
+                SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } => None,
+            };
+            match page {
+                Some(page) => {
+                    let name = label(&page);
+                    let dispatch = dispatch_action(Action::Play(page), core, surf);
+                    (dispatch, Report::Note(format!("opened {name}")))
+                }
+                None => op_fail(format!("no page for '{}'", item.primary_name())),
+            }
+        }
+        Op::ClearConsole => {
+            // the report line is pushed after this returns, so the
+            // console ends up holding exactly one line saying what
+            // happened rather than looking like it crashed.
+            core.console.lines.clear();
+            op_done()
+        }
+        Op::ClearQueue => {
+            // mpv's own `playlist-clear` keeps the file that is
+            // playing and drops the rest, which is exactly what
+            // clearing the queue means; `entries` only mirrors it.
+            match core.player.playlist_clear() {
+                Ok(()) => {
+                    core.queue.replace_upcoming(Vec::new());
+                    if let Some(cursor) = surf.queue_cursor() {
+                        *cursor = 0;
+                    }
+                    op_done()
+                }
+                Err(e) => op_fail(format!("error clearing the queue: {e}")),
+            }
+        }
+        Op::RemoveFromQueue(positions) => {
+            // 1-based and descending, so removing one can't reindex
+            // the next; the same `remove` + `playlist_remove` pairing
+            // the queue view's 'd' uses.
+            let mut removed = 0;
+            for position in &positions {
+                let index = position.saturating_sub(1);
+                if core.queue.remove(index) {
+                    if let Err(e) = core.player.playlist_remove(index) {
+                        return op_fail(format!("error removing: {e}"));
+                    }
+                    removed += 1;
+                }
+            }
+            let left = core.queue.entries().len();
+            if let Some(cursor) = surf.queue_cursor() {
+                *cursor = (*cursor).min(left.saturating_sub(1));
+            }
+            op_note(format!("removed {removed} from the queue"))
+        }
+        Op::GotoQueue(position) => {
+            // a `playlist-pos` write, not a reload: mpv keeps the same
+            // playlist so `entries` stays index-aligned with it (same
+            // as enter in the queue view).
+            op_ipc(core.player.set_property(
+                "playlist-pos",
+                serde_json::json!(position.saturating_sub(1)),
+            ))
+        }
+        Op::ShuffleQueue => {
+            let shuffled = core.queue.shuffled_upcoming();
+            let count = shuffled.len();
+            let status = resync_upcoming(core.player, core.cache, core.queue, shuffled);
+            if status.starts_with("error") {
+                return op_fail(status);
+            }
+            op_note(format!("shuffled {count} upcoming"))
+        }
+        Op::SaveQueue(name) => match queues::save(&name, core.queue.entries()) {
+            Ok(0) => op_fail("nothing in the queue to save"),
+            Ok(count) => {
+                *core.saved_queues = queues::list();
+                op_note(format!("saved {count} tracks as '{}'", queues::slug(&name)))
+            }
+            Err(e) => op_fail(format!("couldn't save '{name}': {e}")),
+        },
+        Op::LoadQueue(name) => {
+            let clients = shellsong_host::clients_of(&core.app.corpus);
+            match queues::load(&name, &clients) {
+                None => op_fail(namehint::unknown(
+                    "saved queue",
+                    &name,
+                    queues::list().iter().map(String::as_str),
+                )),
+                Some(items) if items.is_empty() => {
+                    op_fail(format!("nothing in '{name}' could be found any more"))
+                }
+                Some(items) => {
+                    let count = items.len();
+                    match start_session(items, false, core, surf) {
+                        Ok(_) => op_note(format!("loaded '{name}': {count} tracks")),
+                        Err(why) => op_fail(why),
+                    }
+                }
+            }
+        }
+        // the partition is the language's own: `is_screen()` targets
+        // need a pane, the other five print into the console and so
+        // behave identically in both binaries.
+        Op::View(target) if target.is_screen() => surf.open_screen(target, core),
+        Op::View(target) => print_listing(target, core),
+        Op::Rescan => {
+            // a fresh channel and thread, same as startup: the scan
+            // signs off by dropping its sender, so the old receiver
+            // can't be reused. Only the local half of the corpus is
+            // dropped, or a rescan would also wipe the navidrome
+            // catalog until the next sync landed.
+            let (tx, rx) = mpsc::channel::<library::ScanBatch>();
+            library::spawn_scan(core.cfg.library_paths.clone(), tx);
+            *core.scan_rx = rx;
+            core.app.corpus.drop_local();
+            core.app.scanning_library = true;
+            core.app.resync_results();
+            op_done()
+        }
+        Op::Sleep(Some(secs)) => {
+            *core.sleep_due = Some(core.now + Duration::from_secs_f64(secs.max(0.0)));
+            op_done()
+        }
+        Op::Sleep(None) => {
+            let was_set = core.sleep_due.take().is_some();
+            if !was_set {
+                return op_note("no sleep timer was set");
+            }
+            // the ramp may already have taken the volume down.
+            let _ = core.player.set_volume(*core.base_volume);
+            op_done()
+        }
+        Op::Fade { into, secs } => {
+            let from = current_volume(core.player).unwrap_or(*core.base_volume);
+            let to = if into { *core.base_volume } else { 0.0 };
+            *core.fade = Some(Ramp::new(
+                from,
+                to,
+                core.now,
+                Duration::from_secs_f64(secs.max(0.0)),
+            ));
+            op_done()
+        }
+        Op::Quit => {
+            let dispatch = dispatch_action(Action::Quit, core, surf);
+            (dispatch, Report::Described)
+        }
+    }
+}
+/// The five `view(...)` targets that are not screens: they print into
+/// the console and need no pane, so both front-ends get them for free
+/// and identically. `ViewTarget::is_screen()` is the partition.
+pub fn print_listing(target: ViewTarget, core: &mut CoreCtx) -> (Dispatch, Report) {
+    match target {
+        ViewTarget::Queue => {
+            let pos = core.queue.pos();
+            let lines: Vec<String> = core
+                .queue
+                .entries()
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let here = if Some(i) == pos { '>' } else { ' ' };
+                    format!("{here}{:>3}. {}", i + 1, label(item))
+                })
+                .collect();
+            if lines.is_empty() {
+                return op_note("the queue is empty");
+            }
+            let count = lines.len();
+            for line in lines {
+                core.console.note(line);
+            }
+            op_note(format!("{count} in the queue"))
+        }
+        ViewTarget::Index => {
+            let rows = core.app.corpus.breakdown();
+            for (source, count) in &rows {
+                core.console.note(format!("{source}: {count}"));
+            }
+            op_note(format!("{} sources indexed", rows.len()))
+        }
+        ViewTarget::History => {
+            // cloned first: the scrollback is being pushed into, and
+            // the history lives on the same `Console`.
+            let lines: Vec<String> = core.console.history().to_vec();
+            if lines.is_empty() {
+                return op_note("no history yet");
+            }
+            let count = lines.len();
+            for line in lines {
+                core.console.note(format!(": {line}"));
+            }
+            op_note(format!("{count} past commands"))
+        }
+        ViewTarget::Playlists => {
+            *core.saved_queues = queues::list();
+            if core.saved_queues.is_empty() {
+                return op_note("no saved queues; save_queue(name) makes one");
+            }
+            let names = core.saved_queues.clone();
+            let count = names.len();
+            for name in names {
+                core.console.note(name);
+            }
+            op_note(format!("{count} saved queues"))
+        }
+        // the one listing whose content the language generates rather
+        // than the app, which is what keeps `help()` and `view(help)`
+        // from drifting; printing it is still the host's job.
+        ViewTarget::Help => {
+            let lines = shellsong::help_lines();
+            let count = lines.len();
+            for line in lines {
+                core.console.note(line);
+            }
+            op_note(format!("{count} commands"))
+        }
+        // `is_screen()` sends these to the surface; reached only if
+        // that partition and this match ever disagree.
+        other => (
+            Dispatch::Continue,
+            Report::Failed(format!("{other:?} is a screen, not a listing")),
+        ),
+    }
+}
+
+/// What one frame of driving a program came to. The loop never
+/// blocks: `Await` means the results a `Resolve` wants have not
+/// settled, so the caller keeps the program and tries again next
+/// frame (see `Program::step`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drive {
+    /// The program is finished; drop it.
+    Done,
+    /// Suspended on a search; keep it and step again next frame.
+    Await,
+    /// `quit()` ran; the front-end should exit.
+    Quit,
+}
+
+/// Steps a program as far as it can go this frame, applying each
+/// `Emit` before the next `step`. The one driver, so wim and
+/// shellswim cannot diverge on await handling, on when a program is
+/// dropped, or on where a failure is reported.
+pub fn drive(
+    program: &mut Program,
+    core: &mut CoreCtx,
+    surf: &mut dyn Surface,
+    settle_now: impl Fn(&CoreCtx) -> bool,
+) -> Drive {
+    loop {
+        // rebuilt every step, not once per frame: `search(...)` makes
+        // the query unsettled again, and a `Resolve` reading a stale
+        // `true` would act on the previous query's results, which is
+        // the exact bug `search_settled` exists to stop.
+        let settled = settle_now(core);
+        let env = shellsong_env(core.app, core.queue, surf, settled, core.now);
+        match program.step(&env) {
+            shellsong::Step::Emit(op) => {
+                if apply_op(op, core, surf) == Dispatch::Quit {
+                    return Drive::Quit;
+                }
+                if program.is_done() {
+                    return Drive::Done;
+                }
+            }
+            shellsong::Step::Note(text) => core.console.note(text),
+            shellsong::Step::AwaitResults { .. } => return Drive::Await,
+            shellsong::Step::Failed(e) => {
+                core.console.fail(e.to_string());
+                return Drive::Done;
+            }
+            shellsong::Step::Done => return Drive::Done,
+        }
+    }
+}
+
+/// Starts a freshly built session: mpv's playlist is replaced and
+/// every "a track just started" hook fires for the first track, the
+/// same set `Action::Play` fires. One place, so a shellsong-built
+/// session can't quietly skip a hook the keyboard runs.
+pub fn start_session(
+    items: Vec<SearchItem>,
+    minimize: bool,
+    core: &mut CoreCtx,
+    surf: &mut dyn Surface,
+) -> Result<String, String> {
+    let Some(first) = items.first().cloned() else {
+        return Err("nothing to play".to_string());
+    };
+    let interrupted = core.queue.current().cloned();
+    let (status, played) = load_playlist(
+        core.player,
+        core.cache,
+        core.queue,
+        items,
+        SessionStart::New,
+    );
+    if !played {
+        return Err(status);
+    }
+    fire_subtitle_fetch(core.cfg, core.subtitle_tx, &first);
+    let mut dctx = DownloadCtx {
+        cache: core.cache,
+        download_tx: core.download_tx,
+        downloading: core.downloading,
+        day_threshold: core.cfg.cache_days_threshold,
+    };
+    note_playback_started(&first, &mut dctx, core.notifications);
+    start_tracking_playback(core.cfg, &first, core.scrobble);
+    *core.previous_track = interrupted;
+    surf.minimize_player(minimize);
+    Ok(status)
+}
+/// `add_to_queue(front, ...)`: append, then move the new entry in
+/// right behind what is playing. `enqueue_track` still writes both
+/// sides (mpv's playlist and the index map); this only reorders, with
+/// the same `move_entry` + `playlist_move` pairing the queue view's
+/// reorder uses. Appended unshuffled on purpose: `front` means front.
+pub fn enqueue_next(item: &SearchItem, core: &mut CoreCtx) -> Result<(), String> {
+    let status = enqueue_track(core.player, item, core.cache, core.queue, false);
+    if status.starts_with("error") || status.starts_with("not ") {
+        return Err(status);
+    }
+    let from = core.queue.entries().len().saturating_sub(1);
+    let to = core.queue.pos().map_or(0, |p| p + 1);
+    if to < from && core.queue.move_entry(from, to) {
+        if let Err(e) = core.player.playlist_move(from, to) {
+            return Err(format!("error moving: {e}"));
+        }
+    }
+    Ok(())
+}
+/// Pushes the current query to the background `search3` thread (see
+/// `spawn_background_search`) whenever typing/pasting actually changed
+/// it; a no-op while the query's empty or no server has been indexed
+/// yet, same as the background thread's own guard, just avoiding the
+/// channel send entirely in the common "nothing to search remotely"
+/// case.
+///
+/// Reports whether a request actually went out, which is exactly what
+/// `SearchSettle` needs: with nothing fired there is nothing to wait
+/// for, so the results for the new query are already as complete as
+/// they will get.
+pub fn notify_query_changed(
+    app: &app::App,
+    remote_search_tx: &mpsc::Sender<RemoteSearchQuery>,
+) -> bool {
+    if app.query.trim().is_empty() {
+        return false;
+    }
+    let clients = app.corpus.remote_clients();
+    if clients.is_empty() {
+        return false;
+    }
+    remote_search_tx
+        .send(RemoteSearchQuery {
+            query: app.query.clone(),
+            clients,
+        })
+        .is_ok()
+}
 // MOVED_ITEMS_MARKER
 
 /// What the core could not do by itself. Every method has a default
@@ -1125,25 +1974,25 @@ pub trait Surface {
     /// not screens print into the console and never reach here.
     fn open_screen(&mut self, target: ViewTarget, core: &mut CoreCtx) -> (Dispatch, Report) {
         let _ = core;
-        self.decline(format!("view({})", format!("{target:?}").to_lowercase()))
+        self.decline(&format!("view({})", format!("{target:?}").to_lowercase()))
     }
 
     fn move_selection(&mut self, step: SelectStep, core: &mut CoreCtx) -> (Dispatch, Report) {
         let _ = (step, core);
-        self.decline("moving the selection")
+        self.decline("selection to move")
     }
 
     /// `go()` with a browse view open: play from the highlighted row.
     fn go_browse_row(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
         let _ = core;
-        self.decline("playing from a browse row")
+        self.decline("browse row to play from")
     }
 
     /// An album/playlist/artist opens its track listing rather than
     /// playing; `Action::Play` on one lands here.
     fn open_browse(&mut self, item: &SearchItem, core: &mut CoreCtx) -> (Dispatch, Report) {
         let _ = core;
-        self.decline(format!("opening {}", label(item)))
+        self.decline(&format!("page to open {} in", label(item)))
     }
 
     /// Which bottom-bar control `go()` would press. `None` means
@@ -1174,9 +2023,10 @@ pub trait Surface {
     /// `Op::closes_console`.
     fn close_console(&mut self) {}
 
-    /// The one-line refusal. Shared so every decline reads the same.
-    fn decline(&self, what: impl std::fmt::Display) -> (Dispatch, Report) {
-        op_fail(format!("{} cannot do {what}; wim can", self.front_end()))
+    /// The one-line refusal. Shared so every decline reads the same
+    /// and always names where the thing does exist.
+    fn decline(&self, what: &str) -> (Dispatch, Report) {
+        op_fail(format!("{} has no {what}; wim does", self.front_end()))
     }
 }
 
