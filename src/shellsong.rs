@@ -82,24 +82,31 @@ impl Kind {
     }
 }
 
-/// `kind=` ladder: every rung accepts everything the one before it
-/// did, so a suffix or keyword argument can only ever *add* acceptable
-/// kinds. One line per rung is the whole definition.
+/// `kind=` rungs: the kinds each one accepts.
 ///
-/// **`album` prefers the album, which is the point of asking.** It
-/// used to read `[Song, Album]`, song first, and that made the rung
-/// close to useless: any library with a song whose title contains the
-/// album's name never resolved to the album at all. Reported from
-/// real use -- `queue_aa(crest)` queued the single song "5 Star Crest
-/// (4 Vattenrum)" and left the album Crest untouched.
+/// **These are assertions, not preferences, and that is a reversal.**
+/// `kind=` began as a widening ladder on top of a preference order
+/// ("ambiguity resolution, not filtering", r7). It went through
+/// `album = [Song, Album]` (song first, which made the rung useless
+/// in any library with a song whose title contains an album name),
+/// then `[Album, Song]` (album-preferring). The maintainer then asked
+/// for the thing both of those were approximating: the bare command
+/// decides *dynamically*, and `k=` is how you overrule it.
 ///
-/// Reaching for `_aa` or `kind=album` *is* the statement that an album
-/// is what you meant; the song-preferring reading is already what the
-/// bare command does. The rung still accepts songs, so a term with no
-/// album match behaves exactly as before.
+/// So `k=song` means songs, `k=album` means albums, and neither falls
+/// back to the other -- a term with no album match under `k=album`
+/// reports that rather than quietly queueing a song. The default,
+/// `SONG_ALBUM`, accepts both and lets the scores decide; see
+/// `best_match`.
+///
+/// `_aa` still desugars to `kind=album`, so existing scripts parse,
+/// but its name ("allow album") no longer describes it: albums are
+/// allowed by default now and the suffix asserts. Kept rather than
+/// removed because dropping a documented suffix breaks scripts
+/// silently.
 const KIND_LADDER: &[(&str, &[Kind])] = &[
     ("song", &[Kind::Song]),
-    ("album", &[Kind::Album, Kind::Song]),
+    ("album", &[Kind::Album]),
     (
         "any",
         &[
@@ -970,7 +977,15 @@ impl Command {
 }
 
 const NONE: &[Param] = &[];
-const SONG: &[Kind] = &[Kind::Song];
+/// What `play` and `queue` accept with no `k=`: both, with the better
+/// score winning (`Pick::Best`).
+///
+/// **`queue` used to be `SONG` alone**, by a recorded decision that
+/// "playing an album is ordinary, building a queue out of albums is
+/// not. do not fix the asymmetry". The maintainer asked for the
+/// asymmetry gone, twice, from real use: a term that names an album
+/// should queue the album. The order here no longer carries meaning
+/// for these two commands, since `Pick::Best` reads it as a set.
 const SONG_ALBUM: &[Kind] = &[Kind::Song, Kind::Album];
 /// `view(q, ...)` wants the page a term belongs to, so it prefers the
 /// kinds that *have* pages and takes a song last.
@@ -1088,8 +1103,8 @@ pub const COMMANDS: &[Command] = &[
         "queue",
         &["enqueue"],
         &[opt("terms", Ty::Terms)],
-        SONG,
-        "append each term to the queue",
+        SONG_ALBUM,
+        "append each term; k=song / k=album to insist",
     ),
     cmd("undo", &[], NONE, &[], "step back through the undo tree"),
     cmd("redo", &[], NONE, &[], "step forward again"),
@@ -1126,7 +1141,10 @@ pub const COMMANDS: &[Command] = &[
             ),
             opt("terms", Ty::Terms),
         ],
-        SONG,
+        // the same kinds as `queue`, necessarily: `add_to_queue(back,
+        // x)` *is* `queue(x)`, and a test compares the two lowerings
+        // to keep it that way. it caught this diverging.
+        SONG_ALBUM,
         "insert next (front) or append (back)",
     ),
     cmd(
@@ -1725,6 +1743,7 @@ enum Node {
         group: usize,
         term: String,
         prefs: Vec<Kind>,
+        pick: Pick,
         action: TermAction,
     },
     /// A line of a script that did not parse. Reported and stepped
@@ -1882,8 +1901,9 @@ impl Program {
                 group,
                 term,
                 prefs,
+                pick,
                 action,
-            } => self.resolve(env, group, &term, &prefs, action),
+            } => self.resolve(env, group, &term, &prefs, pick, action),
             Node::Summary { group, past, total } => {
                 self.pc += 1;
                 let ok = self.groups.get(group).map(|g| g.ok).unwrap_or(0);
@@ -1944,6 +1964,7 @@ impl Program {
         group: usize,
         term: &str,
         prefs: &[Kind],
+        pick: Pick,
         action: TermAction,
     ) -> Step {
         if let Some(pending) = self.pending.clone() {
@@ -1959,7 +1980,7 @@ impl Program {
             self.pending = None;
         }
         self.pc += 1;
-        match best_match(&env.results, prefs) {
+        match best_match(&env.results, prefs, pick) {
             Some(index) => {
                 if let Some(g) = self.groups.get_mut(group) {
                     g.ok += 1;
@@ -1978,14 +1999,36 @@ impl Program {
     }
 }
 
-/// First result of the most-preferred kind actually present. Results
-/// arrive best-first within a category (see `Corpus::search`), so the
-/// first of a kind *is* that kind's best match; this is the ambiguity
-/// resolution docs/shellsong.md R7 describes, not a filter.
-fn best_match(results: &[Kind], prefs: &[Kind]) -> Option<usize> {
-    prefs
-        .iter()
-        .find_map(|want| results.iter().position(|k| k == want))
+/// How a term picks among the results it matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    /// The best-scoring result of any acceptable kind.
+    ///
+    /// `Corpus::search` sorts by score and *then* groups categories,
+    /// keeping each category's first appearance, so the acceptable
+    /// result nearest the front is the best-scoring one -- which makes
+    /// "whichever kind actually matched better" a single `position`.
+    /// This is what `play` and `queue` do.
+    Best,
+    /// First result of the most-preferred kind present, in the
+    /// declared order, even when another kind scored higher.
+    ///
+    /// Only `view` wants this, and it is why `view`'s order is
+    /// documented as *different* rather than wider: `view(q, bladee)`
+    /// should open the artist's page, which is the thing an artist
+    /// term most has, even if some song scored above it.
+    InOrder,
+}
+
+/// The result a term resolves to, or `None` if nothing acceptable
+/// matched.
+fn best_match(results: &[Kind], prefs: &[Kind], pick: Pick) -> Option<usize> {
+    match pick {
+        Pick::Best => results.iter().position(|k| prefs.contains(k)),
+        Pick::InOrder => prefs
+            .iter()
+            .find_map(|want| results.iter().position(|k| k == want)),
+    }
 }
 
 // -------------------------------------------------------------- lowering
@@ -2170,6 +2213,16 @@ impl<'a> Lowering<'a> {
 
     fn lower_terms(&mut self, call: &Call, terms: &[String], action: TermAction) {
         let prefs = call.prefs();
+        // `view` is the one command whose preference order is a real
+        // order rather than a set; everything else lets the scores
+        // decide. the same predicate `kind=` is gated on, for the same
+        // reason: the ladder widens *from songs*, and `view` does not
+        // start there.
+        let pick = if widenable(call.command) {
+            Pick::Best
+        } else {
+            Pick::InOrder
+        };
         let group = self.groups;
         self.groups += 1;
         for (i, term) in terms.iter().enumerate() {
@@ -2183,6 +2236,7 @@ impl<'a> Lowering<'a> {
             self.nodes.push(Node::Search(term.clone()));
             self.nodes.push(Node::Resolve {
                 group,
+                pick,
                 term: term.clone(),
                 prefs: prefs.to_vec(),
                 action,
@@ -5227,7 +5281,7 @@ mod tests {
         assert!(out.iter().any(|l| l.contains("search 'hex'")), "{out:?}");
         assert!(
             out.iter()
-                .any(|l| l.contains("queued the best song match for 'crest'")),
+                .any(|l| l.contains("queued the best song/album match for 'crest'")),
             "{out:?}"
         );
     }
@@ -5475,25 +5529,28 @@ mod tests {
     // ---------------------------------------------- kind preferences
 
     /// The ambiguous case: "crest" matching both a song and an album.
-    /// `queue` prefers songs and never falls through to the album;
-    /// `queue_aa` prefers the **album**.
+    /// Bare `queue` takes **whichever scored better**, which is index
+    /// 0 whatever kind it is, because `Corpus::search` puts the
+    /// best-scoring category first.
     ///
-    /// **This assertion is inverted from what it first pinned**, which
-    /// was "a song is still the best match even with albums allowed".
-    /// That shipped and then failed in real use: a library with "5
-    /// Star Crest (4 Vattenrum)" in it meant `queue_aa(crest)` queued
-    /// that one song and never the album Crest, which made the rung
-    /// close to useless. Reaching for `_aa` is the statement that an
-    /// album is what you meant; the song-preferring reading is what
-    /// the bare `queue` already is.
+    /// **This assertion has now been inverted twice**, which is worth
+    /// leaving on the record. It first pinned "a song is still the
+    /// best match even with albums allowed"; that made `_aa` useless
+    /// in a library holding "5 Star Crest (4 Vattenrum)". It then
+    /// pinned album-preferring. Both were approximations of what was
+    /// actually wanted: let the scores decide, and make `k=` the way
+    /// to overrule them.
     #[test]
-    fn queue_aa_prefers_the_album_and_bare_queue_still_prefers_the_song() {
-        let both = vec![Kind::Album, Kind::Song];
-        assert_eq!(resolve_with("queue(crest)", both.clone()), vec![queued(1)]);
+    fn queue_takes_whichever_kind_scored_better() {
+        // album first in the result list means the album scored best.
         assert_eq!(
-            resolve_with("queue_aa(crest)", both),
-            vec![queued(0)],
-            "asking for albums must actually reach the album"
+            resolve_with("queue(crest)", vec![Kind::Album, Kind::Song]),
+            vec![queued(0)]
+        );
+        // and the other way round, same call.
+        assert_eq!(
+            resolve_with("queue(crest)", vec![Kind::Song, Kind::Album]),
+            vec![queued(0)]
         );
     }
 
@@ -5516,7 +5573,6 @@ mod tests {
             );
         }
         for call in [
-            "queue(crest)",
             "queue(crest, kind=song)",
             "queue(crest, k=song)",
             "queue(crest, k=s)",
@@ -5527,36 +5583,52 @@ mod tests {
                 "{call} did not reach the song"
             );
         }
+        // and bare `queue` asserts nothing, so it takes the better
+        // score, which here is the album at index 0.
+        assert_eq!(resolve_with("queue(crest)", both), vec![queued(0)]);
         // and a bad value says what it will take, both spellings.
         let e = error("queue(crest, k=zzz)");
         assert!(e.message.contains("song or album"), "{}", e.message);
         assert!(e.message.contains("s/a"), "{}", e.message);
     }
 
-    /// And the fallback is intact: with no album in the results,
-    /// `_aa` still finds the song.
+    /// An assertion does not fall back, which is the whole of what
+    /// makes it one: `k=album` with no album match reports that
+    /// rather than quietly queueing a song you did not ask for.
     #[test]
-    fn queue_aa_falls_back_to_a_song_when_no_album_matches() {
-        assert_eq!(
-            resolve_with("queue_aa(crest)", vec![Kind::Song]),
-            vec![queued(0)]
-        );
+    fn an_asserted_kind_does_not_fall_back() {
+        assert!(resolve_with("queue_aa(crest)", vec![Kind::Song]).is_empty());
+        assert!(resolve_with("queue(crest, k=a)", vec![Kind::Song]).is_empty());
+        assert!(resolve_with("queue(crest, k=s)", vec![Kind::Album]).is_empty());
     }
 
+    /// **Inverted deliberately**: this used to assert "a plain queue
+    /// must not build itself out of albums", which was the recorded
+    /// asymmetry the maintainer has since overruled. A term naming an
+    /// album now queues the album.
+    ///
+    /// What it still pins is the *ceiling*: neither the default nor
+    /// `_aa` reaches an artist, because an artist expands to a whole
+    /// discography and `kind=any` is the explicit way to ask for that.
     #[test]
-    fn queue_declines_an_album_but_queue_aa_takes_it() {
+    fn queue_reaches_an_album_but_never_an_artist() {
         let albums_only = vec![Kind::Album, Kind::Artist];
-        assert!(
-            resolve_with("queue(crest)", albums_only.clone()).is_empty(),
-            "a plain queue must not build itself out of albums"
+        assert_eq!(
+            resolve_with("queue(crest)", albums_only.clone()),
+            vec![queued(0)],
+            "a term naming an album queues the album"
         );
         assert_eq!(
             resolve_with("queue_aa(crest)", albums_only),
             vec![queued(0)]
         );
         assert!(
+            resolve_with("queue(crest)", vec![Kind::Artist]).is_empty(),
+            "an artist is a discography, not a queue"
+        );
+        assert!(
             resolve_with("queue_aa(crest)", vec![Kind::Artist]).is_empty(),
-            "_aa widens to albums, and stops there"
+            "_aa reaches albums, and stops there"
         );
         assert_eq!(
             resolve_with("queue_any(crest)", vec![Kind::Artist]),
@@ -5619,8 +5691,14 @@ mod tests {
         }
         assert_eq!(emitted.len(), 1, "only the matching term acts");
         assert_eq!(reported.len(), 3, "two misses plus the tally");
-        assert!(reported.iter().any(|r| r.contains("no song match for 'a'")));
-        assert!(reported.iter().any(|r| r.contains("no song match for 'c'")));
+        // "song/album": `queue` accepts both and lets the score
+        // decide, so a miss is a miss for both.
+        assert!(reported
+            .iter()
+            .any(|r| r.contains("no song/album match for 'a'")));
+        assert!(reported
+            .iter()
+            .any(|r| r.contains("no song/album match for 'c'")));
         assert_eq!(reported.last().unwrap(), "queued 1 of 3");
     }
 
@@ -5706,8 +5784,9 @@ mod tests {
             Step::Emit(Op::Search("crest".to_string()))
         );
         env.query = "crest".to_string();
-        // play prefers songs, so the song at 1 wins over the album.
-        assert_eq!(program.step(&env), Step::Emit(Op::Play(Target::Index(1))));
+        // play takes the better score, and the album is at the front
+        // of the list, so it is the better score.
+        assert_eq!(program.step(&env), Step::Emit(Op::Play(Target::Index(0))));
         assert_eq!(
             program.step(&env),
             Step::Emit(Op::Search("hex".to_string()))
