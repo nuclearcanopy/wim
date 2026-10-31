@@ -56,6 +56,92 @@ fn write_vars(path: &Path, scope: &Scope) {
     }
 }
 
+// ---------------------------------------------------------- scripts
+
+/// Script extension. One per file, shellsong lines, `#` comments.
+const SHG: &str = "shg";
+
+/// The one script that runs by itself, at startup.
+pub const INIT_SCRIPT: &str = "init";
+
+/// Where a bare `run(name)` looks: next to `config.toml`, not in the
+/// state dir. A script is something you write and keep, the same class
+/// of thing the config is, where history and ranks are not.
+fn script_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("wim"))
+}
+
+/// `.shg` names in the config dir, alphabetical; the `run(...)`
+/// completion candidates. Same best-effort shape as `queues::list`.
+pub fn script_names() -> Vec<String> {
+    let Some(read) = script_dir().and_then(|d| std::fs::read_dir(d).ok()) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = read
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            (path.extension()? == SHG)
+                .then(|| path.file_stem()?.to_str().map(str::to_string))
+                .flatten()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Whether `init.shg` is there to run at startup.
+pub fn has_init_script() -> bool {
+    script_path(INIT_SCRIPT).is_some_and(|p| p.exists())
+}
+
+/// Resolves a `run(...)` argument. A bare name is a script in the
+/// config dir (the `load_queue(name)` shape: a named thing, not a
+/// path); anything with a separator, a leading `~` or a leading `.` is
+/// taken as a path, so a script can live wherever you keep it.
+fn script_path(name: &str) -> Option<PathBuf> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if let Some(rest) = name.strip_prefix("~/") {
+        return dirs::home_dir().map(|h| h.join(rest));
+    }
+    if is_path(name) {
+        return Some(PathBuf::from(name));
+    }
+    script_dir().map(|d| d.join(format!("{name}.{SHG}")))
+}
+
+/// Whether the argument was written as a path rather than as a name.
+/// Pure and tested; the two spellings get different "not found"
+/// messages, since only a name has a list to suggest from.
+fn is_path(name: &str) -> bool {
+    name.contains('/') || name.starts_with('.') || name.starts_with('~')
+}
+
+/// Reads one script for `run(...)`. `Err` is already phrased for
+/// whoever typed it, since only this side knows how a name resolves and
+/// which scripts exist; a bare name that missed goes through
+/// `namehint::unknown` like every other runtime name.
+pub fn read_script(name: &str) -> Result<String, String> {
+    let Some(path) = script_path(name) else {
+        return Err(format!("'{name}' is not a usable script name"));
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(source) => Ok(source),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !is_path(name) => {
+            let names = script_names();
+            Err(crate::namehint::unknown(
+                "script",
+                name,
+                names.iter().map(String::as_str),
+            ))
+        }
+        Err(e) => Err(format!("couldn't read {}: {e}", path.display())),
+    }
+}
+
 // ------------------------------------------------------- completion
 
 /// Completion candidates off the live corpus. `Corpus::search` is
@@ -74,6 +160,10 @@ pub struct CorpusCandidates<'a> {
     /// The live variables: what a submitted line is expanded against,
     /// and what the variable-name parameters complete from.
     pub vars: &'a Scope,
+    /// `.shg` names behind `run(...)`'s completion; snapshotted on
+    /// console open, same as `saved`, since listing them is a directory
+    /// read and this is called per keystroke.
+    pub scripts: &'a [String],
 }
 
 /// Matches offered per keystroke. `Console` caps the list again at its
@@ -103,6 +193,16 @@ impl Candidates for CorpusCandidates<'_> {
 
     fn scope(&self) -> &Scope {
         self.vars
+    }
+
+    fn scripts(&self) -> Vec<String> {
+        self.scripts.to_vec()
+    }
+
+    /// The one method here that touches the disk, which is fine: it is
+    /// called once per submitted line, not per keystroke.
+    fn read_script(&self, name: &str) -> Result<String, String> {
+        read_script(name)
     }
 }
 
@@ -408,6 +508,7 @@ mod tests {
             saved: &[],
             eq_presets: Vec::new(),
             vars: no_vars(),
+            scripts: &[],
         };
         let got = cand.corpus("flat");
         // the bare title, not "flatline · bladee": a decorated label
@@ -431,6 +532,7 @@ mod tests {
             saved: &[],
             eq_presets: Vec::new(),
             vars: no_vars(),
+            scripts: &[],
         };
         assert_eq!(cand.corpus("hex"), vec!["hex".to_string()]);
     }
@@ -453,6 +555,7 @@ mod tests {
             saved: &[],
             eq_presets: Vec::new(),
             vars: no_vars(),
+            scripts: &[],
         };
         assert_eq!(cand.corpus("same"), vec!["same title".to_string()]);
     }
@@ -465,6 +568,7 @@ mod tests {
             saved: &[],
             eq_presets: Vec::new(),
             vars: no_vars(),
+            scripts: &[],
         };
         assert!(cand.corpus("").is_empty());
     }
@@ -478,6 +582,7 @@ mod tests {
             saved: &saved,
             eq_presets: Vec::new(),
             vars: no_vars(),
+            scripts: &[],
         };
         assert_eq!(cand.saved_queues(), saved);
     }
@@ -644,6 +749,7 @@ mod tests {
                 saved: &saved,
                 eq_presets: Vec::new(),
                 vars: no_vars(),
+                scripts: &[],
             };
             for line in ["play(blade r", "queue([bladee, obedient])", "volume(50%)"] {
                 let iters = if size >= 30_000 { 10u32 } else { 25 };
