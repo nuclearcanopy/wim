@@ -1633,6 +1633,11 @@ pub struct CoreCtx<'a> {
     // volume, and everything that ramps it.
     pub base_volume: &'a mut f64,
     pub crossfade_enabled: &'a mut bool,
+    /// Which per-identity settings the user has since overridden by
+    /// hand, so a binding does not fight them; see
+    /// `identity_settings`. Here rather than a host local because
+    /// `track_started` is shared.
+    pub overridden: &'a mut shellsong_host::Overridden,
     /// The undo tree. Written in `apply_op` and read by `Op::Undo`;
     /// see `src/undo.rs`.
     pub undo: &'a mut undo::Recorder,
@@ -2677,6 +2682,66 @@ pub fn drive(
     }
 }
 
+/// The per-identity ops a newly started track asked for, for the host
+/// to run through its own step loop.
+///
+/// Returned rather than applied because they are *ops*: pushing them
+/// through the same `apply_shellsong_op` path as everything else is
+/// what keeps a bound eq indistinguishable from a typed one, and the
+/// pending-program slot differs between the two front-ends.
+#[derive(Debug, Default)]
+pub struct Started {
+    pub ops: Vec<Op>,
+    /// What to tell the user got applied, if anything did.
+    pub bound: Option<String>,
+}
+
+/// Everything that happens because a track just started playing.
+///
+/// **One place, because there were three and they disagreed.** wim's
+/// ordinary advance and its loop-all restart both fired the full set;
+/// `start_session` -- which is what `play()` and `Action::Play` go
+/// through -- fired three of the five and *not* per-identity settings
+/// or the volume ramp. so a bound eq applied when a track arrived by
+/// advancing and not when you asked for it by name, which is not a
+/// difference anyone would guess at. shellswim fired none of them.
+///
+/// `set_vid_for_item` is deliberately *not* here: it is about what mpv
+/// decodes, which the caller decides when it loads the file, not a
+/// consequence of playback starting.
+pub fn track_started(track: &SearchItem, core: &mut CoreCtx) -> Started {
+    fire_subtitle_fetch(core.cfg, core.subtitle_tx, track);
+    let mut dctx = DownloadCtx {
+        cache: core.cache,
+        download_tx: core.download_tx,
+        downloading: core.downloading,
+        day_threshold: core.cfg.cache_days_threshold,
+    };
+    note_playback_started(track, &mut dctx, core.notifications);
+    start_tracking_playback(core.cfg, track, core.scrobble);
+
+    let (ops, bound) = identity_settings(
+        track,
+        core.bindings,
+        core.overridden,
+        current_eq_name(core.app, core.cfg),
+        current_volume(core.player).unwrap_or(*core.base_volume),
+        core.app.speed,
+    );
+
+    // either start quiet and ramp up (crossfade on), or make sure it
+    // is at full volume regardless of wherever a fade-out left things
+    // -- crossfade switched off mid-fade, say.
+    if *core.crossfade_enabled {
+        let _ = core.player.set_volume(0.0);
+        *core.fade_in_started_at = Some(Instant::now());
+    } else {
+        let _ = core.player.set_volume(*core.base_volume);
+    }
+
+    Started { ops, bound }
+}
+
 /// What `drained` did about mpv running out of playlist.
 #[derive(Debug)]
 pub enum Drained {
@@ -2803,15 +2868,15 @@ pub fn start_session(
     if !played {
         return Err(status);
     }
-    fire_subtitle_fetch(core.cfg, core.subtitle_tx, &first);
-    let mut dctx = DownloadCtx {
-        cache: core.cache,
-        download_tx: core.download_tx,
-        downloading: core.downloading,
-        day_threshold: core.cfg.cache_days_threshold,
-    };
-    note_playback_started(&first, &mut dctx, core.notifications);
-    start_tracking_playback(core.cfg, &first, core.scrobble);
+    // the same hooks an advance fires, which this used to fire only
+    // three of: `play(x)` did not apply a bound eq where advancing to
+    // the same track would have. `surf.queue_program` carries the ops
+    // on, since the pending-program slot is the host's.
+    let started = track_started(&first, core);
+    surf.queue_program(started.ops);
+    if let Some(bound) = started.bound {
+        core.notifications.push(Severity::Info, bound);
+    }
     *core.previous_track = interrupted;
     surf.minimize_player(minimize);
     Ok(status)
@@ -3019,6 +3084,13 @@ pub trait Surface {
     fn open_browse(&mut self, item: &SearchItem, core: &mut CoreCtx) -> (Dispatch, Report) {
         let _ = core;
         self.decline(&format!("page to open {} in", label(item)))
+    }
+
+    /// Per-identity ops a newly started track asked for, for the
+    /// host to run through its step loop. Dropped by default: a
+    /// front-end with no step loop has nothing to do with them.
+    fn queue_program(&mut self, ops: Vec<Op>) {
+        let _ = ops;
     }
 
     /// `search()` ran and this front-end has nowhere to draw the
@@ -3253,6 +3325,7 @@ mod seam_tests {
         _star_rx: mpsc::Receiver<StarFailed>,
         base_volume: f64,
         crossfade_enabled: bool,
+        overridden: shellsong_host::Overridden,
         undo: undo::Recorder,
         gap_secs: f64,
         between_tracks: BetweenTracks,
@@ -3301,6 +3374,7 @@ mod seam_tests {
                 _star_rx: star_rx,
                 base_volume: 100.0,
                 crossfade_enabled: false,
+                overridden: shellsong_host::Overridden::default(),
                 undo: undo::Recorder::default(),
                 gap_secs: 0.0,
                 between_tracks: BetweenTracks::new(),
@@ -3343,6 +3417,7 @@ mod seam_tests {
                 track_resolver: &mut self.track_resolver,
                 base_volume: &mut self.base_volume,
                 crossfade_enabled: &mut self.crossfade_enabled,
+                overridden: &mut self.overridden,
                 undo: &mut self.undo,
                 gap_secs: &mut self.gap_secs,
                 between_tracks: &mut self.between_tracks,
@@ -3676,6 +3751,63 @@ mod seam_tests {
         }
         assert_eq!(h.gap_secs, 10.0, "and redo walks back down");
         assert_eq!(h.undo.len(), 2);
+    }
+
+    /// The parity bug `track_started` exists to close: `play(x)`
+    /// went through `start_session`, which fired the subtitle,
+    /// download and scrobble hooks and **not** per-identity settings,
+    /// while advancing to the very same track did fire them. so a
+    /// bound eq applied when a track arrived on its own and not when
+    /// you asked for it by name.
+    ///
+    /// `#[ignore]` for the usual reason: `CoreCtx` holds a live mpv.
+    #[test]
+    #[ignore]
+    fn starting_a_session_applies_a_bound_eq_like_advancing_does() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let track = test_songs(1).remove(0);
+        // bind an eq to this track's identity, the way `remember`
+        // does.
+        let id = shellsong_host::identity_of(&track);
+        let tier = shellsong::Tier::Track;
+        let name = shellsong_host::name_at(&id, tier).expect("a song has a track identity");
+        h.bindings
+            .remember(tier, &name, &shellsong::Setting::Eq("rock".to_string()));
+
+        // through `start_session`, which is the path that had the
+        // bug; calling `track_started` directly would pass even with
+        // the call site gutted, which is how this test was wrong on
+        // its first draft.
+        let mut surf = Capturing::default();
+        {
+            let mut core = h.ctx(&player);
+            start_session(vec![track], false, &mut core, &mut surf).expect("session starts");
+        }
+        assert!(
+            surf.queued
+                .iter()
+                .any(|op| matches!(op, Op::SetEqPreset(n) if n == "rock")),
+            "play() has to apply a bound eq, same as advancing does: {:?}",
+            surf.queued
+        );
+    }
+
+    /// A `Surface` that records the per-identity ops handed to it, so
+    /// the hook can be checked where it is actually wired.
+    #[derive(Default)]
+    struct Capturing {
+        queued: Vec<Op>,
+    }
+
+    impl Surface for Capturing {
+        fn front_end(&self) -> &'static str {
+            "a test"
+        }
+        fn queue_program(&mut self, ops: Vec<Op>) {
+            self.queued.extend(ops);
+        }
     }
 
     /// The end-of-playlist decision, which is the part both

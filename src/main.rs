@@ -23,15 +23,15 @@ use ratatui_image::StatefulImage;
 use wim::cache::CacheIndex;
 use wim::core::{
     append_resolved, apply_eq_gains, apply_eq_row, apply_op, browse_session, client_for,
-    current_eq_name, current_volume, dispatch_action, download_resolved, download_tracks, drained,
-    drive, enqueue_track, eq_preset_names, fire_scrobble, fire_subtitle_fetch, front_resolved,
-    go_to_previous, identity_settings, load_playlist, lyrics_query, note_playback_started,
-    notify_query_changed, op_done, op_fail, op_note, open_starred, playing_duration, print_listing,
-    retain_live_clients, save_playback_state, set_vid_for_item, shellsong_focus,
-    spawn_background_search, start_session, start_tracking_playback, suggestion_starred_keys,
-    sweep_cache, toggle_star, BetweenTracks, CoreCtx, Dispatch, DownloadCtx, Drained, Drive,
-    GapAction, Intent, RemoteSearchOutcome, RemoteSearchQuery, Report, Resolution, ScrobbleState,
-    SelectStep, SessionStart, StarFailed, SubtitleReady, Surface, TrackChangeCtx, TrackResolver,
+    dispatch_action, download_resolved, download_tracks, drained, drive, enqueue_track,
+    eq_preset_names, fire_scrobble, fire_subtitle_fetch, front_resolved, go_to_previous,
+    load_playlist, lyrics_query, note_playback_started, notify_query_changed, op_done, op_fail,
+    op_note, open_starred, playing_duration, print_listing, retain_live_clients,
+    save_playback_state, set_vid_for_item, shellsong_focus, spawn_background_search, start_session,
+    start_tracking_playback, suggestion_starred_keys, sweep_cache, toggle_star, track_started,
+    BetweenTracks, CoreCtx, Dispatch, DownloadCtx, Drained, Drive, GapAction, Intent,
+    RemoteSearchOutcome, RemoteSearchQuery, Report, Resolution, ScrobbleState, SelectStep,
+    SessionStart, StarFailed, SubtitleReady, Surface, TrackChangeCtx, TrackResolver,
 };
 use wim::download::DownloadEvent;
 use wim::keymap::{KeyAction, Keymap};
@@ -2022,6 +2022,81 @@ fn main() -> anyhow::Result<()> {
         // reads this, so none of them can show a track mpv isn't
         // actually playing.
         let mut now_playing = play_queue.current().cloned();
+        // hoisted from further down with the macros below, which
+        // borrow it: `start.elapsed()` is free to read early.
+        let shellsong_now = start.elapsed();
+        // defined at the top of the loop body rather than beside
+        // their first use: a `macro_rules!` is only in scope after
+        // its definition, and the event drain above wants them too.
+        // every local they borrow is declared before the loop.
+        macro_rules! core_ctx {
+            () => {
+                CoreCtx {
+                    cfg: &cfg,
+                    player: &player,
+                    app: &mut app,
+                    notifications: &mut notifications,
+                    queue: &mut play_queue,
+                    previous_track: &mut previous_track,
+                    cache: &cache_index,
+                    download_tx: &download_tx,
+                    downloading: &mut downloading,
+                    scrobble: &mut scrobble,
+                    subtitle_tx: &subtitle_tx,
+                    console: &mut console,
+                    now: shellsong_now,
+                    now_playing: &now_playing,
+                    favorites: &mut favorites,
+                    remote_starred: &mut remote_starred,
+                    lyrics_client: &lyrics_client,
+                    lyrics_loader: &mut lyrics_loader,
+                    star_tx: &star_tx,
+                    track_resolver: &mut track_resolver,
+                    base_volume: &mut base_volume,
+                    crossfade_enabled: &mut crossfade_enabled,
+                    overridden: &mut shellsong_overridden,
+                    undo: &mut undo_tree,
+                    gap_secs: &mut gap_secs,
+                    between_tracks: &mut between_tracks,
+                    fade_in_started_at: &mut fade_in_started_at,
+                    fade: &mut shellsong_fade,
+                    sleep_due: &mut sleep_due,
+                    resume_due: &mut resume_due,
+                    scan_rx: &mut scan_rx,
+                    remote_search_tx: &remote_search_tx,
+                    settle: &mut settle,
+                    saved_queues: &mut saved_queues,
+                    vars: &mut shellsong_vars,
+                    bindings: &mut shellsong_bindings,
+                }
+            };
+        }
+        macro_rules! wim_surface {
+            () => {
+                WimSurface {
+                    focus: &mut focus,
+                    browse_view: &mut browse_view,
+                    browse_loader: &mut browse_loader,
+                    real_art_protocol: &mut real_art_protocol,
+                    player_minimized: &mut player_minimized,
+                    flash: &mut flash,
+                    console_open: &mut console_open,
+                    queue_selected: &mut queue_selected,
+                    queue_view_open: &mut queue_view_open,
+                    suggestions: &mut suggestions,
+                    suggestions_selected: &mut suggestions_selected,
+                    settings_menu_open: &mut settings_menu_open,
+                    keybinds_menu_open: &mut keybinds_menu_open,
+                    keybinds_menu_selected: &mut keybinds_menu_selected,
+                    eq_menu_open: &mut eq_menu_open,
+                    eq_menu_selected: &mut eq_menu_selected,
+                    eq_menu: &mut eq_menu,
+                    undo_menu_open: &mut undo_menu_open,
+                    bottombar_selected,
+                }
+            };
+        }
+
         // read before this frame's `tick` (which runs after the draw),
         // so the countdown is at most one frame behind. it is a
         // seconds-resolution readout, so that is invisible.
@@ -2982,44 +3057,23 @@ fn main() -> anyhow::Result<()> {
         }
 
         if let Some(next) = advanced_to {
+            // `vid` is about what mpv decodes and belongs with the
+            // load, not with playback starting, so it stays here.
             set_vid_for_item(&player, &next);
-            fire_subtitle_fetch(&cfg, &subtitle_tx, &next);
-            let mut dctx = DownloadCtx {
-                cache: &cache_index,
-                download_tx: &download_tx,
-                downloading: &mut downloading,
-                day_threshold: cfg.cache_days_threshold,
+            let started = {
+                let mut surf = wim_surface!();
+                let mut core = core_ctx!();
+                let s = track_started(&next, &mut core);
+                let _ = &mut surf;
+                s
             };
-            note_playback_started(&next, &mut dctx, &mut notifications);
-            start_tracking_playback(&cfg, &next, &mut scrobble);
-            // per-identity settings. Queued rather than applied here,
-            // so they go through the step loop's `apply_shellsong_op`
-            // like every other op.
-            let (ops, bound) = identity_settings(
-                &next,
-                &shellsong_bindings,
-                &mut shellsong_overridden,
-                current_eq_name(&app, &cfg),
-                current_volume(&player).unwrap_or(base_volume),
-                app.speed,
-            );
-            if !ops.is_empty() {
-                shellsong_queued = Some(Box::new(shellsong::Program::of(ops)));
+            if !started.ops.is_empty() {
+                shellsong_queued = Some(Box::new(shellsong::Program::of(started.ops)));
             }
-            if let Some(bound) = bound {
+            if let Some(bound) = started.bound {
                 notifications.push(Severity::Info, bound);
             }
             previous_track = now_playing.replace(next);
-            // a track just started: either start it quiet and ramp up
-            // (crossfade on), or make sure it's at full volume
-            // regardless of wherever a fade-out left things (crossfade
-            // just got disabled mid-fade, say).
-            if crossfade_enabled {
-                let _ = player.set_volume(0.0);
-                fade_in_started_at = Some(Instant::now());
-            } else {
-                let _ = player.set_volume(base_volume);
-            }
         }
 
         // mpv went back to idling, so its playlist really did run out
@@ -3035,38 +3089,22 @@ fn main() -> anyhow::Result<()> {
                 Drained::Cleared => now_playing = None,
                 Drained::Failed(why) => notifications.push(Severity::Error, why),
                 Drained::Restarted(first) => {
-                    fire_subtitle_fetch(&cfg, &subtitle_tx, &first);
-                    let mut dctx = DownloadCtx {
-                        cache: &cache_index,
-                        download_tx: &download_tx,
-                        downloading: &mut downloading,
-                        day_threshold: cfg.cache_days_threshold,
+                    // a loop-all restart is a track change, so it is
+                    // the same hook the advance above uses.
+                    let started = {
+                        let mut surf = wim_surface!();
+                        let mut core = core_ctx!();
+                        let s = track_started(&first, &mut core);
+                        let _ = &mut surf;
+                        s
                     };
-                    note_playback_started(&first, &mut dctx, &mut notifications);
-                    start_tracking_playback(&cfg, &first, &mut scrobble);
-                    // same hook as the ordinary advance above: a
-                    // loop-all restart is a track change too.
-                    let (ops, bound) = identity_settings(
-                        &first,
-                        &shellsong_bindings,
-                        &mut shellsong_overridden,
-                        current_eq_name(&app, &cfg),
-                        current_volume(&player).unwrap_or(base_volume),
-                        app.speed,
-                    );
-                    if !ops.is_empty() {
-                        shellsong_queued = Some(Box::new(shellsong::Program::of(ops)));
+                    if !started.ops.is_empty() {
+                        shellsong_queued = Some(Box::new(shellsong::Program::of(started.ops)));
                     }
-                    if let Some(bound) = bound {
+                    if let Some(bound) = started.bound {
                         notifications.push(Severity::Info, bound);
                     }
                     previous_track = now_playing.replace(first);
-                    if crossfade_enabled {
-                        let _ = player.set_volume(0.0);
-                        fade_in_started_at = Some(Instant::now());
-                    } else {
-                        let _ = player.set_volume(base_volume);
-                    }
                 }
             }
         }
@@ -3455,78 +3493,11 @@ fn main() -> anyhow::Result<()> {
         // shellsong's own volume ramps, ticked unconditionally like the
         // crossfade ramp above and for the same reason: volume should
         // fade whether or not the console is still on screen.
-        let shellsong_now = start.elapsed();
         // both halves of the seam, built from this frame's locals at
         // every use the way `DownloadCtx` already is. Macros rather
         // than functions because they are struct literals over
         // `main`'s own locals; two disjoint borrow sets, which is why
         // they can be held at once. See docs/library-seam.md.
-        macro_rules! core_ctx {
-            () => {
-                CoreCtx {
-                    cfg: &cfg,
-                    player: &player,
-                    app: &mut app,
-                    notifications: &mut notifications,
-                    queue: &mut play_queue,
-                    previous_track: &mut previous_track,
-                    cache: &cache_index,
-                    download_tx: &download_tx,
-                    downloading: &mut downloading,
-                    scrobble: &mut scrobble,
-                    subtitle_tx: &subtitle_tx,
-                    console: &mut console,
-                    now: shellsong_now,
-                    now_playing: &now_playing,
-                    favorites: &mut favorites,
-                    remote_starred: &mut remote_starred,
-                    lyrics_client: &lyrics_client,
-                    lyrics_loader: &mut lyrics_loader,
-                    star_tx: &star_tx,
-                    track_resolver: &mut track_resolver,
-                    base_volume: &mut base_volume,
-                    crossfade_enabled: &mut crossfade_enabled,
-                    undo: &mut undo_tree,
-                    gap_secs: &mut gap_secs,
-                    between_tracks: &mut between_tracks,
-                    fade_in_started_at: &mut fade_in_started_at,
-                    fade: &mut shellsong_fade,
-                    sleep_due: &mut sleep_due,
-                    resume_due: &mut resume_due,
-                    scan_rx: &mut scan_rx,
-                    remote_search_tx: &remote_search_tx,
-                    settle: &mut settle,
-                    saved_queues: &mut saved_queues,
-                    vars: &mut shellsong_vars,
-                    bindings: &mut shellsong_bindings,
-                }
-            };
-        }
-        macro_rules! wim_surface {
-            () => {
-                WimSurface {
-                    focus: &mut focus,
-                    browse_view: &mut browse_view,
-                    browse_loader: &mut browse_loader,
-                    real_art_protocol: &mut real_art_protocol,
-                    player_minimized: &mut player_minimized,
-                    flash: &mut flash,
-                    console_open: &mut console_open,
-                    queue_selected: &mut queue_selected,
-                    queue_view_open: &mut queue_view_open,
-                    suggestions: &mut suggestions,
-                    suggestions_selected: &mut suggestions_selected,
-                    settings_menu_open: &mut settings_menu_open,
-                    keybinds_menu_open: &mut keybinds_menu_open,
-                    keybinds_menu_selected: &mut keybinds_menu_selected,
-                    eq_menu_open: &mut eq_menu_open,
-                    eq_menu_selected: &mut eq_menu_selected,
-                    eq_menu: &mut eq_menu,
-                    undo_menu_open: &mut undo_menu_open,
-                    bottombar_selected,
-                }
-            };
-        }
         if let Some(ramp) = shellsong_fade {
             let _ = player.set_volume_nowait(ramp.level_at(shellsong_now));
             if ramp.finished(shellsong_now) {
