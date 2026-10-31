@@ -168,11 +168,11 @@ impl Snapshot {
 
         if *core.vars != self.vars {
             *core.vars = self.vars.clone();
-            shellsong_host::save_vars(core.vars);
+            shellsong_host::save_vars_or_warn(core.vars, core.notifications);
         }
         if *core.bindings != self.bindings {
             *core.bindings = self.bindings.clone();
-            shellsong_host::save_bindings(core.bindings);
+            shellsong_host::save_bindings_or_warn(core.bindings, core.notifications);
         }
 
         let mpv_loop = if self.loop_mode == LoopMode::One {
