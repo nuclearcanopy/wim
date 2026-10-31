@@ -1676,19 +1676,35 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
         },
         Op::LoadQueue(name) => {
             let clients = shellsong_host::clients_of(&core.app.corpus);
-            match queues::load(&name, &clients) {
+            // `load_report` rather than `load`: the plain one discards
+            // what it could not rebuild, so a fifty-track queue whose
+            // server is gone came back as twelve tracks and said
+            // nothing about the other thirty-eight.
+            match queues::load_report(&name, &clients) {
                 None => op_fail(namehint::unknown(
                     "saved queue",
                     &name,
                     queues::list().iter().map(String::as_str),
                 )),
-                Some(items) if items.is_empty() => {
-                    op_fail(format!("nothing in '{name}' could be found any more"))
+                Some(loaded) if loaded.items.is_empty() => {
+                    let why = queues::summarise(&loaded.dropped);
+                    if why.is_empty() {
+                        op_fail(format!("'{name}' is empty"))
+                    } else {
+                        op_fail(format!("nothing in '{name}' loaded: {why}"))
+                    }
                 }
-                Some(items) => {
-                    let count = items.len();
-                    match start_session(items, false, core, surf) {
-                        Ok(_) => op_note(format!("loaded '{name}': {count} tracks")),
+                Some(loaded) => {
+                    let count = loaded.items.len();
+                    let lost = loaded.dropped.len();
+                    match start_session(loaded.items, false, core, surf) {
+                        Ok(_) if lost == 0 => op_note(format!("loaded '{name}': {count} tracks")),
+                        Ok(_) => op_note(format!(
+                            "loaded '{name}': {count} of {} tracks; {} missing: {}",
+                            count + lost,
+                            lost,
+                            queues::summarise(&loaded.dropped)
+                        )),
                         Err(why) => op_fail(why),
                     }
                 }
