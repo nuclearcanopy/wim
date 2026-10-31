@@ -839,21 +839,22 @@ fn song_count(n: usize) -> String {
     }
 }
 
-/// An opened album's cover. Goes through the shared on-disk store
-/// keyed by the album's names, so reopening an album costs nothing and
-/// a cover the player already fetched for one of its tracks is a hit
-/// here (and the reverse).
+/// An opened album's cover. Goes through the shared on-disk store, so
+/// reopening an album costs nothing and a cover the player already
+/// fetched for one of its tracks is a hit here (and the reverse).
 ///
-/// `artist`/`album` rather than just the id because the store is
-/// name-keyed; falling back to the id's own slot keeps an untagged
-/// album working, just without sharing.
+/// Keyed by the album id first, which is what the player's own key
+/// prefers too (`coverart::Key::of`); the names are the fallback for a
+/// track whose album id nothing has reported, so both sides have to
+/// try them in the same order or the two stop sharing.
 fn fetch_cover_art(
     client: &Client,
     album_id: &str,
     artist: &str,
     album: &str,
 ) -> Option<image::DynamicImage> {
-    let key = crate::coverart::Key::album(artist, album)
+    let key = crate::coverart::Key::album_id(album_id)
+        .or_else(|| crate::coverart::Key::album(artist, album))
         .unwrap_or_else(|| crate::coverart::Key::Track(format!("album:{album_id}")));
     crate::coverart::fetch_stored(client, &key, album_id)
 }
