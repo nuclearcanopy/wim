@@ -455,6 +455,12 @@ pub enum Op {
     RemoveFromQueue(Vec<usize>),
     GotoQueue(usize),
     ShuffleQueue,
+    /// Walk the undo tree. Classified `Ignored` in `undo::classify`,
+    /// and that is load-bearing: recording an undo would make undoing
+    /// it a new node instead of a redo, and the tree would grow a
+    /// branch every time someone changed their mind.
+    Undo,
+    Redo,
     /// The pause between tracks. `None` turns it off, which is why
     /// this takes `Ty::Duration` where `silence` needed `Ty::Span`:
     /// here `off` means something.
@@ -547,6 +553,8 @@ impl Op {
             Op::RemoveFromQueue(v) => format!("removed {} from the queue", v.len()),
             Op::GotoQueue(n) => format!("jumped to queue {n}"),
             Op::ShuffleQueue => "queue shuffled".into(),
+            Op::Undo => "undone".into(),
+            Op::Redo => "redone".into(),
             Op::SetGap(Some(s)) => format!("gap {s}s between tracks"),
             Op::SetGap(None) => "gap off".into(),
             Op::Silence { secs, front } => format!(
@@ -1030,6 +1038,8 @@ pub const COMMANDS: &[Command] = &[
         SONG,
         "append each term to the queue",
     ),
+    cmd("undo", &[], NONE, &[], "step back through the undo tree"),
+    cmd("redo", &[], NONE, &[], "step forward again"),
     cmd(
         "gap",
         &[],
@@ -2355,6 +2365,8 @@ impl Call {
                 _ => Op::ToggleShuffle,
             },
             "shuffle_queue" => Op::ShuffleQueue,
+            "undo" => Op::Undo,
+            "redo" => Op::Redo,
             "gap" => match first {
                 Some(Arg::Duration(d)) => Op::SetGap(*d),
                 _ => return None,
@@ -7174,6 +7186,7 @@ queue(morning)
                 "quit",
                 "random",
                 "randomize",
+                "redo",
                 "remember",
                 "remove",
                 "repeat",
@@ -7196,6 +7209,7 @@ queue(morning)
                 "tempo",
                 "toggle",
                 "top",
+                "undo",
                 "unfav",
                 "unfavorite",
                 "unlike",
@@ -7397,6 +7411,7 @@ queue(morning)
                 "quit",
                 "random",
                 "randomize",
+                "redo",
                 "remember",
                 "remove",
                 "repeat",
@@ -7419,6 +7434,7 @@ queue(morning)
                 "tempo",
                 "toggle",
                 "top",
+                "undo",
                 "unfav",
                 "unfavorite",
                 "unlike",
@@ -7715,6 +7731,7 @@ queue(morning)
                 "quit",
                 "random",
                 "randomize",
+                "redo",
                 "remember",
                 "remove",
                 "repeat",
@@ -7737,6 +7754,7 @@ queue(morning)
                 "tempo",
                 "toggle",
                 "top",
+                "undo",
                 "unfav",
                 "unfavorite",
                 "unlike",

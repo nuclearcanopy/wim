@@ -22,7 +22,7 @@ use crate::ui::controlsbar::Field;
 use crate::ui::results_list::label;
 use crate::{
     browse, config, eq, favorites, library, listenbrainz, lyrics, mpv, namehint, opensubtitles,
-    persistence, queues, search, shellsong_host, subsonic, ui, Focus,
+    persistence, queues, search, shellsong_host, subsonic, ui, undo, Focus,
 };
 
 /// Local items resolve straight to a file path mpv can load. A remote
@@ -1580,6 +1580,9 @@ pub struct CoreCtx<'a> {
     // volume, and everything that ramps it.
     pub base_volume: &'a mut f64,
     pub crossfade_enabled: &'a mut bool,
+    /// The undo tree. Written in `apply_op` and read by `Op::Undo`;
+    /// see `src/undo.rs`.
+    pub undo: &'a mut undo::Recorder,
     /// Seconds between tracks, live. `config::gap_seconds` is only the
     /// value this starts at; `gap()` changes it for the session, the
     /// same split `crossfade_enabled` already has.
@@ -1753,7 +1756,29 @@ fn shellsong_item(target: Target, core: &CoreCtx, surf: &dyn Surface) -> Option<
 pub fn apply_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> Dispatch {
     let described = op.describe();
     let closes = op.closes_console();
+    // the undo tree's one hook. `apply_op` is the only public way in;
+    // `run_op` recurses into itself three times (a bar field, a
+    // browse-row `go`, a settings call) and never back through here,
+    // so one record per intent needs no re-entrance guard.
+    let how = undo::classify(&op);
+    let kind = undo::coalesce_kind(&op);
+    let recordable = how != undo::Reversibility::Ignored;
+    if recordable && core.undo.is_unrooted() {
+        let before = undo::Snapshot::capture(core);
+        core.undo.plant(before, core.now);
+    }
     let (dispatch, report) = run_op(op, core, surf);
+    // a failed op changed nothing, so recording it would put a row in
+    // the tree that undoes to the state it is already in.
+    if recordable && !matches!(report, Report::Failed(_)) {
+        let after = undo::Snapshot::capture(core);
+        let barrier = match how {
+            undo::Reversibility::Barrier(why) => Some(why),
+            _ => None,
+        };
+        core.undo
+            .record(after, described.clone(), kind, barrier, core.now);
+    }
     // only on success: closing the console to make room for a screen
     // that then failed to open would take the error message with it.
     if closes && !matches!(report, Report::Failed(_)) {
@@ -2159,6 +2184,29 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 } else {
                     op_note(format!("queued a {span} silence"))
                 }
+            }
+        }
+        Op::Undo | Op::Redo => {
+            let back = op == Op::Undo;
+            let outcome = if back {
+                core.undo.undo()
+            } else {
+                core.undo.redo()
+            };
+            match outcome {
+                undo::Outcome::Restored(snapshot) => match snapshot.restore(core) {
+                    Ok(()) => op_done(),
+                    Err(why) => op_fail(why),
+                },
+                // the whole point of barriers: say what cannot be
+                // reversed rather than restoring around it and letting
+                // the user believe it worked.
+                undo::Outcome::Refused(why) => op_fail(format!("can't undo: {why}")),
+                undo::Outcome::Nowhere => op_fail(if back {
+                    "nothing to undo"
+                } else {
+                    "nothing to redo"
+                }),
             }
         }
         Op::ShuffleQueue => {
@@ -2955,6 +3003,7 @@ mod seam_tests {
         _star_rx: mpsc::Receiver<StarFailed>,
         base_volume: f64,
         crossfade_enabled: bool,
+        undo: undo::Recorder,
         gap_secs: f64,
         between_tracks: BetweenTracks,
         fade_in_started_at: Option<Instant>,
@@ -3001,6 +3050,7 @@ mod seam_tests {
                 _star_rx: star_rx,
                 base_volume: 100.0,
                 crossfade_enabled: false,
+                undo: undo::Recorder::default(),
                 gap_secs: 0.0,
                 between_tracks: BetweenTracks::new(),
                 fade_in_started_at: None,
@@ -3041,6 +3091,7 @@ mod seam_tests {
                 track_resolver: &mut self.track_resolver,
                 base_volume: &mut self.base_volume,
                 crossfade_enabled: &mut self.crossfade_enabled,
+                undo: &mut self.undo,
                 gap_secs: &mut self.gap_secs,
                 between_tracks: &mut self.between_tracks,
                 fade_in_started_at: &mut self.fade_in_started_at,
@@ -3317,6 +3368,106 @@ mod seam_tests {
             reported < 600.0 * 0.5,
             "mpv reported {reported}s for a 600s silence; if this now \
              matches, the scrubber may read mpv's duration again"
+        );
+    }
+
+    /// The undo hook, end to end against the real `apply_op` and a
+    /// real mpv: `apply_op` is the only place that records, so this is
+    /// the only way to find out whether it does.
+    ///
+    /// `#[ignore]` for the same reason as the test above (~400ms to
+    /// spawn mpv): `cargo test --lib seam -- --ignored`.
+    #[test]
+    #[ignore]
+    fn an_op_is_recorded_once_and_undoing_it_puts_the_state_back() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let mut surf = Headless;
+
+        // nothing recorded yet, so there is nothing to undo and it
+        // says so rather than silently doing nothing.
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::Undo, &mut core, &mut surf);
+        }
+        assert!(
+            h.console
+                .lines
+                .last()
+                .unwrap()
+                .text
+                .contains("nothing to undo"),
+            "{:?}",
+            h.console.lines
+        );
+
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::SetGap(Some(10.0)), &mut core, &mut surf);
+        }
+        assert_eq!(h.gap_secs, 10.0);
+        // root (the state before) plus the one op.
+        assert_eq!(h.undo.len(), 2, "one op, one node");
+
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::Undo, &mut core, &mut surf);
+        }
+        assert_eq!(h.gap_secs, 0.0, "undo put the gap back");
+        assert_eq!(h.undo.len(), 2, "undo walks the tree, it does not grow it");
+
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::Redo, &mut core, &mut surf);
+        }
+        assert_eq!(h.gap_secs, 10.0, "and redo walks back down");
+        assert_eq!(h.undo.len(), 2);
+    }
+
+    /// A failed op changed nothing, so recording it would put a row in
+    /// the tree that undoes to the state it is already in.
+    #[test]
+    #[ignore]
+    fn a_failed_op_is_not_recorded() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let mut surf = Headless;
+        {
+            let mut core = h.ctx(&player);
+            // an eq preset that does not exist: resolved in memory
+            // against the config, so this fails without touching a
+            // socket or the disk.
+            apply_op(Op::SetEqPreset("nope".into()), &mut core, &mut surf);
+        }
+        assert!(
+            h.console
+                .lines
+                .last()
+                .unwrap()
+                .text
+                .contains("no eq preset"),
+            "the op has to actually fail for this to mean anything: {:?}",
+            h.console.lines
+        );
+        // one node is the *root*, the state the session was in; what
+        // must not appear is a second node for an op that changed
+        // nothing, which would undo to the state it is already in.
+        assert_eq!(h.undo.len(), 1, "{:?}", h.console.lines);
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::Undo, &mut core, &mut surf);
+        }
+        assert!(
+            h.console
+                .lines
+                .last()
+                .unwrap()
+                .text
+                .contains("nothing to undo"),
+            "at the root, so there is nothing behind it: {:?}",
+            h.console.lines
         );
     }
 

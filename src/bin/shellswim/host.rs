@@ -39,6 +39,7 @@ macro_rules! core_ctx {
             track_resolver: &mut $h.track_resolver,
             base_volume: &mut $h.base_volume,
             crossfade_enabled: &mut $h.crossfade_enabled,
+            undo: &mut $h.undo,
             gap_secs: &mut $h.gap_secs,
             between_tracks: &mut $h.between_tracks,
             fade_in_started_at: &mut $h.fade_in_started_at,
@@ -108,6 +109,7 @@ pub struct Host {
     /// session.
     pub gap_secs: f64,
     pub between_tracks: BetweenTracks,
+    pub undo: wim::undo::Recorder,
     /// Last `keep-open` written, so evaluating it every pump costs no
     /// ipc until the answer changes.
     keep_open_held: Option<bool>,
@@ -194,6 +196,7 @@ impl Host {
             crossfade_enabled,
             gap_secs,
             between_tracks: BetweenTracks::new(),
+            undo: wim::undo::Recorder::default(),
             keep_open_held: None,
             fade_in_started_at: None,
             fade: None,
