@@ -1140,6 +1140,164 @@ above this line in the shellswim section is done.
       fixed rather than worked around again.
 
 
+### the overnight performance run (2026-11-01)
+
+Eight agents in parallel, maintainer away, brief was "performance
+first, then bug fixing, then polish". Measured numbers throughout,
+because the standing rule on this is **alternate batches of the two
+implementations in one process**: sequential before/after runs on this
+box came out 1.6x apart while other builds were running, which is not
+a measurement.
+
+- [x] **the album art rasterizer is 2-4x faster, and it was 72% of a
+      frame.** `paint` is the half the memo cannot skip, so it was all
+      of that. four changes: hoist the tone branch out of the per-cell
+      loop and row-slice the grid; replace **8 hardware divides per
+      colour cell** with exact reciprocal multiplies, two of them
+      feeding values that were then thrown away; pre-encode
+      `QUADRANTS` as `&str` for `set_symbol`, the glyph write being a
+      *third* of the per-cell cost; and sum per output sample into a
+      register instead of read-modify-writing a `Vec` slot per tap.
+      21.5 -> 13.5 ns/cell mono, 52 -> 23.5 colour; the whole 200x60
+      frame 126 -> 49us.
+      **two negative results, reported rather than buried**: reading
+      rows as `[u8;3]` chunks to kill per-tap bounds checks measured
+      0.87-1.01x, so the bounds check was never the cost; and
+      `div_taps` alone is 0.99-1.05x, because llvm already hoists a
+      loop-invariant divisor, so it is kept only for landing in the
+      dependency chain once the sum moves into the same loop.
+      every test compares against a **verbatim copy of the old code**,
+      the pattern `legacy_raster_cost` already used: full `Buffer`
+      equality (glyph and both colours) over 4 sources x 2 tones x 2
+      fits x 7 rects, 200k pseudo-random quads, and both reciprocal
+      tables exhaustively. the grid-clip mutation survived the first
+      version of that equality test, which is why the oversized-rect
+      case is in it.
+      what is left: ~9 of the 13.5 ns is `Cell::set_symbol` building
+      and dropping a `CompactString`, a ratatui floor. `fill` is ~2
+      ns/tap and only runs on resample (track change, every frame of a
+      resize drag, every video frame); const-generic specialisation on
+      `taps_x` is the diagnosed next win and was not done.
+- [x] **text is measured by grapheme cluster now, and the fast paths
+      are the whole story.** the repo had **two width models**:
+      `textfit::width` used `UnicodeWidthStr` (string-level ligature
+      rules) while `char_cells` used `UnicodeWidthChar` (none), so
+      every truncation mixed them, and `draw` advanced by
+      `cells.max(1)`, giving a zero-width codepoint its own cell.
+      measured in a real `Buffer` against a border at column 8: an
+      emoji with a variation selector returned x=9 and **overwrote the
+      border**, a zwj family painted three separate faces, NFD
+      `Beyoncé` measured 8 for a 7-cell string, and decomposed hangul
+      painted as loose jamo. NFD is how macOS and APFS store
+      filenames, so this is ordinary library content, not a corner
+      case. the doc contract "never wider than asked for" was simply
+      false.
+      **the first grapheme pass cost 5x on the text path** (12.6 ->
+      96.2us per frame, i.e. 3x what the art panel costs), caught by
+      the rasterizer agent isolating it rather than by anyone noticing
+      later. a `plain_ascii` gate and a `one_cell_chars` gate bring it
+      to **1.00x whole-frame parity**, each with an equivalence test
+      against the grapheme walk. the ascii-only gate was not enough on
+      its own: wim's own chrome (`·`, `…`, `─`, `▸`) is non-ascii, so
+      it missed the title and every rule.
+      the fits cannot slice on the one-cell gate, because a char
+      boundary there can cut a flag's two regional indicators in half;
+      `the_ascii_fast_path_agrees_with_the_grapheme_walk` caught
+      exactly that. an NFD title stays ~9x, which is **text HEAD
+      measured wrongly**; its cheap answer was the bug. and a
+      hand-rolled byte scan was *slower* than the walk, because the
+      crate builds at `opt-level = 0` while dependencies build at 2,
+      so every gate is a library call; that is in
+      docs/text-measurement.md so nobody simplifies it back.
+      **the audit's "in-repo example of the right thing" was itself
+      broken.** it named `swimconsole`'s ghost guard,
+      `cursor_col != width(&window)`, which is never satisfied when
+      the language auto-closes a paren, so **shellswim never drew a
+      ghost for any parenthesised call at all**. both consoles now use
+      the rule that is actually load-bearing.
+      a fifth hand-rolled per-char writer with the same `.max(1)`
+      exists at `ui/controlsbar.rs` ~715 and was not in the audit.
+- [x] **downloads are capped, pooled and timed out.**
+      `download_tracks` spawned **one thread per track with no cap**,
+      so the download key on an 800-track artist meant 800 threads and
+      800 simultaneous connections, most failing into a storm of
+      toasts, while every other batch network op in the tree caps.
+      `DOWNLOAD_CONCURRENCY = 4` via the shared-`AtomicUsize` pattern
+      rather than a fixed stripe, because track sizes vary by an order
+      of magnitude and a stripe idles whoever drew the short ones.
+      `timeout_connect` 10s plus `timeout_read` 30s and **deliberately
+      no overall timeout**: a long flac on a slow link is legitimately
+      minutes, so inactivity is what must be bounded, and ureq's
+      overall `timeout()` takes precedence over `timeout_read` and
+      would break large files.
+      found while in there: `ureq::get` builds a **throwaway `Agent`
+      per call**, so every track in a batch paid its own handshake; one
+      pooled agent took 20 tracks from 20 connections to 4. the `.part`
+      stub is also removed on every error exit now, including a failed
+      rename, and a dead receiver aborts the batch instead of filling a
+      cache nobody will read.
+- [x] **the dead subsonic function is gone, and its test was
+      toothless on both paths.** `artist_albums_with_tracks` was
+      `#[allow(dead_code)]` and its doc's reason for existing was false
+      on both halves: it was not serial (it called `album_details`'
+      bounded fan-out) and nothing ever compared it against the live
+      path. the connection-reuse assertion was the only one in the file
+      and lived **only** on the dead path, so a regression reinstating
+      the recorded "~16 handshakes" bug failed nothing.
+      moving it to `stream_artist_tracks` revealed it was toothless
+      *there* too: with pooling mutated away it still passed, because
+      15 albums at zero latency stagger themselves and the recorded bug
+      does not reproduce at that size. resized to 120 albums at 10ms,
+      where pooled is a flat 9 connections however long the discography
+      and unpooled measures 26-31; the mutation now fails 3 of 3.
+      the live path also moved from static striping to the shared
+      counter, converging it with `album_details`. perf-neutral on
+      uniform latency and **-14% with skew** (469-480ms -> 403-416ms
+      with every tenth album 8x slower), so a `with_slow_albums` knob
+      was added to the mock to measure that rather than assert it.
+- [x] **the frame source for ascii video exists** (`framesource.rs`),
+      turning the unblocking measurement into a tested module. `Grid`
+      owns all geometry, `Schedule` is pure arithmetic so every sync
+      decision is testable with no child process, and `FrameSource`
+      owns the child, the fifo and the read loop with teardown on
+      `Drop`. **`ui::raster` needed no change at all**: frames are read
+      straight into a `DynamicImage::ImageRgb8`, so handing one over is
+      a borrow, and raster is a 2x2 *quadrant* rasterizer (its own doc
+      and docs/raster.md say half-block and are stale) which `Grid` can
+      ask mpv to match exactly, `Fit::Stretch` then being a 1:1 copy.
+      four findings the measurement pass did not have:
+      **the prototype's filter chain letterboxes for square pixels**,
+      so 16:9 into 160x48 cells came out pillarboxed and stretched 2x
+      vertically (the recorded "94.8% non-black" is only right if
+      320x192 is displayed square, which a terminal never is);
+      a clock landing exactly on a frame boundary **froze forever**,
+      because `7.0/25.0*25.0` is `6.999999999999999` and floors to the
+      frame already shown, so nothing was read and `time-pos` never
+      moved; `--hr-seek` is a pin rather than a fix, since mpv already
+      defaults to exact and lands on `floor(start*fps)`, which
+      `Schedule` must snap to or every frame time is permanently off;
+      and SIGPIPE bounds an orphaned instance to one pipe buffer
+      rather than the length of the film.
+      measured, release: mpv 38-39% of a core at 1080p into 320x96 at
+      24fps (confirming the recorded figure), wim's reads 0.4%, wim's
+      rasterization 8-9%. decode dominates by an order of magnitude and
+      is in another process. restart is 156-430ms best but 254ms-1.9s
+      worst, which is worse than the recorded 180-550ms.
+      **zero allocations per frame, counted.** pointer identity cannot
+      prove that: a `clone` of a live buffer still alternates between
+      two addresses, because the old chunk is freed and reused next
+      frame. it takes a counting allocator, in a separate test binary
+      since `#[global_allocator]` is per-binary.
+      open question for the maintainer, recorded in QUESTIONS.md
+      rather than decided: **colour or monochrome.** `paint` takes a
+      `raster::Tone` so both work today and it defaults to `Mono`,
+      matching what `ui/albumart.rs` already asserts. the exemption
+      video has in docs/video.md is narrower than it looks: it covers
+      *mpv's* pixels drawn by `tct`/`kitty`, on the grounds that they
+      are not wim's. an ascii renderer paints wim's own cells, so a
+      second exception needs the same direct authorisation
+      `ascii-color` got.
+
 ### the untracked-defect audit (2026-10-31)
 
 Ran once the roadmap was down to 8 unchecked items, 5 of them blocked,
@@ -1510,11 +1668,24 @@ do the wrong thing quietly, which is worse to diagnose.
       now records that **there is no mute indicator anywhere in the
       ui**, so muted is indistinguishable on screen from volume at
       zero.
-- [ ] **three smaller ones from the same group are still open.**
-      `core.rs` ~1101 `enqueue_track` moves the entry in `entries` and
-      *then* does `let _ = player.playlist_move(..)`, so a failed move
-      permanently breaks the `playqueue.rs` invariant with no message
-      (the same ordering `Op::RemoveFromQueue` was just fixed for).
+- [x] **`enqueue_track`'s shuffle move was fire and forget.** it
+      appended, let `append` pick a shuffle slot (mutating `entries`),
+      and only then asked mpv with `let _ = player.playlist_move(..)`.
+      `entries` and mpv's playlist agree by **index**, so a refused
+      move left them permanently one apart and every later remove,
+      move and jump addressed the wrong track, with nothing said.
+      the same ordering lesson as `Op::RemoveFromQueue`, but it cannot
+      take the same shape: `append` picks the destination *as* it
+      moves, so there is nothing to ask mpv about beforehand. so the
+      local move is reversed on refusal and the failure is reported
+      ("queued X, but could not shuffle it in").
+      the reversal has to be exact including the play position, which
+      is what the test pins: at three different positions, append with
+      shuffle, reverse, and assert the order matches a plain append and
+      the playing track did not move. it asserts the shuffle actually
+      moved something first, so a position with nowhere to go cannot
+      make it vacuous.
+- [ ] **two smaller ones from the same group are still open.**
       `core.rs` ~1539 `persist_eq` is the only writer of
       `cfg.eq_preset`/`eq_gains` and all three call sites are inside
       the eq-menu key block, so `e` to cycle the eq (or `: eq(rock)`)
