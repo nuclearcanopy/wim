@@ -848,6 +848,58 @@ mpv loaded, a generated silence source included".
         empty" from "nothing in it loaded: 38 with no configured
         server".
 
+### shellswim, first real use (maintainer, driving it live)
+
+- [x] **the bottom bar was wim's `ControlsBar`, which was never
+      asked for.** the spec was the title and the scrubber; reusing
+      wim's bar brought pause/loop/shuffle/speed/eq/crossfade glyphs
+      and a queue count with it. `swimconsole::SwimBar` replaces it:
+      title left of centre, scrubber right, **exactly half each** so
+      the scrubber never shifts as titles change length, and a title
+      that would reach it is ellipsised with two cells of clearance.
+      above it a `HorizontalRule`, then space / bar / space.
+      a test asserts none of `▸ ‖ ↻ ⇄` appear. removing them made
+      `Screen`'s `app` and `crossfade` fields dead, which is the
+      confirmation they only ever fed glyphs.
+      **one judgement call**: a running `gap` takes the title's half
+      (`gap · 7s`), because the track whose name would be there has
+      ended and a full scrubber on a paused player explains nothing.
+      the `+N` queue count is gone with the rest; `view(queue)` has it.
+      two of the new tests were wrong first: one compared against
+      `trim()` where testbuf fills untouched cells with `.`, and one
+      used a *byte* offset to find a column, which an ellipsised title
+      breaks because `…` is three bytes to one cell -- the same trap
+      the test it replaced had a comment about.
+- [x] **`search()` answered with a count and nothing else**, which
+      with no sidebar is no answer. `Surface::show_results` is the
+      hook: wim ignores it (its sidebar *is* the answer), shellswim
+      prints the list once the search settles.
+      **asked for through the surface rather than inferred by the
+      host**, which cannot tell `search(x)` from the query a searching
+      `play(x)` sets on its way to a match, and would have echoed a
+      list after both.
+      `ui::textfit::columns` is the layout: up to three columns,
+      column-major like `ls` so reading *down* keeps the ranking, each
+      item ellipsised to its column so every row is one line, and the
+      count drops to whatever keeps columns at least 18 cells -- so a
+      narrow terminal falls back to one column instead of shredding
+      every title. capped at 30 results with `+N more`, since the
+      point was not flooding the terminal.
+      deliberately **unnumbered**: no `Target` is addressable by
+      result index from the language (`Target::Index` is only ever
+      produced internally by `best_match`), so a numbered list would
+      advertise a `play(2)` that does not exist. bare `primary_name`s
+      rather than the decorated label, because three columns of a
+      72-cell terminal leave ~22 cells each, which truncates
+      "title · artist (album)" to exactly the useless half, and a bare
+      name is what you would type back into `play(...)`.
+- [ ] **`search()` in shellswim still prints nothing for a query that
+      matches only remote items**, because the echo fires on settle
+      and a cold remote search can land after it. the settle window is
+      the right hook for the local corpus; a second echo on a late
+      remote batch wants `remote_search_result_rx` to carry the query
+      it answered.
+
 ### stage 4: the queue timeline (started)
 
 - [x] **`wait(15s)` as an alias for `silence`** (maintainer, asked

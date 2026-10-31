@@ -16,6 +16,8 @@ use ratatui::widgets::Widget;
 
 use crate::shellsong::{Console, LineKind};
 use crate::theme::{lerp, shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE, WHITE};
+use crate::ui::controlsbar;
+use crate::ui::progress;
 use crate::ui::textfit::{char_cells, truncate_to_width, truncate_with_ellipsis, width};
 
 /// How far in the prompt and every scrollback line sit, so there is a
@@ -248,17 +250,37 @@ fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: Color) {
 /// The one row of chrome above the transport strip: what is playing,
 /// and whether anything is behind it. The bar itself deliberately has
 /// no words on it (see `ui::controlsbar`), so the name lives here.
-pub struct TrackLine<'a> {
+/// shellswim's whole bottom bar: the playing title on the left half,
+/// its scrubber on the right.
+///
+/// **The maintainer's spec, verbatim in shape:**
+/// `BLADEE - FLATLINE  --:--  (*)-----------  --:--`. No transport
+/// glyphs, no queue count, no eq or loop indicator -- those came from
+/// reusing wim's `ControlsBar` here, which was never asked for. Only
+/// the title and the bar.
+///
+/// The two halves are **exactly half the width each**, so the
+/// scrubber never moves as the title changes length; a title that
+/// would reach the bar is ellipsised instead of pushing it.
+pub struct SwimBar<'a> {
     pub title: Option<&'a str>,
-    /// Entries after the playing one. Shown as a count because the
-    /// names are a `view(queue)` away and a second name here would
-    /// just compete with the first.
-    pub upcoming: usize,
+    pub elapsed_secs: Option<f64>,
+    pub duration_secs: Option<f64>,
+    /// Seconds left of a between-track gap. It takes the title's half
+    /// while it runs, which is not a liberty: the track whose name
+    /// would be there has *ended*, and a full scrubber on a paused
+    /// player with no explanation is the "looks broken" state this
+    /// replaces.
+    pub gap_remaining: Option<f64>,
 }
 
-impl Widget for TrackLine<'_> {
+/// Cells kept between the two halves, so a full-width title and the
+/// scrubber's first readout cannot sit against each other.
+const SPLIT_GAP: u16 = 2;
+
+impl Widget for SwimBar<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width <= GUTTER || area.height == 0 {
+        if area.width <= GUTTER * 2 || area.height == 0 {
             return;
         }
         for x in area.left()..area.right() {
@@ -266,38 +288,44 @@ impl Widget for TrackLine<'_> {
                 cell.reset();
             }
         }
-        let Some(title) = self.title else {
-            draw_str(
-                buf,
-                area.x + GUTTER,
-                area.y,
-                &truncate_with_ellipsis("nothing playing", usize::from(area.width - GUTTER)),
-                shade(DIM),
-            );
-            return;
+
+        // precisely 50/50, measured off the full row rather than what
+        // is left after the gutter, so the split sits where the eye
+        // expects it to.
+        let half = area.width / 2;
+
+        let left = match self.gap_remaining {
+            Some(left) => format!("gap · {}s", left.max(0.0).ceil() as u64),
+            None => self.title.unwrap_or("nothing playing").to_string(),
         };
-        // the count is laid out first so the title is truncated to
-        // what is actually left, never drawn over it.
-        let tail = match self.upcoming {
-            0 => String::new(),
-            n => format!("+{n}"),
-        };
-        let budget = usize::from(area.width - GUTTER).saturating_sub(if tail.is_empty() {
-            0
-        } else {
-            width(&tail) + 2
-        });
+        let dim = self.title.is_none() && self.gap_remaining.is_none();
+        let title_room = half.saturating_sub(GUTTER + SPLIT_GAP);
         draw_str(
             buf,
             area.x + GUTTER,
             area.y,
-            &truncate_with_ellipsis(title, budget),
-            shade(NEAR_WHITE),
+            &truncate_with_ellipsis(&left, usize::from(title_room)),
+            shade(if dim { DIM } else { NEAR_WHITE }),
         );
-        if !tail.is_empty() {
-            let x = area.right() - u16::try_from(width(&tail)).unwrap_or(0);
-            draw_str(buf, x, area.y, &tail, shade(DIM));
+
+        // the scrubber owns the right half: `elapsed <track> total`,
+        // with the readouts reserved first so the track absorbs the
+        // remainder and never shoves them off the end.
+        let (elapsed, total) = progress::readouts(self.elapsed_secs, self.duration_secs);
+        let reserved = width(&elapsed) + width(&total) + 2;
+        let right_room = usize::from(area.width - half - GUTTER);
+        if right_room <= reserved {
+            return;
         }
+        let frac = match (self.elapsed_secs, self.duration_secs) {
+            (Some(e), Some(d)) if d > 0.0 => e / d,
+            _ => 0.0,
+        };
+        let line = format!(
+            "{elapsed} {} {total}",
+            controlsbar::track(frac, right_room - reserved, false)
+        );
+        draw_str(buf, area.x + half, area.y, &line, shade(DIM));
     }
 }
 
@@ -477,68 +505,125 @@ mod tests {
         crate::ui::testbuf::assert_outside_untouched(&buf, area);
     }
 
-    #[test]
-    fn the_track_line_says_what_is_playing_and_what_is_behind_it() {
-        let mut buf = buffer(30, 1);
-        TrackLine {
+    fn bar<'a>(w: u16, f: impl FnOnce(&mut SwimBar<'a>)) -> Buffer {
+        let mut v = SwimBar {
             title: Some("BLADEE - FLATLINE"),
-            upcoming: 3,
-        }
-        .render(Rect::new(0, 0, 30, 1), &mut buf);
-        let line = row(&buf, 0);
+            elapsed_secs: Some(44.0),
+            duration_secs: Some(214.0),
+            gap_remaining: None,
+        };
+        f(&mut v);
+        let mut buf = buffer(w, 1);
+        v.render(Rect::new(0, 0, w, 1), &mut buf);
+        buf
+    }
+
+    #[test]
+    fn the_bar_is_the_title_then_its_scrubber() {
+        let line = row(&bar(60, |_| {}), 0);
         assert!(line.contains("BLADEE - FLATLINE"), "{line:?}");
-        assert!(
-            line.contains("+3"),
-            "the queue depth must be visible: {line:?}"
-        );
+        assert!(line.contains("0:44"), "elapsed: {line:?}");
+        assert!(line.contains("3:34"), "total: {line:?}");
     }
 
+    /// The halves are exactly half each, so the scrubber does not
+    /// shift as titles change length.
     #[test]
-    fn the_track_line_says_so_when_nothing_plays() {
-        let mut buf = buffer(30, 1);
-        TrackLine {
-            title: None,
-            upcoming: 0,
+    fn the_scrubber_starts_at_the_halfway_column_whatever_the_title() {
+        let long = "n".repeat(200);
+        for title in ["x", long.as_str(), "BLADEE - FLATLINE"] {
+            let buf = bar(60, |v| v.title = Some(title));
+            let line = row(&buf, 0);
+            // columns, not bytes: an ellipsised title carries `…`,
+            // three bytes to one cell, so `find` would answer the
+            // wrong question. the same trap the old queue-count test
+            // called out.
+            let cells: Vec<char> = line.chars().collect();
+            let at = cells
+                .windows(4)
+                .position(|w| w.iter().collect::<String>() == "0:44")
+                .unwrap_or_else(|| panic!("{line:?}"));
+            assert_eq!(at, 30, "half of 60, for {:?}", &title[..title.len().min(8)]);
         }
-        .render(Rect::new(0, 0, 30, 1), &mut buf);
-        assert!(row(&buf, 0).contains("nothing playing"), "{}", grid(&buf));
     }
 
+    /// A title that would reach the scrubber is cut with an ellipsis
+    /// rather than pushing it or overwriting it.
     #[test]
-    fn a_long_title_never_runs_over_the_queue_count() {
-        let mut buf = buffer(24, 1);
-        TrackLine {
-            title: Some(&"n".repeat(100)),
-            upcoming: 12,
-        }
-        .render(Rect::new(0, 0, 24, 1), &mut buf);
+    fn a_long_title_is_ellipsised_and_never_touches_the_bar() {
+        let long = "n".repeat(200);
+        let buf = bar(60, |v| v.title = Some(long.as_str()));
         let line = row(&buf, 0);
+        assert!(line.contains('…'), "{line:?}");
+        // two cells of clearance between the halves, so nothing in the
+        // title's half is drawn against the readout.
+        let half: String = line.chars().take(30).collect();
+        assert!(half.ends_with("  "), "no clearance: {half:?}");
+    }
+
+    #[test]
+    fn the_title_is_left_aligned() {
+        let line = row(&bar(60, |_| {}), 0);
         assert!(
-            line.contains("+12"),
-            "the count survives truncation: {line:?}"
+            line.starts_with("  BLADEE"),
+            "one gutter, then the title: {line:?}"
         );
-        // cells, not bytes: the ellipsis is one cell and three bytes,
-        // so `len()` here would fail for entirely the wrong reason.
-        assert_eq!(
-            line.chars().count(),
-            24,
-            "and nothing spills past the rect: {line:?}"
-        );
-        // the real hazard is not spilling, it is the count being
-        // painted *over* the title's tail, which cuts it mid-word with
-        // nothing to say so. the title has to be truncated to the room
-        // actually left, which means it still ends in an ellipsis and
-        // there is still a gap before the count.
-        let (title, tail) = line.split_once("+12").expect("the count");
-        assert!(tail.is_empty(), "the count is last: {line:?}");
-        assert!(
-            title.trim_end().ends_with('\u{2026}'),
-            "the title must say it was cut: {title:?}"
-        );
-        assert!(
-            title.ends_with("  "),
-            "and must not touch the count: {title:?}"
-        );
+    }
+
+    #[test]
+    fn nothing_playing_says_so() {
+        let buf = bar(60, |v| {
+            v.title = None;
+            v.elapsed_secs = None;
+            v.duration_secs = None;
+        });
+        let line = row(&buf, 0);
+        assert!(line.contains("nothing playing"), "{line:?}");
+        assert!(line.contains("--:--"), "the scrubber still reads: {line:?}");
+    }
+
+    /// A gap takes the title's half: the track whose name would be
+    /// there has ended, and a full scrubber on a paused player with no
+    /// explanation is the state this avoids.
+    #[test]
+    fn a_running_gap_takes_the_title_half() {
+        let buf = bar(60, |v| v.gap_remaining = Some(6.2));
+        let line = row(&buf, 0);
+        assert!(line.contains("gap · 7s"), "{line:?}");
+        assert!(!line.contains("BLADEE"), "{line:?}");
+    }
+
+    /// None of wim's transport glyphs: those were never asked for
+    /// here, and reusing `ControlsBar` is how they arrived.
+    #[test]
+    fn the_bar_carries_no_transport_controls() {
+        let line = row(&bar(60, |_| {}), 0);
+        for glyph in ['▸', '‖', '↻', '⇄'] {
+            assert!(
+                !line.contains(glyph),
+                "{glyph} is wim's, not here: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrow_bar_draws_nothing_rather_than_rubble() {
+        let buf = bar(4, |_| {});
+        // `.` is testbuf's untouched-cell fill, so this says the
+        // widget declined rather than that it drew blanks.
+        assert_eq!(row(&buf, 0), "....");
+    }
+
+    #[test]
+    fn print_the_bar() {
+        for (w, f) in [(72u16, 0usize), (48, 0), (72, 1)] {
+            let buf = bar(w, |v| {
+                if f == 1 {
+                    v.gap_remaining = Some(6.2);
+                }
+            });
+            println!("--- {w} gap={f}\n[{}]", row(&buf, 0));
+        }
     }
 
     #[test]
