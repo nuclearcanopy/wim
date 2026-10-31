@@ -791,10 +791,16 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         drop(rx);
         download_tracks(&tracks, &sink, &tx, &batch_agent());
-        assert!(
-            server.requests() <= DOWNLOAD_CONCURRENCY,
-            "kept fetching after the receiver was dropped: {} requests",
-            server.requests()
+        // exact, because the floor matters as much as the cap: a
+        // worker cannot discover the channel is closed until its first
+        // `Progress` send, so one request per worker is both the most
+        // a dropped receiver may cost and proof the fan-out ran at
+        // all. `<=` alone passed on a batch that spawned no workers.
+        assert_eq!(
+            server.requests(),
+            DOWNLOAD_CONCURRENCY,
+            "one in-flight request per worker and no more, out of {} tracks",
+            tracks.len()
         );
     }
 
