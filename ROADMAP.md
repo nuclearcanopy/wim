@@ -1659,17 +1659,51 @@ the order below is not a preference, it is a dependency.
         wrong on the first run and the code was right -- the first
         picked an op that does not fail in the harness, the second
         forgot that planting the root is itself a node.
-      - [ ] **the keyboard and mouse paths are not recorded yet**, and
-        this is the honest limit of what shipped. `apply_op` covers
-        every op, so undo is complete for the console and for
-        shellswim, which is entirely commands. it misses the three
-        `dispatch_action` call sites in `main.rs` and
-        `activate_transport`, which acts on loop/shuffle/speed/
-        crossfade/pause directly for a keypress or a bar click. that
-        wants an `Action` label plus a record at those sites, or the
-        long-planned `Action` variants -- which is still the better
-        structure but now buys only this one path, a much weaker case
-        than when it was also going to fix the shellsong path.
+      - [x] **the keyboard path records now.** hooked in
+        `dispatch_action` itself rather than at its three call sites,
+        so a fourth cannot be added without being recorded.
+        `Action::describe()` gives the rows their labels in the same
+        voice as `Op::describe()`, and `undo::classify_action` files
+        all eight variants (every mutating one is restorable; the two
+        that would be barriers, `Star` and `Download`, are ops with no
+        `Action` of their own).
+        twelve of `run_op`'s arms delegate to `dispatch_action`, so
+        `apply_op` **suspends** the recorder for the length of one op:
+        one owner sets the flag, one reader honours it, which is a
+        smaller thing to keep straight than the two independent hooks
+        the design originally weighed. mutation-checked -- flipping
+        `suspend(true)` to `suspend(false)` makes exactly
+        `a_delegated_op_is_one_row_not_two` fail.
+        **a real bug found by the first test failing**, and worth
+        knowing generally: several actions **do not carry their own
+        mutation**. `app.handle_key` has already flipped
+        `loop_mode`/`shuffle`/`speed` by the time the matching
+        `Action` reaches `dispatch_action`, whose arm only tells mpv
+        about a change `App` already has. so a "before" snapshot taken
+        there is really an "after", and planting the root lazily (as
+        `apply_op` does) would have made undoing the *first* keypress
+        of a session restore the state it had just left. the host
+        plants the root once, up front, before any key is read. the
+        test that found it now uses `Action::Queued`, which does carry
+        its own mutation, and says why.
+      - [ ] **`activate_transport` is still unrecorded, and it turns
+        out to be a duplicate.** `core::run_op`'s
+        `Op::Go(BottomBarField)` arm carries a `Field` -> `Op` match
+        whose comment says it reuses the commands "rather than keeping
+        a second copy of the bar's own match". `activate_transport` in
+        main.rs **is** that second copy: six of its seven arms
+        reimplement `CycleLoop`, `ToggleShuffle`, `SpeedUp`,
+        `View(Eq)`, `ToggleCrossfade` and pause against mpv directly,
+        and its shuffle arm's own comment admits it copies the `s`
+        key. `Field::Progress` is the only one with no op, which core
+        refuses by name.
+        the fix is one extraction (`op_for_field`) used by both, which
+        deletes ~50 lines, closes this undo gap for free and removes a
+        drift hazard the comments claim does not exist. held back from
+        this commit only because it changes the click/enter transport
+        path and deserves its own, with one behaviour difference to
+        settle first: clicking the eq glyph resets `EqMenuState` where
+        `view(eq)` does not.
       - [x] ~~**the view is built but not opened by anything.**~~
         **`view(undo)` opens it** (alias `view(tree)`), drawn over the
         workspace like the eq menu, because a fork is unreadable in a

@@ -30,7 +30,7 @@
 
 use std::time::Duration;
 
-use crate::app::LoopMode;
+use crate::app::{Action, LoopMode};
 use crate::core::{apply_eq_gains, load_playlist, resync_upcoming, CoreCtx, SessionStart};
 use crate::eq;
 use crate::search::SearchItem;
@@ -282,6 +282,33 @@ pub fn classify(op: &Op) -> Reversibility {
         | Op::Undo
         | Op::Redo
         | Op::Quit => Ignored,
+    }
+}
+
+/// `classify`, for the keyboard's own vocabulary.
+///
+/// Every mutating `Action` is restorable: none of them leaves the
+/// process, because the two that would (`Star`, `Download`) are ops
+/// with no `Action` of their own. `Quit` is not recorded because
+/// there is nothing left to undo into, and `None` did nothing.
+pub fn classify_action(action: &Action) -> Reversibility {
+    match action {
+        Action::None | Action::Quit => Reversibility::Ignored,
+        Action::Play(_)
+        | Action::Queued(_)
+        | Action::ShuffleToggled(_)
+        | Action::SetLoop(_)
+        | Action::SetSpeed(_)
+        | Action::SetEq(..) => Reversibility::Restorable,
+    }
+}
+
+/// `coalesce_kind`, for actions. Held speed keys are the one run worth
+/// folding; the rest are one decision per press.
+pub fn coalesce_action(action: &Action) -> Option<&'static str> {
+    match action {
+        Action::SetSpeed(_) => Some("speed"),
+        _ => None,
     }
 }
 
@@ -823,6 +850,14 @@ mod tests {
 #[derive(Default)]
 pub struct Recorder {
     tree: Option<Tree<Snapshot>>,
+    /// Set by `apply_op` for the length of one op.
+    ///
+    /// `dispatch_action` is reached two ways: straight from a keypress,
+    /// which has to be recorded, and from inside twelve of `run_op`'s
+    /// arms, which `apply_op` is already recording. One owner sets
+    /// this and one reader honours it, which is a smaller thing to
+    /// keep straight than the two independent hooks this replaced.
+    suspended: bool,
 }
 
 /// What a `Recorder::undo`/`redo` produced. Owns its snapshot, because
@@ -840,6 +875,17 @@ pub enum Outcome {
 impl Recorder {
     pub fn is_unrooted(&self) -> bool {
         self.tree.is_none()
+    }
+
+    /// Stops `dispatch_action` recording while an op it was called
+    /// from is already being recorded. Returns the previous value, so
+    /// the caller restores rather than assumes.
+    pub fn suspend(&mut self, on: bool) -> bool {
+        std::mem::replace(&mut self.suspended, on)
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.suspended
     }
 
     /// Seeds the tree with the state before the first recorded op.

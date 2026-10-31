@@ -1617,6 +1617,32 @@ pub struct CoreCtx<'a> {
 /// typed); the typing path used to discard its action, which is why
 /// the first enter after a search only closed the text box.
 pub fn dispatch_action(action: Action, core: &mut CoreCtx, surf: &mut dyn Surface) -> Dispatch {
+    // the keyboard's half of the undo tree. computed before the match,
+    // which moves the action.
+    let how = undo::classify_action(&action);
+    let kind = undo::coalesce_action(&action);
+    let label = action.describe();
+    let record = how != undo::Reversibility::Ignored && !core.undo.is_suspended();
+    // **no root is planted here, deliberately**, unlike `apply_op`.
+    // several actions do not carry their own mutation: `app.handle_key`
+    // has already flipped `loop_mode`/`shuffle`/`speed` by the time one
+    // arrives, so a "before" captured here is really an "after" and
+    // undoing the very first keypress of a session would restore the
+    // state it had just left. the host plants the root once, up front,
+    // before any key is read; see main.rs.
+    let record = record && !core.undo.is_unrooted();
+    let dispatch = dispatch_action_inner(action, core, surf);
+    if record {
+        let after = undo::Snapshot::capture(core);
+        core.undo.record(after, label, kind, None, core.now);
+    }
+    dispatch
+}
+
+/// The actions themselves, split out so `dispatch_action` can record
+/// around them without threading the hook through every `return` in
+/// here.
+fn dispatch_action_inner(action: Action, core: &mut CoreCtx, surf: &mut dyn Surface) -> Dispatch {
     match action {
         Action::Quit => {
             save_playback_state(core.player, core.queue);
@@ -1767,7 +1793,12 @@ pub fn apply_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> Dispatch 
         let before = undo::Snapshot::capture(core);
         core.undo.plant(before, core.now);
     }
+    // twelve of `run_op`'s arms call `dispatch_action`, which records
+    // on its own for a keypress; suspended here so a delegated op is
+    // one row rather than two.
+    let was = core.undo.suspend(true);
     let (dispatch, report) = run_op(op, core, surf);
+    core.undo.suspend(was);
     // a failed op changed nothing, so recording it would put a row in
     // the tree that undoes to the state it is already in.
     if recordable && !matches!(report, Report::Failed(_)) {
@@ -3423,6 +3454,75 @@ mod seam_tests {
         }
         assert_eq!(h.gap_secs, 10.0, "and redo walks back down");
         assert_eq!(h.undo.len(), 2);
+    }
+
+    /// The claim the suspend flag exists for: twelve of `run_op`'s
+    /// arms go through `dispatch_action`, which records on its own for
+    /// a keypress, so a delegated op has to come out as one row rather
+    /// than two.
+    #[test]
+    #[ignore]
+    fn a_delegated_op_is_one_row_not_two() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let mut surf = Headless;
+        {
+            let mut core = h.ctx(&player);
+            // `SetLoop` is one of the twelve: the arm calls
+            // `dispatch_action(Action::SetLoop(..))`.
+            apply_op(Op::SetLoop(LoopMode::All), &mut core, &mut surf);
+        }
+        assert_eq!(h.app.loop_mode, LoopMode::All);
+        assert_eq!(h.undo.len(), 2, "root plus one row, not two rows");
+    }
+
+    /// And a keypress that never goes near an op is recorded, which is
+    /// the gap this closes.
+    ///
+    /// `Queued` rather than `SetLoop`, which is how the root-planting
+    /// bug above was found: `app.handle_key` flips `loop_mode` *before*
+    /// producing that action, so `SetLoop`'s arm only tells mpv about a
+    /// change `App` already has. `Queued` carries its own mutation, so
+    /// it actually exercises the hook.
+    #[test]
+    #[ignore]
+    fn a_keypress_action_is_recorded_on_its_own() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let mut surf = Headless;
+
+        // the host plants the root before reading any key; without it
+        // nothing on this path records at all.
+        {
+            let core = h.ctx(&player);
+            let root = undo::Snapshot::capture(&core);
+            let now = core.now;
+            core.undo.plant(root, now);
+        }
+        let before = h.queue.entries().len();
+
+        {
+            let mut core = h.ctx(&player);
+            dispatch_action(
+                Action::Queued(test_songs(1).remove(0)),
+                &mut core,
+                &mut surf,
+            );
+        }
+        assert_eq!(h.queue.entries().len(), before + 1, "the track queued");
+        assert_eq!(h.undo.len(), 2, "the keyboard path records too");
+
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::Undo, &mut core, &mut surf);
+        }
+        assert_eq!(
+            h.queue.entries().len(),
+            before,
+            "and undo took the track back out"
+        );
     }
 
     /// A failed op changed nothing, so recording it would put a row in
