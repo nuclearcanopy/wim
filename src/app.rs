@@ -2,11 +2,13 @@
 //! can be unit-tested without a real terminal (raw mode needs a tty we
 //! don't have in this headless build/test context).
 
+use std::cell::OnceCell;
+
 use crossterm::event::KeyCode;
 
 use crate::eq;
 use crate::keymap::{KeyAction, Keymap};
-use crate::search::{Corpus, SearchItem};
+use crate::search::{Corpus, Ranking, SearchItem};
 
 const MIN_SPEED: f64 = 0.25;
 const MAX_SPEED: f64 = 3.0;
@@ -85,15 +87,34 @@ impl LoopMode {
 }
 
 pub struct App {
+    /// Never assigned from outside this file; `replace_corpus` is the
+    /// swap, because `ranking` below is indices into one corpus state.
+    /// Pinned by `only_app_replaces_the_whole_corpus`.
     pub corpus: Corpus,
     pub query: String,
-    /// The ranked rows for `query`. Private, and reached through the
-    /// accessors below, because the plan for the remaining search cost
-    /// is to stop materializing rows nobody scrolled to; see the
-    /// result-clone item in ROADMAP.md. A `pub` field makes that
-    /// change touch every reader instead of this file.
-    results: Vec<SearchItem>,
-    pub selected: usize,
+    /// The ranked order for `query`: corpus indices plus the revision
+    /// they address, never rows. A broad query at 40k items used to
+    /// spend 3-5ms of a ~7ms keystroke cloning a `SearchItem` per
+    /// match, most of them for rows nobody scrolls to; the draw path
+    /// now resolves a screenful through `results_list::Ranked`.
+    ranking: Ranking,
+    /// `results()`'s rows, built on first ask and dropped on every
+    /// re-rank. Only a caller that wants *every* row (a shellsong
+    /// env, shellswim's result echo) pays the clone, and at most once
+    /// per re-rank rather than once per keystroke.
+    materialized: OnceCell<Vec<SearchItem>>,
+    /// Which row the cursor is on. Private, with `select` as the only
+    /// writer, because `anchor` below has to move with it.
+    selected: usize,
+    /// The identity of the row `selected` names, remembered as the
+    /// selection moved.
+    ///
+    /// `resync_results` runs *after* the corpus has already been
+    /// mutated under the order, which is the one moment the ranking
+    /// can no longer resolve a row to ask its identity; the anchor is
+    /// what survives that. One identity per selection move, not one
+    /// clone per match per keystroke.
+    anchor: Option<(u8, String)>,
     pub editing_query: bool,
     pub loop_mode: LoopMode,
     pub shuffle: bool,
@@ -137,8 +158,14 @@ impl App {
         App {
             corpus,
             query: String::new(),
-            results: Vec::new(),
+            // a default `Ranking` carries revision 0, which
+            // `next_revision` never hands out, so it addresses no
+            // corpus at all and reads as no rows: exactly right for
+            // an app that has not been given a query yet.
+            ranking: Ranking::default(),
+            materialized: OnceCell::new(),
             selected: 0,
+            anchor: None,
             editing_query: false,
             loop_mode: LoopMode::Off,
             shuffle: false,
@@ -153,30 +180,45 @@ impl App {
         }
     }
 
-    /// Every row, as a slice.
+    /// Every row, as a slice, cloned out of the corpus on first ask
+    /// and cached until the next re-rank.
     ///
     /// The only accessor that hands out the whole list, so it is the
-    /// only one a lazy `results` would have to materialize for. The
-    /// others ask about one row or a count, which an index list can
-    /// answer without building a `SearchItem` at all; keeping them
-    /// separate is the point of this seam, not ceremony.
+    /// only one that materializes anything. The others ask about one
+    /// row or a count, which the ranked index list answers without
+    /// building a `SearchItem` at all; keeping them separate is the
+    /// point of this seam, not ceremony. Two callers genuinely want
+    /// every row (a shellsong env's per-row kinds, shellswim's result
+    /// echo) and neither is on the keystroke path.
     pub fn results(&self) -> &[SearchItem] {
-        &self.results
+        self.materialized
+            .get_or_init(|| self.ranking.rows(&self.corpus).cloned().collect())
+    }
+
+    /// The ranked order itself, for the draw path
+    /// (`ui::results_list::Ranked`), which resolves the rows on screen
+    /// against the corpus instead of taking a list.
+    pub fn ranking(&self) -> &Ranking {
+        &self.ranking
     }
 
     /// One row by index, or `None` past the end. Takes an index rather
     /// than letting callers slice, so an out-of-range row stays a
     /// `None` and never a panic.
     pub fn result(&self, at: usize) -> Option<&SearchItem> {
-        self.results.get(at)
+        self.ranking.row(&self.corpus, at)
     }
 
     pub fn result_count(&self) -> usize {
-        self.results.len()
+        if self.ranking.addresses(&self.corpus) {
+            self.ranking.len()
+        } else {
+            0
+        }
     }
 
     pub fn has_results(&self) -> bool {
-        !self.results.is_empty()
+        self.result_count() > 0
     }
 
     /// The row the cursor is on.
@@ -186,7 +228,12 @@ impl App {
     /// this is `Option` and the three key paths that play or enqueue
     /// the selection all read it here rather than indexing themselves.
     pub fn selected_result(&self) -> Option<&SearchItem> {
-        self.results.get(self.selected)
+        self.result(self.selected)
+    }
+
+    /// Which row the cursor is on, for the draw path and the hit map.
+    pub fn selected(&self) -> usize {
+        self.selected
     }
 
     /// Cycles loop mode (off -> one -> all -> off); shared by the
@@ -327,21 +374,41 @@ impl App {
     /// selection by the exact same mutation the keyboard does rather
     /// than a second copy of the clamping.
     pub fn move_selection(&mut self, delta: isize) {
-        if self.results.is_empty() {
-            self.selected = 0;
+        if !self.has_results() {
+            self.select(0);
             return;
         }
-        let len = self.results.len() as isize;
+        let len = self.result_count() as isize;
         let new = (self.selected as isize + delta).clamp(0, len - 1);
-        self.selected = new as usize;
+        self.select(new as usize);
     }
 
     pub fn select_top(&mut self) {
-        self.selected = 0;
+        self.select(0);
     }
 
     pub fn select_bottom(&mut self) {
-        self.selected = self.results.len().saturating_sub(1);
+        self.select(self.result_count().saturating_sub(1));
+    }
+
+    /// The only writer of `selected`: the index and the identity
+    /// anchor move together, so a later `resync_results` can name the
+    /// row the cursor was on even once the corpus has shifted under
+    /// the order.
+    fn select(&mut self, at: usize) {
+        self.selected = at;
+        let identity = self.result(at).map(|item| {
+            let (tag, key) = item.identity();
+            (tag, key.into_owned())
+        });
+        match identity {
+            Some(id) => self.anchor = Some(id),
+            // no such row *and* the order is current, so this is a
+            // real "nothing is selected" rather than a stale read;
+            // keeping the anchor would restore onto it later.
+            None if self.ranking.addresses(&self.corpus) => self.anchor = None,
+            None => {}
+        }
     }
 
     /// Replaces the query wholesale and re-filters, exactly as typing
@@ -358,8 +425,53 @@ impl App {
     /// *under* an unchanged query goes through `resync_results`
     /// instead, which keeps the selection where it was.
     fn refresh_results(&mut self) {
-        self.results = self.corpus.search(&self.query);
-        self.selected = 0;
+        self.rerank();
+        self.select(0);
+    }
+
+    /// Re-ranks against the corpus as it is now and throws away
+    /// whatever `results()` had materialized, which belongs to the
+    /// order just replaced. The one place `ranking` is written, so a
+    /// fresh order and a stale row cache cannot coexist.
+    fn rerank(&mut self) {
+        self.ranking = self.corpus.rank(&self.query);
+        self.materialized = OnceCell::new();
+    }
+
+    /// Puts the cursor back on the anchored row, or clamps if that row
+    /// is genuinely gone. The scan walks the ranked order and borrows
+    /// each row out of the corpus; finding one row again never needed
+    /// a cloned list.
+    fn restore_selection(&mut self) {
+        let last = self.result_count().saturating_sub(1);
+        let found = self.anchor.as_ref().and_then(|(tag, key)| {
+            self.ranking.rows(&self.corpus).position(|item| {
+                let (t, k) = item.identity();
+                t == *tag && k.as_ref() == key.as_str()
+            })
+        });
+        let at = match found {
+            Some(at) => at,
+            None if self.anchor.is_some() => self.selected.min(last),
+            None => 0,
+        };
+        self.select(at);
+    }
+
+    /// Replaces the corpus and re-ranks against it, keeping the
+    /// selection by identity exactly as `resync_results` does.
+    ///
+    /// The only way to swap a corpus, and that is the point: `ranking`
+    /// is indices into one corpus state, so assigning the field and
+    /// forgetting to re-rank leaves an order addressing a corpus that
+    /// no longer exists. `Ranking` refuses such a read, so the
+    /// symptom would be an empty results list rather than wrong rows,
+    /// but onboarding's library-paths step did exactly that and an
+    /// empty list after setting up your library is still a bug.
+    pub fn replace_corpus(&mut self, corpus: Corpus) {
+        self.corpus = corpus;
+        self.rerank();
+        self.restore_selection();
     }
 
     /// Bracketed paste delivers the whole pasted string as one event,
@@ -389,26 +501,12 @@ impl App {
     /// `refresh_results` does, correctly, for a *typed* query) meant
     /// scrolling to row 7 and then having a sync land silently snapped
     /// you back to row 0, with enter playing the wrong thing. The
-    /// previously selected item is found again by identity; if it's
+    /// previously selected item is found again by identity (`anchor`,
+    /// since by here the order can no longer resolve a row); if it's
     /// genuinely gone from the new list, the index is clamped instead.
     pub fn resync_results(&mut self) {
-        let previous = self.selected_result().map(|item| {
-            let (tag, key) = item.identity();
-            (tag, key.into_owned())
-        });
-        self.results = self.corpus.search(&self.query);
-        let last = self.results.len().saturating_sub(1);
-        self.selected = match previous {
-            Some((tag, key)) => self
-                .results
-                .iter()
-                .position(|item| {
-                    let (t, k) = item.identity();
-                    t == tag && k.as_ref() == key.as_str()
-                })
-                .unwrap_or(self.selected.min(last)),
-            None => 0,
-        };
+        self.rerank();
+        self.restore_selection();
     }
 }
 
@@ -418,18 +516,35 @@ mod tests {
     use crate::library::{LocalTrack, MediaKind};
     use std::path::PathBuf;
 
-    fn app_with_three_results() -> App {
-        let mut corpus = Corpus::new();
-        for i in 0..3 {
-            corpus.add_local_tracks([LocalTrack {
+    /// `n` tracks all matching the fixture query, each indexed as its
+    /// own batch so the corpus order is the obvious one.
+    fn tracks(n: usize) -> Vec<LocalTrack> {
+        (0..n)
+            .map(|i| LocalTrack {
                 path: PathBuf::from(format!("/music/track{i}.flac")),
                 title: format!("matchable track {i}"),
                 artist: None,
                 album: None,
                 duration_secs: None,
                 kind: MediaKind::Music,
-            }]);
+            })
+            .collect()
+    }
+
+    fn corpus_of(n: usize) -> Corpus {
+        let mut corpus = Corpus::new();
+        for track in tracks(n) {
+            corpus.add_local_tracks([track]);
         }
+        corpus
+    }
+
+    fn app_with_three_results() -> App {
+        app_with_results(3)
+    }
+
+    fn app_with_results(n: usize) -> App {
+        let corpus = corpus_of(n);
         let keymap = Keymap::default();
         let mut app = App::new(corpus);
         app.editing_query = true;
@@ -524,19 +639,132 @@ mod tests {
 
     #[test]
     fn resync_clamps_when_the_selected_item_is_gone() {
+        let mut app = app_with_results(4);
+        app.select_bottom();
+        assert_eq!(selected_title(&app), "matchable track 3");
+        // a rescan that comes back one track shorter: the selected row
+        // is not in the new list at all, so resync has nothing to
+        // restore onto and clamps instead of jumping to the top.
+        app.corpus.drop_local();
+        app.corpus.add_local_tracks(tracks(3));
+        app.resync_results();
+        assert_eq!(app.result_count(), 3);
+        assert_eq!(app.selected, 2);
+    }
+
+    /// `results()` clones rows out of the corpus on demand and caches
+    /// them, so a re-rank has to drop that cache: a kept one answers
+    /// the next query with the previous query's rows, which is not one
+    /// stale row but the whole list wrong.
+    #[test]
+    fn the_materialized_rows_do_not_survive_a_rerank() {
         let mut app = app_with_three_results();
-        // a row that the corpus can no longer produce: resync has
-        // nothing to restore onto, so it clamps instead of panicking
-        // or silently jumping to the top.
-        app.results.push(SearchItem::LocalMusic {
-            path: PathBuf::from("/music/vanished.flac"),
-            title: "matchable vanished".to_string(),
+        assert_eq!(app.results().len(), 3, "materialized under the first query");
+
+        app.set_query("zzzqqqxyw");
+        assert_eq!(app.result_count(), 0);
+        assert!(
+            app.results().is_empty(),
+            "results() answered from the order it was built for, not the current one"
+        );
+
+        app.set_query("matchable");
+        // two rows the fixture's three did not have, so the count
+        // moves and a cache kept across the resync would show 3.
+        app.corpus.add_local_tracks(tracks(5).into_iter().skip(3));
+        app.resync_results();
+        assert_eq!(app.result_count(), 5);
+        assert_eq!(app.results().len(), 5);
+    }
+
+    /// Replacing the corpus without re-ranking leaves an order
+    /// addressing a corpus that no longer exists. `Ranking` refuses
+    /// such a read, so onboarding pointing wim at a library would have
+    /// emptied the results list rather than filling it.
+    #[test]
+    fn replacing_the_corpus_reranks_against_the_new_one() {
+        let mut app = app_with_three_results();
+        assert_eq!(app.result_count(), 3);
+
+        app.replace_corpus(corpus_of(5));
+        assert_eq!(app.result_count(), 5);
+        assert_eq!(app.results().len(), 5);
+        for at in 0..5 {
+            assert!(app.result(at).is_some(), "row {at} of the new corpus");
+        }
+    }
+
+    /// Same contract as a resync: the swap is not a query change, so
+    /// the cursor stays on the row it was on even though that row's
+    /// index moved.
+    #[test]
+    fn replacing_the_corpus_keeps_the_selection_on_the_same_item() {
+        let mut app = app_with_three_results();
+        app.select_bottom();
+        assert_eq!(selected_title(&app), "matchable track 2");
+
+        // the same three rows behind one that outranks all of them, so
+        // the old index 2 names a different row in the new order.
+        let mut fresh = Corpus::new();
+        fresh.add_local_tracks([LocalTrack {
+            path: PathBuf::from("/music/exact.flac"),
+            title: "matchable".to_string(),
             artist: None,
             album: None,
-        });
-        app.selected = 3;
-        app.resync_results();
-        assert_eq!(app.selected, 2);
+            duration_secs: None,
+            kind: MediaKind::Music,
+        }]);
+        fresh.add_local_tracks(tracks(3));
+        app.replace_corpus(fresh);
+
+        assert_eq!(app.result_count(), 4);
+        assert_eq!(
+            selected_title(&app),
+            "matchable track 2",
+            "a corpus swap must not move the selection to another item"
+        );
+    }
+
+    /// The corpus may only be swapped through `replace_corpus`, and a
+    /// source scan rather than a runtime assertion because what needs
+    /// preventing is a *new* assignment: `ranking` is indices into one
+    /// corpus state, so an assignment anywhere else leaves an order
+    /// addressing a corpus that no longer exists, which reads as an
+    /// empty list at best and is why the revision guard exists.
+    #[test]
+    fn only_app_replaces_the_whole_corpus() {
+        fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("a readable dir").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    rust_sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        rust_sources(&src, &mut sources);
+        assert!(sources.len() > 20, "the scan found almost nothing");
+
+        let mut offenders = Vec::new();
+        for path in sources {
+            // this file: `replace_corpus` is the assignment.
+            if path.file_name().is_some_and(|f| f == "app.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("a readable source file");
+            for (n, line) in text.lines().enumerate() {
+                if line.contains(".corpus =") {
+                    offenders.push(format!("{}:{}", path.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "assign a corpus through App::replace_corpus: {offenders:?}"
+        );
     }
 
     /// The count and the slice are two answers to the same question,
