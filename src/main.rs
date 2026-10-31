@@ -51,6 +51,7 @@ use wim::graphics::{
 };
 use wim::keymap::{KeyAction, Keymap};
 use wim::layout::{PanelLayout, ResizePanel};
+use wim::lyricspane::LyricsPane;
 use wim::navmanager::{NavManager, NavManagerStep};
 use wim::notify::{Notifications, Severity};
 use wim::onboarding::{Onboarding, Step};
@@ -838,18 +839,10 @@ fn main() -> anyhow::Result<()> {
     // corpus walk, so it only happens when this is set.
     let mut enrich_probe = false;
     let mut enrich_job_in_flight = false;
-    let mut lyrics_lines: Option<Vec<String>> = None;
-    let mut lyrics_scroll: usize = 0;
-    // which track the open lyrics belong to; shown in their header so
-    // a pane left open across a track change isn't ambiguous.
-    let mut lyrics_track = String::new();
-    // the workspace width the lyrics were last drawn at; wrapping (and
-    // therefore how far they can scroll) depends on it, and only the
-    // draw pass knows it.
-    let mut lyrics_width: u16 = 0;
+    let mut lyrics = LyricsPane::default();
     // where the last frame put everything, filled in by the draw pass
     // below and read by the next mouse event; same reason
-    // `lyrics_width` is written from in there, taken all the way.
+    // `LyricsPane::saw_width` is written from in there, taken all the way.
     // Declared without a value because every iteration replaces it
     // before anything reads it. See `hit` and
     // docs/input-precedence.md.
@@ -1843,9 +1836,17 @@ fn main() -> anyhow::Result<()> {
                     },
                     main_content,
                 );
-            } else if let Some(lines) = &lyrics_lines {
-                lyrics_width = main_content.width;
-                let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+            } else if lyrics.is_open() {
+                // the width is reported before the lines are taken:
+                // `lines()` borrows the pane, and `saw_width` needs it
+                // mutably.
+                lyrics.saw_width(main_content.width);
+                let borrowed: Vec<&str> = lyrics
+                    .lines()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
                 // no rows: nothing here is selectable, so the wheel
                 // moves the content offset `j`/`k` already move.
                 hits.lists.push(hit::List {
@@ -1860,8 +1861,8 @@ fn main() -> anyhow::Result<()> {
                 f.render_widget(
                     LyricsView {
                         lines: &borrowed,
-                        scroll: lyrics_scroll,
-                        track: &lyrics_track,
+                        scroll: lyrics.scroll(),
+                        track: lyrics.track(),
                     },
                     main_content,
                 );
@@ -2406,14 +2407,13 @@ fn main() -> anyhow::Result<()> {
         if let Some((track, result)) = lyrics_loader.poll() {
             match result {
                 Ok(Some(l)) => {
-                    lyrics_lines = Some(
+                    lyrics.open(
                         wim::core::lyrics_text(&l)
                             .lines()
                             .map(str::to_string)
                             .collect(),
+                        track,
                     );
-                    lyrics_track = track;
-                    lyrics_scroll = 0;
                 }
                 Ok(None) => notifications.push(Severity::Info, format!("no lyrics for {track}")),
                 Err(e) => notifications.push(Severity::Error, format!("lyrics lookup failed: {e}")),
@@ -2664,8 +2664,7 @@ fn main() -> anyhow::Result<()> {
             Focus::Workspace => browse_view.is_some() || suggestions.is_some() || queue_view_open,
             Focus::BottomBar => false,
         };
-        let banner_showing =
-            now_playing.is_none() && browse_view.is_none() && lyrics_lines.is_none();
+        let banner_showing = now_playing.is_none() && browse_view.is_none() && !lyrics.is_open();
         let animating = !overlay
             && (selection_pulsing
                 || banner_showing
@@ -2994,7 +2993,7 @@ fn main() -> anyhow::Result<()> {
                                     hit::wheel_select(suggestions_selected, len, down);
                             }
                             hit::Scrollable::Lyrics => {
-                                lyrics_scroll = hit::wheel_scroll(lyrics_scroll, len, down);
+                                lyrics.set_scroll(hit::wheel_scroll(lyrics.scroll(), len, down));
                             }
                         }
                     }
@@ -3904,7 +3903,7 @@ fn main() -> anyhow::Result<()> {
                 // and showed no `<`/`>` hint at all out of the box.
                 let banner_showing = (now_playing.is_none() || player_minimized)
                     && browse_view.is_none()
-                    && lyrics_lines.is_none();
+                    && !lyrics.is_open();
                 if banner_showing {
                     match key.code {
                         KeyCode::Left => {
@@ -4099,7 +4098,7 @@ fn main() -> anyhow::Result<()> {
                 // lyrics view intercepts input directly rather than going
                 // through App, since scrolling it shouldn't move the
                 // underlying results selection.
-                if lyrics_lines.is_some() {
+                if lyrics.is_open() {
                     // same fix as the browse-view block above: only
                     // swallow keys actually handled here, or lyrics
                     // being open silently ate every other keybind.
@@ -4113,31 +4112,28 @@ fn main() -> anyhow::Result<()> {
                                 // is what's actually on screen; the
                                 // raw line count under-counts once
                                 // long lines wrap.
-                                let rows = lyrics_lines
-                                    .as_ref()
+                                let rows = lyrics
+                                    .lines()
                                     .map(|l| {
                                         let borrowed: Vec<&str> =
                                             l.iter().map(String::as_str).collect();
-                                        ui::lyrics_view::wrapped_len(
-                                            &borrowed,
-                                            lyrics_width.max(1) as usize,
-                                        )
+                                        ui::lyrics_view::wrapped_len(&borrowed, lyrics.width())
                                     })
                                     .unwrap_or(0);
-                                lyrics_scroll =
-                                    ui::scroll::clamp_to_content(lyrics_scroll + 1, rows);
+                                lyrics.set_scroll(ui::scroll::clamp_to_content(
+                                    lyrics.scroll() + 1,
+                                    rows,
+                                ));
                             }
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
-                            lyrics_scroll = lyrics_scroll.saturating_sub(1)
+                            lyrics.set_scroll(lyrics.scroll().saturating_sub(1))
                         }
                         KeyCode::Esc | KeyCode::Char('q') => {
-                            lyrics_lines = None;
-                            lyrics_scroll = 0;
+                            lyrics.close();
                         }
                         _ if key.code == keymap.get(KeyAction::OpenLyrics) => {
-                            lyrics_lines = None;
-                            lyrics_scroll = 0;
+                            lyrics.close();
                         }
                         _ => handled = false,
                     }
