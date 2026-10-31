@@ -937,6 +937,59 @@ mpv loaded, a generated silence source included".
       pinned: a second batch prints only its new names, a third prints
       nothing, and the cap is spent across batches.
 
+### live-use backlog (maintainer, driving shellswim 2026-11-01)
+
+Asked for while testing, in the order they were asked. Everything
+above this line in the shellswim section is done.
+
+- [ ] **scrollback in shellswim.** asked three times; nothing written
+      yet. the console keeps the newest lines and drops the rest
+      (`SwimConsole::render` takes `lines[len - shown..]`), so output
+      that scrolls past is gone.
+      the design settled on: a `scroll` offset on `shellsong::Console`
+      (0 = the live tail), **PageUp/PageDown** for a page and
+      **shift+Up/shift+Down** for a line, because plain Up/Down are
+      history recall and cannot be it. handled in shellswim's key
+      loop, which is where `KeyModifiers` is visible; `Console::key`
+      only receives a `KeyCode`.
+      two things to get right: the offset has to clamp against the
+      *scrollback viewport*, which only the renderer knows (it
+      computes `spare` after the prompt and qualifier rows), so the
+      view should report its height back -- a `Cell<usize>` on
+      `Console` written during render is the contained way to do it.
+      and new output should snap to the live tail **only if already
+      there**, so arriving notes do not yank someone who is reading
+      back; a submitted line always snaps.
+      wim's own console (`ui::shellsong::ShellsongConsole`) has the
+      same limitation and would get it free if the state lives on
+      `Console`.
+- [ ] **`queue()` should decide between a song and an album
+      dynamically**, with `k=song`/`k=album` as the strong assertions.
+      the assertions exist now (`k=`, `k=a`, `k=s`); what is left is
+      the *default*. today bare `queue` is song-only by a recorded
+      decision ("playing an album is ordinary, building a queue out of
+      albums is not. do not fix the asymmetry") and r7 says the whole
+      mechanism is "ambiguity resolution, not filtering".
+      **the maintainer has now asked for the opposite twice**, so the
+      asymmetry note is overruled; what needs care is that "decide
+      dynamically" means the best-scoring match wins *regardless of
+      kind*, which is a different mechanism from the preference ladder
+      rather than another rung on it. `best_match` currently walks
+      `prefs` in order and takes the first kind present; a dynamic
+      default wants the top-scoring result whatever it is. r7 and the
+      `play`/`queue` asymmetry note both need rewriting, not deleting:
+      the reasoning is still why the *ladder* exists for the explicit
+      forms.
+- [ ] **shellswim never handles `idle-active`.** the other half of the
+      `skip()` report. its event drain watches `PROP_PLAYLIST_POS` and
+      nothing else, so when mpv's playlist genuinely runs out the
+      queue still thinks the last track is playing: the bar keeps its
+      name and `now_playing` never clears. wim handles this
+      (`playlist_drained`, plus the loop-all restart), and that block
+      is long and duplicated-looking -- worth extracting into `core`
+      so both front-ends share one end-of-playlist path rather than
+      shellswim growing a second copy.
+
 ### stage 4: the queue timeline (started)
 
 - [x] **`wait(15s)` as an alias for `silence`** (maintainer, asked
