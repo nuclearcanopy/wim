@@ -714,6 +714,52 @@ report, not in a batch at the end.
       of reserving the readout width to kill the drag-jump class
       outright rather than handling the one crossing.
 
+### the input-path freeze audit (complete, 2026-10-31)
+
+The lyrics freeze prompted this: grep every network call reachable from
+`dispatch_action`, `run_shellsong_op` and the key handlers, and check
+whether it sits inside a thread. **Three more freezes, all confirmed on
+the input path, none inside a thread.** Every fix needs `main.rs`,
+which the library split owns tonight, so they are recorded with line
+numbers and the pattern to use rather than half-done.
+
+The pattern is settled, twice over: `browse::Loader` (merged) and
+`lyrics::Loader` (built, waiting on two call sites). One generation
+counter bumped per request and on `invalidate`, checked by the worker
+before it sends and again in `poll`. Copy that shape; do not invent a
+third.
+
+- [ ] **`resolve_tracks` (main.rs ~118) is the worst of the three.**
+      called from `dispatch_action`'s `Action::Play` and `Action::Queued`
+      arms (~1063, ~1099) and from shellsong (~1920). for an album it
+      is one `getAlbum`. **for an artist it calls `artist_tracks`,
+      which is a `getArtist` plus one `getAlbum` per album**, so
+      pressing enqueue on a prolific artist blocks the whole ui for as
+      long as that fan-out takes. the bounded pool made it 5x faster;
+      it is still seconds, and still synchronous.
+      note the irony: `browse::Loader` already streams exactly this
+      data album by album for the *browse* path. queueing it re-fetches
+      the same thing synchronously. the fix may be to route queueing
+      through the loader rather than to build a fourth one.
+- [ ] **`open_starred_view` (main.rs ~312) fetches starred songs from
+      every configured server synchronously**, from shellsong (~1543)
+      and the starred key (~6923). one round trip per server on a
+      keypress, in series with nothing else to look at.
+- [ ] **`toggle_star` (main.rs ~244) is a server round trip on the
+      keypress** for a remote song (`star`/`unstar`), from the key
+      handlers (~6606, ~7039) and shellsong (~1944). the local-file
+      branch is a file write and is fine.
+      this one wants different treatment from the other two: starring
+      should feel instant, so the right shape is **optimistic** (flip
+      `remote_starred` and redraw at once, send in the background, and
+      revert with a notification if the server refuses) rather than a
+      loader the user waits on.
+
+Checked and genuinely fine: `fetch_navidrome_everything` and
+`test_navidrome_connectivity` are already on their own threads, the
+enrichment and catalog fetches are background, `search3` runs in the
+debounced search thread, and the local-favorites path is a file write.
+
 - [ ] **pressing the lyrics key freezes the app on the network.**
       `lyrics::Client::lookup` is a round trip to lrclib and it is
       called **synchronously from the input path** at two sites in
