@@ -9,7 +9,7 @@ what has to change for them to move onto it. read this before touching
 ## the problem names cause
 
 `SearchItem::Song` carries `artist` and `album` as display strings.
-Anything joining on those is joining on a name, which loses three
+anything joining on those is joining on a name, which loses three
 distinct things:
 
 1. **two same-titled albums by one artist collapse.** a 1994 pressing
@@ -31,7 +31,7 @@ albums report `albumId`/`artistId`.
 
 they should be. the blocker is mechanical, not architectural: a new
 field on an enum struct variant makes every *literal construction* of
-that variant a compile error, and Rust has no defaulted fields and no
+that variant a compile error, and rust has no defaulted fields and no
 functional-record-update for enum variants, so "optional and
 defaulted" cannot rescue a construction site. `Option<String>` does
 not help; the field still has to be named.
@@ -73,10 +73,9 @@ already carries.
 
 four edits in main.rs, after which `IdIndex`'s song maps can go (the
 `album -> artist` map is still the only home for an album row's artist
-id until `SearchItem::Album` carries one too):
-
-line numbers are as of the merge of master into feat/identity; grep
-the pattern rather than trusting them.
+id until `SearchItem::Album` carries one too). line numbers are as of
+the merge of master into feat/identity; grep the pattern rather than
+trusting them.
 
 | site | change |
 | --- | --- |
@@ -120,7 +119,7 @@ known, else `Album { artist, album }`, else the track's own identity.
 both sides of the cover keyspace have to try the two forms in the same
 order, or an album opened in the browse view stops sharing its cover
 with the same album's tracks playing from the player. that is why
-`browse::fetch_cover_art` prefers the id even though it always has the
+`browse::cover_key` prefers the id even though it always has the
 names.
 
 ## what is persisted
