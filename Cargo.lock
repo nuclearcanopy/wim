@@ -2095,6 +2095,7 @@ dependencies = [
  "strsim",
  "thiserror 2.0.21",
  "toml",
+ "unicode-segmentation",
  "unicode-width 0.2.0",
  "ureq",
  "walkdir",

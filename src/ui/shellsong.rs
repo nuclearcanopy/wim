@@ -5,6 +5,7 @@ use ratatui::widgets::Widget;
 
 use crate::shellsong::{Console, LineKind};
 use crate::theme::{lerp, shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE, WHITE};
+use crate::ui::draw::{self, put};
 use crate::ui::textfit::{tail_fit, truncate_to_width, truncate_with_ellipsis, width};
 
 /// The shellsong console: a centred box over everything else, same
@@ -91,6 +92,7 @@ impl Widget for ShellsongConsole<'_> {
                 row,
                 &truncate_with_ellipsis(&line.text, inner),
                 color,
+                inner,
             );
             row += 1;
         }
@@ -121,11 +123,19 @@ impl Widget for ShellsongConsole<'_> {
                 row,
                 &truncate_with_ellipsis(&marked.join("  "), budget),
                 shade(MID),
+                budget,
             );
             // the indicator is right-aligned so cycling is not blind
             // about how far through the set it has got.
             let at = inner.saturating_sub(width(&position));
-            text(buf, x + 2 + at as u16, row, &position, shade(BRIGHT));
+            text(
+                buf,
+                x + 2 + at as u16,
+                row,
+                &position,
+                shade(BRIGHT),
+                inner.saturating_sub(at),
+            );
             row += 1;
         }
 
@@ -136,6 +146,7 @@ impl Widget for ShellsongConsole<'_> {
                 row,
                 &truncate_with_ellipsis(error, inner),
                 shade(WHITE),
+                inner,
             );
             row += 1;
         }
@@ -148,6 +159,7 @@ impl Widget for ShellsongConsole<'_> {
                 row,
                 &truncate_with_ellipsis(line, inner.saturating_sub(2)),
                 shade(DIM),
+                inner.saturating_sub(2),
             );
         }
     }
@@ -162,7 +174,7 @@ impl ShellsongConsole<'_> {
         put(buf, x + 2, row, ':', shade(DIM));
         let budget = inner.saturating_sub(2);
         let (shown, cursor_col) = split_at_cursor(&self.console.input, self.console.cursor, budget);
-        text(buf, x + 4, row, &shown, shade(NEAR_WHITE));
+        text(buf, x + 4, row, &shown, shade(NEAR_WHITE), budget);
 
         // never fully invisible: it dims on the off phase rather than
         // disappearing, same rule as the search box's cursor.
@@ -178,18 +190,26 @@ impl ShellsongConsole<'_> {
         // the ghost goes immediately after the cursor, where it would
         // land if accepted, and dim enough that it cannot be mistaken
         // for text that is already there.
+        // and only where it cannot land on a cell `shown` was just
+        // written into. drawn from `cursor_col + 1` with the caret
+        // mid-line it painted over real text, erasing what was typed
+        // to the right of the caret while leaving it in the buffer.
+        // a cursor before an auto-closed `)` still qualifies: the
+        // ghost starts at the end of the row either way.
         let ghost = &self.console.suggestion.ghost;
-        if ghost.is_empty() {
+        let used = cursor_col + 1;
+        if ghost.is_empty() || used < width(&shown) {
             return;
         }
-        let used = cursor_col + 1;
-        let ghost = truncate_to_width(ghost, budget.saturating_sub(used));
+        let budget = budget.saturating_sub(used);
+        let ghost = truncate_to_width(ghost, budget);
         text(
             buf,
             x + 4 + used as u16,
             row,
             &ghost,
             shade(lerp(NEAR_BLACK, DIM, 0.75)),
+            budget,
         );
     }
 
@@ -300,19 +320,11 @@ fn label(buf: &mut Buffer, x: u16, y: u16, w: u16, color: Color) {
     put(buf, col, y, '├', color);
 }
 
-fn text(buf: &mut Buffer, x: u16, y: u16, s: &str, color: Color) {
-    let mut col = 0u16;
-    for ch in s.chars() {
-        put(buf, x + col, y, ch, color);
-        col += width(&ch.to_string()).max(1) as u16;
-    }
-}
-
-fn put(buf: &mut Buffer, x: u16, y: u16, ch: char, color: Color) {
-    if let Some(cell) = buf.cell_mut((x, y)) {
-        cell.set_char(ch);
-        cell.set_fg(color);
-    }
+/// Writes `s` at `x`, clipped to `budget` cells. The box does no
+/// clipping of its own, so the budget is the only thing keeping a row
+/// off its own `│`; `draw::at` is the one writer in the app.
+fn text(buf: &mut Buffer, x: u16, y: u16, s: &str, color: Color, budget: usize) {
+    draw::at(buf, x, y, s, color, budget);
 }
 
 #[cfg(test)]
@@ -548,6 +560,96 @@ mod tests {
         match buf.cell((x, y)).map(|c| c.fg) {
             Some(Color::Rgb(v, _, _)) => v,
             _ => 0,
+        }
+    }
+
+    /// The ghost is only true where it would land. Drawn from
+    /// `cursor_col + 1` with the caret mid-line it painted over cells
+    /// the real text had just been written into: `, hexed` vanished
+    /// from the screen while still being in the buffer. `swimconsole`
+    /// has guarded this all along.
+    #[test]
+    fn the_ghost_is_not_drawn_over_text_the_caret_sits_inside() {
+        let fake = Fake(vec!["flatline"]);
+        let mut c = typed(&fake, "queue(fl, hexed");
+        for _ in 0..7 {
+            c.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &fake);
+        }
+        let out = render(&c, 60, 20);
+        assert!(
+            out.contains("hexed"),
+            "the ghost ate what was typed:\n{out}"
+        );
+        assert!(
+            !out.contains("atline"),
+            "a ghost drawn mid-line overwrites real text:\n{out}"
+        );
+    }
+
+    /// `text` is the only clip the box has: the frame is drawn first,
+    /// so a row that overran its budget painted straight over the `│`.
+    #[test]
+    fn a_row_stops_at_its_budget_even_when_the_caller_did_not_truncate() {
+        let mut buf = buffer(12, 1);
+        text(&mut buf, 2, 0, "abcdefghij", shade(MID), 4);
+        assert_eq!(grid(&buf), "..abcd......");
+    }
+
+    /// nfd text: the accent shares its base's cell, so the caret lands
+    /// on the cell after the name rather than on top of the accent.
+    #[test]
+    fn an_nfd_accent_keeps_its_base_cell_and_the_caret_follows_it() {
+        let mut c = Console::empty();
+        c.input = "Beyonce\u{301}".to_string();
+        c.cursor = c.input.len();
+        let mut buf = buffer(24, 5);
+        ShellsongConsole {
+            console: &c,
+            cursor_visible: true,
+        }
+        .render(Rect::new(0, 0, 24, 5), &mut buf);
+        let row = (0..5u16)
+            .find(|y| (0..24u16).any(|x| char_at(&buf, x, *y) == ':'))
+            .expect("the input row");
+        let at = (0..24u16)
+            .find(|x| char_at(&buf, *x, row) == ':')
+            .expect("the prompt")
+            + 2;
+        let sym = |x: u16| buf.cell((x, row)).unwrap().symbol().to_string();
+        assert_eq!(sym(at + 6), "e\u{301}", "{}", grid(&buf));
+        assert_eq!(sym(at + 7), "█", "{}", grid(&buf));
+    }
+
+    /// The box does no clipping of its own, so the budget is the only
+    /// thing keeping a row off its own border. Every one of the strings
+    /// `textfit::eyeball` measures, on every row the box can draw.
+    #[test]
+    fn nothing_is_painted_over_the_box_border() {
+        for (name, s) in crate::ui::textfit::eyeball::SAMPLES {
+            let mut c = typed(&NoCandidates, s);
+            c.note(format!("{s} {s} {s}"));
+            c.error = Some(format!("{s} failed"));
+            let out = render(&c, 24, 12);
+            let rows: Vec<&str> = out.lines().collect();
+            let top = rows
+                .iter()
+                .position(|r| r.contains('┌'))
+                .expect("a top border");
+            let bottom = rows
+                .iter()
+                .rposition(|r| r.contains('└'))
+                .expect("a bottom border");
+            let cols: Vec<char> = rows[top].chars().collect();
+            let left = cols.iter().position(|c| *c == '┌').unwrap();
+            let right = cols.iter().rposition(|c| *c == '┐').unwrap();
+            for r in &rows[top + 1..bottom] {
+                let cells: Vec<char> = r.chars().collect();
+                assert_eq!(cells[left], '│', "{name}: left border gone:\n{out}");
+                assert_eq!(
+                    cells[right], '│',
+                    "{name}: painted over the right border:\n{out}"
+                );
+            }
         }
     }
 
