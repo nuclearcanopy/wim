@@ -8,6 +8,7 @@ pub mod app;
 pub mod browse;
 pub mod cache;
 pub mod config;
+pub mod core;
 pub mod coverart;
 pub mod download;
 pub mod eq;
