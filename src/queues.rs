@@ -44,6 +44,30 @@ pub enum Kind {
     /// queue holding one is only loadable because the discriminant is
     /// written explicitly now.
     Silence,
+    /// A kind this build cannot rebuild, i.e. one a newer wim wrote.
+    /// Only ever produced on the way in, by `lenient_kind`; nothing
+    /// serialises it, since `entry_of` builds entries from live items.
+    Unknown,
+}
+
+/// Reads `kind` without letting one unreadable value cost the whole
+/// file. An unknown variant is a hard `toml` error, so a single entry
+/// from a newer wim made the other forty-nine unparseable and
+/// `load_report` then reported the queue as not existing at all.
+///
+/// `Kind`'s own `Deserialize` decides what is known, so this list
+/// cannot drift from the enum.
+fn lenient_kind<'de, D>(de: D) -> Result<Option<Kind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::IntoDeserializer;
+    let Some(raw) = Option::<String>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let known: serde::de::value::StrDeserializer<serde::de::value::Error> =
+        raw.as_str().into_deserializer();
+    Ok(Some(Kind::deserialize(known).unwrap_or(Kind::Unknown)))
 }
 
 /// Why an entry in a saved queue did not come back, so the caller can
@@ -135,7 +159,11 @@ pub struct Entry {
     pub album: String,
     /// `None` only in a file written before kinds existed; `kind()`
     /// infers it then.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient_kind",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub kind: Option<Kind>,
     /// A silence's length. `None` for every other kind, and absent
     /// from the toml for them, so an existing saved queue is byte
@@ -270,10 +298,11 @@ fn rebuild(saved: &SavedQueue, clients: &[Arc<Client>]) -> Loaded {
                 Some(Kind::Local) => Dropped::Moved(entry.label()),
                 Some(Kind::Remote) => Dropped::ServerGone(entry.label()),
                 // a silence always rebuilds (it needs nothing from
-                // the filesystem or a server), so this is
-                // unreachable; grouped with the unknown kind rather
-                // than claiming a reason it cannot have.
-                Some(Kind::Silence) | None => Dropped::Unrecognised(entry.label()),
+                // the filesystem or a server), so that half is
+                // unreachable; a kind from a newer wim is the live
+                // case, and neither has a reason beyond "this build
+                // cannot rebuild it".
+                Some(Kind::Silence | Kind::Unknown) | None => Dropped::Unrecognised(entry.label()),
             }),
         }
     }
@@ -336,26 +365,29 @@ fn entry_of(item: &SearchItem) -> Option<Entry> {
 /// knows how to classify a file; a remote song needs its server to
 /// still be connected, since the client is what builds a stream url.
 fn item_of(entry: &Entry, clients: &[Arc<Client>]) -> Option<SearchItem> {
-    // checked before the path, because a silence has no path and
-    // would otherwise fall through to the remote branch and fail on a
-    // missing server.
-    if entry.kind == Some(Kind::Silence) {
-        return Some(SearchItem::Silence {
+    // the kind decides, not which fields happen to be filled in: an
+    // entry from a newer wim can carry a path or a server and still
+    // not be rebuildable as either.
+    match entry.kind()? {
+        // needs nothing from the filesystem or a server, so it is
+        // answered before anything is looked up.
+        Kind::Silence => Some(SearchItem::Silence {
             secs: entry.secs.unwrap_or_default(),
-        });
+        }),
+        Kind::Local => crate::persistence::item_from_path(entry.path.as_deref()?),
+        Kind::Remote => {
+            let (server, id) = (entry.server.as_deref()?, entry.id.as_deref()?);
+            let client = clients.iter().find(|c| c.base_url() == server)?;
+            Some(SearchItem::Song {
+                id: id.to_string(),
+                title: entry.title.clone(),
+                artist: entry.artist.clone(),
+                album: entry.album.clone(),
+                client: client.clone(),
+            })
+        }
+        Kind::Unknown => None,
     }
-    if let Some(path) = &entry.path {
-        return crate::persistence::item_from_path(path);
-    }
-    let (server, id) = (entry.server.as_deref()?, entry.id.as_deref()?);
-    let client = clients.iter().find(|c| c.base_url() == server)?;
-    Some(SearchItem::Song {
-        id: id.to_string(),
-        title: entry.title.clone(),
-        artist: entry.artist.clone(),
-        album: entry.album.clone(),
-        client: client.clone(),
-    })
 }
 
 #[cfg(test)]
@@ -421,11 +453,41 @@ mod tests {
         assert!(!toml.contains("secs"), "{toml}");
     }
 
+    /// The test this replaces asserted only that a *video* is savable,
+    /// under this name, so the three arms it claims to cover were
+    /// unpinned: an album saved as an entry carries no path, no server
+    /// and no kind, so it comes back as `Unrecognised` and a reload is
+    /// short by one track with a reason that is not the real one.
     #[test]
     fn a_multi_track_entity_has_nothing_to_save() {
-        // albums/artists/playlists are expanded by `resolve_tracks`
-        // long before anything reaches the queue, so an entry for one
-        // would be unloadable rather than merely lossy.
+        let client = crate::browse::tests::test_client();
+        let multi = [
+            SearchItem::Artist {
+                id: "ar1".into(),
+                name: "bladee".into(),
+                client: client.clone(),
+            },
+            SearchItem::Album {
+                id: "al1".into(),
+                name: "crest".into(),
+                artist: "bladee".into(),
+                client: client.clone(),
+            },
+            SearchItem::Playlist {
+                id: "pl1".into(),
+                name: "late night".into(),
+                client,
+            },
+        ];
+        for item in &multi {
+            assert!(
+                entry_of(item).is_none(),
+                "{} is many tracks, not an entry",
+                item.primary_name()
+            );
+        }
+        // the positive control: the loop above would also pass if
+        // `entry_of` refused everything.
         assert!(entry_of(&SearchItem::LocalVideo {
             path: PathBuf::from("/v/clip.mkv"),
             title: "clip".into(),
@@ -445,6 +507,18 @@ mod tests {
     }
 
     // ------------------------------------------------- kinds and loss
+
+    /// Its own temp dir, so no test here reads or writes the real
+    /// queues dir; same convention as `persistence::tests::scratch_dir`.
+    fn scratch_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("wim-queues-{label}-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn remote(title: &str, server: &str) -> Entry {
         Entry {
@@ -511,6 +585,52 @@ album = "y"
             vec![Dropped::Unrecognised("a timed silence".into())],
             "it has to be reported, not silently skipped"
         );
+    }
+
+    /// A queue written by a *newer* wim must cost the one entry this
+    /// build cannot read, not the whole file. An unknown variant is a
+    /// hard toml error, so the parse failed outright, `load_report`
+    /// answered `None`, and the op reported "no saved queue called x"
+    /// through `namehint` with the file sitting right there.
+    ///
+    /// The unknown entry's `path` points at a file that really exists,
+    /// deliberately: the kind has to decide what an entry is, or a
+    /// kind this build cannot read is quietly played as a local file.
+    #[test]
+    fn one_entry_from_a_newer_wim_does_not_cost_the_whole_queue() {
+        let dir = scratch_dir("newer-wim");
+        let real = dir.join("not actually a track.flac");
+        fs::write(&real, "x").unwrap();
+        let raw = format!(
+            r#"
+[[entries]]
+title = "silence"
+kind = "silence"
+secs = 900
+
+[[entries]]
+title = "a video essay"
+kind = "stream"
+path = "{}"
+"#,
+            real.display()
+        );
+        let saved: SavedQueue =
+            toml::from_str(&raw).expect("one unreadable entry must still parse");
+        assert_eq!(saved.entries.len(), 2);
+        assert_eq!(saved.entries[1].kind(), Some(Kind::Unknown));
+
+        let loaded = rebuild(&saved, &[]);
+        assert!(
+            matches!(loaded.items.as_slice(), [SearchItem::Silence { secs: 900 }]),
+            "what this build understands still loads"
+        );
+        assert_eq!(
+            loaded.dropped,
+            vec![Dropped::Unrecognised("a video essay".into())],
+            "and the entry it does not is named, not guessed at"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// The present-day loss: a saved queue whose server is no longer
