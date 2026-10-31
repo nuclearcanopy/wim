@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::notify::{Notifications, Severity};
 use crate::search::{Corpus, SearchItem};
 use crate::shellsong::{Candidates, Level, Pos, Scope, Setting, SettingKind, Tier};
 use crate::subsonic::Client;
@@ -35,10 +36,12 @@ pub fn load_vars() -> Scope {
     vars_path().map(|p| read_vars(&p)).unwrap_or_default()
 }
 
-pub fn save_vars(scope: &Scope) {
-    if let Some(path) = vars_path() {
-        write_vars(&path, scope);
-    }
+/// Reporting rather than best-effort, unlike the read above: a
+/// read-only state dir used to leave `let morning = [...]` saying
+/// "defined morning: 2 terms" with the variable gone next launch. Same
+/// contract as `queues::save`, the other store a typed command writes.
+pub fn save_vars(scope: &Scope) -> Result<(), String> {
+    write_vars(&vars_path().ok_or_else(no_state_dir)?, scope)
 }
 
 /// Split from `load_vars` so a test can point it at a temp file; the
@@ -50,13 +53,23 @@ fn read_vars(path: &Path) -> Scope {
         .unwrap_or_default()
 }
 
-fn write_vars(path: &Path, scope: &Scope) {
+fn write_vars(path: &Path, scope: &Scope) -> Result<(), String> {
+    let body = toml::to_string_pretty(scope).map_err(|e| format!("encoding variables: {e}"))?;
+    write_state(path, &body)
+}
+
+fn no_state_dir() -> String {
+    "no state or data dir found for this platform".to_string()
+}
+
+/// The one write both shellsong state stores go through, naming the
+/// path and the reason so the message is actionable.
+fn write_state(path: &Path, body: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
-    if let Ok(body) = toml::to_string_pretty(scope) {
-        let _ = std::fs::write(path, body);
-    }
+    std::fs::write(path, body).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
 // ------------------------------------------------- bound settings
@@ -313,13 +326,37 @@ pub struct Overridden {
     pub speed: Option<f64>,
 }
 
+/// When `settle` considers two readings of a setting the same value,
+/// and so has nothing to apply. A plain `PartialEq` was wrong for the
+/// one setting that is a name: `remember(artist, eq(Night))` stored
+/// "Night" while mpv's live curve reads back as "night", so the eq
+/// never settled and every track got a redundant ipc write and a toast.
+pub trait SameValue {
+    fn same(&self, other: &Self) -> bool;
+}
+
+impl SameValue for f64 {
+    fn same(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+impl SameValue for String {
+    /// `eq::same_name`'s rule, which is what the eq menu and
+    /// `config.toml`'s `eq_preset` already compare by: trimmed and
+    /// ascii-case-insensitive, so one curve however it was typed.
+    fn same(&self, other: &Self) -> bool {
+        self.trim().eq_ignore_ascii_case(other.trim())
+    }
+}
+
 /// One setting's transition on a track change.
 ///
 /// `active` is the value to restore and is updated in place, `wanted`
 /// is what the new track's bindings ask for, `current` is what is in
 /// effect right now. Returns the value to apply, or `None` for "leave
 /// it alone". Pure, so the restore rule is tested with no mpv.
-pub fn settle<T: Clone + PartialEq>(
+pub fn settle<T: Clone + SameValue>(
     active: &mut Option<T>,
     wanted: Option<T>,
     current: T,
@@ -333,9 +370,9 @@ pub fn settle<T: Clone + PartialEq>(
             if active.is_none() {
                 *active = Some(current.clone());
             }
-            (want != current).then_some(want)
+            (!want.same(&current)).then_some(want)
         }
-        None => active.take().filter(|previous| *previous != current),
+        None => active.take().filter(|previous| !previous.same(&current)),
     }
 }
 
@@ -349,10 +386,11 @@ pub fn load_bindings() -> Bindings {
         .unwrap_or_default()
 }
 
-pub fn save_bindings(bindings: &Bindings) {
-    if let Some(path) = bindings_path() {
-        write_bindings(&path, bindings);
-    }
+/// Reports its failure for the same reason `save_vars` does: a
+/// `remember(...)` that said so and then lost the binding is the same
+/// bug twice.
+pub fn save_bindings(bindings: &Bindings) -> Result<(), String> {
+    write_bindings(&bindings_path().ok_or_else(no_state_dir)?, bindings)
 }
 
 fn read_bindings(path: &Path) -> Bindings {
@@ -362,12 +400,26 @@ fn read_bindings(path: &Path) -> Bindings {
         .unwrap_or_default()
 }
 
-fn write_bindings(path: &Path, bindings: &Bindings) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+fn write_bindings(path: &Path, bindings: &Bindings) -> Result<(), String> {
+    let body = toml::to_string_pretty(bindings).map_err(|e| format!("encoding settings: {e}"))?;
+    write_state(path, &body)
+}
+
+/// `config::save_or_warn`'s shape for the two shellsong state stores:
+/// persist, and say so if you cannot. Every write site in the host has
+/// a `Notifications` to hand, so neither of these has to be silent.
+pub fn save_vars_or_warn(scope: &Scope, notifications: &mut Notifications) {
+    if let Err(e) = save_vars(scope) {
+        notifications.push(Severity::Error, format!("couldn't save variables: {e}"));
     }
-    if let Ok(body) = toml::to_string_pretty(bindings) {
-        let _ = std::fs::write(path, body);
+}
+
+pub fn save_bindings_or_warn(bindings: &Bindings, notifications: &mut Notifications) {
+    if let Err(e) = save_bindings(bindings) {
+        notifications.push(
+            Severity::Error,
+            format!("couldn't save remembered settings: {e}"),
+        );
     }
 }
 
@@ -530,9 +582,10 @@ pub fn clients_of(corpus: &Corpus) -> Vec<Arc<Client>> {
 // ---------------------------------------------------- search_settled
 
 /// How long a notified query stays unsettled with nothing coming back.
-/// Comfortably past the 300ms remote-search debounce plus a round trip,
-/// and far inside `shellsong`'s own 8s await timeout, so a slow server
-/// costs `play(crest)` a beat rather than an error.
+/// Comfortably past `core::REMOTE_SEARCH_DEBOUNCE` plus a round trip
+/// (the test below holds the two to that), and far inside `shellsong`'s
+/// own 8s await timeout, so a slow server costs `play(crest)` a beat
+/// rather than an error.
 pub const SETTLE_WINDOW: Duration = Duration::from_millis(1200);
 
 /// `Env::search_settled`: "the results for the current query are as
@@ -583,12 +636,33 @@ impl SearchSettle {
 /// Resolves a `moveto(...)` position to absolute seconds. A percent
 /// stays a percent all the way through the language precisely because
 /// the duration is runtime state; this is where it stops being one.
-pub fn seek_target(pos: Pos, duration: Option<f64>) -> Result<f64, &'static str> {
+///
+/// Both spellings are held to the same range, which is the whole point:
+/// `moveto(1h)` on a three-minute track used to report "moved to 3600s"
+/// and skip the track, where `moveto(200%)` could not. Past the end is
+/// *refused* rather than clamped, the habit everywhere else in the
+/// language (a count above 256, a time over 24h): clamping would end
+/// the track and say "moved to", which reads exactly like a seek that
+/// worked, and `moveto(1h)` for `moveto(1m)` is a typo, not a request
+/// to skip. An unknown duration still goes through, since a live stream
+/// has no end to be past.
+pub fn seek_target(pos: Pos, duration: Option<f64>) -> Result<f64, String> {
     match pos {
-        Pos::Seconds(s) => Ok(s.max(0.0)),
+        Pos::Seconds(s) => {
+            let s = s.max(0.0);
+            match duration {
+                Some(d) if d > 0.0 && s > d => Err(format!(
+                    "{s:.0}s is past the end of this {d:.0}s track; moveto(100%) is the end"
+                )),
+                _ => Ok(s),
+            }
+        }
         Pos::Percent(p) => match duration {
             Some(d) if d > 0.0 => Ok((d * p / 100.0).clamp(0.0, d)),
-            _ => Err("nothing with a known duration is playing, so a percent has nothing to resolve against"),
+            _ => Err(
+                "nothing with a known duration is playing, so a percent has nothing to resolve against"
+                    .to_string(),
+            ),
         },
     }
 }
@@ -819,6 +893,32 @@ mod tests {
         assert!(active.is_none());
     }
 
+    /// The eq is the one setting whose value is a name, and names are
+    /// compared `eq::same_name`'s way. Comparing them with `PartialEq`
+    /// meant `remember(artist, eq(Night))` never settled: the stored
+    /// "Night" never equalled the live "night", so every single track
+    /// got a redundant ipc write and another toast, forever.
+    #[test]
+    fn an_eq_name_settles_whatever_case_it_was_remembered_in() {
+        let mut active: Option<String> = None;
+        assert_eq!(
+            settle(&mut active, Some("Night".to_string()), "night".to_string()),
+            None,
+            "one curve, so there is nothing to apply"
+        );
+        assert_eq!(active.as_deref(), Some("night"), "held for the restore");
+        // the restore side is the same comparison from the other end.
+        let mut active = Some(" Night ".to_string());
+        assert_eq!(settle(&mut active, None, "night".to_string()), None);
+        assert!(active.is_none());
+        // a genuinely different curve still applies.
+        let mut active: Option<String> = None;
+        assert_eq!(
+            settle(&mut active, Some("rock".to_string()), "night".to_string()),
+            Some("rock".to_string())
+        );
+    }
+
     #[test]
     fn bindings_round_trip_through_the_state_file() {
         let path = temp_vars_path("bindings");
@@ -826,7 +926,7 @@ mod tests {
         b.remember(Tier::Track, "bladee - crest", &Setting::Eq("night".into()));
         b.remember(Tier::Album, "icedancer", &Setting::Volume(55.0));
         b.remember(Tier::Artist, "bladee", &Setting::Speed(0.9));
-        write_bindings(&path, &b);
+        write_bindings(&path, &b).expect("temp write");
         assert_eq!(read_bindings(&path), b);
         // and the listing names every tier, so `view(bindings)` shows
         // the lot rather than only the narrowest.
@@ -871,11 +971,32 @@ mod tests {
             vec!["crest".into(), "icedancer".into(), "gods".into()],
         );
         scope.define("quiet", vec!["mazzy star".into()]);
-        write_vars(&path, &scope);
+        write_vars(&path, &scope).expect("temp write");
         let back = read_vars(&path);
         assert_eq!(back, scope);
         assert_eq!(back.names(), vec!["bladee_classics", "quiet"]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The failure the maintainer hits with an unwritable
+    /// `$XDG_STATE_HOME`: `: let morning = [mazzy star, burial]` said
+    /// "defined morning: 2 terms" and the variable was gone next
+    /// launch, where `queues::save` has always reported the same
+    /// failure. Both stores now answer the same way.
+    #[test]
+    fn a_state_write_that_cannot_land_is_reported_not_swallowed() {
+        // a plain file standing where the parent directory would have
+        // to be: unwritable for any user, root included, where a
+        // chmod-ed directory would not be.
+        let blocker = temp_vars_path("unwritable");
+        std::fs::write(&blocker, "not a directory").expect("temp write");
+        let path = blocker.join("wim").join(VARS_FILE);
+        let parent = path.parent().expect("has a parent").display().to_string();
+        let why = write_vars(&path, &Scope::default()).expect_err("must not report success");
+        assert!(why.contains(&parent), "{why}");
+        let why = write_bindings(&path, &Bindings::default()).expect_err("must not report success");
+        assert!(why.contains(&parent), "{why}");
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[test]
@@ -947,9 +1068,22 @@ mod tests {
         assert!(settle.settled(secs(11) + SETTLE_WINDOW));
     }
 
+    /// Coupled to the constant rather than to a copy of its value: the
+    /// hardcoded `300` here pinned neither number, so raising the
+    /// debounce past half the window would have left `play(crest)`
+    /// settling before the request it is waiting for had even gone out.
     #[test]
     fn the_window_clears_the_debounce_plus_a_round_trip() {
-        assert!(SETTLE_WINDOW >= millis(300) * 2);
+        let debounce = crate::core::REMOTE_SEARCH_DEBOUNCE;
+        assert!(
+            SETTLE_WINDOW >= debounce * 2,
+            "a {debounce:?} debounce needs more than a {SETTLE_WINDOW:?} window"
+        );
+        // and the behaviour the margin exists for: a query whose
+        // request has only just left is still unsettled.
+        let mut settle = SearchSettle::default();
+        settle.notified(true, secs(10));
+        assert!(!settle.settled(secs(10) + debounce));
     }
 
     // ----------------------------------------------------- candidates
@@ -1068,6 +1202,25 @@ mod tests {
     fn seconds_go_straight_through_with_no_duration_needed() {
         assert_eq!(seek_target(Pos::Seconds(80.0), None), Ok(80.0));
         assert_eq!(seek_target(Pos::Seconds(-5.0), Some(200.0)), Ok(0.0));
+    }
+
+    /// `moveto(1h)` on a three-minute track reported "moved to 3600s"
+    /// and skipped it: the seconds branch clamped only the bottom while
+    /// the percent branch on the next line clamped both ends. Refused
+    /// rather than clamped, like every other out-of-range value here.
+    #[test]
+    fn a_time_past_the_end_is_refused_the_way_a_percent_over_a_hundred_is() {
+        let three_minutes = Some(185.0);
+        let why = seek_target(Pos::Seconds(3600.0), three_minutes).expect_err("must not seek");
+        assert!(why.contains("past the end"), "{why}");
+        assert!(why.contains("185s"), "{why}");
+        // the end itself is reachable, from either spelling.
+        assert_eq!(seek_target(Pos::Seconds(185.0), three_minutes), Ok(185.0));
+        assert_eq!(seek_target(Pos::Percent(100.0), three_minutes), Ok(185.0));
+        // nothing with a known end cannot be past it: a live stream
+        // reports no duration, and seeking into it is still legal.
+        assert_eq!(seek_target(Pos::Seconds(3600.0), None), Ok(3600.0));
+        assert_eq!(seek_target(Pos::Seconds(3600.0), Some(0.0)), Ok(3600.0));
     }
 
     #[test]

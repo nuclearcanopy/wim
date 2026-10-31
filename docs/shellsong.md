@@ -89,7 +89,7 @@ args       := arg (',' arg)*
 arg        := call | list | keyword '=' value | value
 list       := '[' item (',' item)* ','? ']'
 item       := unquoted-text | '"' text '"'
-comment    := '#' ... end of line
+comment    := '#' ... end of line   (at nesting depth 0)
 ```
 
 - whitespace around anything is ignored, except inside a list item.
@@ -357,7 +357,7 @@ an artist expands to an entire discography, which is never a queue
 anyone asked for. `kind=any` remains as the explicit "i really do mean
 anything" escape hatch, and it is spelled that way on purpose.
 
-`kind=` is refused on a command that does not search, and on `view`.
+`kind=` is refused on a command that does not search, and on `view`, and twice in the same call.
 
 ### a term that matches nothing
 
@@ -584,6 +584,8 @@ rescan()                re-walk the local library
 run(script)             run a .shg script; dry(run(x)) previews it
 sleep(after)            fade out and pause after a delay; sleep(off) cancels
 fade(direction, over?)  fade the volume in or out
+                        `over` has no `off`, unlike sleep/gap above;
+                        leave it out for the 5s default
 help(name?)             list every command, or one command's signature
 quit()                  quit wim                               [exit]
 ```
