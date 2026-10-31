@@ -714,6 +714,100 @@ report, not in a batch at the end.
       of reserving the readout width to kill the drag-jump class
       outright rather than handling the one crossing.
 
+### shellsong stages 1-3 (merged 2026-10-31)
+
+Variables, `.shg` scripts and per-identity settings are in. 940 tests.
+
+- **variables.** `define(name, terms)` is canonical and `let name = [a,
+  b]` is surface sugar parsed straight into it, so typechecking, errors
+  and expansion are all the canonical call's and R1 stays literally
+  true of every *lowered* program. Terms rather than resolved tracks,
+  as briefed: a variable is a vibe that follows the library, and
+  `save_queue` is already the frozen case. Expansion lives in exactly
+  one place (`coerce`'s `Ty::Terms` arm), which is why every
+  terms-taking command gets it for nothing and `dry` prints the
+  expanded plan for free.
+- **`.shg` scripts.** `run(script)` lowers a file's statements into the
+  same `Program`, so there is one stepper, one await path and one
+  `dry`. A bad line reports and the rest runs (`mix:2: col 1: unknown
+  command ...`); a *runtime* failure still stops. `init.shg` runs at
+  startup as literally `run(init)`.
+  A test caught a real design gap: a script's `let` on line 1 was
+  invisible to line 6, because every line parsed against one scope
+  snapshot. Fixing it also made `let a = [x]; play(a)` work typed on
+  one line.
+- **per-identity settings.** `remember(tier, call)` / `forget(tier,
+  setting?)`, where **the setting is a call**: no parallel vocabulary of
+  setting names and value formats, the value goes through `eq`/
+  `volume`/`speed`'s own parameter type, and the binding applies
+  through the identical `Op` the typed command lowers to. A relative
+  value is refused at parse time, since `remember(track, volume(+10%))`
+  would bind "louder than whatever it happens to be".
+  Precedence is **per setting**, track then album then artist, decided
+  independently for eq, volume and speed; per-identity precedence would
+  mean remembering an eq for one track silently dropped the volume its
+  album remembered. Settings **restore** rather than staying applied,
+  with the restore point captured only on the *first* override so a run
+  of bound tracks cannot ratchet it.
+
+**A real user-facing bug it found on the way:** `MAX_CANDIDATES = 50`
+was being applied to the **command-name** list, which the table bounds
+rather than the library. With more than 50 written names (there are 45
+commands plus aliases), every name alphabetically past the cut was
+**unreachable by tab from an empty token, including `view` and
+`volume`**. Only corpus and user-grown lists are capped now, and
+`every_command_name_is_reachable_by_tab_from_an_empty_token` fails if
+any name ever becomes unreachable again.
+
+### the queue timeline: two decisions taken so stage 4 can start
+
+The agent stopped at a stage boundary green rather than half-landing
+the timeline, and left a concrete handoff. Two things needed deciding;
+both are decided here so the next agent does not stall on them.
+
+**1. the entry is `silence(15m)`, not `pause(15m)`.** `pause()` is
+already the play/pause toggle, and R2 explicitly refuses arity
+overloading ("`skip(2)` is refused: it is ambiguous"). `silence`
+describes what actually plays, cannot be confused with the toggle, and
+pairs with `gap(10s)` for the default between tracks, which keeps the
+maintainer's two ideas named distinctly.
+
+**2. `silence` is its own command with an optional position, not a
+nested call inside `queue`.** `queue`'s parameter is `Ty::Terms`, which
+means "names of things in the library"; letting it accept a call form
+is a genuine grammar extension and would make `Ty::Terms` mean "names
+or calls" everywhere. So: `silence(15m)` appends and `silence(15m,
+front)` takes the position parameter `add_to_queue` already uses. The
+composition loss versus `queue(silence(15m))` is real but small, and it
+is reversible later if the grammar extension turns out to be wanted
+anyway.
+
+**The invariant question is already answered, and the answer is the
+good one.** Keep mpv's playlist as the source of truth and make a
+silence a *real* mpv entry via `av://lavfi:anullsrc=d=N`, which mpv in
+this setup already loads (two ignored benches prove it). Then
+`entries.len() == mpv playlist len` still holds, every absolute-index
+path keeps working untouched, and the desync regression tests at
+`playqueue.rs:296-393` keep holding. The invariant's doc comment gets
+*stronger*: "`entries` is mpv's playlist, and every entry is something
+mpv loaded, a generated silence source included".
+
+- [ ] **two latent bugs that must be fixed as part of the timeline**,
+      both found during that survey and both currently unreachable only
+      by luck:
+      - `load_playlist` (~main.rs:691) and `resync_upcoming` (~743)
+        skip an item whose `resolve_playable` returns `None` when
+        appending to mpv **but still store the full vec in
+        `PlayQueue`**. Callers pre-run `resolve_tracks` today, so it
+        cannot fire; a new entry kind that fails to resolve hits it and
+        puts every later index off by one.
+      - `queues.rs`'s `Entry` has **no discriminant** ("a missing
+        `path`/`id` is already the discriminant"). A silence entry
+        would serialise to `{title, artist, album}` and `item_of` would
+        return `None` on load, silently dropped and indistinguishable
+        from a moved file. The save/load round-trip cannot pass without
+        a real tag on that struct.
+
 ### the input-path freeze audit (complete, 2026-10-31)
 
 The lyrics freeze prompted this: grep every network call reachable from

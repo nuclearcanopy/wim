@@ -33,6 +33,7 @@ pub mod shellsong;
 pub mod shellsong_host;
 pub mod subsonic;
 pub mod suggest;
+pub mod swimconsole;
 pub mod term;
 pub mod theme;
 pub mod trace;
