@@ -1494,12 +1494,32 @@ a measurement.
       overwrote a real play index; `cache_dir` now refuses a non-temp
       path under `cfg(test)`, but injecting the save is the fix that
       removes the reach rather than guarding it.
-- [ ] **`append_resolved` reports a refusal as a success.** `core.rs`
-      ~593 checks only `starts_with("error")`, so a
-      "not directly playable" status reads as "queued 1 track", and the
-      count printed is the *requested* count rather than the appended
-      one. `enqueue_track`'s two callers already disagree about which
-      prefixes matter, which is pinned now but not unified.
+- [x] **`enqueue_track` returns a variant, not a sentence its callers
+      parse.** the prefixes *were* the contract and the callers
+      disagreed about them: `enqueue_next` read `"not "`,
+      `append_resolved` read only `"error"`. so a track mpv cannot play
+      directly was **dropped and counted as queued**, and the number
+      printed was `tracks.len()`, the requested count. a mixed album
+      said "queued 12 tracks" having queued nine, and never mentioned
+      the three.
+      `Enqueued::{Queued, NotPlayable, Failed}` cannot be half-read.
+      the shuffle-move-refused case stays `Queued` with the caveat in
+      its note, because the track *is* in and only its position was
+      denied. `append_resolved` counts what went in and appends
+      `lost_note`, and **"queued nothing" when none did**, since
+      "queued 0 tracks" is the wrong shape of sentence entirely.
+      the silence arm gained an honest `NotPlayable` branch too: a
+      generated silence always resolves, so reaching it is a bug rather
+      than a user mistake, and it used to report a queued gap that was
+      not there.
+      two tests through the real `append_resolved` with a mixed batch,
+      mutation-checked by restoring the requested count and by dropping
+      the skipped note. the four existing prefix tests became variant
+      comparisons, which is strictly stronger.
+      **and the harness duplication the audit recorded is closed**:
+      `seam_tests::Harness` is `pub(super)` now, so sibling test
+      modules share it instead of carrying a near-copy (`undo.rs` has
+      one, which is what the audit pointed at).
 - [ ] **docs that went stale tonight.** `docs/text-measurement.md`
       82-84 says `controlsbar` is "still per-char" and "the next one to
       route"; it is routed, and the `char_cells` justification at 72-75
