@@ -2029,9 +2029,27 @@ the order below is not a preference, it is a dependency.
       locals, then the draw closure, and only then the input tiers
       (their ordering is load-bearing and heavily commented).
       **the "~3.9k lines" in this entry was stale: it was 6.2k when
-      the decomposition started.** down to 5.3k over four slices.
+      the decomposition started.** down to 5.0k over five slices.
       worth re-measuring rather than trusting, since every feature
       slice adds to it.
+      - [x] **terminal graphics capability -> `src/graphics.rs`** (304
+        lines). `wants_full_art`, `has_real_protocol`, `real_graphics`,
+        `art_mode_for_picker`, `warn_no_graphics`, `protocol_image`,
+        `cell_aspect`, `graphics_plausible`/`_in`, and nine tests.
+        one seam, stated as a question: every decision in there is
+        "ask the terminal, or decide from what it answered". **main.rs
+        5267 -> 4985**, under five thousand for the first time, from
+        6.2k.
+        **the mixed-test-module pattern repeated, which makes it a
+        pattern rather than an accident.** last slice it was
+        `catalog_fetch_tests` holding the graphics-probe tests; this
+        slice it was `startup_tests` holding *seven* art-mode tests
+        alongside the two `loading_message` ones. both times the
+        module was named for the first thing someone tested in it and
+        then accreted whatever came next. worth expecting in the
+        remaining slices rather than discovering again: check which
+        tests a module actually holds before assuming its name
+        describes it.
       - [x] **catalog fetching and the sync thread -> `src/catalog.rs`**
         (355 lines). `AUTO_SYNC_INTERVAL`, `BackgroundSyncResult`,
         `spawn_background_sync`, `FetchedCatalog`, `fetched`,

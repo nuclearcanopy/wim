@@ -16,6 +16,7 @@ pub mod enrich;
 pub mod eq;
 pub mod favorites;
 pub mod focus;
+pub mod graphics;
 pub mod hit;
 pub mod keymap;
 pub mod layout;
