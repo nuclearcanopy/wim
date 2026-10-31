@@ -1400,6 +1400,9 @@ struct ShellsongCtx<'a, 'b> {
     /// Snapshot behind `load_queue`'s completion; refreshed on open
     /// and after a save rather than read off disk per keystroke.
     saved_queues: &'a mut Vec<String>,
+    /// The live `let` bindings. Held here rather than re-read per
+    /// keystroke, and written back to disk by `define`/`unset`.
+    vars: &'a mut shellsong::Scope,
 }
 
 /// What a term-taking op acts on. `Index` is a row of the results
@@ -1607,6 +1610,16 @@ fn open_shellsong_view(target: ViewTarget, ctx: &mut ShellsongCtx) -> (Dispatch,
                 ctx.console.note(name);
             }
             op_note(format!("{count} saved queues"))
+        }
+        // the language generates these lines too, as `let` statements,
+        // so the listing is also valid input to paste into a `.shg`.
+        ViewTarget::Vars => {
+            let lines = ctx.vars.lines();
+            let count = if ctx.vars.is_empty() { 0 } else { lines.len() };
+            for line in lines {
+                ctx.console.note(line);
+            }
+            op_note(format!("{count} variables"))
         }
         // the one listing whose content the language generates rather
         // than the app, which is what keeps `help()` and `view(help)`
@@ -2107,6 +2120,23 @@ fn run_shellsong_op(op: Op, ctx: &mut ShellsongCtx) -> (Dispatch, Report) {
                 Duration::from_secs_f64(secs.max(0.0)),
             ));
             op_done()
+        }
+        // the terms arrive already expanded: a variable used inside
+        // another is resolved while parsing, so this only ever stores
+        // what it was handed.
+        Op::Define { name, terms } => {
+            let count = terms.len();
+            let replaced = ctx.vars.define(&name, terms);
+            shellsong_host::save_vars(ctx.vars);
+            let verb = if replaced { "redefined" } else { "defined" };
+            op_note(format!("{verb} {name}: {count} terms"))
+        }
+        Op::Unset(name) => {
+            if !ctx.vars.remove(&name) {
+                return op_fail(namehint::unknown("variable", &name, ctx.vars.names()));
+            }
+            shellsong_host::save_vars(ctx.vars);
+            op_note(format!("unset {name}"))
         }
         Op::Quit => {
             let dispatch = dispatch_action(Action::Quit, ctx.actx);
@@ -3528,6 +3558,10 @@ fn main() -> anyhow::Result<()> {
     // `load_queue`'s completion candidates, snapshotted rather than
     // read off the disk on every keystroke.
     let mut saved_queues: Vec<String> = Vec::new();
+    // the `let name = [...]` bindings, loaded once: a submitted line is
+    // parsed against them, so they are read per line rather than per
+    // keystroke, and `define`/`unset` write the file back.
+    let mut shellsong_vars = shellsong_host::load_vars();
     // backs `Env::search_settled`; see `shellsong_host::SearchSettle`.
     let mut settle = SearchSettle::default();
     // the queue view owns main_content like the browse/lyrics views do;
@@ -5262,6 +5296,7 @@ fn main() -> anyhow::Result<()> {
                             remote_search_tx: &remote_search_tx,
                             settle: &mut settle,
                             saved_queues: &mut saved_queues,
+                            vars: &mut shellsong_vars,
                         },
                     );
                     if dispatch == Dispatch::Quit {
@@ -5368,6 +5403,7 @@ fn main() -> anyhow::Result<()> {
                             corpus: &app.corpus,
                             saved: &saved_queues,
                             eq_presets: eq_preset_names(&cfg.eq_custom_presets),
+                            vars: &shellsong_vars,
                         },
                     );
                 } else if !help_open {
@@ -5832,6 +5868,7 @@ fn main() -> anyhow::Result<()> {
                         corpus: &app.corpus,
                         saved: &saved_queues,
                         eq_presets: eq_preset_names(&cfg.eq_custom_presets),
+                        vars: &shellsong_vars,
                     };
                     // the whole `KeyEvent`, not just `key.code`: the
                     // console reads ctrl for its accept key, which no
