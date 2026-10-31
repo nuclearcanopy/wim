@@ -169,9 +169,15 @@ impl Widget for SuggestionsView<'_> {
                     draw::line(buf, area, y, &format!(" {}", reason.title()), shade(MID));
                 }
                 Row::Item(idx) | Row::Reason(idx) => {
-                    let Some((_, suggestion)) = flat.get(*idx) else {
-                        continue;
-                    };
+                    // `rows` numbers its items by walking the same
+                    // sections in the same order `flat` does, so every
+                    // index it emits is in range; the test
+                    // `rows_numbers_every_suggestion_once_in_flat_order`
+                    // is the proof. the `.get(..) else continue` that
+                    // used to stand here could not fire, and if it ever
+                    // had it would have skipped a row `row_items` still
+                    // named, which is a click landing on nothing drawn.
+                    let (_, suggestion) = flat[*idx];
                     let is_selected = *idx == self.selected;
                     if is_selected {
                         // the plate covers both of a suggestion's rows,
@@ -279,6 +285,70 @@ mod tests {
                 Row::Reason(1),
             ]
         );
+    }
+
+    /// Sections of uneven length, including an empty one, so the
+    /// numbering below is tested across section boundaries rather than
+    /// inside one list.
+    fn uneven_sections() -> Suggestions {
+        let items = |n: usize, tag: &str| {
+            (0..n)
+                .map(|i| suggestion(&format!("{tag}{i}"), &format!("because {tag}{i}")))
+                .collect::<Vec<_>>()
+        };
+        Suggestions {
+            sections: vec![
+                Section {
+                    title: Reason::DailyRotation.title().to_string(),
+                    reason: Reason::DailyRotation,
+                    items: items(2, "a"),
+                },
+                Section {
+                    title: Reason::AlbumGap.title().to_string(),
+                    reason: Reason::AlbumGap,
+                    items: Vec::new(),
+                },
+                Section {
+                    title: Reason::Rediscovery.title().to_string(),
+                    reason: Reason::Rediscovery,
+                    items: items(3, "c"),
+                },
+            ],
+        }
+    }
+
+    /// Why `render` may index `flat` directly. `rows` numbers its items
+    /// by walking the same sections in the same order `flat` does, so
+    /// the indices it hands out are exactly `0..flat().count()`, each
+    /// once, ascending. Without this the render's old
+    /// `flat.get(idx) else continue` would have been a row the map
+    /// still named: a click resolving to a suggestion nothing drew.
+    #[test]
+    fn rows_numbers_every_suggestion_once_in_flat_order() {
+        for s in [
+            Suggestions::default(),
+            two_sections(),
+            one_long_section(),
+            uneven_sections(),
+        ] {
+            let flat = s.flat().count();
+            assert_eq!(flat, s.len(), "count() clamps against flat()'s length");
+            let picked = |want_item: bool| -> Vec<usize> {
+                rows(&s)
+                    .into_iter()
+                    .filter_map(|r| match r {
+                        Row::Item(i) if want_item => Some(i),
+                        Row::Reason(i) if !want_item => Some(i),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let expect: Vec<usize> = (0..flat).collect();
+            assert_eq!(picked(true), expect, "title rows");
+            // the reason rows repeat the same numbering, which is what
+            // lets either row of a suggestion pick it.
+            assert_eq!(picked(false), expect, "reason rows");
+        }
     }
 
     #[test]
@@ -519,6 +589,19 @@ mod tests {
             ]
         );
         assert_agrees(&s, 29, 60, 10);
+    }
+
+    /// Every selection, at sizes that scroll and sizes that do not, on
+    /// a fixture with gaps, headings and an empty section: the map's
+    /// answer for a row is the suggestion whose own text landed there.
+    #[test]
+    fn the_map_and_the_render_agree_row_for_row_across_sections() {
+        let s = uneven_sections();
+        for selected in 0..s.len() {
+            for (w, h) in [(60u16, 20u16), (60, 12), (60, 8), (40, 6), (60, 5)] {
+                assert_agrees(&s, selected, w, h);
+            }
+        }
     }
 
     #[test]
