@@ -1000,6 +1000,7 @@ fn main() -> anyhow::Result<()> {
                     download_tx: &download_tx,
                     downloading: &mut downloading,
                     day_threshold: cfg.cache_days_threshold,
+                    persist: cache::CacheIndex::save,
                 };
                 note_playback_started(&item, &mut dctx, &mut notifications);
                 start_tracking_playback(&cfg, &item, &mut scrobble);
@@ -4061,6 +4062,7 @@ fn main() -> anyhow::Result<()> {
                                         download_tx: &download_tx,
                                         downloading: &mut downloading,
                                         day_threshold: cfg.cache_days_threshold,
+                                        persist: cache::CacheIndex::save,
                                     };
                                     note_playback_started(&first, &mut dctx, &mut notifications);
                                     start_tracking_playback(&cfg, &first, &mut scrobble);
@@ -4107,6 +4109,7 @@ fn main() -> anyhow::Result<()> {
                                     download_tx: &download_tx,
                                     downloading: &mut downloading,
                                     day_threshold: cfg.cache_days_threshold,
+                                    persist: cache::CacheIndex::save,
                                 };
                                 download_selected(
                                     &item,
@@ -4513,6 +4516,7 @@ fn main() -> anyhow::Result<()> {
                             download_tx: &download_tx,
                             downloading: &mut downloading,
                             day_threshold: cfg.cache_days_threshold,
+                            persist: cache::CacheIndex::save,
                         };
                         download_selected(
                             &item,

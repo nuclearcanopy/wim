@@ -1488,12 +1488,29 @@ a measurement.
       which moved the 71-char constant into a hard-wrapped paragraph
       and made a 118-cell line. it has its own line now, and the
       longest line in either binary's help is 73.
-- [ ] **`DownloadCtx` wants an injected `persist`**, the shape
-      `download::Sink` already uses. `note_playback_started` reaches
-      for `cache::cache_dir()` directly, which is how a test run
-      overwrote a real play index; `cache_dir` now refuses a non-temp
-      path under `cfg(test)`, but injecting the save is the fix that
-      removes the reach rather than guarding it.
+- [x] **`DownloadCtx::persist` is injected, so the reach is gone and
+      not merely guarded.** `note_playback_started` called
+      `CacheIndex::save`, which resolves `cache::cache_dir()` itself,
+      which is how a test harness starting from
+      `CacheIndex::default()` overwrote a real play index. the
+      `cfg(test)` guard on `cache_dir` is a tripwire; this removes the
+      hazard, because a caller can no longer write anywhere it did not
+      name.
+      **the `auto_download_wiring_tests` module no longer mutates the
+      process environment at all.** it had to set `XDG_CACHE_HOME`
+      once per process and never put it back, with a second assertion
+      to check the redirect was still honoured; both are deleted for a
+      three-line `persist_nowhere`.
+      and `let _ = idx.save()` is reported now. that discarded result
+      is *why* the damage was silent, and in normal use it means a
+      read-only cache dir quietly stops the auto-download threshold
+      working forever: the day count it reads is exactly what fails to
+      persist. `Notifications::push` coalesces repeats, so it is one
+      counted box rather than one per track.
+      two mutations caught: discarding the result again, and reaching
+      for `cache_dir` again instead of the injected hook. all 61
+      `#[ignore]`d tests re-run with `--ignored` afterwards, since
+      those were what did the harm.
 - [x] **`enqueue_track` returns a variant, not a sentence its callers
       parse.** the prefixes *were* the contract and the callers
       disagreed about them: `enqueue_next` read `"not "`,
