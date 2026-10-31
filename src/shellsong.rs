@@ -455,6 +455,13 @@ pub enum Op {
     RemoveFromQueue(Vec<usize>),
     GotoQueue(usize),
     ShuffleQueue,
+    /// A timed silence in the queue. `front` inserts it next, matching
+    /// `add_to_queue`'s position parameter rather than inventing a
+    /// second way to say the same thing.
+    Silence {
+        secs: u64,
+        front: bool,
+    },
     SaveQueue(String),
     LoadQueue(String),
     /// bind a name to a list of search terms, persisted. The terms are
@@ -536,6 +543,11 @@ impl Op {
             Op::RemoveFromQueue(v) => format!("removed {} from the queue", v.len()),
             Op::GotoQueue(n) => format!("jumped to queue {n}"),
             Op::ShuffleQueue => "queue shuffled".into(),
+            Op::Silence { secs, front } => format!(
+                "{} a {} silence",
+                if *front { "inserted next" } else { "queued" },
+                crate::ui::progress::fmt_span(*secs)
+            ),
             Op::SaveQueue(n) => format!("saved queue as '{n}'"),
             Op::LoadQueue(n) => format!("loaded queue '{n}'"),
             Op::Define { name, terms } => {
@@ -629,6 +641,12 @@ pub enum Ty {
     Speed,
     /// a time literal, or `off` to cancel.
     Duration,
+    /// a positive length of time, with no `off`: a span that *is*
+    /// something (a silence in the queue), where `Ty::Duration` is a
+    /// timer that can be cancelled. sharing `Duration` would have made
+    /// `silence(off)` parse and then do nothing at all, silently,
+    /// since there is no silence of no length.
+    Span,
     /// one of an enumerated keyword set.
     Words(Words),
     /// a nested call, for the higher-order commands.
@@ -765,6 +783,7 @@ impl Ty {
             Ty::Indices => Completes::Hint("1, or [1, 3, 5]"),
             Ty::Speed => Completes::Hint("0.25-3.0, or up / down / reset"),
             Ty::Duration => Completes::Hint("30m / off"),
+            Ty::Span => Completes::Hint("15m / 30s / 1h30m"),
         }
     }
 
@@ -797,6 +816,7 @@ impl Ty {
             Ty::Offset => "a signed offset like +30s or -10s".into(),
             Ty::Level => "a percent like 50% or +10%".into(),
             Ty::Count => "a positive whole number".into(),
+            Ty::Span => "a length of time like 15m, 30s or 1h30m".into(),
             Ty::Index => "a queue position (1 or higher)".into(),
             Ty::Indices => "one or more queue positions".into(),
             Ty::Speed => "a multiplier like 1.5, or up / down / reset".into(),
@@ -1003,6 +1023,16 @@ pub const COMMANDS: &[Command] = &[
         &[opt("terms", Ty::Terms)],
         SONG,
         "append each term to the queue",
+    ),
+    cmd(
+        "silence",
+        &[],
+        &[
+            req("length", Ty::Span),
+            opt("position", Ty::Words(Words::Position)),
+        ],
+        &[],
+        "put a timed silence in the queue: silence(15m)",
     ),
     cmd(
         "add_to_queue",
@@ -2183,6 +2213,7 @@ enum Arg {
     Indices(Vec<usize>),
     Speed(SpeedArg),
     Duration(Option<f64>),
+    Span(f64),
     Word(&'static str),
     Call(Box<Call>),
 }
@@ -2247,6 +2278,7 @@ fn render_arg(arg: &Arg) -> String {
         Arg::Speed(SpeedArg::Up) => "up".into(),
         Arg::Speed(SpeedArg::Down) => "down".into(),
         Arg::Speed(SpeedArg::Reset) => "reset".into(),
+        Arg::Span(s) => format!("{s}s"),
         Arg::Duration(Some(s)) => format!("{s}s"),
         Arg::Duration(None) => "off".into(),
         Arg::Word(w) => (*w).to_string(),
@@ -2310,6 +2342,15 @@ impl Call {
                 _ => Op::ToggleShuffle,
             },
             "shuffle_queue" => Op::ShuffleQueue,
+            "silence" => match first {
+                // rounded to whole seconds: the lavfi source takes an
+                // integer and nobody queues a 1.5 second gap.
+                Some(Arg::Span(s)) => Op::Silence {
+                    secs: *s as u64,
+                    front: self.keyword(Words::Position) == Some("front"),
+                },
+                _ => return None,
+            },
             "speed" => match first {
                 Some(Arg::Speed(SpeedArg::Set(s))) => Op::SetSpeed(*s),
                 Some(Arg::Speed(SpeedArg::Up)) => Op::SpeedUp,
@@ -2963,6 +3004,14 @@ fn coerce(
                 SpeedArg::Set(s)
             }
         })),
+        Ty::Span => match parse_time(text) {
+            // zero is refused here rather than at apply time: a
+            // silence of no length is a typo, not an instruction.
+            Ok((None, Pos::Seconds(s))) if s > 0.0 => Ok(Arg::Span(s)),
+            Ok((None, Pos::Seconds(_))) => Err(bad("a silence needs a length".into())),
+            Ok(_) => Err(expected()),
+            Err(why) => Err(bad(format!("{}: {why}", command.name))),
+        },
         Ty::Duration => {
             if text == "off" {
                 return Ok(Arg::Duration(None));
@@ -4569,6 +4618,7 @@ mod tests {
             Ty::Terms => "crest".into(),
             Ty::Query | Ty::NewName | Ty::SavedName | Ty::EqName => "crest".into(),
             Ty::VarName => "mix".into(),
+            Ty::Span => "15m".into(),
             // the samples never touch the disk, so this one is a path
             // that `scripts_of` in the `run` tests resolves.
             Ty::ScriptName => "sample".into(),
@@ -5616,6 +5666,32 @@ mod tests {
     #[test]
     fn sleep_takes_a_duration_or_cancels() {
         assert_eq!(ops("sleep(30m)"), vec![Op::Sleep(Some(1800.0))]);
+        assert_eq!(
+            ops("silence(15m)"),
+            vec![Op::Silence {
+                secs: 900,
+                front: false
+            }]
+        );
+        assert_eq!(
+            ops("silence(15m, front)"),
+            vec![Op::Silence {
+                secs: 900,
+                front: true
+            }]
+        );
+        assert_eq!(
+            ops("silence(1h30m)"),
+            vec![Op::Silence {
+                secs: 5400,
+                front: false
+            }]
+        );
+        // the reason `silence` has its own `Ty::Span` instead of
+        // sharing `sleep`'s `Ty::Duration`: `off` would have parsed
+        // and then done nothing whatsoever.
+        assert!(!error("silence(off)").message.is_empty());
+        assert!(error("silence(0s)").message.contains("needs a length"));
         assert_eq!(ops("sleep(off)"), vec![Op::Sleep(None)]);
         assert_eq!(
             ops("fade(out, 10s)"),
@@ -5753,6 +5829,7 @@ mod tests {
             Ty::Indices,
             Ty::Speed,
             Ty::Duration,
+            Ty::Span,
             Ty::Call,
             Ty::SettingCall,
             Ty::Words(Words::Position),
@@ -7087,6 +7164,7 @@ queue(morning)
                 "shuf",
                 "shuffle",
                 "shuffle_queue",
+                "silence",
                 "skip",
                 "sleep",
                 "speed",
@@ -7308,6 +7386,7 @@ queue(morning)
                 "shuf",
                 "shuffle",
                 "shuffle_queue",
+                "silence",
                 "skip",
                 "sleep",
                 "speed",
@@ -7624,6 +7703,7 @@ queue(morning)
                 "shuf",
                 "shuffle",
                 "shuffle_queue",
+                "silence",
                 "skip",
                 "sleep",
                 "speed",
