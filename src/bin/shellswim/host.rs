@@ -39,6 +39,7 @@ macro_rules! core_ctx {
             track_resolver: &mut $h.track_resolver,
             base_volume: &mut $h.base_volume,
             crossfade_enabled: &mut $h.crossfade_enabled,
+            overridden: &mut $h.overridden,
             undo: &mut $h.undo,
             gap_secs: &mut $h.gap_secs,
             between_tracks: &mut $h.between_tracks,
@@ -110,6 +111,9 @@ pub struct Host {
     /// session.
     pub gap_secs: f64,
     pub between_tracks: BetweenTracks,
+    /// Per-identity settings the user has overridden by hand; see
+    /// `core::track_started`. shellswim applied none of these before.
+    pub overridden: wim::shellsong_host::Overridden,
     pub resume_due: Option<Duration>,
     /// The query whose results have been printed, and the names
     /// already printed for it. Kept so a server answering after the
@@ -203,6 +207,7 @@ impl Host {
             crossfade_enabled,
             gap_secs,
             between_tracks: BetweenTracks::new(),
+            overridden: wim::shellsong_host::Overridden::default(),
             resume_due: None,
             echoed: None,
             undo: wim::undo::Recorder::default(),
@@ -313,6 +318,7 @@ impl Host {
         }
 
         let mut drained = false;
+        let mut advanced: Option<SearchItem> = None;
         while let Ok(ev) = self.player.events().try_recv() {
             let mpv::Event::PropertyChange { name, value } = ev else {
                 continue;
@@ -324,9 +330,7 @@ impl Host {
                 if let PosChange::Advanced(_) =
                     self.play_queue.set_pos(value.as_i64().unwrap_or(-1))
                 {
-                    if let Some(track) = self.play_queue.current().cloned() {
-                        self.console.note(format!("now playing: {}", label(&track)));
-                    }
+                    advanced = self.play_queue.current().cloned();
                 }
             } else if name == mpv::PROP_IDLE_ACTIVE {
                 // this was not handled at all, so a queue that ran out
@@ -347,18 +351,9 @@ impl Host {
                 core::Drained::Cleared => self.console.note("queue finished".to_string()),
                 core::Drained::Failed(why) => self.console.fail(why),
                 core::Drained::Restarted(track) => {
-                    // the hooks a restart owes, as far as shellswim
-                    // has any: wim additionally re-applies
-                    // per-identity settings and the crossfade ramp,
-                    // neither of which shellswim does on an ordinary
-                    // advance either. see ROADMAP.
-                    let now = self.start.elapsed();
-                    let np = Some(track.clone());
-                    let core = core_ctx!(self, now, np);
-                    core::fire_subtitle_fetch(core.cfg, core.subtitle_tx, &track);
-                    core::start_tracking_playback(core.cfg, &track, core.scrobble);
                     self.console
                         .note(format!("looped back to: {}", label(&track)));
+                    advanced = Some(track);
                 }
             }
         }
@@ -377,6 +372,31 @@ impl Host {
                 self.console.note(line);
             }
             self.echoed = Some((self.app.query.clone(), shown));
+        }
+
+        // a track started, by advancing or by a loop-all restart.
+        // shellswim fired *none* of these before: no subtitle fetch,
+        // no scrobble tracking, and no per-identity eq, so a binding
+        // that worked in wim silently did nothing here.
+        if let Some(track) = advanced {
+            if self.play_queue.current().is_some() {
+                self.console.note(format!("now playing: {}", label(&track)));
+            }
+            let now = self.start.elapsed();
+            let np = Some(track.clone());
+            let started = {
+                let mut surf = self.swim.borrowed();
+                let mut core = core_ctx!(self, now, np);
+                let s = core::track_started(&track, &mut core);
+                let _ = &mut surf;
+                s
+            };
+            if !started.ops.is_empty() {
+                self.program = Some(Box::new(wim::shellsong::Program::of(started.ops)));
+            }
+            if let Some(bound) = started.bound {
+                self.console.note(bound);
+            }
         }
 
         // `pause(30s)` letting go.
