@@ -478,7 +478,6 @@ mod tests {
         assert_eq!(titles(q.upcoming()), vec!["b"]);
     }
 
-    #[test]
     /// The flip side of the test below, and the bug: clearing the
     /// queue used to go through `replace_upcoming(vec![])`, which
     /// relays the *same* session out again. so with loop-all on, the
