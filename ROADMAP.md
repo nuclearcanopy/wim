@@ -905,13 +905,36 @@ debounced search thread, and the local-favorites path is a file write.
       accessors; that is the `main.rs` decomposition item's lane. no
       cap was added, deliberately, since any cap is visible at all five
       sites.
-- [ ] **album/artist identity is name-based.** `SearchItem` carries no
-      `album_id`/`artist_id`, so the suggestion catalog joins on
-      trimmed-lowercased names. two same-named albums by one artist
-      collapse, and a split-credit artist ("Bladee & Ecco2k") rolls up
-      under neither. widening `SearchItem` touches every construction
-      site, so it was left alone deliberately; revisit if the menu's
-      suggestions look wrong in practice.
+- [x] **album/artist identity joins on ids, with names as the
+      fallback** (docs/identity.md). the three losses names caused are
+      each fixed and each pinned: two same-titled albums by one artist
+      stay two records, a split credit ("Bladee & Ecco2k") rolls up
+      under the artist the server named by id, and a compilation's
+      differently-credited tracks share their album's cover key
+      instead of refetching it once per track.
+      the ids could **not** go on `SearchItem`, and the reason is
+      mechanical: a new field on an enum struct variant makes every
+      literal construction of it a compile error, and rust has no
+      defaulted fields or record update for variants, so "optional and
+      defaulted" cannot rescue a construction site. main.rs holds two
+      of those literals (plus one in its tests), and the same is true
+      of `subsonic::{Song, Album, Artist}`, `subsonic::SearchResult`
+      and `cache::ServerCatalog`, all of which main.rs's tests
+      construct. so the ids ride in `subsonic::IdIndex`: three maps per
+      server, shared between every `Client` for it exactly the way
+      `NAV_CACHES` is, reached through the `Arc<Client>` every remote
+      item already carries. docs/identity.md lists the exact main.rs
+      edits that would turn them into real fields, and what of the
+      index can then be deleted.
+      the rule everywhere is: prefer an id; fall back to the name, but
+      only onto a row that is not already some other id's; never merge
+      two different ids. the middle clause is what keeps local files
+      (no ids at all) joining exactly as before, and the last is what
+      stops the names re-merging what the ids just separated.
+      the one cost worth knowing: every cover already on disk is filed
+      under a name key, so each album is fetched once more and
+      refiled; the old files age out through the sweep that already
+      runs.
 
 - [x] **maximized player: cover art and an arrow-selectable transport.**
       `ui::player::layout` is a `browse::layout`-shaped free function

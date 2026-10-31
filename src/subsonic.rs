@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -134,6 +134,99 @@ fn catalog_fingerprint(ids: impl Iterator<Item = impl AsRef<str>>) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Album and artist ids for the rows a response mentioned, per server.
+///
+/// Album and artist identity in this app is otherwise name-based:
+/// `SearchItem` carries them as display strings, so two same-titled
+/// albums by one artist collapse and a split credit ("Bladee & Ecco2k")
+/// rolls up under neither. The ids that fix that cannot live on
+/// `SearchItem` yet, because every variant literal would have to be
+/// widened and several are in main.rs; see docs/identity.md. They live
+/// here instead and are reached through the `Arc<Client>` every remote
+/// item already carries.
+///
+/// Only ever learns. A song's album is an immutable server fact, so a
+/// later response restates it rather than contradicting it, and a
+/// re-tag on the server overwrites the one entry it moved. Unbounded
+/// on purpose: three ids per song is ~200 bytes, so even a session
+/// that browsed all 40k songs of a library costs single-digit MB,
+/// against a corpus of the same rows that costs far more; and evicting
+/// an entry would quietly move a cover's key (see `coverart::Key`).
+#[derive(Default)]
+struct IdIndex {
+    song_album: HashMap<String, String>,
+    song_artist: HashMap<String, String>,
+    album_artist: HashMap<String, String>,
+}
+
+/// A usable id from a response object: absent, empty, and subsonic's
+/// `"-1"` ("no such id", see `parse_artist_info`) all read as unknown
+/// rather than as an id that will never match anything.
+fn id_field<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    v.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty() && *id != "-1")
+}
+
+impl IdIndex {
+    /// Learns from a song array: `search3`, `getAlbum`, `getPlaylist`,
+    /// `getStarred2` and `getTopSongs` all carry `albumId`/`artistId`
+    /// per entry alongside the display names.
+    fn learn_songs(&mut self, arr: Option<&serde_json::Value>) {
+        for song in arr.and_then(|a| a.as_array()).into_iter().flatten() {
+            let Some(id) = id_field(song, "id") else {
+                continue;
+            };
+            if let Some(album) = id_field(song, "albumId") {
+                self.song_album.insert(id.to_string(), album.to_string());
+            }
+            if let Some(artist) = id_field(song, "artistId") {
+                self.song_artist.insert(id.to_string(), artist.to_string());
+            }
+        }
+    }
+
+    /// Learns from an ID3 album array (`getAlbumList2`, `search3`),
+    /// whose entries carry the credited artist's id.
+    fn learn_albums(&mut self, arr: Option<&serde_json::Value>) {
+        for album in arr.and_then(|a| a.as_array()).into_iter().flatten() {
+            let (Some(id), Some(artist)) = (id_field(album, "id"), id_field(album, "artistId"))
+            else {
+                continue;
+            };
+            self.album_artist.insert(id.to_string(), artist.to_string());
+        }
+    }
+
+    /// Both halves of a `search3` envelope. Kept here rather than
+    /// folded into `Client::song_rows`/`album_rows` so the pure
+    /// `parse_search3_response` stays the one thing that builds the
+    /// rows.
+    fn learn_search3(&mut self, v: &serde_json::Value) {
+        let r = v.get("searchResult3");
+        self.learn_songs(r.and_then(|r| r.get("song")));
+        self.learn_albums(r.and_then(|r| r.get("album")));
+    }
+}
+
+/// Id indexes keyed by base url, shared by every `Client` for that
+/// server for the same reason `NAV_CACHES` is: the background catalog
+/// sync builds a fresh client per pass and is what learns most of
+/// these, while the clients the corpus hands the ui live for the whole
+/// session. Keyed by url alone, not `username@url`: two accounts on
+/// one server see different playlists but the same album ids.
+static ID_INDEXES: OnceLock<Mutex<HashMap<String, Arc<RwLock<IdIndex>>>>> = OnceLock::new();
+
+fn id_index_for(base_url: &str) -> Arc<RwLock<IdIndex>> {
+    let registry = ID_INDEXES.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut registry) = registry.lock() else {
+        // same stance as `nav_cache_for`: an unshared index is still
+        // correct, it just learns less.
+        return Arc::new(RwLock::new(IdIndex::default()));
+    };
+    registry.entry(base_url.to_string()).or_default().clone()
+}
+
 /// Cheap to clone (ureq's `Agent` is `Arc`-backed internally); every
 /// remote `SearchItem` carries an `Arc<Client>` so playback can later
 /// resolve to the right server's stream url without the app needing a
@@ -158,6 +251,8 @@ pub struct Client {
     /// Shared with every other `Client` for the same server; see
     /// `NAV_CACHES`.
     nav_cache: Arc<Mutex<NavCache>>,
+    /// Shared the same way; see `ID_INDEXES`.
+    ids: Arc<RwLock<IdIndex>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -288,6 +383,7 @@ impl Client {
         let base_url = normalize_url(&cfg.url);
         Ok(Client {
             nav_cache: nav_cache_for(&cfg.username, &base_url),
+            ids: id_index_for(&base_url),
             base_url,
             username: cfg.username.clone(),
             password: Zeroizing::new(cfg.resolve_password()?),
@@ -414,6 +510,82 @@ impl Client {
         }
     }
 
+    /// Updates this server's id index. A poisoned lock is ignored: a
+    /// learned id only ever sharpens a join that still has a name
+    /// fallback, so it is never a correctness requirement.
+    fn learn(&self, f: impl FnOnce(&mut IdIndex)) {
+        if let Ok(mut ids) = self.ids.write() {
+            f(&mut ids);
+        }
+    }
+
+    /// `parse_song_array` plus the id bookkeeping, so no endpoint can
+    /// parse a song array and silently drop what its ids said. Every
+    /// song array in this file goes through here or `learn_search3`.
+    fn song_rows(&self, arr: Option<&serde_json::Value>) -> Vec<Song> {
+        self.learn(|ids| ids.learn_songs(arr));
+        parse_song_array(arr)
+    }
+
+    /// `parse_album_array` plus the id bookkeeping; see `song_rows`.
+    fn album_rows(&self, arr: Option<&serde_json::Value>) -> Vec<Album> {
+        self.learn(|ids| ids.learn_albums(arr));
+        parse_album_array(arr)
+    }
+
+    /// The album a song belongs to, by the server's own id, when some
+    /// response has said so. `None` means nothing has told us yet,
+    /// which is every caller's cue to fall back to names rather than
+    /// to treat the track as album-less; see `IdIndex`.
+    pub fn album_of_song(&self, song_id: &str) -> Option<String> {
+        self.ids.read().ok()?.song_album.get(song_id).cloned()
+    }
+
+    /// The artist a song is credited to, by id. Navidrome reports the
+    /// primary credited artist here, which is what makes a split
+    /// credit ("Bladee & Ecco2k") roll up under a real artist instead
+    /// of under a name no artist row has.
+    pub fn artist_of_song(&self, song_id: &str) -> Option<String> {
+        self.ids.read().ok()?.song_artist.get(song_id).cloned()
+    }
+
+    /// The artist an album is credited to, by id.
+    pub fn artist_of_album(&self, album_id: &str) -> Option<String> {
+        self.ids.read().ok()?.album_artist.get(album_id).cloned()
+    }
+
+    /// Records an album's artist learned somewhere other than a live
+    /// response: the persisted catalog replays its rows through here
+    /// so a cold start has the ids before the first sync lands (see
+    /// `cache::load_catalog`).
+    pub fn remember_album_artist(&self, album_id: &str, artist_id: &str) {
+        if album_id.is_empty() || artist_id.is_empty() {
+            return;
+        }
+        if let Ok(mut ids) = self.ids.write() {
+            ids.album_artist
+                .insert(album_id.to_string(), artist_id.to_string());
+        }
+    }
+
+    /// Seeds what a response would have taught about one song, for
+    /// tests with no server to answer. `remember_album_artist` has a
+    /// live caller (the persisted catalog); this half never does,
+    /// because song links only ever arrive from a response.
+    #[cfg(test)]
+    pub fn remember_song(&self, song_id: &str, album_id: &str, artist_id: &str) {
+        self.learn(|ids| {
+            if !album_id.is_empty() {
+                ids.song_album
+                    .insert(song_id.to_string(), album_id.to_string());
+            }
+            if !artist_id.is_empty() {
+                ids.song_artist
+                    .insert(song_id.to_string(), artist_id.to_string());
+            }
+        });
+    }
+
     pub fn ping(&self) -> anyhow::Result<()> {
         self.get("ping", &[])?;
         Ok(())
@@ -427,12 +599,17 @@ impl Client {
     pub fn get_album(&self, album_id: &str) -> anyhow::Result<AlbumDetails> {
         let v = self.get_cached("getAlbum", &[("id", album_id)])?;
         let album = v.get("album");
+        // the album object itself carries `artistId`, and this is the
+        // one endpoint that reports it for an album opened by id.
+        if let Some(artist_id) = album.and_then(|a| id_field(a, "artistId")) {
+            self.remember_album_artist(album_id, artist_id);
+        }
         Ok(AlbumDetails {
             year: album
                 .and_then(|a| a.get("year"))
                 .and_then(|y| y.as_u64())
                 .map(|y| y as u32),
-            songs: parse_song_array(album.and_then(|a| a.get("song"))),
+            songs: self.song_rows(album.and_then(|a| a.get("song"))),
         })
     }
 
@@ -442,7 +619,14 @@ impl Client {
     /// Various-Artists filtering that requires).
     pub fn get_artist(&self, artist_id: &str) -> anyhow::Result<Vec<ArtistAlbum>> {
         let v = self.get_cached("getArtist", &[("id", artist_id)])?;
-        Ok(parse_artist_albums(&v))
+        let albums = parse_artist_albums(&v);
+        // every album under `getArtist` is by definition credited to
+        // the artist asked for, which `getArtist` does not repeat per
+        // album the way `getAlbumList2` does.
+        for album in &albums {
+            self.remember_album_artist(&album.id, artist_id);
+        }
+        Ok(albums)
     }
 
     /// Navidrome's own `getArtistInfo2` already proxies last.fm, no
@@ -466,9 +650,7 @@ impl Client {
     /// Playlists have no release year, so no metadata wrapper needed.
     pub fn get_playlist_songs(&self, playlist_id: &str) -> anyhow::Result<Vec<Song>> {
         let v = self.get_cached("getPlaylist", &[("id", playlist_id)])?;
-        Ok(parse_song_array(
-            v.get("playlist").and_then(|p| p.get("entry")),
-        ))
+        Ok(self.song_rows(v.get("playlist").and_then(|p| p.get("entry"))))
     }
 
     pub fn star(&self, id: &str) -> anyhow::Result<()> {
@@ -487,9 +669,7 @@ impl Client {
     /// listing, just sourced from here instead of one album).
     pub fn get_starred_songs(&self) -> anyhow::Result<Vec<Song>> {
         let v = self.get("getStarred2", &[])?;
-        Ok(parse_song_array(
-            v.get("starred2").and_then(|s| s.get("song")),
-        ))
+        Ok(self.song_rows(v.get("starred2").and_then(|s| s.get("song"))))
     }
 
     pub fn playlists(&self) -> anyhow::Result<Vec<Playlist>> {
@@ -590,7 +770,7 @@ impl Client {
                 ("offset", &offset.to_string()),
             ],
         )?;
-        Ok(parse_album_list2_page(&v))
+        Ok(self.album_rows(album_list2_albums(&v)))
     }
 
     /// Stream url for a song id. Asks for `format=raw` (the subsonic
@@ -646,6 +826,7 @@ impl Client {
                 ("songCount", "40"),
             ],
         )?;
+        self.learn(|ids| ids.learn_search3(&v));
         Ok(parse_search3_response(&v))
     }
 
@@ -811,9 +992,7 @@ impl Client {
             "getTopSongs",
             &[("artist", artist_name), ("count", &count.to_string())],
         )?;
-        Ok(parse_song_array(
-            v.get("topSongs").and_then(|t| t.get("song")),
-        ))
+        Ok(self.song_rows(v.get("topSongs").and_then(|t| t.get("song"))))
     }
 
     /// Chronological, not whatever order `getArtist` returned
@@ -1031,10 +1210,11 @@ fn parse_album_array(arr: Option<&serde_json::Value>) -> Vec<Album> {
         .unwrap_or_default()
 }
 
-/// Pure parsing for a single `getAlbumList2` page, pulled out of
-/// `all_albums()`'s pagination loop so it's testable in isolation.
-fn parse_album_list2_page(v: &serde_json::Value) -> Vec<Album> {
-    parse_album_array(v.get("albumList2").and_then(|a| a.get("album")))
+/// Where a `getAlbumList2` page keeps its album array, pulled out of
+/// `album_page` so a test can feed the same path a page fixture. The
+/// parse itself is `Client::album_rows`, which also records the ids.
+fn album_list2_albums(v: &serde_json::Value) -> Option<&serde_json::Value> {
+    v.get("albumList2").and_then(|a| a.get("album"))
 }
 
 /// Pure parsing for a flat array of ID3 artist objects (`id`/`name`),
@@ -1229,7 +1409,9 @@ mod tests {
             let size = query_param(request_line, "size").unwrap_or(ALBUM_PAGE_SIZE);
             let page: Vec<String> = (offset..total.min(offset + size))
                 .map(|i| {
-                    format!(r#"{{"id":"cat{rev}-{i}","name":"catalog {i}","artist":"artist"}}"#)
+                    format!(
+                        r#"{{"id":"cat{rev}-{i}","name":"catalog {i}","artist":"artist","artistId":"cat-ar"}}"#
+                    )
                 })
                 .collect();
             return format!(
@@ -1265,16 +1447,101 @@ mod tests {
             let song_json: Vec<String> = (0..songs_per_album)
                 .map(|i| {
                     format!(
-                        r#"{{"id":"{album}-s{i}","title":"track {i}","artist":"Bladee","album":"{album}","duration":100}}"#
+                        r#"{{"id":"{album}-s{i}","title":"track {i}","artist":"Bladee","artistId":"ar-1","album":"{album}","albumId":"{album}","duration":100}}"#
                     )
                 })
                 .collect();
             return format!(
-                r#"{{"subsonic-response":{{"status":"ok","album":{{"id":"{album}","name":"{album}","year":2024,"song":[{}]}}}}}}"#,
+                r#"{{"subsonic-response":{{"status":"ok","album":{{"id":"{album}","name":"{album}","artistId":"ar-1","year":2024,"song":[{}]}}}}}}"#,
                 song_json.join(",")
             );
         }
         r#"{"subsonic-response":{"status":"ok"}}"#.to_string()
+    }
+
+    /// The id index exists so album identity stops being a name join;
+    /// opening an album is the main thing that fills it, and it has to
+    /// learn all three links from the one response.
+    #[test]
+    fn opening_an_album_learns_its_songs_album_and_artist_ids() {
+        let server = MockServer::start(2, 3, Duration::ZERO);
+        let client = server.client();
+        assert_eq!(client.album_of_song("al-1-s0"), None, "nothing known yet");
+
+        client.get_album("al-1").unwrap();
+        assert_eq!(client.album_of_song("al-1-s0"), Some("al-1".to_string()));
+        assert_eq!(client.album_of_song("al-1-s2"), Some("al-1".to_string()));
+        assert_eq!(client.artist_of_song("al-1-s0"), Some("ar-1".to_string()));
+        assert_eq!(client.artist_of_album("al-1"), Some("ar-1".to_string()));
+    }
+
+    /// `getArtist` does not repeat the artist id per album the way
+    /// `getAlbumList2` does; every album it returns is credited to the
+    /// artist that was asked for, which is the same fact.
+    #[test]
+    fn an_artist_fetch_credits_every_album_it_returns() {
+        let server = MockServer::start(3, 1, Duration::ZERO);
+        let client = server.client();
+        client.get_artist("ar-7").unwrap();
+        assert_eq!(client.artist_of_album("al-0"), Some("ar-7".to_string()));
+        assert_eq!(client.artist_of_album("al-2"), Some("ar-7".to_string()));
+    }
+
+    /// The eager catalog fetch is the one pass over every album, so it
+    /// is where most album-to-artist links come from.
+    #[test]
+    fn the_catalog_fetch_learns_each_albums_artist_id() {
+        let server = MockServer::start(0, 0, Duration::ZERO).with_catalog_albums(2);
+        let client = server.client();
+        client.all_albums().unwrap();
+        assert_eq!(client.artist_of_album("cat0-0"), Some("cat-ar".to_string()));
+        assert_eq!(client.artist_of_album("cat0-1"), Some("cat-ar".to_string()));
+    }
+
+    /// A server that reports no ids must leave the index empty rather
+    /// than recording blanks, because `None` is what every caller
+    /// reads as "fall back to names".
+    #[test]
+    fn a_response_with_no_ids_teaches_nothing() {
+        let mut index = IdIndex::default();
+        let v: serde_json::Value = serde_json::from_str(
+            r#"[{"id":"s1","title":"t","artist":"a","album":"b"},
+                {"id":"s2","albumId":"","artistId":"-1"}]"#,
+        )
+        .unwrap();
+        index.learn_songs(Some(&v));
+        assert!(index.song_album.is_empty(), "{:?}", index.song_album);
+        assert!(index.song_artist.is_empty(), "{:?}", index.song_artist);
+    }
+
+    /// `"-1"` is subsonic's "no such id" (see `parse_artist_info`), so
+    /// it must not be stored as an id that will never match anything.
+    #[test]
+    fn id_field_rejects_the_absent_empty_and_minus_one_cases() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"a":"ok","b":"","c":"-1","d":7}"#).unwrap();
+        assert_eq!(id_field(&v, "a"), Some("ok"));
+        assert_eq!(id_field(&v, "b"), None);
+        assert_eq!(id_field(&v, "c"), None);
+        assert_eq!(id_field(&v, "d"), None);
+        assert_eq!(id_field(&v, "missing"), None);
+    }
+
+    /// Two `Client`s for one server share an index, the same way they
+    /// share a nav cache: the background sync builds a fresh client
+    /// per pass and is what learns most of these, while the clients
+    /// the corpus hands the ui live for the whole session.
+    #[test]
+    fn clients_for_one_server_share_what_either_learned() {
+        let server = MockServer::start(1, 2, Duration::ZERO);
+        let syncer = server.client();
+        let long_lived = server.client();
+        syncer.get_album("al-9").unwrap();
+        assert_eq!(
+            long_lived.album_of_song("al-9-s1"),
+            Some("al-9".to_string()),
+            "a client built later must see what an earlier one learned"
+        );
     }
 
     /// Without an explicit format a server-side player profile decides
@@ -1395,7 +1662,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let albums = parse_album_list2_page(&v);
+        let albums = parse_album_array(album_list2_albums(&v));
         assert_eq!(albums.len(), 2);
         assert_eq!(albums[0].name, "Cold Visions");
         assert_eq!(albums[0].artist, "Bladee");
@@ -1448,7 +1715,7 @@ mod tests {
     fn missing_fields_parse_to_empty_not_a_panic() {
         let v: serde_json::Value = serde_json::from_str(r#"{"status":"ok"}"#).unwrap();
         assert!(parse_artists_index(&v).is_empty());
-        assert!(parse_album_list2_page(&v).is_empty());
+        assert!(parse_album_array(album_list2_albums(&v)).is_empty());
         assert!(parse_song_array(None).is_empty());
         let info = parse_artist_info(&v);
         assert!(info.biography.is_none());

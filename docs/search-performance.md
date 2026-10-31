@@ -172,3 +172,32 @@ ranked index list and materializing a growing prefix on demand, with
 those call sites going through accessors; that is an api change across
 files search.rs does not own, so it is a maintainer decision rather
 than a search-local optimization.
+
+## the other whole-corpus walk
+
+`Corpus::remote_clients` answers "which servers are live" by walking
+every item and deduping by base url. it is called per keypress (the
+starred view, the profile manager, `load_queue`), never per frame, and
+it is left as a walk on purpose: it is a pure derivation of the
+corpus, so there is nothing to invalidate, while a memo would need a
+hook on every removal path (`reconcile_server`, `drop_local`) and a
+missed one would name a server with nothing indexed, which is the
+documented contract broken rather than a slow frame.
+
+the walk was never what it cost, though. deduping through a
+`HashSet<String>` allocated one `String` per *item*, while the dedup
+is over one or two servers; comparing `&str` against a `Vec` of the
+servers found so far allocates nothing. measured by
+`search::tests::bench_remote_clients`, release, on a loaded 8-core
+machine (so both columns are inflated):
+
+| items | `HashSet<String>` | `Vec` scan |
+| --- | --- | --- |
+| 40k | 4.9ms | 0.8-1.8ms |
+| 150k | 24.3ms | 3.9-4.9ms |
+
+4.9ms per keypress at 40k was not invisible, and 24ms at 150k would
+have been a stutter. `the_render_layer_never_asks_which_servers_are_live`
+is the guard that keeps the walk off the frame path: a source scan of
+`src/ui`, because what has to be prevented is a new call site, not a
+slow machine.
