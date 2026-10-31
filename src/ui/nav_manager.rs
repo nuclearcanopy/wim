@@ -5,6 +5,7 @@ use ratatui::widgets::Widget;
 use crate::config::NavidromeConfig;
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
+use crate::ui::results_list::scroll_cues;
 use crate::ui::textfit::truncate_with_ellipsis;
 
 /// The profile list; not shown when adding a new one (that reuses
@@ -42,46 +43,74 @@ impl Widget for NavManagerListView<'_> {
             y += 1;
         }
 
-        for (i, server) in self.servers.iter().enumerate() {
+        // the add row is the list's last entry, because that is what
+        // j/k treats it as; ✓/✗ are plain text-presentation symbols
+        // (not emoji variants), so they stay monochrome like
+        // everything else.
+        let mut entries: Vec<String> = self
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(i, server)| {
+                let status = match self.connection_status.get(i) {
+                    Some(Some(true)) => "✓ ",
+                    Some(Some(false)) => "✗ ",
+                    _ => "  ",
+                };
+                format!("{status}{} ({})", server.url, server.username)
+            })
+            .collect();
+        entries.push("[ add new profile ]".to_string());
+
+        // the message row claims its row before the list does, then
+        // the list scrolls inside what is left: it had no offset at
+        // all, so enter reconnected to a profile that was selectable
+        // and never drawn.
+        let footer = 2;
+        let list_top = y;
+        let room = (area.y + area.height).saturating_sub(list_top);
+        let rows = room.saturating_sub(footer).min(entries.len() as u16);
+        let offset = crate::ui::scroll::offset_for(self.selected, rows as usize);
+        // one column of gutter for the scroll cue, and only while
+        // there is one: a list that fits keeps its full width.
+        let scrolls = entries.len() > rows as usize;
+        let text_width = width.saturating_sub(usize::from(scrolls));
+        for (row, (i, entry)) in entries
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(rows as usize)
+            .enumerate()
+        {
             let active = i == self.selected;
             let marker = if active { "> " } else { "  " };
-            // ✓/✗ are plain text-presentation symbols (not emoji
-            // variants), so they stay monochrome like everything else.
-            let status = match self.connection_status.get(i) {
-                Some(Some(true)) => "✓ ",
-                Some(Some(false)) => "✗ ",
-                _ => "  ",
-            };
-            let line = format!("{marker}{status}{} ({})", server.url, server.username);
             draw_line(
                 buf,
-                area,
-                y,
-                &truncate_with_ellipsis(&line, width),
+                Rect {
+                    width: text_width as u16,
+                    ..area
+                },
+                list_top + row as u16,
+                &truncate_with_ellipsis(&format!("{marker}{entry}"), text_width),
                 if active {
                     shade(NEAR_WHITE)
                 } else {
                     shade(DIM)
                 },
             );
-            y += 1;
         }
-
-        let add_active = self.selected == self.servers.len();
-        let marker = if add_active { "> " } else { "  " };
-        draw_line(
+        scroll_cues(
             buf,
-            area,
-            y,
-            &format!("{marker}[ add new profile ]"),
-            if add_active {
-                shade(NEAR_WHITE)
-            } else {
-                shade(DIM)
+            Rect {
+                y: list_top,
+                height: rows,
+                ..area
             },
+            offset,
+            entries.len(),
         );
-        y += 2;
 
+        y = list_top + rows + 1;
         draw_line(
             buf,
             area,
@@ -229,6 +258,67 @@ mod tests {
         );
     }
 
+    fn many(n: usize) -> Vec<NavidromeConfig> {
+        (0..n)
+            .map(|i| server(&format!("https://{i}.example"), &format!("user{i}")))
+            .collect()
+    }
+
+    /// j/k walks every profile and the add row, so every one of them
+    /// has to be reachable: enter on a row nobody can see reconnects
+    /// to a profile the user never picked.
+    #[test]
+    fn the_selected_profile_is_on_screen_at_every_selection() {
+        let servers = many(12);
+        let status = vec![Some(true); servers.len()];
+        for selected in 0..=servers.len() {
+            let mut buf = buffer(54, 10);
+            render(
+                Rect::new(0, 0, 54, 10),
+                &mut buf,
+                &servers,
+                &status,
+                selected,
+            );
+            let g = grid(&buf);
+            let wanted = if selected == servers.len() {
+                "> [ add new profile ]".to_string()
+            } else {
+                format!(
+                    "> ✓ {} ({})",
+                    servers[selected].url, servers[selected].username
+                )
+            };
+            assert!(
+                g.contains(&wanted),
+                "selection {selected} is off screen, wanted {wanted:?}:\n{g}"
+            );
+        }
+    }
+
+    /// Same `▴`/`▾` gutter cue `lyrics_view` uses; the add row counts
+    /// as the list's last entry, since that is what j/k treats it as.
+    #[test]
+    fn a_scrolled_list_cues_what_is_off_each_edge() {
+        let servers = many(12);
+        let status = vec![None; servers.len()];
+        let cue = |selected: usize, h: u16| {
+            let mut buf = buffer(54, h);
+            render(
+                Rect::new(0, 0, 54, h),
+                &mut buf,
+                &servers,
+                &status,
+                selected,
+            );
+            let g = grid(&buf);
+            (g.contains('▴'), g.contains('▾'))
+        };
+        assert_eq!(cue(0, 10), (false, true), "more below only");
+        assert_eq!(cue(servers.len(), 10), (true, false), "above only");
+        assert_eq!(cue(0, 24), (false, false), "every profile fits");
+    }
+
     #[test]
     fn degenerate_sizes_do_not_panic() {
         let servers = [server("日本語", "日本"), server("b", "bob")];
@@ -240,6 +330,57 @@ mod tests {
                 &servers,
                 &[Some(true), None],
                 2,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod eyeball {
+    use super::*;
+    use crate::ui::testbuf::{buffer, grid};
+
+    fn server(url: &str, username: &str) -> NavidromeConfig {
+        NavidromeConfig {
+            url: url.to_string(),
+            username: username.to_string(),
+            password: None,
+            password_file: None,
+            max_bitrate_kbps: None,
+            transcode_format: None,
+        }
+    }
+
+    /// The list at the rows `main_content` actually gets (a 14-row
+    /// terminal with the default 4-row bottom bar leaves 10), with the
+    /// selection on the add row, which is where holding `j` parks it:
+    /// `cargo test --lib ui::nav_manager::eyeball -- --nocapture`.
+    /// Asserts the floor too, so it is a test and not just a printer.
+    #[test]
+    fn print_the_list_with_the_selection_at_the_end() {
+        let servers: Vec<NavidromeConfig> = (0..12)
+            .map(|i| server(&format!("https://{i}.example"), &format!("user{i}")))
+            .collect();
+        let status: Vec<Option<bool>> = (0..12).map(|i| Some(i % 2 == 0)).collect();
+        for (w, h, selected) in [
+            (54u16, 10u16, 12usize),
+            (54, 10, 0),
+            (54, 10, 6),
+            (54, 24, 12),
+        ] {
+            let mut buf = buffer(w, h);
+            NavManagerListView {
+                servers: &servers,
+                selected,
+                message: "connected",
+                connection_status: &status,
+            }
+            .render(Rect::new(0, 0, w, h), &mut buf);
+            let text = grid(&buf);
+            println!("--- {w}x{h} selected={selected}\n{text}");
+            assert!(
+                text.chars().any(|c| c != '.' && c != '\n'),
+                "{w}x{h} drew nothing at all"
             );
         }
     }

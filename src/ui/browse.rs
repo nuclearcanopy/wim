@@ -202,10 +202,17 @@ impl Widget for BrowseListView<'_> {
         // first one continues the sidebar's search-box top border
         // straight across (`ui::junctions` puts the ┬ there),
         // draw_header draws the second under the title itself.
-        for col in 0..area.width {
-            if let Some(cell) = buf.cell_mut((area.x + col, area.y + TOP_RULE_ROW)) {
-                cell.set_char('─');
-                cell.set_fg(shade(NEAR_BLACK));
+        // painted only where `rule_rows` says a rule goes, rather than
+        // repeating its bounds check: the reporting side already
+        // dropped rows past a short pane and this side did not, so a
+        // 0-row pane laid a full `─` across the bottom bar.
+        let rules = rule_rows(area, self.view, self.art_mode, self.cell_aspect);
+        if rules.contains(&(area.y + TOP_RULE_ROW)) {
+            for col in 0..area.width {
+                if let Some(cell) = buf.cell_mut((area.x + col, area.y + TOP_RULE_ROW)) {
+                    cell.set_char('─');
+                    cell.set_fg(shade(NEAR_BLACK));
+                }
             }
         }
         draw_header(
@@ -222,6 +229,11 @@ impl Widget for BrowseListView<'_> {
             &self.view.bio,
             crate::browse::bio_rect(area, self.view.bio.is_some()),
         ) {
+            // `bio_rect` is a fixed three rows four down, whatever the
+            // pane's height; clipped to what the pane owns, a short
+            // one drops bio rows instead of printing them over the
+            // bottom bar.
+            let rect = rect.intersection(area);
             for (i, line) in crate::browse::wrap_bio(bio, rect.width as usize, rect.height as usize)
                 .into_iter()
                 .enumerate()
@@ -884,5 +896,103 @@ mod tests {
         // column's, so it comes first in row order.
         assert_eq!(bg(cells[0]), shade(anim::selection_bg(at, true)));
         assert_eq!(bg(cells[1]), shade(anim::SELECTION_BG_UNFOCUSED));
+    }
+
+    /// The pane is `main_content`, which a short terminal or a grown
+    /// bottom bar can squeeze to a few rows; everything below it
+    /// belongs to the bottom bar, whose rule is drawn earlier and
+    /// never repainted.
+    #[test]
+    fn the_pane_stays_inside_its_rect_at_every_squeezed_height() {
+        for height in [0u16, 1, 2, 3, 4, 5, 6, 7] {
+            for bio in [false, true] {
+                let area = Rect::new(2, 1, 40, height);
+                let mut buf = crate::ui::testbuf::buffer(46, 12);
+                let mut v = test_view(test_songs(8));
+                v.is_artist = true;
+                v.albums = test_albums(8);
+                if bio {
+                    v.bio = Some(
+                        "a long enough last.fm bio that it wraps across every \
+                         row the pane reserved for it and then some"
+                            .to_string(),
+                    );
+                }
+                render(area, &v, &mut buf);
+                crate::ui::testbuf::assert_outside_untouched(&buf, area);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod eyeball {
+    use super::*;
+    use crate::browse::tests::{test_client, test_songs, test_view};
+    use crate::ui::testbuf::{buffer, grid};
+
+    fn artist(bio: bool) -> BrowseView {
+        let mut v = test_view(test_songs(6));
+        v.is_artist = true;
+        v.albums = (0..6)
+            .map(|i| SearchItem::Album {
+                id: format!("album-{i}"),
+                name: format!("album {i}"),
+                artist: "artist".to_string(),
+                client: test_client(),
+            })
+            .collect();
+        if bio {
+            v.bio = Some(
+                "swedish rapper and singer, one of the most influential \
+                 voices in the drain gang collective"
+                    .to_string(),
+            );
+        }
+        v
+    }
+
+    fn render_into(view: &BrowseView, area: Rect, buf: &mut Buffer) {
+        BrowseListView {
+            view,
+            favorites: &Favorites::default(),
+            remote_starred: &HashSet::new(),
+            art_mode: ArtMode::Off,
+            cell_aspect: 2.0,
+            cursor_visible: false,
+            focused: true,
+            elapsed: Duration::ZERO,
+        }
+        .render(area, buf);
+    }
+
+    fn print(label: &str, view: &BrowseView, w: u16, h: u16) {
+        // three rows taller than the rect: those rows are the bottom
+        // bar's, and this is where stray paint shows up.
+        let mut buf = buffer(w, h + 3);
+        render_into(view, Rect::new(0, 0, w, h), &mut buf);
+        println!(
+            "--- {label}: rect {w}x{h} in a {w}x{} buffer\n{}",
+            h + 3,
+            grid(&buf)
+        );
+    }
+
+    /// The heights the host actually hands this pane on a short
+    /// terminal (8 rows, default 4-row bottom bar) or a grown bottom
+    /// bar (10 rows on a 14-row terminal), both of which leave 4:
+    /// `cargo test --lib ui::browse::eyeball -- --nocapture`.
+    /// Asserts the floor too, so it is a test and not just a printer.
+    #[test]
+    fn print_the_pane_at_the_squeezed_heights() {
+        print("artist page", &artist(false), 40, 4);
+        print("artist page with a bio", &artist(true), 40, 6);
+        print("artist page with a bio", &artist(true), 40, 5);
+        print("album", &test_view(test_songs(3)), 40, 0);
+        print("album", &test_view(test_songs(3)), 40, 1);
+
+        let mut buf = buffer(40, 8);
+        render_into(&test_view(test_songs(3)), Rect::new(0, 0, 40, 6), &mut buf);
+        assert!(grid(&buf).contains("album"), "{}", grid(&buf));
     }
 }
