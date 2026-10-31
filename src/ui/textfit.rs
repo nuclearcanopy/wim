@@ -168,3 +168,152 @@ mod tests {
         }
     }
 }
+
+/// Cells between columns in a `columns` layout.
+const COLUMN_GUTTER: usize = 2;
+
+/// Narrowest a column may get before dropping to fewer of them. A
+/// 12-cell column shows almost no title, so more columns stop being
+/// worth the rows they save.
+const MIN_COLUMN: usize = 18;
+
+/// Packs `items` into up to `max_cols` columns of `width` cells, as
+/// the lines to print.
+///
+/// Column-major, like `ls`: reading *down* each column keeps a sorted
+/// or ranked list in order, where row-major would scatter it across
+/// the screen. Items wider than their column are ellipsised rather
+/// than wrapped, so every row is exactly one line and the grid cannot
+/// come apart.
+///
+/// The column count is the most that keeps each one at least
+/// `MIN_COLUMN` wide, so a narrow terminal quietly falls back to one
+/// column instead of shredding every title into nothing.
+pub fn columns(items: &[String], avail: usize, max_cols: usize) -> Vec<String> {
+    if items.is_empty() || avail == 0 {
+        return Vec::new();
+    }
+    let room = |cols: usize| {
+        avail
+            .saturating_sub(COLUMN_GUTTER * (cols - 1))
+            .checked_div(cols)
+            .unwrap_or(0)
+    };
+    let cols = (1..=max_cols.max(1))
+        .rev()
+        .find(|&c| c <= items.len() && room(c) >= MIN_COLUMN)
+        .unwrap_or(1);
+    let col_w = room(cols).max(1);
+    // ceil: the last column is the short one, so every item has a row.
+    let rows = items.len().div_ceil(cols);
+
+    (0..rows)
+        .map(|row| {
+            let mut line = String::new();
+            for col in 0..cols {
+                // column-major indexing is the whole point; row-major
+                // would read across and lose the ranking.
+                let Some(item) = items.get(col * rows + row) else {
+                    break;
+                };
+                let cell = truncate_with_ellipsis(item, col_w);
+                let last = col + 1 == cols || items.get((col + 1) * rows + row).is_none();
+                if last {
+                    line.push_str(&cell);
+                } else {
+                    // padded to the column, not to the item, so the
+                    // next column starts in the same place on every
+                    // row. measured in cells: a wide glyph costs two.
+                    let pad = col_w.saturating_sub(width(&cell)) + COLUMN_GUTTER;
+                    line.push_str(&cell);
+                    line.push_str(&" ".repeat(pad));
+                }
+            }
+            line
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+
+    fn items(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("item{i:02}")).collect()
+    }
+
+    #[test]
+    fn a_wide_terminal_uses_every_column_it_is_allowed() {
+        let lines = columns(&items(9), 80, 3);
+        assert_eq!(lines.len(), 3, "9 items over 3 columns is 3 rows");
+    }
+
+    #[test]
+    fn it_never_exceeds_the_column_cap() {
+        let lines = columns(&items(60), 400, 3);
+        assert_eq!(lines.len(), 20, "60 items, 3 columns, not more");
+    }
+
+    /// Reading down a column has to keep the order, or a ranked list
+    /// is scattered across the screen.
+    #[test]
+    fn columns_are_filled_downwards() {
+        let lines = columns(&items(6), 80, 3);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("item00"), "{:?}", lines[0]);
+        // 6 items, 3 columns, 2 rows: the second column starts at the
+        // third item, not the second.
+        assert!(lines[0].contains("item02"), "{:?}", lines[0]);
+        assert!(lines[0].contains("item04"), "{:?}", lines[0]);
+        assert!(lines[1].starts_with("item01"), "{:?}", lines[1]);
+    }
+
+    #[test]
+    fn a_narrow_terminal_falls_back_to_one_column() {
+        let lines = columns(&items(6), 24, 3);
+        assert_eq!(lines.len(), 6, "one per row rather than 8-cell columns");
+    }
+
+    #[test]
+    fn no_line_is_wider_than_the_terminal() {
+        let long: Vec<String> = (0..7).map(|i| format!("{i} {}", "x".repeat(90))).collect();
+        for w in [20usize, 40, 72, 100] {
+            for line in columns(&long, w, 3) {
+                assert!(width(&line) <= w, "{w}: {} cells in {line:?}", width(&line));
+            }
+        }
+    }
+
+    #[test]
+    fn columns_line_up_across_rows() {
+        let mut mixed = items(6);
+        mixed[0] = "short".into();
+        mixed[1] = "a much longer item here".into();
+        let lines = columns(&mixed, 80, 3);
+        // the second column begins at the same cell on both rows.
+        let at = |l: &str, needle: &str| {
+            let cells: Vec<char> = l.chars().collect();
+            let want: Vec<char> = needle.chars().collect();
+            cells
+                .windows(want.len())
+                .position(|w| w == want.as_slice())
+                .unwrap_or_else(|| panic!("{needle} missing from {l:?}"))
+        };
+        assert_eq!(at(&lines[0], "item02"), at(&lines[1], "item03"));
+    }
+
+    #[test]
+    fn nothing_in_nothing_out() {
+        assert!(columns(&[], 80, 3).is_empty());
+        assert!(columns(&items(3), 0, 3).is_empty());
+    }
+
+    /// One item cannot be laid out in three columns, and trying would
+    /// leave two empty ones padded out to nothing.
+    #[test]
+    fn fewer_items_than_columns_uses_fewer_columns() {
+        let lines = columns(&items(2), 80, 3);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].trim_end().matches("item").count(), 2);
+    }
+}

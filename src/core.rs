@@ -155,6 +155,33 @@ impl BetweenTracks {
     }
 }
 
+/// Most results `show_results` will print. Past this the list is the
+/// flood it was meant to avoid, and a narrower query is the answer.
+pub const MAX_ECHOED_RESULTS: usize = 30;
+
+/// Search results as lines to print, for a front-end with no pane to
+/// list them in.
+///
+/// Bare `primary_name`s, not the decorated `results_list::label`:
+/// three columns of a 72-cell terminal leave ~22 cells each, which
+/// truncates "title · artist (album)" to exactly the useless half, and
+/// a bare name is also what you would type back into `play(...)`.
+/// Deliberately unnumbered, since no `Target` is addressable by
+/// result index from the language and a numbered list would advertise
+/// a `play(2)` that does not exist.
+pub fn result_lines(results: &[SearchItem], avail: usize) -> Vec<String> {
+    let shown = results.len().min(MAX_ECHOED_RESULTS);
+    let names: Vec<String> = results[..shown]
+        .iter()
+        .map(|i| i.primary_name().to_string())
+        .collect();
+    let mut lines = crate::ui::textfit::columns(&names, avail, 3);
+    if results.len() > shown {
+        lines.push(format!("+{} more", results.len() - shown));
+    }
+    lines
+}
+
 /// How long what is playing actually is: the entry's own answer where
 /// it has one, mpv's reported `duration` otherwise.
 ///
@@ -2018,6 +2045,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             core.app.set_query(&query);
             let fired = notify_query_changed(core.app, core.remote_search_tx);
             core.settle.notified(fired, core.now);
+            surf.show_results();
             op_note(format!(
                 "search: {query} ({} results so far)",
                 core.app.results.len()
@@ -2828,6 +2856,16 @@ pub trait Surface {
         let _ = core;
         self.decline(&format!("page to open {} in", label(item)))
     }
+
+    /// `search()` ran and this front-end has nowhere to draw the
+    /// results. wim ignores it: its sidebar *is* the answer. shellswim
+    /// prints them once they settle, because a bare count was the
+    /// whole answer there and a count tells you nothing.
+    ///
+    /// Asked for here rather than inferred by the host, which cannot
+    /// tell `search(x)` from the query a searching `play(x)` sets on
+    /// its way to picking a match, and would echo a list after both.
+    fn show_results(&mut self) {}
 
     /// Which bottom-bar control `go()` would press. `None` means
     /// nothing on the bar is focusable here.
@@ -3830,5 +3868,79 @@ mod seam_tests {
         let (into, _, tracks) = r.poll().expect("a current batch lands");
         assert_eq!(into, Intent::Front, "it must queue where it was asked to");
         assert_eq!(tracks.unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod result_echo {
+    use super::*;
+    use crate::library::{LocalTrack, MediaKind};
+    use crate::search::Corpus;
+    use std::path::PathBuf;
+
+    fn corpus(titles: &[&str]) -> Corpus {
+        let mut c = Corpus::new();
+        c.add_local_tracks(titles.iter().map(|t| LocalTrack {
+            path: PathBuf::from(format!("/m/{t}.flac")),
+            title: (*t).into(),
+            artist: Some("Various".into()),
+            album: Some("Radio".into()),
+            duration_secs: None,
+            kind: MediaKind::Music,
+        }));
+        c
+    }
+
+    #[test]
+    fn print_the_echo() {
+        let c = corpus(&[
+            "Rosu si Negru",
+            "Sergiu si Andrei",
+            "Cine-s Sergiu si Andrei",
+            "Si Daca Tara",
+            "Noapte Buna",
+            "Vara Mea",
+            "Doar Pentru Tine",
+            "Cand Noaptea Vine",
+            "Inima Mea",
+            "Fara Tine",
+            "Zi de Zi",
+        ]);
+        let results = c.search("si");
+        for w in [72usize, 100, 40] {
+            let lines = result_lines(&results, w - 4);
+            println!("--- {w} cells, {} results", results.len());
+            for line in &lines {
+                println!("  [{line}]");
+            }
+            // a floor, so this is a test and not only a printer: a
+            // wide terminal must fold the list into fewer rows than
+            // there are results, and no row may overrun the width.
+            assert!(!lines.is_empty());
+            if w > 60 {
+                assert!(lines.len() < results.len(), "{w} did not use columns");
+            }
+            for line in &lines {
+                assert!(crate::ui::textfit::width(line) <= w - 4, "{line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_found_prints_nothing() {
+        assert!(result_lines(&[], 76).is_empty());
+    }
+
+    /// Past the cap the list is the flood it exists to avoid, so it
+    /// says how much it is not showing.
+    #[test]
+    fn a_huge_result_set_is_capped_and_says_so() {
+        let titles: Vec<String> = (0..80).map(|i| format!("song {i:02}")).collect();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let c = corpus(&refs);
+        let results = c.search("song");
+        assert!(results.len() > MAX_ECHOED_RESULTS);
+        let lines = result_lines(&results, 76);
+        assert!(lines.last().unwrap().starts_with('+'), "{:?}", lines.last());
     }
 }

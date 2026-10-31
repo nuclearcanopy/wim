@@ -17,6 +17,9 @@ use wim::ui::results_list::label;
 /// two front-ends' state.
 #[derive(Default)]
 pub struct SwimSurface {
+    /// `search()` asked for its results to be printed; the host does
+    /// it once they settle. See `Surface::show_results`.
+    pub echo_results: bool,
     /// Whether the last `view(now)` asked for the full readout, so a
     /// second one does not repeat itself. Purely cosmetic.
     pub verbose_now: bool,
@@ -35,6 +38,13 @@ pub struct Borrowed<'a> {
 }
 
 impl Surface for Borrowed<'_> {
+    fn show_results(&mut self) {
+        // only a flag: the results are not in yet, and printing the
+        // partial set would say "2 results" and then disagree with
+        // itself a frame later.
+        self.state.echo_results = true;
+    }
+
     fn front_end(&self) -> &'static str {
         "shellswim"
     }

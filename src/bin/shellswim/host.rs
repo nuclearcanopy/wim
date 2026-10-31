@@ -312,6 +312,26 @@ impl Host {
             }
         }
 
+        // a settled search prints what it found. shellswim has no
+        // sidebar, so `search(x)` used to answer with a count and
+        // nothing else, which is no answer at all.
+        if self.swim.echo_results && self.settle.settled(self.start.elapsed()) {
+            self.swim.echo_results = false;
+            // the terminal's width, asked for once per search rather
+            // than carried on the console: the console is handed a
+            // rect at draw time and the host never sees it.
+            let avail = crossterm::terminal::size()
+                .map(|(w, _)| usize::from(w).saturating_sub(4))
+                .unwrap_or(76);
+            let lines = core::result_lines(&self.app.results, avail);
+            if lines.is_empty() {
+                self.console.note("no matches".to_string());
+            }
+            for line in lines {
+                self.console.note(line);
+            }
+        }
+
         // the between-track gap, same mechanism as wim's loop: mpv
         // holds at each file's end under `keep-open` and pauses
         // itself, and this waits the gap out before advancing.
