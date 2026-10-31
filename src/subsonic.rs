@@ -28,8 +28,8 @@ const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 16;
 
 /// How many `getAlbum` requests an artist fetch runs at once. Subsonic
 /// has no single call for every song by an artist (see
-/// `artist_albums_with_tracks`), so it is one request per album; 8
-/// hides nearly all the latency without opening a socket per album.
+/// `stream_artist_tracks`), so it is one request per album; 8 hides
+/// nearly all the latency without opening a socket per album.
 const ALBUM_FETCH_CONCURRENCY: usize = 8;
 
 /// `getAlbumList2`'s per-page cap per the subsonic spec.
@@ -851,39 +851,6 @@ impl Client {
 /// artist view opens on (see `browse::Loader`), the rest is what it
 /// is built out of.
 impl Client {
-    /// Every song on every album credited to this artist, grouped by
-    /// album, chronological. Subsonic has no single call for this:
-    /// `getArtist` returns albums without songs, `getAlbumList2` can't
-    /// filter by artist, and `getTopSongs` is a last.fm-ranked subset,
-    /// so it stays one `getAlbum` per album; those are independent, so
-    /// they run `ALBUM_FETCH_CONCURRENCY` at a time rather than
-    /// serially. Callers wanting only the artist's own tracks filter on
-    /// each `Song::artist` (a compilation's other credits land here
-    /// too, same as before).
-    /// The serial reference the streaming path is checked against
-    /// (see this module's tests); nothing in the app calls it.
-    #[allow(dead_code)]
-    pub fn artist_albums_with_tracks(
-        &self,
-        artist_id: &str,
-    ) -> anyhow::Result<Vec<ArtistAlbumTracks>> {
-        let albums = self.artist_albums_chronological(artist_id)?;
-        let ids: Vec<&str> = albums.iter().map(|a| a.id.as_str()).collect();
-        Ok(self
-            .album_details(&ids)
-            .into_iter()
-            .zip(albums)
-            .enumerate()
-            .filter_map(|(index, (details, album))| {
-                Some(ArtistAlbumTracks {
-                    index,
-                    album,
-                    songs: details?.songs,
-                })
-            })
-            .collect())
-    }
-
     /// `getAlbum` for many album ids at once, answers in the same
     /// order as `album_ids` (`None` where that album's fetch failed;
     /// one unreadable album shouldn't take down a whole artist page).
@@ -930,9 +897,16 @@ impl Client {
         slots
     }
 
-    /// Non-blocking counterpart for the artist view: one `getArtist`
-    /// round trip, then the album list comes straight back so the page
-    /// can render immediately while everything else streams over `tx`.
+    /// What the artist view actually opens on (see `browse::Loader`):
+    /// one `getArtist` round trip, then the album list comes straight
+    /// back so the page can render immediately while everything else
+    /// streams over `tx`. Subsonic has no single call for every song by
+    /// an artist (`getArtist` returns albums without songs,
+    /// `getAlbumList2` can't filter by artist, `getTopSongs` is a
+    /// last.fm-ranked subset), so it is one `getAlbum` per album, run
+    /// `ALBUM_FETCH_CONCURRENCY` at a time over this client's pooled
+    /// agent. Callers wanting only the artist's own tracks filter on
+    /// each `Song::artist`; a compilation's other credits land here too.
     ///
     /// Drive it with `try_recv` from the event loop. Each
     /// `ArtistLoad::Album` carries one album's tracks and its `index`
@@ -948,24 +922,27 @@ impl Client {
     ) -> anyhow::Result<Vec<ArtistAlbum>> {
         let albums = self.artist_albums_chronological(artist_id)?;
         let workers = ALBUM_FETCH_CONCURRENCY.min(albums.len());
-        for worker in 0..workers {
+        // workers pull from one shared counter rather than each
+        // striping `skip(worker).step_by(workers)`, the same reason
+        // `album_details` does it that way: album sizes vary a lot, so
+        // a fixed stripe leaves whoever drew the short albums idle
+        // while one worker finishes the rest of the page alone.
+        let queue = Arc::new(albums.clone());
+        let next = Arc::new(AtomicUsize::new(0));
+        for _ in 0..workers {
             let client = self.clone();
             let tx = tx.clone();
-            let stripe: Vec<(usize, ArtistAlbum)> = albums
-                .iter()
-                .cloned()
-                .enumerate()
-                .skip(worker)
-                .step_by(workers)
-                .collect();
-            thread::spawn(move || {
-                for (index, album) in stripe {
-                    let Some(tracks) = client.album_tracks(index, &album) else {
-                        continue;
-                    };
-                    if tx.send(ArtistLoad::Album(tracks)).is_err() {
-                        return;
-                    }
+            let (queue, next) = (queue.clone(), next.clone());
+            thread::spawn(move || loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(album) = queue.get(index) else {
+                    return;
+                };
+                let Some(tracks) = client.album_tracks(index, album) else {
+                    continue;
+                };
+                if tx.send(ArtistLoad::Album(tracks)).is_err() {
+                    return;
                 }
             });
         }
@@ -1270,6 +1247,9 @@ mod tests {
         albums: usize,
         songs_per_album: usize,
         latency: Duration,
+        /// How much longer a box-set album takes than a single; see
+        /// `request_latency`. 0 or 1 means every album costs the same.
+        slow_albums: Arc<AtomicUsize>,
         requests: Arc<AtomicUsize>,
         catalog: Arc<MockCatalog>,
     }
@@ -1282,6 +1262,7 @@ mod tests {
         url: String,
         requests: Arc<AtomicUsize>,
         connections: Arc<AtomicUsize>,
+        slow_albums: Arc<AtomicUsize>,
         catalog: Arc<MockCatalog>,
     }
 
@@ -1291,6 +1272,7 @@ mod tests {
             let url = format!("http://{}", listener.local_addr().unwrap());
             let requests = Arc::new(AtomicUsize::new(0));
             let connections = Arc::new(AtomicUsize::new(0));
+            let slow_albums = Arc::new(AtomicUsize::new(0));
             let catalog = Arc::new(MockCatalog {
                 albums: AtomicUsize::new(0),
                 rev: AtomicUsize::new(0),
@@ -1299,6 +1281,7 @@ mod tests {
                 albums,
                 songs_per_album,
                 latency,
+                slow_albums: slow_albums.clone(),
                 requests: requests.clone(),
                 catalog: catalog.clone(),
             });
@@ -1317,6 +1300,7 @@ mod tests {
                 url,
                 requests,
                 connections,
+                slow_albums,
                 catalog,
             }
         }
@@ -1347,6 +1331,13 @@ mod tests {
             self
         }
 
+        /// Makes every tenth album cost `factor` times the base
+        /// latency; see `request_latency`.
+        fn with_slow_albums(self, factor: usize) -> MockServer {
+            self.slow_albums.store(factor, Ordering::Relaxed);
+            self
+        }
+
         /// Same album count, different ids: a catalog that changed
         /// under the client, which is what has to drop cached
         /// tracklists.
@@ -1374,7 +1365,7 @@ mod tests {
                 }
             }
             fixture.requests.fetch_add(1, Ordering::Relaxed);
-            thread::sleep(fixture.latency);
+            thread::sleep(request_latency(&request_line, fixture));
             let body = mock_body(&request_line, fixture);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -1396,6 +1387,30 @@ mod tests {
             .next()?
             .parse()
             .ok()
+    }
+
+    /// Album index out of a `getAlbum?id=al-N` request line.
+    fn requested_album(request_line: &str) -> Option<usize> {
+        request_line
+            .split("id=al-")
+            .nth(1)?
+            .split(['&', ' '])
+            .next()?
+            .parse()
+            .ok()
+    }
+
+    /// How long this one request takes. Uniform unless
+    /// `with_slow_albums` asked for a long tail, where every tenth
+    /// album is a box set and costs an order more server time; that
+    /// skew is the only thing that distinguishes a work-stealing
+    /// fan-out from a striped one, and a uniform mock cannot show it.
+    fn request_latency(request_line: &str, fixture: &MockFixture) -> Duration {
+        let factor = fixture.slow_albums.load(Ordering::Relaxed);
+        match requested_album(request_line) {
+            Some(index) if factor > 1 && index % 10 == 0 => fixture.latency * factor as u32,
+            _ => fixture.latency,
+        }
     }
 
     /// Years descend with album position, so the returned order is the
@@ -1842,10 +1857,38 @@ mod tests {
         assert!(result.songs.is_empty());
     }
 
+    /// Drives the live artist path to completion and returns what it
+    /// streamed, in album order. The artist page is a stream, so the
+    /// assertions about what one fetch costs need somewhere to wait
+    /// for it; this is the only reason the file still has a "collect
+    /// the whole artist" shape at all, and it lives in the tests
+    /// rather than in the client the way the old serial
+    /// `artist_albums_with_tracks` did.
+    fn collect_artist_tracks(
+        client: &Client,
+        artist_id: &str,
+    ) -> (Vec<ArtistAlbumTracks>, Option<String>) {
+        let (tx, rx) = mpsc::channel();
+        let albums = client.stream_artist_tracks(artist_id, tx).unwrap();
+        let mut slots: Vec<Option<ArtistAlbumTracks>> = (0..albums.len()).map(|_| None).collect();
+        let mut bio = None;
+        for event in rx {
+            match event {
+                ArtistLoad::Album(tracks) => {
+                    if let Some(slot) = slots.get_mut(tracks.index) {
+                        *slot = Some(tracks);
+                    }
+                }
+                ArtistLoad::Bio(b) => bio = b,
+            }
+        }
+        (slots.into_iter().flatten().collect(), bio)
+    }
+
     #[test]
     fn artist_fetch_returns_every_album_chronologically_with_its_tracks() {
         let server = MockServer::start(5, 4, Duration::ZERO);
-        let tracks = server.client().artist_albums_with_tracks("ar-1").unwrap();
+        let (tracks, bio) = collect_artist_tracks(&server.client(), "ar-1");
         assert_eq!(tracks.len(), 5);
         // mock years descend with album position, so chronological
         // order is the reverse of what getArtist returned
@@ -1858,20 +1901,36 @@ mod tests {
         assert_eq!(indexes, vec![0, 1, 2, 3, 4]);
         assert_eq!(tracks.iter().map(|t| t.songs.len()).sum::<usize>(), 20);
         assert_eq!(tracks[0].songs[0].album, "al-4");
-        assert_eq!(server.requests(), 6); // one getArtist + one getAlbum per album
+        assert_eq!(bio.as_deref(), Some("mock bio"));
+        // one getArtist + one getAlbum per album + getArtistInfo2
+        assert_eq!(server.requests(), 7);
     }
 
+    /// The metric this area regressed on once: handshakes per artist
+    /// fetch. ureq pools one idle connection per host by default, so a
+    /// fan-out of concurrent `getAlbum`s pays a fresh tcp+tls handshake
+    /// whenever more than one of them goes idle at the same moment;
+    /// `MAX_IDLE_CONNECTIONS_PER_HOST` is what keeps them warm. On the
+    /// live path, not on a reference implementation beside it.
+    ///
+    /// Sized deliberately: the fan-out has to actually overlap. At the
+    /// 15 albums and zero latency this used to run, the workers
+    /// stagger themselves, pooled and unpooled both answer in ~9
+    /// connections and the assertion holds either way. At 120 albums
+    /// and 10ms, pooled is a flat 9 however long the discography is
+    /// and unpooled measured 26-31.
     #[test]
     fn artist_fetch_reuses_connections_instead_of_one_per_album() {
-        let server = MockServer::start(15, 2, Duration::ZERO);
-        let tracks = server.client().artist_albums_with_tracks("ar-1").unwrap();
-        assert_eq!(tracks.len(), 15);
-        assert_eq!(server.requests(), 16);
-        // 16 requests over at most one connection per worker; with
-        // ureq's default idle-per-host of 1 this was ~16 handshakes.
+        let server = MockServer::start(120, 1, Duration::from_millis(10));
+        let (tracks, _) = collect_artist_tracks(&server.client(), "ar-1");
+        assert_eq!(tracks.len(), 120);
+        assert_eq!(server.requests(), 122);
+        // one connection per worker, plus the opening getArtist on the
+        // calling thread and the bio on its own; flat in the number of
+        // albums, which is the whole point.
         assert!(
-            server.connections() <= ALBUM_FETCH_CONCURRENCY + 1,
-            "opened {} connections for 16 requests",
+            server.connections() <= ALBUM_FETCH_CONCURRENCY + 2,
+            "opened {} connections for 122 requests",
             server.connections()
         );
     }
@@ -1879,12 +1938,11 @@ mod tests {
     #[test]
     fn artist_fetch_with_no_albums_is_empty_not_an_error() {
         let server = MockServer::start(0, 0, Duration::ZERO);
-        assert!(server
-            .client()
-            .artist_albums_with_tracks("ar-1")
-            .unwrap()
-            .is_empty());
-        assert_eq!(server.requests(), 1);
+        let (tracks, bio) = collect_artist_tracks(&server.client(), "ar-1");
+        assert!(tracks.is_empty());
+        assert_eq!(bio.as_deref(), Some("mock bio"));
+        // getArtist and the bio; no album worker is spawned at all
+        assert_eq!(server.requests(), 2);
     }
 
     #[test]
@@ -1930,11 +1988,16 @@ mod tests {
         drop(rx);
         thread::sleep(Duration::from_millis(600));
         // each worker notices on its first failed send, so a closed
-        // view costs at most one in-flight request per worker
+        // view costs at most one in-flight request per worker out of
+        // the 60 albums queued. The floor matters as much as the cap:
+        // a worker cannot discover the channel is closed until it has
+        // finished one `getAlbum`, so anything under getArtist plus
+        // one per worker means the fan-out never happened and the
+        // ceiling was passing on a function that does nothing.
+        let requests = server.requests();
         assert!(
-            server.requests() <= 2 + ALBUM_FETCH_CONCURRENCY * 2,
-            "kept fetching after the receiver was dropped: {} requests",
-            server.requests()
+            (1 + ALBUM_FETCH_CONCURRENCY..=2 + ALBUM_FETCH_CONCURRENCY * 2).contains(&requests),
+            "expected getArtist plus one in-flight getAlbum per worker, got {requests} of 61"
         );
     }
 
@@ -2024,13 +2087,14 @@ mod tests {
     fn an_artist_page_reopened_costs_nothing() {
         let server = MockServer::start(6, 4, Duration::ZERO);
         let client = server.client();
-        assert_eq!(client.artist_albums_with_tracks("ar-1").unwrap().len(), 6);
-        assert_eq!(server.requests(), 7); // getArtist + one per album
-        assert_eq!(client.artist_albums_with_tracks("ar-1").unwrap().len(), 6);
+        assert_eq!(collect_artist_tracks(&client, "ar-1").0.len(), 6);
+        // getArtist + one per album + getArtistInfo2
+        assert_eq!(server.requests(), 8);
+        assert_eq!(collect_artist_tracks(&client, "ar-1").0.len(), 6);
         client.get_album("al-3").unwrap();
         assert_eq!(
             server.requests(),
-            7,
+            8,
             "reopening an artist within the ttl must not re-ask for anything"
         );
     }
@@ -2126,9 +2190,8 @@ mod tests {
         let server = MockServer::start(15, 10, LATENCY);
         let client = server.client();
         let started = Instant::now();
-        let parallel: usize = client
-            .artist_albums_with_tracks("ar-1")
-            .unwrap()
+        let parallel: usize = collect_artist_tracks(&client, "ar-1")
+            .0
             .iter()
             .map(|t| t.songs.len())
             .sum();
@@ -2140,9 +2203,8 @@ mod tests {
         // a second open of the same artist, which is what going back
         // to the sidebar and in again costs.
         let started = Instant::now();
-        let reopened: usize = client
-            .artist_albums_with_tracks("ar-1")
-            .unwrap()
+        let reopened: usize = collect_artist_tracks(&client, "ar-1")
+            .0
             .iter()
             .map(|t| t.songs.len())
             .sum();
@@ -2161,6 +2223,51 @@ mod tests {
         assert_eq!(serial, reopened);
         assert!(parallel_elapsed * 2 < serial_elapsed);
         assert!(reopened_elapsed * 10 < parallel_elapsed);
+    }
+
+    /// What the artist page actually costs, on the path the app runs:
+    /// handshakes per fetch (the metric this area regressed on, see
+    /// `artist_fetch_reuses_connections_instead_of_one_per_album`),
+    /// time to the album list, time to the first album of tracks on
+    /// screen, and time to the whole page. Prints rather than asserts,
+    /// same convention as `search::bench_cpu_search`.
+    ///
+    /// The `slow 8x` rows are the same artist with a long tail of box
+    /// sets, which is what tells a work-stealing fan-out apart from a
+    /// striped one; everything else is uniform latency, where the two
+    /// are the same thing.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn bench_artist_page_fetch() {
+        const LATENCY: Duration = Duration::from_millis(20);
+        for (label, skew) in [("uniform", 0usize), ("slow 8x", 8)] {
+            for albums in [6usize, 15, 60] {
+                let server = MockServer::start(albums, 10, LATENCY).with_slow_albums(skew);
+                let client = server.client();
+                let started = Instant::now();
+                let (tx, rx) = mpsc::channel();
+                let listed = client.stream_artist_tracks("ar-1", tx).unwrap();
+                let list_elapsed = started.elapsed();
+                let mut first = None;
+                let mut songs = 0usize;
+                for event in rx {
+                    if let ArtistLoad::Album(tracks) = event {
+                        first.get_or_insert_with(|| started.elapsed());
+                        songs += tracks.songs.len();
+                    }
+                }
+                let all_elapsed = started.elapsed();
+                println!(
+                    "{label:<8} {albums:>3} albums @ {LATENCY:?}: {} listed, {songs:>4} songs, \
+                     {:>3} requests, {:>2} connections, list {list_elapsed:?}, \
+                     first album {:?}, whole page {all_elapsed:?}",
+                    listed.len(),
+                    server.requests(),
+                    server.connections(),
+                    first.unwrap_or_default(),
+                );
+            }
+        }
     }
 
     fn cfg(url: &str, user: &str) -> NavidromeConfig {
