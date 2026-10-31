@@ -46,12 +46,13 @@ pub enum Modal {
     BrowseFilter,
     SubtitleMenu,
     SettingsMenu,
+    UndoMenu,
     EqMenu,
     KeybindsMenu,
 }
 
 /// Same order, as data, so `front` cannot answer in a different one.
-pub const TIERS: [Modal; 10] = [
+pub const TIERS: [Modal; 11] = [
     Modal::Onboarding,
     Modal::NavManager,
     Modal::Help,
@@ -60,6 +61,7 @@ pub const TIERS: [Modal; 10] = [
     Modal::BrowseFilter,
     Modal::SubtitleMenu,
     Modal::SettingsMenu,
+    Modal::UndoMenu,
     Modal::EqMenu,
     Modal::KeybindsMenu,
 ];
@@ -81,8 +83,32 @@ impl Modal {
             | Modal::Console
             | Modal::SubtitleMenu
             | Modal::SettingsMenu
+            | Modal::UndoMenu
             | Modal::EqMenu
             | Modal::KeybindsMenu => true,
+        }
+    }
+
+    /// Whether this tier animates itself, i.e. has something on screen
+    /// that changes without input (a blinking caret).
+    ///
+    /// Separate from `covers_screen` because the two questions were
+    /// conflated into one `overlay` flag in main.rs, and it was wrong
+    /// for both: it fed `video::wanted` (where a tier painted over the
+    /// video must count, and the console and the subtitle menu were
+    /// missing) *and* the animation gate (where a tier with a caret
+    /// must not count, because it is the reason to keep animating).
+    pub fn animates(self) -> bool {
+        match self {
+            Modal::Console | Modal::EditingQuery | Modal::BrowseFilter => true,
+            Modal::Onboarding
+            | Modal::NavManager
+            | Modal::Help
+            | Modal::SubtitleMenu
+            | Modal::SettingsMenu
+            | Modal::UndoMenu
+            | Modal::EqMenu
+            | Modal::KeybindsMenu => false,
         }
     }
 }
@@ -100,11 +126,33 @@ pub struct Tiers {
     pub browse_filter: bool,
     pub subtitle_menu: bool,
     pub settings_menu: bool,
+    pub undo_menu: bool,
     pub eq_menu: bool,
     pub keybinds_menu: bool,
 }
 
 impl Tiers {
+    /// Whether anything is painted over the panes behind it.
+    ///
+    /// This is what mpv must be told, or it keeps drawing a video
+    /// straight over the modal; `video::wanted` takes it as `overlay`.
+    pub fn covers_screen(self) -> bool {
+        TIERS
+            .iter()
+            .any(|m| self.up(*m) && m.covers_screen())
+    }
+
+    /// Whether a tier that does *not* animate itself is covering the
+    /// screen, i.e. there is nothing left worth repainting at the
+    /// animation rate. The console is the case this exists for: it
+    /// covers the screen and is simultaneously a reason to keep
+    /// animating, so one flag cannot answer both questions.
+    pub fn static_modal(self) -> bool {
+        TIERS
+            .iter()
+            .any(|m| self.up(*m) && m.covers_screen() && !m.animates())
+    }
+
     fn up(self, modal: Modal) -> bool {
         match modal {
             Modal::Onboarding => self.onboarding,
@@ -115,6 +163,7 @@ impl Tiers {
             Modal::BrowseFilter => self.browse_filter,
             Modal::SubtitleMenu => self.subtitle_menu,
             Modal::SettingsMenu => self.settings_menu,
+            Modal::UndoMenu => self.undo_menu,
             Modal::EqMenu => self.eq_menu,
             Modal::KeybindsMenu => self.keybinds_menu,
         }
@@ -651,6 +700,7 @@ mod tests {
             browse_filter: true,
             subtitle_menu: true,
             settings_menu: true,
+            undo_menu: true,
             eq_menu: true,
             keybinds_menu: true,
         };
@@ -1064,5 +1114,109 @@ mod tests {
         );
         // one row off it is the workspace the player is drawn in.
         assert_eq!(act(&m, down(33, 10), None), Act::Focus(Focus::Workspace));
+    }
+}
+
+/// The two questions main.rs used to answer with one hand-maintained
+/// `overlay` flag, and the disagreements that caused.
+#[cfg(test)]
+mod tier_questions {
+    use super::*;
+
+    fn up(modal: Modal) -> Tiers {
+        let mut t = Tiers::default();
+        match modal {
+            Modal::Onboarding => t.onboarding = true,
+            Modal::NavManager => t.nav_manager = true,
+            Modal::Help => t.help = true,
+            Modal::Console => t.console = true,
+            Modal::EditingQuery => t.editing_query = true,
+            Modal::BrowseFilter => t.browse_filter = true,
+            Modal::SubtitleMenu => t.subtitle_menu = true,
+            Modal::SettingsMenu => t.settings_menu = true,
+            Modal::UndoMenu => t.undo_menu = true,
+            Modal::EqMenu => t.eq_menu = true,
+            Modal::KeybindsMenu => t.keybinds_menu = true,
+        }
+        t
+    }
+
+    /// Every tier is reachable through `Tiers`, which is the half the
+    /// old flag got wrong in one direction: the undo tree suppressed
+    /// video but had no `Tiers` entry, so a click or a wheel notch
+    /// over it resolved against the pane behind.
+    #[test]
+    fn every_modal_can_be_raised_and_is_found_at_the_front_alone() {
+        for modal in TIERS {
+            let t = up(modal);
+            assert!(t.up(modal), "{modal:?} is not reachable through Tiers");
+            assert_eq!(
+                front(t),
+                Some(modal),
+                "{modal:?} alone is not the frontmost tier"
+            );
+        }
+        assert_eq!(front(Tiers::default()), None, "nothing up, nothing in front");
+    }
+
+    /// The other direction: a tier painted over the panes must tell
+    /// mpv to stop drawing a video there. The console and the subtitle
+    /// menu were the two missing from the old flag, and the subtitle
+    /// menu is the one menu that exists *for* video, so it was
+    /// invisible while claiming every key.
+    #[test]
+    fn a_screen_covering_tier_takes_the_screen_back_from_mpv() {
+        for modal in TIERS {
+            assert_eq!(
+                up(modal).covers_screen(),
+                modal.covers_screen(),
+                "{modal:?} disagrees with its own covers_screen"
+            );
+        }
+        assert!(up(Modal::Console).covers_screen(), "the console was missing");
+        assert!(
+            up(Modal::SubtitleMenu).covers_screen(),
+            "the subtitle menu was missing, over video of all things"
+        );
+        assert!(up(Modal::UndoMenu).covers_screen());
+        assert!(!Tiers::default().covers_screen());
+    }
+
+    /// A text box drawn *inside* a visible pane is not an overlay: it
+    /// must not stop mpv drawing, and the old flag was right about
+    /// these two by omission.
+    #[test]
+    fn a_text_box_inside_a_pane_does_not_take_the_screen() {
+        assert!(!up(Modal::EditingQuery).covers_screen());
+        assert!(!up(Modal::BrowseFilter).covers_screen());
+    }
+
+    /// `static_modal` is the question the animation gate is actually
+    /// asking, and it is not `covers_screen`. The console is the case
+    /// that proves they differ: it covers the screen *and* is a reason
+    /// to keep animating, because its caret blinks. One flag answering
+    /// both made `animating` read `!overlay && (.. || console_open)`,
+    /// which is a contradiction waiting for the console to be added to
+    /// the overlay list.
+    #[test]
+    fn a_tier_with_a_caret_covers_the_screen_without_freezing_it() {
+        assert!(up(Modal::Console).covers_screen());
+        assert!(!up(Modal::Console).static_modal(), "the console animates");
+
+        assert!(up(Modal::SettingsMenu).static_modal(), "a menu does not");
+        assert!(up(Modal::UndoMenu).static_modal());
+        assert!(!Tiers::default().static_modal());
+
+        // and the two must agree about every tier that does not
+        // animate, or one of them is lying.
+        for modal in TIERS {
+            if !modal.animates() {
+                assert_eq!(
+                    up(modal).static_modal(),
+                    modal.covers_screen(),
+                    "{modal:?}"
+                );
+            }
+        }
     }
 }

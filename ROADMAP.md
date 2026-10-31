@@ -1673,16 +1673,39 @@ do the wrong thing quietly, which is worse to diagnose.
       auto-advance: the pane opens unprompted over the next track.
       the comment at `main.rs` ~2323 asserts the opposite of what the
       code does.
-- [ ] **`main.rs` ~1209: `overlay` is a second hand-maintained copy
-      of the modal list** that already exists once in `hit::Tiers`,
-      and they disagree in both directions. `console_open` and
-      `subtitle_menu_open` are in `Tiers` but not `overlay`: play a
-      local video, press `v`, press the subtitle-menu key, and
-      `draw_unless_video` skips the draw entirely, so the one menu
-      that exists purely for video is invisible while claiming every
-      key. `undo_menu_open` is in `overlay` but has no `Tiers` entry,
-      so with the undo tree drawn over the workspace a click or wheel
-      notch resolves against the pane behind it.
+- [x] **`overlay` was a second copy of the modal list, and it was
+      wrong in both directions *and* answering two different
+      questions.** `hit::Tiers` already held the list once.
+      direction one: `console` and `subtitle_menu` cover the screen and
+      were missing from `overlay`, which feeds `video::wanted`, so mpv
+      kept drawing a video over them. play a local video, press `v`,
+      press the subtitle-menu key: **the one menu that exists for video
+      was invisible while claiming every key.**
+      direction two: `undo_menu_open` was in `overlay` with no `Tiers`
+      entry, so with the undo tree drawn over the workspace a click or
+      a wheel notch resolved against the pane behind it.
+      **and the conflation, which is the part the audit did not see.**
+      `animating` read `!overlay && (.. || console_open || ..)`, so one
+      flag was answering "is something painted over the video" *and*
+      "is there nothing left worth repainting". those differ on exactly
+      the console: it covers the screen and is simultaneously the
+      reason to keep animating, because its caret blinks. adding the
+      console to `overlay` to fix direction one would have frozen its
+      own caret. so `Modal` gained `animates()` beside
+      `covers_screen()`, and `Tiers` answers both questions from one
+      literal built once per frame: `covers_screen()` for mpv,
+      `static_modal()` for the animation gate.
+      `Modal::UndoMenu` sits between `SettingsMenu` and `EqMenu`,
+      matching main.rs's key cascade, which is the order `TIERS`
+      exists to mirror.
+      four tests, each mutation-checked: every modal is reachable
+      through `Tiers` and is frontmost alone (direction two), a
+      screen-covering tier takes the screen back with the console and
+      subtitle menu named explicitly (direction one), a text box drawn
+      inside a visible pane does *not* (the two the old flag was right
+      about by omission), and a tier with a caret covers the screen
+      without freezing it (the conflation). making the console static
+      fails the last one; making it not cover the screen fails two.
 - [x] **a restore point taken mid fade-out muted the next track.**
       `identity_settings` stores what it is handed as the level to
       restore to when a binding stops applying, and `track_started`

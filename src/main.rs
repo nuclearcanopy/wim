@@ -1241,16 +1241,28 @@ fn main() -> anyhow::Result<()> {
         // read here rather than next to the poll timeout that also uses
         // it, because the fullscreen-video decision below needs it and
         // nothing between the two touches any of these flags.
-        let overlay = onboarding.is_some()
-            || nav_manager.is_some()
-            || help_open
-            || settings_menu_open
-            || keybinds_menu_open
-            || eq_menu.is_open()
-            // not only for the animation gate: `overlay` also feeds
-            // `video::wanted`, and without it mpv would keep drawing
-            // a video straight over this modal.
-            || undo_menu_open;
+        // one literal for every question about which tiers are up.
+        // this was a second hand-maintained copy of the modal list and
+        // it disagreed with `hit::Tiers` in both directions: the
+        // console and the subtitle menu cover the screen and were
+        // missing, so mpv kept drawing a video over the one menu that
+        // exists for video; and the undo tree was here with no `Tiers`
+        // entry, so a click or a wheel notch over it resolved against
+        // the pane behind.
+        let tiers = hit::Tiers {
+            onboarding: onboarding.is_some(),
+            nav_manager: nav_manager.is_some(),
+            help: help_open,
+            console: console_open,
+            editing_query: app.editing_query,
+            browse_filter: browse_view.as_ref().is_some_and(|bv| bv.filtering),
+            subtitle_menu: subtitle_menu_open,
+            settings_menu: settings_menu_open,
+            undo_menu: undo_menu_open,
+            eq_menu: eq_menu.is_open(),
+            keybinds_menu: keybinds_menu_open,
+        };
+        let overlay = tiers.covers_screen();
         // whether mpv should be drawing the video right now; the whole
         // decision is `video::wanted`, including the guard that keeps
         // music on `vo=null`.
@@ -1310,18 +1322,7 @@ fn main() -> anyhow::Result<()> {
         // order; these are the flags that cascade tests, read in one
         // place rather than re-tested per hit.
         hits = hit::HitMap {
-            modal: hit::front(hit::Tiers {
-                onboarding: onboarding.is_some(),
-                nav_manager: nav_manager.is_some(),
-                help: help_open,
-                console: console_open,
-                editing_query: app.editing_query,
-                browse_filter: browse_view.as_ref().is_some_and(|bv| bv.filtering),
-                subtitle_menu: subtitle_menu_open,
-                settings_menu: settings_menu_open,
-                eq_menu: eq_menu.is_open(),
-                keybinds_menu: keybinds_menu_open,
-            }),
+            modal: hit::front(tiers),
             ..Default::default()
         };
         // skipped outright while mpv owns the screen: a repaint from
@@ -2621,7 +2622,7 @@ fn main() -> anyhow::Result<()> {
             Focus::BottomBar => false,
         };
         let banner_showing = now_playing.is_none() && browse_view.is_none() && !lyrics.is_open();
-        let animating = !overlay
+        let animating = !tiers.static_modal()
             && (selection_pulsing
                 || banner_showing
                 || app.editing_query
