@@ -297,6 +297,21 @@ the one before it.
 | `_aa` | `kind=album` | songs, albums ("allow album") |
 | `_any` | `kind=any` | songs, albums, artists, playlists, local video |
 
+`kind=` has a short spelling, `k=`, and the rung values have short
+spellings too. all of these are the same call:
+
+```
+queue(crest, kind=album)
+queue(crest, k=album)
+queue(crest, k=a)
+queue_aa(crest)
+```
+
+`s` is `song` and `a` is `album`. `any` keeps its full spelling on
+purpose: the ladder's own argument for it is that "i really do mean
+anything" is worth typing out, and `a` was the more useful binding.
+the long name stays canonical, so `help()` and `dry()` print `kind=`.
+
 ```
 : dry(queue_aa([crest]))
 would run: queue(crest, kind=album)

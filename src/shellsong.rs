@@ -120,7 +120,25 @@ const KIND_LADDER: &[(&str, &[Kind])] = &[
 /// hatch). See docs/shellsong.md.
 const KIND_SUFFIXES: &[(&str, &str)] = &[("_aa", "album"), ("_any", "any")];
 
+/// Short spellings for the rung names, so `k=a` is `kind=album`.
+/// One letter each, which is unambiguous because the rungs are
+/// `song`/`album`/`any` and no two share a first letter... except
+/// `album` and `any`, so `a` is bound to the one anyone means. `any`
+/// keeps its full spelling, which the ladder doc already argues it
+/// should: "i really do mean anything" is worth typing out.
+const KIND_ALIASES: &[(&str, &str)] = &[("s", "song"), ("a", "album")];
+
+/// The rung a written value names, accepting the short spellings.
+fn ladder_key(value: &str) -> &str {
+    KIND_ALIASES
+        .iter()
+        .find(|(short, _)| *short == value)
+        .map(|(_, full)| *full)
+        .unwrap_or(value)
+}
+
 fn ladder(name: &str) -> Option<&'static [Kind]> {
+    let name = ladder_key(name);
     KIND_LADDER
         .iter()
         .find(|(n, _)| *n == name)
@@ -2758,7 +2776,10 @@ fn parse_call(input: &str, offset: usize, text: &str, world: &World) -> Result<C
     let mut positional: Vec<(usize, &str)> = Vec::new();
     for (off, piece) in raw {
         match kwarg(piece) {
-            Some(("kind", value)) => {
+            // `k=` is the same argument: the long name stays
+            // canonical for `help()` and `dry()`, the short one is
+            // what anyone actually types.
+            Some(("kind" | "k", value)) => {
                 if !widenable(command) {
                     let why = if command.prefs.is_empty() {
                         format!("{name} does not search, so kind= means nothing here")
@@ -2773,12 +2794,17 @@ fn parse_call(input: &str, offset: usize, text: &str, world: &World) -> Result<C
                         off,
                         value,
                         format!(
-                            "kind= expects {}",
+                            "kind= expects {} (or {})",
                             KIND_LADDER
                                 .iter()
                                 .map(|(n, _)| *n)
                                 .collect::<Vec<_>>()
-                                .join(" or ")
+                                .join(" or "),
+                            KIND_ALIASES
+                                .iter()
+                                .map(|(s, _)| *s)
+                                .collect::<Vec<_>>()
+                                .join("/")
                         ),
                     ));
                 };
@@ -2877,6 +2903,7 @@ fn missing(command: &Command, param: &Param) -> String {
 }
 
 fn ladder_name(value: &str) -> &'static str {
+    let value = ladder_key(value);
     KIND_LADDER
         .iter()
         .find(|(n, _)| *n == value)
@@ -5379,6 +5406,42 @@ mod tests {
             vec![queued(0)],
             "asking for albums must actually reach the album"
         );
+    }
+
+    /// Every spelling of "I mean the album" reaches the album, and
+    /// every spelling of "I mean the song" reaches the song. `k=` is
+    /// the short keyword, `a`/`s` the short values.
+    #[test]
+    fn the_short_kind_spellings_all_resolve() {
+        let both = vec![Kind::Album, Kind::Song];
+        for call in [
+            "queue(crest, kind=album)",
+            "queue(crest, k=album)",
+            "queue(crest, k=a)",
+            "queue_aa(crest)",
+        ] {
+            assert_eq!(
+                resolve_with(call, both.clone()),
+                vec![queued(0)],
+                "{call} did not reach the album"
+            );
+        }
+        for call in [
+            "queue(crest)",
+            "queue(crest, kind=song)",
+            "queue(crest, k=song)",
+            "queue(crest, k=s)",
+        ] {
+            assert_eq!(
+                resolve_with(call, both.clone()),
+                vec![queued(1)],
+                "{call} did not reach the song"
+            );
+        }
+        // and a bad value says what it will take, both spellings.
+        let e = error("queue(crest, k=zzz)");
+        assert!(e.message.contains("song or album"), "{}", e.message);
+        assert!(e.message.contains("s/a"), "{}", e.message);
     }
 
     /// And the fallback is intact: with no album in the results,
