@@ -525,6 +525,17 @@ fn rebuild_corpus(cfg: &config::Config) -> search::Corpus {
     corpus
 }
 
+/// The results list as the ranked order it is, for the three draw-path
+/// readers that need its geometry or the rows on screen. None of them
+/// ever gets the whole list: `App` holds corpus indices, and this
+/// resolves a screenful of them (see `App::ranking`).
+fn result_rows(app: &app::App) -> ui::results_list::Ranked<'_> {
+    ui::results_list::Ranked {
+        ranking: app.ranking(),
+        corpus: &app.corpus,
+    }
+}
+
 /// `KeyAction::DownloadSelected`, for both the browse view and the
 /// sidebar, so the two cannot drift.
 ///
@@ -591,7 +602,7 @@ fn main() -> anyhow::Result<()> {
     // scan thread signs off by dropping its sender, so a finished
     // channel can never be reused.
     let (scan_tx, mut scan_rx) = mpsc::channel::<library::ScanBatch>();
-    library::spawn_scan(cfg.library_paths.clone(), scan_tx);
+    let scan_report = library::spawn_scan(cfg.library_paths.clone(), scan_tx);
     // every configured server's catalog as of its last session, read
     // straight off the disk so the first frame has a full library
     // rather than "connecting to navidrome..."; started here so the
@@ -613,7 +624,7 @@ fn main() -> anyhow::Result<()> {
     // see keymap.rs for which keys deliberately aren't covered
     // (universal navigation primitives, applied the same way
     // everywhere rather than individually named commands).
-    let mut keymap = Keymap::from_overrides(&cfg.keybinds);
+    let (mut keymap, keybind_warnings) = Keymap::from_overrides_reporting(&cfg.keybinds);
     let mut app = app::App::new(warming_corpus.take());
     // so the first frame says "scanning" rather than "no local music
     // found"; cleared when the scan thread drops its sender. the
@@ -726,7 +737,7 @@ fn main() -> anyhow::Result<()> {
     let mut keybinds_menu_open = false;
     let mut keybinds_menu_selected: usize = 0;
     let mut capturing_key = false;
-    let mut keybind_conflict: Option<KeyAction> = None;
+    let mut keybind_refusal: Option<String> = None;
     // left/right cycles through ui::banner::LOGOS while the workspace
     // has focus and the banner is what's showing; '0' resets to the
     // default (index 0, ANSI Shadow). Restored from config by name,
@@ -736,7 +747,7 @@ fn main() -> anyhow::Result<()> {
     // ring (just truncate the front) rather than growing forever.
     let mut level_history: Vec<f32> = Vec::new();
     let mut notifications = Notifications::default();
-    for warning in config_warnings {
+    for warning in config_warnings.into_iter().chain(keybind_warnings) {
         notifications.push(Severity::Alert, warning);
     }
     // track play counts/last-played/on-disk cache state (cache.rs);
@@ -920,7 +931,11 @@ fn main() -> anyhow::Result<()> {
     // resuming across restarts is standard in any serious media player;
     // a missing/corrupt state file just means nothing to resume, not an
     // error; see persistence.rs.
-    if let Some(saved) = persistence::load() {
+    let (saved, resume_warning) = persistence::load_reporting();
+    if let Some(why) = resume_warning {
+        notifications.push(Severity::Alert, why);
+    }
+    if let Some(saved) = saved {
         if let Some(item) = saved
             .now_playing_path
             .as_deref()
@@ -1522,8 +1537,8 @@ fn main() -> anyhow::Result<()> {
             let junction_rows = ui::junctions::SidebarDivider {
                 search: search_rect,
                 results_header_rows: &ui::results_list::header_rows(
-                    app.results(),
-                    app.selected,
+                    &result_rows(&app),
+                    app.selected(),
                     results_rect,
                 ),
                 main_content_rule_rows: &main_content_rules,
@@ -1581,13 +1596,13 @@ fn main() -> anyhow::Result<()> {
             hits.lists.push(hit::List {
                 which: hit::Scrollable::SidebarResults,
                 rect: results_rect,
-                rows: ui::results_list::row_items(app.results(), app.selected, results_rect),
+                rows: ui::results_list::row_items(&result_rows(&app), app.selected(), results_rect),
                 len: app.result_count(),
             });
             f.render_widget(
                 ResultsList {
-                    items: app.results(),
-                    selected: app.selected,
+                    items: &result_rows(&app),
+                    selected: app.selected(),
                     empty_message: &empty_results_message(&app),
                     favorites: &favorites,
                     remote_starred: &remote_starred,
@@ -1801,6 +1816,7 @@ fn main() -> anyhow::Result<()> {
                         selected: queue_selected,
                         focused: focus == Focus::Workspace,
                         elapsed: frame_elapsed,
+                        keymap: &keymap,
                     },
                     main_content,
                 );
@@ -1902,7 +1918,7 @@ fn main() -> anyhow::Result<()> {
                         keys: &keys,
                         selected: keybinds_menu_selected,
                         capturing: capturing_key,
-                        conflict: keybind_conflict.map(|a| a.label()),
+                        refused: keybind_refusal.as_deref(),
                     },
                     top,
                 );
@@ -2262,6 +2278,13 @@ fn main() -> anyhow::Result<()> {
         if scanned_batches > 0 {
             app.resync_results();
         }
+        // the tag index the scan writes is what makes the *next* launch
+        // warm, so a failed write is worth one line rather than a
+        // silently cold start forever. `poll` takes it, so it says this
+        // once.
+        if let Some(why) = scan_report.poll() {
+            notifications.push(Severity::Alert, why);
+        }
 
         // drain whatever the background sync thread finished since the
         // last frame; only notify on an actual offline/online
@@ -2273,7 +2296,9 @@ fn main() -> anyhow::Result<()> {
             app.syncing_servers = false;
             match sr.result {
                 Ok((catalog, starred)) => {
-                    merge_catalog_into_app(&mut app, catalog);
+                    if let Some(why) = merge_catalog_into_app(&mut app, catalog) {
+                        notifications.push(Severity::Alert, why);
+                    }
                     remote_starred.extend(starred);
                     // a freshly indexed server brings artists and
                     // albums the last enrichment probe never saw.
@@ -2791,7 +2816,7 @@ fn main() -> anyhow::Result<()> {
                                 // through the one selection primitive
                                 // j/k and shellsong's up()/down() use,
                                 // rather than a second clamp here.
-                                app.move_selection(item as isize - app.selected as isize);
+                                app.move_selection(item as isize - app.selected() as isize);
                             }
                             hit::Scrollable::BrowseAlbums => {
                                 if let Some(bv) = &mut browse_view {
@@ -2883,8 +2908,8 @@ fn main() -> anyhow::Result<()> {
                             .map_or(0, |l| l.len);
                         match which {
                             hit::Scrollable::SidebarResults => {
-                                let to = hit::wheel_select(app.selected, len, down);
-                                app.move_selection(to as isize - app.selected as isize);
+                                let to = hit::wheel_select(app.selected(), len, down);
+                                app.move_selection(to as isize - app.selected() as isize);
                             }
                             hit::Scrollable::BrowseAlbums => {
                                 if let Some(bv) = &mut browse_view {
@@ -3007,7 +3032,7 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Enter | KeyCode::Esc => {
                                 cfg.library_paths = ob.library_paths.clone();
                                 config::save_or_warn(&cfg, &mut notifications);
-                                app.corpus = rebuild_corpus(&cfg);
+                                app.replace_corpus(rebuild_corpus(&cfg));
                                 ob.advance();
                             }
                             _ => {}
@@ -3609,12 +3634,16 @@ fn main() -> anyhow::Result<()> {
                         // the only way out of a capture gone wrong.
                         if key.code != KeyCode::Esc {
                             let action = keymap::ALL_ACTIONS[keybinds_menu_selected];
-                            keybind_conflict = keymap
-                                .action_bound_to(key.code)
-                                .filter(|owner| *owner != action);
-                            keymap.set(action, key.code);
-                            cfg.keybinds = keymap.overrides();
-                            config::save_or_warn(&cfg, &mut notifications);
+                            // refused rather than accepted and then
+                            // silently dropped at the next launch,
+                            // which is what reserved and unstorable
+                            // keys used to do.
+                            keybind_refusal = keymap.refusal(action, key.code);
+                            if keybind_refusal.is_none() {
+                                keymap.set(action, key.code);
+                                cfg.keybinds = keymap.overrides();
+                                config::save_or_warn(&cfg, &mut notifications);
+                            }
                         }
                         capturing_key = false;
                         continue;
@@ -3624,17 +3653,17 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Char('j') | KeyCode::Down => {
                             keybinds_menu_selected =
                                 (keybinds_menu_selected + 1) % keymap::ALL_ACTIONS.len();
-                            keybind_conflict = None;
+                            keybind_refusal = None;
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             keybinds_menu_selected =
                                 (keybinds_menu_selected + keymap::ALL_ACTIONS.len() - 1)
                                     % keymap::ALL_ACTIONS.len();
-                            keybind_conflict = None;
+                            keybind_refusal = None;
                         }
                         KeyCode::Char('r') => {
                             capturing_key = true;
-                            keybind_conflict = None;
+                            keybind_refusal = None;
                         }
                         KeyCode::Char('0') => {
                             keymap.reset(keymap::ALL_ACTIONS[keybinds_menu_selected]);
@@ -3650,7 +3679,13 @@ fn main() -> anyhow::Result<()> {
                     }
                     continue;
                 }
-                if key.code == KeyCode::Char('K') {
+                // not while the queue view owns the keyboard: `K`
+                // moves a track up there, and this unconditional check
+                // ran first, so the queue's own `Char('J') | Char('K')`
+                // arm was dead for `K` and only `J` ever worked.
+                if key.code == KeyCode::Char('K')
+                    && !(queue_view_open && focus == Focus::Workspace)
+                {
                     keybinds_menu_open = true;
                     keybinds_menu_selected = 0;
                     continue;
