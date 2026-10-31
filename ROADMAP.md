@@ -2032,6 +2032,22 @@ the order below is not a preference, it is a dependency.
       the decomposition started.** down to 4.9k over six slices.
       worth re-measuring rather than trusting, since every feature
       slice adds to it.
+      - [x] **the lyrics pane's four locals -> `LyricsPane`**
+        (`src/lyricspane.rs`). the first `struct Ui` slice, and done
+        as a **small cohesive group rather than one bag**: a single
+        struct holding all fifty-three loose locals relocates the
+        problem without naming anything, so the plan's "struct Ui" is
+        being read as "group what moves together".
+        these four do move together -- open the pane and all four are
+        set, close it and all four stop mattering -- so `is_open()` is
+        now a question about the group instead of a convention about
+        one field being `Some`, and `open()` resets the scroll rather
+        than every caller remembering to. four tests, one of which
+        pins exactly that reset: keeping the old offset lands you
+        mid-song in a different song.
+        **53 loose locals, not ~35** as the entry claimed. the natural
+        groups left: scrub (3, already has `TransportCtx`), eq menu
+        (3), art/picker (4), enrichment probe (4), playback timers (7).
       - [x] **the eq menu's keys and persistence ->
         `src/eq_menu_keys.rs`** (136 lines). `adjust_eq_band`,
         `eq_label`, `persist_eq`, `eq_saved_row_hint`,

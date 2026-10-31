@@ -24,6 +24,7 @@ pub mod layout;
 pub mod library;
 pub mod listenbrainz;
 pub mod lyrics;
+pub mod lyricspane;
 pub mod mpv;
 pub mod namehint;
 pub mod navmanager;
