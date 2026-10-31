@@ -2,6 +2,7 @@
 //! library; `shellswim` is the other. Everything not about panes,
 //! focus and menus lives in the library, not here.
 
+use wim::cli;
 use wim::{
     anim, app, browse, cache, config, coverart, eq, favorites, hit, keymap, library, listenbrainz,
     lyrics, mpv, persistence, queues, search, shellsong, shellsong_host, suggest, term, trace, ui,
@@ -580,17 +581,41 @@ fn download_selected(
 const BUILD: &str = env!("WIM_BUILD");
 
 fn main() -> anyhow::Result<()> {
-    // answered before anything else, so it works with no terminal, no
-    // config and no server: `--version` exists specifically to settle
-    // "am I running the build I think I am", which has cost more time
-    // than any bug it was mistaken for.
-    if std::env::args()
-        .skip(1)
-        .any(|a| a == "--version" || a == "-V")
-    {
-        println!("wim {} ({BUILD})", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
+    // answered before anything else, so these work with no terminal,
+    // no config and no server: `--version` exists specifically to
+    // settle "am I running the build I think I am", which has cost
+    // more time than any bug it was mistaken for. every *other*
+    // argument used to be ignored in silence, `--help` included, and
+    // a path was ignored too, so an "open with wim" association did
+    // nothing at all.
+    let run = match cli::parse_wim(std::env::args().skip(1)) {
+        Ok(run) => run,
+        Err(why) => {
+            eprintln!("wim: {why}\n{}", cli::WIM_USAGE);
+            std::process::exit(2);
+        }
+    };
+    let from_cli = match run {
+        cli::WimRun::Version => {
+            println!("wim {} ({BUILD})", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        cli::WimRun::Help => {
+            println!("{}", cli::wim_help());
+            return Ok(());
+        }
+        cli::WimRun::Panes => Vec::new(),
+        // refused by name rather than started empty, for the same
+        // reason an unknown option above is: being handed a path and
+        // then showing an empty library is the same silence.
+        cli::WimRun::Play(files) => match cli::resolve_files(&files) {
+            Ok(items) => items,
+            Err(why) => {
+                eprintln!("wim: {why}");
+                std::process::exit(2);
+            }
+        },
+    };
     trace::init();
     let is_first_run = !config::config_path()?.exists();
     // held until the notification area exists (the terminal is not up
@@ -943,12 +968,21 @@ fn main() -> anyhow::Result<()> {
     if let Some(why) = resume_warning {
         notifications.push(Severity::Alert, why);
     }
-    if let Some(saved) = saved {
-        if let Some(item) = saved
-            .now_playing_path
-            .as_deref()
-            .and_then(persistence::item_from_path)
-        {
+    // a file named on the command line replaces the resumed session,
+    // the saved queue with it: two things fighting over mpv's playlist
+    // gives you a queue built around a track you did not ask for,
+    // which is not a resume. the volume is a setting rather than a
+    // session, so it restores either way.
+    let saved_volume = saved.as_ref().and_then(|s| s.volume);
+    let resume = saved.filter(|_| from_cli.is_empty());
+    {
+        let first = from_cli.first().cloned().or_else(|| {
+            resume
+                .as_ref()
+                .and_then(|s| s.now_playing_path.as_deref())
+                .and_then(persistence::item_from_path)
+        });
+        if let Some(item) = first {
             let (_, played) = load_playlist(
                 &player,
                 &cache_index,
@@ -957,7 +991,7 @@ fn main() -> anyhow::Result<()> {
                 SessionStart::New,
             );
             if played {
-                if let Some(pos) = saved.position_secs {
+                if let Some(pos) = resume.as_ref().and_then(|s| s.position_secs) {
                     let _ = player.seek(pos, false);
                 }
                 fire_subtitle_fetch(&cfg, &subtitle_tx, &item);
@@ -971,12 +1005,17 @@ fn main() -> anyhow::Result<()> {
                 start_tracking_playback(&cfg, &item, &mut scrobble);
             }
         }
-        for queued_path in &saved.queue_paths {
-            if let Some(item) = persistence::item_from_path(queued_path) {
-                pending_enqueue.push(item);
+        // the rest of the files queue behind the first; `pending_enqueue`
+        // drains after the first frame, so extra paths cost no ipc here.
+        pending_enqueue.extend(from_cli.iter().skip(1).cloned());
+        if let Some(saved) = &resume {
+            for queued_path in &saved.queue_paths {
+                if let Some(item) = persistence::item_from_path(queued_path) {
+                    pending_enqueue.push(item);
+                }
             }
         }
-        if let Some(vol) = saved.volume {
+        if let Some(vol) = saved_volume {
             let _ = player.set_volume(vol);
         }
     }
