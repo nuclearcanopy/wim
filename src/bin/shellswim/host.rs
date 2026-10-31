@@ -41,7 +41,6 @@ macro_rules! core_ctx {
             crossfade_enabled: &mut $h.crossfade_enabled,
             overridden: &mut $h.overridden,
             undo: &mut $h.undo,
-            gap_secs: &mut $h.gap_secs,
             between_tracks: &mut $h.between_tracks,
             fade_in_started_at: &mut $h.fade_in_started_at,
             fade: &mut $h.fade,
@@ -58,8 +57,8 @@ macro_rules! core_ctx {
 }
 
 use wim::core::{
-    self, drive, BetweenTracks, CoreCtx, Drive, GapAction, Intent, RemoteSearchOutcome,
-    ScrobbleState, StarFailed, SubtitleReady, TrackResolver,
+    self, drive, BetweenTracks, CoreCtx, Drive, Intent, RemoteSearchOutcome, ScrobbleState,
+    StarFailed, SubtitleReady, TrackResolver,
 };
 use wim::download::DownloadEvent;
 use wim::notify::Notifications;
@@ -107,9 +106,6 @@ pub struct Host {
     pub star_rx: mpsc::Receiver<StarFailed>,
     pub base_volume: f64,
     pub crossfade_enabled: bool,
-    /// Live, from `config::gap_seconds`; `gap()` changes it for the
-    /// session.
-    pub gap_secs: f64,
     pub between_tracks: BetweenTracks,
     /// Per-identity settings the user has overridden by hand; see
     /// `core::track_started`. shellswim applied none of these before.
@@ -121,9 +117,6 @@ pub struct Host {
     /// repeating the list or saying nothing at all.
     echoed: Option<(String, HashSet<String>)>,
     pub undo: wim::undo::Recorder,
-    /// Last `keep-open` written, so evaluating it every pump costs no
-    /// ipc until the answer changes.
-    keep_open_held: Option<bool>,
     pub fade_in_started_at: Option<Instant>,
     pub fade: Option<Ramp>,
     pub sleep_due: Option<Duration>,
@@ -177,7 +170,7 @@ impl Host {
 
         let base_volume = core::current_volume(&player).unwrap_or(100.0);
         let crossfade_enabled = cfg.crossfade_enabled;
-        let gap_secs = cfg.gap_seconds.max(0.0);
+        let gap_at_start = cfg.gap_seconds;
         let (star_tx, star_rx) = mpsc::channel();
         Ok(Host {
             cfg,
@@ -205,13 +198,11 @@ impl Host {
             star_rx,
             base_volume,
             crossfade_enabled,
-            gap_secs,
-            between_tracks: BetweenTracks::new(),
+            between_tracks: BetweenTracks::new(gap_at_start),
             overridden: wim::shellsong_host::Overridden::default(),
             resume_due: None,
             echoed: None,
             undo: wim::undo::Recorder::default(),
-            keep_open_held: None,
             fade_in_started_at: None,
             fade: None,
             sleep_due: None,
@@ -412,23 +403,12 @@ impl Host {
         // the between-track gap, same mechanism as wim's loop: mpv
         // holds at each file's end under `keep-open` and pauses
         // itself, and this waits the gap out before advancing.
-        let gap = Duration::from_secs_f64(self.gap_secs.max(0.0));
-        let more_to_play = self.play_queue.upcoming_len() > 0;
-        let want_hold = !gap.is_zero() && more_to_play;
-        if self.keep_open_held != Some(want_hold) {
-            let _ = self.player.set_keep_open(want_hold);
-            self.keep_open_held = Some(want_hold);
-        }
-        if self
-            .between_tracks
-            .tick(self.playback.eof_reached, gap, more_to_play, Instant::now())
-            == Some(GapAction::Release)
-        {
-            let _ = self.player.playlist_next();
-            // mpv stays paused across `playlist-next` once it has
-            // held; see `mpv::PROP_EOF_REACHED`.
-            let _ = self.player.set_pause(false);
-        }
+        self.between_tracks.step(
+            &self.player,
+            self.playback.eof_reached,
+            self.play_queue.upcoming_len() > 0,
+            Instant::now(),
+        );
 
         let mut scanned = 0;
         loop {

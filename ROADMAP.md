@@ -2032,6 +2032,22 @@ the order below is not a preference, it is a dependency.
       the decomposition started.** down to 4.9k over six slices.
       worth re-measuring rather than trusting, since every feature
       slice adds to it.
+      - [x] **the gap mechanism's three locals folded into
+        `BetweenTracks`.** `gap_secs` and `keep_open_held` joined the
+        hold timer, and `BetweenTracks::step` replaced the per-frame
+        block.
+        **this one removed a real duplication rather than just
+        grouping**: the `keep-open` toggle was written out twice, once
+        in main.rs and once in shellswim's `pump`, because when the
+        gap shipped each front-end needed its own copy of the rule.
+        both call `step` now, and `CoreCtx` lost its `gap_secs` field
+        -- the live gap belongs to the thing that waits it out, so
+        `Op::SetGap` goes through `set_gap`, which also drops a hold
+        in progress, because "off" must mean off rather than "off
+        after this one". a test pins that.
+        two more tests: the length round-trips, and a negative gap
+        clamps to zero rather than meaning a reverse one.
+        main.rs 4836 -> 4820, shellswim's host smaller too.
       - [x] **the enrichment warm-up's four flags -> `enrich::Warmup`.**
         `enrich_probe`, `enrich_job_in_flight`, `suggestions_stale`,
         `suggestions_open_last_frame`.

@@ -87,6 +87,17 @@ pub enum GapAction {
 /// testable without mpv.
 #[derive(Debug, Default)]
 pub struct BetweenTracks {
+    /// Seconds between tracks, live. `config::gap_seconds` is only
+    /// the value this starts at; `gap()` changes it for the session.
+    ///
+    /// Held here rather than beside it as a loose `f64` because the
+    /// gap length, the hold timer and the `keep-open` toggle are one
+    /// mechanism: every one of them is meaningless without the other
+    /// two, and both front-ends had their own copy of the toggle.
+    gap: Duration,
+    /// Last `keep-open` written to mpv, so evaluating the toggle every
+    /// frame costs no ipc until the answer changes.
+    keep_open: Option<bool>,
     until: Option<Instant>,
     /// Whether an `eof` may still start a gap. Cleared when one
     /// starts and set again only once mpv reports it has left the end.
@@ -100,11 +111,59 @@ pub struct BetweenTracks {
 }
 
 impl BetweenTracks {
-    pub fn new() -> Self {
+    pub fn new(gap_secs: f64) -> Self {
         BetweenTracks {
+            gap: Duration::from_secs_f64(gap_secs.max(0.0)),
+            keep_open: None,
             until: None,
             rearmed: true,
         }
+    }
+
+    pub fn gap_secs(&self) -> f64 {
+        self.gap.as_secs_f64()
+    }
+
+    /// `gap(10s)` / `gap(off)`. Turning it off drops a hold being
+    /// waited out rather than letting it expire: "off" should mean
+    /// off, not "off after this one".
+    pub fn set_gap(&mut self, secs: f64) {
+        self.gap = Duration::from_secs_f64(secs.max(0.0));
+        if self.gap.is_zero() {
+            self.cancel();
+        }
+    }
+
+    /// The whole per-frame step, which both front-ends had their own
+    /// copy of: keep mpv's `keep-open` in step with whether a gap is
+    /// wanted, then advance the hold.
+    ///
+    /// `keep-open` is toggled rather than pinned on because holding
+    /// also stops mpv ever going idle, and `idle-active` going quiet
+    /// would take the end-of-playlist and loop-all handling with it.
+    /// So it is on only while a gap is wanted *and* something is
+    /// queued after this track.
+    pub fn step(
+        &mut self,
+        player: &mpv::Mpv,
+        eof: bool,
+        more_to_play: bool,
+        now: Instant,
+    ) -> Option<GapAction> {
+        let want_hold = !self.gap.is_zero() && more_to_play;
+        if self.keep_open != Some(want_hold) {
+            let _ = player.set_keep_open(want_hold);
+            self.keep_open = Some(want_hold);
+        }
+        let action = self.tick(eof, self.gap, more_to_play, now);
+        if action == Some(GapAction::Release) {
+            let _ = player.playlist_next();
+            // measured: mpv stays paused across `playlist-next` once
+            // it has held at an end, so this is not redundant. without
+            // it the first gap is also the last.
+            let _ = player.set_pause(false);
+        }
+        action
     }
 
     /// `eof` is mpv's `eof-reached`, `gap` the configured pause,
@@ -1641,10 +1700,6 @@ pub struct CoreCtx<'a> {
     /// The undo tree. Written in `apply_op` and read by `Op::Undo`;
     /// see `src/undo.rs`.
     pub undo: &'a mut undo::Recorder,
-    /// Seconds between tracks, live. `config::gap_seconds` is only the
-    /// value this starts at; `gap()` changes it for the session, the
-    /// same split `crossfade_enabled` already has.
-    pub gap_secs: &'a mut f64,
     /// The gap currently being waited out, so `gap(off)` can drop a
     /// hold instead of leaving it to expire, and play/pause can skip
     /// one.
@@ -2091,16 +2146,14 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             op_done()
         }
         Op::SetGap(secs) => {
-            *core.gap_secs = secs.unwrap_or(0.0).max(0.0);
-            if *core.gap_secs == 0.0 {
-                // a gap being waited out right now is dropped rather
-                // than left to expire: "off" should mean off, not
-                // "off after this one".
-                core.between_tracks.cancel();
+            core.between_tracks.set_gap(secs.unwrap_or(0.0));
+            if core.between_tracks.gap_secs() == 0.0 {
                 let _ = core.player.set_pause(false);
             }
             match secs {
-                Some(s) if *core.gap_secs > 0.0 => op_note(format!("{s}s between tracks")),
+                Some(s) if core.between_tracks.gap_secs() > 0.0 => {
+                    op_note(format!("{s}s between tracks"))
+                }
                 _ => op_note("no gap between tracks".to_string()),
             }
         }
@@ -3327,7 +3380,6 @@ mod seam_tests {
         crossfade_enabled: bool,
         overridden: shellsong_host::Overridden,
         undo: undo::Recorder,
-        gap_secs: f64,
         between_tracks: BetweenTracks,
         fade_in_started_at: Option<Instant>,
         fade: Option<Ramp>,
@@ -3376,8 +3428,7 @@ mod seam_tests {
                 crossfade_enabled: false,
                 overridden: shellsong_host::Overridden::default(),
                 undo: undo::Recorder::default(),
-                gap_secs: 0.0,
-                between_tracks: BetweenTracks::new(),
+                between_tracks: BetweenTracks::new(0.0),
                 fade_in_started_at: None,
                 fade: None,
                 sleep_due: None,
@@ -3419,7 +3470,6 @@ mod seam_tests {
                 crossfade_enabled: &mut self.crossfade_enabled,
                 overridden: &mut self.overridden,
                 undo: &mut self.undo,
-                gap_secs: &mut self.gap_secs,
                 between_tracks: &mut self.between_tracks,
                 fade_in_started_at: &mut self.fade_in_started_at,
                 fade: &mut self.fade,
@@ -3734,7 +3784,7 @@ mod seam_tests {
             let mut core = h.ctx(&player);
             apply_op(Op::SetGap(Some(10.0)), &mut core, &mut surf);
         }
-        assert_eq!(h.gap_secs, 10.0);
+        assert_eq!(h.between_tracks.gap_secs(), 10.0);
         // root (the state before) plus the one op.
         assert_eq!(h.undo.len(), 2, "one op, one node");
 
@@ -3742,14 +3792,18 @@ mod seam_tests {
             let mut core = h.ctx(&player);
             apply_op(Op::Undo, &mut core, &mut surf);
         }
-        assert_eq!(h.gap_secs, 0.0, "undo put the gap back");
+        assert_eq!(h.between_tracks.gap_secs(), 0.0, "undo put the gap back");
         assert_eq!(h.undo.len(), 2, "undo walks the tree, it does not grow it");
 
         {
             let mut core = h.ctx(&player);
             apply_op(Op::Redo, &mut core, &mut surf);
         }
-        assert_eq!(h.gap_secs, 10.0, "and redo walks back down");
+        assert_eq!(
+            h.between_tracks.gap_secs(),
+            10.0,
+            "and redo walks back down"
+        );
         assert_eq!(h.undo.len(), 2);
     }
 
@@ -4015,7 +4069,7 @@ mod seam_tests {
 
     #[test]
     fn a_gap_begins_at_the_held_end_and_releases_when_it_is_up() {
-        let mut g = BetweenTracks::new();
+        let mut g = BetweenTracks::new(0.0);
         let t0 = Instant::now();
         assert_eq!(g.tick(false, GAP, true, t0), None, "mid-track, nothing");
         assert_eq!(g.tick(true, GAP, true, t0), Some(GapAction::Begin));
@@ -4034,7 +4088,7 @@ mod seam_tests {
     /// gets two of them.
     #[test]
     fn a_stale_eof_after_release_does_not_start_a_second_gap() {
-        let mut g = BetweenTracks::new();
+        let mut g = BetweenTracks::new(0.0);
         let t0 = Instant::now();
         g.tick(true, GAP, true, t0);
         assert_eq!(
@@ -4055,20 +4109,47 @@ mod seam_tests {
     /// never run either.
     #[test]
     fn the_last_track_does_not_gap() {
-        let mut g = BetweenTracks::new();
+        let mut g = BetweenTracks::new(0.0);
         assert_eq!(g.tick(true, GAP, false, Instant::now()), None);
         assert!(!g.holding());
     }
 
+    /// `gap(off)` drops a hold being waited out rather than letting
+    /// it expire: "off" must mean off, not "off after this one".
+    #[test]
+    fn turning_the_gap_off_drops_a_hold_in_progress() {
+        let mut g = BetweenTracks::new(10.0);
+        let t0 = Instant::now();
+        assert_eq!(g.tick(true, GAP, true, t0), Some(GapAction::Begin));
+        assert!(g.holding());
+        g.set_gap(0.0);
+        assert!(!g.holding());
+        assert_eq!(g.gap_secs(), 0.0);
+    }
+
+    /// The gap length lives with the hold and the keep-open toggle
+    /// because they are one mechanism; both front-ends had their own
+    /// copy of the toggle before `step` existed.
+    #[test]
+    fn the_gap_length_round_trips() {
+        let mut g = BetweenTracks::new(10.0);
+        assert_eq!(g.gap_secs(), 10.0);
+        g.set_gap(90.0);
+        assert_eq!(g.gap_secs(), 90.0);
+        // negative is nonsense, not a reverse gap.
+        g.set_gap(-5.0);
+        assert_eq!(g.gap_secs(), 0.0);
+    }
+
     #[test]
     fn no_gap_configured_means_no_hold() {
-        let mut g = BetweenTracks::new();
+        let mut g = BetweenTracks::new(0.0);
         assert_eq!(g.tick(true, Duration::ZERO, true, Instant::now()), None);
     }
 
     #[test]
     fn the_countdown_counts_down_and_never_goes_negative() {
-        let mut g = BetweenTracks::new();
+        let mut g = BetweenTracks::new(0.0);
         let t0 = Instant::now();
         assert_eq!(g.remaining(t0), None, "no gap, nothing to count");
         g.tick(true, GAP, true, t0);
@@ -4085,7 +4166,7 @@ mod seam_tests {
     /// not let the same still-true `eof` immediately re-gap.
     #[test]
     fn cancelling_a_gap_does_not_immediately_re_gap() {
-        let mut g = BetweenTracks::new();
+        let mut g = BetweenTracks::new(0.0);
         let t0 = Instant::now();
         g.tick(true, GAP, true, t0);
         g.cancel();

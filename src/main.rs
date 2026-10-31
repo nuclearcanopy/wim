@@ -32,7 +32,7 @@ use wim::core::{
     playing_duration, print_listing, save_playback_state, set_vid_for_item, shellsong_focus,
     spawn_background_search, start_session, start_tracking_playback, suggestion_starred_keys,
     sweep_cache, toggle_star, track_started, BetweenTracks, CoreCtx, Dispatch, DownloadCtx,
-    Drained, Drive, GapAction, Intent, RemoteSearchOutcome, RemoteSearchQuery, Report, Resolution,
+    Drained, Drive, Intent, RemoteSearchOutcome, RemoteSearchQuery, Report, Resolution,
     ScrobbleState, SelectStep, SessionStart, StarFailed, SubtitleReady, Surface, TrackChangeCtx,
     TrackResolver,
 };
@@ -986,11 +986,9 @@ fn main() -> anyhow::Result<()> {
     // the between-track gap, and the last `keep-open` wim wrote. the
     // cache is what makes evaluating it every frame free: mpv only
     // hears about it when the answer actually changes.
-    let mut between_tracks = BetweenTracks::new();
+    let mut between_tracks = BetweenTracks::new(cfg.gap_seconds);
     let mut resume_due: Option<Duration> = None;
     let mut undo_tree = wim::undo::Recorder::default();
-    let mut gap_secs = cfg.gap_seconds.max(0.0);
-    let mut keep_open_held: Option<bool> = None;
     // shellsong's `fade(in|out)` ramp and `sleep(...)` deadline, both
     // off the same `start.elapsed()` clock `Env::now` carries so an op
     // and the tick that finishes it agree about the time. They reuse
@@ -1131,7 +1129,6 @@ fn main() -> anyhow::Result<()> {
                     crossfade_enabled: &mut crossfade_enabled,
                     overridden: &mut shellsong_overridden,
                     undo: &mut undo_tree,
-                    gap_secs: &mut gap_secs,
                     between_tracks: &mut between_tracks,
                     fade_in_started_at: &mut fade_in_started_at,
                     fade: &mut shellsong_fade,
@@ -2207,25 +2204,12 @@ fn main() -> anyhow::Result<()> {
         // quiet would take the end-of-playlist and loop-all handling
         // above with it. so it is only on while a gap is wanted *and*
         // something is queued after this track.
-        let gap = Duration::from_secs_f64(gap_secs.max(0.0));
-        let more_to_play = play_queue.upcoming_len() > 0;
-        let want_hold = !gap.is_zero() && more_to_play;
-        if keep_open_held != Some(want_hold) {
-            let _ = player.set_keep_open(want_hold);
-            keep_open_held = Some(want_hold);
-        }
-        match between_tracks.tick(playback.eof_reached, gap, more_to_play, Instant::now()) {
-            // mpv paused itself; nothing to send, the screen says it.
-            Some(GapAction::Begin) => {}
-            Some(GapAction::Release) => {
-                let _ = player.playlist_next();
-                // measured: mpv stays paused across `playlist-next`
-                // once it has held at an end, so this is not
-                // redundant. without it the first gap is also the last.
-                let _ = player.set_pause(false);
-            }
-            None => {}
-        }
+        between_tracks.step(
+            &player,
+            playback.eof_reached,
+            play_queue.upcoming_len() > 0,
+            Instant::now(),
+        );
 
         if crossfade_enabled && now_playing.is_some() {
             if let Some(started) = fade_in_started_at {
