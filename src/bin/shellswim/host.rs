@@ -10,7 +10,9 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use wim::core::{self, drive, CoreCtx, Drive, RemoteSearchOutcome, ScrobbleState, SubtitleReady};
+use wim::core::{
+    self, drive, CoreCtx, Drive, RemoteSearchOutcome, ScrobbleState, StarFailed, SubtitleReady,
+};
 use wim::download::DownloadEvent;
 use wim::notify::Notifications;
 use wim::playqueue::{PlayQueue, PosChange};
@@ -52,6 +54,8 @@ pub struct Host {
     pub remote_starred: HashSet<String>,
     pub lyrics_client: lyrics::Client,
     pub lyrics_loader: lyrics::Loader,
+    pub star_tx: mpsc::Sender<StarFailed>,
+    pub star_rx: mpsc::Receiver<StarFailed>,
     pub base_volume: f64,
     pub crossfade_enabled: bool,
     pub fade_in_started_at: Option<Instant>,
@@ -107,6 +111,7 @@ impl Host {
 
         let base_volume = core::current_volume(&player).unwrap_or(100.0);
         let crossfade_enabled = cfg.crossfade_enabled;
+        let (star_tx, star_rx) = mpsc::channel();
         Ok(Host {
             cfg,
             player,
@@ -128,6 +133,8 @@ impl Host {
             remote_starred: HashSet::new(),
             lyrics_client: lyrics::Client::new(),
             lyrics_loader: lyrics::Loader::new(),
+            star_tx,
+            star_rx,
             base_volume,
             crossfade_enabled,
             fade_in_started_at: None,
@@ -170,6 +177,18 @@ impl Host {
     /// Each one is a `try_recv`, so this is the whole reason nothing
     /// in shellswim blocks.
     pub fn pump(&mut self) {
+        // the server refused a star, so the optimistic flip goes back.
+        while let Ok(failed) = self.star_rx.try_recv() {
+            if failed.wanted {
+                self.remote_starred.remove(&failed.id);
+            } else {
+                self.remote_starred.insert(failed.id.clone());
+            }
+            let verb = if failed.wanted { "star" } else { "unstar" };
+            self.console
+                .note(format!("couldn't {verb}: {}", failed.error));
+        }
+
         // a lyrics fetch landed. the loader has already dropped any
         // reply for a track the user moved past, so whatever arrives
         // belongs to the request still standing.
@@ -289,6 +308,7 @@ impl Host {
             remote_starred: &mut self.remote_starred,
             lyrics_client: &self.lyrics_client,
             lyrics_loader: &mut self.lyrics_loader,
+            star_tx: &self.star_tx,
             base_volume: &mut self.base_volume,
             crossfade_enabled: &mut self.crossfade_enabled,
             fade_in_started_at: &mut self.fade_in_started_at,

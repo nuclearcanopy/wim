@@ -858,8 +858,26 @@ third.
       every configured server synchronously**, from shellsong (~1543)
       and the starred key (~6923). one round trip per server on a
       keypress, in series with nothing else to look at.
-- [ ] **`toggle_star` (main.rs ~244) is a server round trip on the
-      keypress** for a remote song (`star`/`unstar`), from the key
+- [x] **`toggle_star` is a server round trip on the keypress** -- fixed,
+      and **optimistically** rather than with a loader, which is the
+      right shape for this one: the local set flips and the next frame
+      shows it, while the server hears on a thread. a refusal comes
+      back on `star_tx` and the flip is taken back with one honest
+      line.
+      `StarFailed` carries **which way the flip went**, not just the
+      id, because the id alone cannot say how to undo it; a refused
+      star has to be removed and a refused *unstar* re-inserted, and
+      the two are opposite operations on the same id.
+      reverting rather than retrying, deliberately: the user saw it
+      take, and a retry loop against a server that is saying no is
+      worse than one line admitting it. local files stay synchronous,
+      since they are a file write and not a round trip, pinned by its
+      own test.
+      drained in both binaries (wim's loop beside the lyrics drain,
+      shellswim's `Host::pump`), so the two cannot diverge on what a
+      refusal does.
+- [x] ~~**`toggle_star` (main.rs ~244) is a server round trip on the
+      keypress**~~ for a remote song (`star`/`unstar`), from the key
       handlers (~6606, ~7039) and shellsong (~1944). the local-file
       branch is a file write and is fine.
       this one wants different treatment from the other two: starring

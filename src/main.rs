@@ -31,7 +31,7 @@ use wim::core::{
     spawn_background_search, start_session, start_tracking_playback, suggestion_starred_keys,
     sweep_cache, toggle_star, trigger_downloads, CoreCtx, Dispatch, DownloadCtx, Drive,
     RemoteSearchOutcome, RemoteSearchQuery, Report, ScrobbleState, SelectStep, SessionStart,
-    SubtitleReady, Surface, TrackChangeCtx,
+    StarFailed, SubtitleReady, Surface, TrackChangeCtx,
 };
 use wim::download::DownloadEvent;
 use wim::keymap::{KeyAction, Keymap};
@@ -1685,6 +1685,9 @@ fn main() -> anyhow::Result<()> {
     let lyrics_client = lyrics::Client::new();
     // the fetch runs off-thread; the key handler only asks.
     let mut lyrics_loader = lyrics::Loader::new();
+    // a refused star comes back here so the optimistic flip can be put
+    // back; see `toggle_star`.
+    let (star_tx, star_rx) = mpsc::channel::<StarFailed>();
     // the shellsong console: ':' opens it, and while it is open it
     // claims every key and every paste (see its input tier, which sits
     // at the same tier `editing_query` does and for the same reason).
@@ -3237,6 +3240,23 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        // the server refused a star, so the optimistic flip goes back.
+        // reverting rather than re-asking: the user saw it take, and a
+        // retry loop against a server saying no is worse than one
+        // honest line.
+        while let Ok(failed) = star_rx.try_recv() {
+            if failed.wanted {
+                remote_starred.remove(&failed.id);
+            } else {
+                remote_starred.insert(failed.id.clone());
+            }
+            let verb = if failed.wanted { "star" } else { "unstar" };
+            notifications.push(
+                Severity::Error,
+                format!("couldn't {verb}: {}", failed.error),
+            );
+        }
+
         // a lyrics fetch landed. the loader has already dropped any
         // reply for a track the user moved past, so whatever arrives
         // here belongs to the request still standing.
@@ -3446,6 +3466,7 @@ fn main() -> anyhow::Result<()> {
                     remote_starred: &mut remote_starred,
                     lyrics_client: &lyrics_client,
                     lyrics_loader: &mut lyrics_loader,
+                    star_tx: &star_tx,
                     base_volume: &mut base_volume,
                     crossfade_enabled: &mut crossfade_enabled,
                     fade_in_started_at: &mut fade_in_started_at,
@@ -4834,9 +4855,12 @@ fn main() -> anyhow::Result<()> {
                             if let Some(item) = bv.tracks.get(bv.selected).cloned() {
                                 // the row's own "*" marker is the
                                 // feedback; only a failure needs words.
-                                if let Err(msg) =
-                                    toggle_star(&item, &mut favorites, &mut remote_starred)
-                                {
+                                if let Err(msg) = toggle_star(
+                                    &item,
+                                    &mut favorites,
+                                    &mut remote_starred,
+                                    &star_tx,
+                                ) {
                                     notifications.push(Severity::Error, msg);
                                 }
                             }
@@ -5249,7 +5273,9 @@ fn main() -> anyhow::Result<()> {
                     // sidebar has focus, so it's always the sidebar's
                     // own selected search result here.
                     if let Some(item) = app.results.get(app.selected).cloned() {
-                        if let Err(msg) = toggle_star(&item, &mut favorites, &mut remote_starred) {
+                        if let Err(msg) =
+                            toggle_star(&item, &mut favorites, &mut remote_starred, &star_tx)
+                        {
                             notifications.push(Severity::Error, msg);
                         }
                     }
