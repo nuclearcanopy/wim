@@ -2032,6 +2032,26 @@ the order below is not a preference, it is a dependency.
       the decomposition started.** down to 4.9k over six slices.
       worth re-measuring rather than trusting, since every feature
       slice adds to it.
+      - [x] **the eq menu's three locals -> `ui::eq_menu::EqMenuPane`.**
+        `eq_menu_open`, `eq_menu_selected` and the `EqMenuState`
+        editor, behind `open`/`close`/`selected`/`state_mut`. named
+        `EqMenuPane` because `EqMenu` is already the widget.
+        **the rule it makes structural was broken once for real**:
+        opening must reset the editor *and* place the cursor on the
+        curve in use, and the two openers disagreed -- the eq-glyph
+        click reset `EqMenuState`, `view(eq)` did not, so a half-typed
+        name or an armed delete survived a close and reopen. that was
+        fixed by hand at the second site; `open` means a third opener
+        cannot get it wrong.
+        five tests, and the fresh-start one **opens over an
+        already-open menu with no close in between**: `close` resets
+        too, so a close-then-open sequence passes even with the reset
+        deleted from `open`. the first draft did exactly that and the
+        mutation walked through it. reopening while open is also a
+        real path, since `view(eq)` does not care what is on screen.
+        main.rs 4819 -> 4814. groups left: art/picker (4) and the
+        playback timers, which stay loose on purpose (four unrelated
+        features, one bag would name nothing).
       - [x] **both art-protocol caches -> `graphics::ProtocolCache`.**
         `player_art_protocol`, `real_art_protocol` and
         `browse_art_key` become two instances of one type.
