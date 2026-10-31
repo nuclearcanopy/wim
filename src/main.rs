@@ -171,7 +171,7 @@ impl Surface for WimSurface<'_> {
                 bv.tracks.get(bv.selected).cloned()
             };
         }
-        core.app.results.get(core.app.selected).cloned()
+        core.app.selected_result().cloned()
     }
 
     fn focus(&self) -> shellsong::Focus {
@@ -1530,7 +1530,7 @@ fn main() -> anyhow::Result<()> {
             let junction_rows = ui::junctions::SidebarDivider {
                 search: search_rect,
                 results_header_rows: &ui::results_list::header_rows(
-                    &app.results,
+                    app.results(),
                     app.selected,
                     results_rect,
                 ),
@@ -1589,12 +1589,12 @@ fn main() -> anyhow::Result<()> {
             hits.lists.push(hit::List {
                 which: hit::Scrollable::SidebarResults,
                 rect: results_rect,
-                rows: ui::results_list::row_items(&app.results, app.selected, results_rect),
-                len: app.results.len(),
+                rows: ui::results_list::row_items(app.results(), app.selected, results_rect),
+                len: app.result_count(),
             });
             f.render_widget(
                 ResultsList {
-                    items: &app.results,
+                    items: app.results(),
                     selected: app.selected,
                     empty_message: &empty_results_message(&app),
                     favorites: &favorites,
@@ -2617,7 +2617,7 @@ fn main() -> anyhow::Result<()> {
         // selection pulse, no blinking cursor, nothing playing) must
         // not redraw at 60fps just because the display could.
         let selection_pulsing = match focus {
-            Focus::Sidebar => !app.results.is_empty(),
+            Focus::Sidebar => app.has_results(),
             // every list the workspace can hold, not just the browse
             // view: the suggestions menu and the queue view both plate
             // a selected row, and leaving them out dropped their pulse
@@ -4415,7 +4415,7 @@ fn main() -> anyhow::Result<()> {
                     // nothing's being browsed, or something is but the
                     // sidebar has focus, so it's always the sidebar's
                     // own selected search result here.
-                    if let Some(item) = app.results.get(app.selected).cloned() {
+                    if let Some(item) = app.selected_result().cloned() {
                         if let Err(msg) =
                             toggle_star(&item, &mut favorites, &mut remote_starred, &star_tx)
                         {
@@ -4432,7 +4432,7 @@ fn main() -> anyhow::Result<()> {
                     // is but the sidebar has focus, so it's always
                     // the sidebar's own selected search result here
                     // (same split `ToggleStar` already uses).
-                    if let Some(item) = app.results.get(app.selected).cloned() {
+                    if let Some(item) = app.selected_result().cloned() {
                         let mut dctx = DownloadCtx {
                             cache: &cache_index,
                             download_tx: &download_tx,

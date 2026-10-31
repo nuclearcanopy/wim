@@ -1514,6 +1514,32 @@ debounced search thread, and the local-favorites path is a file write.
       accessors; that is the `main.rs` decomposition item's lane. no
       cap was added, deliberately, since any cap is visible at all five
       sites.
+      - [x] **the api change itself: `results` is private.** fourteen
+        external reads across main.rs, core.rs and both shellswim
+        files now go through `results()` / `result(i)` /
+        `result_count()` / `has_results()` / `selected_result()`, and
+        the four internal `self.results.get(self.selected)` sites
+        through the last one.
+        the split is the whole point rather than ceremony: `results()`
+        is the **only** accessor that hands out the list, so it is the
+        only one a lazy `results` has to build anything for; every
+        other reader asks for one row or a count, which a ranked index
+        list answers without constructing a `SearchItem`. the sites
+        that *looked* like they needed the slice -- the result counter,
+        `G`'s clamp, `Target::Index`, the sidebar's emptiness test --
+        all turned out to be those, leaving the drawing path as the
+        real consumer.
+        two tests. the count and the slice agree today, pinned now
+        **because the lazy version computes them from different
+        things** (the index list vs the prefix built), so the day they
+        can disagree this fails. and a selection past the end reads as
+        no row: `selected_result` is `Option` on purpose, since
+        clamping there plays whatever sits at the clamped index, a
+        wrong song rather than a missing one. mutation-checked by
+        making it clamp.
+        what is left for the item proper: `rank` returning indices and
+        `resync_results`' identity scan, which still touches every
+        row.
 - [x] **catalog parse beyond ~100k rows: measured, and deliberately
       not parallelised.** 34k, 100k and 300k rows timed. three measured
       reasons against the fan-out: its own overhead with no parallelism
