@@ -19,9 +19,15 @@ use ratatui::layout::Rect;
 use crate::ui::controlsbar::Field;
 use crate::Focus;
 
-/// Rows one wheel notch moves. Three, the usual terminal convention;
-/// `j` moves one, and a wheel that also moved one would take a dozen
-/// notches to cross a pane.
+/// Steps one wheel notch moves, in whatever unit `j`/`k` move on the
+/// surface it lands on: items where a selection moves, lines where
+/// content scrolls. Three, the usual terminal convention; `j` moves
+/// one, and a wheel that also moved one would take a dozen notches to
+/// cross a pane. Not screen rows, despite the name: an item painted on
+/// two rows travels twice as far per notch (the suggestions menu, six
+/// rows for three items), which is the rule in
+/// `docs/input-precedence.md` and is pinned by
+/// `a_notch_moves_items_not_screen_rows`.
 pub const WHEEL_ROWS: usize = 3;
 
 /// The surfaces that own the keyboard outright while they are up, in
@@ -801,6 +807,61 @@ mod tests {
         // and an empty list has nowhere to go.
         assert_eq!(wheel_select(0, 0, true), 0);
         assert_eq!(wheel_select(5, 0, false), 0);
+    }
+
+    /// What the constant's name used to claim and does not do: a notch
+    /// is `WHEEL_ROWS` *items*, so on the one surface that paints two
+    /// rows per item it covers twice as many screen rows. That follows
+    /// from "the wheel does what `j`/`k` do here" and is deliberate;
+    /// this pins it so nobody scales the notch by rows-per-item and
+    /// calls it a fix.
+    #[test]
+    fn a_notch_moves_items_not_screen_rows() {
+        use crate::suggest::{Reason, Section, Suggestions};
+        use crate::ui::suggestions::{count, row_items};
+
+        let s = Suggestions {
+            sections: vec![Section {
+                title: Reason::DailyRotation.title().to_string(),
+                reason: Reason::DailyRotation,
+                items: (0..30)
+                    .map(|i| crate::suggest::Suggestion {
+                        item: crate::search::SearchItem::LocalMusic {
+                            path: format!("/m/t{i}.flac").into(),
+                            title: format!("t{i}"),
+                            artist: None,
+                            album: None,
+                        },
+                        reason_text: format!("because {i}"),
+                        score: 0.5,
+                    })
+                    .collect(),
+            }],
+        };
+        // the clamp is against suggestions, not rows: thirty items on
+        // sixty drawn rows.
+        assert_eq!(count(&s), 30);
+
+        // tall enough that nothing scrolls, so a body row moving is the
+        // selection moving and not the window under it.
+        let area = Rect::new(0, 0, 60, 70);
+        let row_of = |selected: usize| {
+            row_items(&s, selected, area)
+                .iter()
+                .position(|r| *r == Some(selected))
+                .expect("the selected suggestion is on a row")
+        };
+
+        let from = 0;
+        let to = wheel_select(from, count(&s), true);
+        assert_eq!(to, WHEEL_ROWS, "a notch is WHEEL_ROWS items");
+        assert_eq!(
+            row_of(to) - row_of(from),
+            2 * WHEEL_ROWS,
+            "two rows per item means a notch covers twice the rows"
+        );
+        // and back up by the same, which is the same item count again.
+        assert_eq!(wheel_select(to, count(&s), false), from);
     }
 
     #[test]
