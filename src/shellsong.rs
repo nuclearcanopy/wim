@@ -3426,6 +3426,19 @@ pub struct Console {
     recall: Option<usize>,
     /// the fresh line, parked while recalling through history.
     draft: String,
+    /// Lines scrolled back from the live tail. `0` is the bottom,
+    /// which is where new output and every submitted line put it.
+    scroll: usize,
+    /// How many scrollback rows the view last drew.
+    ///
+    /// Written by the renderer because it is the only thing that knows:
+    /// the height left for scrollback is whatever the prompt and the
+    /// error/cycle/info rows above it did not claim, and that varies
+    /// per frame. A `Cell` rather than a `&mut` because the widget is
+    /// handed `&Console`, and clamping a scroll against a stale or
+    /// guessed height is how a scrollback ends up with dead keypresses
+    /// at the top.
+    viewport: std::cell::Cell<usize>,
 }
 
 impl Console {
@@ -3451,6 +3464,14 @@ impl Console {
     }
 
     pub fn push(&mut self, kind: LineKind, text: impl Into<String>) {
+        // arriving output must not yank someone who is reading back,
+        // so a scrolled-back console holds its *line* rather than its
+        // offset: one more line below means one more line of distance
+        // from the tail. at the tail there is nothing to hold and it
+        // simply follows.
+        if !self.following() {
+            self.scroll = self.scroll.saturating_add(1);
+        }
         self.lines.push(Line {
             kind,
             text: text.into(),
@@ -3458,6 +3479,9 @@ impl Console {
         if self.lines.len() > MAX_SCROLLBACK {
             let overflow = self.lines.len() - MAX_SCROLLBACK;
             self.lines.drain(..overflow);
+            // the lines it was parked on are gone; the offset would
+            // now point somewhere else entirely.
+            self.scroll = self.scroll.saturating_sub(overflow);
         }
     }
 
@@ -3465,8 +3489,48 @@ impl Console {
         self.push(LineKind::Note, text);
     }
 
+    /// The view reporting the height it just drew with; see
+    /// `Console::viewport`.
+    pub fn saw_viewport(&self, rows: usize) {
+        self.viewport.set(rows);
+    }
+
+    pub fn scroll(&self) -> usize {
+        self.scroll
+    }
+
+    /// How far back the scrollback can go: everything above the window
+    /// currently on screen.
+    fn scroll_max(&self) -> usize {
+        self.lines.len().saturating_sub(self.viewport.get().max(1))
+    }
+
+    /// Up is back through history, which is *away* from the live tail,
+    /// so `lines` is positive and clamped at the top.
+    pub fn scroll_lines(&mut self, lines: isize) {
+        let max = self.scroll_max();
+        self.scroll = self.scroll.saturating_add_signed(lines).min(max);
+    }
+
+    /// A page is the window itself, less one row of overlap so the
+    /// line you were reading stays on screen to orient by.
+    pub fn scroll_pages(&mut self, pages: isize) {
+        let page = self.viewport.get().saturating_sub(1).max(1) as isize;
+        self.scroll_lines(pages.saturating_mul(page));
+    }
+
+    pub fn scroll_to_tail(&mut self) {
+        self.scroll = 0;
+    }
+
     pub fn fail(&mut self, text: impl Into<String>) {
         self.push(LineKind::Error, text);
+    }
+
+    /// Whether the scrollback is at the live tail, and so should
+    /// follow new output rather than hold its place.
+    fn following(&self) -> bool {
+        self.scroll == 0
     }
 
     /// Recent commands, newest last; backs `show(history)`.
@@ -3476,6 +3540,29 @@ impl Console {
 
     pub fn handle_key(&mut self, key: KeyEvent, cand: &dyn Candidates) -> ConsoleAction {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // scrollback, handled before the editor sees the key.
+        // shift+up/down rather than plain: up/down are history recall
+        // and cannot be taken from it.
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::PageUp => {
+                self.scroll_pages(1);
+                return ConsoleAction::None;
+            }
+            KeyCode::PageDown => {
+                self.scroll_pages(-1);
+                return ConsoleAction::None;
+            }
+            KeyCode::Up if shift => {
+                self.scroll_lines(1);
+                return ConsoleAction::None;
+            }
+            KeyCode::Down if shift => {
+                self.scroll_lines(-1);
+                return ConsoleAction::None;
+            }
+            _ => {}
+        }
         match key.code {
             KeyCode::Esc => {
                 // an open cycle swallows the first esc: cancelling the
@@ -3571,6 +3658,8 @@ impl Console {
         if line.is_empty() {
             return ConsoleAction::Close;
         }
+        // you pressed enter, so you want to see what it did.
+        self.scroll_to_tail();
         self.push(LineKind::Command, format!(": {line}"));
         let read = |name: &str| cand.read_script(name);
         let world = World {
@@ -8067,5 +8156,135 @@ queue(morning)
             let per = start.elapsed() / (iters * keys);
             println!("{:<52} {per:>10.3?}/key  worst {worst:>10.3?}", line);
         }
+    }
+}
+
+#[cfg(test)]
+mod scrollback {
+    use super::*;
+
+    fn console(lines: usize, viewport: usize) -> Console {
+        let mut c = Console::default();
+        for i in 0..lines {
+            c.note(format!("line {i}"));
+        }
+        c.saw_viewport(viewport);
+        c
+    }
+
+    fn press(c: &mut Console, code: KeyCode, shift: bool) {
+        let mods = if shift {
+            KeyModifiers::SHIFT
+        } else {
+            KeyModifiers::NONE
+        };
+        c.handle_key(KeyEvent::new(code, mods), &NoCandidates);
+    }
+
+    #[test]
+    fn a_fresh_console_is_at_the_live_tail() {
+        assert_eq!(console(100, 10).scroll(), 0);
+    }
+
+    #[test]
+    fn shift_up_walks_back_a_line_at_a_time() {
+        let mut c = console(100, 10);
+        press(&mut c, KeyCode::Up, true);
+        assert_eq!(c.scroll(), 1);
+        press(&mut c, KeyCode::Up, true);
+        assert_eq!(c.scroll(), 2);
+        press(&mut c, KeyCode::Down, true);
+        assert_eq!(c.scroll(), 1);
+    }
+
+    /// Plain up/down stay history recall; taking them for scrolling
+    /// would break the one thing a prompt must do.
+    #[test]
+    fn plain_up_and_down_are_still_history() {
+        let mut c = console(100, 10);
+        press(&mut c, KeyCode::Up, false);
+        assert_eq!(c.scroll(), 0, "plain up must not scroll");
+    }
+
+    /// A page keeps one row of overlap, so the line being read stays
+    /// on screen to orient by.
+    #[test]
+    fn a_page_is_the_window_less_one_row() {
+        let mut c = console(100, 10);
+        press(&mut c, KeyCode::PageUp, false);
+        assert_eq!(c.scroll(), 9);
+        press(&mut c, KeyCode::PageDown, false);
+        assert_eq!(c.scroll(), 0);
+    }
+
+    /// There is nothing above the first line, and pressing into it
+    /// must not bank keypresses that then have to be undone.
+    #[test]
+    fn it_stops_at_the_oldest_line() {
+        let mut c = console(12, 10);
+        for _ in 0..50 {
+            press(&mut c, KeyCode::PageUp, false);
+        }
+        assert_eq!(c.scroll(), 2, "12 lines, a 10-row window");
+    }
+
+    #[test]
+    fn it_stops_at_the_tail_going_down() {
+        let mut c = console(100, 10);
+        press(&mut c, KeyCode::PageUp, false);
+        for _ in 0..50 {
+            press(&mut c, KeyCode::PageDown, false);
+        }
+        assert_eq!(c.scroll(), 0);
+    }
+
+    /// A console shorter than its window has nowhere to go.
+    #[test]
+    fn nothing_to_scroll_when_it_all_fits() {
+        let mut c = console(4, 10);
+        press(&mut c, KeyCode::PageUp, false);
+        assert_eq!(c.scroll(), 0);
+    }
+
+    /// The behaviour that makes scrollback usable while a program is
+    /// printing: arriving output must not yank you to the bottom.
+    #[test]
+    fn output_does_not_drag_a_scrolled_console_to_the_tail() {
+        let mut c = console(100, 10);
+        press(&mut c, KeyCode::PageUp, false);
+        let at = c.scroll();
+        c.note("something arrived");
+        assert_eq!(
+            c.scroll(),
+            at + 1,
+            "it holds the line it was on, not the offset"
+        );
+    }
+
+    #[test]
+    fn output_follows_the_tail_when_already_there() {
+        let mut c = console(100, 10);
+        c.note("something arrived");
+        assert_eq!(c.scroll(), 0);
+    }
+
+    /// Trimming the buffer moves every line, so an offset parked on
+    /// the dropped ones would point somewhere unrelated.
+    #[test]
+    fn trimming_the_buffer_keeps_the_offset_pointing_at_the_same_text() {
+        let mut c = Console::default();
+        for i in 0..MAX_SCROLLBACK {
+            c.note(format!("line {i}"));
+        }
+        c.saw_viewport(10);
+        press(&mut c, KeyCode::PageUp, false);
+        let before = c.scroll();
+        // one more line pushes the oldest out.
+        c.note("overflow");
+        assert_eq!(
+            c.scroll(),
+            before,
+            "+1 for the new line, -1 for the dropped one"
+        );
     }
 }

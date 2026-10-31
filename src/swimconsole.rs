@@ -17,6 +17,10 @@ use ratatui::widgets::Widget;
 use crate::shellsong::{Console, LineKind};
 use crate::theme::{lerp, shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE, WHITE};
 use crate::ui::controlsbar;
+/// Marks the scrolled-back notice. Ascii, like every other marker
+/// here: the alignment of this console depends on single cells.
+const SCROLL_MARK: char = '^';
+
 use crate::ui::progress;
 use crate::ui::textfit::{char_cells, truncate_to_width, truncate_with_ellipsis, width};
 
@@ -56,6 +60,23 @@ impl Widget for SwimConsole<'_> {
         if let Some(info) = self.info_line() {
             rows_from_bottom.push((format!("{INFO_MARK} {info}"), shade(DIM)));
         }
+        // a scrolled-back console that said nothing would read as a
+        // frozen one: output arrives, the screen does not move, and
+        // nothing explains why. this row is the explanation, and it is
+        // only there while it is true.
+        if self.console.scroll() > 0 {
+            rows_from_bottom.push((
+                // short on purpose: printed at 46 cells it was
+                // ellipsised mid-hint, which is worse than naming one
+                // key. pgdn is the one that moves a page.
+                format!(
+                    "{} {} back · pgdn to catch up",
+                    SCROLL_MARK,
+                    self.console.scroll()
+                ),
+                shade(MID),
+            ));
+        }
         if let Some(error) = &self.console.error {
             rows_from_bottom.push((error.clone(), shade(WHITE)));
         }
@@ -83,12 +104,19 @@ impl Widget for SwimConsole<'_> {
         if spare == 0 {
             return;
         }
-        let shown = self.console.lines.len().min(usize::from(spare));
+        // the view is the only thing that knows this height, and the
+        // scroll offset is clamped against it; see `Console::viewport`.
+        self.console.saw_viewport(usize::from(spare));
+
+        let total = self.console.lines.len();
+        let shown = total.min(usize::from(spare));
+        // `scroll` is lines back from the live tail, already clamped,
+        // but clamped against *last* frame's height: a terminal that
+        // just got taller would otherwise index past the start.
+        let back = self.console.scroll().min(total - shown);
+        let end = total - back;
         let top = area.y + (area.height - 1 - claimed) - u16::try_from(shown).unwrap_or(0);
-        for (i, line) in self.console.lines[self.console.lines.len() - shown..]
-            .iter()
-            .enumerate()
-        {
+        for (i, line) in self.console.lines[end - shown..end].iter().enumerate() {
             let level = match line.kind {
                 LineKind::Command => BRIGHT,
                 LineKind::Note => MID,
@@ -612,6 +640,31 @@ mod tests {
         // `.` is testbuf's untouched-cell fill, so this says the
         // widget declined rather than that it drew blanks.
         assert_eq!(row(&buf, 0), "....");
+    }
+
+    /// Prints the console at the tail and scrolled back, so the
+    /// window actually moves and the notice is readable in place:
+    /// `cargo test --lib print_the_scroll -- --nocapture`.
+    #[test]
+    fn print_the_scroll() {
+        let mut console = Console::default();
+        for i in 0..12 {
+            console.note(format!("output line {i}"));
+        }
+        console.saw_viewport(6);
+        for (label, back) in [("tail", 0usize), ("4 back", 4), ("6 back", 6)] {
+            for _ in 0..back {
+                console.scroll_lines(1);
+            }
+            let mut buf = buffer(46, 9);
+            SwimConsole {
+                console: &console,
+                cursor_visible: true,
+            }
+            .render(Rect::new(0, 0, 46, 9), &mut buf);
+            println!("--- {label}\n{}", grid(&buf));
+            console.scroll_to_tail();
+        }
     }
 
     #[test]
