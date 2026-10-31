@@ -1514,6 +1514,36 @@ debounced search thread, and the local-favorites path is a file write.
       accessors; that is the `main.rs` decomposition item's lane. no
       cap was added, deliberately, since any cap is visible at all five
       sites.
+      - [x] **the ranking is a list of corpus indices.**
+        `score_chunk` carries a per-chunk `base` and pushes
+        `(score, base + nth)` instead of `(score, &item)`;
+        `rank_borrowed` became `rank_order(items, scored) -> Vec<u32>`
+        and is reintroduced on top of it for `search_names`;
+        `Corpus::rank_indices` is the new entry and **`search` is now
+        exactly that plus the clone**, which is the only reason this
+        is safe to introduce (a caller switching between them cannot
+        see a different order; a test fingerprints both).
+        the clone itself is still there, because the holder is still
+        `App`; what is gone is the *need* for it. an index list can be
+        held across an event loop where `Vec<&SearchItem>` cannot, so
+        the next step (`App` holding the order) no longer needs a
+        self-referential borrow of `corpus`.
+        **`Corpus` grew a revision counter, and that is the load-
+        bearing part.** an order is indices into one revision: a later
+        `drop_local` shifts every index past the first removal, so a
+        held order stops being *stale* and starts being silently
+        **wrong rows**, which plays the wrong song rather than
+        failing. `rev` is bumped at all three `items` write sites and
+        a test pins that a removal bumps it too (the easy one to
+        forget; mutation-checked by deleting the bump in
+        `drop_local`).
+        two more tests. every ranked index resolves, because
+        `rank_order` indexes `items` directly and an out-of-range one
+        is a panic on a keystroke. and the threaded path reports the
+        same *indices* as the sequential one, not just the same rows:
+        zeroing the per-chunk base fails that and the older
+        item-fingerprint test both, but this one says "a chunk
+        reported the wrong base" instead of "the list changed".
       - [x] **the api change itself: `results` is private.** fourteen
         external reads across main.rs, core.rs and both shellswim
         files now go through `results()` / `result(i)` /

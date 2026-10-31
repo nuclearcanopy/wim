@@ -600,6 +600,16 @@ pub struct Corpus {
     /// `RefCell` instead of forcing `&mut` on every caller; `search`
     /// is not reentrant, so the borrow can't conflict.
     scratches: RefCell<Vec<Scratch>>,
+    /// Bumped by every change to `items`.
+    ///
+    /// A ranking is a list of indices into `items` (see
+    /// `rank_indices`), so it is only meaningful against the corpus it
+    /// was computed from: a later `drop_local` shifts every index past
+    /// the first removal, which turns a held ranking from stale into
+    /// silently *wrong* rows. Holders keep the revision alongside the
+    /// order and compare, rather than hoping every mutation site
+    /// remembered to re-rank.
+    rev: u64,
 }
 
 impl Corpus {
@@ -699,6 +709,7 @@ impl Corpus {
                 self.remote_keys[*kind as usize].remove(id);
             }
             self.items.retain(|e| !gone(&e.item));
+            self.rev += 1;
         }
         self.add_catalog(catalog, client);
     }
@@ -722,6 +733,7 @@ impl Corpus {
             self.remote_keys[kind as usize].insert(id.to_string());
         }
         self.items.push(Entry::new(item));
+        self.rev += 1;
     }
 
     pub fn add_local_tracks(&mut self, tracks: impl IntoIterator<Item = LocalTrack>) {
@@ -810,6 +822,7 @@ impl Corpus {
     /// catalog until the next 45s sync lands.
     pub fn drop_local(&mut self) {
         self.items.retain(|e| e.item.source().is_some());
+        self.rev += 1;
     }
 
     /// Every indexed item, in insertion order. Read-only whole-corpus
@@ -818,6 +831,22 @@ impl Corpus {
     /// `suggest::Catalog::ingest_corpus`).
     pub fn items(&self) -> impl Iterator<Item = &SearchItem> {
         self.items.iter().map(|e| &e.item)
+    }
+
+    /// The corpus's current revision; see the field's own note. Only
+    /// ever compared for equality, never for order.
+    pub fn revision(&self) -> u64 {
+        self.rev
+    }
+
+    /// One indexed item by its corpus index, as `rank_indices` hands
+    /// them out. `None` for an index from a different revision that no
+    /// longer exists, which is the honest answer; a stale index that
+    /// still happens to be in range reads as whatever moved into that
+    /// slot, which is why holders check the revision instead of
+    /// relying on this.
+    pub fn item_at(&self, at: u32) -> Option<&SearchItem> {
+        self.items.get(at as usize).map(|e| &e.item)
     }
 
     /// Every distinct navidrome server already represented in the
@@ -881,8 +910,23 @@ impl Corpus {
     /// order so nucleo alone would miss it). An item counts as a match if
     /// *either* signal fires, so a typo never silently returns nothing.
     pub fn search(&self, query: &str) -> Vec<SearchItem> {
-        let scored = self.score_all(query);
-        rank(scored)
+        self.rank_indices(query)
+            .into_iter()
+            .filter_map(|at| self.item_at(at))
+            .cloned()
+            .collect()
+    }
+
+    /// `search`'s exact order, as indices into the corpus, paired with
+    /// the revision they are indices *for*.
+    ///
+    /// This is the whole point of the index list: `search` clones a
+    /// `SearchItem` per match, which at 40k items and a broad query
+    /// was 3-5ms of a ~7ms search, and a caller that only draws a
+    /// screenful needs none of those clones. `search` is now this plus
+    /// the clone, so the two cannot order differently.
+    pub fn rank_indices(&self, query: &str) -> Vec<u32> {
+        rank_order(&self.items, self.score_all(query))
     }
 
     /// The primary names of the best matches, deduped and capped at
@@ -893,7 +937,7 @@ impl Corpus {
     pub fn search_names(&self, query: &str, cap: usize) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
-        for item in rank_borrowed(self.score_all(query)) {
+        for item in rank_borrowed(&self.items, self.score_all(query)) {
             let name = item.primary_name();
             if name.is_empty() || !seen.insert(name) {
                 continue;
@@ -909,14 +953,14 @@ impl Corpus {
     /// Phase one of `search`: every item that either signal fired on,
     /// with its score, in corpus order. Split out from the ranking so
     /// the two can be benchmarked separately.
-    fn score_all(&self, query: &str) -> Vec<(u32, &SearchItem)> {
+    fn score_all(&self, query: &str) -> Vec<(u32, u32)> {
         self.score_all_maybe_parallel(query, self.items.len() >= PARALLEL_SCORING_FLOOR)
     }
 
     /// `score_all` with the fan-out decision forced, so a benchmark can
     /// measure the per-item cost single-threaded (immune to whatever
     /// else is loading the machine) as well as end to end.
-    fn score_all_maybe_parallel(&self, query: &str, parallel: bool) -> Vec<(u32, &SearchItem)> {
+    fn score_all_maybe_parallel(&self, query: &str, parallel: bool) -> Vec<(u32, u32)> {
         if query.trim().is_empty() {
             return Vec::new();
         }
@@ -937,11 +981,19 @@ impl Corpus {
             // single-threaded; each thread takes one of the corpus's
             // own scratches rather than building its own.
             let chunk = self.items.len().div_ceil(scratches.len());
-            let parts: Vec<Vec<(u32, &SearchItem)>> = thread::scope(|scope| {
+            let parts: Vec<Vec<(u32, u32)>> = thread::scope(|scope| {
                 self.items
                     .chunks(chunk)
                     .zip(scratches.iter_mut())
-                    .map(|(part, scratch)| scope.spawn(|| score_chunk(part, &needle, scratch)))
+                    .enumerate()
+                    .map(|(nth, (part, scratch))| {
+                        // each chunk scores its own slice but reports
+                        // corpus indices, so the concat below is in
+                        // corpus order with no fixup pass.
+                        let base = (nth * chunk) as u32;
+                        let needle = &needle;
+                        scope.spawn(move || score_chunk(part, base, needle, scratch))
+                    })
                     .collect::<Vec<_>>()
                     .into_iter()
                     .map(|handle| handle.join().unwrap_or_default())
@@ -949,7 +1001,7 @@ impl Corpus {
             });
             parts.concat()
         } else {
-            score_chunk(&self.items, &needle, &mut scratches[0])
+            score_chunk(&self.items, 0, &needle, &mut scratches[0])
         }
     }
 }
@@ -966,10 +1018,10 @@ fn thread_count() -> usize {
 /// Phase two of `search`: sort, cut weak matches, group by category,
 /// materialize. Takes the scored candidates in corpus order, which the
 /// stable sort relies on for tie-breaking.
-/// `rank`, but borrowed. Split out so shellsong's completion can read
-/// the ranking without cloning a `SearchItem` per match; `rank` is
-/// this plus the clone, so the two cannot order differently.
-fn rank_borrowed(mut scored: Vec<(u32, &SearchItem)>) -> Vec<&SearchItem> {
+/// The ranking proper, as corpus indices. `scored` carries indices
+/// rather than references so the result can outlive the borrow and be
+/// held across an event loop; `Corpus::rank_indices` is the caller.
+fn rank_order(items: &[Entry], mut scored: Vec<(u32, u32)>) -> Vec<u32> {
     // relative score cutoff: nucleo's own subsequence matcher will
     // happily return *some* nonzero score for almost any haystack
     // against a short query (e.g. "crest" is a valid, if scattered,
@@ -996,6 +1048,7 @@ fn rank_borrowed(mut scored: Vec<(u32, &SearchItem)>) -> Vec<&SearchItem> {
     let Some(top_score) = scored.iter().map(|&(score, _)| score).max() else {
         return Vec::new();
     };
+    let category = |at: u32| items[at as usize].item.category();
     let threshold = (top_score as f64 * WEAK_MATCH_CUTOFF_FRACTION).round() as u32;
     scored.retain(|(s, _)| *s >= threshold);
     scored.sort_by_key(|a| std::cmp::Reverse(a.0));
@@ -1010,8 +1063,8 @@ fn rank_borrowed(mut scored: Vec<(u32, &SearchItem)>) -> Vec<&SearchItem> {
     // Artists first even though a song titled "Rewind feat.
     // Bladee" might outscore the rest of that artist's own songs.
     let mut group_order: Vec<Category> = Vec::new();
-    for (_, item) in &scored {
-        let cat = item.category();
+    for &(_, at) in &scored {
+        let cat = category(at);
         if !group_order.contains(&cat) {
             group_order.push(cat);
         }
@@ -1021,29 +1074,37 @@ fn rank_borrowed(mut scored: Vec<(u32, &SearchItem)>) -> Vec<&SearchItem> {
         out.extend(
             scored
                 .iter()
-                .filter(|(_, item)| item.category() == cat)
-                .map(|(_, item)| *item),
+                .filter(|&&(_, at)| category(at) == cat)
+                .map(|&(_, at)| at),
         );
     }
     out
 }
 
-fn rank(scored: Vec<(u32, &SearchItem)>) -> Vec<SearchItem> {
-    rank_borrowed(scored).into_iter().cloned().collect()
+/// `rank_order` resolved back to references, for the one caller that
+/// wants every match's name in order and nothing else (shellsong's
+/// completion). Goes through `rank_order` so it cannot order
+/// differently.
+fn rank_borrowed<'a>(items: &'a [Entry], scored: Vec<(u32, u32)>) -> Vec<&'a SearchItem> {
+    rank_order(items, scored)
+        .into_iter()
+        .map(|at| &items[at as usize].item)
+        .collect()
 }
 
 /// Scores one slice of the corpus against `pattern`, reusing a single
 /// `Scratch` for every item; the whole per-item hot path lives here so
 /// the threaded and single-threaded paths can't score differently.
 /// Keeps corpus order, which the caller's stable sort relies on.
-fn score_chunk<'a>(
-    entries: &'a [Entry],
+fn score_chunk(
+    entries: &[Entry],
+    base: u32,
     needle: &Needle,
     scratch: &mut Scratch,
-) -> Vec<(u32, &'a SearchItem)> {
+) -> Vec<(u32, u32)> {
     let Scratch { matcher, buf } = scratch;
     let mut scored = Vec::new();
-    for entry in entries {
+    for (nth, entry) in entries.iter().enumerate() {
         // checked before scoring: an excluded item cannot be rescued by
         // any score, so this is the cheapest possible rejection.
         if needle.excludes(&entry.haystack_lower) {
@@ -1079,7 +1140,7 @@ fn score_chunk<'a>(
 
         match (fuzzy_score, typo) {
             (None, None) => {}
-            (a, b) => scored.push((a.unwrap_or(0).max(b.unwrap_or(0)), &entry.item)),
+            (a, b) => scored.push((a.unwrap_or(0).max(b.unwrap_or(0)), base + nth as u32)),
         }
     }
     scored
@@ -2011,6 +2072,17 @@ mod tests {
     /// every item's identity in order. Pinned per query by
     /// `search_results_are_unchanged`, so any reordering, addition or
     /// removal shows up as a failure rather than as a "faster" search.
+    /// `rank_order` resolved to owned items, which is exactly what
+    /// `Corpus::search` does. The tests below predate the index list
+    /// and compare whole items; going through `rank_order` keeps them
+    /// testing the real ranking rather than a second copy of it.
+    fn rank(c: &Corpus, scored: Vec<(u32, u32)>) -> Vec<SearchItem> {
+        rank_order(&c.items, scored)
+            .into_iter()
+            .map(|at| c.items[at as usize].item.clone())
+            .collect()
+    }
+
     fn fingerprint(items: &[SearchItem]) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         let mut eat = |bytes: &[u8]| {
@@ -2183,7 +2255,7 @@ mod tests {
         for query in GUARD_QUERIES {
             let needle = Needle::new(query);
             let mut scratch = Scratch::default();
-            let fast = score_chunk(&c.items, &needle, &mut scratch);
+            let fast = score_chunk(&c.items, 0, &needle, &mut scratch);
             // the reference gets the same exclusion the hot path
             // applies: `!term` is a filter over the corpus, not part of
             // scoring, so excluding it here keeps this an apples-to-
@@ -2212,6 +2284,7 @@ mod tests {
                 "{query:?}: candidate count differs from the reference scorer"
             );
             for (i, ((fs, fi), (es, ei))) in fast.iter().zip(expected.iter()).enumerate() {
+                let fi = &c.items[*fi as usize].item;
                 assert_eq!(
                     (fs, fi.identity()),
                     (es, ei.identity()),
@@ -2232,14 +2305,107 @@ mod tests {
             "needs more items than threads, or there is only one chunk to compare"
         );
         for query in GUARD_QUERIES {
-            let par = rank(c.score_all_maybe_parallel(query, true));
-            let seq = rank(c.score_all_maybe_parallel(query, false));
+            let par = rank(&c, c.score_all_maybe_parallel(query, true));
+            let seq = rank(&c, c.score_all_maybe_parallel(query, false));
             assert_eq!(
                 fingerprint(&par),
                 fingerprint(&seq),
                 "{query:?}: threaded scoring changed the result list"
             );
         }
+    }
+
+    /// The per-chunk base arithmetic, stated directly.
+    ///
+    /// `threaded_and_sequential_scoring_agree` above also catches a
+    /// shifted base (checked: zeroing the base fails both), but it
+    /// does so second-hand, by noticing the resolved rows differ.
+    /// This compares the index lists themselves, so a failure says
+    /// "a chunk reported the wrong base" instead of "the result list
+    /// changed", and it still holds if the rows a shifted base lands
+    /// on ever happen to fingerprint the same.
+    #[test]
+    fn threaded_scoring_reports_the_same_corpus_indices() {
+        let c = varied_corpus(5_000);
+        assert!(
+            c.items.len() > thread_count(),
+            "needs more items than threads, or there is only one chunk"
+        );
+        for query in GUARD_QUERIES {
+            let par = c.score_all_maybe_parallel(query, true);
+            let seq = c.score_all_maybe_parallel(query, false);
+            assert_eq!(par, seq, "{query:?}: a chunk reported the wrong base");
+        }
+    }
+
+    /// Every index a ranking hands out resolves. `rank_order` and
+    /// `rank_borrowed` index `items` directly, so an index that is out
+    /// of range is a panic on the keystroke that produced it, not a
+    /// missing row.
+    #[test]
+    fn every_ranked_index_resolves_to_an_item() {
+        let c = varied_corpus(3_000);
+        for query in GUARD_QUERIES {
+            let order = c.rank_indices(query);
+            for at in order {
+                assert!(
+                    c.item_at(at).is_some(),
+                    "{query:?}: index {at} is past the corpus ({} items)",
+                    c.items.len()
+                );
+            }
+        }
+    }
+
+    /// `search` is `rank_indices` plus a clone, and that is the only
+    /// reason the index list is safe to introduce: a caller switching
+    /// from one to the other must see the same rows in the same order.
+    #[test]
+    fn rank_indices_orders_exactly_like_search() {
+        let c = varied_corpus(3_000);
+        for query in GUARD_QUERIES {
+            let cloned = c.search(query);
+            let via_index: Vec<SearchItem> = c
+                .rank_indices(query)
+                .into_iter()
+                .filter_map(|at| c.item_at(at))
+                .cloned()
+                .collect();
+            assert_eq!(
+                fingerprint(&cloned),
+                fingerprint(&via_index),
+                "{query:?}: the index list and search disagree"
+            );
+            assert_eq!(
+                cloned.len(),
+                via_index.len(),
+                "{query:?}: different lengths"
+            );
+        }
+    }
+
+    /// A ranking is indices into one revision of the corpus, so every
+    /// change to `items` has to bump it; a missed bump lets a holder
+    /// keep an order whose indices now name different rows, which
+    /// plays the wrong song rather than failing.
+    #[test]
+    fn every_change_to_the_corpus_bumps_the_revision() {
+        let mut c = Corpus::new();
+        let empty = c.revision();
+        c.add_local_tracks([LocalTrack {
+            path: PathBuf::from("/music/a.flac"),
+            title: "a".into(),
+            artist: None,
+            album: None,
+            duration_secs: None,
+            kind: MediaKind::Music,
+        }]);
+        let after_add = c.revision();
+        assert_ne!(empty, after_add, "an insertion must bump");
+
+        c.drop_local();
+        assert_ne!(after_add, c.revision(), "a removal must bump");
+        assert!(c.items.is_empty(), "the local track really did go");
     }
 
     /// Appending a character can *add* candidates, so a type-ahead
@@ -2332,8 +2498,9 @@ mod tests {
             ("varied 150k", varied_corpus(150_000)),
         ] {
             for query in BENCH_QUERIES {
-                let (cpu, out) =
-                    bench_cpu(8, || rank(c.score_all_maybe_parallel(query, false)).len());
+                let (cpu, out) = bench_cpu(8, || {
+                    rank(&c, c.score_all_maybe_parallel(query, false)).len()
+                });
                 println!("{label:<18} {query:<14} cpu {cpu:>11.3?}  ({out} hits)");
             }
         }
@@ -2390,7 +2557,7 @@ mod tests {
                 for _ in 0..12 {
                     let scored = c.score_all(query);
                     let start = std::time::Instant::now();
-                    let ranked = rank(scored);
+                    let ranked = rank(&c, scored);
                     rank_t = rank_t.min(start.elapsed());
                     out = ranked.len();
                 }
@@ -2506,12 +2673,13 @@ mod tests {
                     .score_all(&short)
                     .into_iter()
                     .map(|(_, i)| {
-                        let (t, k) = i.identity();
+                        let (t, k) = c.items[i as usize].item.identity();
                         (t, k.into_owned())
                     })
                     .collect();
                 let mut escaped = Vec::new();
-                for (_, item) in c.score_all(&long) {
+                for (_, at) in c.score_all(&long) {
+                    let item = &c.items[at as usize].item;
                     let (t, k) = item.identity();
                     let key = (t, k.into_owned());
                     if !a.contains(&key) {
