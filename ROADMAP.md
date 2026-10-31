@@ -1298,6 +1298,93 @@ a measurement.
       second exception needs the same direct authorisation
       `ascii-color` got.
 
+- [x] **`App` holds the ranking, not a clone of every row.** the last
+      step of the search-cost item. `Ranking` (indices plus the
+      revision they address) replaces `Vec<SearchItem>`, with the
+      materialized rows built on first ask and dropped on every
+      re-rank. `results()` still hands out a slice, because `core.rs`
+      and shellswim's `echo_lines` need one, but **the keystroke path
+      never calls it**: the two whole-list consumers are a shellsong
+      env and the console echo. `results_list` grew a `Rows` trait so
+      `layout`/`header_rows`/`row_items` take a count and the group
+      boundaries, which is all they ever read.
+      **measured by interleaving the two trees**, because sequential
+      runs moved 1.8x on load: the clone is 3.74ms of a broad 40k query
+      and 14.27ms at 150k, which **confirms the roadmap's 3-5ms**. the
+      "of a ~7ms search" framing does **not** hold: it is 41% on top of
+      ranking at that query and 1-3% for a realistic 5-6 character one.
+      the win is exactly where this item pointed (short query, large
+      library) and scales with library size, but it is not a halving of
+      a keystroke in general.
+      an obstacle not in the brief: `resync_results` runs *after* the
+      corpus was mutated, which is precisely when a ranking refuses to
+      resolve a row, so read-the-selection-then-research cannot work.
+      `selected` and an identity anchor are private now, written only
+      by `select`. and `replace_corpus` is the only way to swap a
+      corpus, pinned by a source scan asserting no other file assigns
+      `.corpus`, which closes the onboarding site that swapped it
+      without resyncing.
+- [x] **keybinds are refused instead of silently dropped**, from both
+      sides. a typo'd action, an unrepresentable key and a reserved key
+      all fell back to the default with nothing said, and a collision
+      was *applied*: `quit = "a"` killed quit outright, because
+      `app.rs` tests `Enqueue` before it. `keymap.rs`'s own doc said
+      the opposite. `from_overrides_reporting` returns warnings in
+      `config::load_reporting`'s shape; collision resolution loops,
+      since refusing an override hands its default back and that can
+      collide in turn, and a genuine **swap** is honoured with no
+      warning, which the naive version would have refused.
+      the interactive remap had the same hole from the other side: it
+      never checked `reserved_key_purpose`, so a binding was accepted,
+      displayed, written to config.toml and discarded at the next
+      launch. `Keymap::refusal` refuses exactly what a load would drop,
+      including **a third class nobody had noticed**: keys
+      `key_to_name` cannot store at all. and `name_to_key` measured
+      length in *bytes*, so a key rebound to a wide char wrote a name
+      that could not be read back.
+      **the console was undiscoverable.** `:` opens a whole command
+      language and appeared in neither help, onboarding nor the bottom
+      bar, while `K` was listed. walking a new `RESERVED_KEYS` table
+      found two more missing (`up`/`down`, `backspace`). the queue's
+      `'a' to add` is the real `Enqueue` binding now, and `J/K` is
+      honest again because main.rs stops claiming `K` over a focused
+      queue view; a test reads main.rs for that guard, crudely, because
+      the hint lives in one file and the precedence in the other and
+      nothing else tied them together.
+      the eyeball grid caught one more: onboarding clipped **both** its
+      how-to-leave lines at 50x20, i.e. a screen that never says how to
+      leave it, so a pinned tail draws them from the bottom up.
+- [x] **the play index is off toml, and lost writes are reported.**
+      the biggest startup find was not the catalog parse at all:
+      `CacheIndex::load` is toml and is the one startup read still on
+      the main thread before the first frame, with `save` back on it on
+      **every track change**. parse then render: 2 000 tracks 22.3 ->
+      4.2ms and 26.8 -> 1.3ms; 5 000 59.6 -> 13.0 and 73.8 -> 4.5;
+      20 000 x 64 days 948 -> 361ms and 1.47s -> 97ms. `index.toml`
+      becomes `index.ndjson`, the same shape and the same argument the
+      catalog half already used; the old toml is read once when there
+      is no ndjson and unlinked after the first good write, so nobody
+      loses the play history the auto-download threshold counts.
+      the warm scan's resolve did three things per file it did not
+      need: a `String` for a `HashSet` of every path, a `PathBuf`
+      clone, and a clone of tags out of an index that is then dropped
+      unread. `TagIndex::take` moves them, and what is left is by
+      construction what `retain_seen` pruned: **73.7 -> 39.6ms at 34k
+      files**, floor 210 -> 175ms. the walk is 78% of what remains, at
+      exactly one `lstat` per media file (a non-media extension is
+      never stat'd and never tagged).
+      **tried and reverted**: fanning the 34k stats over a pool, with
+      order preserved. serial cpu 138.9ms vs pooled 137.0, i.e.
+      identical, so they are cpu-bound on a warm dcache rather than
+      latency-bound, and pool-of-one overhead was +78%. same three
+      reasons as the recorded catalog finding. the catalog fan-out was
+      not re-litigated.
+      and the audit's two silent-save findings here: a full disk killed
+      the startup cache and the queue resume without a word. both
+      report now, and `PlaybackState` gained a round-trip test plus a
+      **literal on-disk fixture**, so a field rename fails instead of
+      reading as "nothing to resume" on every install.
+
 ### the untracked-defect audit (2026-10-31)
 
 Ran once the roadmap was down to 8 unchecked items, 5 of them blocked,
@@ -1731,7 +1818,7 @@ different models**: `textfit::width` uses `UnicodeWidthStr`
 (string-level ligature rules) while `textfit::char_cells` uses
 `UnicodeWidthChar` (no such rules), so every truncation mixes them.
 
-- [ ] **`ui/draw.rs` ~73: `cursor += cells.max(1)` gives a
+- [x] ~~resolved by the overnight run~~ **`ui/draw.rs` ~73: `cursor += cells.max(1)` gives a
       zero-width codepoint its own cell.** measured in a real
       `Buffer` with a `│` at column 8: `"❤️ love song"` returns x=9 and
       overwrites the border; `"1️⃣ favourites"` x=10; `"👩‍👩‍👧 mix"` x=10
@@ -1742,13 +1829,13 @@ different models**: `textfit::width` uses `UnicodeWidthStr`
       cluster and everything after it lands one column left of where
       the buffer thinks. trigger: any NFD-tagged or emoji-containing
       track name, which is ordinary library content.
-- [ ] **`ui/textfit.rs` 39/55/74: the doc contract "never wider than
+- [x] ~~resolved by the overnight run~~ **`ui/textfit.rs` 39/55/74: the doc contract "never wider than
       asked for" is false.** `truncate_with_ellipsis("❤️ love song", 8)`
       returns real width 9; `truncate_to_width("👩‍👩‍👧 mix", 8)` returns
       real width 4 (ZWJ components double-counted). this feeds the
       item above, and via `textfit::columns` it makes a console echo
       line exceed `avail`, wrap, and break the grid.
-- [ ] **`swimconsole.rs` ~262 and `ui/shellsong.rs` ~303: two more
+- [x] ~~resolved by the overnight run~~ **`swimconsole.rs` ~262 and `ui/shellsong.rs` ~303: two more
       hand-rolled per-char writers with the same `.max(1)`,** measured
       against `width()`-derived budgets. type `Beyoncé` NFD at the
       shellswim prompt and the combining acute is written to the next
@@ -1759,7 +1846,7 @@ different models**: `textfit::width` uses `UnicodeWidthStr`
       width-based, never drops zero-width chars, so a pasted
       combining-mark run drives `col: u16` past 65535 and wraps in
       release.
-- [ ] **`ui/header.rs` ~61: the `│` separator column comes from an
+- [x] ~~resolved by the overnight run~~ **`ui/header.rs` ~61: the `│` separator column comes from an
       advancing per-char `x`** while the `┴` junction uses the same
       overcounted value, so with an NFD title the rule is painted at
       buffer column 20 and renders at terminal column 19, a visible
@@ -1769,7 +1856,7 @@ different models**: `textfit::width` uses `UnicodeWidthStr`
       zero-width clusters), have `draw::at_styled` write a cluster as
       one `set_symbol`, delete the `.max(1)`, and route the three
       hand-rolled writers through `draw::at`.
-- [ ] **`ui/shellsong.rs` ~181: the ghost completion is drawn
+- [x] ~~resolved by the overnight run~~ **`ui/shellsong.rs` ~181: the ghost completion is drawn
       unconditionally at `cursor_col + 1`,** over cells the real text
       was just written into. type `queue(fl, hexed` then press Left
       seven times: the row renders `: queue(fl█atline)` with your
@@ -1863,7 +1950,7 @@ stray paint.
       `map(|(i, _)| i).collect()` leaves both tests green and restores
       the exact off-by-one (wrong title, wrong scrobble, wrong art)
       the comment says shipped once.
-- [ ] **`subsonic.rs` 1845/1865/1880 test a dead function.**
+- [x] ~~resolved by the overnight run~~ **`subsonic.rs` 1845/1865/1880 test a dead function.**
       `artist_albums_with_tracks` is `#[allow(dead_code)]` and its own
       doc says nothing calls it; the live artist page uses
       `stream_artist_tracks`, and the two are structurally different
@@ -1872,7 +1959,7 @@ stray paint.
       (`connections() <= ALBUM_FETCH_CONCURRENCY + 1`) exists **only
       on the dead path**, so a regression reinstating the recorded
       "~16 handshakes" bug fails nothing.
-- [ ] **four assertions that cannot fail.** `shellsong.rs` ~6257
+- [x] ~~resolved by the overnight run~~ **four assertions that cannot fail.** `shellsong.rs` ~6257
       asserts `candidates_at(..).len() <= MAX_CANDIDATES` with a
       one-item corpus against a cap of 50, while the comment two lines
       up says "the corpus is the half that still has to be capped: it
@@ -1924,7 +2011,7 @@ stray paint.
 
 **silent failures and undiscoverable keys.**
 
-- [ ] **`main.rs` ~3588: the interactive remap accepts a key it will
+- [x] ~~resolved by the overnight run~~ **`main.rs` ~3588: the interactive remap accepts a key it will
       then drop.** it never checks `reserved_key_purpose`, so a
       binding onto a reserved key is accepted, displayed, written to
       config.toml, and silently discarded by `keymap.rs` ~309 at the
@@ -1935,7 +2022,7 @@ stray paint.
       the binding and saying why beats a key that silently does
       nothing"); the refusal exists only in `from_overrides`, never in
       the path most users will use.
-- [ ] **`main.rs` ~3631 shadows `main.rs` ~4199, so `K` is broken in
+- [x] ~~resolved by the overnight run~~ **`main.rs` ~3631 shadows `main.rs` ~4199, so `K` is broken in
       the queue view.** the unconditional
       `if key.code == Char('K') { keybinds_menu_open = true; continue; }`
       runs before the queue view's own handler, making the
@@ -1943,7 +2030,7 @@ stray paint.
       track down, `K` never moves one up, and `ui/queue.rs` ~161
       prints "enter: jump, d: remove, J/K: move, esc: close",
       teaching the broken half.
-- [ ] **`keymap.rs` ~300: every class of `[keybinds]` config error is
+- [x] ~~resolved by the overnight run~~ **`keymap.rs` ~300: every class of `[keybinds]` config error is
       silent, and duplicates are not even detected.** a typo'd action
       name, an unrepresentable key and a reserved key all fall back to
       the default with no message; a collision (`quit = "a"`, which
@@ -1953,14 +2040,14 @@ stray paint.
       (`keybinds_menu.rs` ~84) but the warning is cleared by the next
       `j`/`k` and the menu then lists the shadowed binding as if it
       worked.
-- [ ] **`ui/help.rs` ~164: the shellsong console is absent from the
+- [x] ~~resolved by the overnight run~~ **`ui/help.rs` ~164: the shellsong console is absent from the
       help pane entirely.** `:` opens a full command console with
       completion and is in `reserved_key_purpose` as "the shellsong
       console", but grepping `help.rs` for `console`/`shellsong`/`:`
       returns nothing; it is also missing from onboarding's controls
       table, the controls bar and the helpbox. an entire subsystem is
       reachable only by guessing, while `K` is listed.
-- [ ] **`download.rs` ~155: one thread per track, no cap,** while
+- [x] ~~resolved by the overnight run~~ **`download.rs` ~155: one thread per track, no cap,** while
       every other batch network operation in the tree caps
       (`ALBUM_FETCH_CONCURRENCY`, `ENRICH_CONCURRENCY`). select an
       artist and press the download key: `download_resolved` hands the
@@ -1969,7 +2056,7 @@ stray paint.
       storm of toasts. `ureq::get(url).call()` at ~82 also sets no
       timeout, so a black-holing server pins a thread and a `.part`
       file forever.
-- [ ] **nine shellsong commands with no error for the obvious wrong
+- [x] ~~resolved by the overnight run~~ **nine shellsong commands with no error for the obvious wrong
       input** (all `shellsong.rs`). ~2606 the `#` comment arm is the
       only separator not guarded by `depth <= 0`, so
       `: play(track #3)` truncates to `play(track` and reports
@@ -1985,7 +2072,7 @@ stray paint.
       `a` to the literal `"= [x]"` and says "defined a: 1 terms".
       ~3647 `Delete` clears `cycle` but not `self.error`, unlike
       `Char` and `Backspace`.
-- [ ] **`shellsong_host.rs` 38/352/336/588: four silent or wrong
+- [x] ~~resolved by the overnight run~~ **`shellsong_host.rs` 38/352/336/588: four silent or wrong
       answers.** `save_vars`/`save_bindings` return `()` and discard
       both "no state dir" and the `fs::write` error while callers
       report success, so with an unwritable `$XDG_STATE_HOME`
@@ -2042,7 +2129,7 @@ stray paint.
       the startup cache, the queue resume and download bookkeeping).
       `config::save_or_warn` is the established pattern and is used
       correctly at all 16 settings sites.
-- [ ] **two hardcoded keys in rendered text.** `ui/queue.rs` ~188
+- [x] ~~resolved by the overnight run~~ **two hardcoded keys in rendered text.** `ui/queue.rs` ~188
       hardcodes `'a'` for the remappable `Enqueue` ("enter on a song
       to start, 'a' to add"), the exact bug class
       `help::Key::Bound` exists to prevent and that the roadmap
