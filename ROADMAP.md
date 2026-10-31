@@ -1058,52 +1058,71 @@ debounced search thread, and the local-favorites path is a file write.
       sidebar and main content and an interior cell left unwritten
       showed through (the box can be wider than its text, see the
       `max(4)`).
-## the overnight run (2026-10-31, four agents in flight)
+## the overnight run (2026-10-31): all four merged
 
-The maintainer went to sleep asking for a lot built and no questions.
-Four agents are working in parallel, partitioned by file so they cannot
-collide. Every one of them was told the same thing, which is the
-lesson this repo learned the hard way today: **merge master down at the
-start, at every stage boundary, and before finishing.** `feat/mouse`
-merged with zero conflicts after twelve commits because it kept merging
-down; `feat/art-modes` was based three merges back and cost twelve
-conflicts.
+Every branch is in. **1001 tests** across three targets (the lib plus
+the two binaries), clippy `-D warnings` clean, fmt clean, both binaries
+build and run.
 
-- `feat/shellsong-lang` (`../wim-wt-lang`): variables (`let x = [...]`),
-  `.shg` scripts, per-identity eq/volume/speed, then the queue
-  **timeline**: pause as a queue entry, a default gap between tracks,
-  and clips. owns `shellsong.rs`, `shellsong_host.rs`,
-  `ui/shellsong.rs`, `playqueue.rs`. the `when` conditional engine in
-  its original brief was **cancelled** by the maintainer ("writing
-  conditionals is just not particularly it") and replaced with the
-  timeline, which is the right call: a rules engine is a programmer's
-  idea of a feature, the timeline is something a listener uses.
-- `feat/shellswim` (`../wim-wt-swim`): the **library split** plus the
-  second binary. owns `main.rs` exclusively, which is why nobody else
-  may touch it tonight.
-- `fix/ui-batch` (`../wim-wt-uibatch`): the recorded ui defects, plus a
-  sweep for the char-versus-cell bug class (four separate instances
-  found and fixed today, so a fifth is likely) and for
-  emoji-presentation glyphs. owns `hit.rs` and `ui/*`.
-- `feat/identity` (`../wim-wt-ident`): album and artist ids on
-  `SearchItem`, the catalog parse at scale, and a verdict on
-  `remote_clients`'s O(corpus) scan. owns the data layer.
+### shellswim and the library seam
 
-**Queued behind the lib split, in this order, because each needs
-`main.rs` and the split rewrites it:**
-1. the **undo tree** (hooks the single op dispatch; see below),
-2. **in-workspace sub-rect video**. the blocker recorded as "the real
-   work" was **wrong and is now gone**: ratatui's `flush` diffs the
-   previous buffer against the current one, so it has no idea what is
-   on the terminal and cannot "restore" cells mpv drew. a rect left
-   untouched in two consecutive frames emits nothing. `video::Hole`
-   plus five tests against ratatui's own `Buffer::diff` pin that, and
-   `Hole::painted` reports when an overlay or a resize repaint breaks
-   the promise so mpv can be asked to redraw. what is left is the
-   unglamorous half: keeping wim's widgets out of the rect (a layout
-   change in `main.rs`) and the redraw trigger. see `docs/video.md`.
-3. **cron scheduling** (`at(07:00) ...`), which needs the language
-   work landed first.
+`core::CoreCtx` plus `core::Surface` (`docs/library-seam.md`).
+`CoreCtx` holds config, mpv, session, queue, cache, favorites,
+notifications, scrobble, the channels, vars, bindings and console; it
+**does not know about** focus, the browse view and its loader, the art
+protocol, the six menu-open/selected pairs, lyrics state, suggestions
+or the queue view.
+
+The 17 places that did reach pane state ask `Surface`, **a trait whose
+every method declines by default**. A trait rather than a drained
+request queue, deliberately: wim had to stay bit-identical, and several
+effects are ordered *inside* an op (`view(starred)` invalidates the
+art, builds the view, then moves focus), which a queue drained
+afterwards would reorder. `view()` splits on the language's own
+`ViewTarget::is_screen()`, so the five listings print in the core,
+identically in both binaries.
+
+shellswim declines each pane view **by name, pointing at wim's key**
+(`shellswim has no equaliser pane; wim's 'e' has it`), and
+`dry(view(eq))` still describes it fully, because `dry` lowers to notes
+and never reaches the op table.
+
+**Measured, isolated XDG, machine under load:** wim's first frame
+364ms, shellswim's 420ms, of which `Mpv::spawn()` is ~400ms in both.
+Everything shellswim itself does costs ~4ms; it is usable in
+single-digit ms and then waits for mpv. **The obvious next move,
+leaving the prompt usable before mpv answers, is not done** and is the
+single biggest win available there.
+
+Also measured and worth knowing: in wim the graphics probe answers at
+**1361ms, a full second after the first frame**, as a second reader on
+stdin. Skipping it on terminals that implement no protocol (done
+earlier) removes that for alacritty; elsewhere it still races.
+
+- [x] **a real find from actually running it:** `-c` drew a frame and
+      exited, and leaving the alternate screen **wiped the line it had
+      just written**. Fixed by making one-shot never touch raw mode at
+      all (plain stdout/stderr, non-zero on failure), which also makes
+      it the one path here **testable with no pty** and is how every
+      decline above was verified rather than assumed.
+- [x] **the merge caught something that would have shipped broken.**
+      master's language work landed in the two functions the split had
+      just moved, giving five conflicts. Ported rather than discarded,
+      and the audit was a diff of master's `main.rs` against the branch
+      for unaccounted `Op`/`ViewTarget`/`Step` arms. The one that
+      mattered: **`shellsong_queued`'s promotion**, without which a
+      per-identity eq binding would be synthesised on track change and
+      then never run.
+
+- [ ] **wire `lyrics::Loader`.** It landed on master unwired and
+      shellswim's `view(lyrics)` uses the blocking lookup too, matching
+      wim. Now that `main.rs` is free this is the three-line change
+      recorded above, and "nothing blocks" is shellswim's stated rule,
+      so it is the first thing to do.
+- [ ] **one commit on that branch should have been two** (`ede72c0`):
+      the shellswim files were staged when the merge was resolved, so
+      they went in with it. The message says so. Nothing to fix, worth
+      not repeating.
 
 ## shellswim and the undo tree (maintainer, 2026-10-31)
 
