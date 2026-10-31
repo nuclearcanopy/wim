@@ -420,14 +420,35 @@ pub enum Resolution {
 /// queue disowns all of them. That last part matters more here than
 /// elsewhere: a late arrival does not just draw something stale, it
 /// *mutates the queue*.
+///
+/// **Several in flight at once is what makes the order a guard of its
+/// own.** The epoch says a batch still belongs to this queue; it says
+/// nothing about where in the queue it goes, and the workers finish in
+/// whatever order the network answers. Every queue-bound batch mutates
+/// the one queue, so each takes a `ticket` when it is asked for and
+/// `poll` hands them on in that order, holding an early arrival back.
+/// Without it `add_to_queue(front, a)` then `(front, b)` fight for the
+/// same insert slot and the order flips run to run; appending two
+/// albums interleaves them the same way.
 pub struct TrackResolver {
     epoch: Arc<AtomicU64>,
+    /// Handed to the next queue-bound request, and the one `poll` will
+    /// hand on next. Only `invalidate` can lose a ticket (its workers
+    /// give up without sending), and it resets both, so nothing ever
+    /// waits on a reply that is not coming.
+    next_ticket: u64,
+    next_delivery: u64,
+    /// Arrived before the ticket in front of it.
+    held: Vec<ResolvedBatch>,
     tx: mpsc::Sender<ResolvedBatch>,
     rx: mpsc::Receiver<ResolvedBatch>,
 }
 
 struct ResolvedBatch {
     epoch: u64,
+    /// `None` for a download: it writes files rather than the queue, so
+    /// nothing else is waiting on its position.
+    ticket: Option<u64>,
     into: Intent,
     label: String,
     tracks: Result<Vec<SearchItem>, String>,
@@ -444,6 +465,9 @@ impl TrackResolver {
         let (tx, rx) = mpsc::channel();
         TrackResolver {
             epoch: Arc::new(AtomicU64::new(0)),
+            next_ticket: 0,
+            next_delivery: 0,
+            held: Vec::new(),
             tx,
             rx,
         }
@@ -468,6 +492,11 @@ impl TrackResolver {
         // read, not bumped: a second request does not supersede the
         // first, it joins it.
         let epoch = self.epoch.load(Ordering::SeqCst);
+        let ticket = into.queue_bound().then(|| {
+            let t = self.next_ticket;
+            self.next_ticket += 1;
+            t
+        });
         let (item, tx, shared) = (item.clone(), self.tx.clone(), Arc::clone(&self.epoch));
         let sent = label.clone();
         thread::spawn(move || {
@@ -477,6 +506,7 @@ impl TrackResolver {
             }
             let _ = tx.send(ResolvedBatch {
                 epoch,
+                ticket,
                 into,
                 label: sent,
                 tracks,
@@ -491,25 +521,52 @@ impl TrackResolver {
     /// per request.
     pub fn invalidate(&mut self) {
         self.epoch.fetch_add(1, Ordering::SeqCst);
+        // every outstanding ticket belongs to a worker that will now
+        // give up without sending, so the ordering has to forget them
+        // or the next batch waits on a reply that never comes.
+        self.held.clear();
+        self.next_delivery = self.next_ticket;
     }
 
     /// The next batch still belonging to the current queue, if one
-    /// landed.
+    /// landed; queue-bound ones in the order they were asked for.
     pub fn poll(&mut self) -> Option<(Intent, String, Result<Vec<SearchItem>, String>)> {
         let current = self.epoch.load(Ordering::SeqCst);
         loop {
+            // whatever was waiting on the ticket just handed on goes
+            // before anything newly off the channel.
+            if let Some(i) = self
+                .held
+                .iter()
+                .position(|b| b.ticket == Some(self.next_delivery))
+            {
+                let batch = self.held.remove(i);
+                self.next_delivery += 1;
+                return Some((batch.into, batch.label, batch.tracks));
+            }
             match self.rx.try_recv() {
                 Ok(batch) if batch.into.queue_bound() && batch.epoch != current => continue,
-                Ok(batch) => return Some((batch.into, batch.label, batch.tracks)),
+                Ok(batch) => match batch.ticket {
+                    None => return Some((batch.into, batch.label, batch.tracks)),
+                    Some(t) if t == self.next_delivery => {
+                        self.next_delivery += 1;
+                        return Some((batch.into, batch.label, batch.tracks));
+                    }
+                    Some(_) => {
+                        self.held.push(batch);
+                        continue;
+                    }
+                },
                 Err(_) => return None,
             }
         }
     }
 
     #[cfg(test)]
-    fn deliver(&self, epoch: u64, into: Intent, tracks: Vec<SearchItem>) {
+    fn deliver(&self, epoch: u64, ticket: Option<u64>, into: Intent, tracks: Vec<SearchItem>) {
         let _ = self.tx.send(ResolvedBatch {
             epoch,
+            ticket,
             into,
             label: "test".into(),
             tracks: Ok(tracks),
@@ -519,6 +576,14 @@ impl TrackResolver {
     #[cfg(test)]
     fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// (the ticket the next request takes, the one `poll` is waiting
+    /// for), so a test can state the lost-ticket rule in the
+    /// resolver's own terms rather than guessing at numbers.
+    #[cfg(test)]
+    fn tickets(&self) -> (u64, u64) {
+        (self.next_ticket, self.next_delivery)
     }
 }
 
@@ -774,6 +839,57 @@ pub struct SubtitleReady {
     pub path: String,
     pub release: String,
     pub language: String,
+    /// The video this was fetched for, by path. Every other async
+    /// reply in the tree is tagged (`browse::Loader`'s generation,
+    /// `coverart::Cache`'s `Key`, `DownloadEvent`'s id, mpv's
+    /// `request_id`) and this one was not; see
+    /// `subtitle_belongs_to_playing`, which is the check that makes it
+    /// worth carrying.
+    pub for_video: String,
+}
+
+impl SubtitleReady {
+    /// Where the fetch writes what it downloaded: beside the video, so
+    /// mpv would find it again on its own next time.
+    fn sidecar(video: &std::path::Path) -> std::path::PathBuf {
+        video.with_extension("wim-auto.srt")
+    }
+
+    /// One constructor rather than a field-by-field literal at the
+    /// send, so the tag and the file it describes can only come from
+    /// the same path. `subtitle_belongs_to_playing` compares the tag,
+    /// and a reply tagged with anything else (or with nothing) lets
+    /// every late answer through again.
+    fn written_beside(video: &std::path::Path, release: &str, language: &str) -> SubtitleReady {
+        SubtitleReady {
+            path: Self::sidecar(video).to_string_lossy().into_owned(),
+            release: release.to_string(),
+            language: language.to_string(),
+            for_video: video.to_string_lossy().into_owned(),
+        }
+    }
+}
+
+/// Whether a finished subtitle fetch still belongs to what is playing.
+///
+/// A fetch is three round trips, so a reply routinely outlives the
+/// video it was for: play A then B (or let a queue advance) and A's
+/// answer lands while B plays. `Mpv::sub_add` carries mpv's `select`
+/// flag and an external track attaches to whatever file is loaded
+/// *now*, so loading it unguarded makes A's subtitle B's active
+/// subtitle, with a toast naming A's release; which wins is
+/// thread-completion order.
+///
+/// Identity rather than a counter, the shape `coverart::Cache` uses:
+/// the fetch already knows the path it was asked about, and a path is
+/// what tells two videos apart. It also answers the case a generation
+/// would miss, a video followed by music, since an audio track wants
+/// no subtitle at all.
+pub fn subtitle_belongs_to_playing(sub: &SubtitleReady, playing: Option<&SearchItem>) -> bool {
+    matches!(
+        playing,
+        Some(SearchItem::LocalVideo { path, .. }) if *path.to_string_lossy() == *sub.for_video
+    )
 }
 /// Starts an opensubtitles search + download on its own thread, same
 /// fire-and-forget contract as `fire_playing_now`: a no-op whenever
@@ -795,7 +911,10 @@ pub fn fire_subtitle_fetch(
     };
     let language = cfg.subtitle_language.clone();
     let title = title.clone();
-    let sub_path = path.with_extension("wim-auto.srt");
+    // carried into the worker whole: the reply is tagged with it, and
+    // the file is written beside it, and both come out of
+    // `SubtitleReady::written_beside` so they cannot disagree.
+    let video = path.clone();
     let subtitle_tx = subtitle_tx.clone();
     thread::spawn(move || {
         let client = opensubtitles::Client::new(api_key);
@@ -808,14 +927,14 @@ pub fn fire_subtitle_fetch(
         let Ok(bytes) = client.download(best.file_id) else {
             return;
         };
-        if std::fs::write(&sub_path, bytes).is_err() {
+        if std::fs::write(SubtitleReady::sidecar(&video), bytes).is_err() {
             return;
         }
-        let _ = subtitle_tx.send(SubtitleReady {
-            path: sub_path.to_string_lossy().into_owned(),
-            release: best.release.clone(),
-            language: best.language.clone(),
-        });
+        let _ = subtitle_tx.send(SubtitleReady::written_beside(
+            &video,
+            &best.release,
+            &best.language,
+        ));
     });
 }
 /// What a reply's text is, by the api's own `instrumental` flag rather
@@ -1180,10 +1299,11 @@ pub fn save_playback_state(player: &mpv::Mpv, queue: &PlayQueue) {
 /// Bundles everything the auto/manual download paths need to touch:
 /// the shared cache index, the channel to report progress back on,
 /// and the set of track ids currently mid-transfer. One struct instead
-/// of four separate parameters, mostly so `go_to_previous` (which
-/// already takes half a dozen other params) doesn't trip clippy's
-/// too-many-arguments lint; see `note_playback_started`/
-/// `trigger_downloads`, which take the same bundle.
+/// of four separate parameters; see `note_playback_started`/
+/// `trigger_downloads`, which take the same bundle. `TrackChangeCtx`
+/// used to wrap this for `go_to_previous`, which takes a `CoreCtx`
+/// now and builds the bundle in `track_started` like every other
+/// track-start path.
 pub struct DownloadCtx<'a> {
     pub cache: &'a Arc<Mutex<CacheIndex>>,
     pub download_tx: &'a mpsc::Sender<DownloadEvent>,
@@ -1191,18 +1311,6 @@ pub struct DownloadCtx<'a> {
     /// Distinct play days a track needs before it auto-downloads; see
     /// `config::Config::cache_days_threshold`.
     pub day_threshold: u32,
-}
-/// Bundles the two independent "a track just started" trackers
-/// (download-on-repeat-listen, scrobble-on-threshold) into one
-/// argument, purely to keep `go_to_previous` under clippy's
-/// too-many-arguments limit; each one is otherwise unrelated to the
-/// other and gets built/used on its own everywhere else.
-pub struct TrackChangeCtx<'a, 'b> {
-    pub dctx: &'a mut DownloadCtx<'b>,
-    pub scrobble: &'a mut ScrobbleState,
-    /// where `fire_subtitle_fetch` reports back; bundled here for the
-    /// same argument-count reason as everything else in this struct.
-    pub subtitle_tx: &'a mpsc::Sender<SubtitleReady>,
 }
 /// "Back" re-plays whatever was playing before the current track,
 /// putting the interrupted track right behind it so playback picks up
@@ -1214,28 +1322,39 @@ pub struct TrackChangeCtx<'a, 'b> {
 /// mpv and the index map written together, which inserting into a
 /// separate queue copy (while mpv's own playlist got replaced out from
 /// under it) did not. Only ever one step back, not a full history.
-pub fn go_to_previous(
-    cfg: &config::Config,
-    player: &mpv::Mpv,
-    notifications: &mut Notifications,
-    previous_track: &mut Option<SearchItem>,
-    queue: &mut PlayQueue,
-    hooks: &mut TrackChangeCtx,
-) -> String {
-    let Some(prev) = previous_track.take() else {
+///
+/// **It fired three of the five track-start hooks by hand**, which is
+/// the exact parity bug `track_started` was written to close: no bound
+/// eq/volume/speed, and with crossfade on the volume stayed wherever
+/// the fade-out ramp last wrote it for the whole track. It takes a
+/// `CoreCtx` and a `Surface` for that: the two hooks it was missing
+/// are precisely the two that need somewhere to put ops, since
+/// `identity_settings` mutates `Overridden` as it decides and hands
+/// the changes back rather than applying them. Dropping them would be
+/// worse than the gap (docs/undo.md), which is why this could not be
+/// fixed without changing the signature.
+pub fn go_to_previous(core: &mut CoreCtx, surf: &mut dyn Surface) -> String {
+    let Some(prev) = core.previous_track.take() else {
         return "no previous track".to_string();
     };
     let mut items = vec![prev.clone()];
-    items.extend(queue.current().cloned());
-    items.extend(queue.upcoming().to_vec());
-    let (status, played) =
-        load_playlist(player, hooks.dctx.cache, queue, items, SessionStart::Keep);
-    if played {
-        fire_subtitle_fetch(cfg, hooks.subtitle_tx, &prev);
-        note_playback_started(&prev, hooks.dctx, notifications);
-        start_tracking_playback(cfg, &prev, hooks.scrobble);
-    } else {
-        *previous_track = Some(prev);
+    items.extend(core.queue.current().cloned());
+    items.extend(core.queue.upcoming().to_vec());
+    let (status, played) = load_playlist(
+        core.player,
+        core.cache,
+        core.queue,
+        items,
+        SessionStart::Keep,
+    );
+    if !played {
+        *core.previous_track = Some(prev);
+        return status;
+    }
+    let started = track_started(&prev, core);
+    surf.queue_program(started.ops);
+    if let Some(bound) = started.bound {
+        core.notifications.push(Severity::Info, bound);
     }
     status
 }
@@ -2056,26 +2175,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             if core.previous_track.is_none() {
                 return op_fail("no previous track");
             }
-            let mut dctx = DownloadCtx {
-                cache: core.cache,
-                download_tx: core.download_tx,
-                downloading: core.downloading,
-                day_threshold: core.cfg.cache_days_threshold,
-            };
-            let mut hooks = TrackChangeCtx {
-                dctx: &mut dctx,
-                scrobble: core.scrobble,
-                subtitle_tx: core.subtitle_tx,
-            };
-            let status = go_to_previous(
-                core.cfg,
-                core.player,
-                core.notifications,
-                core.previous_track,
-                core.queue,
-                &mut hooks,
-            );
-            op_note(status)
+            op_note(go_to_previous(core, surf))
         }
         Op::SeekAbsolute(pos) => {
             // asked for directly rather than read from the observed
@@ -2543,6 +2643,18 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             );
             core.bindings.remember(tier, &name, &setting);
             shellsong_host::save_bindings_or_warn(core.bindings, core.notifications);
+            // the restore point, taken before the setting below moves
+            // the thing it describes. `settle` takes it on a track
+            // change and this binds a track that is already playing,
+            // so that track change never happens; see
+            // `seed_overridden`.
+            seed_overridden(
+                core.overridden,
+                &setting,
+                current_eq_name(core.app, core.cfg),
+                *core.base_volume,
+                core.app.speed,
+            );
             // applied now as well as remembered, through the same arm
             // the typed command goes through, so remembering a setting
             // and setting it cannot drift.
@@ -2805,6 +2917,12 @@ pub struct Started {
 /// consequence of playback starting.
 pub fn track_started(track: &SearchItem, core: &mut CoreCtx) -> Started {
     fire_subtitle_fetch(core.cfg, core.subtitle_tx, track);
+    // a lyrics reply belongs to the track that asked for it, and
+    // `LyricsPane::close` drops the lines only. nothing disowned the
+    // loader, so a reply landing after the track changed opened the
+    // pane unprompted over the new track; this is the hook that says
+    // the track changed.
+    core.lyrics_loader.invalidate();
     let mut dctx = DownloadCtx {
         cache: core.cache,
         download_tx: core.download_tx,
@@ -3099,6 +3217,44 @@ pub fn current_eq_name(app: &app::App, cfg: &config::Config) -> String {
 /// back to the value the user had chosen before any binding took over,
 /// rather than keeping the last bound one (which is what leaves
 /// everything quiet after one quiet song).
+/// The restore point `Op::Remember` owes `settle`, taken before it
+/// applies the setting it has just bound.
+///
+/// `settle` captures the value to go back to the first time a binding
+/// takes over, which happens *on a track change*. `remember(...)`
+/// binds and applies in the same breath, to a track that is already
+/// playing, so for that track there is no change to capture on: at
+/// volume 80, `: remember(album, volume(25%))` then `: skip()` onto
+/// another album left `overridden.volume` at `None`, so `settle` saw
+/// nothing to put back and the session stayed at 25.
+///
+/// `get_or_insert` rather than an assignment, for the same reason
+/// `settle` guards on `active.is_none()`: remembering twice over must
+/// restore to what the user chose, not to the binding in between.
+///
+/// `volume_now` is `*core.base_volume`, never mpv's live reading, for
+/// the reason written up on `track_started`: at a track boundary the
+/// live value is mid crossfade fade-out.
+pub fn seed_overridden(
+    overridden: &mut shellsong_host::Overridden,
+    setting: &shellsong::Setting,
+    eq_now: String,
+    volume_now: f64,
+    speed_now: f64,
+) {
+    match setting {
+        shellsong::Setting::Eq(_) => {
+            overridden.eq.get_or_insert(eq_now);
+        }
+        shellsong::Setting::Volume(_) => {
+            overridden.volume.get_or_insert(volume_now);
+        }
+        shellsong::Setting::Speed(_) => {
+            overridden.speed.get_or_insert(speed_now);
+        }
+    }
+}
+
 pub fn identity_settings(
     item: &SearchItem,
     bindings: &shellsong_host::Bindings,
@@ -3197,6 +3353,102 @@ mod identity_settings_tests {
         assert_eq!(restored_volume(&ops), Some(80.0), "back to what was chosen");
     }
 
+    /// `remember` binds a track that is already playing, so `settle`
+    /// never gets the track change it would have captured the restore
+    /// point on. Seeding is what stands in for it.
+    ///
+    /// The sequence, which is the only shape it shows up in: at volume
+    /// 80, `remember(album, volume(25%))`, then another album. Without
+    /// the seed `settle` sees `active == None` for the unbound track
+    /// and restores nothing, so 25 is the session's volume from then
+    /// on.
+    #[test]
+    fn remembering_a_volume_leaves_something_to_restore_to() {
+        let bound = song("bound", "an artist");
+        let mut bindings = Bindings::default();
+        let key = shellsong_host::name_at(&shellsong_host::identity_of(&bound), Tier::Album)
+            .expect("a track with an album has an album identity");
+        bindings.remember(Tier::Album, &key, &Setting::Volume(25.0));
+
+        // what `Op::Remember` does: bind, seed, then apply, which is
+        // what makes `base_volume` 25 by the time the next track
+        // starts.
+        let mut overridden = Overridden::default();
+        seed_overridden(
+            &mut overridden,
+            &Setting::Volume(25.0),
+            "flat".into(),
+            80.0,
+            1.0,
+        );
+
+        // `skip()` onto a track of another album.
+        let plain = SearchItem::LocalMusic {
+            path: std::path::PathBuf::from("/music/plain.flac"),
+            title: "plain".to_string(),
+            artist: Some("an artist".to_string()),
+            album: Some("another album".to_string()),
+        };
+        let (ops, _) =
+            identity_settings(&plain, &bindings, &mut overridden, "flat".into(), 25.0, 1.0);
+        assert_eq!(
+            restored_volume(&ops),
+            Some(80.0),
+            "the unbound track has to go back to the chosen level"
+        );
+    }
+
+    /// Remembering twice must still restore to what the user chose,
+    /// not to the binding in between; the same rule `settle` keeps with
+    /// its `active.is_none()` guard.
+    #[test]
+    fn seeding_twice_keeps_the_first_restore_point() {
+        let mut overridden = Overridden::default();
+        seed_overridden(
+            &mut overridden,
+            &Setting::Volume(25.0),
+            "flat".into(),
+            80.0,
+            1.0,
+        );
+        seed_overridden(
+            &mut overridden,
+            &Setting::Volume(40.0),
+            "flat".into(),
+            25.0,
+            1.0,
+        );
+        assert_eq!(overridden.volume, Some(80.0));
+    }
+
+    /// And it seeds only the setting that was remembered: an eq
+    /// binding must not claim the volume as overridden, or the next
+    /// unbound track would be "restored" to a level nothing set.
+    #[test]
+    fn seeding_touches_only_the_setting_that_was_bound() {
+        let mut overridden = Overridden::default();
+        seed_overridden(
+            &mut overridden,
+            &Setting::Eq("night".into()),
+            "flat".into(),
+            80.0,
+            1.25,
+        );
+        assert_eq!(overridden.eq.as_deref(), Some("flat"));
+        assert_eq!(overridden.volume, None);
+        assert_eq!(overridden.speed, None);
+
+        seed_overridden(
+            &mut overridden,
+            &Setting::Speed(1.5),
+            "flat".into(),
+            80.0,
+            1.25,
+        );
+        assert_eq!(overridden.speed, Some(1.25));
+        assert_eq!(overridden.volume, None, "still nobody's business");
+    }
+
     /// `track_started` is the one caller, and it must not read mpv's
     /// live volume at all.
     ///
@@ -3226,6 +3478,104 @@ mod identity_settings_tests {
         assert!(
             body.contains("*core.base_volume"),
             "it has to take the chosen level from somewhere:\n{body}"
+        );
+    }
+}
+
+/// Which video a late subtitle may be loaded onto. Its own module
+/// rather than joining the seam tests: the fetch itself is three
+/// network round trips and none of this needs one, or an mpv.
+#[cfg(test)]
+mod late_subtitle_tests {
+    use super::*;
+    use crate::browse::fixtures::test_songs;
+    use std::path::PathBuf;
+
+    fn video(path: &str) -> SearchItem {
+        SearchItem::LocalVideo {
+            path: PathBuf::from(path),
+            title: "a film".into(),
+        }
+    }
+
+    /// Built through the real constructor, not a literal: the tag
+    /// being filled in is half of what is under test, so a test that
+    /// wrote it by hand would pass with the sender still untagged.
+    fn reply_for(path: &str) -> SubtitleReady {
+        SubtitleReady::written_beside(std::path::Path::new(path), "A.Film.1080p", "en")
+    }
+
+    /// The pairing the guard rests on: one path in, and both the file
+    /// the worker wrote and the tag the drain compares come out of it.
+    #[test]
+    fn a_reply_is_tagged_with_the_video_it_was_written_beside() {
+        let reply = reply_for("/v/a.mkv");
+        assert_eq!(reply.for_video, "/v/a.mkv");
+        assert_eq!(reply.path, "/v/a.wim-auto.srt");
+        assert_eq!(reply.release, "A.Film.1080p");
+        assert_eq!(reply.language, "en");
+    }
+
+    #[test]
+    fn a_reply_for_the_playing_video_is_loaded() {
+        let playing = video("/v/a.mkv");
+        assert!(subtitle_belongs_to_playing(
+            &reply_for("/v/a.mkv"),
+            Some(&playing)
+        ));
+    }
+
+    /// The bug, as the sequence that produces it: start A, start B
+    /// before A's three round trips finish, and A's answer arrives
+    /// with B loaded. `sub_add` has mpv's `select` flag, so loading it
+    /// makes A's subtitle B's active track and toasts A's release.
+    #[test]
+    fn a_reply_for_the_previous_video_is_not_loaded_onto_this_one() {
+        let playing = video("/v/b.mkv");
+        assert!(!subtitle_belongs_to_playing(
+            &reply_for("/v/a.mkv"),
+            Some(&playing)
+        ));
+    }
+
+    /// The case a plain generation counter would miss: a video
+    /// followed by music. Nothing bumps per track, and an audio track
+    /// wants no subtitle at all.
+    #[test]
+    fn a_reply_is_not_loaded_onto_a_track_that_is_not_a_video() {
+        let playing = test_songs(1).remove(0);
+        assert!(!subtitle_belongs_to_playing(
+            &reply_for("/v/a.mkv"),
+            Some(&playing)
+        ));
+    }
+
+    /// The queue ran out while the fetch was in flight; there is no
+    /// file loaded to attach anything to.
+    #[test]
+    fn a_reply_with_nothing_playing_is_not_loaded() {
+        assert!(!subtitle_belongs_to_playing(&reply_for("/v/a.mkv"), None));
+    }
+
+    /// And that the sender goes through that constructor rather than
+    /// a literal of its own, which is the only way a reply can be sent
+    /// untagged. Pinned by reading the source because the fetch itself
+    /// is three network round trips and needs an api key.
+    #[test]
+    fn the_sender_builds_its_reply_through_the_constructor() {
+        let src = include_str!("core.rs");
+        let at = src
+            .find("pub fn fire_subtitle_fetch(")
+            .expect("fire_subtitle_fetch moved or was renamed");
+        let body = &src[at..];
+        let body = &body[..body.find("\n}\n").expect("an unterminated fn")];
+        assert!(
+            body.contains("SubtitleReady::written_beside("),
+            "a literal here can be sent with no video tag:\n{body}"
+        );
+        assert!(
+            !body.contains("for_video"),
+            "the tag is the constructor's to fill in, not this one's:\n{body}"
         );
     }
 }
@@ -3811,8 +4161,8 @@ mod seam_tests {
     fn two_batches_at_the_current_epoch_both_arrive() {
         let mut r = TrackResolver::new();
         let at = r.epoch();
-        r.deliver(at, Intent::Back, test_songs(3));
-        r.deliver(at, Intent::Back, test_songs(2));
+        r.deliver(at, Some(0), Intent::Back, test_songs(3));
+        r.deliver(at, Some(1), Intent::Back, test_songs(2));
         let landed: Vec<usize> = std::iter::from_fn(|| r.poll())
             .map(|(_, _, tracks)| tracks.unwrap().len())
             .collect();
@@ -3823,6 +4173,68 @@ mod seam_tests {
         );
     }
 
+    /// And the half the test above could not state, because delivering
+    /// in order over a fifo channel proves nothing about it: the
+    /// workers finish in whatever order the network answers, and every
+    /// queue-bound batch mutates the one queue. So an early arrival
+    /// waits for the ticket in front of it, which is what makes
+    /// `add_to_queue(front, a)` then `(front, b)` land the same way
+    /// round every run instead of by thread-completion order.
+    #[test]
+    fn a_batch_that_answered_early_waits_for_the_one_asked_for_first() {
+        let mut r = TrackResolver::new();
+        let at = r.epoch();
+        // the second request is the one that answers first.
+        r.deliver(at, Some(1), Intent::Front, test_songs(2));
+        assert!(
+            r.poll().is_none(),
+            "applying the second batch first is the nondeterministic order"
+        );
+        r.deliver(at, Some(0), Intent::Front, test_songs(3));
+        let landed: Vec<usize> = std::iter::from_fn(|| r.poll())
+            .map(|(_, _, tracks)| tracks.unwrap().len())
+            .collect();
+        assert_eq!(
+            landed,
+            vec![3, 2],
+            "request order, not arrival order; and the held one is not lost"
+        );
+    }
+
+    /// The hazard the ordering introduces, since a ticket that never
+    /// arrives would stall every batch behind it forever. The only
+    /// worker that gives up without sending is one `invalidate`
+    /// disowned, so `invalidate` forgets the outstanding tickets too:
+    /// queue an artist, clear the queue, queue an album, and the album
+    /// must not wait on the fan-out that was cancelled.
+    #[test]
+    fn invalidate_leaves_nothing_waiting_on_a_ticket_that_is_not_coming() {
+        let mut r = TrackResolver::new();
+        r.request(&album_item("first"), Intent::Back);
+        r.request(&album_item("second"), Intent::Back);
+        r.invalidate();
+        let (next, waiting_for) = r.tickets();
+        assert_eq!(
+            next, waiting_for,
+            "both outstanding tickets were disowned, so neither is waited on"
+        );
+
+        r.deliver(r.epoch(), Some(next), Intent::Back, test_songs(2));
+        assert!(
+            r.poll().is_some(),
+            "a batch asked for after the clear is stuck behind a cancelled one"
+        );
+    }
+
+    fn album_item(name: &str) -> crate::search::SearchItem {
+        crate::search::SearchItem::Album {
+            id: "al1".into(),
+            name: name.into(),
+            artist: "a".into(),
+            client: crate::browse::tests::test_client(),
+        }
+    }
+
     /// Replacing or emptying the queue has to disown what is in
     /// flight, or a batch resolved against the old queue lands in the
     /// new one. The only thing that bumps the epoch.
@@ -3831,7 +4243,7 @@ mod seam_tests {
         let mut r = TrackResolver::new();
         let before = r.epoch();
         r.invalidate();
-        r.deliver(before, Intent::Back, test_songs(2));
+        r.deliver(before, Some(0), Intent::Back, test_songs(2));
         assert!(r.poll().is_none());
     }
 
@@ -3844,8 +4256,8 @@ mod seam_tests {
         let mut r = TrackResolver::new();
         let before = r.epoch();
         r.invalidate();
-        r.deliver(before, Intent::Back, test_songs(2));
-        r.deliver(before, Intent::Front, test_songs(4));
+        r.deliver(before, Some(0), Intent::Back, test_songs(2));
+        r.deliver(before, Some(1), Intent::Front, test_songs(4));
         assert!(r.poll().is_none());
     }
 
@@ -3995,6 +4407,152 @@ mod seam_tests {
                 .any(|op| matches!(op, Op::SetEqPreset(n) if n == "rock")),
             "play() has to apply a bound eq, same as advancing does: {:?}",
             surf.queued
+        );
+    }
+
+    /// The wiring and not just the rule: `Op::Remember` has to take
+    /// the restore point itself, because the track change `settle`
+    /// would have taken it on never comes for a track already playing.
+    ///
+    /// Through `apply_op` and then the real track-change hook, because
+    /// a test that called `seed_overridden` by hand would pass with
+    /// the op arm never calling it, which is this repo's recurring way
+    /// of pinning a function and not its wiring.
+    ///
+    /// `#[ignore]` for the usual reason: `CoreCtx` holds a live mpv.
+    #[test]
+    #[ignore]
+    fn remembering_a_volume_restores_it_on_the_next_unbound_album() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        h.base_volume = 80.0;
+        let bound = test_songs(1).remove(0);
+        h.now_playing = Some(bound);
+
+        let mut surf = Capturing::default();
+        {
+            let mut core = h.ctx(&player);
+            apply_op(
+                Op::Remember {
+                    tier: shellsong::Tier::Album,
+                    setting: shellsong::Setting::Volume(25.0),
+                },
+                &mut core,
+                &mut surf,
+            );
+        }
+        assert_eq!(
+            h.base_volume, 25.0,
+            "remember applies as well as binds, which is what makes 25 \
+             the level the next track measures against"
+        );
+
+        // `skip()` onto a track of another album, through the hook the
+        // advance itself uses.
+        let other = crate::search::SearchItem::Song {
+            id: "other-1".into(),
+            title: "another song".into(),
+            artist: "artist".into(),
+            album: "another album".into(),
+            client: crate::browse::tests::test_client(),
+        };
+        let started = {
+            let mut core = h.ctx(&player);
+            track_started(&other, &mut core)
+        };
+        assert!(
+            started
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::SetVolume(shellsong::Level::Absolute(v)) if *v == 80.0)),
+            "the unbound album has to go back to 80; staying at 25 is the \
+             bug, and it lasts the session: {:?}",
+            started.ops
+        );
+    }
+
+    /// `go_to_previous` fired three of the five track-start hooks by
+    /// hand, which is the same parity bug as the test above: skip back
+    /// onto a bound track and none of its eq, volume or speed applied,
+    /// and with crossfade on the volume stayed wherever the fade-out
+    /// ramp last wrote it for the whole track.
+    ///
+    /// Through `Op::SkipBack` rather than `track_started`, because
+    /// calling the hook directly would pass with the call site still
+    /// firing three by hand; that is how the test above was wrong on
+    /// its first draft.
+    ///
+    /// `#[ignore]` for the usual reason: `CoreCtx` holds a live mpv.
+    #[test]
+    #[ignore]
+    fn skipping_back_applies_the_previous_tracks_bound_eq() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+
+        let songs = test_songs(2);
+        let (prev, current) = (songs[0].clone(), songs[1].clone());
+        let tier = shellsong::Tier::Track;
+        let name = shellsong_host::name_at(&shellsong_host::identity_of(&prev), tier)
+            .expect("a song has a track identity");
+        h.bindings
+            .remember(tier, &name, &shellsong::Setting::Eq("rock".to_string()));
+        h.queue.reset(vec![current]);
+        h.previous_track = Some(prev);
+
+        let mut surf = Capturing::default();
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::SkipBack, &mut core, &mut surf);
+        }
+        assert!(
+            surf.queued
+                .iter()
+                .any(|op| matches!(op, Op::SetEqPreset(n) if n == "rock")),
+            "skip-back has to apply what the track it goes back to is \
+             bound to, same as advancing onto it does: {:?}",
+            surf.queued
+        );
+    }
+
+    /// `lyrics::Loader::invalidate` had no production caller at all,
+    /// and the `#[cfg_attr(not(test), allow(dead_code))]` on the impl
+    /// is why nothing flagged it. The symptom is the pane opening
+    /// unprompted: press the lyrics key three seconds before a track
+    /// ends, let it auto-advance, and lrclib's answer opens the pane
+    /// over the next track.
+    ///
+    /// Asserted through the hook rather than on the loader on its own,
+    /// which `lyrics::tests` already covers; the missing half was
+    /// nobody calling it.
+    ///
+    /// `#[ignore]` for the usual reason: `CoreCtx` holds a live mpv.
+    #[test]
+    #[ignore]
+    fn a_track_change_disowns_an_in_flight_lyrics_fetch() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        // what the lyrics key and `view(lyrics)` both do.
+        h.lyrics_loader
+            .request(&h.lyrics_client, "crest", "bladee", "crest", "crest", None);
+        assert_eq!(
+            h.lyrics_loader.pending(),
+            Some("crest"),
+            "the fetch has to be in flight for this to say anything"
+        );
+
+        let next = test_songs(1).remove(0);
+        {
+            let mut core = h.ctx(&player);
+            track_started(&next, &mut core);
+        }
+        assert_eq!(
+            h.lyrics_loader.pending(),
+            None,
+            "the fetch outlived the track it was asked for, so its \
+             answer will open the pane over the next one"
         );
     }
 
@@ -4450,8 +5008,8 @@ mod seam_tests {
         let mut r = TrackResolver::new();
         let before = r.epoch();
         r.invalidate();
-        r.deliver(before, Intent::Back, test_songs(2));
-        r.deliver(before, Intent::Download, test_songs(5));
+        r.deliver(before, Some(0), Intent::Back, test_songs(2));
+        r.deliver(before, None, Intent::Download, test_songs(5));
         let landed: Vec<(Intent, usize)> = std::iter::from_fn(|| r.poll())
             .map(|(into, _, tracks)| (into, tracks.unwrap().len()))
             .collect();
@@ -4465,7 +5023,7 @@ mod seam_tests {
     #[test]
     fn a_current_batch_arrives_with_its_destination() {
         let mut r = TrackResolver::new();
-        r.deliver(r.epoch(), Intent::Front, test_songs(2));
+        r.deliver(r.epoch(), Some(0), Intent::Front, test_songs(2));
         let (into, _, tracks) = r.poll().expect("a current batch lands");
         assert_eq!(into, Intent::Front, "it must queue where it was asked to");
         assert_eq!(tracks.unwrap().len(), 2);
@@ -4589,5 +5147,583 @@ mod result_echo {
         assert!(results.len() > MAX_ECHOED_RESULTS);
         let lines = echo_lines(&results, &mut HashSet::new(), 76);
         assert!(lines.last().unwrap().starts_with('+'), "{:?}", lines.last());
+    }
+}
+
+/// What is and is not a listen, variant by variant.
+///
+/// `scrobble_metadata` had no tests at all, and it is the only gate in
+/// front of a public ListenBrainz profile: everything downstream of it
+/// (`build_submit_body`, `should_scrobble`) was fully covered, which
+/// is what made the gap easy to miss. The wiring half of this, that a
+/// refused item never reaches a submission, is
+/// `listenbrainz::submission_wiring`.
+#[cfg(test)]
+mod scrobble_metadata_tests {
+    use super::*;
+    use crate::browse::fixtures::test_client;
+
+    /// Spelled out per arm with no `_`, so adding a variant to
+    /// `SearchItem` stops compiling here until somebody decides
+    /// whether it is a listen. That is the whole reason `Silence` is a
+    /// variant rather than a `LocalMusic` with an `av://` path.
+    fn is_a_listen(item: &SearchItem) -> bool {
+        match item {
+            SearchItem::LocalMusic { .. } | SearchItem::Song { .. } => true,
+            SearchItem::Silence { .. }
+            | SearchItem::LocalVideo { .. }
+            | SearchItem::Artist { .. }
+            | SearchItem::Album { .. }
+            | SearchItem::Playlist { .. } => false,
+        }
+    }
+
+    fn one_of_every_variant() -> Vec<SearchItem> {
+        let client = test_client();
+        vec![
+            SearchItem::LocalMusic {
+                path: std::path::PathBuf::from("/music/hex.flac"),
+                title: "hex".into(),
+                artist: Some("bladee".into()),
+                album: Some("crest".into()),
+            },
+            SearchItem::LocalVideo {
+                path: std::path::PathBuf::from("/videos/clip.mkv"),
+                title: "clip".into(),
+            },
+            SearchItem::Silence { secs: 900 },
+            SearchItem::Artist {
+                id: "ar1".into(),
+                name: "bladee".into(),
+                client: client.clone(),
+            },
+            SearchItem::Album {
+                id: "al1".into(),
+                name: "crest".into(),
+                artist: "bladee".into(),
+                client: client.clone(),
+            },
+            SearchItem::Song {
+                id: "s1".into(),
+                title: "icedancer".into(),
+                artist: "bladee".into(),
+                album: "cold visions".into(),
+                client: client.clone(),
+            },
+            SearchItem::Playlist {
+                id: "pl1".into(),
+                name: "late night".into(),
+                client,
+            },
+        ]
+    }
+
+    #[test]
+    fn every_variant_either_is_a_listen_or_is_refused() {
+        let all = one_of_every_variant();
+        assert_eq!(all.len(), 7, "one of every variant, or this proves less");
+        for item in &all {
+            assert_eq!(
+                scrobble_metadata(item).is_some(),
+                is_a_listen(item),
+                "{item:?}"
+            );
+        }
+    }
+
+    /// The site that earned `Silence` its own variant: a fifteen-minute
+    /// gap in the queue is not a track called "silence".
+    #[test]
+    fn a_fifteen_minute_silence_is_never_a_listen() {
+        assert!(scrobble_metadata(&SearchItem::Silence { secs: 900 }).is_none());
+        assert!(scrobble_metadata(&SearchItem::Silence { secs: 1 }).is_none());
+    }
+
+    /// `artist_name` is required by the api, and a listen with an empty
+    /// artist is a row nobody can read on their own profile.
+    #[test]
+    fn local_music_with_no_artist_tag_is_refused_rather_than_sent_blank() {
+        let untagged = SearchItem::LocalMusic {
+            path: std::path::PathBuf::from("/music/untagged.flac"),
+            title: "an untagged rip".into(),
+            artist: None,
+            album: None,
+        };
+        assert!(scrobble_metadata(&untagged).is_none());
+    }
+
+    /// Which field goes where, since nothing pinned it: an artist
+    /// submitted as the track name is a listen for a track that does
+    /// not exist, and it is not reversible from here.
+    #[test]
+    fn a_listen_carries_the_artist_title_and_album_in_their_own_fields() {
+        let meta = scrobble_metadata(&SearchItem::Song {
+            id: "s1".into(),
+            title: "icedancer".into(),
+            artist: "bladee".into(),
+            album: "cold visions".into(),
+            client: test_client(),
+        })
+        .expect("a remote song is a listen");
+        assert_eq!(meta.artist_name, "bladee");
+        assert_eq!(meta.track_name, "icedancer");
+        assert_eq!(meta.release_name.as_deref(), Some("cold visions"));
+
+        let local = scrobble_metadata(&SearchItem::LocalMusic {
+            path: std::path::PathBuf::from("/music/hex.flac"),
+            title: "hex".into(),
+            artist: Some("bladee".into()),
+            album: Some("crest".into()),
+        })
+        .expect("a tagged local track is a listen too");
+        assert_eq!(local.artist_name, "bladee");
+        assert_eq!(local.track_name, "hex");
+        assert_eq!(local.release_name.as_deref(), Some("crest"));
+    }
+
+    /// An unknown album is omitted rather than submitted as an empty
+    /// release name; `release_name` is `skip_serializing_if` for
+    /// exactly this, and a remote `Song` spells "unknown" as `""`.
+    #[test]
+    fn an_unknown_album_is_no_release_rather_than_an_empty_one() {
+        let meta = scrobble_metadata(&SearchItem::Song {
+            id: "s1".into(),
+            title: "a single".into(),
+            artist: "bladee".into(),
+            album: String::new(),
+            client: test_client(),
+        })
+        .expect("a remote song is a listen");
+        assert_eq!(meta.release_name, None);
+    }
+}
+
+/// The one invariant the three playlist writers share: `PlayQueue`'s
+/// `entries` **is** mpv's playlist, same items, same order, same
+/// length, so an mpv `playlist-pos` of `i` resolves to `entries[i]`.
+///
+/// `load_playlist`, `resync_upcoming` and `enqueue_track` all write
+/// both sides together, and all three had zero test call sites: the
+/// `resolve_all` tests cover the pairing they were given but not one
+/// of the seams that uses it. One index of drift is a wrong title on
+/// the bar, a wrong scrobble and wrong art, which is what shipped
+/// once.
+///
+/// `#[ignore]` because these need a live mpv, the repo's convention
+/// (see `seam_tests`). Run with
+/// `cargo test --lib index_map -- --ignored`.
+#[cfg(test)]
+mod index_map_tests {
+    use super::*;
+
+    fn headless_mpv() -> mpv::Mpv {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        // measured on a desktop that may have a real wim playing:
+        // exercise the control path, do not touch the speakers.
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        player
+    }
+
+    fn empty_cache() -> Arc<Mutex<CacheIndex>> {
+        Arc::new(Mutex::new(CacheIndex::default()))
+    }
+
+    /// A queue entry that needs no library, no server and no file on
+    /// disk, and whose length is its identity: two different silences
+    /// have two different paths, so a drifted index map is visible
+    /// rather than coincidentally right.
+    fn silence(secs: u64) -> SearchItem {
+        SearchItem::Silence { secs }
+    }
+
+    /// The entry kind that does not resolve to anything playable, and
+    /// the reason `resolve_all` exists.
+    fn an_album() -> SearchItem {
+        SearchItem::Album {
+            id: "al1".into(),
+            name: "crest".into(),
+            artist: "bladee".into(),
+            client: crate::browse::fixtures::test_client(),
+        }
+    }
+
+    fn mpv_playlist(player: &mpv::Mpv) -> Vec<String> {
+        let v = player
+            .get_property("playlist")
+            .expect("mpv reports its own playlist");
+        v.as_array()
+            .expect("the playlist is an array")
+            .iter()
+            .map(|e| e["filename"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn lengths(queue: &PlayQueue) -> Vec<u64> {
+        queue
+            .entries()
+            .iter()
+            .map(|item| match item {
+                SearchItem::Silence { secs } => *secs,
+                other => panic!("the queue kept something unplayable: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Both sides, index for index. The assertion the shipped
+    /// off-by-one would have failed.
+    fn assert_both_sides_agree(
+        player: &mpv::Mpv,
+        queue: &PlayQueue,
+        cache: &Arc<Mutex<CacheIndex>>,
+    ) {
+        let expected: Vec<String> = queue
+            .entries()
+            .iter()
+            .filter_map(|item| resolve_playable(item, cache))
+            .collect();
+        assert_eq!(
+            expected.len(),
+            queue.entries().len(),
+            "the index map holds an entry mpv was never given a path for: {:?}",
+            queue.entries()
+        );
+        assert_eq!(
+            mpv_playlist(player),
+            expected,
+            "mpv's playlist and the index map disagree"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn an_unplayable_entry_never_reaches_the_index_map() {
+        let player = headless_mpv();
+        let cache = empty_cache();
+        let mut queue = PlayQueue::default();
+        // the exact shape the bug needed: something unresolvable in
+        // the middle, so everything after it is what drifts.
+        let items = vec![silence(1), an_album(), silence(2), silence(3)];
+
+        let (status, played) = load_playlist(&player, &cache, &mut queue, items, SessionStart::New);
+        assert!(played, "{status}");
+        assert!(
+            status.contains("(1 skipped)"),
+            "a silently shortened queue is the bug: {status}"
+        );
+        assert_both_sides_agree(&player, &queue, &cache);
+        assert_eq!(lengths(&queue), vec![1, 2, 3], "order survives the drop");
+        assert_eq!(queue.pos(), Some(0), "the first playable entry is playing");
+    }
+
+    #[test]
+    #[ignore]
+    fn a_resync_keeps_the_playing_track_at_index_zero() {
+        let player = headless_mpv();
+        let cache = empty_cache();
+        let mut queue = PlayQueue::default();
+        let (status, played) = load_playlist(
+            &player,
+            &cache,
+            &mut queue,
+            vec![silence(1), silence(2)],
+            SessionStart::New,
+        );
+        assert!(played, "{status}");
+
+        // what `Op::ShuffleQueue` and the shuffle keybind hand it,
+        // with one entry that cannot be appended.
+        let status = resync_upcoming(
+            &player,
+            &cache,
+            &mut queue,
+            vec![silence(3), an_album(), silence(4)],
+        );
+        assert!(status.starts_with("shuffled"), "{status}");
+        assert!(status.contains("(1 skipped)"), "{status}");
+        assert_both_sides_agree(&player, &queue, &cache);
+        assert_eq!(
+            lengths(&queue),
+            vec![1, 3, 4],
+            "the playing track stays, the upcoming list is replaced"
+        );
+        assert_eq!(queue.pos(), Some(0));
+    }
+
+    #[test]
+    #[ignore]
+    fn an_enqueued_track_is_appended_to_both_sides() {
+        let player = headless_mpv();
+        let cache = empty_cache();
+        let mut queue = PlayQueue::default();
+        let (status, played) = load_playlist(
+            &player,
+            &cache,
+            &mut queue,
+            vec![silence(1)],
+            SessionStart::New,
+        );
+        assert!(played, "{status}");
+
+        let status = enqueue_track(&player, &silence(2), &cache, &mut queue, false);
+        assert!(status.starts_with("queued: "), "{status}");
+        assert_both_sides_agree(&player, &queue, &cache);
+        assert_eq!(lengths(&queue), vec![1, 2]);
+    }
+
+    /// Shuffle is where the two sides are written in *different
+    /// orders*: `append` picks the slot locally and mpv is asked to
+    /// move afterwards, so this is the case that can drift.
+    #[test]
+    #[ignore]
+    fn a_shuffled_enqueue_keeps_the_two_sides_in_step() {
+        let player = headless_mpv();
+        let cache = empty_cache();
+        let mut queue = PlayQueue::default();
+        let (status, played) = load_playlist(
+            &player,
+            &cache,
+            &mut queue,
+            vec![silence(1), silence(2), silence(3), silence(4)],
+            SessionStart::New,
+        );
+        assert!(played, "{status}");
+
+        for secs in [10, 20, 30] {
+            let status = enqueue_track(&player, &silence(secs), &cache, &mut queue, true);
+            assert!(status.starts_with("queued: "), "{status}");
+            assert_both_sides_agree(&player, &queue, &cache);
+        }
+        assert_eq!(queue.entries().len(), 7);
+        assert_eq!(queue.pos(), Some(0), "shuffling in never moves what plays");
+    }
+}
+
+/// `enqueue_track`'s refusals are **its return string**, and its two
+/// callers read that string differently: `append_resolved` treats
+/// anything not starting with "error" as queued, while `enqueue_next`
+/// also checks "not ". Nothing pinned either prefix, so rewording the
+/// refusal silently changes which callers notice it.
+///
+/// `#[ignore]`: the function takes an mpv handle even on the path that
+/// refuses before touching it.
+#[cfg(test)]
+mod enqueue_status_tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn an_entity_that_is_not_one_track_is_refused_by_prefix() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let cache = Arc::new(Mutex::new(CacheIndex::default()));
+        let mut queue = PlayQueue::default();
+        let album = SearchItem::Album {
+            id: "al1".into(),
+            name: "crest".into(),
+            artist: "bladee".into(),
+            client: crate::browse::fixtures::test_client(),
+        };
+
+        let status = enqueue_track(&player, &album, &cache, &mut queue, false);
+        // the prefix is the contract: `enqueue_next` reads "not ",
+        // `append_resolved` reads only "error" and would report this
+        // album as queued.
+        assert!(
+            status.starts_with("not "),
+            "the refusal prefix both callers parse: {status}"
+        );
+        assert!(
+            queue.entries().is_empty(),
+            "a refused item must not reach the index map"
+        );
+        assert!(
+            player
+                .get_property("playlist")
+                .expect("mpv reports its playlist")
+                .as_array()
+                .expect("an array")
+                .is_empty(),
+            "and nothing must reach mpv either"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn a_queued_track_reports_the_success_prefix_neither_caller_treats_as_failure() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let cache = Arc::new(Mutex::new(CacheIndex::default()));
+        let mut queue = PlayQueue::default();
+
+        let status = enqueue_track(
+            &player,
+            &SearchItem::Silence { secs: 5 },
+            &cache,
+            &mut queue,
+            false,
+        );
+        assert!(status.starts_with("queued: "), "{status}");
+        assert!(!status.starts_with("error"), "{status}");
+        assert!(!status.starts_with("not "), "{status}");
+        assert_eq!(queue.entries().len(), 1);
+    }
+}
+
+/// The reported "pressing enter twice downloads it" bug, at the call
+/// site rather than in the policy function.
+///
+/// `should_auto_download` has five tests and `note_playback_started`,
+/// its only caller, had none, so swapping its first two arguments (the
+/// day count and the threshold) left every one of those five green and
+/// put the bug straight back.
+#[cfg(test)]
+mod auto_download_wiring_tests {
+    use super::*;
+
+    /// `note_playback_started` saves the cache index through
+    /// `cache::cache_dir()` itself, so without redirecting that this
+    /// test would overwrite the real `~/.cache/wim/index.ndjson` with
+    /// its own fixture. Set once for the process and never put back:
+    /// any later test is safer pointing at a temp dir than at the real
+    /// cache. A `persist` hook on `DownloadCtx` (the shape
+    /// `download::Sink` already uses) would remove the need for this.
+    fn redirected_cache_dir() -> std::path::PathBuf {
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("wim-core-cache-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("a temp cache dir");
+            std::env::set_var("XDG_CACHE_HOME", &dir);
+            dir
+        })
+        .clone()
+    }
+
+    /// Fails loudly rather than writing the real cache, if the
+    /// redirect above ever stops being honoured.
+    fn assert_cache_is_redirected() {
+        let dir = redirected_cache_dir();
+        let live = cache::cache_dir().expect("a cache dir");
+        assert!(
+            live.starts_with(&dir),
+            "a test must never write the real cache index: {live:?}"
+        );
+    }
+
+    fn song(id: &str) -> SearchItem {
+        SearchItem::Song {
+            id: id.into(),
+            title: "icedancer".into(),
+            artist: "bladee".into(),
+            album: "cold visions".into(),
+            client: crate::browse::fixtures::test_client(),
+        }
+    }
+
+    struct Hooks {
+        cache: Arc<Mutex<CacheIndex>>,
+        downloading: HashSet<String>,
+        notifications: Notifications,
+        tx: mpsc::Sender<DownloadEvent>,
+        _rx: mpsc::Receiver<DownloadEvent>,
+    }
+
+    impl Hooks {
+        fn new() -> Hooks {
+            let (tx, _rx) = mpsc::channel();
+            Hooks {
+                cache: Arc::new(Mutex::new(CacheIndex::default())),
+                downloading: HashSet::new(),
+                notifications: Notifications::default(),
+                tx,
+                _rx,
+            }
+        }
+
+        fn play(&mut self, item: &SearchItem, day_threshold: u32) {
+            let mut dctx = DownloadCtx {
+                cache: &self.cache,
+                download_tx: &self.tx,
+                downloading: &mut self.downloading,
+                day_threshold,
+            };
+            note_playback_started(item, &mut dctx, &mut self.notifications);
+        }
+
+        fn downloading_now(&self) -> bool {
+            !self.downloading.is_empty()
+        }
+
+        fn said_downloading(&self) -> bool {
+            self.notifications
+                .visible()
+                .iter()
+                .any(|n| n.message.contains("downloading"))
+        }
+    }
+
+    /// The bug itself: four plays in one sitting are one distinct day,
+    /// so nothing is cached. Swapping the two arguments makes the
+    /// threshold the thing compared against 1, and the first play
+    /// downloads.
+    #[test]
+    fn four_plays_in_one_sitting_are_still_one_day() {
+        assert_cache_is_redirected();
+        let mut hooks = Hooks::new();
+        let track = song("auto-same-day");
+        for _ in 0..4 {
+            hooks.play(&track, 3);
+        }
+        assert!(
+            !hooks.downloading_now(),
+            "pressing enter again is not another day"
+        );
+        assert!(!hooks.said_downloading(), "and nothing is announced");
+    }
+
+    /// The positive control: the policy does fire, so the test above
+    /// cannot be passing because the whole path is dead.
+    #[test]
+    fn the_third_distinct_day_caches_the_track() {
+        assert_cache_is_redirected();
+        let mut hooks = Hooks::new();
+        let track = song("auto-third-day");
+        {
+            let mut idx = hooks.cache.lock().unwrap();
+            idx.record_play("auto-third-day", "2026-10-01");
+            idx.record_play("auto-third-day", "2026-10-02");
+        }
+
+        hooks.play(&track, 3);
+        assert!(
+            hooks.downloading_now(),
+            "the third distinct day is what the threshold means"
+        );
+        assert!(
+            hooks.said_downloading(),
+            "and a download in flight is on screen"
+        );
+    }
+
+    /// One in-flight download per track, however many times it is
+    /// played: `downloading` is the guard, and it is read here rather
+    /// than in the policy.
+    #[test]
+    fn a_track_already_downloading_is_not_started_twice() {
+        assert_cache_is_redirected();
+        let mut hooks = Hooks::new();
+        let track = song("auto-in-flight");
+        {
+            let mut idx = hooks.cache.lock().unwrap();
+            idx.record_play("auto-in-flight", "2026-10-01");
+            idx.record_play("auto-in-flight", "2026-10-02");
+        }
+        hooks.play(&track, 3);
+        let after_first = hooks.notifications.visible().len();
+        hooks.play(&track, 3);
+        assert_eq!(
+            hooks.notifications.visible().len(),
+            after_first,
+            "a second play must not start a second transfer"
+        );
     }
 }
