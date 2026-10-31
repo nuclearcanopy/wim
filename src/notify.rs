@@ -232,6 +232,20 @@ impl Notifications {
             .retain(|n| n.progress.is_some() || n.shown_at.elapsed() < n.lifetime);
     }
 
+    /// Takes every pending message as text and clears them. For a
+    /// front-end with no toast layer (shellswim), where an overlay
+    /// would cover the thing it is talking about; the scrollback is
+    /// the only output it has.
+    pub fn drain_text(&mut self) -> Vec<String> {
+        let out = self
+            .items
+            .iter()
+            .map(|n| n.message.clone())
+            .collect::<Vec<_>>();
+        self.items.clear();
+        out
+    }
+
     pub fn visible(&self) -> &[Notification] {
         &self.items
     }
