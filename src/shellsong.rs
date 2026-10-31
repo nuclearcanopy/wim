@@ -2652,7 +2652,11 @@ fn statements(input: &str) -> Vec<(usize, &str)> {
                 push_statement(input, start, i, &mut out);
                 start = i + 1;
             }
-            '#' if !quoted => {
+            // depth-guarded like the other separators: a `#` inside a
+            // call is part of the argument, so `play(track #3)` plays
+            // the track rather than truncating to `play(track` and
+            // reporting an unclosed paren with no mention of the `#`.
+            '#' if !quoted && depth <= 0 => {
                 push_statement(input, start, i, &mut out);
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
@@ -2694,25 +2698,43 @@ fn err(input: &str, offset: usize, token: &str, message: impl Into<String>) -> P
     }
 }
 
-/// Index of the `)` matching the `(` at `open`, quote- and depth-aware.
-fn matching(text: &str, open: usize) -> Option<usize> {
+/// What closed the `(` at `open`, if anything.
+enum Close {
+    /// index of the matching `)`.
+    At(usize),
+    /// a closer of the wrong kind: where it is, the opener it landed
+    /// on, and the closer that was written.
+    Wrong(usize, char, char),
+    Missing,
+}
+
+/// The `)` matching the `(` at `open`, quote- and depth-aware. A closer
+/// has to match its own opener: counting depth alone let `]` close a
+/// `(`, so `play(crest]` parsed and ran with nothing said.
+fn matching(text: &str, open: usize) -> Close {
     let bytes = text.as_bytes();
-    let mut depth = 0i32;
+    let mut stack: Vec<char> = Vec::new();
     let mut quoted = false;
     for (i, b) in bytes.iter().enumerate().skip(open) {
-        match *b as char {
+        let c = *b as char;
+        match c {
             '"' => quoted = !quoted,
-            '(' | '[' if !quoted => depth += 1,
+            '(' | '[' if !quoted => stack.push(c),
             ')' | ']' if !quoted => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
+                let want = if c == ')' { '(' } else { '[' };
+                match stack.pop() {
+                    None => return Close::Missing,
+                    Some(opener) if opener != want => return Close::Wrong(i, opener, c),
+                    Some(_) => {}
+                }
+                if stack.is_empty() {
+                    return Close::At(i);
                 }
             }
             _ => {}
         }
     }
-    None
+    Close::Missing
 }
 
 /// Splits on commas at depth 0, keeping each piece's offset so an error
@@ -2796,6 +2818,16 @@ fn parse_let(input: &str, offset: usize, text: &str, world: &World) -> Result<Ca
             missing(command, &command.params[1]),
         ));
     }
+    // only the first `=` is the binding, so a typed `==` used to bind
+    // the name to the literal "= [x]" and report "defined a: 1 terms".
+    if value.starts_with('=') {
+        return Err(err(
+            input,
+            value_offset,
+            value,
+            "let takes one '=': write let name = [a, b]",
+        ));
+    }
     let args = vec![
         coerce(input, command, &command.params[0], offset, name, world)?,
         coerce(
@@ -2841,13 +2873,25 @@ fn parse_call(input: &str, offset: usize, text: &str, world: &World) -> Result<C
             "command names are lowercase snake_case",
         ));
     }
-    let Some(rp) = matching(text, lp) else {
-        return Err(err(
-            input,
-            offset + lp,
-            "(",
-            format!("{name}( is never closed"),
-        ));
+    let rp = match matching(text, lp) {
+        Close::At(i) => i,
+        Close::Wrong(i, opener, found) => {
+            let want = if opener == '(' { ')' } else { ']' };
+            return Err(err(
+                input,
+                offset + i,
+                &found.to_string(),
+                format!("{name}: {opener} is closed with {found}; write {want}"),
+            ));
+        }
+        Close::Missing => {
+            return Err(err(
+                input,
+                offset + lp,
+                "(",
+                format!("{name}( is never closed"),
+            ))
+        }
     };
     let trailing = text[rp + 1..].trim();
     if !trailing.is_empty() {
@@ -2876,6 +2920,10 @@ fn parse_call(input: &str, offset: usize, text: &str, world: &World) -> Result<C
     }
 
     let mut kind = kind;
+    // `kind=` written twice used to last-win in silence, so a line
+    // edited from `kind=album` to `kind=artist` could keep searching by
+    // whichever copy came last.
+    let mut said_kind = false;
     let mut positional: Vec<(usize, &str)> = Vec::new();
     for (off, piece) in raw {
         match kwarg(piece) {
@@ -2883,6 +2931,15 @@ fn parse_call(input: &str, offset: usize, text: &str, world: &World) -> Result<C
             // canonical for `help()` and `dry()`, the short one is
             // what anyone actually types.
             Some(("kind" | "k", value)) => {
+                if said_kind {
+                    return Err(err(
+                        input,
+                        off,
+                        piece,
+                        format!("{name}: kind= is given twice; keep the one you meant"),
+                    ));
+                }
+                said_kind = true;
                 if !widenable(command) {
                     let why = if command.prefs.is_empty() {
                         format!("{name} does not search, so kind= means nothing here")
@@ -2931,6 +2988,9 @@ fn parse_call(input: &str, offset: usize, text: &str, world: &World) -> Result<C
     }
     if command.name == "remember" {
         check_remember(input, &args, &positional)?;
+    }
+    if command.name == "fade" {
+        check_fade(input, &args, &positional)?;
     }
     Ok(Call {
         command,
@@ -2986,6 +3046,23 @@ fn check_remember(
             why,
         )),
     }
+}
+
+/// `fade`'s `over` shares `Ty::Duration` with `gap` and `sleep`, where
+/// `off` is a real instruction ("no gap", "cancel the timer"). A fade
+/// over no time is not one, and `simple_op` only ever matched
+/// `Some(secs)`, so `fade(out, off)` silently faded over the default 5s
+/// instead of saying that `off` means nothing here.
+fn check_fade(input: &str, args: &[Arg], positional: &[(usize, &str)]) -> Result<(), ParseError> {
+    let Some(at) = args.iter().position(|a| matches!(a, Arg::Duration(None))) else {
+        return Ok(());
+    };
+    Err(err(
+        input,
+        positional.get(at).map(|(o, _)| *o).unwrap_or(0),
+        positional.get(at).map(|(_, t)| *t).unwrap_or("off"),
+        "fade has no off; write fade(out, 2s), or fade(out) for the default",
+    ))
 }
 
 /// The "you left out a required argument" message. Carries the
@@ -3714,6 +3791,10 @@ impl Console {
                 self.refresh(cand);
             }
             KeyCode::Delete => {
+                // cleared like `Char` and `Backspace` do: editing the
+                // line is what retires the error it was reported for,
+                // and delete edits the line.
+                self.error = None;
                 self.cycle = None;
                 if let Some(next) = next_boundary(&self.input, self.cursor) {
                     self.input.replace_range(self.cursor..next, "");
@@ -4768,6 +4849,13 @@ mod tests {
         assert!(error_in("let(mix, [hex])", &empty)
             .message
             .contains("let is not a call"));
+        // only the first `=` is the binding, so a typed `==` used to
+        // bind the name to the literal "= [x]" and report "defined a:
+        // 1 terms".
+        for bad in ["let a == [hex]", "let a = = hex", "let a ==hex"] {
+            let e = error_in(bad, &empty);
+            assert!(e.message.contains("takes one '='"), "{bad}: {}", e.message);
+        }
     }
 
     #[test]
@@ -5405,6 +5493,23 @@ mod tests {
         assert_eq!(ops("# nothing but a comment"), Vec::<Op>::new());
     }
 
+    /// The `#` was the one separator not guarded by `depth <= 0`, so a
+    /// name with a `#` in it was cut in half: `play(track #3)` became
+    /// `play(track` and reported "play( is never closed", never
+    /// mentioning the `#` that caused it.
+    #[test]
+    fn a_hash_inside_a_call_is_part_of_the_argument_not_a_comment() {
+        assert_eq!(terms_of("play(track #3)"), ["track #3"]);
+        assert_eq!(terms_of("queue([hex #2, crest])"), ["hex #2", "crest"]);
+        // and still a comment everywhere it already was: after a closed
+        // call, and as a whole line.
+        assert_eq!(
+            ops("pause() # skip() here would be a comment"),
+            vec![Op::TogglePause]
+        );
+        assert_eq!(ops("# nothing but a comment"), Vec::<Op>::new());
+    }
+
     #[test]
     fn a_call_may_span_lines_because_splitting_is_depth_aware() {
         assert_eq!(terms_of("queue([hex,\n  crest])"), ["hex", "crest"]);
@@ -5523,6 +5628,21 @@ mod tests {
         assert_eq!(suffixed[0], "would run: queue(crest, kind=album)");
     }
 
+    /// A repeated `kind=` used to last-win in silence, so a line edited
+    /// from one rung to another searched by whichever copy came last.
+    #[test]
+    fn kind_given_twice_is_refused_rather_than_last_wins() {
+        let e = error("queue([crest], kind=album, kind=any)");
+        assert!(e.message.contains("kind= is given twice"), "{}", e.message);
+        // the short spelling is the same argument, so writing one of
+        // each is still twice.
+        let e = error("queue([crest], kind=album, k=any)");
+        assert!(e.message.contains("kind= is given twice"), "{}", e.message);
+        // one of them is still fine, and a suffix is not a second one.
+        assert!(Program::parse("queue([crest], kind=album)").is_ok());
+        assert!(Program::parse("queue_aa([crest])").is_ok());
+    }
+
     /// Deleted on purpose: an artist expands to a whole discography,
     /// which is never a queue anyone wanted.
     #[test]
@@ -5596,6 +5716,23 @@ mod tests {
         let e = error("pause() ; QUEUE(hex)");
         assert!(e.message.contains("snake_case"), "{}", e.message);
         assert_eq!(e.column, 11, "column should point at the offending name");
+    }
+
+    /// `play(crest]` was accepted and run: `matching` counted depth
+    /// without asking whether a closer belonged to its opener, so `]`
+    /// closed the `(` and the line executed with nothing said.
+    #[test]
+    fn a_closer_has_to_match_its_own_opener() {
+        let e = error("play(crest]");
+        assert!(e.message.contains("( is closed with ]"), "{}", e.message);
+        assert!(e.message.contains("write )"), "{}", e.message);
+        assert_eq!(e.column, 11, "it points at the wrong bracket");
+        let e = error("queue([hex)");
+        assert!(e.message.contains("[ is closed with )"), "{}", e.message);
+        assert!(e.message.contains("write ]"), "{}", e.message);
+        // the matched spellings are untouched, nesting included.
+        assert_eq!(terms_of("queue([hex, crest])"), ["hex", "crest"]);
+        assert!(Program::parse("repeat(2, queue([hex]))").is_ok());
     }
 
     // --------------------------------------------- the selection rule
@@ -6295,6 +6432,12 @@ mod tests {
                 secs: DEFAULT_FADE_SECS
             }]
         );
+        // `fade`'s `over` shares the same `Ty::Duration` and so accepts
+        // `off`, but `simple_op` only ever matched `Some(secs)`: this
+        // used to fade over the default 5s and say nothing.
+        let e = error("fade(out, off)");
+        assert!(e.message.contains("fade has no off"), "{}", e.message);
+        assert!(e.message.contains("fade(out, 2s)"), "{}", e.message);
     }
 
     /// `f64::parse` accepts `inf` and `nan`, and the host turns every
@@ -6596,11 +6739,28 @@ mod tests {
                 "'{name}' cannot be reached by tab"
             );
         }
-        // the corpus is the half that still has to be capped: it is as
-        // long as the library.
-        let wide = Fake::new(&["flatline"]);
-        let here = site("play(", 5);
-        assert!(c.candidates_at(&here, &wide).len() <= MAX_CANDIDATES);
+    }
+
+    /// The corpus is the half that has to be capped: it is as long as
+    /// the library, and the popup draws what it is handed. A one-item
+    /// corpus against a cap of 50 could not fail, so dropping the
+    /// `MAX_CANDIDATES` from the `CorpusTerms` arm and shipping a
+    /// 20k-row completion list broke no test.
+    #[test]
+    fn a_corpus_wider_than_the_cap_is_cut_to_it() {
+        let wide = ManyNames::new(MAX_CANDIDATES * 3);
+        let offered = wide.corpus("blade");
+        assert!(
+            offered.len() > MAX_CANDIDATES,
+            "the fixture no longer exceeds the cap, so this test is about nothing"
+        );
+        assert!(
+            offered.iter().all(|n| extends("blade", n)),
+            "the prefix filter has to keep all of them, or it is doing the capping"
+        );
+        let c = Console::empty();
+        let here = site("play(blade", 10);
+        assert_eq!(c.candidates_at(&here, &wide).len(), MAX_CANDIDATES);
     }
 
     #[test]
@@ -6711,6 +6871,25 @@ mod tests {
         }
         fn scope(&self) -> &Scope {
             &self.vars
+        }
+    }
+
+    /// A host-shaped provider of `n` corpus names, every one a prefix
+    /// extension of "blade", so the prefix filter keeps all of them and
+    /// only the console's own cap can shorten the list. `MAX_CANDIDATES`
+    /// is what the real `CorpusCandidates` hands over, so that width is
+    /// the realistic one; exercising the cap needs more.
+    struct ManyNames(Vec<String>);
+
+    impl ManyNames {
+        fn new(n: usize) -> ManyNames {
+            ManyNames((0..n).map(|i| format!("blade runner blues {i}")).collect())
+        }
+    }
+
+    impl Candidates for ManyNames {
+        fn corpus(&self, _token: &str) -> Vec<String> {
+            self.0.clone()
         }
     }
 
@@ -7199,6 +7378,21 @@ mod tests {
         assert!(error.starts_with("col 1:"), "{error}");
         assert!(c.history().is_empty(), "a bad line is not remembered");
         press(&mut c, &fake, KeyCode::Backspace);
+        assert!(c.error.is_none());
+    }
+
+    /// Delete edits the line too, so it has to retire the error the
+    /// same way `Char` and `Backspace` do; it cleared only the cycle,
+    /// so a stale message sat under a line that no longer produced it.
+    #[test]
+    fn delete_clears_the_error_like_every_other_edit() {
+        let fake = Fake::new(&[]);
+        let mut c = console_with(&fake, "shufle()");
+        press(&mut c, &fake, KeyCode::Enter);
+        assert!(c.error.is_some(), "the bad line should have reported");
+        c.cursor = 0;
+        press(&mut c, &fake, KeyCode::Delete);
+        assert_eq!(c.input, "hufle()");
         assert!(c.error.is_none());
     }
 
@@ -8526,27 +8720,6 @@ queue(morning)
 
     // ------------------------------------------------------- benchmarks
 
-    /// A host-shaped provider: hands back exactly the 50 names the real
-    /// `CorpusCandidates` caps at, so the console-side cost is measured
-    /// against the list length it really sees.
-    struct FiftyNames(Vec<String>);
-
-    impl FiftyNames {
-        fn new() -> FiftyNames {
-            FiftyNames(
-                (0..MAX_CANDIDATES)
-                    .map(|i| format!("blade runner blues {i}"))
-                    .collect(),
-            )
-        }
-    }
-
-    impl Candidates for FiftyNames {
-        fn corpus(&self, _token: &str) -> Vec<String> {
-            self.0.clone()
-        }
-    }
-
     /// Not an assertion: prints the per-keystroke wall time of the whole
     /// `handle_key` -> `refresh` path, which is what decides whether the
     /// prompt feels instant. Absolute numbers are machine-dependent.
@@ -8554,7 +8727,7 @@ queue(morning)
     #[test]
     #[ignore = "timing benchmark, run manually"]
     fn bench_keystrokes() {
-        let cand = FiftyNames::new();
+        let cand = ManyNames::new(MAX_CANDIDATES);
         // a command name (every_name + the prefix filter), a corpus
         // term (the 50-name list), and a value parameter (hint only,
         // the cheap case) in one line each.
@@ -8580,6 +8753,57 @@ queue(morning)
             let keys = line.chars().count() as u32;
             let per = start.elapsed() / (iters * keys);
             println!("{:<52} {per:>10.3?}/key  worst {worst:>10.3?}", line);
+        }
+    }
+
+    /// Not an assertion: the two halves of one keystroke, timed apart,
+    /// against the 50 names the host really hands over and against a
+    /// whole library's worth. The last column is what the cap buys:
+    /// `keep_extensions` dedups against what it has already kept, so
+    /// with no cap the filter is quadratic in the number of matches,
+    /// and `iters` has to shrink per width to stay runnable at all.
+    /// `cargo test --release --bin wim -- --ignored --nocapture bench_candidates`
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_candidates() {
+        for (width, iters, wide_iters) in [
+            (MAX_CANDIDATES, 2_000u32, 2_000u32),
+            (1_000, 500, 100),
+            (5_000, 200, 5),
+            (20_000, 50, 2),
+        ] {
+            let cand = ManyNames::new(width);
+            let mut console = Console::empty();
+            type_in(&mut console, &cand, "play(blade runner");
+            let here = site(&console.input, console.cursor);
+            let start = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(console.candidates_at(&here, &cand));
+            }
+            let per_candidates = start.elapsed() / iters;
+            let start = Instant::now();
+            for _ in 0..iters {
+                console.refresh(&cand);
+            }
+            let per_refresh = start.elapsed() / iters;
+            // what the cap itself costs: the same prefix filter with
+            // and without it, over the same list.
+            let names = cand.corpus("blade runner");
+            let start = Instant::now();
+            for _ in 0..wide_iters {
+                std::hint::black_box(keep_extensions(
+                    "blade runner",
+                    names.iter().map(String::as_str),
+                    usize::MAX,
+                ));
+            }
+            let uncapped = start.elapsed() / wide_iters;
+            println!(
+                "{width:>6} names  candidates_at {per_candidates:>10.3?}  \
+                 refresh {per_refresh:>10.3?}  uncapped filter {uncapped:>10.3?}  \
+                 offered {}",
+                console.candidates_at(&here, &cand).len()
+            );
         }
     }
 }
