@@ -32,8 +32,8 @@ use crate::subsonic::{self, Album, Artist, Client, Playlist};
 /// How many distinct play days are kept per track. Only the count
 /// matters, but keeping the days themselves means raising the
 /// threshold later still has history to judge against; 64 is far past
-/// any threshold worth configuring and keeps `index.toml` from growing
-/// without bound for a track played every day for years.
+/// any threshold worth configuring and keeps the play index from
+/// growing without bound for a track played every day for years.
 const MAX_TRACKED_DAYS: usize = 64;
 
 /// Per-track bookkeeping, keyed by the track's stable navidrome id
@@ -119,8 +119,81 @@ pub fn tracks_dir() -> Result<PathBuf> {
     Ok(cache_dir()?.join("tracks"))
 }
 
-fn index_path() -> Result<PathBuf> {
-    Ok(cache_dir()?.join("index.toml"))
+/// One json line per tracked track. Same reasoning as `CatalogRow`
+/// and the same measurement behind it: this read is on the **main
+/// thread before the first frame** (main.rs builds the shared index
+/// there), and the write happens on every track change. At the size a
+/// long-running install reaches, toml was ~5x slower to parse and
+/// ~20x slower to render than this; see docs/startup-cache.md. One
+/// corrupt line also costs one track rather than the whole history,
+/// and it stays greppable.
+const INDEX_FILE: &str = "index.ndjson";
+
+/// The toml index `INDEX_FILE` replaced. Read once, when there is no
+/// ndjson yet, so an existing install keeps its play history; never
+/// written.
+const LEGACY_INDEX_FILE: &str = "index.toml";
+
+/// One `CacheEntry` as a row. Flat, with `Cow` fields, so a line with
+/// no escapes borrows straight out of it and only the strings actually
+/// kept are allocated.
+#[derive(Debug, Serialize, Deserialize)]
+struct PlayRow<'a> {
+    #[serde(borrow)]
+    id: Cow<'a, str>,
+    #[serde(default)]
+    play_count: u32,
+    #[serde(default, borrow)]
+    play_days: Vec<Cow<'a, str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_played_secs: Option<u64>,
+    #[serde(default, borrow, skip_serializing_if = "Option::is_none")]
+    cached_path: Option<Cow<'a, str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cached_at_secs: Option<u64>,
+}
+
+fn index_body(index: &CacheIndex) -> String {
+    let mut body = String::new();
+    for (id, entry) in &index.entries {
+        let row = PlayRow {
+            id: Cow::Borrowed(id),
+            play_count: entry.play_count,
+            play_days: entry
+                .play_days
+                .iter()
+                .map(|d| Cow::Borrowed(d.as_str()))
+                .collect(),
+            last_played_secs: entry.last_played_secs,
+            cached_path: entry.cached_path.as_deref().map(Cow::Borrowed),
+            cached_at_secs: entry.cached_at_secs,
+        };
+        if let Ok(line) = serde_json::to_string(&row) {
+            body.push_str(&line);
+            body.push('\n');
+        }
+    }
+    body
+}
+
+fn parse_index_body(raw: &str) -> CacheIndex {
+    let mut index = CacheIndex::default();
+    for row in raw
+        .lines()
+        .filter_map(|line| serde_json::from_str::<PlayRow>(line).ok())
+    {
+        index.entries.insert(
+            row.id.into_owned(),
+            CacheEntry {
+                play_count: row.play_count,
+                play_days: row.play_days.into_iter().map(Cow::into_owned).collect(),
+                last_played_secs: row.last_played_secs,
+                cached_path: row.cached_path.map(Cow::into_owned),
+                cached_at_secs: row.cached_at_secs,
+            },
+        );
+    }
+    index
 }
 
 /// Where a given track id would land on disk once downloaded, with the
@@ -487,26 +560,40 @@ fn restrict_dir_to_owner(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Best-effort, same leniency as `load_catalog`: whichever of the two
+/// files is there, and a fresh index if neither parses. The ndjson
+/// wins when both exist, since it is the only one `save_in` writes.
+fn load_in(dir: &Path) -> CacheIndex {
+    match fs::read_to_string(dir.join(INDEX_FILE)) {
+        Ok(raw) => parse_index_body(&raw),
+        Err(_) => fs::read_to_string(dir.join(LEGACY_INDEX_FILE))
+            .ok()
+            .and_then(|raw| toml::from_str(&raw).ok())
+            .unwrap_or_default(),
+    }
+}
+
+fn save_in(dir: &Path, index: &CacheIndex) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join(INDEX_FILE);
+    fs::write(&path, index_body(index)).with_context(|| format!("writing {}", path.display()))?;
+    // the toml index held a second copy of the same history and is
+    // dead the moment the line above lands; a failure to unlink it is
+    // nothing but a stale file in a cache dir, so it is not reported.
+    let _ = fs::remove_file(dir.join(LEGACY_INDEX_FILE));
+    Ok(())
+}
+
 impl CacheIndex {
     /// Best-effort load; a missing/corrupt index just means starting
     /// fresh (nothing known to be cached yet), not an error worth
     /// surfacing, same leniency as `persistence::load`.
     pub fn load() -> Self {
-        index_path()
-            .ok()
-            .and_then(|p| fs::read_to_string(p).ok())
-            .and_then(|raw| toml::from_str(&raw).ok())
-            .unwrap_or_default()
+        cache_dir().map(|dir| load_in(&dir)).unwrap_or_default()
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = index_path()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let toml = toml::to_string_pretty(self)?;
-        fs::write(&path, toml).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        save_in(&cache_dir()?, self)
     }
 
     /// Records a play that happened on `today` (`YYYY-MM-DD`), bumping
@@ -710,6 +797,123 @@ mod tests {
         let idx: CacheIndex = toml::from_str(raw).expect("old index must still parse");
         assert_eq!(idx.play_count("t1"), 3);
         assert_eq!(idx.days_played("t1"), 0);
+    }
+
+    #[test]
+    fn the_play_index_survives_a_round_trip_through_the_disk() {
+        let dir = scratch_dir("playindex");
+        let mut idx = CacheIndex::default();
+        idx.record_play("t1", "2026-01-01");
+        idx.record_play("t1", "2026-01-03");
+        idx.mark_cached("t1", PathBuf::from("/c/wim/tracks/t1.mp3"));
+        idx.record_play("t2", "2026-01-02");
+
+        save_in(&dir, &idx).unwrap();
+        let back = load_in(&dir);
+        assert_eq!(back.entries.len(), 2);
+        assert_eq!(back.play_count("t1"), 2);
+        assert_eq!(back.days_played("t1"), 2);
+        assert_eq!(
+            back.entry("t1").unwrap().play_days,
+            ["2026-01-01", "2026-01-03"],
+            "the day list is what the download threshold counts, and it is ordered"
+        );
+        assert_eq!(
+            back.entry("t1").unwrap().cached_path.as_deref(),
+            Some("/c/wim/tracks/t1.mp3")
+        );
+        assert_eq!(
+            back.entry("t1").unwrap().last_played_secs,
+            idx.entry("t1").unwrap().last_played_secs
+        );
+        assert_eq!(back.play_count("t2"), 1);
+        assert!(back.entry("t2").unwrap().cached_path.is_none(), "no blanks");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole point of the migration: someone who has been using
+    /// wim already has their play history in `index.toml`, and the
+    /// auto-download threshold is counted off it. Losing it would
+    /// silently reset everyone's history to zero.
+    #[test]
+    fn a_toml_index_from_before_the_format_change_is_still_read() {
+        let dir = scratch_dir("migrate");
+        fs::write(
+            dir.join(LEGACY_INDEX_FILE),
+            "[entries.t1]\nplay_count = 7\nplay_days = [\"2026-01-01\", \"2026-01-05\"]\n\
+             last_played_secs = 1767225600\ncached_path = \"/c/wim/tracks/t1.mp3\"\n",
+        )
+        .unwrap();
+
+        let back = load_in(&dir);
+        assert_eq!(back.play_count("t1"), 7, "the old history has to survive");
+        assert_eq!(back.days_played("t1"), 2);
+        assert_eq!(
+            back.entry("t1").unwrap().cached_path.as_deref(),
+            Some("/c/wim/tracks/t1.mp3")
+        );
+
+        // and the next save moves it over, leaving no second copy of
+        // the whole history behind.
+        save_in(&dir, &back).unwrap();
+        assert!(dir.join(INDEX_FILE).is_file());
+        assert!(
+            !dir.join(LEGACY_INDEX_FILE).exists(),
+            "a migrated index must not leave the old one on disk"
+        );
+        assert_eq!(load_in(&dir).play_count("t1"), 7);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The reason for one row per line here too: a truncated write or
+    /// a hand-edit costs one track, not every play count in the
+    /// install.
+    #[test]
+    fn a_corrupt_play_row_costs_one_track_not_the_history() {
+        let dir = scratch_dir("playcorrupt");
+        let mut idx = CacheIndex::default();
+        for id in ["t1", "t2", "t3"] {
+            idx.record_play(id, "2026-01-01");
+        }
+        save_in(&dir, &idx).unwrap();
+
+        let path = dir.join(INDEX_FILE);
+        let mut lines: Vec<String> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        lines[1] = "{\"id\":\"t2\",\"play_c".to_string(); // truncated mid-row
+        fs::write(&path, lines.join("\n")).unwrap();
+
+        assert_eq!(load_in(&dir).entries.len(), 2);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The row shape has to read back exactly what the toml shape
+    /// held, field for field, or the format changed under every index
+    /// already on disk. Same oracle idea as
+    /// `the_flat_row_reads_exactly_what_the_tagged_row_did`.
+    #[test]
+    fn the_row_shape_reads_exactly_what_the_toml_shape_did() {
+        let mut idx = CacheIndex::default();
+        idx.record_play("t1", "2026-01-01");
+        idx.record_play("t1", "2026-01-02");
+        idx.mark_cached("t1", PathBuf::from("/c/t1.mp3"));
+        idx.record_play("t2", "2026-01-02");
+        idx.entries.get_mut("t2").unwrap().last_played_secs = None;
+
+        let via_rows = parse_index_body(&index_body(&idx));
+        let via_toml: CacheIndex = toml::from_str(&toml::to_string_pretty(&idx).unwrap()).unwrap();
+        assert_eq!(via_rows.entries.len(), via_toml.entries.len());
+        for (id, want) in &via_toml.entries {
+            let got = via_rows.entries.get(id).expect("every track must survive");
+            assert_eq!(got.play_count, want.play_count, "{id}");
+            assert_eq!(got.play_days, want.play_days, "{id}");
+            assert_eq!(got.last_played_secs, want.last_played_secs, "{id}");
+            assert_eq!(got.cached_path, want.cached_path, "{id}");
+            assert_eq!(got.cached_at_secs, want.cached_at_secs, "{id}");
+        }
     }
 
     #[test]
@@ -1232,7 +1436,7 @@ mod tests {
     }
 
     /// Why newline-delimited json and not `toml::to_string_pretty`
-    /// (what `index.toml` uses) or pretty json: at catalog scale the
+    /// or pretty json: at catalog scale the
     /// format is most of the file. Prints the comparison; run with
     /// `cargo test -- --ignored --nocapture`.
     #[test]
@@ -1273,6 +1477,103 @@ mod tests {
              ndjson {ndjson_bytes} bytes, write {write:?}, load {read:?}\n  \
              albums alone: compact json array {compact} bytes, pretty {pretty} bytes"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A play index the size a long-running install reaches: `tracks`
+    /// entries, each with `days` recorded play days.
+    fn play_index(tracks: usize, days: usize) -> CacheIndex {
+        let mut idx = CacheIndex::default();
+        for t in 0..tracks {
+            idx.entries.insert(
+                format!("track-id-{t:08}"),
+                CacheEntry {
+                    play_count: days as u32,
+                    play_days: (0..days)
+                        .map(|d| day_of(1_700_000_000 + d as u64 * 86_400))
+                        .collect(),
+                    last_played_secs: Some(1_700_000_000),
+                    // only a minority of played tracks are ever
+                    // downloaded, so most rows carry no path.
+                    cached_path: (t % 10 == 0)
+                        .then(|| format!("/home/u/.cache/wim/tracks/track-id-{t:08}.mp3")),
+                    cached_at_secs: (t % 10 == 0).then_some(1_700_000_000),
+                },
+            );
+        }
+        idx
+    }
+
+    /// `CacheIndex::load` is the one startup read still on the **main
+    /// thread** (main.rs builds the `Arc<Mutex<_>>` before the first
+    /// frame), and `save` runs on every track change from that same
+    /// thread. Why it is not toml, at three install ages:
+    /// `cargo test --release -- --ignored --nocapture
+    /// cache_index_load_scaling`.
+    #[test]
+    #[ignore = "measurement, run explicitly"]
+    fn cache_index_load_scaling() {
+        for (tracks, days) in [(200usize, 3usize), (2_000, 3), (5_000, 4), (20_000, 64)] {
+            let idx = play_index(tracks, days);
+            let as_toml = toml::to_string_pretty(&idx).unwrap();
+            let (t_parse, t_back) = best_cpu(5, || toml::from_str::<CacheIndex>(&as_toml).unwrap());
+            let (t_render, _) = best_cpu(3, || toml::to_string_pretty(&idx).unwrap().len());
+            assert_eq!(t_back.entries.len(), tracks);
+
+            let as_rows = index_body(&idx);
+            let (r_parse, r_back) = best_cpu(5, || parse_index_body(&as_rows));
+            let (r_render, _) = best_cpu(3, || index_body(&idx).len());
+            assert_eq!(r_back.entries.len(), tracks);
+
+            println!(
+                "{tracks:>6} tracks x {days:>2} days | toml {:>9}B parse {t_parse:>10.3?} \
+                 render {t_render:>10.3?} | ndjson {:>9}B parse {r_parse:>10.3?} render {r_render:>10.3?}",
+                as_toml.len(),
+                as_rows.len()
+            );
+        }
+    }
+
+    /// Where a warm catalog read actually spends its time: the file
+    /// read, the header line, and the row parse, separately. The row
+    /// parse is the only one `catalog_parse_scaling` covers.
+    /// `cargo test --release -- --ignored --nocapture
+    /// catalog_load_phases`.
+    #[test]
+    #[ignore = "measurement, run explicitly"]
+    fn catalog_load_phases() {
+        let dir = scratch_dir("phases");
+        for rows in [34_000usize, 100_000] {
+            let body = body_of(rows);
+            let path = catalog_path(&dir, "k");
+            let header = serde_json::to_string(&CatalogHeader {
+                v: CATALOG_FORMAT,
+                id: catalog_id("k"),
+                sum: "ignored".into(),
+                at: 1,
+            })
+            .unwrap();
+            fs::write(&path, format!("{header}\n{body}")).unwrap();
+
+            let (read, raw) = best_cpu(5, || fs::read_to_string(&path).unwrap());
+            let (split, _) = best_cpu(5, || {
+                let mut s = raw.splitn(2, '\n');
+                let h: CatalogHeader = serde_json::from_str(s.next().unwrap()).unwrap();
+                h.v
+            });
+            let (parse, parsed) = best_cpu(5, || parse_rows(body.lines()));
+            let (whole, _) = best_cpu(5, || load_catalog_in(&dir, "k").unwrap());
+            assert_eq!(
+                parsed.0.albums.len(),
+                load_catalog_in(&dir, "k").unwrap().0.albums.len()
+            );
+            println!(
+                "{rows:>7} rows ({:>8} bytes)  read {read:>10.3?}  header {split:>10.3?}  \
+                 rows {parse:>10.3?}  whole {whole:>10.3?}  links {}",
+                raw.len(),
+                parsed.1.len()
+            );
+        }
         fs::remove_dir_all(&dir).ok();
     }
 
