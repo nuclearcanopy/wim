@@ -38,6 +38,7 @@ pub mod term;
 pub mod theme;
 pub mod trace;
 pub mod ui;
+pub mod undo;
 pub mod video;
 
 /// Which pane plain navigation (j/k/arrows/enter) currently targets.

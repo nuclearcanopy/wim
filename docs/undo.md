@@ -73,8 +73,16 @@ Plus, per node: the label from `Op::describe()`, which every op already
 has, so the tree gets human-readable rows for free; a timestamp; the
 parent; and the children in visit order.
 
-The snapshot is taken **before** the op applies. That is the restore
-point.
+The snapshot is the state **after** the op applied, and the root holds
+the state the session started in.
+
+**Corrected while building `src/undo.rs`.** This said *before*, which
+works for undo alone: restore the state the op replaced. But then redo
+has nothing to restore, because the state after an op is recorded
+nowhere, and a tree whose redo cannot move is a stack with extra steps.
+After-states make the two symmetric: undo restores the parent's
+snapshot, redo the child's. `redo_walks_back_down_the_branch` is the
+test that pins it.
 
 ## the three classes of op
 
@@ -124,15 +132,45 @@ trees become useless.
 Selection and view changes are navigation, not edits. (`Go` is a queue
 jump and belongs in class 1, despite reading like navigation.)
 
+### ops added since this table, now classified
+
+`SetGap` and `Silence` are class 1: a session setting and a queue
+mutation.
+
+`Define`, `Unset`, `Remember` and `Forget` are **class 1, not
+barriers**, which is a judgement worth stating. They do write a file,
+which is the rule that makes `SaveQueue` a barrier. The difference is
+whose artifact it is: a saved queue and a downloaded track are things
+the user now has, and undo would have to delete them. Variables and
+per-identity bindings are wim's own state, so restoring the scope and
+writing it back leaves nothing behind. The price is that **the snapshot
+has to carry vars and bindings**, and that is worth paying to be able
+to undo an accidental `unset` of a variable built up over a session.
+
+`classify` in `src/undo.rs` is an exhaustive match, so a new op cannot
+be added without being filed here.
+
 ## coalescing
 
 Without this the tree fills with noise and the feature dies.
 
 - A run of the same adjusting op within a short window is **one node**:
   holding `+` through twelve `SpeedUp`s, dragging the scrubber, or
-  walking the volume up. Coalesce on (same op kind, within N ms), and
-  keep the *first* snapshot of the run, since that is the state the user
-  wants back.
+  walking the volume up. Coalesce on (same op kind, within N ms).
+
+  **Keep the *latest* snapshot of the run, not the first.** This said
+  first, because "that is the state the user wants back" -- which is
+  right, and the conclusion was inverted by the before/after change
+  above. With after-states the state before a run is the *parent's*
+  snapshot, which coalescing never touches, so undo already lands
+  there. The run's own node should hold where the run ended, or redo
+  drops you back into the middle of it.
+
+  Two further rules, both found by testing rather than designed:
+  coalescing must not fold into a node that already has **children**
+  (that rewrites a state redo can reach, which is a silent lie about
+  history), and a **barrier never coalesces**, because undo has to be
+  able to name the one irreversible effect it stopped at.
 - Typing in the search box must not record per keystroke. One node per
   settled query, which `shellsong_host`'s `search_settled` already has
   a notion of.
