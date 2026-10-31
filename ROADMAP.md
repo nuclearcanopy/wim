@@ -863,13 +863,22 @@ the order below is not a preference, it is a dependency.
       then doing something new does not destroy the branch you left;
       it becomes a sibling you can walk back to, the way vim's undo
       tree works. thematically right for an app called wim.
-      **why this app can do it properly and others cannot:** every
-      state change already funnels through one choke point,
-      `apply_shellsong_op`, and every op already has
-      `Op::describe()`. so there is exactly one place to record
-      history, which is the difference between complete undo and
-      best-effort undo, and every node gets a human-readable label for
-      free. a branch of the tree is then *already* a list of ops, which
+      **correction to what this entry first claimed.** it said every
+      state change funnels through one choke point,
+      `apply_shellsong_op`. it does not, and the difference matters:
+      `run_shellsong_op` has 40 op arms, **12 delegate to
+      `dispatch_action` and 28 act directly**, and the 28 include
+      `ClearQueue`, which is the single most valuable thing to be able
+      to undo. hooking either function alone misses half the mutations;
+      hooking both double-records the 12. the fix is to give those 28
+      `Action` variants so there really is one choke point, which is
+      cheapest to do **during the library split**, since that is
+      already moving the mutation surface into a core. `Op::describe()`
+      does exist for every op, so the labels really are free.
+      the full design, including an op-by-op classification into
+      snapshot-restorable, irreversible-side-effect (undo must refuse
+      with a reason rather than restore around it) and not-recorded, is
+      in **docs/undo.md**. a branch of the tree is then *already* a list of ops, which
       is to say **a `.shg` script**: exporting a branch is close to
       free once scripts exist, and that ties the two headline features
       together.
