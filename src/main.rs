@@ -28,7 +28,7 @@ use wim::core::{
     enqueue_track, eq_preset_names, fire_scrobble, fire_subtitle_fetch, front_resolved,
     go_to_previous, identity_settings, load_playlist, lyrics_query, note_playback_started,
     notify_query_changed, op_done, op_fail, op_note, open_starred, playing_duration, print_listing,
-    resync_upcoming, retain_live_clients, save_playback_state, set_vid_for_item, shellsong_focus,
+    retain_live_clients, save_playback_state, set_vid_for_item, shellsong_focus,
     spawn_background_search, start_session, start_tracking_playback, suggestion_starred_keys,
     sweep_cache, toggle_star, BetweenTracks, CoreCtx, Dispatch, DownloadCtx, Drive, GapAction,
     Intent, RemoteSearchOutcome, RemoteSearchQuery, Report, Resolution, ScrobbleState, SelectStep,
@@ -240,20 +240,14 @@ enum ScrubAt {
 
 /// Everything activating a transport control can touch, bundled into
 /// one argument the way `ActionCtx` is and for the same reason.
+/// The scrubber's drag state, which is the one bar control with no op
+/// behind it.
+///
+/// Everything else this struct used to carry (the app, the queue, the
+/// cache, crossfade, the eq menu, the gap) was only here to serve six
+/// arms that each duplicated an op; `core::op_for_field` plus
+/// `apply_op` replaced them, and the fields went with them.
 struct TransportCtx<'a> {
-    cfg: &'a config::Config,
-    player: &'a mpv::Mpv,
-    app: &'a mut app::App,
-    notifications: &'a mut Notifications,
-    play_queue: &'a mut PlayQueue,
-    cache_index: &'a Arc<Mutex<CacheIndex>>,
-    flash: &'a mut Option<(Field, Instant)>,
-    eq_menu_open: &'a mut bool,
-    eq_menu_selected: &'a mut usize,
-    eq_menu: &'a mut ui::eq_menu::EqMenuState,
-    crossfade_enabled: &'a mut bool,
-    fade_in_started_at: &'a mut Option<Instant>,
-    base_volume: f64,
     scrub: &'a mut Option<Scrub>,
     scrub_pending: &'a mut bool,
     scrub_sent_at: &'a mut Option<Instant>,
@@ -261,93 +255,44 @@ struct TransportCtx<'a> {
     /// frame by the loop rather than asked for again here.
     elapsed_secs: Option<f64>,
     duration_secs: Option<f64>,
-    /// So pressing play during a between-track gap skips the rest of
-    /// it instead of unpausing a track that has already ended.
-    between_tracks: &'a mut BetweenTracks,
 }
 
 /// The one place a transport control is acted on. Enter on the bottom
 /// bar, enter on the maximized player and a mouse click all land here,
 /// so the three can never drift into doing different things to the
 /// same glyph; `controlsbar::Field` is the whole alphabet.
-fn activate_transport(field: Field, at: ScrubAt, ctx: &mut TransportCtx) {
-    match field {
-        Field::Pause => match wim::core::toggle_pause(ctx.player, ctx.between_tracks) {
-            Ok(()) => *ctx.flash = Some((Field::Pause, Instant::now())),
-            Err(e) => ctx
-                .notifications
-                .push(Severity::Error, format!("error pausing: {e}")),
-        },
-        Field::Loop => {
-            let mode = ctx.app.cycle_loop();
-            let mpv_loop = if mode == LoopMode::One { "inf" } else { "no" };
-            match ctx.player.set_loop_file(mpv_loop) {
-                Ok(()) => *ctx.flash = Some((Field::Loop, Instant::now())),
-                Err(e) => ctx
-                    .notifications
-                    .push(Severity::Error, format!("error setting loop: {e}")),
-            }
-        }
-        Field::Shuffle => {
-            // same semantics as the 's' key
-            // (`Action::ShuffleToggled`):
-            // turning it on reshuffles what's
-            // upcoming, turning it off leaves
-            // the order alone.
-            let mut msg = String::new();
-            if ctx.app.toggle_shuffle() {
-                let shuffled = ctx.play_queue.shuffled_upcoming();
-                msg = resync_upcoming(ctx.player, ctx.cache_index, ctx.play_queue, shuffled);
-            }
-            if msg.starts_with("error") {
-                ctx.notifications.push(Severity::Error, msg);
-            } else {
-                *ctx.flash = Some((Field::Shuffle, Instant::now()));
-            }
-        }
-        Field::Speed => {
-            let speed = ctx.app.bump_speed(1.0);
-            match ctx.player.set_speed(speed) {
-                Ok(()) => *ctx.flash = Some((Field::Speed, Instant::now())),
-                Err(e) => ctx
-                    .notifications
-                    .push(Severity::Error, format!("error setting speed: {e}")),
-            }
-        }
-        Field::Eq => {
-            *ctx.eq_menu_open = true;
-            *ctx.eq_menu = ui::eq_menu::EqMenuState::default();
-            *ctx.eq_menu_selected =
-                ui::eq_menu::opening_selection(ctx.app.eq_source, ctx.cfg.eq_custom_presets.len());
-        }
-        Field::Crossfade => {
-            *ctx.crossfade_enabled = !*ctx.crossfade_enabled;
-            if !*ctx.crossfade_enabled {
-                *ctx.fade_in_started_at = None;
-                let _ = ctx.player.set_volume(ctx.base_volume);
-            }
-            *ctx.flash = Some((Field::Crossfade, Instant::now()));
-        }
-        Field::Progress => {
-            // duration is captured here, once, so each step can clamp
-            // without asking mpv again; nothing loaded means nothing
-            // to scrub, so the drag just doesn't open.
-            if let Some(elapsed) = ctx.elapsed_secs {
-                let open = Scrub {
-                    target_secs: elapsed,
-                    duration_secs: ctx.duration_secs,
-                };
-                // opening where it already is has nothing to seek to;
-                // opening where a pointer landed does, so only that
-                // one leaves a target for the coalescer to send.
-                *ctx.scrub = Some(match at {
-                    ScrubAt::Position => open,
-                    ScrubAt::Fraction(frac) => open.at_fraction(frac),
-                });
-                *ctx.scrub_pending = matches!(at, ScrubAt::Fraction(_));
-                *ctx.scrub_sent_at = None;
-            }
-        }
+fn activate_transport(
+    field: Field,
+    at: ScrubAt,
+    core: &mut CoreCtx,
+    surf: &mut dyn Surface,
+    ctx: &mut TransportCtx,
+) {
+    // every control but the scrubber *is* a command, so it goes
+    // through the command. that is not only deduplication: `apply_op`
+    // is where the undo tree records, so this is what puts a clicked
+    // loop or shuffle in the history alongside a typed one.
+    if let Some(op) = wim::core::op_for_field(field) {
+        apply_op(op, core, surf);
+        return;
+    }
+    // the scrubber. duration is captured by the caller, once, so each
+    // step can clamp without asking mpv again; nothing loaded means
+    // nothing to scrub, so the drag just doesn't open.
+    if let Some(elapsed) = ctx.elapsed_secs {
+        let open = Scrub {
+            target_secs: elapsed,
+            duration_secs: ctx.duration_secs,
+        };
+        // opening where it already is has nothing to seek to; opening
+        // where a pointer landed does, so only that one leaves a
+        // target for the coalescer to send.
+        *ctx.scrub = Some(match at {
+            ScrubAt::Position => open,
+            ScrubAt::Fraction(frac) => open.at_fraction(frac),
+        });
+        *ctx.scrub_pending = matches!(at, ScrubAt::Fraction(_));
+        *ctx.scrub_sent_at = None;
     }
 }
 
@@ -374,6 +319,12 @@ struct WimSurface<'a> {
     keybinds_menu_selected: &'a mut usize,
     eq_menu_open: &'a mut bool,
     eq_menu_selected: &'a mut usize,
+    /// Reset when the menu opens, so a half-typed name editor or an
+    /// armed delete cannot survive a close and reopen. The click path
+    /// always did this; `view(eq)` did not, and routing the click
+    /// through the op made that difference visible. Fixed here rather
+    /// than preserved, since opening fresh is right either way.
+    eq_menu: &'a mut ui::eq_menu::EqMenuState,
     undo_menu_open: &'a mut bool,
     bottombar_selected: Field,
 }
@@ -578,6 +529,7 @@ fn open_wim_screen(
         }
         ViewTarget::Eq => {
             *surf.eq_menu_open = true;
+            *surf.eq_menu = ui::eq_menu::EqMenuState::default();
             *surf.eq_menu_selected = ui::eq_menu::opening_selection(
                 core.app.eq_source,
                 core.cfg.eq_custom_presets.len(),
@@ -3630,6 +3582,7 @@ fn main() -> anyhow::Result<()> {
                     keybinds_menu_selected: &mut keybinds_menu_selected,
                     eq_menu_open: &mut eq_menu_open,
                     eq_menu_selected: &mut eq_menu_selected,
+                    eq_menu: &mut eq_menu,
                     undo_menu_open: &mut undo_menu_open,
                     bottombar_selected,
                 }
@@ -3944,34 +3897,19 @@ fn main() -> anyhow::Result<()> {
                                 player_selected = field;
                             }
                         }
-                        activate_transport(
-                            field,
-                            at,
-                            &mut TransportCtx {
-                                cfg: &cfg,
-                                player: &player,
-                                app: &mut app,
-                                notifications: &mut notifications,
-                                play_queue: &mut play_queue,
-                                cache_index: &cache_index,
-                                flash: &mut flash,
-                                eq_menu_open: &mut eq_menu_open,
-                                eq_menu_selected: &mut eq_menu_selected,
-                                eq_menu: &mut eq_menu,
-                                crossfade_enabled: &mut crossfade_enabled,
-                                fade_in_started_at: &mut fade_in_started_at,
-                                base_volume,
-                                scrub: &mut scrub,
-                                scrub_pending: &mut scrub_pending,
-                                scrub_sent_at: &mut scrub_sent_at,
-                                elapsed_secs: playback.elapsed_secs,
-                                duration_secs: playing_duration(
-                                    now_playing.as_ref(),
-                                    playback.duration_secs,
-                                ),
-                                between_tracks: &mut between_tracks,
-                            },
-                        );
+                        let mut tctx = TransportCtx {
+                            scrub: &mut scrub,
+                            scrub_pending: &mut scrub_pending,
+                            scrub_sent_at: &mut scrub_sent_at,
+                            elapsed_secs: playback.elapsed_secs,
+                            duration_secs: playing_duration(
+                                now_playing.as_ref(),
+                                playback.duration_secs,
+                            ),
+                        };
+                        let mut surf = wim_surface!();
+                        let mut core = core_ctx!();
+                        activate_transport(field, at, &mut core, &mut surf, &mut tctx);
                     }
                     // the drag redraws from the pending target and the
                     // seek stays coalesced behind it, exactly as a
@@ -4925,33 +4863,24 @@ fn main() -> anyhow::Result<()> {
                         Some(Nav::Inert) => continue,
                         Some(Nav::Activate) => {
                             let field = *cursor;
+                            let mut tctx = TransportCtx {
+                                scrub: &mut scrub,
+                                scrub_pending: &mut scrub_pending,
+                                scrub_sent_at: &mut scrub_sent_at,
+                                elapsed_secs: playback.elapsed_secs,
+                                duration_secs: playing_duration(
+                                    now_playing.as_ref(),
+                                    playback.duration_secs,
+                                ),
+                            };
+                            let mut surf = wim_surface!();
+                            let mut core = core_ctx!();
                             activate_transport(
                                 field,
                                 ScrubAt::Position,
-                                &mut TransportCtx {
-                                    cfg: &cfg,
-                                    player: &player,
-                                    app: &mut app,
-                                    notifications: &mut notifications,
-                                    play_queue: &mut play_queue,
-                                    cache_index: &cache_index,
-                                    flash: &mut flash,
-                                    eq_menu_open: &mut eq_menu_open,
-                                    eq_menu_selected: &mut eq_menu_selected,
-                                    eq_menu: &mut eq_menu,
-                                    crossfade_enabled: &mut crossfade_enabled,
-                                    fade_in_started_at: &mut fade_in_started_at,
-                                    base_volume,
-                                    scrub: &mut scrub,
-                                    scrub_pending: &mut scrub_pending,
-                                    scrub_sent_at: &mut scrub_sent_at,
-                                    elapsed_secs: playback.elapsed_secs,
-                                    duration_secs: playing_duration(
-                                        now_playing.as_ref(),
-                                        playback.duration_secs,
-                                    ),
-                                    between_tracks: &mut between_tracks,
-                                },
+                                &mut core,
+                                &mut surf,
+                                &mut tctx,
                             );
                             continue;
                         }

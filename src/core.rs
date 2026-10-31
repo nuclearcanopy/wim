@@ -1822,6 +1822,31 @@ pub fn apply_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> Dispatch 
     }
     dispatch
 }
+/// The op a bottom-bar control presses, or `None` for the scrubber,
+/// which is a drag rather than a one-shot.
+///
+/// **One table, two callers**, which is the whole point: `Op::Go(
+/// BottomBarField)` reads it for enter-on-the-bar, and main.rs's
+/// `activate_transport` reads it for a keypress or a mouse click.
+/// This arm's comment already claimed to reuse the commands "rather
+/// than keeping a second copy of the bar's own match" -- and
+/// `activate_transport` *was* that second copy, reimplementing six of
+/// these against mpv directly, with its shuffle arm's own comment
+/// admitting it duplicated the `s` key. Routing both through here also
+/// means every bar control lands in the undo tree, since `apply_op`
+/// is where recording happens.
+pub fn op_for_field(field: Field) -> Option<Op> {
+    Some(match field {
+        Field::Pause => Op::TogglePause,
+        Field::Loop => Op::CycleLoop,
+        Field::Shuffle => Op::ToggleShuffle,
+        Field::Speed => Op::SpeedUp,
+        Field::Eq => Op::View(ViewTarget::Eq),
+        Field::Crossfade => Op::ToggleCrossfade,
+        Field::Progress => return None,
+    })
+}
+
 /// The `Op` -> host table. Every arm goes through the call the matching
 /// keypress already makes (`dispatch_action` wherever an `Action`
 /// exists), so a shellsong command and a keybind can never diverge in
@@ -2018,19 +2043,11 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             let Some(field) = surf.bar_field() else {
                 return surf.decline("bar control to press");
             };
-            let field_op = match field {
-                Field::Pause => Op::TogglePause,
-                Field::Loop => Op::CycleLoop,
-                Field::Shuffle => Op::ToggleShuffle,
-                Field::Speed => Op::SpeedUp,
-                Field::Eq => Op::View(ViewTarget::Eq),
-                Field::Crossfade => Op::ToggleCrossfade,
+            let Some(field_op) = op_for_field(field) else {
                 // enter on the scrubber opens a keyboard drag, which
                 // the open console would swallow every key of; the
                 // language has real seek commands instead.
-                Field::Progress => {
-                    return op_fail("use moveto(1m20s) or seek(+30s) to scrub from here")
-                }
+                return op_fail("use moveto(1m20s) or seek(+30s) to scrub from here");
             };
             let closes = field_op.closes_console();
             let result = run_op(field_op, core, surf);
@@ -3454,6 +3471,48 @@ mod seam_tests {
         }
         assert_eq!(h.gap_secs, 10.0, "and redo walks back down");
         assert_eq!(h.undo.len(), 2);
+    }
+
+    /// The bar's controls are commands, and this is the one table
+    /// that says which. Both enter-on-the-bar (`Op::Go`) and the
+    /// click/keypress path (`main::activate_transport`) read it, so
+    /// the two cannot drift the way they had: `activate_transport`
+    /// used to reimplement six of these against mpv directly.
+    #[test]
+    fn every_bar_control_but_the_scrubber_is_an_op() {
+        use crate::ui::controlsbar::FIELDS;
+        for field in FIELDS {
+            let op = op_for_field(field);
+            if field == Field::Progress {
+                assert!(
+                    op.is_none(),
+                    "the scrubber is a drag, not a one-shot: {op:?}"
+                );
+            } else {
+                assert!(op.is_some(), "{field:?} has no command behind it");
+            }
+        }
+    }
+
+    /// Pressing a bar control has to land in the undo tree, which is
+    /// the other thing routing it through an op buys. Asserted on the
+    /// mapping plus `classify`, since the click itself is main.rs's.
+    #[test]
+    fn a_bar_control_is_undoable() {
+        use crate::ui::controlsbar::FIELDS;
+        for field in FIELDS {
+            let Some(op) = op_for_field(field) else {
+                continue;
+            };
+            // `View(Eq)` opens a menu and is correctly not an edit;
+            // every other bar control changes playback state.
+            let expected = if field == Field::Eq {
+                undo::Reversibility::Ignored
+            } else {
+                undo::Reversibility::Restorable
+            };
+            assert_eq!(undo::classify(&op), expected, "{field:?}");
+        }
     }
 
     /// The claim the suspend flag exists for: twelve of `run_op`'s

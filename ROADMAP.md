@@ -1686,8 +1686,7 @@ the order below is not a preference, it is a dependency.
         plants the root once, up front, before any key is read. the
         test that found it now uses `Action::Queued`, which does carry
         its own mutation, and says why.
-      - [ ] **`activate_transport` is still unrecorded, and it turns
-        out to be a duplicate.** `core::run_op`'s
+      - [x] **`activate_transport` was a duplicate, and is gone.** `core::run_op`'s
         `Op::Go(BottomBarField)` arm carries a `Field` -> `Op` match
         whose comment says it reuses the commands "rather than keeping
         a second copy of the bar's own match". `activate_transport` in
@@ -1697,13 +1696,32 @@ the order below is not a preference, it is a dependency.
         and its shuffle arm's own comment admits it copies the `s`
         key. `Field::Progress` is the only one with no op, which core
         refuses by name.
-        the fix is one extraction (`op_for_field`) used by both, which
-        deletes ~50 lines, closes this undo gap for free and removes a
-        drift hazard the comments claim does not exist. held back from
-        this commit only because it changes the click/enter transport
-        path and deserves its own, with one behaviour difference to
-        settle first: clicking the eq glyph resets `EqMenuState` where
-        `view(eq)` does not.
+        `core::op_for_field` is now the one table, read by both, and
+        `activate_transport` is a four-line `if let` plus the scrub
+        drag. **net -54 lines**, and two things fell out of it:
+        `TransportCtx` dropped from 19 fields to 5, since the rest
+        only existed to serve the duplicated arms, and
+        `resync_upcoming` became an unused import in main.rs -- the
+        duplicated shuffle arm was its only caller there, which is
+        about as direct a confirmation as a refactor gets.
+        every bar control now lands in the undo tree, because
+        `apply_op` is where recording happens. pinned two ways: every
+        `Field` but `Progress` maps to an op (the scrubber is a drag,
+        not a one-shot), and each of those ops classifies as
+        restorable, except `View(Eq)` which opens a menu and correctly
+        is not an edit.
+        **the behaviour difference, settled rather than preserved.**
+        clicking the eq glyph reset `EqMenuState`; `view(eq)` did not,
+        so a half-typed name editor or an armed delete could survive a
+        close and reopen. routing the click through the op made that
+        visible, and the reset moved into the `ViewTarget::Eq` arm so
+        both paths open fresh. that is a small bug fix the
+        deduplication found rather than caused.
+        **undo coverage is now complete**: ops via `apply_op`, keyboard
+        actions via `dispatch_action`, bar controls via `op_for_field`.
+        what is left unrecorded is deliberate -- seek and volume keys
+        (volume is in the snapshot but its keys mutate directly) and
+        `paused`, which the snapshot excludes on purpose.
       - [x] ~~**the view is built but not opened by anything.**~~
         **`view(undo)` opens it** (alias `view(tree)`), drawn over the
         workspace like the eq menu, because a fork is unreadable in a
