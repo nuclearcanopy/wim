@@ -854,8 +854,28 @@ third.
       data album by album for the *browse* path. queueing it re-fetches
       the same thing synchronously. the fix may be to route queueing
       through the loader rather than to build a fourth one.
-- [ ] **`open_starred_view` (main.rs ~312) fetches starred songs from
-      every configured server synchronously**, from shellsong (~1543)
+- [x] **`open_starred_view` fetched starred songs from every configured
+      server synchronously** -- fixed by routing it through
+      `browse::Loader` rather than building a fourth loader, which is
+      what the audit guessed would be right. it already fanned out
+      across servers, but **joined before returning**, so the keypress
+      paid for the slowest one.
+      `Loader::open_starred` is its own entry point, since starred is
+      not a `SearchItem`, but it shares the generation guard and
+      `Load::Tracks`. two consequences worth having: the call sites
+      stop needing their own `invalidate()` (opening it bumps the
+      generation, so anything in flight is disowned by construction),
+      and **local favorites show immediately** because they are a file
+      read, not a round trip; there was never a reason to make them
+      wait for a network answer they do not need.
+      clients are resolved in `core` and passed in, because
+      `client_for` lives there and `core` already depends on `browse`;
+      resolving them in the loader would have been a cycle.
+      pinned both ways: the view comes back with the local half in it,
+      and a reply from the album that was open before does not fold
+      into the starred listing. the second fails if the generation bump
+      is removed.
+- [x] ~~**`open_starred_view` (main.rs ~312)**~~, from shellsong (~1543)
       and the starred key (~6923). one round trip per server on a
       keypress, in series with nothing else to look at.
 - [x] **`toggle_star` is a server round trip on the keypress** -- fixed,
