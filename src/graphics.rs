@@ -6,10 +6,11 @@
 //! of it touches app state, panes or the input tiers, and the probe's
 //! own tests came with it.
 
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+
 use ratatui_image::picker::{Picker, ProtocolType};
 
-use crate::notify::{Notifications, Severity};
-use crate::{browse, config};
+use crate::{browse, config, trace};
 
 /// Whether the config asks for a real graphics protocol outright, so
 /// the host owes an explanation when the terminal has none; `auto`
@@ -68,18 +69,10 @@ pub fn art_mode_for_picker(mode: config::AlbumArtMode, protocol_detected: bool) 
     }
 }
 
-/// Said once per session, not once per keypress: the full modes are
-/// not reachable here at all, so cycling past them needs a reason.
-pub fn warn_no_graphics(notifications: &mut Notifications, warned: &mut bool) {
-    if *warned {
-        return;
-    }
-    *warned = true;
-    notifications.push(
-        Severity::Alert,
-        "album art: this terminal reports no graphics protocol (sixel/kitty/iterm2), so the full-* modes are unavailable here",
-    );
-}
+/// Said once per session by `ArtProbe::cycle`, not once per keypress:
+/// the full modes are not reachable here at all, so cycling past them
+/// needs a reason.
+const NO_GRAPHICS_ALERT: &str = "album art: this terminal reports no graphics protocol (sixel/kitty/iterm2), so the full-* modes are unavailable here";
 
 /// The image handed to a graphics protocol: greyscaled for `full-bw`,
 /// the source untouched otherwise. Converted here rather than at paint
@@ -401,5 +394,286 @@ mod protocol_cache_tests {
         });
         c.clear();
         assert!(c.key().is_none(), "a stale key would suppress the rebuild");
+    }
+}
+
+/// The graphics probe in flight, its answer, and the album-art mode
+/// that follows from it.
+///
+/// A `struct Ui` slice (see ROADMAP), and the group shares one rule:
+/// the terminal's answer is the only authority over which modes are
+/// live, so each of the four locals it replaces (`picker`,
+/// `picker_probed`, `art_mode`/`art_mode_pending`,
+/// `warned_no_graphics`) only means anything next to the others. The
+/// rule is three methods now: the answer is taken exactly once, it may
+/// only move a mode nobody has cycled by hand since startup, and
+/// cycling is judged against the protocol rather than against
+/// `picker.is_some()`.
+pub struct ArtProbe {
+    /// What config.toml asked for, held once so the sites that used to
+    /// pass `cfg.album_art` by hand cannot disagree about it.
+    asked: config::AlbumArtMode,
+    mode: browse::ArtMode,
+    /// The mode the config implied with the probe still out; `mode`
+    /// still equal to it means nobody has cycled since.
+    pending: browse::ArtMode,
+    picker: Option<Picker>,
+    /// Dropped the moment the answer lands, so applying it twice is
+    /// not representable rather than guarded by a separate flag.
+    answer: Option<Receiver<Option<Picker>>>,
+    warned: bool,
+}
+
+impl ArtProbe {
+    /// Asks the terminal on its own thread: it may simply never
+    /// answer, and `ratatui-image` then waits out a full second, which
+    /// was the single largest thing the first frame sat behind. Call
+    /// once raw mode is on, since the query saves and restores
+    /// whatever termios state it finds.
+    pub fn spawn(asked: config::AlbumArtMode) -> Self {
+        let (tx, rx) = mpsc::channel();
+        if graphics_plausible() {
+            std::thread::spawn(move || {
+                let _ = tx.send(Picker::from_query_stdio().ok());
+                trace::mark("graphics probe answered");
+            });
+        } else {
+            // skipped, not backgrounded: the probe reads stdin waiting
+            // for an answer, so on a terminal that will never send one
+            // it sits there for a second racing the event loop for
+            // input and eating whatever arrives, mouse reports
+            // included. not asking at all is both faster and the only
+            // way the event loop is the single reader of stdin.
+            let _ = tx.send(None);
+            trace::mark("graphics probe skipped (terminal has no protocol)");
+        }
+        Self::waiting(asked, rx)
+    }
+
+    /// Pre-answer state: the config's mode as if no protocol existed,
+    /// since a full mode with nothing to draw it is a blank pane and
+    /// the first frames happen before the terminal has replied.
+    fn waiting(asked: config::AlbumArtMode, answer: Receiver<Option<Picker>>) -> Self {
+        let pending = art_mode_for_picker(asked, false);
+        Self {
+            asked,
+            mode: pending,
+            pending,
+            picker: None,
+            answer: Some(answer),
+            warned: false,
+        }
+    }
+
+    /// The mode to draw with this frame.
+    pub fn mode(&self) -> browse::ArtMode {
+        self.mode
+    }
+
+    /// For `ProtocolCache::ensure`, which is where the protocol
+    /// instances live; this only owns the picker that builds them.
+    pub fn picker_mut(&mut self) -> Option<&mut Picker> {
+        self.picker.as_mut()
+    }
+
+    /// What the terminal answered, for the video output's own decision.
+    pub fn protocol_type(&self) -> Option<ProtocolType> {
+        self.picker.map(|p| p.protocol_type())
+    }
+
+    /// The capability test, asked of the protocol and never of the
+    /// picker; see `has_real_protocol`.
+    pub fn real_graphics(&self) -> bool {
+        has_real_protocol(self.protocol_type())
+    }
+
+    /// Takes the terminal's answer if it has arrived, and only ever
+    /// once. Returns the alert the host owes the user.
+    ///
+    /// A `full-*` config on a terminal with no protocol is told so out
+    /// loud rather than left with an art pane that never fills; `auto`
+    /// asked for whatever was available and got it. A dropped channel
+    /// is an answer too (no protocol), where the loose version marked
+    /// the probe done and skipped the mode decision and the alert with
+    /// it.
+    pub fn poll(&mut self) -> Option<String> {
+        let answered = match self.answer.as_ref()?.try_recv() {
+            Ok(answer) => answer,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => None,
+        };
+        self.answer = None;
+        self.picker = answered;
+        // only a mode the user has not touched: the probe can take a
+        // second to land, which is long enough to cycle 'i' first, and
+        // upgrading then would undo a deliberate keypress.
+        if self.mode == self.pending {
+            self.mode = art_mode_for_picker(self.asked, self.real_graphics());
+        }
+        (!self.real_graphics() && wants_full_art(self.asked)).then(|| {
+            format!(
+                "album art: terminal reported no graphics protocol, using {}",
+                art_mode_for_picker(self.asked, false).label()
+            )
+        })
+    }
+
+    /// One step of the cycle `i` walks (and the settings menu's art
+    /// row), stepping past the full modes this terminal cannot draw.
+    /// Returns the alert for that, at most once per session.
+    pub fn cycle(&mut self) -> Option<&'static str> {
+        let (next, skipped) = self.mode.cycle(self.real_graphics());
+        self.mode = next;
+        if !skipped || self.warned {
+            return None;
+        }
+        self.warned = true;
+        Some(NO_GRAPHICS_ALERT)
+    }
+}
+
+#[cfg(test)]
+mod art_probe_tests {
+    use super::*;
+
+    /// A picker carrying a real protocol, the way a kitty-class
+    /// terminal's answer arrives.
+    fn capable() -> Picker {
+        let mut p = Picker::from_fontsize((10, 20));
+        p.set_protocol_type(ProtocolType::Kitty);
+        p
+    }
+
+    /// What `from_query_stdio` hands back when nothing answered at
+    /// all: a picker, and not a capability.
+    fn silent() -> Picker {
+        let mut p = Picker::from_fontsize((10, 20));
+        p.set_protocol_type(ProtocolType::Halfblocks);
+        p
+    }
+
+    fn waiting(asked: config::AlbumArtMode) -> (ArtProbe, mpsc::Sender<Option<Picker>>) {
+        let (tx, rx) = mpsc::channel();
+        (ArtProbe::waiting(asked, rx), tx)
+    }
+
+    /// The probe takes about a second on a terminal that answers
+    /// slowly, which is long enough to press 'i' first. An upgrade
+    /// then would silently undo that keypress.
+    #[test]
+    fn the_answer_only_moves_a_mode_nobody_has_cycled() {
+        let (mut art, tx) = waiting(config::AlbumArtMode::Auto);
+        assert_eq!(art.mode(), browse::ArtMode::AsciiColor);
+        // 'i' pressed before the answer lands, which on a terminal
+        // that answers slowly is a whole second of real time.
+        art.cycle();
+        assert_eq!(art.mode(), browse::ArtMode::Off);
+
+        tx.send(Some(capable())).unwrap();
+        assert_eq!(art.poll(), None);
+        assert!(art.real_graphics());
+        assert_eq!(
+            art.mode(),
+            browse::ArtMode::Off,
+            "the probe landed on a mode the user chose by hand"
+        );
+
+        // and the same answer on an untouched mode does upgrade it,
+        // which is the whole reason the probe is waited for.
+        let (mut fresh, tx) = waiting(config::AlbumArtMode::Auto);
+        tx.send(Some(capable())).unwrap();
+        assert_eq!(fresh.poll(), None);
+        assert_eq!(fresh.mode(), browse::ArtMode::FullColor);
+    }
+
+    /// Two answers must not both be applied: the second would find
+    /// `mode` back at `pending` (the first one degraded it to exactly
+    /// that) and read as a free upgrade, resurrecting a full mode the
+    /// terminal had already said it cannot draw.
+    #[test]
+    fn the_answer_is_taken_exactly_once() {
+        let (mut art, tx) = waiting(config::AlbumArtMode::FullColor);
+        tx.send(None).unwrap();
+        tx.send(Some(capable())).unwrap();
+
+        assert!(art.poll().is_some(), "a full-* config is owed the alert");
+        assert_eq!(art.mode(), browse::ArtMode::AsciiColor);
+
+        assert_eq!(art.poll(), None);
+        assert!(!art.real_graphics(), "a second answer was applied");
+        assert_eq!(art.mode(), browse::ArtMode::AsciiColor);
+    }
+
+    /// Nothing on the channel yet is not an answer: the mode stays put
+    /// and the next frame asks again.
+    #[test]
+    fn an_empty_channel_leaves_the_probe_in_flight() {
+        let (mut art, tx) = waiting(config::AlbumArtMode::FullColor);
+        assert_eq!(art.poll(), None);
+        assert_eq!(art.mode(), browse::ArtMode::AsciiColor);
+
+        tx.send(Some(capable())).unwrap();
+        assert_eq!(art.poll(), None);
+        assert_eq!(
+            art.mode(),
+            browse::ArtMode::FullColor,
+            "the answer still has to land once it arrives"
+        );
+    }
+
+    /// A sender dropped without sending (the probe thread panicking in
+    /// `from_query_stdio`) is an answer of "no protocol", alert
+    /// included. The loose version marked the probe done on
+    /// `Disconnected` and skipped the decision, so a `full-*` config
+    /// silently got ascii with no explanation.
+    #[test]
+    fn a_dropped_probe_answers_no_protocol_out_loud() {
+        let (mut art, tx) = waiting(config::AlbumArtMode::FullBw);
+        drop(tx);
+        let alert = art.poll().expect("a full-* config is owed the alert");
+        assert!(alert.contains("ascii-bw"), "{alert}");
+        assert_eq!(art.mode(), browse::ArtMode::AsciiBw);
+        assert_eq!(art.poll(), None, "and it is still answered only once");
+    }
+
+    /// `auto` is a detect, so landing on ascii is what it asked for;
+    /// an alert there would be noise on every terminal without sixel.
+    #[test]
+    fn auto_is_not_owed_an_explanation() {
+        let (mut art, tx) = waiting(config::AlbumArtMode::Auto);
+        tx.send(Some(silent())).unwrap();
+        assert_eq!(art.poll(), None);
+        assert_eq!(art.mode(), browse::ArtMode::AsciiColor);
+    }
+
+    /// Halfblocks is ratatui-image's unicode fallback, so a picker
+    /// holding it must not make the full modes reachable; cycling has
+    /// to walk straight past them.
+    #[test]
+    fn a_picker_without_a_protocol_is_not_a_capability() {
+        let (mut art, tx) = waiting(config::AlbumArtMode::AsciiBw);
+        tx.send(Some(silent())).unwrap();
+        assert_eq!(art.poll(), None);
+        assert!(!art.real_graphics());
+        for _ in 0..8 {
+            art.cycle();
+            assert!(!art.mode().is_full(), "cycled into {:?}", art.mode());
+        }
+    }
+
+    /// One alert per session, not one per keypress: 'i' can be held
+    /// down, and the full modes are unreachable for the whole run.
+    #[test]
+    fn the_unreachable_modes_are_announced_once_per_session() {
+        let (mut art, _tx) = waiting(config::AlbumArtMode::AsciiBw);
+        assert_eq!(art.mode(), browse::ArtMode::AsciiBw);
+        assert_eq!(art.cycle(), None, "ascii-bw -> ascii-color skips nothing");
+        assert!(
+            art.cycle().is_some(),
+            "ascii-color steps past full-bw/full-color to off, which is worth saying"
+        );
+        for _ in 0..12 {
+            assert_eq!(art.cycle(), None, "said twice");
+        }
     }
 }
