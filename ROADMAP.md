@@ -1615,16 +1615,65 @@ the order below is not a preference, it is a dependency.
       must carry vars and bindings.
 - [ ] **wiring the undo tree**, which is what is left and is the
       larger half. two pieces:
-      - **the `Snapshot` type and where it is taken.** the recorded
-        plan is still to give the direct op arms `Action` variants so
-        there is one choke point by construction. that was costed as
-        "cheapest during the library split"; **the split has landed
-        and it was not done**, so that window is closed and the
-        re-entrance-guard alternative (record at the outermost entry,
-        one depth counter) is worth re-pricing against it rather than
-        inheriting the earlier verdict. current measurement: 44 `Op`
-        variants, 47 arms in `core::run_op`, 12 `dispatch_action`
-        call sites.
+      - ~~**the `Snapshot` type and where it is taken.**~~ **done,
+        and the re-pricing changed the answer.** both recorded options
+        (28 new `Action` variants, or a re-entrance guard) assumed the
+        choke point had to be built. it already existed: **`run_op` is
+        private and `apply_op` is the only public way in.** `run_op`
+        recurses into itself three times and never back out through
+        `apply_op`, so one record in `apply_op` is complete for all 44
+        ops with no guard and no refactor. the 28-arm refactor was
+        never needed for the shellsong path at all.
+        `Snapshot` carries the queue (as current plus upcoming, which
+        is what restoring actually needs), base volume, loop, shuffle,
+        speed, eq source and gains, crossfade, gap, query, sleep, and
+        vars plus bindings.
+        **three things it deliberately leaves out, each with a
+        reason**: `paused`, because undo starting or stopping the music
+        as a side effect of reversing something else reads as a bug and
+        pressing play is already the undo of pressing pause; a live
+        fade, which is a position in a transition rather than state;
+        and mpv's instantaneous volume, which the crossfade ramp moves
+        every frame, so capturing it would record a ramp artefact as a
+        decision. `base_volume` is the volume that was *asked for*.
+        capture is pure, which is why those last two are out: reading
+        them means a blocking `get_property` on what is otherwise the
+        input path.
+        restore follows the doc's rule for the delicate half -- **do
+        not restart the current track if it survives** -- by routing
+        the two cases through the two functions that already write
+        mpv's playlist and the index map together: `resync_upcoming`
+        when the same track is playing (mpv keeps its current file,
+        only what follows is rewritten) and `load_playlist` with
+        `SessionStart::Keep` when it is not.
+        a **failed op is not recorded**, since it changed nothing and
+        the row would undo to the state it is already in. `undo` and
+        `redo` are themselves classified `Ignored`, which is
+        load-bearing: recording an undo would make undoing it a new
+        branch instead of a redo, and the tree would fork on every
+        change of mind.
+        pinned by two `--ignored` tests against real mpv, which is the
+        only way to exercise `apply_op`: one records an op, undoes it,
+        redoes it and checks the tree never grew while walking; the
+        other checks a genuinely failing op adds no node. both were
+        wrong on the first run and the code was right -- the first
+        picked an op that does not fail in the harness, the second
+        forgot that planting the root is itself a node.
+      - [ ] **the keyboard and mouse paths are not recorded yet**, and
+        this is the honest limit of what shipped. `apply_op` covers
+        every op, so undo is complete for the console and for
+        shellswim, which is entirely commands. it misses the three
+        `dispatch_action` call sites in `main.rs` and
+        `activate_transport`, which acts on loop/shuffle/speed/
+        crossfade/pause directly for a keypress or a bar click. that
+        wants an `Action` label plus a record at those sites, or the
+        long-planned `Action` variants -- which is still the better
+        structure but now buys only this one path, a much weaker case
+        than when it was also going to fix the shellsong path.
+      - [ ] **the view is built but not opened by anything.**
+        `ui::undo_tree::UndoTreeView` and `Recorder::rows` are ready;
+        what is missing is a `view(undo)` target and a pane to draw it
+        in.
       - ~~**the tree view**~~ **built: `src/ui/undo_tree.rs`.**
         box-drawing spines (not ascii pipes), the current row plated
         with `anim::selection_bg` like every other selection in the

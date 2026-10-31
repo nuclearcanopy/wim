@@ -1971,6 +1971,7 @@ fn main() -> anyhow::Result<()> {
     // cache is what makes evaluating it every frame free: mpv only
     // hears about it when the answer actually changes.
     let mut between_tracks = BetweenTracks::new();
+    let mut undo_tree = wim::undo::Recorder::default();
     let mut gap_secs = cfg.gap_seconds.max(0.0);
     let mut keep_open_held: Option<bool> = None;
     // shellsong's `fade(in|out)` ramp and `sleep(...)` deadline, both
@@ -3565,6 +3566,7 @@ fn main() -> anyhow::Result<()> {
                     track_resolver: &mut track_resolver,
                     base_volume: &mut base_volume,
                     crossfade_enabled: &mut crossfade_enabled,
+                    undo: &mut undo_tree,
                     gap_secs: &mut gap_secs,
                     between_tracks: &mut between_tracks,
                     fade_in_started_at: &mut fade_in_started_at,

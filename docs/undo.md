@@ -35,7 +35,23 @@ So:
   that does not arrive as an op;
 - hooking **both** double-records the 12 that delegate.
 
-Two ways out, and the second is better:
+**Re-priced when it came to wiring, and the answer changed.** Neither
+of those is what shipped, because the premise was wrong: `run_op` is
+**private**, and `apply_op` is the only public way in. `run_op`
+recurses into itself three times (a bar field, a browse-row `go`, a
+settings call) and never back out through `apply_op`, so recording in
+`apply_op` is **one hook, no re-entrance guard, and complete for every
+op** including the ones that delegate. Measured at the time: 44 `Op`
+variants, 47 arms, 12 `dispatch_action` call sites inside `run_op`,
+and only 3 in `main.rs`.
+
+That is what `src/core.rs::apply_op` does now. The 28-arm refactor was
+never needed for the shellsong path. What it *would* buy is the
+keyboard path, which is the remaining gap: see "what is not recorded
+yet" below.
+
+The two options originally weighed, kept because the reasoning is
+still the right shape for the keyboard half:
 
 1. Record at the shellsong layer and in `dispatch_action`, with a
    re-entrance guard so a delegated op is recorded once. Works, and
@@ -48,6 +64,23 @@ Two ways out, and the second is better:
 Option 2 is cheapest to do **during the library split**, since that is
 already moving the mutation surface into a core that does not know
 about panes. If the split lands before undo, do it then.
+
+## what is not recorded yet
+
+Recording in `apply_op` covers **every op**, which is everything the
+shellsong console and shellswim can do, and shellswim is entirely
+commands. It does not cover mutations that never become an `Op`:
+
+- the three `dispatch_action` call sites in `main.rs` (enter on a
+  result, a suggestion row, a browse row),
+- `activate_transport`, which acts on `Field::Loop`/`Shuffle`/`Speed`/
+  `Crossfade`/`Pause` directly for a keypress or a bar click.
+
+Those want either an `Action::describe()` plus a record at the three
+call sites, or the long-planned `Action` variants for the direct arms.
+The second is still the structurally better answer and is now the
+*only* thing it would buy, which is a much weaker case than when it
+was also going to fix the shellsong path.
 
 ## what a node holds
 

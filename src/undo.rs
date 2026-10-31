@@ -28,9 +28,171 @@
 //! on what wim's undoable state turns out to be; see `classify` for the
 //! half that does know about ops.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::app::LoopMode;
+use crate::core::{apply_eq_gains, load_playlist, resync_upcoming, CoreCtx, SessionStart};
+use crate::eq;
+use crate::search::SearchItem;
 use crate::shellsong::Op;
+use crate::{shellsong, shellsong_host};
+
+/// Everything undo restores.
+///
+/// Small on purpose: this is what makes snapshotting viable at all
+/// instead of maintaining a correct inverse per op, which is the one
+/// design call `docs/undo.md` has never had to revisit.
+///
+/// **What is deliberately not in here**, each for its own reason:
+///
+/// - **`paused`.** `TogglePause` is classified as undoable and it is,
+///   but *restoring* it is not what anyone wants: undo would start or
+///   stop the music as a side effect of reversing something else,
+///   which reads as a bug. Pressing play is already the undo of
+///   pressing pause.
+/// - **a live fade.** A `Ramp` is a position in a transition, not
+///   state; restoring one mid-flight would resume a fade towards a
+///   volume nobody asked for any more.
+/// - **mpv's instantaneous volume.** `base_volume` is the volume that
+///   was *asked for*; the crossfade ramp moves the real one around it
+///   every frame. Restoring the instantaneous value would capture a
+///   ramp artefact as if it were a decision.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    /// What was playing, so a restore can tell whether the current
+    /// track survived and avoid restarting it if it did.
+    pub current: Option<SearchItem>,
+    pub upcoming: Vec<SearchItem>,
+    pub base_volume: f64,
+    pub loop_mode: LoopMode,
+    pub shuffle: bool,
+    pub speed: f64,
+    pub eq_source: Option<eq::Source>,
+    pub eq_gains: [f64; 10],
+    pub crossfade: bool,
+    pub gap_secs: f64,
+    pub query: String,
+    pub sleep_due: Option<Duration>,
+    /// Vars and bindings are in the snapshot because `classify` files
+    /// `define`/`unset`/`remember`/`forget` as undoable; see
+    /// `docs/undo.md` for why those are not barriers.
+    pub vars: shellsong::Scope,
+    pub bindings: shellsong_host::Bindings,
+}
+
+impl Snapshot {
+    /// Reads the current state. Pure: no ipc, which is the reason
+    /// `paused` and the live volume are out (both would need a
+    /// blocking `get_property` on what is otherwise the input path).
+    pub fn capture(core: &CoreCtx) -> Snapshot {
+        Snapshot {
+            current: core.queue.current().cloned(),
+            upcoming: core.queue.upcoming().to_vec(),
+            base_volume: *core.base_volume,
+            loop_mode: core.app.loop_mode,
+            shuffle: core.app.shuffle,
+            speed: core.app.speed,
+            eq_source: core.app.eq_source,
+            eq_gains: core.app.eq_gains,
+            crossfade: *core.crossfade_enabled,
+            gap_secs: *core.gap_secs,
+            query: core.app.query.clone(),
+            sleep_due: *core.sleep_due,
+            vars: core.vars.clone(),
+            bindings: core.bindings.clone(),
+        }
+    }
+
+    /// Puts the state back, and says what it could not.
+    ///
+    /// The queue is the delicate half, and the rule is the one
+    /// `docs/undo.md` sets: **do not restart the current track if it
+    /// survives the restore**, or undo reads as a skip. So the two
+    /// cases go through the two functions that already write mpv's
+    /// playlist and the index map together:
+    ///
+    /// - same track playing: `resync_upcoming`, which keeps mpv's
+    ///   current file and rewrites only what comes after it.
+    /// - a different track (or nothing) playing: `load_playlist` with
+    ///   `SessionStart::Keep`, which does restart playback, and has to.
+    pub fn restore(&self, core: &mut CoreCtx) -> Result<(), String> {
+        core.app.loop_mode = self.loop_mode;
+        core.app.shuffle = self.shuffle;
+        core.app.speed = self.speed;
+        core.app.eq_source = self.eq_source;
+        core.app.eq_gains = self.eq_gains;
+        *core.crossfade_enabled = self.crossfade;
+        *core.gap_secs = self.gap_secs;
+        *core.sleep_due = self.sleep_due;
+        *core.base_volume = self.base_volume;
+        core.app.set_query(&self.query);
+
+        if *core.vars != self.vars {
+            *core.vars = self.vars.clone();
+            shellsong_host::save_vars(core.vars);
+        }
+        if *core.bindings != self.bindings {
+            *core.bindings = self.bindings.clone();
+            shellsong_host::save_bindings(core.bindings);
+        }
+
+        let mpv_loop = if self.loop_mode == LoopMode::One {
+            "inf"
+        } else {
+            "no"
+        };
+        let _ = core.player.set_loop_file(mpv_loop);
+        let _ = core.player.set_speed(self.speed);
+        let _ = core.player.set_volume(self.base_volume);
+        apply_eq_gains(core.app, core.player, core.notifications);
+
+        self.restore_queue(core)
+    }
+
+    fn restore_queue(&self, core: &mut CoreCtx) -> Result<(), String> {
+        let playing = core.queue.current().map(|i| i.identity());
+        let wanted = self.current.as_ref().map(|i| i.identity());
+        if playing == wanted {
+            // the track survives, so only what comes after it moves.
+            // anything already resolved for the old queue has nowhere
+            // to go now, same reason `start_session` disowns it.
+            core.track_resolver.invalidate();
+            let status =
+                resync_upcoming(core.player, core.cache, core.queue, self.upcoming.clone());
+            if status.starts_with("error") {
+                return Err(status);
+            }
+            return Ok(());
+        }
+        let Some(current) = self.current.clone() else {
+            // nothing was playing then, and something is now. stopping
+            // playback is a bigger side effect than leaving it, so the
+            // queue after it is restored and the track is left alone.
+            core.track_resolver.invalidate();
+            let status =
+                resync_upcoming(core.player, core.cache, core.queue, self.upcoming.clone());
+            if status.starts_with("error") {
+                return Err(status);
+            }
+            return Ok(());
+        };
+        let mut items = Vec::with_capacity(self.upcoming.len() + 1);
+        items.push(current);
+        items.extend(self.upcoming.iter().cloned());
+        let (status, played) = load_playlist(
+            core.player,
+            core.cache,
+            core.queue,
+            items,
+            SessionStart::Keep,
+        );
+        if played {
+            Ok(())
+        } else {
+            Err(status)
+        }
+    }
+}
 
 /// A run of the same adjusting op inside this window is one node.
 ///
@@ -114,6 +276,11 @@ pub fn classify(op: &Op) -> Reversibility {
         | Op::SelectBottom
         | Op::View(_)
         | Op::ClearConsole
+        // walking the tree is not an edit to it. recording an undo
+        // would turn undoing-the-undo into a new branch rather than a
+        // redo, and the tree would fork on every change of mind.
+        | Op::Undo
+        | Op::Redo
         | Op::Quit => Ignored,
     }
 }
@@ -153,7 +320,7 @@ struct Node<S> {
     /// human-readable rows for free.
     label: String,
     kind: Option<&'static str>,
-    at: Instant,
+    at: Duration,
     parent: Option<usize>,
     children: Vec<usize>,
     /// Which child redo goes to: the one most recently walked into,
@@ -170,7 +337,7 @@ pub struct Tree<S> {
 
 impl<S> Tree<S> {
     /// A tree holding only where the session started.
-    pub fn new(initial: S, at: Instant) -> Self {
+    pub fn new(initial: S, at: Duration) -> Self {
         Tree {
             nodes: vec![Node {
                 snapshot: initial,
@@ -197,7 +364,7 @@ impl<S> Tree<S> {
         label: String,
         kind: Option<&'static str>,
         barrier: Option<&'static str>,
-        now: Instant,
+        now: Duration,
     ) {
         if self.coalesces(kind, barrier, now) {
             let node = &mut self.nodes[self.current];
@@ -228,7 +395,7 @@ impl<S> Tree<S> {
     /// A barrier never coalesces: each irreversible effect is its own
     /// row, because undo has to be able to name the one it stopped at.
     /// Neither does the root, which is a state and not an op.
-    fn coalesces(&self, kind: Option<&'static str>, barrier: Option<&str>, now: Instant) -> bool {
+    fn coalesces(&self, kind: Option<&'static str>, barrier: Option<&str>, now: Duration) -> bool {
         let Some(kind) = kind else { return false };
         if barrier.is_some() || self.current == 0 {
             return false;
@@ -238,7 +405,7 @@ impl<S> Tree<S> {
         // past would silently rewrite history a redo could reach.
         node.children.is_empty()
             && node.kind == Some(kind)
-            && now.saturating_duration_since(node.at) <= COALESCE_WINDOW
+            && now.saturating_sub(node.at) <= COALESCE_WINDOW
     }
 
     pub fn undo(&mut self) -> Moved<'_, S> {
@@ -306,7 +473,7 @@ impl<S> Tree<S> {
 
     /// One row per node for the tree view: depth, label, age, whether
     /// it is current, and whether it is a barrier.
-    pub fn rows(&self, now: Instant) -> Vec<Row<'_>> {
+    pub fn rows(&self, now: Duration) -> Vec<Row<'_>> {
         let mut out = Vec::with_capacity(self.nodes.len());
         let path = self.path_to_current();
         self.walk(0, 0, true, now, &path, &mut out);
@@ -331,7 +498,7 @@ impl<S> Tree<S> {
         id: usize,
         depth: usize,
         last_child: bool,
-        now: Instant,
+        now: Duration,
         path: &[usize],
         out: &mut Vec<Row<'a>>,
     ) {
@@ -340,7 +507,7 @@ impl<S> Tree<S> {
             id,
             depth,
             label: &node.label,
-            age: now.saturating_duration_since(node.at),
+            age: now.saturating_sub(node.at),
             current: id == self.current,
             on_path: path.contains(&id),
             last_child,
@@ -378,16 +545,16 @@ pub struct Row<'a> {
 mod tests {
     use super::*;
 
-    fn at(base: Instant, ms: u64) -> Instant {
+    fn at(base: Duration, ms: u64) -> Duration {
         base + Duration::from_millis(ms)
     }
 
-    fn tree() -> (Tree<&'static str>, Instant) {
-        let t0 = Instant::now();
+    fn tree() -> (Tree<&'static str>, Duration) {
+        let t0 = Duration::ZERO;
         (Tree::new("start", t0), t0)
     }
 
-    fn rec(t: &mut Tree<&'static str>, s: &'static str, now: Instant) {
+    fn rec(t: &mut Tree<&'static str>, s: &'static str, now: Duration) {
         t.record(s, s.to_string(), None, None, now);
     }
 
@@ -623,6 +790,15 @@ mod tests {
         }
     }
 
+    /// Load-bearing: recording an undo would make undoing *it* a new
+    /// branch instead of a redo, and the tree would fork every time
+    /// someone changed their mind.
+    #[test]
+    fn walking_the_tree_is_not_an_edit_to_it() {
+        assert_eq!(classify(&Op::Undo), Reversibility::Ignored);
+        assert_eq!(classify(&Op::Redo), Reversibility::Ignored);
+    }
+
     #[test]
     fn only_the_adjusting_ops_coalesce() {
         assert_eq!(
@@ -634,5 +810,89 @@ mod tests {
         // two plays are two decisions however fast they came.
         assert_eq!(coalesce_kind(&Op::TogglePause), None);
         assert_eq!(coalesce_kind(&Op::ClearQueue), None);
+    }
+}
+
+/// The host's handle on the tree.
+///
+/// Rooted lazily: `Tree::new` wants the state the session started in,
+/// and the host has no `CoreCtx` to capture one from until it is
+/// already running. So the first recordable op plants the root with
+/// the state *before* it, which is the same thing and costs one extra
+/// capture, once.
+#[derive(Default)]
+pub struct Recorder {
+    tree: Option<Tree<Snapshot>>,
+}
+
+/// What a `Recorder::undo`/`redo` produced. Owns its snapshot, because
+/// restoring needs `&mut CoreCtx` and a borrow out of the tree would
+/// hold `core` immutably across it.
+pub enum Outcome {
+    // boxed because a `Snapshot` carries the queue and dwarfs the
+    // other two variants, which clippy rightly objects to for an enum
+    // returned by value.
+    Restored(Box<Snapshot>),
+    Refused(&'static str),
+    Nowhere,
+}
+
+impl Recorder {
+    pub fn is_unrooted(&self) -> bool {
+        self.tree.is_none()
+    }
+
+    /// Seeds the tree with the state before the first recorded op.
+    pub fn plant(&mut self, initial: Snapshot, now: Duration) {
+        self.tree.get_or_insert_with(|| Tree::new(initial, now));
+    }
+
+    pub fn record(
+        &mut self,
+        snapshot: Snapshot,
+        label: String,
+        kind: Option<&'static str>,
+        barrier: Option<&'static str>,
+        now: Duration,
+    ) {
+        if let Some(tree) = &mut self.tree {
+            tree.record(snapshot, label, kind, barrier, now);
+        }
+    }
+
+    pub fn undo(&mut self) -> Outcome {
+        let Some(tree) = &mut self.tree else {
+            return Outcome::Nowhere;
+        };
+        match tree.undo() {
+            Moved::To(s) => Outcome::Restored(Box::new(s.clone())),
+            Moved::Refused(why) => Outcome::Refused(why),
+            Moved::Nowhere => Outcome::Nowhere,
+        }
+    }
+
+    pub fn redo(&mut self) -> Outcome {
+        let Some(tree) = &mut self.tree else {
+            return Outcome::Nowhere;
+        };
+        match tree.redo() {
+            Moved::To(s) => Outcome::Restored(Box::new(s.clone())),
+            Moved::Refused(why) => Outcome::Refused(why),
+            Moved::Nowhere => Outcome::Nowhere,
+        }
+    }
+
+    /// Rows for the tree view, empty until something has been
+    /// recorded.
+    pub fn rows(&self, now: Duration) -> Vec<Row<'_>> {
+        self.tree.as_ref().map(|t| t.rows(now)).unwrap_or_default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.tree.as_ref().map_or(0, |t| t.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tree.is_none()
     }
 }
