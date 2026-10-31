@@ -43,6 +43,32 @@ it.
 
 ---
 
+### ascii video: colour, or monochrome like everything else
+
+`framesource::FrameSource::paint` takes a `raster::Tone`, so colour
+and greyscale are the same call with a different argument and both
+work today. It defaults to `Mono`, matching what `ui/albumart.rs`
+already asserts ("the video pane stays monochrome with the rest of the
+ui").
+
+**Why this is yours and not a default I can take.** The exemption
+video already has in docs/video.md is narrower than it looks: it
+covers *mpv's own pixels*, drawn by `tct` or `kitty`, on the grounds
+that they are not wim's cells. An ascii renderer paints wim's cells,
+so allowing colour there is a second exception to the monochrome rule
+and needs the same direct authorisation `ascii-color` album art got
+from you.
+
+Nothing needs changing either way. If you allow it, it wants a config
+variant beside `AlbumArtMode`'s `ascii-bw`/`ascii-color` pair,
+following `browse::ArtMode::tone()`.
+
+One smaller related question: `raster`'s unsharp pass is unconditional
+and is pure cost on a 1:1 frame (it is inside the 8-9%
+rasterization figure). Making it optional is the only plausible win
+left on wim's side of the frame budget, and it would touch `Style` and
+therefore `Memo`'s cache key.
+
 ## defaults taken, recorded so they are not re-litigated
 
 ### a completion matched by folding types the ascii, not the diacritics
