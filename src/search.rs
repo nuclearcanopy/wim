@@ -1222,7 +1222,7 @@ fn rank_order(items: &[Entry], mut scored: Vec<Scored>) -> Vec<u32> {
 /// wants every match's name in order and nothing else (shellsong's
 /// completion). Goes through `rank_order` so it cannot order
 /// differently.
-fn rank_borrowed<'a>(items: &'a [Entry], scored: Vec<Scored>) -> Vec<&'a SearchItem> {
+fn rank_borrowed(items: &[Entry], scored: Vec<Scored>) -> Vec<&SearchItem> {
     rank_order(items, scored)
         .into_iter()
         .map(|at| &items[at as usize].item)

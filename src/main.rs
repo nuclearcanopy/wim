@@ -11,12 +11,10 @@ use wim::{
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui_image::picker::Picker;
 use ratatui_image::StatefulImage;
 
 use wim::catalog::{
@@ -44,10 +42,7 @@ use wim::eq_menu_keys::{
     adjust_eq_band, eq_label, eq_menu_editor_key, eq_saved_row_hint, persist_eq,
 };
 use wim::focus::{focus_direction_key, focus_in_direction, InputMode};
-use wim::graphics::{
-    art_mode_for_picker, cell_aspect, graphics_plausible, protocol_image, real_graphics,
-    wants_full_art, warn_no_graphics, ProtocolCache,
-};
+use wim::graphics::{cell_aspect, protocol_image, ArtProbe, ProtocolCache};
 use wim::keymap::{KeyAction, Keymap};
 use wim::layout::{PanelLayout, ResizePanel};
 use wim::lyricspane::LyricsPane;
@@ -665,16 +660,6 @@ fn main() -> anyhow::Result<()> {
     // the track listing stays visible rather than getting replaced.
     // 'm' toggles it by hand either way.
     let mut player_minimized = false;
-    // 'i' cycles ascii-bw -> ascii-color -> full-bw -> full-color ->
-    // off from here; this is just the config-driven starting point,
-    // with the graphics probe still out (so never a full mode yet, see
-    // `art_mode_for_picker`). kept around so the probe landing can only
-    // upgrade a mode the user hasn't since cycled by hand.
-    let art_mode_pending = art_mode_for_picker(cfg.album_art, false);
-    let mut art_mode = art_mode_pending;
-    // one alert, not one per keypress, when `i` reaches a real mode
-    // the terminal cannot render.
-    let mut warned_no_graphics = false;
     // latest captured frame while playing a local video, rendered
     // through the same ascii pipeline as album art instead of mpv
     // opening its own window; `None` whenever nothing video is
@@ -1027,37 +1012,19 @@ fn main() -> anyhow::Result<()> {
     let mut panels = PanelLayout::from_sizes(cfg.sidebar_width, cfg.bottom_bar_height);
     let start = Instant::now();
     let mut guard = term::TerminalGuard::new(cfg.mouse)?;
-    // queries the terminal over stdio for font-cell size and graphics
-    // protocol support; best-effort, 'i' (real image mode) just stays
-    // unavailable if this fails rather than erroring the whole app.
-    // on its own thread because the terminal may simply never answer,
-    // in which case ratatui-image waits out a full second: the single
-    // largest thing the first frame used to sit behind. spawned after
-    // raw mode is already on, since the probe saves and restores
-    // whatever termios state it finds.
-    let (picker_tx, picker_rx) = mpsc::channel::<Option<Picker>>();
-    if graphics_plausible() {
-        thread::spawn(move || {
-            let _ = picker_tx.send(Picker::from_query_stdio().ok());
-            trace::mark("graphics probe answered");
-        });
-    } else {
-        // skipped, not backgrounded: the probe reads stdin waiting for
-        // an answer, so on a terminal that will never send one it sits
-        // there for a full second racing the main loop for input and
-        // eating whatever arrives, mouse reports included. not probing
-        // at all is both faster and the only way the event loop is the
-        // single reader of stdin.
-        let _ = picker_tx.send(None);
-        trace::mark("graphics probe skipped (terminal has no protocol)");
-    }
-    let mut picker: Option<Picker> = None;
-    let mut picker_probed = false;
+    // the terminal's font-cell size and graphics-protocol support,
+    // asked over stdio on its own thread, plus the album-art mode that
+    // follows from the answer ('i' cycles it from the config's
+    // starting point). best-effort: a terminal that answers nothing
+    // just leaves the full-* modes unavailable rather than erroring.
+    // spawned here because the query saves and restores whatever
+    // termios state it finds, so raw mode has to be on first.
+    let mut art = ArtProbe::spawn(cfg.album_art);
     trace::mark("terminal ready");
     // rebuilt (not re-encoded every frame) whenever the open view's
     // art or the art mode changes; `ratatui-image` owns the actual
-    // resize/encode caching per protocol instance. `browse_art_key`
-    // names what the protocol currently holds, cover and tone both.
+    // resize/encode caching per protocol instance. the key inside it
+    // names what the protocol holds, cover and tone both.
     let mut browse_art = ProtocolCache::default();
     // the display's refresh rate decides how often an animation is
     // sampled (never how fast it runs, see `anim`); one subprocess on
@@ -1187,6 +1154,10 @@ fn main() -> anyhow::Result<()> {
                 .and_then(|bv| bv.art.as_ref())
                 .or_else(|| cover_art.get(item))
         });
+        // read once for the whole frame: every write to it (the probe
+        // landing, 'i', the settings menu's art row) happens after the
+        // draw, so one snapshot is what this frame renders with.
+        let art_mode = art.mode();
         // rebuild either image protocol only when its cover or the art
         // mode changes; every frame would throw away the resize state a
         // protocol exists to hold. the mode is in the key because
@@ -1196,7 +1167,7 @@ fn main() -> anyhow::Result<()> {
         match (&now_playing, playing_art) {
             (Some(item), Some(img)) if art_mode.is_full() => {
                 player_art.ensure(
-                    picker.as_mut(),
+                    art.picker_mut(),
                     protocol_key(&coverart::art_key(item)),
                     || protocol_image(img, art_mode),
                 );
@@ -1214,7 +1185,7 @@ fn main() -> anyhow::Result<()> {
                 // latched behind a key that never changed.
                 match bv.art.as_ref() {
                     Some(img) => {
-                        browse_art.ensure(picker.as_mut(), protocol_key(&bv.art_key()), || {
+                        browse_art.ensure(art.picker_mut(), protocol_key(&bv.art_key()), || {
                             protocol_image(img, art_mode)
                         })
                     }
@@ -1255,7 +1226,7 @@ fn main() -> anyhow::Result<()> {
                 is_video: now_playing_is_video(&now_playing),
             },
             cfg.video_output,
-            picker.map(|p| p.protocol_type()),
+            art.protocol_type(),
         );
         let size = guard
             .terminal
@@ -2241,34 +2212,12 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // the terminal's answer to the graphics probe. a `full-*` mode
-        // only starts drawing from here on; until (or unless) this
-        // lands it stays ascii, and a terminal with no real protocol is
-        // said so out loud rather than leaving an art pane that never
-        // fills. the test is the *protocol*, never `picker.is_some()`:
-        // see `has_real_protocol`.
-        if !picker_probed {
-            match picker_rx.try_recv() {
-                Ok(probed) => {
-                    picker_probed = true;
-                    picker = probed;
-                    let real = real_graphics(picker);
-                    if art_mode == art_mode_pending {
-                        art_mode = art_mode_for_picker(cfg.album_art, real);
-                    }
-                    if !real && wants_full_art(cfg.album_art) {
-                        notifications.push(
-                            Severity::Alert,
-                            format!(
-                                "album art: terminal reported no graphics protocol, using {}",
-                                art_mode_for_picker(cfg.album_art, false).label()
-                            ),
-                        );
-                    }
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => picker_probed = true,
-            }
+        // the terminal's answer to the graphics probe, taken once. a
+        // `full-*` mode only starts drawing from here on, and the whole
+        // decision (upgrade only a mode nobody cycled, say so when a
+        // full-* config has nothing to draw with) is `ArtProbe::poll`.
+        if let Some(alert) = art.poll() {
+            notifications.push(Severity::Alert, alert);
         }
 
         // drain whatever the library scan thread read since the last
@@ -3381,10 +3330,8 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right
                             if settings_menu_selected == 0 =>
                         {
-                            let (next, skipped) = art_mode.cycle(real_graphics(picker));
-                            art_mode = next;
-                            if skipped {
-                                warn_no_graphics(&mut notifications, &mut warned_no_graphics);
+                            if let Some(alert) = art.cycle() {
+                                notifications.push(Severity::Alert, alert);
                             }
                         }
                         KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 1 => {
@@ -3910,10 +3857,8 @@ fn main() -> anyhow::Result<()> {
                     // graphics protocol it is not "ascii anyway", it is
                     // a blank pane; `cycle` steps past those and says
                     // so once rather than letting `i` look broken.
-                    let (next, skipped) = art_mode.cycle(real_graphics(picker));
-                    art_mode = next;
-                    if skipped {
-                        warn_no_graphics(&mut notifications, &mut warned_no_graphics);
+                    if let Some(alert) = art.cycle() {
+                        notifications.push(Severity::Alert, alert);
                     }
                     continue;
                 }

@@ -1544,6 +1544,41 @@ debounced search thread, and the local-favorites path is a file write.
         zeroing the per-chunk base fails that and the older
         item-fingerprint test both, but this one says "a chunk
         reported the wrong base" instead of "the list changed".
+      - [x] **the art/picker group's four locals ->
+        `graphics::ArtProbe`.** `picker`, `picker_probed`,
+        `art_mode`/`art_mode_pending` and `warned_no_graphics`, plus
+        the probe thread and its channel, which main.rs had no reason
+        to hold once the answer stopped landing there. home is
+        `graphics.rs` unchanged: every method is still "ask the
+        terminal, or decide from what it answered", and `cycle` folded
+        `warn_no_graphics` in, which had no other caller.
+        **the rule is a method each**: the answer is taken exactly
+        once, by *dropping* the receiver when it arrives rather than
+        latching a `picker_probed` flag next to it, so a second apply
+        is not representable; it may only move a mode nobody has
+        cycled by hand since startup (the probe can take a second,
+        which is long enough to press 'i', and an upgrade then undoes
+        a deliberate keypress); and the capability it judges by is the
+        protocol, never `picker.is_some()`. the three sites that each
+        re-derived that from `cfg.album_art` now ask one object that
+        holds it.
+        **the bug it would have prevented was in the arm nobody looked
+        at**: `Err(Disconnected)` set `picker_probed = true` and
+        skipped the mode decision with it, so a probe thread that died
+        before sending left a `full-*` config silently in ascii with no
+        alert saying why. `poll` treats a dropped channel as the answer
+        it is (no protocol), alert included.
+        seven tests, seven mutations, each caught by the one it was
+        aimed at: deleting the `mode == pending` guard, keeping the
+        receiver after an answer (two answers would find `mode` back at
+        `pending`, since the first degraded it to exactly that, and
+        read as a free upgrade), `Disconnected` waiting instead of
+        answering, dropping the once-per-session `warned` latch,
+        `is_some()` as the capability, the alert unconditional, and
+        `Empty` counting as an answer.
+        main.rs 4814 -> 4759. the only group left is the playback
+        timers, which stay loose on purpose (four unrelated features,
+        one bag would name nothing).
       - [x] **the revision is an identity, and a `Ranking` carries
         it.** an adversarial review of the slice above found the
         counter did not do the job it was added for, and it was right:
