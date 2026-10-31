@@ -898,13 +898,49 @@ mpv loaded, a generated silence source included".
       span as "15m"/"1h30m"/"1m30s", distinct from `fmt_time`'s
       fixed-width `m:ss` because a span is a length someone chose, not
       a position in a track, and sits nowhere near a scrubber.
-- [ ] **nothing can create one yet**, which is the next slice: the
-      `silence(15m)` and `silence(15m, front)` command (grammar
-      decided above; `Ty::Duration` already parses `15m`, as `sleep`
-      uses it), and then the bottom bar and scrubber reading the
-      entry's own length for the playing silence. until that lands the
-      variant is inert, which is deliberate: it means the 23 decisions
-      are reviewable on their own.
+- [x] **`silence(15m)` and `silence(15m, front)` exist.** the
+      position parameter is `add_to_queue`'s own, rather than a second
+      way to say the same thing.
+      it takes a new **`Ty::Span`, not `Ty::Duration`**, and that was
+      not pedantry: `Duration` accepts `off` (for `sleep(off)`), so
+      `silence(off)` would have parsed cleanly and then done *nothing
+      at all, silently*, since there is no silence of no length. a
+      span is a length that is something; a duration is a timer that
+      can be cancelled. `silence(0s)` is refused at parse time for the
+      same reason, "a silence needs a length".
+      appended unshuffled even with shuffle on: a silence is
+      positional by nature, and the one thing worse than a gap in the
+      wrong place is a gap somewhere nobody chose.
+      `Silence` joined `TrackResolver::request`'s instant list while
+      wiring this, which is not cosmetic: `queue(3)` can target a
+      queue row that *is* a silence, and without it that spawned a
+      thread to "resolve" an entry that is already its own track list.
+      two existing guard tests caught the addition by design (the
+      pinned completion list, and the one asserting every parameter
+      type in the table is covered), which is what they are for.
+- [ ] **the playing silence still draws from mpv's duration**, so a
+      15m gap shows as a one-second track on the bar and the scrubber
+      fills instantly. the fix is known (read `Silence { secs }`) and
+      is a ui slice: `now_playing`'s length comes from the `duration`
+      property, so it needs a path for "the entry knows better than
+      mpv". **this is the one part a human should look at**, since it
+      is the only visible half of the feature.
+- [ ] **three racy tests of my own, fixed while here, worth the
+      note.** the resolver tests mixed a real `request` (which spawns
+      a worker that tries to reach the fixture client's host) with a
+      staged `deliver`, so the real reply raced the fake one. they
+      passed for two sessions because dns failed slower than the test
+      ran; `Intent::queue_bound` then let the real error batch through
+      the epoch filter and one of them started failing on a dns error
+      instead of its assertion.
+      they `deliver` only now. one consequence had to be handled
+      rather than accepted: dropping `request` made
+      `two_albums_queued_in_a_row_both_arrive` **toothless against the
+      per-request bump**, since with no request the epoch never moved
+      either way. split into two tests, one asserting `request` leaves
+      the epoch alone (which catches that mutation) and one asserting
+      `poll` hands both batches over. both mutation-checked again
+      after the split.
 - [ ] **`gap(10s)`, the default between tracks**, is still open and is
       *not* simply "insert a silence between every entry": that would
       double the queue's length and make every index the user sees

@@ -187,7 +187,10 @@ impl TrackResolver {
     pub fn request(&mut self, item: &SearchItem, into: Intent) -> Resolution {
         if matches!(
             item,
-            SearchItem::LocalMusic { .. } | SearchItem::LocalVideo { .. } | SearchItem::Song { .. }
+            SearchItem::LocalMusic { .. }
+                | SearchItem::LocalVideo { .. }
+                | SearchItem::Song { .. }
+                | SearchItem::Silence { .. }
         ) {
             // `resolve_tracks` cannot fail for these, but it owns the
             // rule about what they resolve to, so it stays the one
@@ -1976,6 +1979,29 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 serde_json::json!(position.saturating_sub(1)),
             ))
         }
+        Op::Silence { secs, front } => {
+            // no network and no expansion: a silence is already its
+            // own one-entry track list, so it goes straight in.
+            let item = SearchItem::Silence { secs };
+            let span = crate::ui::progress::fmt_span(secs);
+            if front {
+                match front_resolved(&[item], core) {
+                    Ok(_) => op_note(format!("a {span} silence plays next")),
+                    Err(why) => op_fail(why),
+                }
+            } else {
+                // appended, never shuffled into a random slot even
+                // with shuffle on: a silence is positional by nature,
+                // and the one thing worse than a gap in the wrong
+                // place is a gap somewhere nobody chose.
+                let status = enqueue_track(core.player, &item, core.cache, core.queue, false);
+                if status.starts_with("error") {
+                    op_fail(status)
+                } else {
+                    op_note(format!("queued a {span} silence"))
+                }
+            }
+        }
         Op::ShuffleQueue => {
             let shuffled = core.queue.shuffled_upcoming();
             let count = shuffled.len();
@@ -3010,8 +3036,13 @@ mod seam_tests {
     /// and nothing said so. Queueing an artist then an album is the
     /// realistic way in, since the artist fan-out is slow enough to
     /// still be running.
+    /// Half one: asking for a second thing must not disown the
+    /// first. Asserted on the epoch rather than by polling, because
+    /// `request` spawns a real worker whose reply would race anything
+    /// this test staged; the epoch is the whole mechanism, so it is
+    /// also the honest thing to assert on.
     #[test]
-    fn two_albums_queued_in_a_row_both_arrive() {
+    fn requesting_does_not_supersede_an_earlier_request() {
         let mut r = TrackResolver::new();
         let album = crate::search::SearchItem::Album {
             id: "al1".into(),
@@ -3019,12 +3050,25 @@ mod seam_tests {
             artist: "a".into(),
             client: crate::browse::tests::test_client(),
         };
+        let before = r.epoch();
         r.request(&album, Intent::Back);
-        let first = r.epoch();
         r.request(&album, Intent::Back);
+        assert_eq!(
+            r.epoch(),
+            before,
+            "a request that bumped the epoch would drop every batch \
+             still in flight, which for queueing means losing tracks \
+             the user asked for"
+        );
+    }
 
-        r.deliver(first, Intent::Back, test_songs(3));
-        r.deliver(r.epoch(), Intent::Back, test_songs(2));
+    /// Half two: and `poll` hands both of them over, in order.
+    #[test]
+    fn two_batches_at_the_current_epoch_both_arrive() {
+        let mut r = TrackResolver::new();
+        let at = r.epoch();
+        r.deliver(at, Intent::Back, test_songs(3));
+        r.deliver(at, Intent::Back, test_songs(2));
         let landed: Vec<usize> = std::iter::from_fn(|| r.poll())
             .map(|(_, _, tracks)| tracks.unwrap().len())
             .collect();
@@ -3041,13 +3085,6 @@ mod seam_tests {
     #[test]
     fn invalidate_disowns_a_batch_in_flight() {
         let mut r = TrackResolver::new();
-        let album = crate::search::SearchItem::Album {
-            id: "al1".into(),
-            name: "x".into(),
-            artist: "a".into(),
-            client: crate::browse::tests::test_client(),
-        };
-        r.request(&album, Intent::Back);
         let before = r.epoch();
         r.invalidate();
         r.deliver(before, Intent::Back, test_songs(2));
@@ -3061,14 +3098,6 @@ mod seam_tests {
     #[test]
     fn invalidate_disowns_every_batch_in_flight_not_just_the_last() {
         let mut r = TrackResolver::new();
-        let album = crate::search::SearchItem::Album {
-            id: "al1".into(),
-            name: "x".into(),
-            artist: "a".into(),
-            client: crate::browse::tests::test_client(),
-        };
-        r.request(&album, Intent::Back);
-        r.request(&album, Intent::Front);
         let before = r.epoch();
         r.invalidate();
         r.deliver(before, Intent::Back, test_songs(2));
@@ -3219,14 +3248,6 @@ mod seam_tests {
     #[test]
     fn invalidate_does_not_cancel_an_in_flight_download() {
         let mut r = TrackResolver::new();
-        let album = crate::search::SearchItem::Album {
-            id: "al1".into(),
-            name: "x".into(),
-            artist: "a".into(),
-            client: crate::browse::tests::test_client(),
-        };
-        r.request(&album, Intent::Download);
-        r.request(&album, Intent::Back);
         let before = r.epoch();
         r.invalidate();
         r.deliver(before, Intent::Back, test_songs(2));
@@ -3244,13 +3265,6 @@ mod seam_tests {
     #[test]
     fn a_current_batch_arrives_with_its_destination() {
         let mut r = TrackResolver::new();
-        let album = crate::search::SearchItem::Album {
-            id: "al1".into(),
-            name: "x".into(),
-            artist: "a".into(),
-            client: crate::browse::tests::test_client(),
-        };
-        r.request(&album, Intent::Front);
         r.deliver(r.epoch(), Intent::Front, test_songs(2));
         let (into, _, tracks) = r.poll().expect("a current batch lands");
         assert_eq!(into, Intent::Front, "it must queue where it was asked to");
