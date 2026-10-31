@@ -839,23 +839,28 @@ fn song_count(n: usize) -> String {
     }
 }
 
-/// An opened album's cover. Goes through the shared on-disk store
-/// keyed by the album's names, so reopening an album costs nothing and
-/// a cover the player already fetched for one of its tracks is a hit
-/// here (and the reverse).
-///
-/// `artist`/`album` rather than just the id because the store is
-/// name-keyed; falling back to the id's own slot keeps an untagged
-/// album working, just without sharing.
+/// Where an opened album's cover is filed. The album id first, which
+/// is what the player's own key prefers too (`coverart::Key::of`); the
+/// names are the fallback for a track whose album id nothing has
+/// reported. **Both sides have to try the forms in this same order**,
+/// or an album opened here stops sharing its cover with the same
+/// album's tracks playing from the player.
+fn cover_key(album_id: &str, artist: &str, album: &str) -> crate::coverart::Key {
+    crate::coverart::Key::album_id(album_id)
+        .or_else(|| crate::coverart::Key::album(artist, album))
+        .unwrap_or_else(|| crate::coverart::Key::Track(format!("album:{album_id}")))
+}
+
+/// An opened album's cover. Goes through the shared on-disk store, so
+/// reopening an album costs nothing and a cover the player already
+/// fetched for one of its tracks is a hit here (and the reverse).
 fn fetch_cover_art(
     client: &Client,
     album_id: &str,
     artist: &str,
     album: &str,
 ) -> Option<image::DynamicImage> {
-    let key = crate::coverart::Key::album(artist, album)
-        .unwrap_or_else(|| crate::coverart::Key::Track(format!("album:{album_id}")));
-    crate::coverart::fetch_stored(client, &key, album_id)
+    crate::coverart::fetch_stored(client, &cover_key(album_id, artist, album), album_id)
 }
 
 pub fn songs_to_items(songs: Vec<crate::subsonic::Song>, client: &Arc<Client>) -> Vec<SearchItem> {
@@ -933,6 +938,32 @@ pub mod fixtures {
 pub(crate) mod tests {
     pub(crate) use super::fixtures::{test_client, test_songs, test_view};
     use super::*;
+
+    /// An opened album and the same album's tracks playing from the
+    /// player have to reach one key, or each fetches the cover
+    /// separately and neither is the other's hit on disk. The player
+    /// side prefers the album id (`coverart::Key::of`), so this side
+    /// must too.
+    #[test]
+    fn an_opened_albums_cover_is_keyed_on_the_album_id_first() {
+        let by_id = cover_key("al-crest", "Bladee", "Crest");
+        assert_eq!(by_id, crate::coverart::Key::album_id("al-crest").unwrap());
+
+        // names only when there is no id at all, which is the same
+        // fallback the player's key takes.
+        let by_name = cover_key("", "Bladee", "Crest");
+        assert_eq!(
+            by_name,
+            crate::coverart::Key::album("Bladee", "Crest").unwrap()
+        );
+
+        // and an untagged album with no id still gets its own slot
+        // rather than colliding with every other untagged one.
+        assert!(matches!(
+            cover_key("", "", ""),
+            crate::coverart::Key::Track(_)
+        ));
+    }
 
     #[test]
     fn set_tracks_clamps_selection_into_the_shorter_list() {

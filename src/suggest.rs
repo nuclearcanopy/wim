@@ -406,10 +406,16 @@ impl Enrichment for EnrichmentCache {
 // catalog
 // ---------------------------------------------------------------------
 
-/// Normalised join key. Remote `SearchItem`s carry album and artist as
-/// display *names*, not ids, so names are what tracks, albums, and
-/// artists get joined on; casing and stray whitespace must not split
-/// one artist in two.
+/// Normalised join key: the fallback half of the identity, used
+/// wherever no server id is available (local files, and anything the
+/// server has not reported ids for). Casing and stray whitespace must
+/// not split one artist in two.
+///
+/// Ids win where they exist, because names are a lossy join: two
+/// same-titled albums by one artist collapse into one, and a split
+/// credit ("Bladee & Ecco2k") rolls up under neither artist. See
+/// `Catalog::artist_slot`/`album_slot`, and docs/identity.md for why
+/// the ids arrive through the client rather than on `SearchItem`.
 fn norm(s: &str) -> String {
     s.trim().to_lowercase()
 }
@@ -430,6 +436,33 @@ fn norm_into(s: &str, out: &mut String) {
 
 /// `(normalised artist, normalised album)`.
 type AlbumKey = (String, String);
+
+/// A track's album and artist as the server's own ids, where some
+/// response has said so. The id-preferring half of the joins; `None`
+/// is the name-fallback case, which is every local file and any song
+/// nothing has described yet.
+#[derive(Debug, Default, Clone)]
+struct TrackIds {
+    album: Option<String>,
+    artist: Option<String>,
+}
+
+impl TrackIds {
+    /// Nothing known, so every join falls back to names.
+    const NONE: TrackIds = TrackIds {
+        album: None,
+        artist: None,
+    };
+
+    /// Whatever the song's own server has learned about it; see
+    /// `subsonic::IdIndex`.
+    fn of(client: &Client, song_id: &str) -> TrackIds {
+        TrackIds {
+            album: client.album_of_song(song_id),
+            artist: client.artist_of_song(song_id),
+        }
+    }
+}
 
 /// One known track. `key` is the play-history key, i.e. the remote
 /// song id (what `cache::CacheIndex` is keyed by) or the local path.
@@ -454,8 +487,17 @@ pub struct Track {
 #[derive(Debug, Clone)]
 struct AlbumEntry {
     key: AlbumKey,
+    /// The server's own album id, once anything has said so. What
+    /// `by_album_id` keys on, and what keeps two same-titled records
+    /// by one artist apart.
+    id: Option<String>,
     name: String,
     artist: String,
+    /// The artist slot this album rolls up to, resolved when the album
+    /// was ingested (by artist id where the server gave one). `None`
+    /// for an album only ever seen as a track's album name, where
+    /// `album_gap` falls back to the name join.
+    artist_slot: Option<usize>,
     /// `None` for an album only ever seen as a track's album name;
     /// without a `SearchItem::Album` there is no row to suggest.
     item: Option<SearchItem>,
@@ -494,9 +536,15 @@ pub struct Catalog {
     track_artist: Vec<Option<usize>>,
     by_key: HashMap<String, usize>,
     albums: Vec<AlbumEntry>,
+    /// Name index, `(normalised artist, normalised album)`. Kept
+    /// alongside `by_album_id` rather than replaced by it: an id must
+    /// never *split* what the names would have merged, or a local file
+    /// and the same album from a server would stop being one slot.
     by_album: HashMap<AlbumKey, usize>,
+    by_album_id: HashMap<String, usize>,
     artists: Vec<ArtistEntry>,
     by_artist: HashMap<String, usize>,
+    by_artist_id: HashMap<String, usize>,
 }
 
 impl Catalog {
@@ -523,15 +571,30 @@ impl Catalog {
     fn ingest_item(&mut self, item: &SearchItem) {
         match item {
             SearchItem::Artist { id, name, .. } => {
-                let slot = self.artist_slot(name);
+                let slot = self.artist_slot(Some(id), name);
                 let artist = &mut self.artists[slot];
-                artist.id = Some(id.clone());
+                // the artist row is authoritative for the display
+                // name, which a split-credit track may have got here
+                // first with.
+                artist.name = name.clone();
+                artist.key = norm(name);
                 artist.item = Some(item.clone());
+                let key = artist.key.clone();
+                // `or_insert`, not `insert`: a namesake artist already
+                // holding this key keeps it (see `artist_slot`).
+                self.by_artist.entry(key).or_insert(slot);
             }
-            SearchItem::Album { name, artist, .. } => {
-                let slot = self.album_slot(artist, name);
+            SearchItem::Album {
+                id,
+                name,
+                artist,
+                client,
+            } => {
+                let slot = self.album_slot(Some(id), artist, name);
                 self.albums[slot].item = Some(item.clone());
-                let artist_slot = self.artist_slot(artist);
+                let artist_id = client.artist_of_album(id);
+                let artist_slot = self.artist_slot(artist_id.as_deref(), artist);
+                self.albums[slot].artist_slot = Some(artist_slot);
                 if !self.artists[artist_slot].albums.contains(&slot) {
                     self.artists[artist_slot].albums.push(slot);
                 }
@@ -541,9 +604,10 @@ impl Catalog {
                 title,
                 artist,
                 album,
-                ..
+                client,
             } => {
-                self.upsert_track(id, item, title, artist, album, &[], None, None);
+                let ids = TrackIds::of(client, id);
+                self.upsert_track(id, item, title, artist, album, &[], &ids, None);
             }
             SearchItem::LocalMusic {
                 path,
@@ -553,11 +617,21 @@ impl Catalog {
             } => {
                 // local files are never in the play-history index at
                 // all (see cache.rs), so these only ever matter as
-                // cold-start material.
+                // cold-start material. They have no ids of any kind,
+                // which is the whole reason the name join stays.
                 let key = path.to_string_lossy().into_owned();
                 let artist = artist.clone().unwrap_or_default();
                 let album = album.clone().unwrap_or_default();
-                self.upsert_track(&key, item, title, &artist, &album, &[], None, None);
+                self.upsert_track(
+                    &key,
+                    item,
+                    title,
+                    &artist,
+                    &album,
+                    &[],
+                    &TrackIds::NONE,
+                    None,
+                );
             }
             SearchItem::LocalVideo { .. } | SearchItem::Playlist { .. } => {}
         }
@@ -569,6 +643,7 @@ impl Catalog {
     pub fn ingest_songs(&mut self, songs: &[Song], client: &Arc<Client>) {
         for song in songs {
             let item = song_item(song, client);
+            let ids = TrackIds::of(client, &song.id);
             self.upsert_track(
                 &song.id,
                 &item,
@@ -576,7 +651,7 @@ impl Catalog {
                 &song.artist,
                 &song.album,
                 &song.genres,
-                None,
+                &ids,
                 None,
             );
         }
@@ -598,11 +673,17 @@ impl Catalog {
         songs: &[Song],
         client: &Arc<Client>,
     ) {
-        let slot = self.album_slot(album_artist, album_name);
+        // the host fetched by album id (`AlbumTarget::id`) but passes
+        // the names, so the id comes back off the tracks: it lands on
+        // the exact record fetched rather than on whichever
+        // same-titled sibling holds the name index.
+        let id = songs.first().and_then(|s| client.album_of_song(&s.id));
+        let slot = self.album_slot(id.as_deref(), album_artist, album_name);
         self.albums[slot].track_total = Some(songs.len());
         self.albums[slot].asked = true;
         for (position, song) in songs.iter().enumerate() {
             let item = song_item(song, client);
+            let ids = TrackIds::of(client, &song.id);
             self.upsert_track(
                 &song.id,
                 &item,
@@ -610,8 +691,8 @@ impl Catalog {
                 &song.artist,
                 album_name,
                 &song.genres,
-                Some(position),
-                Some(slot),
+                &ids,
+                Some((position, slot)),
             );
         }
     }
@@ -619,14 +700,21 @@ impl Catalog {
     /// Records that a tracklist fetch was attempted and produced
     /// nothing usable, so `album_targets` stops offering it. Without
     /// this a server that 404s one album re-offers it forever.
+    /// Names only, deliberately: this is the empty-tracklist case, so
+    /// there is no song to read an album id off. Between two
+    /// same-titled records it marks whichever holds the name index,
+    /// and the other is re-offered once more.
     pub fn mark_album_asked(&mut self, album_artist: &str, album_name: &str) {
-        let slot = self.album_slot(album_artist, album_name);
+        let slot = self.album_slot(None, album_artist, album_name);
         self.albums[slot].asked = true;
     }
 
     /// Insert or enrich. A track can arrive first from the corpus
     /// (no genre, no position) and again from a full album fetch; the
     /// richer facts win, and nothing already known is dropped.
+    /// `placement` is `(track position, album slot)`, known only from
+    /// a full album fetch: the one ingest that knows both which album
+    /// row it fetched for and where each track sits on it.
     #[allow(clippy::too_many_arguments)]
     fn upsert_track(
         &mut self,
@@ -636,9 +724,11 @@ impl Catalog {
         artist: &str,
         album: &str,
         genres: &[String],
-        position: Option<usize>,
-        album_slot: Option<usize>,
+        ids: &TrackIds,
+        placement: Option<(usize, usize)>,
     ) {
+        let position = placement.map(|(position, _)| position);
+        let album_slot = placement.map(|(_, slot)| slot);
         let index = match self.by_key.get(key) {
             Some(&index) => {
                 let track = &mut self.tracks[index];
@@ -668,21 +758,23 @@ impl Catalog {
             }
         };
 
-        if !artist.is_empty() {
-            let slot = self.artist_slot(artist);
+        // an id with no name still identifies an artist, which is the
+        // point: the credit string is what was unreliable.
+        if !artist.is_empty() || ids.artist.is_some() {
+            let slot = self.artist_slot(ids.artist.as_deref(), artist);
             if !self.artists[slot].tracks.contains(&index) {
                 self.artists[slot].tracks.push(index);
             }
             self.track_artist[index] = Some(slot);
         }
-        if !album.is_empty() {
-            let slot = album_slot.unwrap_or_else(|| self.album_slot(artist, album));
+        if !album.is_empty() || ids.album.is_some() {
+            let slot =
+                album_slot.unwrap_or_else(|| self.album_slot(ids.album.as_deref(), artist, album));
             if !self.albums[slot].tracks.contains(&index) {
                 self.albums[slot].tracks.push(index);
             }
             self.track_album[index] = Some(slot);
-            if !artist.is_empty() {
-                let artist_slot = self.artist_slot(artist);
+            if let Some(artist_slot) = self.track_artist[index] {
                 if !self.artists[artist_slot].albums.contains(&slot) {
                     self.artists[artist_slot].albums.push(slot);
                 }
@@ -690,41 +782,136 @@ impl Catalog {
         }
     }
 
-    fn artist_slot(&mut self, name: &str) -> usize {
+    /// The slot for one artist, by the server's id where there is one
+    /// and by normalised name otherwise.
+    ///
+    /// The id is tried first, which is what makes a track credited
+    /// "Bladee & Ecco2k" land on Bladee's own slot instead of opening
+    /// a third artist nothing else joins to. The name is the fallback,
+    /// but only onto a row that is not already some *other* id's: two
+    /// bands with one name are two artists. An id-less row still joins
+    /// (local files have no ids at all), and a row whose id arrives
+    /// later adopts the slot the name built rather than starting a
+    /// second one.
+    fn artist_slot(&mut self, id: Option<&str>, name: &str) -> usize {
         let key = norm(name);
-        if let Some(&slot) = self.by_artist.get(&key) {
+        if let Some(slot) = id.and_then(|id| self.by_artist_id.get(id).copied()) {
+            // an alias: the split credit and the artist's real name
+            // both resolve here now. A blank name is not a name, and
+            // indexing it would make every untagged row join this one.
+            if !key.is_empty() {
+                self.by_artist.entry(key).or_insert(slot);
+            }
             return slot;
+        }
+        if let Some(slot) = self.by_artist.get(&key).copied() {
+            match (&self.artists[slot].id, id) {
+                (None, Some(id)) => {
+                    self.artists[slot].id = Some(id.to_string());
+                    self.by_artist_id.insert(id.to_string(), slot);
+                    return slot;
+                }
+                (_, None) => return slot,
+                // a different id under the same name: a second artist.
+                (Some(_), Some(_)) => {}
+            }
         }
         let slot = self.artists.len();
         self.artists.push(ArtistEntry {
             key: key.clone(),
             name: name.to_string(),
-            id: None,
+            id: id.map(str::to_string),
             item: None,
             tracks: Vec::new(),
             albums: Vec::new(),
         });
-        self.by_artist.insert(key, slot);
+        // first row of a name keeps the name index; a namesake is
+        // reachable by its own id, and an id-less arrival has nothing
+        // better to join on than the first.
+        if !key.is_empty() {
+            self.by_artist.entry(key).or_insert(slot);
+        }
+        if let Some(id) = id {
+            self.by_artist_id.insert(id.to_string(), slot);
+        }
         slot
     }
 
-    fn album_slot(&mut self, artist: &str, name: &str) -> usize {
+    /// The slot for one album, by the server's id where there is one
+    /// and by `(artist, album)` names otherwise; same resolution order
+    /// and the same "a different id is a different record" rule as
+    /// `artist_slot`, which here is what stops two same-titled albums
+    /// by one artist from collapsing into one.
+    fn album_slot(&mut self, id: Option<&str>, artist: &str, name: &str) -> usize {
         let key = (norm(artist), norm(name));
-        if let Some(&slot) = self.by_album.get(&key) {
+        if let Some(slot) = id.and_then(|id| self.by_album_id.get(id).copied()) {
+            if !key.1.is_empty() {
+                self.by_album.entry(key).or_insert(slot);
+            }
             return slot;
+        }
+        if let Some(slot) = self.by_album.get(&key).copied() {
+            match (&self.albums[slot].id, id) {
+                (None, Some(id)) => {
+                    self.albums[slot].id = Some(id.to_string());
+                    self.by_album_id.insert(id.to_string(), slot);
+                    return slot;
+                }
+                (_, None) => return slot,
+                (Some(_), Some(_)) => {}
+            }
         }
         let slot = self.albums.len();
         self.albums.push(AlbumEntry {
             key: key.clone(),
+            id: id.map(str::to_string),
             name: name.to_string(),
             artist: artist.to_string(),
+            artist_slot: None,
             item: None,
             tracks: Vec::new(),
             track_total: None,
             asked: false,
         });
-        self.by_album.insert(key, slot);
+        if !key.1.is_empty() {
+            self.by_album.entry(key).or_insert(slot);
+        }
+        if let Some(id) = id {
+            self.by_album_id.insert(id.to_string(), slot);
+        }
         slot
+    }
+
+    /// The artist key a track rolls up under, for the cold start and
+    /// for diversification: its resolved artist slot's key, which for
+    /// a split credit is the artist the server named by id rather than
+    /// the credit string, and its own normalised credit otherwise.
+    /// One definition so the two cannot bucket differently.
+    fn track_artist_key(&self, index: usize) -> String {
+        match self.track_artist.get(index).copied().flatten() {
+            Some(slot) => self.artists[slot].key.clone(),
+            None => norm(&self.tracks[index].artist),
+        }
+    }
+
+    /// Same for an album row.
+    fn album_artist_key(&self, slot: usize) -> String {
+        match self.albums[slot].artist_slot {
+            Some(artist) => self.artists[artist].key.clone(),
+            None => self.albums[slot].key.0.clone(),
+        }
+    }
+
+    /// Diversification identity for an album slot: the server's album
+    /// id when there is one, the name pair otherwise. A single string
+    /// so the two forms share one keyspace and the cap cannot count a
+    /// record twice.
+    fn album_identity(&self, slot: usize) -> String {
+        let album = &self.albums[slot];
+        match &album.id {
+            Some(id) => format!("i:{id}"),
+            None => format!("n:{}\u{1}{}", album.key.0, album.key.1),
+        }
     }
 
     /// Which server to ask about this artist. `ArtistTarget` carries
@@ -1100,7 +1287,9 @@ struct Candidate {
     score: f32,
     reason_text: String,
     artist_key: String,
-    album_key: Option<AlbumKey>,
+    /// `Catalog::album_identity`: the album id where there is one, the
+    /// name pair otherwise.
+    album_key: Option<String>,
     genre_key: Option<String>,
 }
 
@@ -1123,7 +1312,7 @@ impl Candidate {
     fn attributes(
         mut self,
         artist_key: String,
-        album_key: Option<AlbumKey>,
+        album_key: Option<String>,
         genre_key: Option<String>,
     ) -> Candidate {
         self.artist_key = artist_key;
@@ -1441,7 +1630,12 @@ fn album_gap(model: &Model<'_>) -> Vec<Candidate> {
         let Some(item) = &album.item else {
             continue;
         };
-        let artist_slot = model.catalog.by_artist.get(&album.key.0).copied();
+        // the album's resolved artist slot (by id where the server
+        // gave one), falling back to the name join for an album that
+        // only ever showed up as a track's album name.
+        let artist_slot = album
+            .artist_slot
+            .or_else(|| model.catalog.by_artist.get(&album.key.0).copied());
         let artist_score = model.artist_score(artist_slot);
         if artist_score < model.tuning.min_artist_affinity {
             continue;
@@ -1477,8 +1671,8 @@ fn album_gap(model: &Model<'_>) -> Vec<Candidate> {
         };
         out.push(
             Candidate::new(Reason::AlbumGap, item, raw, text).attributes(
-                album.key.0.clone(),
-                Some(album.key.clone()),
+                model.catalog.album_artist_key(slot),
+                Some(model.catalog.album_identity(slot)),
                 None,
             ),
         );
@@ -1792,8 +1986,8 @@ fn track_candidate(
 ) -> Candidate {
     let track = &model.catalog.tracks[index];
     Candidate::new(reason, &track.item, raw, reason_text).attributes(
-        norm(&track.artist),
-        model.catalog.track_album[index].map(|s| model.catalog.albums[s].key.clone()),
+        model.catalog.track_artist_key(index),
+        model.catalog.track_album[index].map(|s| model.catalog.album_identity(s)),
         track.genres.first().map(|g| norm(g)),
     )
 }
@@ -1873,7 +2067,7 @@ fn diversify(pool: Vec<Candidate>, tuning: &Tuning) -> Vec<Candidate> {
     let mut remaining: Vec<Option<Candidate>> = pool.into_iter().map(Some).collect();
     let mut picked: Vec<Candidate> = Vec::new();
     let mut artists: HashMap<String, usize> = HashMap::new();
-    let mut albums: HashMap<AlbumKey, usize> = HashMap::new();
+    let mut albums: HashMap<String, usize> = HashMap::new();
     let mut genres: HashMap<String, usize> = HashMap::new();
     let mut sections: HashMap<Reason, usize> = HashMap::new();
 
@@ -1890,7 +2084,7 @@ fn diversify(pool: Vec<Candidate>, tuning: &Tuning) -> Vec<Candidate> {
             let album_count = candidate
                 .album_key
                 .as_ref()
-                .map_or(0, |k| albums.get(k).copied().unwrap_or(0));
+                .map_or(0, |k| count(&albums, k));
             if candidate.album_key.is_some() && album_count >= tuning.max_per_album {
                 continue;
             }
@@ -2012,13 +2206,13 @@ fn cold_start(model: &Model<'_>, req: &Request<'_>) -> Suggestions {
         }
         by_artist[slot].1.push(item.clone());
     };
-    for album in &catalog.albums {
+    for (slot, album) in catalog.albums.iter().enumerate() {
         if let Some(item) = &album.item {
-            push(&album.key.0, item);
+            push(&catalog.album_artist_key(slot), item);
         }
     }
-    for track in &catalog.tracks {
-        push(&norm(&track.artist), &track.item);
+    for (index, track) in catalog.tracks.iter().enumerate() {
+        push(&catalog.track_artist_key(index), &track.item);
     }
 
     let artist_total = catalog.artists.len().max(by_artist.len());
@@ -2737,7 +2931,7 @@ mod tests {
                 let id = format!("al-{i}");
                 Candidate::new(Reason::AlbumGap, &item(&id), 1.0, String::new()).attributes(
                     "one artist".into(),
-                    Some(("one artist".into(), id)),
+                    Some(format!("i:{id}")),
                     Some("metal".into()),
                 )
             })
@@ -2758,11 +2952,7 @@ mod tests {
             .map(|i| {
                 let id = format!("al-{i}");
                 let mut c = Candidate::new(Reason::AlbumGap, &item(&id), 1.0, String::new())
-                    .attributes(
-                        format!("artist {i}"),
-                        Some((format!("artist {i}"), id)),
-                        None,
-                    );
+                    .attributes(format!("artist {i}"), Some(format!("i:{id}")), None);
                 c.score = 1.0;
                 c
             })
@@ -3149,6 +3339,217 @@ mod tests {
         assert_eq!(catalog.track_count(), 1, "the same id is one track");
         assert_eq!(catalog.tracks[0].genres, vec!["Cloud Rap"]);
         assert_eq!(catalog.tracks[0].position, Some(0));
+    }
+
+    /// A client of this test's own, since the id index is shared per
+    /// server url (`subsonic::ID_INDEXES`) and these tests teach it.
+    fn client_for(tag: &str) -> Arc<Client> {
+        Arc::new(
+            Client::new(&NavidromeConfig {
+                url: format!("https://suggest-{tag}.invalid"),
+                username: "test".into(),
+                password: Some("pw".into()),
+                password_file: None,
+                max_bitrate_kbps: None,
+                transcode_format: None,
+            })
+            .unwrap(),
+        )
+    }
+
+    fn album_item_on(client: &Arc<Client>, id: &str, name: &str, artist: &str) -> SearchItem {
+        SearchItem::Album {
+            id: id.into(),
+            name: name.into(),
+            artist: artist.into(),
+            client: client.clone(),
+        }
+    }
+
+    fn artist_item_on(client: &Arc<Client>, id: &str, name: &str) -> SearchItem {
+        SearchItem::Artist {
+            id: id.into(),
+            name: name.into(),
+            client: client.clone(),
+        }
+    }
+
+    /// The first of the two name-join losses in ROADMAP: by name these
+    /// two records are one album, so one of them could never be
+    /// suggested and their coverage was pooled.
+    #[test]
+    fn two_same_titled_albums_by_one_artist_stay_two_slots() {
+        let client = client_for("sametitle");
+        let mut catalog = Catalog::new();
+        catalog.ingest_item(&album_item_on(&client, "al-1994", "Crest", "Bladee"));
+        catalog.ingest_item(&album_item_on(&client, "al-2024", "Crest", "Bladee"));
+        assert_eq!(
+            catalog.albums.len(),
+            2,
+            "two album ids are two records, whatever they are called"
+        );
+        assert_eq!(
+            catalog.artists.len(),
+            1,
+            "and they are still one artist, not two"
+        );
+        // and each is reachable by its own id rather than one
+        // shadowing the other
+        assert_ne!(
+            catalog.by_album_id["al-1994"],
+            catalog.by_album_id["al-2024"]
+        );
+    }
+
+    /// The second: a track credited "Bladee & Ecco2k" used to open a
+    /// third artist slot that no artist row, album or affinity rollup
+    /// ever joined to. The server names the primary artist by id, so
+    /// the track rolls up under Bladee.
+    #[test]
+    fn a_split_credit_track_rolls_up_under_the_artist_the_server_named() {
+        let client = client_for("splitcredit");
+        client.remember_song("s1", "al-1", "ar-bladee");
+        let mut catalog = Catalog::new();
+        catalog.ingest_item(&artist_item_on(&client, "ar-bladee", "Bladee"));
+        catalog.ingest_item(&song_item(
+            &song("s1", "Drama", "Bladee & Ecco2k", "Crest", &[]),
+            &client,
+        ));
+
+        assert_eq!(
+            catalog.artist_count(),
+            1,
+            "the split credit must not open a second artist: {:?}",
+            catalog.artists.iter().map(|a| &a.key).collect::<Vec<_>>()
+        );
+        let slot = catalog.by_artist["bladee"];
+        assert_eq!(catalog.track_artist[0], Some(slot));
+        assert_eq!(catalog.artists[slot].tracks, vec![0]);
+        // the credit string is an alias onto the same slot, so the
+        // rollup is one bucket rather than two
+        assert_eq!(catalog.by_artist["bladee & ecco2k"], slot);
+        assert_eq!(catalog.track_artist_key(0), "bladee");
+    }
+
+    /// Two bands with one name are two artists, the same way two
+    /// records with one title are two albums; the name index keeps
+    /// pointing at the first, which is all an id-less row has to join
+    /// on.
+    #[test]
+    fn two_artists_with_the_same_name_stay_two_slots() {
+        let client = client_for("namesake");
+        let mut catalog = Catalog::new();
+        catalog.ingest_item(&artist_item_on(&client, "ar-1", "Crisis"));
+        catalog.ingest_item(&artist_item_on(&client, "ar-2", "Crisis"));
+        assert_eq!(catalog.artist_count(), 2);
+        assert_eq!(
+            catalog.by_artist["crisis"], catalog.by_artist_id["ar-1"],
+            "the first row keeps the name"
+        );
+    }
+
+    /// A tracklist must land on the record it was fetched for, which
+    /// between two same-titled albums by one artist the names cannot
+    /// say; the songs that came back carry the album id, so it can.
+    #[test]
+    fn a_tracklist_lands_on_the_same_titled_record_it_was_fetched_for() {
+        let client = client_for("twinfetch");
+        client.remember_song("t-1", "al-2024", "ar-1");
+        let mut catalog = Catalog::new();
+        catalog.ingest_item(&album_item_on(&client, "al-1994", "Crest", "Bladee"));
+        catalog.ingest_item(&album_item_on(&client, "al-2024", "Crest", "Bladee"));
+        catalog.ingest_album(
+            "Bladee",
+            "Crest",
+            &[song("t-1", "Drama", "Bladee", "Crest", &[])],
+            &client,
+        );
+
+        let reissue = catalog.by_album_id["al-2024"];
+        let original = catalog.by_album_id["al-1994"];
+        assert_eq!(catalog.albums[reissue].track_total, Some(1));
+        assert_eq!(
+            catalog.albums[original].track_total, None,
+            "the tracklist landed on the wrong pressing"
+        );
+        assert_eq!(catalog.albums[reissue].tracks, vec![0]);
+    }
+
+    /// A compilation's tracks each carry their own artist, so by name
+    /// they key apart from the album; the track's album id is what
+    /// puts them back on the album's own row even when the tracklist
+    /// never came through `ingest_album`.
+    #[test]
+    fn a_compilation_track_joins_the_album_row_by_id_not_by_credit() {
+        let client = client_for("compid");
+        client.remember_song("c1", "al-comp", "ar-someone");
+        let mut catalog = Catalog::new();
+        catalog.ingest_item(&album_item_on(
+            &client,
+            "al-comp",
+            "A Compilation",
+            "Various Artists",
+        ));
+        catalog.ingest_item(&song_item(
+            &song("c1", "First", "Someone Else", "A Compilation", &[]),
+            &client,
+        ));
+
+        let album = catalog.by_album_id["al-comp"];
+        assert_eq!(
+            catalog.track_album[0],
+            Some(album),
+            "the track landed on a second, unread album slot"
+        );
+        assert_eq!(catalog.albums[album].tracks, vec![0]);
+        assert_eq!(catalog.albums.len(), 1);
+    }
+
+    /// The name fallback has to keep working, because local files have
+    /// no ids at all: a local track and a server's album row with the
+    /// same names are still one album slot, which is what makes local
+    /// plays count towards a remote album's coverage.
+    #[test]
+    fn an_id_less_row_still_joins_the_id_keyed_slot_by_name() {
+        let client = client_for("namefallback");
+        let mut catalog = Catalog::new();
+        catalog.ingest_item(&album_item_on(&client, "al-1", "Eversince", "Bladee"));
+        catalog.ingest_item(&SearchItem::LocalMusic {
+            path: std::path::PathBuf::from("/m/obedient.flac"),
+            title: "Obedient".into(),
+            artist: Some("Bladee".into()),
+            album: Some("Eversince".into()),
+        });
+
+        assert_eq!(catalog.albums.len(), 1, "names must still merge");
+        assert_eq!(catalog.artists.len(), 1);
+        assert_eq!(catalog.track_album[0], Some(catalog.by_album_id["al-1"]));
+    }
+
+    /// An id arriving after the names built a slot must adopt it, not
+    /// start a second one: the corpus order is artists, then albums,
+    /// then whatever search pulled in, and a track can beat its own
+    /// album row into the catalog.
+    #[test]
+    fn an_id_learned_later_adopts_the_slot_the_names_built() {
+        let client = client_for("lateid");
+        let mut catalog = Catalog::new();
+        // the track arrives first, with no id known for it yet
+        catalog.ingest_item(&song_item(
+            &song("s1", "Obedient", "Bladee", "Eversince", &[]),
+            &client,
+        ));
+        assert_eq!(catalog.albums.len(), 1);
+        // then the album row, which does have an id
+        catalog.ingest_item(&album_item_on(&client, "al-1", "Eversince", "Bladee"));
+
+        assert_eq!(catalog.albums.len(), 1, "the id opened a second slot");
+        let slot = catalog.by_album_id["al-1"];
+        assert_eq!(catalog.albums[slot].tracks, vec![0]);
+        assert!(
+            catalog.albums[slot].item.is_some(),
+            "the row is suggestable"
+        );
     }
 
     #[test]

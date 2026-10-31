@@ -53,6 +53,51 @@ first frame.
   a configured server's catalog is the thing that makes a cold start
   instant, including after a week offline.
 
+#### the row parse, and why it is not threaded
+
+the row parse is on the startup path, so the worry is that it outgrows
+the mpv spawn it hides behind and resurfaces on the first frame. two
+things were tried; one shipped.
+
+**what shipped: the row shape.** `CatalogRow` was an internally-tagged
+enum (`#[serde(tag = "k")]`), which serde cannot deserialize in one
+pass: every row is buffered into its own `Content` tree, allocating per
+field, before the variant is known. the same bytes through a flat
+struct with a `k` discriminant and `Cow` fields (so a row with no
+escapes borrows out of the line) is a fifth cheaper, with no machinery
+and no format change at all.
+
+**what did not: fanning the lines out over threads.** measured by
+`cache::tests::catalog_parse_scaling`, release, on an 8-core machine
+whose other cores were *not* idle (load average ~11 throughout, so
+every wall number here is pessimistic and the thread numbers most of
+all; the 26ms above is the same parse on an idle machine):
+
+| rows | cpu, tagged | cpu, flat | wall, flat | wall, 8 threads | wall, 1 chunk |
+| --- | --- | --- | --- | --- | --- |
+| 34k (today) | 87-121ms | 77-98ms | 85-107ms | 67-89ms | 109-141ms |
+| 100k | 375-379ms | 307-312ms | 343-401ms | 223-278ms | 334-424ms |
+| 300k | 1.17-1.21s | 0.92-0.97s | 1.21-1.24s | 0.68-0.74s | 1.41-1.43s |
+
+three things in those numbers, together, are the argument against it:
+
+1. the "1 chunk" column is the fan-out's own overhead with no
+   parallelism (collecting the line slices, then `thread::scope`). at
+   34k it is **25-30% worse than not doing it at all**, so shipping
+   this needs a measured row-count floor the way
+   `search::PARALLEL_SCORING_FLOOR` does, and this machine cannot
+   calibrate one honestly.
+2. at the real size the win is tens of milliseconds on a thread that
+   already overlaps the mpv spawn, which is the definition of free.
+3. at the size that was the worry it does not change the answer. 100k
+   rows is 300ms+ sequential and 220ms+ threaded; both are far past an
+   mpv spawn, so a library that big needs the parse off the startup
+   path entirely (not reading every row up front), not the same work
+   divided by cores.
+
+the candidate implementation is kept in the test module next to the
+measurement, as the evidence rather than as dead production code.
+
 **staleness and invalidation.** the warm-loaded catalog is only ever
 as current as the last session, which is why loading it is not enough
 on its own: `Corpus::reconcile_server` runs on every sync result and
