@@ -32,6 +32,29 @@ pub enum Action {
     SetEq(&'static str, [f64; 10]),
 }
 
+impl Action {
+    /// The undo tree's row label for a keypress, in the same voice as
+    /// `Op::describe()` so a tree mixing both reads as one history.
+    ///
+    /// Not every action has an op to borrow a label from: `Queued`
+    /// carries the item, where `Op::Enqueue` carries a target that was
+    /// already resolved by the time it got here.
+    pub fn describe(&self) -> String {
+        match self {
+            Action::None => "nothing".into(),
+            Action::Quit => "quit".into(),
+            Action::Play(item) => format!("played {}", item.primary_name()),
+            Action::Queued(item) => format!("queued {}", item.primary_name()),
+            Action::ShuffleToggled(on) => {
+                format!("shuffle {}", if *on { "on" } else { "off" })
+            }
+            Action::SetLoop(mode) => format!("loop {}", mode.label()),
+            Action::SetSpeed(speed) => format!("speed {speed}x"),
+            Action::SetEq(name, _) => format!("eq {name}"),
+        }
+    }
+}
+
 /// `One` loops just the current track forever (maps to mpv's own
 /// `loop-file`); `All` replays the whole queue/album from the top once
 /// it empties, a separate concept main.rs tracks itself (mpv has no
