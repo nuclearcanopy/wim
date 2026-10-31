@@ -443,8 +443,16 @@ accident.
       `ESC[2J` at init and neither can be told not to; and init-only
       geometry makes every pane resize a vo bounce. realistic shape is
       kitty-only sub-rect video with tct staying fullscreen.
-- [ ] **BLOCKER (for the pull-frames-ourselves route only): there is no
-      working way to get frames out of mpv.**
+- [x] **BLOCKER (for the pull-frames-ourselves route only): there is no
+      working way to get frames out of mpv.** -- **closed as obsolete.**
+      it gated a route that no longer exists: `FramePump` is deleted
+      (`fe6a687`) and mpv draws video with its own `tct`/`kitty` vo, so
+      nothing in wim wants a frame. the measurements below are kept
+      because they are the reason, and because anyone tempted by
+      `screenshot-raw` over ipc should read them first. the last
+      sentence of it is now wrong: `FramePump`'s public surface cannot
+      be a swap point for a replacement source, because there is no
+      `FramePump`.
       found by `perf/mpv` and it gates every item below. `screenshot-raw`
       **cannot work over json ipc at all**: mpv's own manual says it is
       client-api/script only, and over ipc it replies with a `data`
@@ -907,12 +915,27 @@ mpv loaded, a generated silence source included".
       72-cell terminal leave ~22 cells each, which truncates
       "title · artist (album)" to exactly the useless half, and a bare
       name is what you would type back into `play(...)`.
-- [ ] **`search()` in shellswim still prints nothing for a query that
-      matches only remote items**, because the echo fires on settle
-      and a cold remote search can land after it. the settle window is
-      the right hook for the local corpus; a second echo on a late
-      remote batch wants `remote_search_result_rx` to carry the query
-      it answered.
+- [x] **`search()` in shellswim printed nothing for a query whose
+      matches land after the settle window.** the plumbing was already
+      most of the way there and the note above misread it:
+      `settle.answered()` is called when a remote outcome arrives, so
+      `settled()` is already true as soon as a server replies. the
+      1200ms `SETTLE_WINDOW` only bites when a server is *slower* than
+      that, and then the echo had already gone out with the local
+      matches alone and the late batch enriched the corpus silently.
+      so no tagging of `RemoteSearchOutcome` was needed, which the
+      note had guessed at. the host remembers **the query echoed and
+      the names printed for it**, and a late answer prints only what
+      is new, under "...and from the servers:".
+      **by name, not by index**, and that is the whole reason it is a
+      set: a late answer is merged into the corpus and the results are
+      then *re-ranked*, so the new matches are not a tail that can be
+      printed by offset -- a name can move anywhere in the list.
+      diffing by name is correct under any reordering and cannot
+      reprint what was already shown. the 30-result cap spans both
+      batches, so a late arrival cannot push the total past it.
+      pinned: a second batch prints only its new names, a third prints
+      nothing, and the cap is spent across batches.
 
 ### stage 4: the queue timeline (started)
 
