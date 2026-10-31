@@ -1083,6 +1083,11 @@ pub struct CoreCtx<'a> {
     /// Snapshot behind `load_queue`'s completion; refreshed on open
     /// and after a save rather than read off disk per keystroke.
     pub saved_queues: &'a mut Vec<String>,
+    /// The live `let` bindings. Held here rather than re-read per
+    /// keystroke, and written back to disk by `define`/`unset`.
+    pub vars: &'a mut shellsong::Scope,
+    /// The per-identity settings, written back by `remember`/`forget`.
+    pub bindings: &'a mut shellsong_host::Bindings,
 }
 
 /// The one place an `Action` from `app.handle_key` is acted on. Both
@@ -1671,6 +1676,72 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 }
             }
         }
+        // the terms arrive already expanded: a variable used inside
+        // another is resolved while parsing, so this only ever stores
+        // what it was handed.
+        Op::Define { name, terms } => {
+            let count = terms.len();
+            let replaced = core.vars.define(&name, terms);
+            shellsong_host::save_vars(core.vars);
+            let verb = if replaced { "redefined" } else { "defined" };
+            op_note(format!("{verb} {name}: {count} terms"))
+        }
+        Op::Unset(name) => {
+            if !core.vars.remove(&name) {
+                return op_fail(namehint::unknown("variable", &name, core.vars.names()));
+            }
+            shellsong_host::save_vars(core.vars);
+            op_note(format!("unset {name}"))
+        }
+        Op::Remember { tier, setting } => {
+            let Some(item) = core.now_playing.as_ref() else {
+                return op_fail("nothing is playing to remember it for");
+            };
+            let id = shellsong_host::identity_of(item);
+            let Some(name) = shellsong_host::name_at(&id, tier) else {
+                return op_fail(format!(
+                    "this track has no {} to hang a setting off",
+                    tier.label()
+                ));
+            };
+            let report = format!(
+                "{} {} remembered for {} '{name}'",
+                setting.kind().label(),
+                setting.value(),
+                tier.label()
+            );
+            core.bindings.remember(tier, &name, &setting);
+            shellsong_host::save_bindings(core.bindings);
+            // applied now as well as remembered, through the same arm
+            // the typed command goes through, so remembering a setting
+            // and setting it cannot drift.
+            let (dispatch, _) = run_op(setting.op(), core, surf);
+            (dispatch, Report::Note(report))
+        }
+        Op::Forget { tier, setting } => {
+            let Some(item) = core.now_playing.as_ref() else {
+                return op_fail("nothing is playing to forget anything for");
+            };
+            let id = shellsong_host::identity_of(item);
+            let Some(name) = shellsong_host::name_at(&id, tier) else {
+                return op_fail(format!("this track has no {}", tier.label()));
+            };
+            if !core.bindings.forget(tier, &name, setting) {
+                return op_fail(match setting {
+                    Some(kind) => format!(
+                        "no {} was remembered for {} '{name}'",
+                        kind.label(),
+                        tier.label()
+                    ),
+                    None => format!("nothing was remembered for {} '{name}'", tier.label()),
+                });
+            }
+            shellsong_host::save_bindings(core.bindings);
+            op_note(match setting {
+                Some(kind) => format!("forgot {} for {} '{name}'", kind.label(), tier.label()),
+                None => format!("forgot everything for {} '{name}'", tier.label()),
+            })
+        }
         // the partition is the language's own: `is_screen()` targets
         // need a pane, the other five print into the console and so
         // behave identically in both binaries.
@@ -1778,6 +1849,28 @@ pub fn print_listing(target: ViewTarget, core: &mut CoreCtx) -> (Dispatch, Repor
             }
             op_note(format!("{count} saved queues"))
         }
+        ViewTarget::Bindings => {
+            let lines = core.bindings.lines();
+            let count = if core.bindings.is_empty() {
+                0
+            } else {
+                lines.len()
+            };
+            for line in lines {
+                core.console.note(line);
+            }
+            op_note(format!("{count} remembered"))
+        }
+        // the language generates these lines too, as `let` statements,
+        // so the listing is also valid input to paste into a `.shg`.
+        ViewTarget::Vars => {
+            let lines = core.vars.lines();
+            let count = if core.vars.is_empty() { 0 } else { lines.len() };
+            for line in lines {
+                core.console.note(line);
+            }
+            op_note(format!("{count} variables"))
+        }
         // the one listing whose content the language generates rather
         // than the app, which is what keeps `help()` and `view(help)`
         // from drifting; printing it is still the host's job.
@@ -1839,6 +1932,9 @@ pub fn drive(
                 }
             }
             shellsong::Step::Note(text) => core.console.note(text),
+            // a non-fatal complaint: reported and the program keeps
+            // going, where `Failed` stops it.
+            shellsong::Step::Warn(text) => core.console.fail(text),
             shellsong::Step::AwaitResults { .. } => return Drive::Await,
             shellsong::Step::Failed(e) => {
                 core.console.fail(e.to_string());
@@ -1934,6 +2030,102 @@ pub fn notify_query_changed(
         })
         .is_ok()
 }
+/// The `?` list: every command name, packed into rows. Derived from
+/// `shellsong::help_lines()` rather than a second table, so a command
+/// added to the language appears here without anyone remembering to.
+/// `help()` is the full version with signatures; this is the one a new
+/// user needs before they know there is a `help()`.
+pub fn short_help() -> Vec<String> {
+    let mut names: Vec<String> = shellsong::help_lines()
+        .iter()
+        .filter_map(|line| {
+            let sig = line.trim_start();
+            let name = sig.split(['(', ' ']).next()?;
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect();
+    names.dedup();
+    let mut out = vec![format!("{} commands:", names.len())];
+    out.extend(pack(&names, HELP_COLUMNS));
+    out.push("help() for the arguments, dry(cmd) to see without doing".to_string());
+    out
+}
+
+/// Rows of at most `budget` cells, words separated by two spaces.
+const HELP_COLUMNS: usize = 66;
+
+fn pack(words: &[String], budget: usize) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    for w in words {
+        let want = if row.is_empty() {
+            w.chars().count()
+        } else {
+            row.chars().count() + 2 + w.chars().count()
+        };
+        if want > budget && !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+        }
+        if !row.is_empty() {
+            row.push_str("  ");
+        }
+        row.push_str(w);
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+/// The name of the live eq curve, which the per-identity settings
+/// restore to. A hand-tuned curve has no name, so the configured preset
+/// stands in; that is better than leaving one track's curve applied for
+/// the rest of the session.
+pub fn current_eq_name(app: &app::App, cfg: &config::Config) -> String {
+    app.eq_source
+        .and_then(|s| eq::source_name(s, &cfg.eq_custom_presets))
+        .map(str::to_string)
+        .or_else(|| cfg.eq_preset.clone())
+        .unwrap_or_else(|| eq::PRESETS[0].name.to_string())
+}
+
+/// What the per-identity settings want for a track that just started:
+/// the ops to apply, and the one line to toast when the sound actually
+/// changed because of them.
+///
+/// The restore is the load-bearing half, and it lives in
+/// `shellsong_host::settle`: a setting the new track does not bind goes
+/// back to the value the user had chosen before any binding took over,
+/// rather than keeping the last bound one (which is what leaves
+/// everything quiet after one quiet song).
+pub fn identity_settings(
+    item: &SearchItem,
+    bindings: &shellsong_host::Bindings,
+    overridden: &mut shellsong_host::Overridden,
+    eq_now: String,
+    volume_now: f64,
+    speed_now: f64,
+) -> (Vec<Op>, Option<String>) {
+    let wanted = bindings.resolve(&shellsong_host::identity_of(item));
+    let mut ops = Vec::new();
+    if let Some(name) = shellsong_host::settle(&mut overridden.eq, wanted.eq.clone(), eq_now) {
+        ops.push(Op::SetEqPreset(name));
+    }
+    if let Some(v) = shellsong_host::settle(&mut overridden.volume, wanted.volume, volume_now) {
+        ops.push(Op::SetVolume(shellsong::Level::Absolute(v)));
+    }
+    if let Some(s) = shellsong_host::settle(&mut overridden.speed, wanted.speed, speed_now) {
+        ops.push(Op::SetSpeed(s));
+    }
+    // only when something moved, so a bound album says it once on its
+    // first track rather than on all twelve.
+    let note = (!ops.is_empty()).then(|| match wanted.summary() {
+        summary if summary.is_empty() => "settings restored".to_string(),
+        summary => format!("remembered: {summary}"),
+    });
+    (ops, note)
+}
+
 // MOVED_ITEMS_MARKER
 
 /// What the core could not do by itself. Every method has a default
@@ -2037,5 +2229,266 @@ pub struct Headless;
 impl Surface for Headless {
     fn front_end(&self) -> &'static str {
         "this front-end"
+    }
+}
+
+#[cfg(test)]
+mod seam_tests {
+    use super::*;
+    use crate::browse::fixtures::test_songs;
+
+    /// The whole claim of the library split, as a test: an op applies
+    /// with `Headless` in the room, which is a unit struct. There is
+    /// no `Focus`, no browse view, no menu flag and no selection
+    /// cursor anywhere in these calls, and the ops still work and
+    /// still report one line each.
+    ///
+    /// `#[ignore]` because `CoreCtx` holds a live mpv handle and
+    /// spawning one is ~400ms; the repo's convention for a test that
+    /// needs mpv (see `mpv::tests`). Run it with
+    /// `cargo test --lib seam -- --ignored`.
+    #[test]
+    #[ignore]
+    fn ops_apply_with_no_ui_state_at_all() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        // measured on a desktop that may have a real wim playing:
+        // exercise the control path, do not touch the speakers.
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let mut surf = Headless;
+
+        // a transport op: reaches mpv, reports one line, no panes.
+        let (dispatch, report) = {
+            let mut core = h.ctx(&player);
+            (
+                apply_op(
+                    Op::SetVolume(shellsong::Level::Absolute(55.0)),
+                    &mut core,
+                    &mut surf,
+                ),
+                core.console.lines.last().map(|l| l.text.clone()),
+            )
+        };
+        assert_eq!(dispatch, Dispatch::Continue);
+        assert_eq!(report.as_deref(), Some("volume: 55%"));
+
+        // a console-only listing: handled entirely in the core, so it
+        // is identical in both front-ends.
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::View(ViewTarget::Index), &mut core, &mut surf);
+        }
+        assert!(
+            h.console.lines.iter().any(|l| l.text.contains("indexed")),
+            "view(index) must print in the core: {:?}",
+            h.console.lines
+        );
+
+        // a pane op: declined, not crashed and not silently dropped.
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::View(ViewTarget::Eq), &mut core, &mut surf);
+        }
+        let last = h.console.lines.last().expect("a line").clone();
+        assert_eq!(
+            last.kind,
+            crate::shellsong::LineKind::Error,
+            "a decline is a failure line: {last:?}"
+        );
+        assert!(
+            last.text.contains("wim"),
+            "and it says where the eq is: {}",
+            last.text
+        );
+
+        // every op reports exactly one line (docs/shellsong.md R9),
+        // declines included.
+        let before = h.console.lines.len();
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::SelectTop, &mut core, &mut surf);
+        }
+        assert_eq!(
+            h.console.lines.len(),
+            before + 1,
+            "one line per op, no more and no fewer"
+        );
+    }
+
+    /// `Env` is built with no pane state either: `Headless` answers
+    /// the only two readings it takes from a front-end. Needs no mpv,
+    /// so this one is not ignored.
+    #[test]
+    fn the_env_needs_no_front_end_state() {
+        let mut app = app::App::new(crate::search::Corpus::new());
+        app.set_query("hex");
+        let mut queue = PlayQueue::default();
+        queue.reset(test_songs(2));
+        let env = shellsong_env(&app, &queue, &Headless, true, Duration::from_secs(3));
+        assert_eq!(env.query, "hex");
+        assert_eq!(env.queue_len, 2);
+        assert_eq!(env.focus, shellsong::Focus::Sidebar);
+        assert!(!env.browsing, "a headless front-end is never browsing");
+    }
+
+    /// `dry()` describes every op in both binaries, including the ones
+    /// a front-end would decline: it lowers to notes and never reaches
+    /// the op table at all, so there is nothing to decline.
+    #[test]
+    fn dry_describes_even_what_a_front_end_would_refuse() {
+        let mut program = Program::parse("dry(view(eq))").expect("parses");
+        let env = shellsong_env(
+            &app::App::new(crate::search::Corpus::new()),
+            &PlayQueue::default(),
+            &Headless,
+            true,
+            Duration::ZERO,
+        );
+        let mut notes = Vec::new();
+        loop {
+            match program.step(&env) {
+                shellsong::Step::Note(t) => notes.push(t),
+                shellsong::Step::Done => break,
+                other => panic!("dry must only ever emit notes, got {other:?}"),
+            }
+        }
+        let text = notes.join("\n");
+        assert!(text.contains("view(eq)"), "{text}");
+        assert!(text.contains("viewing eq"), "{text}");
+    }
+
+    /// `short_help` is derived from the language's own table, so a
+    /// command added to shellsong shows up under `?` with nobody
+    /// remembering to add it.
+    #[test]
+    fn the_short_help_lists_every_command_the_language_has() {
+        let lines = short_help();
+        let joined = lines.join(" ");
+        for expected in ["play", "queue", "volume", "view", "dry", "quit"] {
+            assert!(joined.contains(expected), "? must list {expected}");
+        }
+        let claimed: usize = lines[0]
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("a count on the first line");
+        assert_eq!(
+            claimed,
+            shellsong::help_lines().len(),
+            "the count must match the language's own table"
+        );
+        assert!(
+            lines.iter().all(|l| l.chars().count() <= 80),
+            "every row has to fit a narrow terminal: {lines:?}"
+        );
+    }
+
+    /// Everything a `CoreCtx` needs that is not the mpv handle, owned,
+    /// so a test can build one without a front-end in sight.
+    struct Harness {
+        cfg: config::Config,
+        app: app::App,
+        notifications: Notifications,
+        queue: PlayQueue,
+        previous_track: Option<SearchItem>,
+        cache: Arc<Mutex<CacheIndex>>,
+        download_tx: mpsc::Sender<DownloadEvent>,
+        _download_rx: mpsc::Receiver<DownloadEvent>,
+        downloading: HashSet<String>,
+        scrobble: ScrobbleState,
+        subtitle_tx: mpsc::Sender<SubtitleReady>,
+        _subtitle_rx: mpsc::Receiver<SubtitleReady>,
+        console: Console,
+        now_playing: Option<SearchItem>,
+        favorites: favorites::Favorites,
+        remote_starred: HashSet<String>,
+        lyrics_client: lyrics::Client,
+        base_volume: f64,
+        crossfade_enabled: bool,
+        fade_in_started_at: Option<Instant>,
+        fade: Option<Ramp>,
+        sleep_due: Option<Duration>,
+        scan_rx: mpsc::Receiver<library::ScanBatch>,
+        _scan_tx: mpsc::Sender<library::ScanBatch>,
+        remote_search_tx: mpsc::Sender<RemoteSearchQuery>,
+        _remote_search_rx: mpsc::Receiver<RemoteSearchQuery>,
+        settle: SearchSettle,
+        saved_queues: Vec<String>,
+        vars: shellsong::Scope,
+        bindings: shellsong_host::Bindings,
+    }
+
+    impl Harness {
+        fn new() -> Harness {
+            let (download_tx, _download_rx) = mpsc::channel();
+            let (subtitle_tx, _subtitle_rx) = mpsc::channel();
+            let (_scan_tx, scan_rx) = mpsc::channel();
+            let (remote_search_tx, _remote_search_rx) = mpsc::channel();
+            Harness {
+                cfg: config::Config::default(),
+                app: app::App::new(crate::search::Corpus::new()),
+                notifications: Notifications::default(),
+                queue: PlayQueue::default(),
+                previous_track: None,
+                cache: Arc::new(Mutex::new(CacheIndex::default())),
+                download_tx,
+                _download_rx,
+                downloading: HashSet::new(),
+                scrobble: ScrobbleState::default(),
+                subtitle_tx,
+                _subtitle_rx,
+                console: Console::empty(),
+                now_playing: Some(test_songs(1).remove(0)),
+                favorites: favorites::Favorites::default(),
+                remote_starred: HashSet::new(),
+                lyrics_client: lyrics::Client::new(),
+                base_volume: 100.0,
+                crossfade_enabled: false,
+                fade_in_started_at: None,
+                fade: None,
+                sleep_due: None,
+                scan_rx,
+                _scan_tx,
+                remote_search_tx,
+                _remote_search_rx,
+                settle: SearchSettle::default(),
+                saved_queues: Vec::new(),
+                vars: shellsong::Scope::default(),
+                bindings: shellsong_host::Bindings::default(),
+            }
+        }
+
+        fn ctx<'a>(&'a mut self, player: &'a mpv::Mpv) -> CoreCtx<'a> {
+            CoreCtx {
+                cfg: &self.cfg,
+                player,
+                app: &mut self.app,
+                notifications: &mut self.notifications,
+                queue: &mut self.queue,
+                previous_track: &mut self.previous_track,
+                cache: &self.cache,
+                download_tx: &self.download_tx,
+                downloading: &mut self.downloading,
+                scrobble: &mut self.scrobble,
+                subtitle_tx: &self.subtitle_tx,
+                console: &mut self.console,
+                now: Duration::from_secs(1),
+                now_playing: &self.now_playing,
+                favorites: &mut self.favorites,
+                remote_starred: &mut self.remote_starred,
+                lyrics_client: &self.lyrics_client,
+                base_volume: &mut self.base_volume,
+                crossfade_enabled: &mut self.crossfade_enabled,
+                fade_in_started_at: &mut self.fade_in_started_at,
+                fade: &mut self.fade,
+                sleep_due: &mut self.sleep_due,
+                scan_rx: &mut self.scan_rx,
+                remote_search_tx: &self.remote_search_tx,
+                settle: &mut self.settle,
+                saved_queues: &mut self.saved_queues,
+                vars: &mut self.vars,
+                bindings: &mut self.bindings,
+            }
+        }
     }
 }

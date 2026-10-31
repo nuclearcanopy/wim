@@ -23,14 +23,15 @@ use ratatui_image::StatefulImage;
 use wim::app::LoopMode;
 use wim::cache::CacheIndex;
 use wim::core::{
-    apply_eq_gains, apply_eq_row, browse_session, client_for, dispatch_action, drive,
-    enqueue_track, eq_preset_names, fire_scrobble, fire_subtitle_fetch, go_to_previous,
-    load_playlist, lyrics_query, note_playback_started, notify_query_changed, op_done, op_fail,
-    op_note, open_starred_view, print_listing, resync_upcoming, retain_live_clients,
-    save_playback_state, set_vid_for_item, shellsong_focus, spawn_background_search, start_session,
-    start_tracking_playback, suggestion_starred_keys, sweep_cache, toggle_star, trigger_downloads,
-    CoreCtx, Dispatch, DownloadCtx, Drive, RemoteSearchOutcome, RemoteSearchQuery, Report,
-    ScrobbleState, SelectStep, SessionStart, SubtitleReady, Surface, TrackChangeCtx,
+    apply_eq_gains, apply_eq_row, browse_session, client_for, current_eq_name, current_volume,
+    dispatch_action, drive, enqueue_track, eq_preset_names, fire_scrobble, fire_subtitle_fetch,
+    go_to_previous, identity_settings, load_playlist, lyrics_query, note_playback_started,
+    notify_query_changed, op_done, op_fail, op_note, open_starred_view, print_listing,
+    resync_upcoming, retain_live_clients, save_playback_state, set_vid_for_item, shellsong_focus,
+    spawn_background_search, start_session, start_tracking_playback, suggestion_starred_keys,
+    sweep_cache, toggle_star, trigger_downloads, CoreCtx, Dispatch, DownloadCtx, Drive,
+    RemoteSearchOutcome, RemoteSearchQuery, Report, ScrobbleState, SelectStep, SessionStart,
+    SubtitleReady, Surface, TrackChangeCtx,
 };
 use wim::download::DownloadEvent;
 use wim::keymap::{KeyAction, Keymap};
@@ -588,6 +589,8 @@ fn open_wim_screen(
         | ViewTarget::Index
         | ViewTarget::History
         | ViewTarget::Playlists
+        | ViewTarget::Vars
+        | ViewTarget::Bindings
         | ViewTarget::Help => print_listing(target, core),
         ViewTarget::Starred => {
             let live = core.app.corpus.remote_clients();
@@ -1706,6 +1709,40 @@ fn main() -> anyhow::Result<()> {
     // `load_queue`'s completion candidates, snapshotted rather than
     // read off the disk on every keystroke.
     let mut saved_queues: Vec<String> = Vec::new();
+    // the `let name = [...]` bindings, loaded once: a submitted line is
+    // parsed against them, so they are read per line rather than per
+    // keystroke, and `define`/`unset` write the file back.
+    let mut shellsong_vars = shellsong_host::load_vars();
+    // `run(...)`'s completion candidates, snapshotted on console open
+    // for the same reason the saved queues are.
+    let mut shellsong_scripts: Vec<String> = Vec::new();
+    // the per-identity settings, and what they are currently
+    // overriding so it can be put back when an unbound track starts.
+    let mut shellsong_bindings = shellsong_host::load_bindings();
+    let mut shellsong_overridden = shellsong_host::Overridden::default();
+    // ops the host itself asked for, waiting for the step loop so they
+    // go through `apply_shellsong_op` like everything else. One slot:
+    // a newer track change supersedes an older pending settle.
+    let mut shellsong_queued: Option<Box<shellsong::Program>> = None;
+    // `~/.config/wim/init.shg`, if there is one, as the first program
+    // the step loop drives. Spelled as the language rather than wired
+    // specially: it is one `run(init)` line through the same parse and
+    // the same stepper, so a startup script and a typed one cannot
+    // behave differently.
+    if shellsong_host::has_init_script() {
+        let read = |name: &str| shellsong_host::read_script(name);
+        let world = shellsong::World {
+            scope: &shellsong_vars,
+            read: Some(&read),
+        };
+        let line = format!("run({})", shellsong_host::INIT_SCRIPT);
+        match shellsong::Program::parse_in(&line, &world) {
+            Ok(program) => shellsong_program = Some(Box::new(program)),
+            // into the scrollback rather than a toast: it is a
+            // shellsong error and `:` is where you go to read them.
+            Err(e) => console.fail(format!("{}.shg: {e}", shellsong_host::INIT_SCRIPT)),
+        }
+    }
     // backs `Env::search_settled`; see `shellsong_host::SearchSettle`.
     let mut settle = SearchSettle::default();
     // the queue view owns main_content like the browse/lyrics views do;
@@ -2941,6 +2978,23 @@ fn main() -> anyhow::Result<()> {
             };
             note_playback_started(&next, &mut dctx, &mut notifications);
             start_tracking_playback(&cfg, &next, &mut scrobble);
+            // per-identity settings. Queued rather than applied here,
+            // so they go through the step loop's `apply_shellsong_op`
+            // like every other op.
+            let (ops, bound) = identity_settings(
+                &next,
+                &shellsong_bindings,
+                &mut shellsong_overridden,
+                current_eq_name(&app, &cfg),
+                current_volume(&player).unwrap_or(base_volume),
+                app.speed,
+            );
+            if !ops.is_empty() {
+                shellsong_queued = Some(Box::new(shellsong::Program::of(ops)));
+            }
+            if let Some(bound) = bound {
+                notifications.push(Severity::Info, bound);
+            }
             previous_track = now_playing.replace(next);
             // a track just started: either start it quiet and ramp up
             // (crossfade on), or make sure it's at full volume
@@ -2984,6 +3038,22 @@ fn main() -> anyhow::Result<()> {
                     };
                     note_playback_started(&first, &mut dctx, &mut notifications);
                     start_tracking_playback(&cfg, &first, &mut scrobble);
+                    // same hook as the ordinary advance above: a
+                    // loop-all restart is a track change too.
+                    let (ops, bound) = identity_settings(
+                        &first,
+                        &shellsong_bindings,
+                        &mut shellsong_overridden,
+                        current_eq_name(&app, &cfg),
+                        current_volume(&player).unwrap_or(base_volume),
+                        app.speed,
+                    );
+                    if !ops.is_empty() {
+                        shellsong_queued = Some(Box::new(shellsong::Program::of(ops)));
+                    }
+                    if let Some(bound) = bound {
+                        notifications.push(Severity::Info, bound);
+                    }
                     previous_track = now_playing.replace(first);
                     if crossfade_enabled {
                         let _ = player.set_volume(0.0);
@@ -3373,6 +3443,8 @@ fn main() -> anyhow::Result<()> {
                     remote_search_tx: &remote_search_tx,
                     settle: &mut settle,
                     saved_queues: &mut saved_queues,
+                    vars: &mut shellsong_vars,
+                    bindings: &mut shellsong_bindings,
                 }
             };
         }
@@ -3438,6 +3510,9 @@ fn main() -> anyhow::Result<()> {
         // shellswim cannot diverge on await handling, on when a
         // finished program is dropped, or on where a failure lands.
         let mut shellsong_quit = false;
+        if shellsong_program.is_none() {
+            shellsong_program = shellsong_queued.take();
+        }
         if let Some(program) = shellsong_program.as_mut() {
             let mut surf = wim_surface!();
             let mut core = core_ctx!();
@@ -3529,6 +3604,8 @@ fn main() -> anyhow::Result<()> {
                             corpus: &app.corpus,
                             saved: &saved_queues,
                             eq_presets: eq_preset_names(&cfg.eq_custom_presets),
+                            vars: &shellsong_vars,
+                            scripts: &shellsong_scripts,
                         },
                     );
                 } else if !help_open {
@@ -3993,6 +4070,8 @@ fn main() -> anyhow::Result<()> {
                         corpus: &app.corpus,
                         saved: &saved_queues,
                         eq_presets: eq_preset_names(&cfg.eq_custom_presets),
+                        vars: &shellsong_vars,
+                        scripts: &shellsong_scripts,
                     };
                     // the whole `KeyEvent`, not just `key.code`: the
                     // console reads ctrl for its accept key, which no
@@ -4066,6 +4145,7 @@ fn main() -> anyhow::Result<()> {
                     // one disk read per open, so completion itself
                     // never touches it.
                     saved_queues = queues::list();
+                    shellsong_scripts = shellsong_host::script_names();
                     continue;
                 }
 
