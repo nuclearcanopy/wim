@@ -22,7 +22,7 @@ use wim::ui::divider::HorizontalRule;
 use wim::ui::results_list::label;
 use wim::{anim, config, mpv, term, trace};
 
-mod cli;
+use wim::cli;
 mod host;
 mod surface;
 

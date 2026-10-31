@@ -1453,19 +1453,41 @@ a measurement.
       `render_with(.., Sharpen::Off, ..)` is a 3.21x win sitting
       uncollected. it is a visible picture change on the video pane,
       so it wants the maintainer's eye rather than a quiet flip.
-- [ ] **`cli.rs` wants to move to the library.** `wim --help` and
-      `wim [FILE...]` are implemented and tested in
-      `src/bin/shellswim/cli.rs`, but that is a private module of one
-      bin crate, so `src/main.rs` cannot `use` it and the five
-      `#[allow(dead_code)]`s are there for that reason. the move is
-      `git mv src/bin/shellswim/cli.rs src/cli.rs`, `pub mod cli;` in
-      lib.rs, `use wim::cli;` in shellswim's main, plus the main.rs
-      hunks the agent wrote out. **`wim song.mp3` plays it** (decided:
-      a positional path guesses nothing, mpv/vlc/mplayer all do it, and
-      it is what a desktop file association sends); several files are a
-      queue; a file replaces the resumed session rather than fighting
-      it for mpv's playlist; an unplayable path is refused with exit 2
-      rather than starting empty.
+- [x] **`wim --help` and `wim [FILE...]` work now.** both were
+      written and tested, and both were **unreachable**: `cli.rs` was a
+      private module of the shellswim bin crate, so `main.rs` could not
+      `use` it, and five `#[allow(dead_code)]`s were papering over
+      that. moved to `src/cli.rs` in the library (where
+      `both_front_ends_answer_the_same_two_options` already said it
+      belonged), the attributes deleted, and main.rs wired to it.
+      before this, `wim --help` and `wim song.mp3` **both just started
+      the panes in silence**, so an "open with wim" desktop
+      association did nothing at all.
+      the decisions, taken by the agent that wrote the parser and kept
+      here rather than re-litigated: a positional path *plays* (it
+      guesses nothing, mpv/vlc/mplayer all do it, and it is what a file
+      association sends); several files are a queue; **a file replaces
+      the resumed session**, saved queue included, because two things
+      fighting over mpv's playlist gives you a queue built around a
+      track you did not ask for (the volume restores either way, being
+      a setting rather than a session); an unplayable path is refused
+      with exit 2 rather than starting empty, since being handed a path
+      and then showing an empty library is the same silence as ignoring
+      `--help`; and a url gets its own sentence, because
+      `item_from_path` requires `is_file()` so "does not exist" would
+      be the wrong answer.
+      verified by running the binary, not just the tests: `--help`,
+      `--version`, exit 2 on an unknown option and on a missing file,
+      and shellswim still answering both options identically.
+      **and one real polish bug, caught by a test written for it.**
+      `every_help_line_fits_a_plain_terminal` found a 108-cell line
+      where every other line is under 72: the "plays instead of
+      resuming" sentence had been interpolated into the example
+      column, so it wrapped mid-sentence on an 80-column terminal and
+      the whole block read as broken. then it caught **my own fix**,
+      which moved the 71-char constant into a hard-wrapped paragraph
+      and made a 118-cell line. it has its own line now, and the
+      longest line in either binary's help is 73.
 - [ ] **`DownloadCtx` wants an injected `persist`**, the shape
       `download::Sink` already uses. `note_playback_started` reaches
       for `cache::cache_dir()` directly, which is how a test run

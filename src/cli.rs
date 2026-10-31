@@ -9,9 +9,10 @@
 //! every argument it was given in silence (`wim --help` and
 //! `wim song.mp3` both just started the panes).
 //!
-//! This file's home is `src/cli.rs` in the library, not a private
-//! module of one binary; see docs/library-seam.md. It is here only
-//! because the move is the caller's to make.
+//! Shared by both binaries, which is why it is here rather than in
+//! either one: the two front-ends must answer `--help` and `--version`
+//! identically, and `both_front_ends_answer_the_same_two_options`
+//! pins that they do.
 
 use std::path::PathBuf;
 
@@ -104,7 +105,6 @@ impl Cli {
 /// What `wim`'s argv asked for. Its own enum rather than a shape bent
 /// to fit `Run`: wim has no `-c` and takes any number of files, where
 /// a second script is an error.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WimRun {
     /// No arguments: the panes, resuming what was playing.
@@ -120,7 +120,6 @@ pub enum WimRun {
 
 /// `wim`'s argv. Several files are a queue rather than an error,
 /// which is the one place the two front-ends deliberately differ.
-#[allow(dead_code)]
 pub fn parse_wim<I: IntoIterator<Item = String>>(args: I) -> Result<WimRun, String> {
     let mut files: Vec<PathBuf> = Vec::new();
     for arg in args {
@@ -148,11 +147,10 @@ pub fn parse_wim<I: IntoIterator<Item = String>>(args: I) -> Result<WimRun, Stri
 /// Refused rather than skipped: being handed a path and then starting
 /// the panes with nothing playing is exactly the silence this file
 /// exists to remove.
-#[allow(dead_code)]
-pub fn resolve_files(files: &[PathBuf]) -> Result<Vec<wim::search::SearchItem>, String> {
+pub fn resolve_files(files: &[PathBuf]) -> Result<Vec<crate::search::SearchItem>, String> {
     files
         .iter()
-        .map(|p| wim::persistence::item_from_path(&p.to_string_lossy()).ok_or_else(|| unplayable(p)))
+        .map(|p| crate::persistence::item_from_path(&p.to_string_lossy()).ok_or_else(|| unplayable(p)))
         .collect()
 }
 
@@ -216,16 +214,13 @@ view(now) and view(lyrics) print instead of opening a pane.
     )
 }
 
-#[allow(dead_code)]
 pub const WIM_USAGE: &str = "usage: wim [FILE...] [--version] [--help]";
 
 /// What a file argument does to the resumed session, spelled once:
 /// the help says it and `main.rs` does it.
-#[allow(dead_code)]
 pub const PLAY_REPLACES_RESUME: &str =
     "a file argument plays instead of resuming; the rest are queued behind it";
 
-#[allow(dead_code)]
 pub fn wim_help() -> String {
     format!(
         "{WIM_USAGE}
@@ -234,10 +229,12 @@ wim is a terminal omniplayer: navidrome/subsonic and local files in one
 search, played through mpv.
 
   wim                 the panes, resuming what was playing
-  wim song.flac       play it now ({PLAY_REPLACES_RESUME})
+  wim song.flac       play that instead
   wim a.mp3 b.mp3     play the first, queue the rest
   wim --version       which build this is
   wim --help          this
+
+{PLAY_REPLACES_RESUME}.
 
 a file has to be a local music or video file that exists; a url is not
 one yet, and neither is refused in silence. shellswim is the same
@@ -424,6 +421,25 @@ mod tests {
 
         assert!(resolve_files(&[]).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nothing in `--help` may need an 80-column terminal to widen.
+    ///
+    /// This caught a 108-cell line: the "plays instead of resuming"
+    /// sentence had been interpolated into the example column, where
+    /// every other line is under 72, so it wrapped mid-sentence and
+    /// the block read as broken.
+    #[test]
+    fn every_help_line_fits_a_plain_terminal() {
+        for text in [wim_help(), help(), WIM_USAGE.to_string(), USAGE.to_string()] {
+            for line in text.lines() {
+                assert!(
+                    crate::ui::textfit::width(line) <= 80,
+                    "{} cells: {line:?}",
+                    crate::ui::textfit::width(line)
+                );
+            }
+        }
     }
 
     #[test]
