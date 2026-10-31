@@ -18,7 +18,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui_image::StatefulImage;
 
 use wim::catalog::{
-    index_navidrome_server, merge_catalog_into_app, spawn_background_sync,
+    edit_servers, index_navidrome_server, merge_catalog_into_app, spawn_background_sync,
     test_navidrome_connectivity, BackgroundSyncResult,
 };
 use wim::core::{
@@ -30,8 +30,7 @@ use wim::core::{
     spawn_background_search, start_session, start_tracking_playback, suggestion_starred_keys,
     sweep_cache, toggle_star, track_started, BetweenTracks, CoreCtx, Dispatch, DownloadCtx,
     Drained, Drive, Intent, RemoteSearchOutcome, RemoteSearchQuery, Report, Resolution,
-    ScrobbleState, SelectStep, SessionStart, StarFailed, SubtitleReady, Surface, TrackChangeCtx,
-    TrackResolver,
+    ScrobbleState, SelectStep, SessionStart, StarFailed, SubtitleReady, Surface, TrackResolver,
 };
 use wim::download::DownloadEvent;
 use wim::enrich::{
@@ -147,12 +146,27 @@ struct WimSurface<'a> {
     /// through the op made that difference visible. Fixed here rather
     /// than preserved, since opening fresh is right either way.
     undo_menu_open: &'a mut bool,
+    /// Where `Surface::queue_program` puts the per-identity ops a
+    /// newly started track asked for. The trait's default *drops*
+    /// them, and `identity_settings` has already recorded them in
+    /// `Overridden` as applied by then, so a default here would
+    /// restore the next unbound track to a value nothing ever set
+    /// (docs/undo.md).
+    shellsong_queued: &'a mut Option<Box<shellsong::Program>>,
     bottombar_selected: Field,
 }
 
 impl Surface for WimSurface<'_> {
     fn front_end(&self) -> &'static str {
         "wim"
+    }
+
+    /// The same slot the advance hook writes directly; the step loop
+    /// picks it up next frame.
+    fn queue_program(&mut self, ops: Vec<shellsong::Op>) {
+        if !ops.is_empty() {
+            *self.shellsong_queued = Some(Box::new(shellsong::Program::of(ops)));
+        }
     }
 
     /// A focused browse view owns the highlight, otherwise the
@@ -1078,7 +1092,8 @@ fn main() -> anyhow::Result<()> {
         let aspect = cell_aspect();
         // no ipc here any more: these arrive as observed property
         // changes on the event channel drained just below.
-        let (elapsed_secs, paused) = (playback.elapsed_secs, playback.paused);
+        let (elapsed_secs, paused, muted) =
+            (playback.elapsed_secs, playback.paused, playback.muted);
         // re-derived every frame and never kept across one: whatever
         // mpv's last reported `playlist-pos` resolves to. Everything
         // downstream (title, mini bar, lyrics header, scrobbling)
@@ -1152,6 +1167,7 @@ fn main() -> anyhow::Result<()> {
                     keybinds_menu_selected: &mut keybinds_menu_selected,
                     eq_menu: &mut eq_menu,
                     undo_menu_open: &mut undo_menu_open,
+                    shellsong_queued: &mut shellsong_queued,
                     bottombar_selected,
                 }
             };
@@ -2000,6 +2016,7 @@ fn main() -> anyhow::Result<()> {
                 eq_active: !eq::is_flat(&app.eq_gains),
                 crossfade_on: crossfade_enabled,
                 paused,
+                muted,
                 gap_remaining: gap_left,
                 // mid-drag the bar draws the pending target, not
                 // mpv's position: the seek is throttled, the
@@ -2335,6 +2352,12 @@ fn main() -> anyhow::Result<()> {
         // a subtitle `fire_subtitle_fetch` landed; loading it is this
         // thread's job, it owns the mpv handle.
         while let Ok(sub) = subtitle_rx.try_recv() {
+            // three round trips, so a reply routinely outlives the
+            // video it was for; `sub_add` carries mpv's `select` flag,
+            // so loading it unguarded makes A's subtitle B's own.
+            if !wim::core::subtitle_belongs_to_playing(&sub, now_playing.as_ref()) {
+                continue;
+            }
             if player.sub_add(&sub.path).is_ok() {
                 notifications.push(
                     Severity::Info,
@@ -2360,9 +2383,11 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
-        // a lyrics fetch landed. the loader has already dropped any
-        // reply for a track the user moved past, so whatever arrives
-        // here belongs to the request still standing.
+        // a lyrics fetch landed. whatever arrives here belongs to the
+        // request still standing: the loader drops a reply for a
+        // superseded request, `track_started` disowns one the track
+        // changed under, and closing the pane disowns one too. this
+        // comment claimed all that while only the first was true.
         if let Some((track, result)) = lyrics_loader.poll() {
             match result {
                 Ok(Some(l)) => {
@@ -2983,9 +3008,8 @@ fn main() -> anyhow::Result<()> {
                                 let nav = navidrome_config_from_form(&ob.login);
                                 match index_navidrome_server(&mut app, &nav) {
                                     Ok(msg) => {
-                                        cfg.navidrome_servers.push(nav);
+                                        edit_servers(&mut cfg, &servers_tx, |s| s.push(nav));
                                         config::save_or_warn(&cfg, &mut notifications);
-                                        let _ = servers_tx.send(cfg.navidrome_servers.clone());
                                         notifications.push(
                                             Severity::Info,
                                             format!("navidrome connected: {msg}"),
@@ -3078,7 +3102,9 @@ fn main() -> anyhow::Result<()> {
                                     // same row commits; this rewrites
                                     // config.toml and can't be undone.
                                     if nm.pending_delete == Some(nm.selected) {
-                                        cfg.navidrome_servers.remove(nm.selected);
+                                        edit_servers(&mut cfg, &servers_tx, |s| {
+                                            s.remove(nm.selected);
+                                        });
                                         nm.forget_status_at(nm.selected);
                                         config::save_or_warn(&cfg, &mut notifications);
                                         nm.selected = nm.selected.min(cfg.navidrome_servers.len());
@@ -3141,7 +3167,7 @@ fn main() -> anyhow::Result<()> {
                                             Severity::Info,
                                             format!("connected: {}", nav.url),
                                         );
-                                        cfg.navidrome_servers.push(nav);
+                                        edit_servers(&mut cfg, &servers_tx, |s| s.push(nav));
                                         config::save_or_warn(&cfg, &mut notifications);
                                         warn_plaintext_password(&cfg, &mut notifications);
                                         nm.connection_status.push(Some(true));
@@ -4109,10 +4135,15 @@ fn main() -> anyhow::Result<()> {
                             lyrics.set_scroll(lyrics.scroll().saturating_sub(1))
                         }
                         KeyCode::Esc | KeyCode::Char('q') => {
+                            // `close` drops the lines only; without
+                            // this the in-flight reply reopens the
+                            // pane and swallows j/k/esc again.
                             lyrics.close();
+                            lyrics_loader.invalidate();
                         }
                         _ if key.code == keymap.get(KeyAction::OpenLyrics) => {
                             lyrics.close();
+                            lyrics_loader.invalidate();
                         }
                         _ => handled = false,
                     }
@@ -4404,25 +4435,12 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if key.code == keymap.get(KeyAction::SkipBack) && previous_track.is_some() {
-                    let mut dctx = DownloadCtx {
-                        cache: &cache_index,
-                        download_tx: &download_tx,
-                        downloading: &mut downloading,
-                        day_threshold: cfg.cache_days_threshold,
-                    };
-                    let mut hooks = TrackChangeCtx {
-                        dctx: &mut dctx,
-                        scrobble: &mut scrobble,
-                        subtitle_tx: &subtitle_tx,
-                    };
-                    let _ = go_to_previous(
-                        &cfg,
-                        &player,
-                        &mut notifications,
-                        &mut previous_track,
-                        &mut play_queue,
-                        &mut hooks,
-                    );
+                    // every track-start hook, not three of five: it
+                    // takes a surface because the two it used to miss
+                    // are the two that hand ops back.
+                    let mut surf = wim_surface!();
+                    let mut core = core_ctx!();
+                    let _ = go_to_previous(&mut core, &mut surf);
                     continue;
                 }
 

@@ -475,7 +475,9 @@ impl Host {
             }
         }
         while let Ok(sub) = self.subtitle_rx.try_recv() {
-            let _ = self.player.sub_add(&sub.path);
+            if core::subtitle_belongs_to_playing(&sub, self.play_queue.current()) {
+                let _ = self.player.sub_add(&sub.path);
+            }
         }
         // notifications are wim's toast channel; an overlay here would
         // cover the thing it is talking about, so the text goes into

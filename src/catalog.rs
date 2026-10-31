@@ -107,6 +107,34 @@ pub fn spawn_background_sync(
     });
 }
 
+/// Changes the configured server list **and** tells the sync thread,
+/// which is the pairing that was got wrong.
+///
+/// `spawn_background_sync` keeps its own `servers` vec and its own
+/// clients, and `servers_rx` is the only thing that can change either;
+/// `retain_live_clients` runs off that list every pass. Three sites
+/// mutated `cfg.navidrome_servers` and only one of them sent, so
+/// deleting a profile left it being polled every 45s, re-merging its
+/// catalog, toasting offline/online for a profile that is gone, and
+/// holding the last `Arc<Client>` so the superseded password was never
+/// zeroized. Adding one indexed it once and then never auto-resynced,
+/// so new albums did not appear until a restart.
+///
+/// Takes the edit as a closure so the two halves cannot be done
+/// separately: there is no way to reach the vec through here without
+/// the send. Persisting stays the caller's, because the add paths also
+/// warn about a plaintext password and the delete path does not.
+pub fn edit_servers(
+    cfg: &mut config::Config,
+    servers_tx: &mpsc::Sender<Vec<config::NavidromeConfig>>,
+    edit: impl FnOnce(&mut Vec<config::NavidromeConfig>),
+) {
+    edit(&mut cfg.navidrome_servers);
+    // a dead receiver only means the sync thread is gone (shutting
+    // down), the same stance every other channel in here takes.
+    let _ = servers_tx.send(cfg.navidrome_servers.clone());
+}
+
 /// The catalog shape fetched over the wire, kept separate from `App` so
 /// a background thread can fetch it without touching app state (which
 /// isn't `Send` across the mpv/terminal borrow it lives behind).
@@ -411,19 +439,109 @@ mod fetch_outcome_tests {
     }
 }
 
+/// Changing the configured server list, which is one step and not
+/// two. Its own module: this is the seam between the main thread and
+/// the sync thread, where `kept_client_tests` below is about what the
+/// sync thread then does with the list it was handed.
+#[cfg(test)]
+mod server_list_tests {
+    use super::*;
+
+    fn nav(url: &str) -> config::NavidromeConfig {
+        config::NavidromeConfig {
+            url: url.into(),
+            username: "ana".into(),
+            password: Some("pw".into()),
+            password_file: None,
+            max_bitrate_kbps: None,
+            transcode_format: None,
+        }
+    }
+
+    fn with(servers: Vec<config::NavidromeConfig>) -> config::Config {
+        config::Config {
+            navidrome_servers: servers,
+            ..Default::default()
+        }
+    }
+
+    /// Removing a profile has to reach the sync thread, which is the
+    /// only way it can stop polling one. Asserted all the way through
+    /// to the client being dropped, because that is what the symptoms
+    /// are: a profile you deleted still re-merging its catalog and
+    /// still toasting, and its password never zeroized.
+    #[test]
+    fn removing_a_profile_reaches_the_sync_thread_and_drops_its_client() {
+        let (tx, rx) = mpsc::channel();
+        let mut cfg = with(vec![nav("https://a.invalid"), nav("https://b.invalid")]);
+        let mut clients = vec![
+            Arc::new(subsonic::Client::new(&nav("https://a.invalid")).unwrap()),
+            Arc::new(subsonic::Client::new(&nav("https://b.invalid")).unwrap()),
+        ];
+
+        edit_servers(&mut cfg, &tx, |servers| {
+            servers.remove(0);
+        });
+
+        assert_eq!(cfg.navidrome_servers.len(), 1, "the edit itself happened");
+        let pushed = rx
+            .try_recv()
+            .expect("the sync thread is never told, so it keeps polling a deleted profile");
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].url, "https://b.invalid");
+
+        // what the thread does with it, and the reason the send
+        // matters: `retain_live_clients` runs off this list every pass.
+        retain_live_clients(&mut clients, &pushed);
+        assert_eq!(clients.len(), 1, "the removed profile's client has to go");
+        assert!(clients[0].matches(&pushed[0]));
+    }
+
+    /// And the other direction, which fails quietly rather than
+    /// loudly: a profile added at runtime indexed once and was never
+    /// auto-resynced, so new albums did not appear until a restart.
+    #[test]
+    fn adding_a_profile_reaches_the_sync_thread() {
+        let (tx, rx) = mpsc::channel();
+        let mut cfg = with(vec![nav("https://a.invalid")]);
+
+        edit_servers(&mut cfg, &tx, |servers| {
+            servers.push(nav("https://b.invalid"));
+        });
+
+        let pushed = rx.try_recv().expect("a new profile is never synced");
+        assert_eq!(pushed.len(), 2);
+        assert_eq!(pushed[1].url, "https://b.invalid");
+    }
+
+    /// The point of the closure: the list the thread is told about is
+    /// the list after the edit, not a copy taken before it.
+    #[test]
+    fn the_pushed_list_is_the_edited_one() {
+        let (tx, rx) = mpsc::channel();
+        let mut cfg = with(vec![nav("https://a.invalid")]);
+        edit_servers(&mut cfg, &tx, |servers| servers.clear());
+        assert!(
+            rx.try_recv().expect("something is pushed").is_empty(),
+            "the last profile was removed, so the thread has nothing to poll"
+        );
+    }
+}
+
 /// The clients the sync thread keeps across passes, and when it has
 /// to let one go. Split out of the fetch tests above: this is
 /// `core::retain_live_clients`, which is also what zeroizes a
 /// superseded password when it drops the last `Arc` to a client.
 ///
-/// **These pin behaviour that no path in the binary currently
-/// reaches.** `retain_live_clients`' single production call site is
-/// `spawn_background_sync`, whose `servers` list only ever grows (the
-/// main thread pushes an updated list over `servers_rx`, and nothing
-/// shrinks or edits it in place), so neither the edit nor the removal
-/// below can happen there today. The fix is in main.rs; the tests
-/// stay, because the function's contract is the thing that makes the
-/// fix safe.
+/// `retain_live_clients`' single production call site is
+/// `spawn_background_sync`, which runs it off the `servers` list
+/// `servers_rx` hands it, so **a removal is only reachable once every
+/// site that mutates `cfg.navidrome_servers` goes through
+/// `edit_servers`**; see its doc for what one that does not costs. An
+/// *edit* of an existing profile is still unreachable at runtime for a
+/// second reason, which is not this one: nothing in the ui edits a
+/// profile in place, so a credential change means editing config.toml
+/// and restarting.
 #[cfg(test)]
 mod kept_client_tests {
     use super::*;

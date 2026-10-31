@@ -101,13 +101,6 @@ impl Client {
 
 /// A lyrics fetch that does not block the input path.
 ///
-/// Unused in the binary for now: the two call sites that need it are
-/// in `main.rs` (the lyrics key handler and the shellsong op), which
-/// another agent holds for the library split. The loader and its
-/// stale-reply rules are the deliverable here; swapping the two
-/// `lookup` calls for `request`/`poll` is the blocked step. Same
-/// `cfg_attr` shape `video::Hole` and `shellsong::NoCandidates` use.
-///
 /// `Client::lookup` is a network round trip and it used to be called
 /// straight from the key handler, so pressing the lyrics key froze the
 /// whole ui until lrclib answered. Same shape as `browse::Loader`,
@@ -115,33 +108,37 @@ impl Client {
 /// on every `invalidate`, checked by the worker before it sends and
 /// again in `poll`, so a reply for a track the user has already moved
 /// on from is dropped instead of appearing over the new one.
-#[cfg_attr(not(test), allow(dead_code))]
+///
+/// **The blanket `#[cfg_attr(not(test), allow(dead_code))]` this used
+/// to carry is gone**, and that was not cosmetic: it covered the whole
+/// impl, so `invalidate` having no production caller for its entire
+/// life was never flagged, and the pane reopened itself over the next
+/// track. What is still unreached in the binary is annotated one item
+/// at a time now, so the next one is a warning.
 pub struct Loader {
     /// Shared with the workers so a superseded fetch can give up
     /// before it sends, rather than only being filtered on arrival.
     generation: Arc<AtomicU64>,
     tx: Sender<Fetched>,
     rx: Receiver<Fetched>,
-    /// The track a fetch is in flight for, which is also what the ui
-    /// needs in order to say what it is waiting on.
+    /// The track a fetch is in flight for; `None` once it has been
+    /// delivered or disowned, which is the one reading `invalidate`
+    /// is observable through.
     pending: Option<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct Fetched {
     generation: u64,
     track: String,
     result: Result<Option<Lyrics>, String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Default for Loader {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Loader {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
@@ -195,6 +192,13 @@ impl Loader {
     }
 
     /// The track a fetch is waiting on, if any.
+    ///
+    /// Still read by tests only: both front-ends report "fetching
+    /// lyrics for X" from their own copy of the label at the keypress
+    /// instead, so nothing on screen is derived from this. Annotated
+    /// here rather than over the whole impl, which is what hid
+    /// `invalidate` having no caller.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pending(&self) -> Option<&str> {
         self.pending.as_deref()
     }
@@ -221,6 +225,12 @@ impl Loader {
 
     /// Disowns whatever is in flight: the lyrics view was closed, or
     /// the track changed, so an answer for it must not arrive later.
+    ///
+    /// `core::track_started` is the track-changed caller. The
+    /// view-closed one is the front-end's: `LyricsPane::close` drops
+    /// the lines and knows nothing about the loader, so a host that
+    /// closes the pane has to call this in the same breath or the next
+    /// reply reopens it.
     pub fn invalidate(&mut self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.pending = None;
