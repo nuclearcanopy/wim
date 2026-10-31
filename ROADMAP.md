@@ -1342,6 +1342,60 @@ above this line in the shellswim section is done.
       looked at, not just tested: `controlsbar::tests::print_the_gap_bar`
       prints the bar both ways, which is how the spacing and the
       scrubber absorbing the three extra cells were checked.
+- [x] **eyeball pass on the five most on-screen widgets with no
+      `mod eyeball`**: helpbox, miniplayer, lyrics_view, header,
+      searchbox. printed at realistic and awkward sizes and read,
+      which is the only verification available headlessly and the one
+      that keeps finding things assertions do not.
+      - [x] **helpbox**: `height / 2` is not the centre at even
+        heights, so a two-row bar put "? help" on the *bottom* row with
+        the blank one above it, hugging the frame; top-biased
+        `(h - 1) / 2` now. a clipped label was hard-cut to "? h",
+        which reads as a label in its own right rather than a cut one,
+        so it ellipsises. and the key is BRIGHT with the word DIM,
+        matching the controls bar an inch to its left, instead of one
+        flat shade. splits on the *last* space so a key rebound to
+        `space` stays one key.
+      - [x] **miniplayer**: one left-aligned sentence with 29 dead
+        columns at 72 wide, and narrowing it cut the hints to
+        "(space: paus…" while the title still had room. hints are the
+        right end of a bar now and drop whole below an 18-cell title
+        floor; glyph/title/hints are three brightnesses over the
+        NEAR_BLACK rule; and squeezed to one row it spends it on the
+        title, where it used to spend it on the rule and say nothing
+        about what was playing.
+      - [x] **lyrics_view**: the only text pane on screen running
+        column 0 to the last cell, while every list beside it indents
+        by its selection marker. a cell of gutter each side, with
+        `wrapped_len` insetting identically so the host's scroll clamp
+        still counts the rows that actually get drawn. the freed right
+        gutter carries `▴`/`▾` when verses sit off-screen, which a
+        scrolled pane previously gave no sign of at all.
+      - [x] **header** (heads ten panes: browse, queue, lyrics, help,
+        eq, settings, login, nav, keybinds, suggestions): the joined
+        "title │ instructions" was truncated blind, so a 28-cell pane
+        was headed "j/k: …", six columns of ellipsis where the verb
+        should be. whole hints drop now, back to the last complete one
+        or to nothing so the title takes the row.
+        **and the first fix was wrong in a way only printing caught.**
+        it kept any fragment with two cells of "action", but a cut
+        landing *inside* a key leaves no `": "` at all, which fell into
+        the "hint with no key prefix" branch and was kept: 40 cells
+        rendered "j/k: scroll, ente…", a half-key naming nothing. the
+        fragment alone cannot tell that from "enter to advance" cut
+        short, so `names_an_action` takes the original hint too. pinned
+        over every width from "fits" down to "nothing fits", and
+        mutation-checked; no assertion anyone had written would have
+        caught it, because every case thought of cut *after* a colon.
+      - [x] **searchbox**: the query sat flush against the `│` it was
+        inside, the one box in the ui without the inset
+        `draw::framed_inner` documents, and `┌┤` butted two
+        line-drawing glyphs together. a cell inside both borders, a
+        `─` lead-in when the box can afford one (additive, so the
+        squeezed 18-column case keeps its label rather than losing
+        it), the cursor no longer lands on the right border at widths
+        with no interior, and the label is measured in cells rather
+        than chars.
 - [x] **clearing the queue was undone by loop-all.** `Op::ClearQueue`
       went through `PlayQueue::replace_upcoming(vec![])`, which relays
       the *same* session out again. that is right for a shuffle (mpv is
