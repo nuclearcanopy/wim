@@ -264,6 +264,17 @@ pub struct ControlsBar<'a> {
     pub resize_hint: Option<&'a str>,
 }
 
+/// How the mode line advertises the shellsong console, spelled from
+/// `shellsong::OPEN_KEY` rather than typed out: this bar is the only
+/// permanently-visible thing on screen, and the console (a whole
+/// command language, see docs/shellsong.md) was advertised nowhere.
+fn console_hint() -> String {
+    format!(
+        "{} opens the console",
+        crate::keymap::key_label(crate::shellsong::OPEN_KEY)
+    )
+}
+
 impl Widget for ControlsBar<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if let Some(hint) = self.resize_hint {
@@ -278,13 +289,29 @@ impl Widget for ControlsBar<'_> {
             // already accounted for.
             let y = y - 1;
             let hint = if self.move_mode {
-                "wasd/arrows: focus pane, enter: interact"
+                "wasd/arrows: focus pane, enter: interact".to_string()
             } else if self.scrubbing {
-                "arrows: seek, shift: coarse, enter/esc: done"
-            } else if self.focused {
-                "arrows: pick, enter: use, tab: move focus"
+                "arrows: seek, shift: coarse, enter/esc: done".to_string()
             } else {
-                "tab: move focus"
+                let keys = if self.focused {
+                    "arrows: pick, enter: use, tab: move focus"
+                } else {
+                    "tab: move focus"
+                };
+                // the console is reachable from every one of these
+                // states and had no glyph, no row and no hint
+                // anywhere, so this is the only permanently-visible
+                // place it can be advertised. appended only when the
+                // whole thing fits, since half a key taught is worse
+                // than the line it crowded out; move mode and a scrub
+                // drag are the two states where `:` is genuinely inert.
+                let room = area.width as usize;
+                let with = format!("{keys}, {}", console_hint());
+                if width(&mode_label) + 2 + width(&with) <= room {
+                    with
+                } else {
+                    keys.to_string()
+                }
             };
             let x = draw_chars(
                 buf,
@@ -307,7 +334,7 @@ impl Widget for ControlsBar<'_> {
                 x + 2,
                 area.x + area.width,
                 y,
-                hint,
+                &hint,
                 shade(NEAR_BLACK),
                 None,
             );
@@ -1126,6 +1153,50 @@ mod tests {
         assert!(grid(&dragging).contains("arrows: seek"));
     }
 
+    /// The console had no glyph on this bar, no row in any menu and no
+    /// line in the help reference, so a whole command language was
+    /// reachable only by guessing `:`. This line is the one thing
+    /// always on screen, so it is where the key belongs.
+    #[test]
+    fn the_mode_line_advertises_the_console_whenever_it_fits() {
+        let hint = console_hint();
+        assert_eq!(hint, ": opens the console", "spelled from OPEN_KEY");
+        for (w, focused) in [(100u16, false), (100, true), (80, false), (64, false)] {
+            let buf = bar_at(w, 2, |cb| cb.focused = focused);
+            assert!(
+                grid(&buf).contains(&hint),
+                "{w} cells, focused={focused}:\n{}",
+                grid(&buf)
+            );
+        }
+        // and it is dropped rather than clipped when the keys that
+        // change what every other key does need the room: the line has
+        // to end on the last whole hint, with no fragment of this one
+        // left holding cells and teaching nothing.
+        let tight = bar_at(72, 2, |cb| cb.focused = true);
+        let g = grid(&tight);
+        assert!(!g.contains(&hint), "no room, yet it claimed to fit:\n{g}");
+        let row = g.lines().next().unwrap().trim_end_matches('.');
+        assert!(
+            row.ends_with("arrows: pick, enter: use, tab: move focus"),
+            "a clipped hint left a fragment behind:\n{row}"
+        );
+    }
+
+    /// `:` is inert in both of these, so advertising it there would be
+    /// the same class of lie the queue hint was.
+    #[test]
+    fn the_console_is_not_advertised_where_its_key_is_inert() {
+        let hint = console_hint();
+        let moving = bar_at(140, 2, |cb| cb.move_mode = true);
+        assert!(!grid(&moving).contains(&hint), "{}", grid(&moving));
+        let dragging = bar_at(140, 2, |cb| {
+            cb.focused = true;
+            cb.scrubbing = true;
+        });
+        assert!(!grid(&dragging).contains(&hint), "{}", grid(&dragging));
+    }
+
     #[test]
     fn a_flash_lifts_only_its_own_element() {
         let buf = bar_at(100, 2, |cb| cb.flash = Some((Field::Shuffle, 1.0)));
@@ -1494,6 +1565,64 @@ mod tests {
                 claimed,
                 "at {width} cells the lit plate and the clickable rect disagree:\n{}",
                 grid(&buf)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod eyeball {
+    use super::*;
+    use crate::ui::testbuf::{buffer, grid};
+
+    fn bar() -> ControlsBar<'static> {
+        ControlsBar {
+            move_mode: false,
+            focus_label: "bottom bar",
+            focused: false,
+            queue_len: 3,
+            loop_mode: LoopMode::Off,
+            shuffle_on: false,
+            speed: 1.0,
+            eq_active: false,
+            crossfade_on: false,
+            paused: false,
+            gap_remaining: None,
+            elapsed_secs: Some(42.0),
+            duration_secs: Some(214.0),
+            flash: None,
+            selected: None,
+            scrubbing: false,
+            resize_hint: None,
+        }
+    }
+
+    /// The mode line at the widths a real terminal gives it, which is
+    /// what decides whether the console hint is there at all:
+    /// `cargo test --lib ui::controlsbar::eyeball -- --nocapture`.
+    /// Asserts the floor too, so it is a test and not just a printer.
+    #[test]
+    fn print_the_mode_line_across_the_widths_the_console_hint_turns_on_at() {
+        for (w, focused, move_mode) in [
+            (120u16, false, false),
+            (100, false, false),
+            (100, true, false),
+            (80, true, false),
+            (72, true, false),
+            (64, false, false),
+            (56, false, false),
+            (100, false, true),
+        ] {
+            let mut cb = bar();
+            cb.focused = focused;
+            cb.move_mode = move_mode;
+            let mut buf = buffer(w, 2);
+            cb.render(Rect::new(0, 0, w, 2), &mut buf);
+            let text = grid(&buf);
+            println!("--- {w}x2 focused={focused} move={move_mode}\n{text}");
+            assert!(
+                text.contains("--"),
+                "{w} cells lost the mode label:\n{text}"
             );
         }
     }

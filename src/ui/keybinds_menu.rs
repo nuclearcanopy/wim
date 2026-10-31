@@ -17,7 +17,16 @@ pub struct KeybindsMenu<'a> {
     pub keys: &'a [String],
     pub selected: usize,
     pub capturing: bool,
-    pub conflict: Option<&'a str>,
+    /// Why the key just pressed was not taken, from
+    /// `Keymap::refusal`, printed verbatim.
+    ///
+    /// It used to be the label of whatever already held the key, under
+    /// an "rebinding anyway" line, and the rebind really did go
+    /// through: the row showed the new key, config.toml got it, and
+    /// `Keymap::from_overrides` threw it away at the next launch. The
+    /// menu refuses now, so this row is the whole explanation and the
+    /// row above it still shows the key that actually works.
+    pub refused: Option<&'a str>,
 }
 
 impl Widget for KeybindsMenu<'_> {
@@ -46,12 +55,12 @@ impl Widget for KeybindsMenu<'_> {
             .map(|a| a.label().len())
             .max()
             .unwrap_or(0);
-        // the hint row (and the conflict notice while there is one)
+        // the hint row (and the refusal notice while there is one)
         // claim their rows before the list does, then the list scrolls
         // inside what is left: it had no offset at all, so past the
         // pane height `j` moved an invisible cursor and `r` rebound a
         // row nobody could see.
-        let footer = 2 + u16::from(self.conflict.is_some());
+        let footer = 2 + u16::from(self.refused.is_some());
         let list_top = y;
         let room = (area.y + area.height).saturating_sub(list_top);
         let rows = room.saturating_sub(footer).min(ALL_ACTIONS.len() as u16);
@@ -109,15 +118,9 @@ impl Widget for KeybindsMenu<'_> {
             "j/k select, r rebind selected, 0 reset selected, shift+r reset all",
             shade(DIM),
         );
-        if let Some(owner) = self.conflict {
+        if let Some(why) = self.refused {
             y += 1;
-            draw_line(
-                buf,
-                area,
-                y,
-                &format!("already bound to \"{owner}\"; rebinding anyway"),
-                shade(NEAR_WHITE),
-            );
+            draw_line(buf, area, y, why, shade(NEAR_WHITE));
         }
     }
 }
@@ -129,9 +132,11 @@ fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keymap::Keymap;
     use crate::ui::testbuf::{
         assert_no_bleed_through, assert_outside_untouched, buffer, grid, plated_buffer,
     };
+    use crossterm::event::KeyCode;
 
     /// Rows from the rect's top: the frame's top edge, the header
     /// title, the header rule, a blank, then the action rows.
@@ -143,12 +148,12 @@ mod tests {
         ALL_ACTIONS.iter().map(|_| "x".to_string()).collect()
     }
 
-    fn render(area: Rect, buf: &mut Buffer, keys: &[String], conflict: Option<&str>) {
+    fn render(area: Rect, buf: &mut Buffer, keys: &[String], refused: Option<&str>) {
         KeybindsMenu {
             keys,
             selected: 0,
             capturing: false,
-            conflict,
+            refused,
         }
         .render(area, buf);
     }
@@ -181,15 +186,49 @@ mod tests {
         assert!(g.contains("j/k select, r rebind selected"), "{g}");
     }
 
+    /// The notice is `Keymap::refusal`'s own sentence, printed as it
+    /// came: it used to read "rebinding anyway", and the rebind really
+    /// did happen and really was discarded at the next launch.
     #[test]
-    fn the_conflict_notice_quotes_the_action_already_holding_the_key() {
+    fn the_refusal_notice_is_printed_verbatim_and_claims_nothing_was_bound() {
         let area = Rect::new(0, 0, 64, 9 + ALL_ACTIONS.len() as u16);
         let mut buf = buffer(area.width, area.height);
-        render(area, &mut buf, &keys(), Some("quit"));
+        let why = Keymap::default()
+            .refusal(ALL_ACTIONS[0], KeyCode::Char('j'))
+            .expect("j is reserved");
+        render(area, &mut buf, &keys(), Some(&why));
+        let g = grid(&buf);
+        assert!(g.contains(&why), "{g}");
         assert!(
-            grid(&buf).contains("already bound to \"quit\"; rebinding anyway"),
-            "{}",
-            grid(&buf)
+            !g.contains("rebinding anyway"),
+            "the menu must not claim a refused key was taken:\n{g}"
+        );
+    }
+
+    /// The row above the notice is the load-bearing half: a refused
+    /// rebind has to leave the action showing the key that still
+    /// works, not the one that was just turned down.
+    #[test]
+    fn a_refused_rebind_leaves_the_row_showing_its_real_key() {
+        let area = Rect::new(0, 0, 64, 9 + ALL_ACTIONS.len() as u16);
+        let mut buf = buffer(area.width, area.height);
+        let mut labels = keys();
+        labels[0] = "/".to_string();
+        render(
+            area,
+            &mut buf,
+            &labels,
+            Some("j is reserved for move selection; not bound"),
+        );
+        let g = grid(&buf);
+        let row = g
+            .lines()
+            .find(|l| l.contains(ALL_ACTIONS[0].label()))
+            .unwrap();
+        assert!(row.contains('/'), "the real key is gone from the row:\n{g}");
+        assert!(
+            !row.trim_end().ends_with('j'),
+            "the refused key is listed as if it took:\n{row}"
         );
     }
 
@@ -278,7 +317,7 @@ mod tests {
                 keys: &keys(),
                 selected,
                 capturing: true,
-                conflict: None,
+                refused: None,
             }
             .render(area, &mut buf);
             let g = grid(&buf);
@@ -298,16 +337,21 @@ mod tests {
         }
     }
 
-    /// The conflict notice is the one row that explains what a rebind
-    /// just did, so it claims its row from the list rather than being
-    /// pushed off the bottom by it.
+    /// The refusal notice is the one row that explains what a rebind
+    /// just did (or did not do), so it claims its row from the list
+    /// rather than being pushed off the bottom by it.
     #[test]
-    fn the_conflict_notice_survives_a_pane_the_list_overflows() {
+    fn the_refusal_notice_survives_a_pane_the_list_overflows() {
         let area = Rect::new(0, 0, 80, 20);
         let mut buf = buffer(80, 20);
-        render(area, &mut buf, &keys(), Some("quit"));
+        render(
+            area,
+            &mut buf,
+            &keys(),
+            Some("a is already enqueue selected; not bound"),
+        );
         assert!(
-            grid(&buf).contains("already bound to \"quit\""),
+            grid(&buf).contains("a is already enqueue selected; not bound"),
             "{}",
             grid(&buf)
         );
@@ -335,7 +379,7 @@ mod tests {
             keys: &keys(),
             selected,
             capturing: false,
-            conflict: None,
+            refused: None,
         }
         .render(area, buf);
     }
@@ -344,33 +388,46 @@ mod tests {
 #[cfg(test)]
 mod eyeball {
     use super::*;
+    use crate::keymap::{KeyAction, Keymap};
     use crate::ui::testbuf::{buffer, grid};
+    use crossterm::event::KeyCode;
 
     /// The menu at the rows `main_content` actually gets (80x24 with
     /// the default 4-row bottom bar leaves 20), with the selection on
     /// the last action, which is where it ends up after holding `j`:
     /// `cargo test --lib ui::keybinds_menu::eyeball -- --nocapture`.
     /// Asserts the floor too, so it is a test and not just a printer.
+    ///
+    /// The last three cases are the three refusals `Keymap::refusal`
+    /// produces, read off the real keymap rather than written out, so
+    /// looking at this is looking at what the app says.
     #[test]
     fn print_the_menu_with_the_selection_at_the_end() {
         let keys: Vec<String> = ALL_ACTIONS.iter().map(|_| "x".to_string()).collect();
-        for (w, h, selected, capturing, conflict) in [
-            (80u16, 20u16, ALL_ACTIONS.len() - 1, true, None),
+        let km = Keymap::default();
+        let why = |key| km.refusal(KeyAction::Quit, key);
+        let last = ALL_ACTIONS.len() - 1;
+        for (w, h, selected, capturing, refused) in [
+            (80u16, 20u16, last, true, None),
             (80, 20, 0, false, None),
             (80, 20, 13, false, None),
-            (80, 20, ALL_ACTIONS.len() - 1, false, Some("quit")),
-            (80, 8, ALL_ACTIONS.len() - 1, true, None),
+            (80, 20, last, false, why(KeyCode::Char('a'))),
+            (80, 20, last, false, why(KeyCode::Char(':'))),
+            (80, 20, last, false, why(KeyCode::Home)),
+            (80, 8, last, true, None),
         ] {
             let mut buf = buffer(w, h);
             KeybindsMenu {
                 keys: &keys,
                 selected,
                 capturing,
-                conflict,
+                refused: refused.as_deref(),
             }
             .render(Rect::new(0, 0, w, h), &mut buf);
             let text = grid(&buf);
-            println!("--- {w}x{h} selected={selected} capturing={capturing} conflict={conflict:?}\n{text}");
+            println!(
+                "--- {w}x{h} selected={selected} capturing={capturing} refused={refused:?}\n{text}"
+            );
             assert!(
                 text.chars().any(|c| c != '.' && c != '\n'),
                 "{w}x{h} drew nothing at all"

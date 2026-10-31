@@ -75,6 +75,7 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Fixed("gg / G"), "jump to top / bottom"),
             (Key::Fixed("enter"), "play / open"),
             (Key::Fixed("esc"), "back / close"),
+            (Key::Fixed("backspace"), "edit the query"),
             (Key::Fixed("tab"), "enter move mode"),
             (Key::Fixed("wasd / arrows"), "move: focus pane"),
             (Key::Fixed("enter / esc"), "move: back to interact"),
@@ -159,6 +160,22 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Fixed("^foo"), "starts with"),
             (Key::Fixed("foo$"), "ends with"),
             (Key::Fixed("!foo"), "exclude matches"),
+        ],
+    ),
+    (
+        // `:` opens an entire command language (docs/shellsong.md) and
+        // this reference never mentioned it once, so the only way to
+        // find the console was to guess at a key. It is in
+        // `reserved_key_purpose`, which means no remap can ever reach
+        // it and this table is the only place it can be learned.
+        "console",
+        &[
+            (Key::Fixed(":"), "open the command console"),
+            (Key::Fixed("help()"), "list every command"),
+            (Key::Fixed("play(x)"), "play or queue by name"),
+            (Key::Fixed("view(queue)"), "open a screen by name"),
+            (Key::Fixed("tab"), "complete what you typed"),
+            (Key::Fixed("up / down"), "recall a past command"),
         ],
     ),
     (
@@ -567,6 +584,30 @@ mod tests {
         assert!(reachable(120, 24).contains("quit from anywhere"));
     }
 
+    /// A reserved key is one no remap can reach, which makes this
+    /// table the only place its purpose is written down for a user.
+    /// `:` sat in `RESERVED_KEYS` naming "the shellsong console", a
+    /// whole command language with its own completion, and appeared in
+    /// no section, no onboarding row and no hint: the subsystem was
+    /// reachable only by guessing the key.
+    #[test]
+    fn every_reserved_key_is_named_somewhere_in_the_table() {
+        let keymap = Keymap::default();
+        let listed = SECTIONS
+            .iter()
+            .flat_map(|(_, binds)| binds.iter())
+            .map(|(key, _)| key.label(&keymap))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        for (key, purpose) in crate::keymap::RESERVED_KEYS {
+            let label = key_label(*key);
+            assert!(
+                listed.contains(&label),
+                "{label:?} is reserved for {purpose:?} and no row mentions it:\n{listed}"
+            );
+        }
+    }
+
     /// The column width is derived from the table, so a description
     /// longer than `MIN_COLUMN_WIDTH` allows for silently truncates
     /// mid-word. That is how "press a bottom-bar con" and "select text
@@ -725,5 +766,72 @@ mod tests {
             col(shuffle, "shuffle"),
             "the wide key pushed its description out of the column:\n{eq}\n{shuffle}"
         );
+    }
+}
+
+#[cfg(test)]
+mod eyeball {
+    use super::*;
+    use crate::keymap::Keymap;
+    use crate::ui::testbuf::{buffer, grid};
+
+    /// The reference at the sizes it is actually read at, including
+    /// the scroll offsets, since the table is taller than a terminal
+    /// and the console section was added to the end of it:
+    /// `cargo test --lib ui::help::eyeball -- --nocapture`.
+    /// Asserts the floor too, so it is a test and not just a printer.
+    #[test]
+    fn print_the_reference_at_every_width_it_is_read_at() {
+        let keymap = Keymap::default();
+        for (w, h) in [(120u16, 24u16), (80, 24), (160, 40), (100, 20), (50, 16)] {
+            let scroll_max = HelpOverlay {
+                keymap: &keymap,
+                mouse: true,
+                scroll: 0,
+            }
+            .max_scroll(Rect::new(0, 0, w, h));
+            for scroll in [0, scroll_max / 2, scroll_max] {
+                let mut buf = buffer(w, h);
+                HelpOverlay {
+                    keymap: &keymap,
+                    mouse: true,
+                    scroll,
+                }
+                .render(Rect::new(0, 0, w, h), &mut buf);
+                let text = grid(&buf);
+                println!("--- {w}x{h} scroll={scroll}/{scroll_max}\n{text}");
+                assert!(
+                    text.contains("keybinds"),
+                    "{w}x{h} lost its own header:\n{text}"
+                );
+            }
+        }
+    }
+
+    /// The console block as the user meets it, next to the key that
+    /// opens it; the whole section was missing, so this is the one
+    /// that wants looking at rather than asserting.
+    #[test]
+    fn print_the_console_section() {
+        let keymap = Keymap::default();
+        let area = Rect::new(0, 0, 50, 24);
+        // the console block is at the end of a one-column table, so
+        // it is only on screen at the bottom of the scroll.
+        let scroll = HelpOverlay {
+            keymap: &keymap,
+            mouse: false,
+            scroll: 0,
+        }
+        .max_scroll(area);
+        let mut buf = buffer(50, 24);
+        HelpOverlay {
+            keymap: &keymap,
+            mouse: false,
+            scroll,
+        }
+        .render(area, &mut buf);
+        let text = grid(&buf);
+        println!("--- 50x24 scroll={scroll} (one column, mouse off)\n{text}");
+        assert!(text.contains("open the command console"), "{text}");
     }
 }

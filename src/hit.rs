@@ -1008,6 +1008,7 @@ mod tests {
                 selected,
                 focused: true,
                 elapsed: Duration::ZERO,
+                keymap: &crate::keymap::Keymap::default(),
             }
             .render(area, &mut buf);
             let body = body_rect(area);

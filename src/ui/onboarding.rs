@@ -56,6 +56,11 @@ const CONTROLS: &[(Key, &str)] = &[
         Key::Bound(KeyAction::OpenNavManager),
         "reopen navidrome setup",
     ),
+    // the console is a whole command language (docs/shellsong.md) and
+    // it was advertised nowhere at all: not here, not in the help
+    // reference, not on the bottom bar. one row is cheap and it is the
+    // difference between finding it and guessing.
+    (Key::Fixed(":"), "open the command console"),
     (Key::Bound(KeyAction::Quit), "quit"),
 ];
 
@@ -97,6 +102,11 @@ struct Screen {
     /// construction, like `banner.rs`'s logo.
     art: &'static [&'static str],
     rows: Vec<Row>,
+    /// Trailing rows pinned to the body's bottom when the block is
+    /// taller than the body. "press any key to continue" is the only
+    /// thing on the controls screen that says how to leave it, and it
+    /// was the first row pushed off the bottom on a short terminal.
+    pinned: usize,
 }
 
 impl Screen {
@@ -105,6 +115,7 @@ impl Screen {
             step,
             art: &[],
             rows: Vec::new(),
+            pinned: 0,
         }
     }
 
@@ -128,6 +139,15 @@ impl Screen {
         self
     }
 
+    /// A centred row that keeps its place at the bottom of the body
+    /// even when the rows above it do not all fit. Only for the lines
+    /// that say how to get off the screen.
+    fn pinned(mut self, text: impl Into<String>, level: f32) -> Screen {
+        self.rows.push(Row::new(text, level, true));
+        self.pinned += 1;
+        self
+    }
+
     fn render(self, area: Rect, buf: &mut Buffer) {
         let body = chrome(buf, area, self.step);
         if body.width == 0 || body.height == 0 {
@@ -140,22 +160,45 @@ impl Screen {
             self.art.len() as u16 + 1
         };
         let total = art_rows + self.rows.len() as u16;
-        let mut y = body.y + body.height.saturating_sub(total) / 2;
+        let mut top = body.y + body.height.saturating_sub(total) / 2;
+        let bottom = body.y + body.height;
 
         if !self.art.is_empty() {
-            draw_art(buf, body, y, self.art);
-            y += art_rows;
+            draw_art(buf, body, top, self.art);
+            top += art_rows;
         }
-        for row in &self.rows {
-            if y >= body.y + body.height {
-                break;
-            }
+        // a block taller than the body used to clip from the end, which
+        // took "press any key to continue" with it and left a screen
+        // that never said how to advance. the pinned tail keeps the
+        // body's last rows instead, and whatever it displaces is a
+        // keybind the pinned line itself points at ("? opens the full
+        // list any time").
+        let (loose, pins) = self
+            .rows
+            .split_at(self.rows.len().saturating_sub(self.pinned));
+        let overflows = total > body.height;
+        let loose_end = if overflows {
+            bottom.saturating_sub(pins.len() as u16)
+        } else {
+            bottom
+        };
+        let draw = |buf: &mut Buffer, y: u16, row: &Row| {
             if row.centred {
                 draw_centred(buf, body, y, &row.text, row.level);
             } else {
                 draw_row(buf, body, y, &row.text, row.level);
             }
-            y += 1;
+        };
+        for (y, row) in (top..loose_end).zip(loose) {
+            draw(buf, y, row);
+        }
+        let pin_top = if overflows {
+            loose_end
+        } else {
+            top.saturating_add(loose.len() as u16)
+        };
+        for (y, row) in (pin_top..bottom).zip(pins) {
+            draw(buf, y, row);
         }
     }
 }
@@ -284,14 +327,14 @@ impl Widget for ControlsView<'_> {
         }
         screen
             .gap()
-            .centred(
+            .pinned(
                 format!(
                     "{} opens the full list any time",
                     Key::Bound(KeyAction::OpenHelp).label(self.keymap)
                 ),
                 MID,
             )
-            .centred("press any key to continue", NEAR_WHITE)
+            .pinned("press any key to continue", NEAR_WHITE)
             .render(area, buf);
     }
 }
@@ -542,6 +585,23 @@ mod tests {
         assert!(g.contains("opens the full list"), "{g}");
     }
 
+    /// The first screenful of keys is where a subsystem gets found or
+    /// does not. The console was in none of the three places it could
+    /// have been (here, the help reference, the bottom bar), so `:`
+    /// was reachable only by guessing it.
+    #[test]
+    fn the_controls_screen_teaches_the_console_key() {
+        let g = render_controls(80, 24, &keymap());
+        let row = g
+            .lines()
+            .find(|l| l.contains("open the command console"))
+            .unwrap_or_else(|| panic!("no console row:\n{g}"));
+        assert!(
+            row.contains(&crate::keymap::key_label(crate::shellsong::OPEN_KEY)),
+            "the row does not name the key the console opens on:\n{row}"
+        );
+    }
+
     #[test]
     fn the_token_screen_masks_the_input_one_star_per_char() {
         let mut buf = buffer(72, 16);
@@ -676,6 +736,31 @@ mod tests {
         }
     }
 
+    /// Caught by looking at the 50x20 eyeball grid: the table is 18
+    /// rows against the 16 a 20-row terminal leaves, and the block
+    /// clipped from the end, so the two rows that say how to get off
+    /// the screen were the two that went. A screen with no way off it
+    /// is the worst version of this whole class of bug.
+    #[test]
+    fn the_controls_screen_still_says_how_to_advance_when_it_overflows() {
+        for (w, h) in [(80u16, 20u16), (50, 20), (70, 14), (80, 10), (60, 8)] {
+            let g = render_controls(w, h, &keymap());
+            assert!(
+                g.contains("press any key to continue"),
+                "{w}x{h} has no way off it:\n{g}"
+            );
+            assert!(
+                g.contains("opens the full list any time"),
+                "{w}x{h} dropped the pointer at the full list:\n{g}"
+            );
+            // and the pinned rows sit above the rail, not on it; the
+            // rail owns the row just inside the bottom frame edge.
+            let lines: Vec<&str> = g.lines().collect();
+            let rail = lines[lines.len() - 2];
+            assert!(rail.contains("step 2 of 6"), "{w}x{h} rail:\n{g}");
+        }
+    }
+
     /// A tall-but-narrow terminal is the case where the content block
     /// and the rail can collide; the rail must still be the last row.
     #[test]
@@ -688,5 +773,37 @@ mod tests {
             rail.contains("step 2 of 6"),
             "rail should be the interior's last row:\n{g}"
         );
+    }
+}
+
+#[cfg(test)]
+mod eyeball {
+    use super::*;
+    use crate::keymap::Keymap;
+    use crate::ui::testbuf::{buffer, grid};
+    use crossterm::event::KeyCode;
+
+    /// The controls table at the terminal sizes it is actually read
+    /// at, with the console row added to it and with a rebound key, so
+    /// the column padding is looked at rather than assumed:
+    /// `cargo test --lib ui::onboarding::eyeball -- --nocapture`.
+    /// Asserts the floor too, so it is a test and not just a printer.
+    #[test]
+    fn print_the_controls_table() {
+        let mut rebound = Keymap::default();
+        rebound.set(KeyAction::Enqueue, KeyCode::F(12));
+        for (w, h, km) in [
+            (80u16, 24u16, Keymap::default()),
+            (80, 22, Keymap::default()),
+            (120, 30, Keymap::default()),
+            (80, 24, rebound.clone()),
+            (50, 20, Keymap::default()),
+        ] {
+            let mut buf = buffer(w, h);
+            ControlsView { keymap: &km }.render(Rect::new(0, 0, w, h), &mut buf);
+            let text = grid(&buf);
+            println!("--- {w}x{h}\n{text}");
+            assert!(text.contains("controls"), "{w}x{h}:\n{text}");
+        }
     }
 }
