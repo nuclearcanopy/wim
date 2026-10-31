@@ -801,12 +801,26 @@ mpv loaded, a generated silence source included".
         `PlayQueue`**. Callers pre-run `resolve_tracks` today, so it
         cannot fire; a new entry kind that fails to resolve hits it and
         puts every later index off by one.
-      - `queues.rs`'s `Entry` has **no discriminant** ("a missing
-        `path`/`id` is already the discriminant"). A silence entry
-        would serialise to `{title, artist, album}` and `item_of` would
-        return `None` on load, silently dropped and indistinguishable
-        from a moved file. The save/load round-trip cannot pass without
-        a real tag on that struct.
+      - ~~`queues.rs`'s `Entry` has no discriminant~~ **fixed.**
+        `Entry::kind` is explicit now and written on save, optional on
+        load, with `Entry::kind()` falling back to exactly the old rule
+        (a path means local, a server plus id means remote) so every
+        queue saved before this loads unchanged; that compatibility is
+        pinned by a test against toml the old code actually wrote.
+        an entry that is neither comes back as
+        `Dropped::Unrecognised` rather than vanishing.
+        **this turned up a present-day bug while in there, not just a
+        latent one:** `load`'s `filter_map` dropped every unresolvable
+        entry silently, so a fifty-track queue whose server is no
+        longer configured came back as twelve tracks and said nothing
+        about the other thirty-eight. `load_report` returns what it
+        could not rebuild and why (moved file, server gone,
+        unrecognised), `load` delegates to it so nothing changed for
+        existing callers, and all four reasons fail their tests if the
+        silent drop is restored.
+        still to do, and it needs `main.rs`: `load_queue`'s handler
+        should call `load_report` and put the losses on the status line
+        instead of quietly handing over a shorter queue.
 
 ### the input-path freeze audit (complete, 2026-10-31)
 

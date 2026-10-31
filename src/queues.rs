@@ -21,9 +21,69 @@ use serde::{Deserialize, Serialize};
 use crate::search::SearchItem;
 use crate::subsonic::Client;
 
+/// What an entry represents.
+///
+/// Added because "a missing `path`/`id` is already the discriminant"
+/// stopped being safe to rely on. An entry that is neither a local
+/// file nor a remote song (a timed silence, once the queue timeline
+/// lands) serialises to just its title fields, `item_of` returns
+/// `None`, and `load` drops it **silently and indistinguishably from a
+/// moved file**.
+///
+/// Written out from now on, and optional on the way in: a queue saved
+/// before this has no `kind`, and `Entry::kind` falls back to exactly
+/// the old rule (a path means local, a server plus id means remote),
+/// so every existing file loads unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    Local,
+    Remote,
+}
+
+/// Why an entry in a saved queue did not come back, so the caller can
+/// say so instead of quietly handing over a shorter queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dropped {
+    /// A local file that is no longer where it was.
+    Moved(String),
+    /// A remote song whose server is not configured any more.
+    ServerGone(String),
+    /// An entry this build does not know how to rebuild: a `kind` from
+    /// a newer wim, or an old untagged entry with neither a path nor a
+    /// server. Named rather than lumped in with the above, because
+    /// "your wim is older than this file" is a different problem from
+    /// "your file moved".
+    Unrecognised(String),
+}
+
+impl Dropped {
+    /// One line naming what was lost and why, for a notification.
+    ///
+    /// Unused in the binary until `load_queue`'s handler in main.rs
+    /// adopts `load_report`, which is a `main.rs` change queued behind
+    /// the library split; the reasons and their tests are the
+    /// deliverable here. Same `cfg_attr` shape `video::Hole` and
+    /// `lyrics::Loader` use for a prepared primitive.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn describe(&self) -> String {
+        match self {
+            Dropped::Moved(title) => format!("{title}: file moved or gone"),
+            Dropped::ServerGone(title) => format!("{title}: its server is not configured"),
+            Dropped::Unrecognised(title) => format!("{title}: unrecognised entry"),
+        }
+    }
+}
+
+/// A load, including what it could not rebuild.
+#[derive(Debug, Clone, Default)]
+pub struct Loaded {
+    pub items: Vec<SearchItem>,
+    pub dropped: Vec<Dropped>,
+}
+
 /// One queue entry. Flat with optional fields rather than an enum:
-/// toml's handling of enums inside an array of tables is awkward, and
-/// a missing `path`/`id` is already the discriminant.
+/// toml's handling of enums inside an array of tables is awkward.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Entry {
     /// Local file path; `None` for a remote song.
@@ -42,6 +102,37 @@ pub struct Entry {
     pub artist: String,
     #[serde(default)]
     pub album: String,
+    /// `None` only in a file written before kinds existed; `kind()`
+    /// infers it then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<Kind>,
+}
+
+impl Entry {
+    /// The explicit kind, or the pre-kinds rule inferred from which
+    /// fields are present. `None` when neither applies, which is the
+    /// case that used to vanish without trace.
+    pub fn kind(&self) -> Option<Kind> {
+        if let Some(kind) = self.kind {
+            return Some(kind);
+        }
+        if self.path.is_some() {
+            return Some(Kind::Local);
+        }
+        if self.server.is_some() && self.id.is_some() {
+            return Some(Kind::Remote);
+        }
+        None
+    }
+
+    /// What to call this entry in a message about losing it.
+    fn label(&self) -> String {
+        if self.title.is_empty() {
+            "(untitled)".to_string()
+        } else {
+            self.title.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -117,16 +208,36 @@ pub fn save(name: &str, items: &[SearchItem]) -> Result<usize> {
 /// whatever could still be resolved otherwise, which may be shorter
 /// than what was saved (a moved file, a server no longer configured).
 pub fn load(name: &str, clients: &[Arc<Client>]) -> Option<Vec<SearchItem>> {
+    load_report(name, clients).map(|l| l.items)
+}
+
+/// `load`, plus what it could not rebuild and why.
+///
+/// `load` discards that, so a fifty-track queue whose server is gone
+/// came back as twelve tracks with nothing said about the other
+/// thirty-eight. Callers that can show a message should prefer this.
+pub fn load_report(name: &str, clients: &[Arc<Client>]) -> Option<Loaded> {
     let path = dir().ok()?.join(format!("{}.toml", slug(name)));
     let raw = fs::read_to_string(path).ok()?;
     let saved: SavedQueue = toml::from_str(&raw).ok()?;
-    Some(
-        saved
-            .entries
-            .iter()
-            .filter_map(|e| item_of(e, clients))
-            .collect(),
-    )
+    Some(rebuild(&saved, clients))
+}
+
+/// Split out from `load_report` so the rebuild rules are testable
+/// without touching the filesystem.
+fn rebuild(saved: &SavedQueue, clients: &[Arc<Client>]) -> Loaded {
+    let mut out = Loaded::default();
+    for entry in &saved.entries {
+        match item_of(entry, clients) {
+            Some(item) => out.items.push(item),
+            None => out.dropped.push(match entry.kind() {
+                Some(Kind::Local) => Dropped::Moved(entry.label()),
+                Some(Kind::Remote) => Dropped::ServerGone(entry.label()),
+                None => Dropped::Unrecognised(entry.label()),
+            }),
+        }
+    }
+    out
 }
 
 /// `None` for anything that is not a single track: an album or artist
@@ -144,11 +255,13 @@ fn entry_of(item: &SearchItem) -> Option<Entry> {
             title: title.clone(),
             artist: artist.clone().unwrap_or_default(),
             album: album.clone().unwrap_or_default(),
+            kind: Some(Kind::Local),
             ..Entry::default()
         }),
         SearchItem::LocalVideo { path, title } => Some(Entry {
             path: Some(path.to_string_lossy().into_owned()),
             title: title.clone(),
+            kind: Some(Kind::Local),
             ..Entry::default()
         }),
         SearchItem::Song {
@@ -163,6 +276,7 @@ fn entry_of(item: &SearchItem) -> Option<Entry> {
             title: title.clone(),
             artist: artist.clone(),
             album: album.clone(),
+            kind: Some(Kind::Remote),
             ..Entry::default()
         }),
         SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => None,
@@ -237,5 +351,134 @@ mod tests {
             ..Entry::default()
         };
         assert!(item_of(&entry, &[]).is_none());
+    }
+
+    // ------------------------------------------------- kinds and loss
+
+    fn remote(title: &str, server: &str) -> Entry {
+        Entry {
+            server: Some(server.into()),
+            id: Some("s1".into()),
+            title: title.into(),
+            kind: Some(Kind::Remote),
+            ..Entry::default()
+        }
+    }
+
+    /// The compatibility promise: a queue saved before kinds existed
+    /// has no `kind` field, and must load exactly as it used to. This
+    /// is toml written by the old code, pasted verbatim.
+    #[test]
+    fn a_queue_saved_before_kinds_existed_still_loads() {
+        let raw = r#"
+[[entries]]
+path = "/music/a.flac"
+title = "a"
+artist = "x"
+album = "y"
+
+[[entries]]
+server = "https://nav.example"
+id = "song-1"
+title = "b"
+artist = "x"
+album = "y"
+"#;
+        let saved: SavedQueue = toml::from_str(raw).expect("old format must still parse");
+        assert_eq!(saved.entries.len(), 2);
+        assert_eq!(
+            saved.entries[0].kind(),
+            Some(Kind::Local),
+            "a path still means local"
+        );
+        assert_eq!(
+            saved.entries[1].kind(),
+            Some(Kind::Remote),
+            "a server plus id still means remote"
+        );
+    }
+
+    /// The bug this exists to stop: an entry that is neither, which
+    /// used to be dropped indistinguishably from a moved file.
+    #[test]
+    fn an_entry_that_is_neither_is_named_rather_than_vanishing() {
+        let entry = Entry {
+            title: "a timed silence".into(),
+            ..Entry::default()
+        };
+        assert_eq!(entry.kind(), None);
+
+        let loaded = rebuild(
+            &SavedQueue {
+                entries: vec![entry],
+            },
+            &[],
+        );
+        assert!(loaded.items.is_empty());
+        assert_eq!(
+            loaded.dropped,
+            vec![Dropped::Unrecognised("a timed silence".into())],
+            "it has to be reported, not silently skipped"
+        );
+    }
+
+    /// The present-day loss: a saved queue whose server is no longer
+    /// configured came back shorter with nothing said about it.
+    #[test]
+    fn a_remote_entry_with_no_live_client_is_reported_as_such() {
+        let loaded = rebuild(
+            &SavedQueue {
+                entries: vec![remote("gone", "https://nav.example")],
+            },
+            &[],
+        );
+        assert!(loaded.items.is_empty());
+        assert_eq!(
+            loaded.dropped,
+            vec![Dropped::ServerGone("gone".into())],
+            "the reason has to survive to the caller"
+        );
+    }
+
+    #[test]
+    fn a_local_entry_whose_file_is_gone_is_reported_as_moved() {
+        let entry = Entry {
+            path: Some("/nowhere/at/all/missing.flac".into()),
+            title: "missing".into(),
+            kind: Some(Kind::Local),
+            ..Entry::default()
+        };
+        let loaded = rebuild(
+            &SavedQueue {
+                entries: vec![entry],
+            },
+            &[],
+        );
+        assert!(loaded.items.is_empty());
+        assert_eq!(loaded.dropped, vec![Dropped::Moved("missing".into())]);
+    }
+
+    /// An entry with no title still has to be nameable in the message.
+    #[test]
+    fn a_titleless_entry_is_still_describable() {
+        let loaded = rebuild(
+            &SavedQueue {
+                entries: vec![Entry::default()],
+            },
+            &[],
+        );
+        assert_eq!(loaded.dropped.len(), 1);
+        assert!(loaded.dropped[0].describe().contains("untitled"));
+    }
+
+    /// Going forward the kind is written, so a future wim does not
+    /// have to infer it.
+    #[test]
+    fn a_saved_entry_writes_its_kind_explicitly() {
+        let toml = toml::to_string_pretty(&SavedQueue {
+            entries: vec![remote("b", "https://nav.example")],
+        })
+        .unwrap();
+        assert!(toml.contains("kind = \"remote\""), "{toml}");
     }
 }
