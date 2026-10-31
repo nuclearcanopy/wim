@@ -15,6 +15,7 @@
 //! (`ServerCatalog`), so a cold start paints the whole library off the
 //! disk instead of waiting on the network; see docs/startup-cache.md.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -162,34 +163,50 @@ struct CatalogHeader {
     at: u64,
 }
 
+/// Which entity a row describes. An unknown value fails the row's
+/// deserialization, which costs that row and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RowKind {
+    Artist,
+    Album,
+    Playlist,
+}
+
 /// One catalog row. Newline-delimited json rather than one json
 /// document: it parses a line at a time with no whole-file value tree,
 /// a single corrupt line costs one entry instead of the catalog, and
 /// it stays greppable. See docs/startup-cache.md for the format
 /// comparison that picked it.
+///
+/// One flat struct with a `k` discriminant rather than the obvious
+/// `#[serde(tag = "k")]` enum: identical bytes on disk, a fifth off
+/// the parse. An internally-tagged enum cannot be deserialized in one
+/// pass, so serde buffers every row into its own `Content` tree
+/// (allocating per field) before it can know which variant to build.
+/// `Cow` fields then let a row with no escapes borrow straight out of
+/// the line, so only the strings actually kept are allocated. See
+/// `catalog_parse_scaling` for the numbers and
+/// docs/startup-cache.md for why this is where the parse cost was
+/// taken from rather than fanning it out over threads.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "k", rename_all = "lowercase")]
-enum CatalogRow {
-    Artist {
-        id: String,
-        name: String,
-    },
-    Album {
-        id: String,
-        name: String,
-        artist: String,
-        /// The credited artist's own id, when the server told us
-        /// (`subsonic::IdIndex`). Optional and skipped when absent, so
-        /// a catalog written before this field existed still loads and
-        /// one written by a server that reports no artist ids is
-        /// byte-identical to what it used to be.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        artist_id: Option<String>,
-    },
-    Playlist {
-        id: String,
-        name: String,
-    },
+struct CatalogRow<'a> {
+    k: RowKind,
+    #[serde(borrow)]
+    id: Cow<'a, str>,
+    #[serde(borrow)]
+    name: Cow<'a, str>,
+    /// Album rows only. Absent on an artist or playlist row rather
+    /// than written empty, which is what the format always did.
+    #[serde(default, borrow, skip_serializing_if = "Option::is_none")]
+    artist: Option<Cow<'a, str>>,
+    /// The credited artist's own id, when the server told us
+    /// (`subsonic::IdIndex`). Optional and skipped when absent, so a
+    /// catalog written before this field existed still loads and one
+    /// written by a server that reports no artist ids is byte-
+    /// identical to what it used to be.
+    #[serde(default, borrow, skip_serializing_if = "Option::is_none")]
+    artist_id: Option<Cow<'a, str>>,
 }
 
 fn catalogs_dir() -> Result<PathBuf> {
@@ -238,19 +255,26 @@ fn catalog_body(
 ) -> String {
     let rows = artists
         .iter()
-        .map(|a| CatalogRow::Artist {
-            id: a.id.clone(),
-            name: a.name.clone(),
+        .map(|a| CatalogRow {
+            k: RowKind::Artist,
+            id: Cow::Borrowed(&a.id),
+            name: Cow::Borrowed(&a.name),
+            artist: None,
+            artist_id: None,
         })
-        .chain(albums.iter().map(|a| CatalogRow::Album {
-            id: a.id.clone(),
-            name: a.name.clone(),
-            artist: a.artist.clone(),
-            artist_id: artist_of_album(&a.id),
+        .chain(albums.iter().map(|a| CatalogRow {
+            k: RowKind::Album,
+            id: Cow::Borrowed(&a.id),
+            name: Cow::Borrowed(&a.name),
+            artist: Some(Cow::Borrowed(&a.artist)),
+            artist_id: artist_of_album(&a.id).map(Cow::Owned),
         }))
-        .chain(playlists.iter().map(|p| CatalogRow::Playlist {
-            id: p.id.clone(),
-            name: p.name.clone(),
+        .chain(playlists.iter().map(|p| CatalogRow {
+            k: RowKind::Playlist,
+            id: Cow::Borrowed(&p.id),
+            name: Cow::Borrowed(&p.name),
+            artist: None,
+            artist_id: None,
         }));
     let mut body = String::new();
     for row in rows {
@@ -378,21 +402,24 @@ type CatalogRows = (ServerCatalog, Vec<(String, String)>);
 fn parse_rows<'a>(lines: impl Iterator<Item = &'a str>) -> CatalogRows {
     let mut catalog = ServerCatalog::default();
     let mut album_artists = Vec::new();
-    for row in lines.filter_map(|line| serde_json::from_str(line).ok()) {
-        match row {
-            CatalogRow::Artist { id, name } => catalog.artists.push(Artist { id, name }),
-            CatalogRow::Album {
-                id,
-                name,
-                artist,
-                artist_id,
-            } => {
-                if let Some(artist_id) = artist_id {
-                    album_artists.push((id.clone(), artist_id));
+    for row in lines.filter_map(|line| serde_json::from_str::<CatalogRow>(line).ok()) {
+        let (id, name) = (row.id.into_owned(), row.name.into_owned());
+        match row.k {
+            RowKind::Artist => catalog.artists.push(Artist { id, name }),
+            RowKind::Album => {
+                if let Some(artist_id) = row.artist_id {
+                    album_artists.push((id.clone(), artist_id.into_owned()));
                 }
-                catalog.albums.push(Album { id, name, artist })
+                catalog.albums.push(Album {
+                    id,
+                    name,
+                    // an album row has always carried its credited
+                    // artist; a row missing it is read as untagged
+                    // rather than thrown away.
+                    artist: row.artist.unwrap_or_default().into_owned(),
+                })
             }
-            CatalogRow::Playlist { id, name } => catalog.playlists.push(Playlist { id, name }),
+            RowKind::Playlist => catalog.playlists.push(Playlist { id, name }),
         }
     }
     (catalog, album_artists)
@@ -1009,6 +1036,201 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// What the row shape used to be, kept only as the baseline
+    /// `catalog_parse_scaling` measures against: the same bytes,
+    /// deserialized through an internally-tagged enum.
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "k", rename_all = "lowercase")]
+    enum TaggedRow {
+        Artist {
+            id: String,
+            name: String,
+        },
+        Album {
+            id: String,
+            name: String,
+            artist: String,
+            #[serde(default)]
+            artist_id: Option<String>,
+        },
+        Playlist {
+            id: String,
+            name: String,
+        },
+    }
+
+    fn parse_rows_tagged<'a>(lines: impl Iterator<Item = &'a str>) -> CatalogRows {
+        let mut catalog = ServerCatalog::default();
+        let mut album_artists = Vec::new();
+        for row in lines.filter_map(|line| serde_json::from_str::<TaggedRow>(line).ok()) {
+            match row {
+                TaggedRow::Artist { id, name } => catalog.artists.push(Artist { id, name }),
+                TaggedRow::Album {
+                    id,
+                    name,
+                    artist,
+                    artist_id,
+                } => {
+                    if let Some(artist_id) = artist_id {
+                        album_artists.push((id.clone(), artist_id));
+                    }
+                    catalog.albums.push(Album { id, name, artist })
+                }
+                TaggedRow::Playlist { id, name } => catalog.playlists.push(Playlist { id, name }),
+            }
+        }
+        (catalog, album_artists)
+    }
+
+    /// The flat row shape has to read the same catalog the tagged one
+    /// did, row for row, or the format changed under every catalog
+    /// already on disk.
+    #[test]
+    fn the_flat_row_reads_exactly_what_the_tagged_row_did() {
+        let catalog = sample_catalog(3, 5, 2);
+        let body = catalog_body(
+            &catalog.artists,
+            &catalog.albums,
+            &catalog.playlists,
+            &|_| Some("ar-9".to_string()),
+        );
+        let (flat, flat_links) = parse_rows(body.lines());
+        let (tagged, tagged_links) = parse_rows_tagged(body.lines());
+        assert_eq!(flat_links, tagged_links);
+        assert_eq!(flat.artists.len(), tagged.artists.len());
+        assert_eq!(flat.albums.len(), tagged.albums.len());
+        assert_eq!(flat.playlists.len(), tagged.playlists.len());
+        for (a, b) in flat.albums.iter().zip(&tagged.albums) {
+            assert_eq!((&a.id, &a.name, &a.artist), (&b.id, &b.name, &b.artist));
+        }
+        for (a, b) in flat.artists.iter().zip(&tagged.artists) {
+            assert_eq!((&a.id, &a.name), (&b.id, &b.name));
+        }
+        // and an unknown kind is still one skipped row, not a failure
+        assert_eq!(
+            parse_rows(["{\"k\":\"genre\",\"id\":\"g\",\"name\":\"n\"}"].into_iter())
+                .0
+                .artists
+                .len(),
+            0
+        );
+    }
+
+    /// The candidate parallel row parse, kept here rather than in the
+    /// module so the numbers decide whether it ships; see
+    /// `catalog_parse_scaling`. Chunks keep file order and are
+    /// concatenated in chunk order, so the result is row-for-row the
+    /// sequential one (`parse_rows`'s order contract).
+    fn parse_rows_parallel(body: &str, workers: usize) -> CatalogRows {
+        let lines: Vec<&str> = body.lines().collect();
+        if lines.is_empty() {
+            return CatalogRows::default();
+        }
+        let chunk = lines.len().div_ceil(workers.max(1));
+        let parts: Vec<CatalogRows> = std::thread::scope(|scope| {
+            lines
+                .chunks(chunk)
+                .map(|part| scope.spawn(move || parse_rows(part.iter().copied())))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap_or_default())
+                .collect()
+        });
+        let mut out = CatalogRows::default();
+        for (catalog, links) in parts {
+            out.0.artists.extend(catalog.artists);
+            out.0.albums.extend(catalog.albums);
+            out.0.playlists.extend(catalog.playlists);
+            out.1.extend(links);
+        }
+        out
+    }
+
+    /// A catalog body with a real library's row mix (artists, albums,
+    /// a handful of playlists) at `rows` total rows.
+    fn body_of(rows: usize) -> String {
+        let artists = rows * 12 / 100;
+        let albums = rows - artists - rows / 300;
+        let playlists = rows / 300;
+        let catalog = sample_catalog(artists, albums, playlists);
+        let body = catalog_body(
+            &catalog.artists,
+            &catalog.albums,
+            &catalog.playlists,
+            &|id| Some(format!("ar-{}", id.len())),
+        );
+        assert_eq!(body.lines().count(), rows);
+        body
+    }
+
+    fn best<T>(iters: u32, mut f: impl FnMut() -> T) -> (std::time::Duration, T) {
+        let mut best = std::time::Duration::MAX;
+        let mut last = f();
+        for _ in 0..iters {
+            let start = std::time::Instant::now();
+            last = f();
+            best = best.min(start.elapsed());
+        }
+        (best, last)
+    }
+
+    /// Cpu time, not wall time, for the same reason
+    /// `search::tests::cpu_now` exists: this machine's other cores are
+    /// busy during a bench run, so wall clock moves 2-3x between runs
+    /// while the work done does not. The single-threaded numbers are
+    /// only comparable in this clock.
+    fn best_cpu<T>(iters: u32, mut f: impl FnMut() -> T) -> (std::time::Duration, T) {
+        let cpu_now = || {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: clock_gettime only writes the timespec we hand it.
+            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+            std::time::Duration::new(
+                u64::try_from(ts.tv_sec).unwrap_or(0),
+                u32::try_from(ts.tv_nsec).unwrap_or(0),
+            )
+        };
+        let mut best = std::time::Duration::MAX;
+        let mut last = f();
+        for _ in 0..iters {
+            let start = cpu_now();
+            last = f();
+            best = best.min(cpu_now().saturating_sub(start));
+        }
+        (best, last)
+    }
+
+    /// Does the row parse need parallelising? It is on the startup
+    /// path (`search::spawn_warm_from_cache`), where it overlaps the
+    /// mpv spawn; past the point where it outgrows that overlap it
+    /// would resurface on the first frame. Prints sequential against
+    /// `parse_rows_parallel` at the real size and two multiples of it.
+    /// `cargo test --release -- --ignored --nocapture
+    /// catalog_parse_scaling`.
+    #[test]
+    #[ignore = "measurement, run explicitly"]
+    fn catalog_parse_scaling() {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        println!("{threads} cores available");
+        for rows in [34_000usize, 100_000, 300_000] {
+            let body = body_of(rows);
+            let (tagged_cpu, _) = best_cpu(5, || parse_rows_tagged(body.lines()));
+            let (flat_cpu, one) = best_cpu(5, || parse_rows(body.lines()));
+            let (flat, _) = best(5, || parse_rows(body.lines()));
+            let (par, many) = best(5, || parse_rows_parallel(&body, threads));
+            let (chunked, _) = best(5, || parse_rows_parallel(&body, 1));
+            assert_eq!(one.0.albums.len(), many.0.albums.len());
+            println!(
+                "{rows:>7} rows ({:>8} bytes)  cpu: tagged {tagged_cpu:>10.3?} flat \
+                 {flat_cpu:>10.3?}   wall: flat {flat:>10.3?} threads({threads}) \
+                 {par:>10.3?} 1-chunk {chunked:>10.3?}",
+                body.len()
+            );
+        }
+    }
+
     /// Why newline-delimited json and not `toml::to_string_pretty`
     /// (what `index.toml` uses) or pretty json: at catalog scale the
     /// format is most of the file. Prints the comparison; run with
@@ -1035,10 +1257,11 @@ mod tests {
         let rows: Vec<CatalogRow> = catalog
             .albums
             .iter()
-            .map(|a| CatalogRow::Album {
-                id: a.id.clone(),
-                name: a.name.clone(),
-                artist: a.artist.clone(),
+            .map(|a| CatalogRow {
+                k: RowKind::Album,
+                id: Cow::Borrowed(&a.id),
+                name: Cow::Borrowed(&a.name),
+                artist: Some(Cow::Borrowed(&a.artist)),
                 artist_id: None,
             })
             .collect();
