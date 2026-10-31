@@ -30,6 +30,19 @@ cargo build
 or build the packaged binary directly: `nix build .#wim` (mpv is
 wrapped onto its `PATH` automatically, no system-wide install needed).
 
+## usage
+
+```
+wim                 the panes, resuming what was playing
+wim song.flac       play that instead
+wim a.mp3 b.mp3     play the first, queue the rest
+wim --help          every option
+shellswim           the same player, shellsong prompt only
+```
+
+a file argument plays instead of resuming, and the rest queue behind
+it; an unplayable path is refused rather than starting empty.
+
 ## nix
 
 packaged as `packages.<system>.wim` (and `.default`). a home-manager

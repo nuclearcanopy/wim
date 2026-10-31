@@ -100,21 +100,19 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Reads the current state. One ipc read, for `mute`, which has no
-    /// host-side mirror to read instead; the rest is memory. That read
-    /// is once per recorded op rather than per frame, which is the
-    /// budget `paused` and the live volume were refused on.
+    /// Reads the current state. All memory, no ipc.
+    ///
+    /// `mute` used to cost one blocking `get_property` per *recorded
+    /// op*, on the input path, because it had no host-side mirror.
+    /// `mpv::PROP_MUTE` is observed now, so `CoreCtx::muted` is that
+    /// mirror and this is pure again.
     pub fn capture(core: &CoreCtx) -> Snapshot {
         Snapshot {
             current: core.queue.current().cloned(),
             upcoming: core.queue.upcoming().to_vec(),
             previous_track: core.previous_track.clone(),
             base_volume: *core.base_volume,
-            muted: core
-                .player
-                .get_property("mute")
-                .ok()
-                .and_then(|v| v.as_bool()),
+            muted: Some(core.muted),
             loop_mode: core.app.loop_mode,
             shuffle: core.app.shuffle,
             speed: core.app.speed,
@@ -1060,6 +1058,7 @@ mod restore {
         star_tx: mpsc::Sender<StarFailed>,
         _star_rx: mpsc::Receiver<StarFailed>,
         base_volume: f64,
+        muted: bool,
         crossfade_enabled: bool,
         overridden: shellsong_host::Overridden,
         undo: Recorder,
@@ -1112,6 +1111,7 @@ mod restore {
                 star_tx,
                 _star_rx,
                 base_volume: 100.0,
+                muted: false,
                 crossfade_enabled: false,
                 overridden: shellsong_host::Overridden::default(),
                 undo: Recorder::default(),
@@ -1154,6 +1154,7 @@ mod restore {
                 star_tx: &self.star_tx,
                 track_resolver: &mut self.track_resolver,
                 base_volume: &mut self.base_volume,
+                muted: self.muted,
                 crossfade_enabled: &mut self.crossfade_enabled,
                 overridden: &mut self.overridden,
                 undo: &mut self.undo,
@@ -1351,6 +1352,42 @@ mod restore {
         assert!(
             !h.settle.settled(NOW),
             "a query with a request outstanding must not report settled"
+        );
+    }
+
+    /// `capture` asks mpv for nothing.
+    ///
+    /// It runs once per *recorded op*, i.e. on the input path, and the
+    /// one thing it used to ask for was `mute`, which had no
+    /// host-side mirror. `mpv::PROP_MUTE` is observed now, so reading
+    /// the mirror is both free and **less racy**: a snapshot is taken
+    /// *before* its op is applied, and the mirror still holds the
+    /// pre-op value, where a `get_property` issued after the apply
+    /// could come back with the post-op one.
+    ///
+    /// Pinned by reading the source, which is the technique this repo
+    /// already uses for `track_started`, because `CoreCtx` holds a
+    /// live mpv handle and there is no way to count its round trips
+    /// from a test.
+    #[test]
+    fn capturing_a_snapshot_makes_no_ipc_call() {
+        let src = include_str!("undo.rs");
+        let at = src
+            .find("pub fn capture(core: &CoreCtx) -> Snapshot {")
+            .expect("capture moved or was renamed");
+        let body = &src[at..];
+        let end = body.find("\n    }\n").expect("an unterminated fn");
+        let body = &body[..end];
+        for asked in ["get_property", "command(", "set_property"] {
+            assert!(
+                !body.contains(asked),
+                "capture runs per recorded op, on the input path, and this \
+                 puts {asked:?} back on it:\n{body}"
+            );
+        }
+        assert!(
+            body.contains("core.muted"),
+            "it has to read the observed mirror from somewhere:\n{body}"
         );
     }
 
