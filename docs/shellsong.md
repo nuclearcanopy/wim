@@ -23,7 +23,9 @@ should be added that breaks one.
 
 - **r1. everything is a call.** no prefixes, no suffixes that carry
   behaviour, no bare words. repetition is `repeat(n, call)`; a dry run
-  is `dry(call)`.
+  is `dry(call)`. the one surface exception is `let name = [a, b]`,
+  which is sugar for `define(name, [a, b])` in the r6 sense and lowers
+  to it; see "variables".
 - **r2. a bare number means exactly one thing per parameter.**
   `speed(1.5)` is a multiplier, `volume(50%)` a level, `moveto(10s)` a
   position. `skip(2)` is refused: it is ambiguous between "skip twice"
@@ -44,14 +46,21 @@ should be added that breaks one.
   both directions. `seek(30s)` and `moveto(+30s)` are both errors that
   tell you which one you meant.
 - **r9. nothing is silent.** every call reports one line into the
-  scrollback, including no-ops.
+  scrollback, including no-ops. a script's bad line reports as an error
+  line (`Step::Warn`) and the program carries on; everything else
+  reports as a note.
 - **r10. one name, one meaning.** no arity overloading, and no second
   name for something a first name already does. every screen is a
   `view` target rather than its own verb.
 - **r11. omitting the terms means the current selection.** uniformly,
-  for every command that takes them: `star()` stars what is
+  for every command that *operates on* them: `star()` stars what is
   highlighted, `star(flatline)` stars what that finds. one meaning
   ("operate on terms, defaulting to the selection"), one code path.
+  `view(q, ...)` and `define` are the two exceptions, and both are
+  exceptions because their terms are not an operand: `q` means "search
+  for this", and `define` *stores* terms, where the selection (a
+  resolved row) is not a term at all. a test drives this off the table
+  and names both.
 - **r12. completion is driven by the declared parameter type.** a
   parameter either has a candidate list worth inserting or it has none
   and gets a hint. nothing is ever guessed.
@@ -61,7 +70,8 @@ should be added that breaks one.
 ```
 program    := statement (separator statement)*
 separator  := ';' | newline
-statement  := call
+statement  := call | binding
+binding    := 'let' name '=' terms
 call       := name '(' args? ')'
 args       := arg (',' arg)*
 arg        := call | list | keyword '=' value | value
@@ -74,6 +84,12 @@ comment    := '#' ... end of line
 - a call may span lines; splitting is nesting-aware.
 - a trailing comma is allowed in a list and in an argument list.
 - quotes are only needed for an item containing a literal comma.
+- `binding` is the only statement that is not a call, and it is pure
+  sugar: it is parsed straight into `define(name, terms)` through
+  `define`'s own parameters, so the typechecking, the error messages
+  and the variable expansion are all the canonical call's. `dry` takes
+  a *call*, so `dry(define(mix, [hex]))` is how you preview one;
+  `dry(let ...)` is an error rather than a second grammar for `dry`.
 - `q` is deliberately not an alias for anything at statement level: it
   is ambiguous between `queue` and `quit`, so neither claims it. it
   *is* the keyword that switches `view` into its search form, where
@@ -88,10 +104,13 @@ messages come from, and (r12) what completion offers.
 
 | type | accepts | completes from |
 | --- | --- | --- |
-| `terms` | a term, or `[a, b, c]` (r4, r5) | the local corpus |
+| `terms` | a term, or `[a, b, c]` (r4, r5) | the variables, then the local corpus |
 | `query` | free text to search for | the local corpus |
 | `new_name` | a name you are inventing | nothing; hint only |
 | `saved_name` | the name of a saved queue | the saved queues |
+| `var_name` | a variable name | the defined variables |
+| `script_name` | a `.shg` script, or a path to one | the scripts in the config dir |
+| `setting_call` | a call that *is* a setting | `eq` / `volume` / `speed` |
 | `command_name` | a command name | the command table |
 | `call` | a nested call | the command table |
 | keyword sets | one of an enumerated list | that list |
@@ -241,6 +260,8 @@ view(q, terms)     search, and open the best match's page
 | `index` | the corpus breakdown, listed | |
 | `history` | past shellsong commands, listed | |
 | `playlists` | saved queues, listed | |
+| `vars` | the defined variables, listed | `variables` |
+| `bindings` | the per-identity settings, listed | |
 | `eq` | the eq menu | `equalizer` |
 | `help` | the command listing | |
 
@@ -248,8 +269,8 @@ an unknown target is matched against this list and suggests the closest
 real one; `view()` with nothing at all lists them.
 
 the screens take over the display and close the console behind them;
-the five listings (`queue`, `index`, `history`, `playlists`, `help`)
-print into the scrollback and leave it open. `view` means "put this on
+the seven listings (`queue`, `index`, `history`, `playlists`, `vars`,
+`bindings`, `help`) print into the scrollback and leave it open. `view` means "put this on
 screen" either way, and a listing satisfies that; there is deliberately
 no second verb for the distinction.
 
@@ -338,6 +359,72 @@ r10 does not allow; `front` is the capability `queue` genuinely lacks,
 so that is all the command is for. `add_to_queue(flatline)` is an error
 pointing at `queue(flatline)` or at a position.
 
+### variables
+
+a name for a list of track references, so a set of songs you keep
+coming back to is one word.
+
+```
+: let bladee_classics = [crest, icedancer, gods]
+: play(bladee_classics)
+: queue(bladee_classics)
+: view(vars)
+: unset(bladee_classics)
+```
+
+```
+define(name, terms)     bind a name to a list of terms
+unset(name)             drop a variable
+```
+
+**a variable stores the terms, not the tracks they resolve to.** that
+is the deliberate choice, and it is the whole point: `bladee_classics`
+is a vibe, so a track that joins the library later joins the variable
+too, and a term that stops matching reports itself the usual way (see
+"a term that matches nothing"). the frozen reading already exists and
+is spelled `save_queue(name)`, which stores resolved entries with their
+server ids; having both is one meaning each rather than one name with
+two behaviours.
+
+**`let` is a second statement form, and it is sugar.** r1 says
+everything is a call, so `define(name, terms)` is canonical and
+`let name = [a, b]` is parsed straight into it. that is the same deal
+r6 strikes for `queue_aa`: a shorter spelling that lowers to the long
+one, with `dry` printing the long one so you can check. it earns the
+exception because the maintainer's own example is written that way and
+because an assignment is the one thing every reader already knows how
+to spell. nothing else is getting a non-call form.
+
+**where a variable expands.** anywhere a `terms` parameter is accepted,
+which is every searching command, because expansion happens in the one
+place that parses a `terms` argument rather than per command. so it
+composes with lists, with the kind ladder and with `dry`:
+
+```
+: queue([hex, bladee_classics])
+: star_aa(bladee_classics)
+: dry(play(bladee_classics))
+would run: play([crest, icedancer, gods])
+```
+
+**a bare name that is not a variable is still a search term.** there is
+no sigil, because r1 allows no prefixes; the cost is that defining a
+variable named after a song shadows that song in a terms slot. three
+things keep that honest: a variable name must be lowercase snake_case
+(so it does not look like `4 star crest` or `Icedancer`), a name that
+collides with a command is refused outright, and `dry()` always shows
+which reading you got.
+
+**expansion is not recursive.** a `terms` argument expands when it is
+*written*, `define`'s included, so `let b = [a, gods]` stores whatever
+`a` held at that moment. composing variables therefore snapshots the
+components, there is no cycle to detect and no depth to bound, and the
+terms themselves stay terms and are still re-resolved against the
+library on every use.
+
+`view(vars)` prints one `let` line per variable, which means the
+listing is also valid input: paste it back in, or into a `.shg` file.
+
 ### selection
 
 ```
@@ -359,6 +446,7 @@ exactly, which is the point.
 ```
 view(target)            see above                              [show, ls]
 rescan()                re-walk the local library
+run(script)             run a .shg script; dry(run(x)) previews it
 sleep(after)            fade out and pause after a delay; sleep(off) cancels
 fade(direction, over?)  fade the volume in or out
 help(name?)             list every command, or one command's signature
@@ -370,6 +458,151 @@ dead: the last `crossfade_seconds` of the wait fade the volume down,
 then it pauses and puts the level back so unpausing later is not
 silent. A toast says so when it fires; there is no countdown on the
 player screen yet.
+
+### per-identity settings
+
+a setting bound to a track, an album or an artist, applied by itself
+when that music starts. no other player does this.
+
+```
+: remember(track, eq(night))
+: remember(album, volume(55%))
+: remember(artist, speed(0.9))
+: view(bindings)
+: forget(track, eq)
+: forget(album)
+```
+
+```
+remember(tier, call)    bind a setting to what is playing
+forget(tier, setting?)  drop one setting, or all of them, for it
+```
+
+**the setting is a call**, so `remember` is higher-order the way
+`repeat` and `dry` are. that is the whole design: there is no parallel
+vocabulary of setting names and value formats to keep in step with the
+real commands, the value goes through `eq`/`volume`/`speed`'s own
+parameter type, the binding applies through the very same `Op` the typed
+command lowers to, and `dry(remember(track, eq(night)))` works for
+free. `remember` accepts exactly `eq(...)`, `volume(...)` and
+`speed(...)`; anything else is a parse error naming the three, and
+completion only offers those three (r12).
+
+a **relative** value is refused: `remember(track, volume(+10%))` would
+bind "louder than whatever it happens to be", which is not a setting to
+settle on. the error points at `volume(40%)`. same for `speed(up)`.
+
+**precedence is per setting**: track, then album, then artist, decided
+for each of eq, volume and speed independently. so a track-level eq and
+an album-level volume both apply. deciding it per *identity* instead
+would mean remembering an eq for one track silently dropped the volume
+its album remembered, which is not what anyone asked for.
+
+**a setting the new track does not bind is put back**, to the value you
+chose before any binding took over, not to the last bound one. that
+matters more than it sounds: leaving it applied is the bug where one
+quiet song makes everything after it quiet, and a run of bound tracks
+must not ratchet the restore point along either. the rule lives in one
+pure function (`shellsong_host::settle`) precisely so it is tested
+without mpv:
+
+| what the new track binds | what happens |
+| --- | --- |
+| a value, nothing overridden yet | hold the current value, apply the new one |
+| a value, already overriding | apply it; the held value does not move |
+| nothing, already overriding | apply the held value, stop overriding |
+| nothing, not overriding | nothing at all |
+
+a setting that is already in effect applies nothing, so a bound album
+writes to mpv once on its first track rather than on all twelve. the
+toast that names the binding follows the same rule.
+
+a hand-tuned eq curve has no name, so there is nothing to restore *to*;
+the configured preset stands in. that is deliberate, and better than
+leaving one track's curve on for the rest of the session.
+
+**identities are names, not ids.** a track's key is `artist - title`,
+an album's is its album name, an artist's is its name, all lowercased.
+the reason is the one `eq::resolve` already gives for resolving curves
+by name: an id points at something else the moment the library is
+rescanned, a server is swapped, or the same track plays from a local
+copy instead of a stream, and a remembered eq should survive all three.
+the cost is that two genuinely different tracks sharing an artist and a
+title share a binding, which is the rarer problem. a track with no
+album tag refuses `remember(album, ...)` rather than binding an empty
+key.
+
+the applied curve already shows by name in the player and the eq menu
+(`eq::applied_label`), so the eq half is visible without any new
+chrome; a toast on the track change says which identity asked for it,
+and `view(bindings)` lists the lot.
+
+### scripts
+
+a `.shg` file is shellsong, one statement per line, with `#` comments.
+
+```
+# ~/.config/wim/morning.shg
+let morning = [mazzy star, boards of canada]
+
+eq(flat)
+volume(40%)
+queue(morning)
+```
+
+```
+: run(morning)
+: dry(run(morning))
+```
+
+`~/.config/wim/init.shg` runs once at startup if it is there, as one
+`run(init)` through the same parse and the same stepper, so a startup
+script cannot behave differently from a typed one.
+
+**a script is not a second execution path.** `run(path)` is inlined
+while the line is parsed: the file's statements are lowered into the
+same `Program` the rest of the line lowers into, so a script that
+searches suspends on `AwaitResults` and resumes exactly as `play(crest)`
+typed by hand does. three things fall out of that for free rather than
+being written twice:
+
+- `dry(run(x))` previews the whole file, because the plan is the real
+  lowered program. this matters more here than anywhere: a file can
+  `clear_queue` or `download`, and you should be able to read what it
+  will do first.
+- a `let` on line 1 is visible on line 6, because the expansion scope
+  grows as statements are lowered. the same thing makes
+  `let a = [x]; play(a)` work typed on one line.
+- nothing new has to be told about `repeat`, the kind ladder or the
+  await, because none of them know a script happened.
+
+**one statement per line, and a bad line does not stop the file.** it
+is reported with the file and the line number, and the rest runs:
+
+```
+: run(mix)
+mix:2: col 1: unknown command 'xyzzy' (at 'xyzzy')
+mix:4: col 8: volume: 'nonsense' is not a time
+```
+
+that is the same stance a term that matches nothing already takes (one
+bad term never aborts a queue build), and for the same reason: the
+statements are independent, so a typo on line 3 should not cost you the
+other twenty. `;` still separates statements inside one line, but a
+call may **not** span lines in a file, because continuing past a bad
+line needs a line to blame. a *runtime* failure is unchanged and still
+stops the program, since that is `Program`'s existing contract.
+
+**naming one.** a bare name is a script in the config dir
+(`run(morning)` is `~/.config/wim/morning.shg`), the same shape
+`load_queue(name)` has; anything with a `/`, a leading `.` or a leading
+`~` is taken as a path, so a script can live wherever you keep it. a
+bare name that misses goes through the usual "did you mean". the file is
+read while the line is *parsed*, so a wrong name is a parse error and
+the console keeps your line for you to fix.
+
+a script may `run` another, up to 8 frames deep; past that it reports
+and stops rather than recursing.
 
 ### higher-order
 
@@ -508,8 +741,17 @@ deterministic.
 
 completion runs on every keystroke, so it uses the **local corpus
 only** and never triggers a remote search; typing would otherwise spam
-the server. candidates are capped at 50 and the existing optimised
-`Corpus::search` does the scoring rather than a second scorer. the host
+the server. a list the corpus or the user can grow is capped at 50 and
+the existing optimised `Corpus::search` does the scoring rather than a
+second scorer.
+
+the lists the command table itself bounds (command names, a keyword
+set) are deliberately **not** capped. there are more than 50 written
+command names, so capping them hid every name alphabetically past the
+cut from tab on an empty token, `view` and `volume` included; the
+overlay already ellipsis-truncates the row it draws candidates in, so a
+long list costs nothing on screen. a test walks `every_name()` and
+fails if any of them stops being reachable. the host
 supplies the corpus behind a small provider trait, which is also what
 lets the completer be tested with no corpus, no network and no
 terminal.
@@ -518,11 +760,19 @@ terminal.
 
 deliberately not built, so they do not creep in later:
 
-- variables, conditionals, loops, user-defined functions, pipelines.
+- conditionals, loops, user-defined functions, pipelines.
 
 this is a command language for a music player, not a general-purpose
-shell. statement sequencing plus `repeat` and `dry` covers the real
-use cases; anything more is scope that will rot.
+shell. statement sequencing plus `repeat`, `dry` and named lists of
+terms covers the real use cases; anything more is scope that will rot.
+
+variables used to be on this list. they came off it deliberately,
+because a name for a set of songs is a *listening* feature rather than
+a programming one, and because the shape it took (a name expanding to
+terms, at parse time, through the existing `terms` parameter type) adds
+no control flow and no second interpreter. conditionals stay off: a
+rules engine is a programmer's idea of a feature, and the queue
+timeline covers the real cases without one.
 
 ## how it runs
 
@@ -533,6 +783,14 @@ is a resumable state machine: it hands the host one `Op` at a time and
 blocks on `AwaitResults` until the host says the results for that
 query have settled. a search that never settles times out with an
 error rather than hanging.
+
+a `.shg` script is the same machine: `run(path)` inlines the file's
+statements into the program being built, so there is exactly one
+stepper, one await path and one `dry` for a typed line and for a file.
+`World` is the parse-time counterpart of `Env`: the variables a term
+might name and the contents of a script `run(...)` names, both of which
+have to be known while the program is still being built, which is what
+lets `dry()` report a whole file's plan.
 
 every `Op` is applied by the host through the same call its keybind
 already uses, so a shellsong command and a keypress can never drift
@@ -549,8 +807,15 @@ whole `Op` -> host table and sits next to `dispatch_action`.
 `shellsong_host.rs` holds the host decisions worth having apart from
 the event loop (all pure, all tested): the completion provider, the
 `search_settled` state machine, percent-to-seconds resolution, the
-volume clamp and the fade/sleep ramps. `queues.rs` is the named-queue
-store behind `save_queue`/`load_queue`.
+volume clamp, the fade/sleep ramps, the variable and per-identity
+binding stores, `.shg` path resolution, and `settle`, which is the
+per-identity restore rule. `queues.rs` is the named-queue store behind
+`save_queue`/`load_queue`.
+
+the one place that reads live state is the track-change hook in
+`main.rs`: it hands `settle`'s answers to `Program::of(ops)`, which the
+step loop drives through `apply_shellsong_op` like every other op, so
+a per-track eq cannot behave differently from `eq(night)` typed in.
 
 ### the api a host calls
 
@@ -574,8 +839,19 @@ Console::cycle(&self) -> Option<&Cycle>
 // suggestion.
 
 Program::parse(input: &str) -> Result<Program, ParseError>
+Program::parse_in(input: &str, world: &World)
+    -> Result<Program, ParseError>     // expands variables, inlines run()
+World::bare() -> World<'static>        // no variables, no scripts
+Program::of(ops: Vec<Op>) -> Program   // the host's own synthesised work
 Program::step(&mut self, env: &Env) -> Step
 Program::is_done(&self) -> bool
+
+Scope::define(&mut self, name: &str, terms: Vec<String>) -> bool
+Scope::remove(&mut self, name: &str) -> bool
+Scope::get(&self, name: &str) -> Option<&[String]>
+Scope::names(&self) -> Vec<&str>        // alphabetical
+Scope::lines(&self) -> Vec<String>      // what view(vars) prints
+Scope::is_empty(&self) -> bool
 
 Op::describe(&self) -> String           // the one scrollback line (r9)
 Op::closes_console(&self) -> bool
@@ -586,6 +862,10 @@ help_lines() -> Vec<String>              // what view(help) prints
 trait Candidates {
     fn corpus(&self, token: &str) -> Vec<String>;
     fn saved_queues(&self) -> Vec<String> { Vec::new() }
+    fn eq_presets(&self) -> Vec<String> { Vec::new() }
+    fn scope(&self) -> &Scope;          // defaults to an empty one
+    fn scripts(&self) -> Vec<String> { Vec::new() }
+    fn read_script(&self, name: &str) -> Result<String, String>;
 }
 ```
 
@@ -715,7 +995,22 @@ error beats a silent no-op:
 $XDG_STATE_HOME/wim/shellsong_history   the command history
 $XDG_STATE_HOME/wim/shellsong_ranks     the completion frequency store
 $XDG_STATE_HOME/wim/queues/<name>.toml  one saved queue each
+$XDG_STATE_HOME/wim/vars.toml           every variable, in one map
+$XDG_STATE_HOME/wim/bindings.toml       the per-identity settings
+$XDG_CONFIG_HOME/wim/<name>.shg         one script each
+$XDG_CONFIG_HOME/wim/init.shg           the one that runs at startup
 ```
+
+the scripts are the one shellsong thing under the *config* dir rather
+than the state dir: a script is something you write and keep, which is
+the class of thing `config.toml` is; history, ranks, queues and
+variables are all things the app wrote for you.
+
+the variables are one file rather than a file each, unlike the saved
+queues: a queue entry carries a server url, a song id and a title, so
+it is a document; a variable is a name and a handful of short strings,
+and the whole set is read once at startup and rewritten on every
+change, so one file is one read.
 
 a saved queue stores more than a path per entry: a remote song keeps
 its server url plus the server-side song id and is re-bound to a live

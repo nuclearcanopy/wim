@@ -677,6 +677,208 @@ report, not in a batch at the end.
       also: the app had quietly supported `'foo`, `^foo` and `foo$`
       all along and said so nowhere, so the help overlay has a "search
       syntax" block now instead of leaving it folklore.
+- [x] **the ui defect batch, and the char-versus-cell class is now at
+      eight instances.** merged. the four recorded defects were all
+      real; more usefully, the sweep found **four more char-versus-cell
+      bugs and one more emoji glyph**, which is why that sweep was
+      worth asking for rather than assuming the class was closed:
+      - `lyrics_view` wrapped on chars, so a CJK song put up to twice
+        the pane width on a row and `wrapped_len` under-counted, which
+        put the end of the song outside the scroll clamp. lyrics are
+        arbitrary utf-8 from lrclib, so this was live.
+      - `header::junction_col` compared a **char index against a cell
+        column**, so a wide glyph in a title moved the `T` junction a
+        cell left per glyph and the two lines that must meet did not.
+        live for any CJK library, since browse heads its pane with an
+        album name.
+      - `banner`'s logo box was sized by `chars().count()`, mis-centring
+        the wordmark and putting the right arrow inside it.
+      - a bonus defect the new invariant test turned up: the lyrics
+        hard-split only ran when the over-long word was **first** on
+        its row, so a long word after a flush overflowed on its own.
+      the emoji one: `logos.rs` has a logo drawing circled capitals,
+      and U+24C2 is `Emoji=Yes` with no non-emoji equivalent to swap
+      in. since that file is generated, the fix was to filter the logo
+      table to codepoints the art is actually built from (ascii, box
+      drawing, block elements, braille), which drops exactly 2 of 178
+      entries, and to make a config naming a dropped one fall back to
+      the default rather than to whichever logo took its index.
+      **the sharpest thing in the report, worth keeping:** the
+      render-versus-map agreement test alone does *not* catch a
+      mis-numbering, because the render and the map read the same wrong
+      index and agree with each other. consistency and correctness need
+      two different tests. that generalises well beyond this one case.
+      two intended user-visible changes: 176 logo alternatives instead
+      of 178, and the scrubber's track is a cell shorter for the first
+      ten minutes of a song longer than ten minutes, which is the cost
+      of reserving the readout width to kill the drag-jump class
+      outright rather than handling the one crossing.
+
+### shellsong stages 1-3 (merged 2026-10-31)
+
+Variables, `.shg` scripts and per-identity settings are in. 940 tests.
+
+- **variables.** `define(name, terms)` is canonical and `let name = [a,
+  b]` is surface sugar parsed straight into it, so typechecking, errors
+  and expansion are all the canonical call's and R1 stays literally
+  true of every *lowered* program. Terms rather than resolved tracks,
+  as briefed: a variable is a vibe that follows the library, and
+  `save_queue` is already the frozen case. Expansion lives in exactly
+  one place (`coerce`'s `Ty::Terms` arm), which is why every
+  terms-taking command gets it for nothing and `dry` prints the
+  expanded plan for free.
+- **`.shg` scripts.** `run(script)` lowers a file's statements into the
+  same `Program`, so there is one stepper, one await path and one
+  `dry`. A bad line reports and the rest runs (`mix:2: col 1: unknown
+  command ...`); a *runtime* failure still stops. `init.shg` runs at
+  startup as literally `run(init)`.
+  A test caught a real design gap: a script's `let` on line 1 was
+  invisible to line 6, because every line parsed against one scope
+  snapshot. Fixing it also made `let a = [x]; play(a)` work typed on
+  one line.
+- **per-identity settings.** `remember(tier, call)` / `forget(tier,
+  setting?)`, where **the setting is a call**: no parallel vocabulary of
+  setting names and value formats, the value goes through `eq`/
+  `volume`/`speed`'s own parameter type, and the binding applies
+  through the identical `Op` the typed command lowers to. A relative
+  value is refused at parse time, since `remember(track, volume(+10%))`
+  would bind "louder than whatever it happens to be".
+  Precedence is **per setting**, track then album then artist, decided
+  independently for eq, volume and speed; per-identity precedence would
+  mean remembering an eq for one track silently dropped the volume its
+  album remembered. Settings **restore** rather than staying applied,
+  with the restore point captured only on the *first* override so a run
+  of bound tracks cannot ratchet it.
+
+**A real user-facing bug it found on the way:** `MAX_CANDIDATES = 50`
+was being applied to the **command-name** list, which the table bounds
+rather than the library. With more than 50 written names (there are 45
+commands plus aliases), every name alphabetically past the cut was
+**unreachable by tab from an empty token, including `view` and
+`volume`**. Only corpus and user-grown lists are capped now, and
+`every_command_name_is_reachable_by_tab_from_an_empty_token` fails if
+any name ever becomes unreachable again.
+
+### the queue timeline: two decisions taken so stage 4 can start
+
+The agent stopped at a stage boundary green rather than half-landing
+the timeline, and left a concrete handoff. Two things needed deciding;
+both are decided here so the next agent does not stall on them.
+
+**1. the entry is `silence(15m)`, not `pause(15m)`.** `pause()` is
+already the play/pause toggle, and R2 explicitly refuses arity
+overloading ("`skip(2)` is refused: it is ambiguous"). `silence`
+describes what actually plays, cannot be confused with the toggle, and
+pairs with `gap(10s)` for the default between tracks, which keeps the
+maintainer's two ideas named distinctly.
+
+**2. `silence` is its own command with an optional position, not a
+nested call inside `queue`.** `queue`'s parameter is `Ty::Terms`, which
+means "names of things in the library"; letting it accept a call form
+is a genuine grammar extension and would make `Ty::Terms` mean "names
+or calls" everywhere. So: `silence(15m)` appends and `silence(15m,
+front)` takes the position parameter `add_to_queue` already uses. The
+composition loss versus `queue(silence(15m))` is real but small, and it
+is reversible later if the grammar extension turns out to be wanted
+anyway.
+
+**The invariant question is already answered, and the answer is the
+good one.** Keep mpv's playlist as the source of truth and make a
+silence a *real* mpv entry via `av://lavfi:anullsrc=d=N`, which mpv in
+this setup already loads (two ignored benches prove it). Then
+`entries.len() == mpv playlist len` still holds, every absolute-index
+path keeps working untouched, and the desync regression tests at
+`playqueue.rs:296-393` keep holding. The invariant's doc comment gets
+*stronger*: "`entries` is mpv's playlist, and every entry is something
+mpv loaded, a generated silence source included".
+
+- [ ] **two latent bugs that must be fixed as part of the timeline**,
+      both found during that survey and both currently unreachable only
+      by luck:
+      - `load_playlist` (~main.rs:691) and `resync_upcoming` (~743)
+        skip an item whose `resolve_playable` returns `None` when
+        appending to mpv **but still store the full vec in
+        `PlayQueue`**. Callers pre-run `resolve_tracks` today, so it
+        cannot fire; a new entry kind that fails to resolve hits it and
+        puts every later index off by one.
+      - `queues.rs`'s `Entry` has **no discriminant** ("a missing
+        `path`/`id` is already the discriminant"). A silence entry
+        would serialise to `{title, artist, album}` and `item_of` would
+        return `None` on load, silently dropped and indistinguishable
+        from a moved file. The save/load round-trip cannot pass without
+        a real tag on that struct.
+
+### the input-path freeze audit (complete, 2026-10-31)
+
+The lyrics freeze prompted this: grep every network call reachable from
+`dispatch_action`, `run_shellsong_op` and the key handlers, and check
+whether it sits inside a thread. **Three more freezes, all confirmed on
+the input path, none inside a thread.** Every fix needs `main.rs`,
+which the library split owns tonight, so they are recorded with line
+numbers and the pattern to use rather than half-done.
+
+The pattern is settled, twice over: `browse::Loader` (merged) and
+`lyrics::Loader` (built, waiting on two call sites). One generation
+counter bumped per request and on `invalidate`, checked by the worker
+before it sends and again in `poll`. Copy that shape; do not invent a
+third.
+
+- [ ] **`resolve_tracks` (main.rs ~118) is the worst of the three.**
+      called from `dispatch_action`'s `Action::Play` and `Action::Queued`
+      arms (~1063, ~1099) and from shellsong (~1920). for an album it
+      is one `getAlbum`. **for an artist it calls `artist_tracks`,
+      which is a `getArtist` plus one `getAlbum` per album**, so
+      pressing enqueue on a prolific artist blocks the whole ui for as
+      long as that fan-out takes. the bounded pool made it 5x faster;
+      it is still seconds, and still synchronous.
+      note the irony: `browse::Loader` already streams exactly this
+      data album by album for the *browse* path. queueing it re-fetches
+      the same thing synchronously. the fix may be to route queueing
+      through the loader rather than to build a fourth one.
+- [ ] **`open_starred_view` (main.rs ~312) fetches starred songs from
+      every configured server synchronously**, from shellsong (~1543)
+      and the starred key (~6923). one round trip per server on a
+      keypress, in series with nothing else to look at.
+- [ ] **`toggle_star` (main.rs ~244) is a server round trip on the
+      keypress** for a remote song (`star`/`unstar`), from the key
+      handlers (~6606, ~7039) and shellsong (~1944). the local-file
+      branch is a file write and is fine.
+      this one wants different treatment from the other two: starring
+      should feel instant, so the right shape is **optimistic** (flip
+      `remote_starred` and redraw at once, send in the background, and
+      revert with a notification if the server refuses) rather than a
+      loader the user waits on.
+
+Checked and genuinely fine: `fetch_navidrome_everything` and
+`test_navidrome_connectivity` are already on their own threads, the
+enrichment and catalog fetches are background, `search3` runs in the
+debounced search thread, and the local-favorites path is a file write.
+
+- [ ] **pressing the lyrics key freezes the app on the network.**
+      `lyrics::Client::lookup` is a round trip to lrclib and it is
+      called **synchronously from the input path** at two sites in
+      `main.rs`: the `OpenLyrics` key handler and the shellsong op. the
+      same class of freeze as the album open fixed earlier today, and
+      just as visible.
+      `lyrics::Loader` is built and tested: one generation counter,
+      bumped on every request and on `invalidate`, checked by the
+      worker before it sends and again in `poll`, so a reply for a
+      track the user has moved past is dropped rather than appearing
+      over the new one. both stale paths pinned, and the guard
+      mutation-checked by deleting the check and watching exactly those
+      two tests fail. `cfg_attr(not(test), allow(dead_code))` until
+      wired.
+      **what is left is two call sites**: replace each `lookup` with
+      `request`, drain `poll` next to the other channel drains in the
+      main loop, and `invalidate` when the lyrics view closes or the
+      track changes. blocked only because `main.rs` is owned by the
+      library split tonight.
+      **while in there, audit the input path for the same pattern.**
+      the two found so far (album/artist open, lyrics) were both a
+      client call straight from a key handler, so grepping for network
+      calls reachable from `dispatch_action` and `run_shellsong_op` is
+      the cheap way to find the third.
+
 - [ ] **the remaining search cost is the result clone, and it needs an
       api change to fix.** for a broad query at 40k items, 3-5ms of a
       ~7ms search is `rank` cloning ~15k `SearchItem`s. cutting it
@@ -840,8 +1042,16 @@ conflicts.
 **Queued behind the lib split, in this order, because each needs
 `main.rs` and the split rewrites it:**
 1. the **undo tree** (hooks the single op dispatch; see below),
-2. **in-workspace sub-rect video** (needs ratatui taught to leave a
-   hole; `docs/video.md` has the analysis),
+2. **in-workspace sub-rect video**. the blocker recorded as "the real
+   work" was **wrong and is now gone**: ratatui's `flush` diffs the
+   previous buffer against the current one, so it has no idea what is
+   on the terminal and cannot "restore" cells mpv drew. a rect left
+   untouched in two consecutive frames emits nothing. `video::Hole`
+   plus five tests against ratatui's own `Buffer::diff` pin that, and
+   `Hole::painted` reports when an overlay or a resize repaint breaks
+   the promise so mpv can be asked to redraw. what is left is the
+   unglamorous half: keeping wim's widgets out of the rect (a layout
+   change in `main.rs`) and the redraw trigger. see `docs/video.md`.
 3. **cron scheduling** (`at(07:00) ...`), which needs the language
    work landed first.
 
@@ -878,13 +1088,22 @@ the order below is not a preference, it is a dependency.
       then doing something new does not destroy the branch you left;
       it becomes a sibling you can walk back to, the way vim's undo
       tree works. thematically right for an app called wim.
-      **why this app can do it properly and others cannot:** every
-      state change already funnels through one choke point,
-      `apply_shellsong_op`, and every op already has
-      `Op::describe()`. so there is exactly one place to record
-      history, which is the difference between complete undo and
-      best-effort undo, and every node gets a human-readable label for
-      free. a branch of the tree is then *already* a list of ops, which
+      **correction to what this entry first claimed.** it said every
+      state change funnels through one choke point,
+      `apply_shellsong_op`. it does not, and the difference matters:
+      `run_shellsong_op` has 40 op arms, **12 delegate to
+      `dispatch_action` and 28 act directly**, and the 28 include
+      `ClearQueue`, which is the single most valuable thing to be able
+      to undo. hooking either function alone misses half the mutations;
+      hooking both double-records the 12. the fix is to give those 28
+      `Action` variants so there really is one choke point, which is
+      cheapest to do **during the library split**, since that is
+      already moving the mutation surface into a core. `Op::describe()`
+      does exist for every op, so the labels really are free.
+      the full design, including an op-by-op classification into
+      snapshot-restorable, irreversible-side-effect (undo must refuse
+      with a reason rather than restore around it) and not-recorded, is
+      in **docs/undo.md**. a branch of the tree is then *already* a list of ops, which
       is to say **a `.shg` script**: exporting a branch is close to
       free once scripts exist, and that ties the two headline features
       together.
