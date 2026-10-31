@@ -23,15 +23,16 @@ use ratatui_image::StatefulImage;
 use wim::app::LoopMode;
 use wim::cache::CacheIndex;
 use wim::core::{
-    apply_eq_gains, apply_eq_row, browse_session, client_for, current_eq_name, current_volume,
-    dispatch_action, drive, enqueue_track, eq_preset_names, fire_scrobble, fire_subtitle_fetch,
-    go_to_previous, identity_settings, load_playlist, lyrics_query, note_playback_started,
-    notify_query_changed, op_done, op_fail, op_note, open_starred, print_listing, resync_upcoming,
-    retain_live_clients, save_playback_state, set_vid_for_item, shellsong_focus,
-    spawn_background_search, start_session, start_tracking_playback, suggestion_starred_keys,
-    sweep_cache, toggle_star, trigger_downloads, CoreCtx, Dispatch, DownloadCtx, Drive,
-    RemoteSearchOutcome, RemoteSearchQuery, Report, ScrobbleState, SelectStep, SessionStart,
-    StarFailed, SubtitleReady, Surface, TrackChangeCtx,
+    append_resolved, apply_eq_gains, apply_eq_row, browse_session, client_for, current_eq_name,
+    current_volume, dispatch_action, drive, enqueue_track, eq_preset_names, fire_scrobble,
+    fire_subtitle_fetch, front_resolved, go_to_previous, identity_settings, load_playlist,
+    lyrics_query, note_playback_started, notify_query_changed, op_done, op_fail, op_note,
+    open_starred, print_listing, resync_upcoming, retain_live_clients, save_playback_state,
+    set_vid_for_item, shellsong_focus, spawn_background_search, start_session,
+    start_tracking_playback, suggestion_starred_keys, sweep_cache, toggle_star, trigger_downloads,
+    CoreCtx, Dispatch, DownloadCtx, Drive, Enqueue, EnqueueResolver, RemoteSearchOutcome,
+    RemoteSearchQuery, Report, ScrobbleState, SelectStep, SessionStart, StarFailed, SubtitleReady,
+    Surface, TrackChangeCtx,
 };
 use wim::download::DownloadEvent;
 use wim::keymap::{KeyAction, Keymap};
@@ -1690,6 +1691,7 @@ fn main() -> anyhow::Result<()> {
     // a refused star comes back here so the optimistic flip can be put
     // back; see `toggle_star`.
     let (star_tx, star_rx) = mpsc::channel::<StarFailed>();
+    let mut enqueue_resolver = EnqueueResolver::new();
     // the shellsong console: ':' opens it, and while it is open it
     // claims every key and every paste (see its input tier, which sits
     // at the same tier `editing_query` does and for the same reason).
@@ -3469,6 +3471,7 @@ fn main() -> anyhow::Result<()> {
                     lyrics_client: &lyrics_client,
                     lyrics_loader: &mut lyrics_loader,
                     star_tx: &star_tx,
+                    enqueue_resolver: &mut enqueue_resolver,
                     base_volume: &mut base_volume,
                     crossfade_enabled: &mut crossfade_enabled,
                     fade_in_started_at: &mut fade_in_started_at,
@@ -3600,6 +3603,31 @@ fn main() -> anyhow::Result<()> {
         } else {
             anim::IDLE_POLL
         };
+
+        // a queue batch resolved. the resolver has already dropped any
+        // belonging to a superseded request, which matters more here
+        // than elsewhere: a late arrival would not just draw something
+        // stale, it would append to the queue behind the user's back.
+        while let Some((into, label, tracks)) = enqueue_resolver.poll() {
+            let mut surf = wim_surface!();
+            let mut core = core_ctx!();
+            match tracks {
+                Ok(tracks) if tracks.is_empty() => core
+                    .notifications
+                    .push(Severity::Info, format!("nothing to queue in {label}")),
+                Ok(tracks) => match into {
+                    Enqueue::Back => append_resolved(&tracks, &mut core),
+                    Enqueue::Front => match front_resolved(&tracks, &mut core) {
+                        Ok(n) => core
+                            .notifications
+                            .push(Severity::Info, format!("queued {n} tracks next")),
+                        Err(why) => core.notifications.push(Severity::Error, why),
+                    },
+                },
+                Err(why) => core.notifications.push(Severity::Error, why),
+            }
+            let _ = &mut surf;
+        }
 
         if event::poll(timeout)? {
             let ev = event::read()?;
