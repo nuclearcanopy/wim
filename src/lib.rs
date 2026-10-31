@@ -38,6 +38,7 @@ pub mod swimconsole;
 pub mod term;
 pub mod theme;
 pub mod trace;
+pub mod transport;
 pub mod ui;
 pub mod undo;
 pub mod video;

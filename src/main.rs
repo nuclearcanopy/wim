@@ -45,6 +45,9 @@ use wim::search::SearchItem;
 use wim::shellsong::{Console, ConsoleAction, ViewTarget};
 use wim::shellsong_host::{CorpusCandidates, Ramp, SearchSettle, SleepStep};
 use wim::theme::{shade, NEAR_BLACK};
+use wim::transport::{
+    activate_transport, audio_level, commit_scrub, now_playing_is_video, ScrubAt, TransportCtx,
+};
 use wim::ui::banner::Banner;
 use wim::ui::browse::BrowseListView;
 use wim::ui::controlsbar::{
@@ -193,26 +196,6 @@ fn cell_aspect() -> f32 {
     }
 }
 
-/// Finishes an open drag: one absolute seek to the target the bar has
-/// been drawing, then the drag closes. Shared by the keyboard's
-/// enter/esc and the mouse's button release, so "committed" means the
-/// same thing however the drag was being held.
-fn commit_scrub(
-    target: Scrub,
-    player: &mpv::Mpv,
-    notifications: &mut Notifications,
-    scrub: &mut Option<Scrub>,
-    scrub_pending: &mut bool,
-    scrub_sent_at: &mut Option<Instant>,
-) {
-    if let Err(e) = player.seek(target.target_secs, false) {
-        notifications.push(Severity::Error, format!("error seeking: {e}"));
-    }
-    *scrub = None;
-    *scrub_pending = false;
-    *scrub_sent_at = None;
-}
-
 /// Crossterm's mouse event, reduced to what `hit::act` decides from.
 /// Only the left button is wired up: no other button means anything
 /// anywhere in this app, and a terminal reporting one should not be
@@ -225,73 +208,6 @@ fn mouse_kind(kind: MouseEventKind) -> hit::Kind {
         MouseEventKind::ScrollUp => hit::Kind::WheelUp,
         MouseEventKind::ScrollDown => hit::Kind::WheelDown,
         _ => hit::Kind::Other,
-    }
-}
-
-/// Where enter (or a click) on the scrubber opens its drag: at the
-/// current position, which is the only place a key could mean, or at a
-/// fraction of the duration, which is where a pointer landed.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ScrubAt {
-    Position,
-    Fraction(f64),
-}
-
-/// Everything activating a transport control can touch, bundled into
-/// one argument the way `ActionCtx` is and for the same reason.
-/// The scrubber's drag state, which is the one bar control with no op
-/// behind it.
-///
-/// Everything else this struct used to carry (the app, the queue, the
-/// cache, crossfade, the eq menu, the gap) was only here to serve six
-/// arms that each duplicated an op; `core::op_for_field` plus
-/// `apply_op` replaced them, and the fields went with them.
-struct TransportCtx<'a> {
-    scrub: &'a mut Option<Scrub>,
-    scrub_pending: &'a mut bool,
-    scrub_sent_at: &'a mut Option<Instant>,
-    /// mpv's last reported position and duration, sampled once per
-    /// frame by the loop rather than asked for again here.
-    elapsed_secs: Option<f64>,
-    duration_secs: Option<f64>,
-}
-
-/// The one place a transport control is acted on. Enter on the bottom
-/// bar, enter on the maximized player and a mouse click all land here,
-/// so the three can never drift into doing different things to the
-/// same glyph; `controlsbar::Field` is the whole alphabet.
-fn activate_transport(
-    field: Field,
-    at: ScrubAt,
-    core: &mut CoreCtx,
-    surf: &mut dyn Surface,
-    ctx: &mut TransportCtx,
-) {
-    // every control but the scrubber *is* a command, so it goes
-    // through the command. that is not only deduplication: `apply_op`
-    // is where the undo tree records, so this is what puts a clicked
-    // loop or shuffle in the history alongside a typed one.
-    if let Some(op) = wim::core::op_for_field(field) {
-        apply_op(op, core, surf);
-        return;
-    }
-    // the scrubber. duration is captured by the caller, once, so each
-    // step can clamp without asking mpv again; nothing loaded means
-    // nothing to scrub, so the drag just doesn't open.
-    if let Some(elapsed) = ctx.elapsed_secs {
-        let open = Scrub {
-            target_secs: elapsed,
-            duration_secs: ctx.duration_secs,
-        };
-        // opening where it already is has nothing to seek to; opening
-        // where a pointer landed does, so only that one leaves a
-        // target for the coalescer to send.
-        *ctx.scrub = Some(match at {
-            ScrubAt::Position => open,
-            ScrubAt::Fraction(frac) => open.at_fraction(frac),
-        });
-        *ctx.scrub_pending = matches!(at, ScrubAt::Fraction(_));
-        *ctx.scrub_sent_at = None;
     }
 }
 
@@ -598,20 +514,6 @@ fn open_wim_lyrics(core: &mut CoreCtx) -> (Dispatch, Report) {
     op_note(format!("fetching lyrics for {name}"))
 }
 
-/// Current output level, 0..1, for the now-playing level meter. Reads
-/// the `astats` tap `build_af_filter` (eq.rs) puts at the end of the af
-/// chain, which mpv pushes (`mpv::PROP_LEVEL_RMS`) rather than being
-/// asked for: this used to be a blocking IPC round trip per frame. No
-/// fresh reading (paused, stopped, or an mpv that doesn't resolve the
-/// property) falls back to a calm idle breathe instead of silently
-/// showing a dead meter, driven off `elapsed` like every other
-/// animation.
-fn audio_level(playback: &mpv::Playback, elapsed: Duration) -> f32 {
-    playback.level().unwrap_or_else(|| {
-        (anim::pulse(elapsed, anim::LEVEL_FALLBACK_PERIOD) * 0.6 + 0.05).clamp(0.0, 1.0)
-    })
-}
-
 /// How often the background thread (see `spawn_background_sync`)
 /// re-fetches every configured server, so navidrome stays "constantly
 /// updating" without the user ever pressing a manual refresh key.
@@ -622,10 +524,6 @@ const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(45);
 /// sweep that always runs once at startup; cheap local filesystem
 /// work, not worth its own background thread the way network sync is.
 const CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
-
-fn now_playing_is_video(now_playing: &Option<SearchItem>) -> bool {
-    matches!(now_playing, Some(SearchItem::LocalVideo { .. }))
-}
 
 /// `dir`: -1.0 or 1.0. One step per field, matching `ui::subtitle_menu`'s
 /// field order; kept as a plain index match rather than a generic
@@ -5658,29 +5556,6 @@ mod shellsong_wiring_tests {
 #[cfg(test)]
 mod video_wiring_tests {
     use super::*;
-
-    /// The one question the whole video path hangs off: only a local
-    /// video file ever hands the screen to mpv. wim is mostly a music
-    /// player, so getting this wrong means a blanked ui on every song;
-    /// `set_vid_for_item` splits the same way, and the two must agree
-    /// or mpv would be asked to draw a track it is not decoding video
-    /// for.
-    #[test]
-    fn only_a_local_video_counts_as_video() {
-        let video = SearchItem::LocalVideo {
-            path: "/tmp/a.mkv".into(),
-            title: "a".into(),
-        };
-        assert!(now_playing_is_video(&Some(video)));
-
-        assert!(!now_playing_is_video(&None));
-        assert!(!now_playing_is_video(&Some(SearchItem::LocalMusic {
-            path: "/tmp/a.flac".into(),
-            title: "a".into(),
-            artist: None,
-            album: None,
-        })));
-    }
 
     /// Mapped from the file extension at scan time, never from mpv, so
     /// the extension list is the real definition of "video" here.

@@ -2031,6 +2031,26 @@ the order below is not a preference, it is a dependency.
       **the "~3.9k lines" in this entry was stale: it is 6.2k.** worth
       knowing before picking the next step, since every slice above
       has been adding to it.
+      - [x] **the transport controls -> `src/transport.rs`** (160
+        lines). `ScrubAt`, `TransportCtx`, `activate_transport`,
+        `commit_scrub`, `audio_level` and `now_playing_is_video`. the
+        seam is `controlsbar::Field`: everything in there either
+        presses one of those or reads playback to draw one, and none
+        of it knows about panes, menus or the input tiers.
+        it is a smaller win in lines than it looks (main.rs 6187 ->
+        6062) because `activate_transport` had already shrunk to four
+        lines plus the drag when the bar's controls became commands.
+        the value is the seam, not the count.
+        two tests came with it, one new: `audio_level`'s fallback has
+        to *move* rather than read a constant, since the point of it
+        is a meter that breathes when mpv reports nothing instead of
+        sitting dead.
+        **the doc-comment hazard noted below recurred, and this one
+        was pre-existing**: `TransportCtx` carried two glued doc
+        blocks, the older of which ("everything activating a transport
+        control can touch") stopped being true when the struct shrank
+        to five fields earlier the same day. the move surfaced it
+        rather than causing it; the stale half is gone.
       - [x] **focus/InputMode -> `src/focus.rs`** (155 lines with its
         tests). the cheapest possible first slice and chosen for that:
         `InputMode`, `focus_direction_key` and `focus_in_direction`
