@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::eq;
+use crate::notify::{Notifications, Severity};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NavidromeConfig {
@@ -436,6 +437,15 @@ fn restrict_to_owner(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn restrict_to_owner(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+/// Persists config, surfacing a failure instead of swallowing it: a
+/// read-only config dir or a full disk used to mean every setting
+/// silently reverted on the next launch with nothing said about it.
+pub fn save_or_warn(cfg: &Config, notifications: &mut Notifications) {
+    if let Err(e) = save(cfg) {
+        notifications.push(Severity::Error, format!("couldn't save settings: {e}"));
+    }
 }
 
 #[cfg(test)]

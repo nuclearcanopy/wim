@@ -25,21 +25,24 @@ use wim::catalog::{
     test_navidrome_connectivity, BackgroundSyncResult,
 };
 use wim::core::{
-    append_resolved, apply_eq_gains, apply_eq_row, apply_op, browse_session, dispatch_action,
-    download_resolved, download_tracks, drained, drive, enqueue_track, eq_preset_names,
-    fire_scrobble, fire_subtitle_fetch, front_resolved, go_to_previous, load_playlist,
-    lyrics_query, note_playback_started, notify_query_changed, op_done, op_fail, op_note,
-    open_starred, playing_duration, print_listing, save_playback_state, set_vid_for_item,
-    shellsong_focus, spawn_background_search, start_session, start_tracking_playback,
-    suggestion_starred_keys, sweep_cache, toggle_star, track_started, BetweenTracks, CoreCtx,
-    Dispatch, DownloadCtx, Drained, Drive, GapAction, Intent, RemoteSearchOutcome,
-    RemoteSearchQuery, Report, Resolution, ScrobbleState, SelectStep, SessionStart, StarFailed,
-    SubtitleReady, Surface, TrackChangeCtx, TrackResolver,
+    append_resolved, apply_eq_row, apply_op, browse_session, dispatch_action, download_resolved,
+    download_tracks, drained, drive, enqueue_track, eq_preset_names, fire_scrobble,
+    fire_subtitle_fetch, front_resolved, go_to_previous, load_playlist, lyrics_query,
+    note_playback_started, notify_query_changed, op_done, op_fail, op_note, open_starred,
+    playing_duration, print_listing, save_playback_state, set_vid_for_item, shellsong_focus,
+    spawn_background_search, start_session, start_tracking_playback, suggestion_starred_keys,
+    sweep_cache, toggle_star, track_started, BetweenTracks, CoreCtx, Dispatch, DownloadCtx,
+    Drained, Drive, GapAction, Intent, RemoteSearchOutcome, RemoteSearchQuery, Report, Resolution,
+    ScrobbleState, SelectStep, SessionStart, StarFailed, SubtitleReady, Surface, TrackChangeCtx,
+    TrackResolver,
 };
 use wim::download::DownloadEvent;
 use wim::enrich::{
     next_enrichment_job, recompute_suggestions, spawn_background_enrichment, EnrichmentEvent,
     EnrichmentJob,
+};
+use wim::eq_menu_keys::{
+    adjust_eq_band, eq_label, eq_menu_editor_key, eq_saved_row_hint, persist_eq,
 };
 use wim::focus::{focus_direction_key, focus_in_direction, InputMode};
 use wim::graphics::{
@@ -451,32 +454,6 @@ fn adjust_subtitle_field(sub: &mut config::SubtitleConfig, field: usize, dir: f6
     }
 }
 
-/// Persists config, surfacing a failure instead of swallowing it: a
-/// read-only config dir or a full disk used to mean every setting
-/// silently reverted on the next launch with nothing said about it.
-fn save_config(cfg: &config::Config, notifications: &mut Notifications) {
-    if let Err(e) = config::save(cfg) {
-        notifications.push(Severity::Error, format!("couldn't save settings: {e}"));
-    }
-}
-
-/// One h/l nudge (`dir`: -1.0 or 1.0) on band `band`, 1 dB per step,
-/// clamped to `eq::GAIN_LIMIT`; touching any band diverges from
-/// whatever named curve was active, which keeps its name but reads as
-/// modified from here on (`app.eq_source` is deliberately not
-/// cleared, so the menu can still say which curve this came from).
-fn adjust_eq_band(
-    app: &mut app::App,
-    player: &mpv::Mpv,
-    notifications: &mut Notifications,
-    band: usize,
-    dir: f64,
-) {
-    app.eq_gains[band] = (app.eq_gains[band] + dir).clamp(-eq::GAIN_LIMIT, eq::GAIN_LIMIT);
-    app.eq_custom = true;
-    apply_eq_gains(app, player, notifications);
-}
-
 /// Warns once, right after a profile is saved, that the password it
 /// just persisted is cleartext. Typing credentials into the app is the
 /// only way it can store them (subsonic auth needs the cleartext for
@@ -542,113 +519,6 @@ fn rebuild_corpus(cfg: &config::Config) -> search::Corpus {
     let mut corpus = search::Corpus::new();
     corpus.add_local_tracks(library::scan(&cfg.library_paths));
     corpus
-}
-
-/// A built-in or saved curve's name, that name plus "(modified)" once
-/// a band's been nudged off it, or "custom" for a curve that never
-/// had one; shared by the player view and the bottom bar so neither
-/// keeps crediting a curve that no longer matches `app.eq_gains`.
-fn eq_label(app: &app::App, cfg: &config::Config) -> String {
-    eq::applied_label(app.eq_source, app.eq_custom, &cfg.eq_custom_presets)
-}
-
-/// Writes the live eq state back to config.toml. Called on every
-/// structural change (a save, rename or delete) as well as on closing
-/// the menu, so a curve you deliberately named is on disk before
-/// anything else can go wrong rather than only at esc.
-fn persist_eq(cfg: &mut config::Config, app: &app::App, notifications: &mut Notifications) {
-    let (preset, gains) = eq::persisted(app.eq_source, app.eq_gains, &cfg.eq_custom_presets);
-    cfg.eq_preset = preset;
-    cfg.eq_gains = gains;
-    save_config(cfg, notifications);
-}
-
-/// Why rename/delete did nothing: with nothing saved at all, the
-/// useful answer is how to get there, not that the cursor is on the
-/// wrong kind of row.
-fn eq_saved_row_hint(cfg: &config::Config, verb: &str) -> String {
-    if cfg.eq_custom_presets.is_empty() {
-        format!(
-            "nothing saved yet; {} saves the live curve under a name",
-            keymap::key_label(ui::eq_menu::SAVE_KEY)
-        )
-    } else {
-        format!("{verb} works on a row under 'saved'")
-    }
-}
-
-/// One keypress while the eq menu's name editor is up. The editor
-/// owns every key while it is open, so a letter types rather than
-/// firing a menu action; split out because the validation branches
-/// all have to write the menu's own message line. Returns which edit
-/// committed, if any: the store changed, so config.toml needs
-/// rewriting and the caller has to put the cursor back on the row
-/// that now holds the curve (a new preset shifts every band row down
-/// one).
-fn eq_menu_editor_key(
-    key: KeyCode,
-    menu: &mut ui::eq_menu::EqMenuState,
-    saved: &mut eq::CustomPresets,
-    app: &mut app::App,
-) -> Option<ui::eq_menu::EditorMode> {
-    // taken rather than borrowed: dropping it on the floor is how the
-    // editor closes, and putting it back is how it stays open.
-    let mut editor = menu.editor.take()?;
-    match key {
-        KeyCode::Esc => {
-            menu.message.clear();
-            return None;
-        }
-        KeyCode::Backspace => editor.pop(),
-        KeyCode::Char(c) => editor.push(c),
-        KeyCode::Enter => {
-            let name = editor.text.trim().to_string();
-            match saved.check_name(&name, editor.rename_target()) {
-                eq::NameCheck::Empty => menu.message = "give it a name first".to_string(),
-                eq::NameCheck::TooLong => {
-                    menu.message = format!("names are capped at {} characters", eq::MAX_NAME_LEN);
-                }
-                eq::NameCheck::Builtin => {
-                    menu.message = format!("'{name}' is a built-in preset already");
-                }
-                // overwriting a saved curve destroys it, so it takes
-                // a second enter, same gate as a delete.
-                eq::NameCheck::Taken(i) if !editor.overwrite.press(i) => {
-                    menu.message = format!("'{name}' exists; enter again to overwrite it");
-                }
-                _ => {
-                    menu.message = eq_commit_name(editor.mode, &name, saved, app);
-                    return Some(editor.mode);
-                }
-            }
-        }
-        _ => {}
-    }
-    menu.editor = Some(editor);
-    None
-}
-
-/// Commits an accepted (or confirmed) name: a rename leaves the curve
-/// alone, a save stores the live one, which makes the live gains that
-/// saved preset exactly rather than a nameless curve.
-fn eq_commit_name(
-    mode: ui::eq_menu::EditorMode,
-    name: &str,
-    saved: &mut eq::CustomPresets,
-    app: &mut app::App,
-) -> String {
-    match mode {
-        ui::eq_menu::EditorMode::Rename(i) => {
-            saved.rename(i, name);
-            format!("renamed to '{name}'")
-        }
-        ui::eq_menu::EditorMode::Save => {
-            let index = saved.insert(name, app.eq_gains);
-            app.eq_source = Some(eq::Source::Saved(index));
-            app.eq_custom = false;
-            format!("saved as '{name}'")
-        }
-    }
 }
 
 /// `KeyAction::DownloadSelected`, for both the browse view and the
@@ -3164,7 +3034,7 @@ fn main() -> anyhow::Result<()> {
                                 match index_navidrome_server(&mut app, &nav) {
                                     Ok(msg) => {
                                         cfg.navidrome_servers.push(nav);
-                                        save_config(&cfg, &mut notifications);
+                                        config::save_or_warn(&cfg, &mut notifications);
                                         let _ = servers_tx.send(cfg.navidrome_servers.clone());
                                         notifications.push(
                                             Severity::Info,
@@ -3187,7 +3057,7 @@ fn main() -> anyhow::Result<()> {
                                 let token = ob.listenbrainz_token_input.trim().to_string();
                                 if !token.is_empty() {
                                     cfg.listenbrainz_user_token = Some(token);
-                                    save_config(&cfg, &mut notifications);
+                                    config::save_or_warn(&cfg, &mut notifications);
                                     notifications
                                         .push(Severity::Info, "listenbrainz scrobbling enabled");
                                 }
@@ -3206,7 +3076,7 @@ fn main() -> anyhow::Result<()> {
                             }
                             KeyCode::Enter | KeyCode::Esc => {
                                 cfg.library_paths = ob.library_paths.clone();
-                                save_config(&cfg, &mut notifications);
+                                config::save_or_warn(&cfg, &mut notifications);
                                 app.corpus = rebuild_corpus(&cfg);
                                 ob.advance();
                             }
@@ -3242,7 +3112,7 @@ fn main() -> anyhow::Result<()> {
                                     if nm.pending_delete == Some(nm.selected) {
                                         cfg.navidrome_servers.remove(nm.selected);
                                         nm.forget_status_at(nm.selected);
-                                        save_config(&cfg, &mut notifications);
+                                        config::save_or_warn(&cfg, &mut notifications);
                                         nm.selected = nm.selected.min(cfg.navidrome_servers.len());
                                         nm.pending_delete = None;
                                         nm.message = "profile removed (already-indexed items stay until restart)".to_string();
@@ -3304,7 +3174,7 @@ fn main() -> anyhow::Result<()> {
                                             format!("connected: {}", nav.url),
                                         );
                                         cfg.navidrome_servers.push(nav);
-                                        save_config(&cfg, &mut notifications);
+                                        config::save_or_warn(&cfg, &mut notifications);
                                         warn_plaintext_password(&cfg, &mut notifications);
                                         nm.connection_status.push(Some(true));
                                         nm.selected = cfg.navidrome_servers.len() - 1;
@@ -3466,7 +3336,7 @@ fn main() -> anyhow::Result<()> {
                         || key.code == keymap.get(KeyAction::OpenSubtitleMenu)
                     {
                         subtitle_menu_open = false;
-                        save_config(&cfg, &mut notifications);
+                        config::save_or_warn(&cfg, &mut notifications);
                         continue;
                     }
                     match key.code {
@@ -3517,7 +3387,7 @@ fn main() -> anyhow::Result<()> {
                                 let token = settings_token_input.trim().to_string();
                                 cfg.listenbrainz_user_token =
                                     if token.is_empty() { None } else { Some(token) };
-                                save_config(&cfg, &mut notifications);
+                                config::save_or_warn(&cfg, &mut notifications);
                                 settings_token_editing = false;
                                 settings_token_input.clear();
                             }
@@ -3530,7 +3400,7 @@ fn main() -> anyhow::Result<()> {
                     {
                         settings_menu_open = false;
                         cfg.crossfade_enabled = crossfade_enabled;
-                        save_config(&cfg, &mut notifications);
+                        config::save_or_warn(&cfg, &mut notifications);
                         continue;
                     }
                     match key.code {
@@ -3812,7 +3682,7 @@ fn main() -> anyhow::Result<()> {
                                 .filter(|owner| *owner != action);
                             keymap.set(action, key.code);
                             cfg.keybinds = keymap.overrides();
-                            save_config(&cfg, &mut notifications);
+                            config::save_or_warn(&cfg, &mut notifications);
                         }
                         capturing_key = false;
                         continue;
@@ -3837,12 +3707,12 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Char('0') => {
                             keymap.reset(keymap::ALL_ACTIONS[keybinds_menu_selected]);
                             cfg.keybinds = keymap.overrides();
-                            save_config(&cfg, &mut notifications);
+                            config::save_or_warn(&cfg, &mut notifications);
                         }
                         KeyCode::Char('R') => {
                             keymap.reset_all();
                             cfg.keybinds = keymap.overrides();
-                            save_config(&cfg, &mut notifications);
+                            config::save_or_warn(&cfg, &mut notifications);
                         }
                         _ => {}
                     }
@@ -3900,7 +3770,7 @@ fn main() -> anyhow::Result<()> {
                         {
                             cfg.sidebar_width = panels.sidebar_width;
                             cfg.bottom_bar_height = panels.bottom_bar_height;
-                            save_config(&cfg, &mut notifications);
+                            config::save_or_warn(&cfg, &mut notifications);
                         }
                         continue;
                     }
@@ -4041,19 +3911,19 @@ fn main() -> anyhow::Result<()> {
                             logo_index = (logo_index + ui::banner::logo_count() - 1)
                                 % ui::banner::logo_count();
                             cfg.logo_style = ui::banner::logo_name(logo_index).map(String::from);
-                            save_config(&cfg, &mut notifications);
+                            config::save_or_warn(&cfg, &mut notifications);
                             continue;
                         }
                         KeyCode::Right => {
                             logo_index = (logo_index + 1) % ui::banner::logo_count();
                             cfg.logo_style = ui::banner::logo_name(logo_index).map(String::from);
-                            save_config(&cfg, &mut notifications);
+                            config::save_or_warn(&cfg, &mut notifications);
                             continue;
                         }
                         KeyCode::Char('0') => {
                             logo_index = 0;
                             cfg.logo_style = None;
-                            save_config(&cfg, &mut notifications);
+                            config::save_or_warn(&cfg, &mut notifications);
                             continue;
                         }
                         _ => {}
