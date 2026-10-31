@@ -1327,41 +1327,17 @@ pub fn dispatch_action(action: Action, core: &mut CoreCtx, surf: &mut dyn Surfac
             // say why it will not.
             surf.open_browse(&item, core);
         }
+        // a song or a local file, always: the arm above takes every
+        // page, so nothing here needs resolving and no request is
+        // made. this used to call `resolve_tracks` for a track list it
+        // already had, which read like a network call on the keypress
+        // and was recorded in ROADMAP as one.
+        //
+        // `minimize: false` because a standalone play (not from an
+        // open album or playlist) takes over the full player.
         Action::Play(item) => {
-            match resolve_tracks(&item) {
-                Ok(tracks) if tracks.is_empty() => core
-                    .notifications
-                    .push(Severity::Info, "nothing to play (empty album or playlist)"),
-                Ok(tracks) => {
-                    let first = tracks[0].clone();
-                    let interrupted = core.queue.current().cloned();
-                    let (s, played) = load_playlist(
-                        core.player,
-                        core.cache,
-                        core.queue,
-                        tracks,
-                        SessionStart::New,
-                    );
-                    if played {
-                        fire_subtitle_fetch(core.cfg, core.subtitle_tx, &first);
-                        let mut dctx = DownloadCtx {
-                            cache: core.cache,
-                            download_tx: core.download_tx,
-                            downloading: core.downloading,
-                            day_threshold: core.cfg.cache_days_threshold,
-                        };
-                        note_playback_started(&first, &mut dctx, core.notifications);
-                        start_tracking_playback(core.cfg, &first, core.scrobble);
-                        *core.previous_track = interrupted;
-                        // a standalone play (not from an open
-                        // album/playlist) takes over the full player
-                        // by default.
-                        surf.minimize_player(false);
-                    } else {
-                        core.notifications.push(Severity::Error, s);
-                    }
-                }
-                Err(msg) => core.notifications.push(Severity::Error, msg),
+            if let Err(why) = start_session(vec![item], false, core, surf) {
+                core.notifications.push(Severity::Error, why);
             }
         }
         Action::Queued(item) => {
@@ -2159,9 +2135,13 @@ pub fn drive(
 }
 
 /// Starts a freshly built session: mpv's playlist is replaced and
-/// every "a track just started" hook fires for the first track, the
-/// same set `Action::Play` fires. One place, so a shellsong-built
-/// session can't quietly skip a hook the keyboard runs.
+/// every "a track just started" hook fires for the first track. One
+/// place, so a shellsong-built session can't quietly skip a hook the
+/// keyboard runs.
+///
+/// This doc used to say "the same set `Action::Play` fires", which was
+/// aspirational: `Action::Play` kept its own copy of the body and the
+/// two were free to drift. It calls this now.
 pub fn start_session(
     items: Vec<SearchItem>,
     minimize: bool,

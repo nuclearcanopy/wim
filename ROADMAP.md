@@ -893,14 +893,31 @@ third.
       in order, mutation-checked against the old `fetch_add`, plus one
       that `invalidate` disowns *every* batch in flight rather than
       only the newest, which only matters now that several can be.
-- [ ] **`Action::Play` on an album or artist still resolves
-      synchronously.** the same `EnqueueResolver` shape applies, but
-      playing has more to do on arrival than queueing (it loads the
-      playlist, remembers what it interrupted, and starts tracking
-      playback), so it wants its own intent and a `play_resolved`
-      extracted the way `append_resolved` was. starting playback does
-      inherently wait for the first track, so this is less felt than
-      queueing was.
+- [x] **`Action::Play` on an album or artist resolves synchronously:
+      wrong, there is no such freeze.** this item said the resolver
+      shape applied and asked for a `play_resolved` and a `Play`
+      intent. checked before building any of it, and the premise does
+      not hold: **the arm above it takes every page**. `Action::Play`
+      on an `Album`/`Playlist`/`Artist` is matched first and handed to
+      `Surface::open_browse`, which goes through `browse::Loader` and
+      was made async already. traced all five producers to be sure
+      (two in `app.rs`'s enter handling, `Op::Play`, `Op::OpenPage`,
+      and the suggestions row in main.rs); every one of them hands
+      either a page, which is intercepted, or a single song. so the
+      resolving arm only ever saw something that resolves to itself.
+      what was actually there was **a duplicated body**, not a
+      network call: the arm was a copy of `start_session` with
+      `minimize: false`, and `resolve_tracks` on a track list it
+      already had is what made it read like a round trip. it calls
+      `start_session` now, 34 lines down to 4. `start_session`'s own
+      doc claimed to be "the same set `Action::Play` fires", which was
+      aspirational while the copy existed; corrected to say it is
+      called.
+      the lesson is the one this file already applies to QUESTIONS.md:
+      **an entry asserting a bug is a claim and decays like any
+      other.** this one named a fix precisely enough to sound verified
+      and would have had me build an intent, a resolver path and a
+      drain for a call that cannot block.
 - [ ] **`trigger_downloads` resolves synchronously too** (download
       selected on an album or artist). lowest of the three in felt
       cost, since a download is already understood to take a while,
