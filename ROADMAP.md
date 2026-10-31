@@ -1767,12 +1767,32 @@ stray paint.
       the `Percent` branch on the next line clamps to the duration, so
       `: moveto(1h)` on a three-minute track reports "moved to 3600s"
       and skips the track.
-- [ ] **`shellsong_host.rs` ~490 vs `shellsong.rs` ~4103: completion
-      does not fold diacritics** while `Corpus::search_names` does.
-      with a romanian library, typing `: play(tara` for `Țara` gives
-      no ghost, no tab candidate, no listing and no message, even
-      though submitting the line resolves fine. this is the
-      diacritic-folding feature half-wired.
+- [x] **completion folds diacritics now, the way the search already
+      did.** the corpus half was right: `search_names` folds, so it
+      handed `Țara` back for `tara`. `extension` then compared the
+      *unfolded* head, `țar` against `tar`, and threw every one of them
+      away, so with a romanian library the feature looked entirely
+      absent in the console (no ghost, no tab candidate, no listing and
+      no message) while submitting the same line resolved fine.
+      both sides fold in the comparison; the remainder is still sliced
+      out of the **original** candidate, so nothing downstream sees a
+      folded name, and folding is char for char so the char index still
+      lines up. two tests through the real `candidates_at`, both
+      directions (an ascii token reaching the diacritics and a typed
+      `țar` reaching the ascii names), plus one pinning that the
+      remainder carries the original bytes. mutation-checked by
+      restoring the unfolded compare.
+      **and the eyeball print earned its keep twice.** it is how the
+      candidate row was confirmed non-empty at all, and its first draft
+      appended the ghost to the end of the line and printed
+      `play(t)ara`, which read like a bug in the autopairing; the ghost
+      goes at the cursor.
+      what accepting such a match *types* is a separate decision, now
+      recorded in QUESTIONS.md: the remainder is appended, so the line
+      becomes `play(tara)` rather than `play(Țara)`. left that way
+      because `Suggestion`'s doc states "always a pure extension of
+      what was typed, never a replacement" and a test enforces it, and
+      because the folded line resolves anyway.
 - [ ] **nine discarded results the user would expect feedback from.**
       `core.rs` 887/900 (every scrobble failure forever, so a revoked
       token is indistinguishable from working); ~640 (a failed
