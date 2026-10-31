@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui_image::picker::Picker;
-use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 
 use wim::catalog::{
@@ -47,7 +46,7 @@ use wim::eq_menu_keys::{
 use wim::focus::{focus_direction_key, focus_in_direction, InputMode};
 use wim::graphics::{
     art_mode_for_picker, cell_aspect, graphics_plausible, protocol_image, real_graphics,
-    wants_full_art, warn_no_graphics,
+    wants_full_art, warn_no_graphics, ProtocolCache,
 };
 use wim::keymap::{KeyAction, Keymap};
 use wim::layout::{PanelLayout, ResizePanel};
@@ -94,7 +93,7 @@ fn open_browse(
     item: &SearchItem,
     loader: &mut browse::Loader,
     view: &mut Option<browse::BrowseView>,
-    real_art_protocol: &mut Option<StatefulProtocol>,
+    browse_art: &mut ProtocolCache,
     focus: &mut Focus,
 ) {
     let Some(opened) = loader.open(item) else {
@@ -102,7 +101,7 @@ fn open_browse(
     };
     // the previous view's cover must not sit under the new title; the
     // new one is built when `Loader::poll` hands the image over.
-    *real_art_protocol = None;
+    browse_art.clear();
     *view = Some(opened);
     // opening something to browse and then still needing a separate
     // keypress just to be able to scroll it read as "enter doesn't do
@@ -135,7 +134,7 @@ struct WimSurface<'a> {
     focus: &'a mut Focus,
     browse_view: &'a mut Option<browse::BrowseView>,
     browse_loader: &'a mut browse::Loader,
-    real_art_protocol: &'a mut Option<StatefulProtocol>,
+    browse_art: &'a mut ProtocolCache,
     player_minimized: &'a mut bool,
     flash: &'a mut Option<(Field, Instant)>,
     console_open: &'a mut bool,
@@ -214,7 +213,7 @@ impl Surface for WimSurface<'_> {
             item,
             self.browse_loader,
             self.browse_view,
-            self.real_art_protocol,
+            self.browse_art,
             self.focus,
         );
         op_done()
@@ -659,7 +658,7 @@ fn main() -> anyhow::Result<()> {
     // sharing one protocol made the player draw whatever album a view
     // had last opened. keyed so it rebuilds only when the cover
     // actually changes, since a protocol holds resize state.
-    let mut player_art_protocol: Option<(String, StatefulProtocol)> = None;
+    let mut player_art = ProtocolCache::default();
     // whatever was playing right before `now_playing` last changed;
     // purely for the player view's "previous: ..." line.
     let mut previous_track: Option<SearchItem> = None;
@@ -1064,8 +1063,7 @@ fn main() -> anyhow::Result<()> {
     // art or the art mode changes; `ratatui-image` owns the actual
     // resize/encode caching per protocol instance. `browse_art_key`
     // names what the protocol currently holds, cover and tone both.
-    let mut real_art_protocol: Option<StatefulProtocol> = None;
-    let mut browse_art_key: Option<String> = None;
+    let mut browse_art = ProtocolCache::default();
     // the display's refresh rate decides how often an animation is
     // sampled (never how fast it runs, see `anim`); one subprocess on
     // a thread, applied whenever it answers, so the first frame never
@@ -1149,7 +1147,7 @@ fn main() -> anyhow::Result<()> {
                     focus: &mut focus,
                     browse_view: &mut browse_view,
                     browse_loader: &mut browse_loader,
-                    real_art_protocol: &mut real_art_protocol,
+                    browse_art: &mut browse_art,
                     player_minimized: &mut player_minimized,
                     flash: &mut flash,
                     console_open: &mut console_open,
@@ -1204,17 +1202,13 @@ fn main() -> anyhow::Result<()> {
         let protocol_key = |key: &str| format!("{key}\u{1}{}", art_mode.label());
         match (&now_playing, playing_art) {
             (Some(item), Some(img)) if art_mode.is_full() => {
-                let key = protocol_key(&coverart::art_key(item));
-                let stale = player_art_protocol
-                    .as_ref()
-                    .is_none_or(|(have, _)| *have != key);
-                if stale {
-                    player_art_protocol = picker
-                        .as_mut()
-                        .map(|p| (key, p.new_resize_protocol(protocol_image(img, art_mode))));
-                }
+                player_art.ensure(
+                    picker.as_mut(),
+                    protocol_key(&coverart::art_key(item)),
+                    || protocol_image(img, art_mode),
+                );
             }
-            _ => player_art_protocol = None,
+            _ => player_art.clear(),
         }
         // the browse view's own protocol, same rule. keyed here rather
         // than rebuilt wherever a view opens: the mode can change with
@@ -1225,19 +1219,18 @@ fn main() -> anyhow::Result<()> {
                 // `None` while the view has no art, so a cover that
                 // only arrives later is still picked up rather than
                 // latched behind a key that never changed.
-                let want = bv.art.as_ref().map(|_| protocol_key(&bv.art_key()));
-                if browse_art_key != want {
-                    real_art_protocol = picker
-                        .as_mut()
-                        .zip(bv.art.as_ref())
-                        .map(|(p, img)| p.new_resize_protocol(protocol_image(img, art_mode)));
-                    browse_art_key = want;
+                match bv.art.as_ref() {
+                    Some(img) => {
+                        browse_art.ensure(picker.as_mut(), protocol_key(&bv.art_key()), || {
+                            protocol_image(img, art_mode)
+                        })
+                    }
+                    // cleared rather than left holding, so a cover
+                    // that only arrives later is still picked up.
+                    None => browse_art.clear(),
                 }
             }
-            _ => {
-                real_art_protocol = None;
-                browse_art_key = None;
-            }
+            _ => browse_art.clear(),
         }
         if let Ok(detected) = frame_rx.try_recv() {
             frame = detected;
@@ -1691,8 +1684,8 @@ fn main() -> anyhow::Result<()> {
                     // same contract as the browse view: the widget drew
                     // no ascii art, the real image goes on the exact
                     // rect its own layout picked.
-                    if let (Some((_, protocol)), Some(art_rect)) = (
-                        &mut player_art_protocol,
+                    if let (Some(protocol), Some(art_rect)) = (
+                        player_art.protocol(),
                         ui::player::layout(
                             main_content,
                             playing_art.is_some(),
@@ -1772,7 +1765,7 @@ fn main() -> anyhow::Result<()> {
                     main_content,
                 );
                 if art_mode.is_full() {
-                    if let Some(protocol) = &mut real_art_protocol {
+                    if let Some(protocol) = browse_art.protocol() {
                         let (art_rect, _) = browse::layout(
                             main_content,
                             bv.art.is_some(),
@@ -2343,8 +2336,14 @@ fn main() -> anyhow::Result<()> {
         // dropped inside `poll` (see docs/async-open.md); the art
         // protocol is built here because the `Picker` lives here.
         let browse_loaded = browse_loader.poll(&mut browse_view);
-        if let Some(image) = browse_loaded.art {
-            real_art_protocol = picker.as_mut().map(|p| p.new_resize_protocol(image));
+        if browse_loaded.art.is_some() {
+            // cleared rather than built here: the per-frame block
+            // above builds it *with its key*, and this site had no key
+            // to give it. that mismatch is exactly the desync
+            // `ProtocolCache` exists to make unrepresentable -- the
+            // protocol was set here while `browse_art_key` was set
+            // somewhere else.
+            browse_art.clear();
         }
         for msg in browse_loaded.errors {
             notifications.push(Severity::Error, msg);
@@ -4058,7 +4057,7 @@ fn main() -> anyhow::Result<()> {
                         &album,
                         &mut browse_loader,
                         &mut browse_view,
-                        &mut real_art_protocol,
+                        &mut browse_art,
                         &mut focus,
                     );
                     continue;

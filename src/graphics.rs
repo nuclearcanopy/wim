@@ -302,3 +302,104 @@ mod art_mode_tests {
         assert_eq!(kept, hued.to_rgb8(), "full-color must not touch the source");
     }
 }
+
+/// One `ratatui-image` protocol instance plus the key naming what it
+/// holds, so the two cannot drift apart.
+///
+/// A `struct Ui` slice (see ROADMAP), and it removes a duplication
+/// rather than only grouping: the full player and the browse view
+/// follow the same rule -- rebuild only when the art or the tone
+/// changes, since `ratatui-image` owns the per-instance resize and
+/// encode caching -- and each had its own copy. The browse view's copy
+/// kept its key in a *separate* local from the protocol, which is
+/// desync by construction: two fields updated at two sites, and
+/// nothing making them agree.
+#[derive(Default)]
+pub struct ProtocolCache {
+    held: Option<(String, ratatui_image::protocol::StatefulProtocol)>,
+}
+
+impl ProtocolCache {
+    /// Rebuilds for `key` if that is not what is already held.
+    ///
+    /// `image` is a closure because building it is the expensive part
+    /// (a greyscale copy for `full-bw`) and a hit must not pay it.
+    pub fn ensure(
+        &mut self,
+        picker: Option<&mut Picker>,
+        key: String,
+        image: impl FnOnce() -> image::DynamicImage,
+    ) {
+        if self.held.as_ref().is_some_and(|(have, _)| *have == key) {
+            return;
+        }
+        self.held = picker.map(|p| (key, p.new_resize_protocol(image())));
+    }
+
+    pub fn clear(&mut self) {
+        self.held = None;
+    }
+
+    pub fn protocol(&mut self) -> Option<&mut ratatui_image::protocol::StatefulProtocol> {
+        self.held.as_mut().map(|(_, p)| p)
+    }
+
+    /// What it currently holds, for a caller that needs to decide
+    /// whether to clear.
+    pub fn key(&self) -> Option<&str> {
+        self.held.as_ref().map(|(k, _)| k.as_str())
+    }
+}
+
+#[cfg(test)]
+mod protocol_cache_tests {
+    use super::*;
+
+    /// With no picker there is no protocol, and asking must not latch
+    /// a key the cache cannot actually honour -- otherwise the first
+    /// frame after a probe lands would think it was already current.
+    #[test]
+    fn no_picker_holds_nothing() {
+        let mut c = ProtocolCache::default();
+        c.ensure(None, "a".into(), || image::DynamicImage::new_rgb8(1, 1));
+        assert!(c.key().is_none());
+        assert!(c.protocol().is_none());
+    }
+
+    /// The expensive half is the image, so a hit must not build it.
+    /// This is what the closure is for.
+    #[test]
+    fn a_hit_does_not_build_the_image() {
+        let mut picker = Picker::from_fontsize((10, 20));
+        let mut c = ProtocolCache::default();
+        c.ensure(Some(&mut picker), "a".into(), || {
+            image::DynamicImage::new_rgb8(2, 2)
+        });
+        assert_eq!(c.key(), Some("a"));
+
+        let mut built = false;
+        c.ensure(Some(&mut picker), "a".into(), || {
+            built = true;
+            image::DynamicImage::new_rgb8(2, 2)
+        });
+        assert!(!built, "same key, so nothing should be rebuilt");
+
+        c.ensure(Some(&mut picker), "b".into(), || {
+            built = true;
+            image::DynamicImage::new_rgb8(2, 2)
+        });
+        assert!(built, "a new key has to rebuild");
+        assert_eq!(c.key(), Some("b"));
+    }
+
+    #[test]
+    fn clearing_forgets_the_key_too() {
+        let mut picker = Picker::from_fontsize((10, 20));
+        let mut c = ProtocolCache::default();
+        c.ensure(Some(&mut picker), "a".into(), || {
+            image::DynamicImage::new_rgb8(1, 1)
+        });
+        c.clear();
+        assert!(c.key().is_none(), "a stale key would suppress the rebuild");
+    }
+}
