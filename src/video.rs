@@ -5,6 +5,8 @@
 //! ask for; see `docs/video.md` for why pulling frames out of mpv over
 //! json ipc is not an option.
 
+use ratatui::buffer::{Buffer, Cell};
+use ratatui::layout::Rect;
 use ratatui_image::picker::ProtocolType;
 
 use crate::config::VideoOutput;
@@ -81,6 +83,61 @@ pub fn wanted(screen: Screen, want: VideoOutput, probed: Option<ProtocolType>) -
         return None;
     }
     drawing_vo(want, probed)
+}
+
+/// A rect wim deliberately leaves unpainted, so mpv's own output can
+/// live there while the rest of the ui carries on.
+///
+/// **The mechanism is ratatui's own, and needs no change to it.**
+/// `Terminal::flush` diffs the *previous buffer* against the *current
+/// buffer* and writes only the cells that differ; it has no knowledge
+/// of what is actually on the terminal. So a rect left untouched in
+/// two consecutive frames holds identical cells in both buffers, the
+/// diff yields nothing for it, and whatever mpv painted there is never
+/// written over. docs/video.md used to record this as the blocker for
+/// sub-rect video on the theory that the diff would "restore" the
+/// cells; it cannot, because it does not know what they look like.
+///
+/// What is actually required is the opposite of clever: wim must not
+/// draw in the rect, and something must notice when that promise is
+/// broken so mpv can be asked to redraw. `painted` is that notice.
+/// Unused in the binary until the render path keeps its half of the
+/// bargain and skips the rect, which is a `main.rs` change queued
+/// behind the library split. The mechanism and its proof are the
+/// deliverable here; wiring it is the separate, blocked step. Same
+/// `cfg_attr` shape `shellsong::NoCandidates` uses for a type that is
+/// real but not yet reached.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hole {
+    pub area: Rect,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Hole {
+    pub fn new(area: Rect) -> Hole {
+        Hole { area }
+    }
+
+    /// Whether anything is painted inside the hole in `buf`.
+    ///
+    /// True means the promise was broken this frame: an overlay, a
+    /// toast, or a full repaint after a resize wrote into it. Those
+    /// cells now differ from the previous frame, so the diff *will*
+    /// emit them and mpv's picture there is about to be destroyed.
+    /// Nothing here can repair that; the host's answer is to ask mpv
+    /// to redraw once whatever covered the hole has gone.
+    pub fn painted(&self, buf: &Buffer) -> bool {
+        let vis = self.area.intersection(buf.area);
+        for y in vis.y..vis.y + vis.height {
+            for x in vis.x..vis.x + vis.width {
+                if buf.cell((x, y)).is_some_and(|c| *c != Cell::EMPTY) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 #[cfg(test)]
@@ -205,5 +262,102 @@ mod tests {
         ] {
             assert_eq!(wanted(blocked, VideoOutput::Tct, None), None, "{blocked:?}");
         }
+    }
+
+    // ---------------------------------------------------------- hole
+
+    fn filled(area: Rect, ch: char) -> Buffer {
+        let mut buf = Buffer::empty(area);
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_char(ch);
+                }
+            }
+        }
+        buf
+    }
+
+    /// The claim the whole design rests on, proved against ratatui's
+    /// own diff rather than argued: two consecutive frames that both
+    /// leave the hole alone emit **nothing** for it, so mpv's picture
+    /// there is never written over. `Terminal::flush` diffs previous
+    /// buffer against current buffer, so it cannot restore cells it
+    /// has never seen.
+    #[test]
+    fn an_untouched_hole_emits_nothing_on_the_next_frame() {
+        let area = Rect::new(0, 0, 20, 6);
+        let hole = Hole::new(Rect::new(4, 1, 10, 3));
+
+        // two frames that differ outside the hole and are identical
+        // inside it (both untouched, i.e. still empty).
+        let mut prev = Buffer::empty(area);
+        prev.set_string(0, 0, "sidebar one", ratatui::style::Style::default());
+        let mut next = Buffer::empty(area);
+        next.set_string(0, 0, "sidebar two", ratatui::style::Style::default());
+
+        let updates = prev.diff(&next);
+        assert!(!updates.is_empty(), "the row outside the hole did change");
+        for (x, y, _) in &updates {
+            assert!(
+                !hole.area.contains(ratatui::layout::Position::new(*x, *y)),
+                "cell ({x}, {y}) is inside the hole and would be written over"
+            );
+        }
+    }
+
+    /// The first frame after a hole opens is different and has to be:
+    /// whatever was there is still in the previous buffer, so the diff
+    /// emits blanks over it. mpv draws after that, and from then on the
+    /// test above holds.
+    #[test]
+    fn the_frame_that_opens_a_hole_still_clears_what_was_there() {
+        let area = Rect::new(0, 0, 8, 3);
+        let hole = Hole::new(Rect::new(2, 1, 4, 1));
+
+        let prev = filled(area, 'x');
+        let next = Buffer::empty(area);
+
+        let updates = prev.diff(&next);
+        let inside = updates
+            .iter()
+            .filter(|(x, y, _)| hole.area.contains(ratatui::layout::Position::new(*x, *y)))
+            .count();
+        assert_eq!(
+            inside,
+            hole.area.area() as usize,
+            "the opening frame must clear the hole before mpv draws into it"
+        );
+    }
+
+    #[test]
+    fn painted_is_false_while_the_promise_is_kept() {
+        let area = Rect::new(0, 0, 10, 4);
+        let hole = Hole::new(Rect::new(2, 1, 4, 2));
+        let mut buf = Buffer::empty(area);
+        // drawing outside the hole is exactly what is allowed.
+        buf.set_string(0, 0, "chrome", ratatui::style::Style::default());
+        assert!(!hole.painted(&buf));
+    }
+
+    /// An overlay over the hole is the case that breaks it: those cells
+    /// will differ next frame, so the diff emits them and mpv's picture
+    /// is gone. The host needs to know, which is what this reports.
+    #[test]
+    fn painted_notices_an_overlay_over_the_hole() {
+        let area = Rect::new(0, 0, 10, 4);
+        let hole = Hole::new(Rect::new(2, 1, 4, 2));
+        let mut buf = Buffer::empty(area);
+        buf.set_string(3, 2, "!", ratatui::style::Style::default());
+        assert!(hole.painted(&buf), "a toast landed in the hole unnoticed");
+    }
+
+    /// A hole hanging off the edge of the buffer must not panic; the
+    /// pane can be larger than the terminal mid-resize.
+    #[test]
+    fn a_hole_outside_the_buffer_is_clipped_not_a_panic() {
+        let buf = Buffer::empty(Rect::new(0, 0, 4, 2));
+        assert!(!Hole::new(Rect::new(10, 10, 5, 5)).painted(&buf));
+        assert!(!Hole::new(Rect::new(2, 1, 50, 50)).painted(&buf));
     }
 }

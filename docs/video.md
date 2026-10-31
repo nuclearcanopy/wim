@@ -184,11 +184,40 @@ the tui (the `main_content` pane, next to the sidebar and the bottom
 bar) does not work yet and is a separate, harder problem. what stands in
 the way:
 
-1. **wim repaints every cell it owns, every frame.** sharing the screen
-   means wim must never write the cells mpv is drawing into. ratatui has
-   no concept of a hole in its buffer; it owns a rectangle of `Cell`s
-   and diffs all of them. something has to teach the render path to skip
-   a rect, and the diff to not "restore" it.
+1. ~~**wim repaints every cell it owns, every frame.**~~ **this was
+   wrong, and it was the item called "the real work".** the claim was
+   that ratatui's diff would "restore" the cells mpv drew into. it
+   cannot: `Terminal::flush` is
+
+   ```rust
+   let previous_buffer = &self.buffers[1 - self.current];
+   let current_buffer = &self.buffers[self.current];
+   let updates = previous_buffer.diff(current_buffer);
+   self.backend.draw(updates.into_iter())
+   ```
+
+   a diff of **previous buffer against current buffer**. ratatui has no
+   knowledge of what is actually on the terminal, so it cannot restore
+   anything it has not been told to draw. a rect left untouched in two
+   consecutive frames holds identical cells in both buffers, the diff
+   yields nothing for it, and whatever mpv painted there is never
+   written over. no fork, no patch, nothing to teach ratatui.
+
+   `video::Hole` is this, with the mechanism pinned by tests against
+   ratatui's own `Buffer::diff` rather than argued: an untouched hole
+   emits nothing on the next frame, the frame that *opens* the hole
+   still clears what was there (which is correct, mpv draws after), and
+   a hole hanging off the edge of the buffer clips instead of
+   panicking.
+
+   what is actually required turns out to be the unglamorous half:
+   wim's render path must **not draw in the rect** (a layout change,
+   not a ratatui change), and something must notice when that promise
+   is broken so mpv can be asked to redraw. `Hole::painted` is that
+   notice. the cases that break it are an overlay or toast landing in
+   the hole, and the full repaint after a resize; neither can be
+   repaired from wim's side, so the answer is always "ask mpv to draw
+   again once the thing covering it has gone".
 2. **the two vos place themselves differently.** `kitty` has
    `--vo-kitty-left`/`--vo-kitty-top` and `--vo-kitty-alt-screen=no`, so
    it can be told to draw a sized image at an offset without touching

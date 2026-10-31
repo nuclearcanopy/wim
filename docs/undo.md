@@ -1,0 +1,180 @@
+# undo and redo as a tree
+
+Design for the maintainer's ask: "allow UNDOING and REDOING with nice
+decision trees that should be super smart and dynamic". Not built yet;
+this is the spec, written before the code because the hard parts here
+are classification and the hook point, not the data structure.
+
+A tree rather than a stack means undoing three steps and then doing
+something new does not destroy the branch you left: it becomes a
+sibling you can walk back to, the way vim's undo tree works. For an app
+called wim that is the right shape.
+
+## the hook point, which is not where it looked
+
+The appeal of undo in this codebase is that mutations look centralised.
+They are less centralised than they appear, and getting this wrong is
+the difference between complete undo and undo that silently misses
+things.
+
+Measured against `src/main.rs` as of writing:
+
+- `run_shellsong_op` has **40 op arms**.
+- **12 of them delegate to `dispatch_action`**: `CycleLoop`, `Enqueue`,
+  `Go`, `OpenPage`, `Play`, `Quit`, `SetLoop`, `SetShuffle`,
+  `SetSpeed`, `SpeedDown`, `SpeedUp`, `ToggleShuffle`.
+- **28 act directly** on `ShellsongCtx`, including the ones that matter
+  most for undo: `ClearQueue`, `RemoveFromQueue`, `LoadQueue`,
+  `SaveQueue`, `SetVolume`, `SetEqPreset`, `Star`, `Download`.
+
+So:
+
+- hooking **only** `dispatch_action` misses those 28, which includes
+  `ClearQueue`, the single most valuable thing to be able to undo;
+- hooking **only** the shellsong layer misses every keyboard action
+  that does not arrive as an op;
+- hooking **both** double-records the 12 that delegate.
+
+Two ways out, and the second is better:
+
+1. Record at the shellsong layer and in `dispatch_action`, with a
+   re-entrance guard so a delegated op is recorded once. Works, and
+   leaves two places to keep in sync forever.
+2. **Give the 28 direct arms `Action` variants so every state mutation
+   goes through `dispatch_action`.** Then undo has one choke point by
+   construction rather than by vigilance, and the guarantee is
+   structural. This is more work up front and it is the right answer.
+
+Option 2 is cheapest to do **during the library split**, since that is
+already moving the mutation surface into a core that does not know
+about panes. If the split lands before undo, do it then.
+
+## what a node holds
+
+**Snapshot, do not invert.** The undoable state is small, so storing it
+per node is cheaper to write and impossible to get subtly wrong, unlike
+maintaining a correct inverse for every op.
+
+A snapshot is:
+
+- the play queue: entries in order, plus `pos` (order matters on its
+  own, because `ToggleShuffle` reshuffles rather than just setting a
+  flag),
+- `paused`, volume, mute,
+- loop mode, shuffle flag,
+- speed,
+- eq `Source` plus the live gains (both: a nudged curve is "rock,
+  modified" and the name alone would lose the nudge),
+- crossfade on/off,
+- the search query,
+- any live sleep timer or fade.
+
+Plus, per node: the label from `Op::describe()`, which every op already
+has, so the tree gets human-readable rows for free; a timestamp; the
+parent; and the children in visit order.
+
+The snapshot is taken **before** the op applies. That is the restore
+point.
+
+## the three classes of op
+
+This is the part that makes undo honest rather than a lie that happens
+to work most of the time.
+
+### 1. snapshot-restorable
+
+Undo restores the snapshot and that is the whole story.
+
+`TogglePause`, `SkipNext`, `SkipBack`, `SeekAbsolute`, `SeekRelative`,
+`SetVolume`, `Mute`, `CycleLoop`, `SetLoop`, `ToggleShuffle`,
+`SetShuffle`, `SetSpeed`, `SpeedUp`, `SpeedDown`, `SetEqPreset`,
+`ToggleCrossfade`, `Search`, `Play`, `Enqueue`, `ClearQueue`,
+`RemoveFromQueue`, `GotoQueue`, `ShuffleQueue`, `LoadQueue`, `Sleep`,
+`Fade`.
+
+### 2. irreversible side effects: undo must refuse, with a reason
+
+These left the process. Restoring a snapshot around them restores the
+*rest* of the state and leaves the effect in place, which is worse than
+refusing because the user believes undo worked.
+
+- `Star` on a remote item is a **write to the server**. An inverse call
+  exists (unstar) but it is a network round trip that can fail on its
+  own, so it is not a restore. Offer it as an explicit action, or
+  refuse; do not fold it into a snapshot.
+- `Download` wrote a file. Undo would mean deleting it, which is
+  destructive in the other direction.
+- `SaveQueue` wrote a file. Same.
+- `OpenPage` handed a url to a browser. There is nothing to undo.
+- `Rescan` rebuilt the corpus from disk and network. It is not state the
+  user edited.
+
+The rule: a node carrying one of these is a **barrier**. Undo may walk
+up to it and stop, saying what it cannot reverse and why. It may not
+step over it and pretend.
+
+### 3. not recorded at all
+
+Recording these buries the real changes under noise, which is how undo
+trees become useless.
+
+`MoveSelection`, `SelectTop`, `SelectBottom`, `View`, `ClearConsole`,
+`Quit`.
+
+Selection and view changes are navigation, not edits. (`Go` is a queue
+jump and belongs in class 1, despite reading like navigation.)
+
+## coalescing
+
+Without this the tree fills with noise and the feature dies.
+
+- A run of the same adjusting op within a short window is **one node**:
+  holding `+` through twelve `SpeedUp`s, dragging the scrubber, or
+  walking the volume up. Coalesce on (same op kind, within N ms), and
+  keep the *first* snapshot of the run, since that is the state the user
+  wants back.
+- Typing in the search box must not record per keystroke. One node per
+  settled query, which `shellsong_host`'s `search_settled` already has
+  a notion of.
+
+## tree semantics, and the "smart and dynamic" part
+
+- **undo** moves to the parent and restores its snapshot.
+- **redo** moves to the **last-visited child**, not the first. That is
+  what makes a tree feel intelligent rather than annoying: after
+  undoing along a branch, redo retraces the path you actually walked.
+- doing something new while not at a leaf **adds a child**; it never
+  truncates. The branch you left stays reachable.
+- branch navigation picks a sibling, which is the only operation that
+  needs the tree view to be visible to be usable.
+
+**Restoring a queue while music plays** needs a rule, or undo becomes a
+skip: restore entries and position, and **do not restart the current
+track if it survives the restore**. Only reload mpv's playlist when the
+restored queue's current entry differs from what is playing.
+
+## the tree view
+
+This is the part most likely to ship barebones, so it gets the ux
+self-check in ROADMAP.md explicitly.
+
+Minimum to be worth opening:
+
+- one row per node, labelled with `Op::describe()` and a relative time
+  ("2m ago"), the current node marked unambiguously,
+- branch structure drawn with the box-drawing glyphs the rest of the ui
+  already uses, not ascii pipes,
+- barrier nodes (class 2) marked as such, so "why can I not go further"
+  is answerable from the screen rather than from a notification,
+- the monochrome rule applies: brightness carries the hierarchy
+  (current node brightest, ancestors mid, other branches dim), since
+  there is no colour to spend.
+
+## the payoff that ties this to the rest
+
+A branch of this tree is a list of ops in order, which is to say **a
+`.shg` script**. Once scripts exist, "export this branch" is close to
+free, and an undo tree becomes a way to *capture* a session you stumbled
+into and replay or share it. That is the feature the maintainer and I
+both want out of this, and it is worth keeping the node data in a shape
+that can serialise to a script line rather than only to a snapshot.
