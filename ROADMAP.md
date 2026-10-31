@@ -1814,14 +1814,27 @@ do the wrong thing quietly, which is worse to diagnose.
       close. enable crossfade, press skip-back during a fade-out: no
       bound eq/volume/speed, and the volume is left wherever the ramp
       last wrote it for the whole track.
-- [ ] **`main.rs` ~2623 is the only queue-mutating site in the loop
-      with no undo hook** (`let _ = &mut surf;` at ~2650 is the tell).
-      queue an album, undo, redo: redo restores a snapshot that never
-      saw the tracks, so they vanish. relatedly `core.rs` ~450: the
-      resolver *reads* the epoch rather than bumping it, right for
-      `Intent::Back` but it means two `Intent::Front` batches fight
-      for the same insert slot, so queue-front album A then album B
-      and the order is nondeterministic run to run.
+- [ ] **the resolver's queue append has no undo hook, and the reason
+      is a timing one worth writing down before anyone starts.**
+      the site is `track_resolver.poll()`'s drain loop in main.rs (grep
+      `let _ = &mut surf;`, which is the tell: a `Surface` is built and
+      deliberately unused). queue an album, undo, redo: the tracks
+      vanish.
+      **the snapshot is not missing, it is early.** `queue(album)` is
+      recorded when it is typed, which is before the fan-out has
+      resolved a single track, so the snapshot redo restores is a state
+      that never saw them. so the fix is not "add a hook here" but
+      "record again once the tracks land", which raises a question the
+      audit did not: a second snapshot per async batch means an undo
+      tree with a node the user never typed. the alternative is
+      amending the existing node in place, which `undo::Tree` has no
+      operation for. **pick deliberately and say which in the entry**;
+      amending is probably right, since the user performed one action.
+      relatedly `core.rs` ~450: the resolver *reads* the epoch rather
+      than bumping it, which is right for `Intent::Back` but means two
+      `Intent::Front` batches fight for the same insert slot, so
+      queue-front album A then album B and the order is
+      nondeterministic run to run.
 - [ ] **`main.rs` ~2356 / `shellsong_host.rs` ~569: a settle can
       answer the wrong query.** `SearchSettle::answered` clears
       `pending_since` unconditionally and `RemoteSearchOutcome`
