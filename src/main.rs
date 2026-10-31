@@ -27,12 +27,12 @@ use wim::core::{
     current_volume, dispatch_action, download_resolved, download_tracks, drive, enqueue_track,
     eq_preset_names, fire_scrobble, fire_subtitle_fetch, front_resolved, go_to_previous,
     identity_settings, load_playlist, lyrics_query, note_playback_started, notify_query_changed,
-    op_done, op_fail, op_note, open_starred, print_listing, resync_upcoming, retain_live_clients,
-    save_playback_state, set_vid_for_item, shellsong_focus, spawn_background_search, start_session,
-    start_tracking_playback, suggestion_starred_keys, sweep_cache, toggle_star, CoreCtx, Dispatch,
-    DownloadCtx, Drive, Intent, RemoteSearchOutcome, RemoteSearchQuery, Report, Resolution,
-    ScrobbleState, SelectStep, SessionStart, StarFailed, SubtitleReady, Surface, TrackChangeCtx,
-    TrackResolver,
+    op_done, op_fail, op_note, open_starred, playing_duration, print_listing, resync_upcoming,
+    retain_live_clients, save_playback_state, set_vid_for_item, shellsong_focus,
+    spawn_background_search, start_session, start_tracking_playback, suggestion_starred_keys,
+    sweep_cache, toggle_star, CoreCtx, Dispatch, DownloadCtx, Drive, Intent, RemoteSearchOutcome,
+    RemoteSearchQuery, Report, Resolution, ScrobbleState, SelectStep, SessionStart, StarFailed,
+    SubtitleReady, Surface, TrackChangeCtx, TrackResolver,
 };
 use wim::download::DownloadEvent;
 use wim::keymap::{KeyAction, Keymap};
@@ -52,6 +52,7 @@ use wim::ui::controlsbar::{
     self, ControlsBar, Field, Nav, NavKeys, Scrub, SCRUB_STEP, SCRUB_STEP_COARSE,
 };
 use wim::ui::divider::{HorizontalRule, VerticalRule};
+use wim::ui::gap::Gap;
 use wim::ui::login::{LoginForm, LoginView};
 use wim::ui::lyrics_view::LyricsView;
 use wim::ui::miniplayer::MiniPlayerBar;
@@ -2061,17 +2062,16 @@ fn main() -> anyhow::Result<()> {
         let aspect = cell_aspect();
         // no ipc here any more: these arrive as observed property
         // changes on the event channel drained just below.
-        let (elapsed_secs, duration_secs, paused) = (
-            playback.elapsed_secs,
-            playback.duration_secs,
-            playback.paused,
-        );
+        let (elapsed_secs, paused) = (playback.elapsed_secs, playback.paused);
         // re-derived every frame and never kept across one: whatever
         // mpv's last reported `playlist-pos` resolves to. Everything
         // downstream (title, mini bar, lyrics header, scrobbling)
         // reads this, so none of them can show a track mpv isn't
         // actually playing.
         let mut now_playing = play_queue.current().cloned();
+        // mpv misreports a generated silence's length, so the entry is
+        // asked first; see `core::playing_duration`.
+        let duration_secs = playing_duration(now_playing.as_ref(), playback.duration_secs);
         // take delivery of any cover that finished, ask for the
         // playing track's if it is not already in hand, and warm the
         // next queued track's. all no-ops once an album's cover has
@@ -2540,6 +2540,18 @@ fn main() -> anyhow::Result<()> {
                 let has_context = previous_label.is_some() || next_label.is_some();
                 let player_view = PlayerView {
                     title: &label(item),
+                    // the cover rect becomes a countdown for a gap,
+                    // which is the only thing anyone wants from the
+                    // screen while one plays. elapsed is the scrub
+                    // target mid-drag, so the countdown follows a drag
+                    // too rather than fighting it.
+                    gap: match item {
+                        SearchItem::Silence { secs } => Some(Gap {
+                            remaining_secs: *secs as f64
+                                - scrub.map(|s| s.target_secs).or(elapsed_secs).unwrap_or(0.0),
+                        }),
+                        _ => None,
+                    },
                     art: playing_art,
                     art_key: &coverart::art_key(item),
                     art_mode,
@@ -3114,9 +3126,10 @@ fn main() -> anyhow::Result<()> {
                     fade_in_started_at = None;
                 }
             } else {
-                if let (Some(elapsed), Some(duration)) =
-                    (playback.elapsed_secs, playback.duration_secs)
-                {
+                if let (Some(elapsed), Some(duration)) = (
+                    playback.elapsed_secs,
+                    playing_duration(now_playing.as_ref(), playback.duration_secs),
+                ) {
                     let remaining = duration - elapsed;
                     if remaining <= cfg.crossfade_seconds {
                         let t = (remaining / cfg.crossfade_seconds).clamp(0.0, 1.0);
@@ -3853,7 +3866,10 @@ fn main() -> anyhow::Result<()> {
                                 scrub_pending: &mut scrub_pending,
                                 scrub_sent_at: &mut scrub_sent_at,
                                 elapsed_secs: playback.elapsed_secs,
-                                duration_secs: playback.duration_secs,
+                                duration_secs: playing_duration(
+                                    now_playing.as_ref(),
+                                    playback.duration_secs,
+                                ),
                             },
                         );
                     }
@@ -4774,7 +4790,10 @@ fn main() -> anyhow::Result<()> {
                                     scrub_pending: &mut scrub_pending,
                                     scrub_sent_at: &mut scrub_sent_at,
                                     elapsed_secs: playback.elapsed_secs,
-                                    duration_secs: playback.duration_secs,
+                                    duration_secs: playing_duration(
+                                        now_playing.as_ref(),
+                                        playback.duration_secs,
+                                    ),
                                 },
                             );
                             continue;
