@@ -848,6 +848,69 @@ mpv loaded, a generated silence source included".
         empty" from "nothing in it loaded: 38 with no configured
         server".
 
+### stage 4: the queue timeline (started)
+
+- [x] **a silence is a real queue entry.** `SearchItem::Silence {
+      secs }`, resolving to `av://lavfi:anullsrc=d=N`, so mpv loads it
+      as a file like any other and `PlayQueue`'s invariant (`entries`
+      *is* mpv's playlist) holds with no notion of the variant
+      anywhere near it. every absolute-index path, the queue view,
+      reorder, removal and the desync guards work untouched.
+      **a variant, not a `LocalMusic` with an `av://` path.** the path
+      spelling costs zero match arms, which is exactly why it is
+      wrong: the compiler found **23 exhaustive matches** that each had
+      to decide what a silence means, and four of those decisions are
+      load-bearing. scrobbling is the one that settles it: a silence
+      would have been sent to listenbrainz as a track called
+      "silence". starring returns an error, downloading and cover art
+      refuse, and `identity_of` deliberately yields an identity whose
+      every tier is `None`, so **no per-identity eq or volume fires
+      when a silence starts** (a gap must not change how the next
+      track sounds).
+      the other 19 were genuinely trivial, and are commented where the
+      answer is unreachable rather than merely dull (`category`, say,
+      which no silence ever reaches because none is in the corpus).
+- [x] **measured: mpv honours `d` and lies about `duration`.** the
+      recorded decision said mpv "already loads" the source and left
+      it there. it does, and it plays for exactly the length asked
+      (timed: `d=3` and `d=6` differ by three seconds of wall clock),
+      **but it reports `duration` as `00:00:01` whatever `d` says**,
+      at every spelling tried (`d=`, `duration=`, with and without an
+      explicit rate and channel layout). loading is not honouring.
+      consequence, and it is a ui one: **anything drawing the length
+      of a silence must read `Silence { secs }`, never mpv's
+      `duration`**, or a 15m gap draws as a one-second track. pinned
+      by an `--ignored` test that drives real mpv and asserts both
+      halves, so an mpv or ffmpeg upgrade cannot change it quietly.
+- [x] **saved queues round-trip a silence.** `queues::Kind` gained
+      `Silence` and `Entry` a `secs`, both `skip_serializing_if`, so a
+      queue with no silence in it serialises byte identically to
+      before (pinned). a silence is the one kind the pre-kinds
+      inference could never guess, having neither a path nor a server,
+      so it loads only because the discriminant landed first.
+- [x] **the display decision worth not undoing.** a silence row keeps
+      its duration when *not* hovered, which no other row does. for
+      every other item the title is the identity and the artist is
+      decoration; for a silence the duration *is* the identity, and a
+      column of bare "silence" rows is unreadable. `[z]` for the kind
+      code and `g` (generated) for the source code, since it came from
+      neither a file nor a server. `ui::progress::fmt_span` prints a
+      span as "15m"/"1h30m"/"1m30s", distinct from `fmt_time`'s
+      fixed-width `m:ss` because a span is a length someone chose, not
+      a position in a track, and sits nowhere near a scrubber.
+- [ ] **nothing can create one yet**, which is the next slice: the
+      `silence(15m)` and `silence(15m, front)` command (grammar
+      decided above; `Ty::Duration` already parses `15m`, as `sleep`
+      uses it), and then the bottom bar and scrubber reading the
+      entry's own length for the playing silence. until that lands the
+      variant is inert, which is deliberate: it means the 23 decisions
+      are reviewable on their own.
+- [ ] **`gap(10s)`, the default between tracks**, is still open and is
+      *not* simply "insert a silence between every entry": that would
+      double the queue's length and make every index the user sees
+      wrong. likely a property of the session applied on advance
+      instead, which needs its own think.
+
 ### the input-path freeze audit (complete, 2026-10-31)
 
 The lyrics freeze prompted this: grep every network call reachable from
