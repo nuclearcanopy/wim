@@ -7,49 +7,132 @@ use ratatui::widgets::Widget;
 
 use crate::anim;
 use crate::favorites::Favorites;
-use crate::search::{group_boundaries, Category, SearchItem};
+use crate::search::{group_boundaries, Category, Corpus, Ranking, SearchItem};
 use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK};
 use crate::ui::progress::fmt_span;
 use crate::ui::textfit::truncate_with_ellipsis;
 
+/// A results list as this widget reads it: how many rows, where the
+/// category runs begin, and one row at a time.
+///
+/// Row *geometry* needs only the first two, never a row's content,
+/// which is what lets a 15k-match list be laid out without
+/// materializing a single `SearchItem` (see the result-clone item in
+/// ROADMAP.md). `Ranked` is how `App` holds its results; a plain
+/// slice is still a source, for lists that are already owned.
+pub trait Rows {
+    fn count(&self) -> usize;
+
+    /// `(index, category)` per category change, as
+    /// `search::group_boundaries` defines them.
+    fn boundaries(&self) -> Vec<(usize, Category)>;
+
+    /// One row, or `None` past the end.
+    fn row(&self, at: usize) -> Option<&SearchItem>;
+}
+
+impl Rows for [SearchItem] {
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn boundaries(&self) -> Vec<(usize, Category)> {
+        group_boundaries(self)
+    }
+
+    fn row(&self, at: usize) -> Option<&SearchItem> {
+        self.get(at)
+    }
+}
+
+/// The owned form too, because `&Vec<SearchItem>` reaching a
+/// `&dyn Rows` parameter would be a deref *and* an unsize coercion in
+/// one step, which the compiler will not do.
+impl Rows for Vec<SearchItem> {
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn boundaries(&self) -> Vec<(usize, Category)> {
+        group_boundaries(self)
+    }
+
+    fn row(&self, at: usize) -> Option<&SearchItem> {
+        self.get(at)
+    }
+}
+
+/// A ranked order plus the corpus it addresses, which is how `App`
+/// holds its results: rows resolve one at a time instead of arriving
+/// as a cloned list.
+///
+/// A ranking that no longer addresses this corpus reports **no rows
+/// at all**, matching `Ranking::row`: an order is indices into one
+/// corpus state, so reading it against another resolves to
+/// real-looking wrong rows, which plays the wrong song. An empty list
+/// is the safe answer, and `App::replace_corpus` is what keeps it
+/// from being the answer in practice.
+pub struct Ranked<'a> {
+    pub ranking: &'a Ranking,
+    pub corpus: &'a Corpus,
+}
+
+impl Rows for Ranked<'_> {
+    fn count(&self) -> usize {
+        if self.ranking.addresses(self.corpus) {
+            self.ranking.len()
+        } else {
+            0
+        }
+    }
+
+    fn boundaries(&self) -> Vec<(usize, Category)> {
+        self.ranking.group_boundaries(self.corpus)
+    }
+
+    fn row(&self, at: usize) -> Option<&SearchItem> {
+        self.ranking.row(self.corpus, at)
+    }
+}
+
 /// One rendered row: either a section header or an actual result,
-/// carrying its index into the original `items` slice so the caller
-/// can map back to it (`self.selected` stays a plain index into
-/// `items`; headers never get one).
+/// carrying its index into the row source so the caller can map back
+/// to it (`self.selected` stays a plain row index; headers never get
+/// one).
 pub enum DisplayRow {
     Header(Category),
     Item(usize),
 }
 
-/// Flattens `items` (already grouped into category runs by
-/// `Corpus::search`) into a display-row sequence with a header before
-/// each run, plus the scroll offset keeping `selected` visible within
+/// Flattens `rows` (already grouped into category runs by the
+/// ranking) into a display-row sequence with a header before each
+/// run, plus the scroll offset keeping `selected` visible within
 /// `visible_rows`. The one place both this widget's own render and
 /// main.rs's sidebar-divider header-junction marks compute this, so
 /// they can't disagree about where a header actually lands.
-pub fn layout(
-    items: &[SearchItem],
-    selected: usize,
-    visible_rows: usize,
-) -> (Vec<DisplayRow>, usize) {
-    let boundaries = group_boundaries(items);
-    let mut rows = Vec::with_capacity(items.len() + boundaries.len());
+///
+/// Reads nothing but the count and the boundaries, which is why it
+/// takes `&dyn Rows` rather than a list of rows.
+pub fn layout(rows: &dyn Rows, selected: usize, visible_rows: usize) -> (Vec<DisplayRow>, usize) {
+    let count = rows.count();
+    let boundaries = rows.boundaries();
+    let mut display = Vec::with_capacity(count + boundaries.len());
     let mut next_boundary = boundaries.into_iter().peekable();
-    for i in 0..items.len() {
+    for i in 0..count {
         if let Some((idx, cat)) = next_boundary.peek() {
             if *idx == i {
-                rows.push(DisplayRow::Header(*cat));
+                display.push(DisplayRow::Header(*cat));
                 next_boundary.next();
             }
         }
-        rows.push(DisplayRow::Item(i));
+        display.push(DisplayRow::Item(i));
     }
-    let selected_row = rows
+    let selected_row = display
         .iter()
         .position(|r| matches!(r, DisplayRow::Item(i) if *i == selected))
         .unwrap_or(0);
     (
-        rows,
+        display,
         crate::ui::scroll::offset_for(selected_row, visible_rows),
     )
 }
@@ -59,8 +142,8 @@ pub fn layout(
 /// needs to join them (see `ui::junctions`); derived from the same
 /// `layout` call the render itself uses, so the two can't disagree
 /// about where a header actually lands.
-pub fn header_rows(items: &[SearchItem], selected: usize, area: Rect) -> Vec<u16> {
-    if items.is_empty() || area.height == 0 {
+pub fn header_rows(items: &dyn Rows, selected: usize, area: Rect) -> Vec<u16> {
+    if items.count() == 0 || area.height == 0 {
         return Vec::new();
     }
     let visible_rows = area.height as usize;
@@ -75,8 +158,8 @@ pub fn header_rows(items: &[SearchItem], selected: usize, area: Rect) -> Vec<u16
 /// section header or ran out of list. Same `layout` call the render
 /// itself uses, so a click resolves to the row the user saw rather
 /// than to a second guess at where it landed (see `hit::List`).
-pub fn row_items(items: &[SearchItem], selected: usize, area: Rect) -> Vec<Option<usize>> {
-    if items.is_empty() || area.height == 0 {
+pub fn row_items(items: &dyn Rows, selected: usize, area: Rect) -> Vec<Option<usize>> {
+    if items.count() == 0 || area.height == 0 {
         return Vec::new();
     }
     let visible_rows = area.height as usize;
@@ -187,8 +270,12 @@ fn is_starred(item: &SearchItem, favorites: &Favorites, remote_starred: &HashSet
 /// explanation is a dead end, not a loved-app experience; `empty_message`
 /// is shown instead so there's always *something* telling the user why
 /// nothing's there and what to do about it.
+///
+/// `items` is a row *source*, not a list: it is asked for the rows on
+/// screen and for nothing else, so the ranked order `App` holds never
+/// has to be materialized to draw a screenful of it.
 pub struct ResultsList<'a> {
-    pub items: &'a [SearchItem],
+    pub items: &'a dyn Rows,
     pub selected: usize,
     pub empty_message: &'a str,
     pub favorites: &'a Favorites,
@@ -208,7 +295,7 @@ impl Widget for ResultsList<'_> {
             return;
         }
 
-        if self.items.is_empty() {
+        if self.items.count() == 0 {
             let text = truncate_with_ellipsis(self.empty_message, area.width as usize);
             crate::ui::draw::line(buf, area, area.y, &text, shade(DIM));
             return;
@@ -226,7 +313,12 @@ impl Widget for ResultsList<'_> {
             match display_row {
                 DisplayRow::Header(cat) => draw_header_row(buf, area, y, cat.label()),
                 DisplayRow::Item(idx) => {
-                    let item = &self.items[*idx];
+                    // `count()` covered this index a moment ago, so a
+                    // miss is a corpus that moved mid-render; draw
+                    // nothing rather than guess at a row.
+                    let Some(item) = self.items.row(*idx) else {
+                        continue;
+                    };
                     let is_selected = *idx == self.selected;
 
                     // the selection reads off the row's background,
@@ -340,7 +432,9 @@ mod tests {
     use crate::ui::testbuf::{assert_outside_untouched, buffer};
     use ratatui::style::Color;
 
-    fn items(n: usize) -> Vec<SearchItem> {
+    /// `pub(super)` for the `eyeball` module next door, which prints
+    /// the same rows this one asserts about.
+    pub(super) fn items(n: usize) -> Vec<SearchItem> {
         (0..n)
             .map(|i| SearchItem::LocalMusic {
                 path: format!("/m/{i}.flac").into(),
@@ -431,9 +525,71 @@ mod tests {
         }
     }
 
+    /// A ranked order is indices into one corpus state, so reading it
+    /// against another resolves to real-looking wrong rows. `Ranked`
+    /// reports none at all instead, which is what makes the empty
+    /// message show rather than a screenful of the wrong songs.
+    #[test]
+    fn a_ranking_read_against_a_changed_corpus_draws_nothing() {
+        use crate::library::{LocalTrack, MediaKind};
+        use crate::search::Corpus;
+
+        let mut corpus = Corpus::new();
+        corpus.add_local_tracks((0..6).map(|i| LocalTrack {
+            path: format!("/m/{i}.flac").into(),
+            title: format!("track {i}"),
+            artist: None,
+            album: None,
+            duration_secs: None,
+            kind: MediaKind::Music,
+        }));
+        let ranking = corpus.rank("track");
+        assert_eq!(
+            Ranked {
+                ranking: &ranking,
+                corpus: &corpus,
+            }
+            .count(),
+            6
+        );
+
+        // the corpus moves on under the order.
+        corpus.drop_local();
+        let stale = Ranked {
+            ranking: &ranking,
+            corpus: &corpus,
+        };
+        assert_eq!(stale.count(), 0);
+        assert!(stale.row(0).is_none());
+        assert!(stale.boundaries().is_empty());
+
+        let area = Rect::new(0, 0, 24, 4);
+        let mut buf = buffer(24, 4);
+        ResultsList {
+            items: &stale,
+            selected: 0,
+            empty_message: "nothing found",
+            favorites: &Favorites::default(),
+            remote_starred: &HashSet::new(),
+            focused: true,
+            elapsed: Duration::ZERO,
+        }
+        .render(area, &mut buf);
+        let painted = crate::ui::testbuf::grid(&buf);
+        assert!(
+            painted.contains("nothing found"),
+            "a stale order must read as no results, not as rows\n{painted}"
+        );
+        assert!(
+            !painted.contains("track "),
+            "no row may be drawn from an order the corpus no longer matches\n{painted}"
+        );
+        assert!(row_items(&stale, 0, area).is_empty());
+    }
+
     #[test]
     fn an_empty_or_flat_list_has_no_rows_to_click() {
-        assert!(row_items(&[], 0, Rect::new(0, 0, 20, 5)).is_empty());
+        assert!(row_items(&items(0), 0, Rect::new(0, 0, 20, 5)).is_empty());
         assert!(row_items(&items(3), 0, Rect::new(0, 0, 20, 0)).is_empty());
     }
 
@@ -539,5 +695,55 @@ mod eyeball {
         let mut buf = buffer(20, 6);
         draw_header_row(&mut buf, Rect::new(0, 2, 20, 1), 2, "ALBUMS");
         assert!(grid(&buf).contains("ALBUMS"), "{}", grid(&buf));
+    }
+
+    /// The whole list, printed at three heights against a 6-row pane:
+    /// shorter than the pane, exactly filling it, and longer than it
+    /// (the scrolled case, pinned to the last row). Read it:
+    /// `cargo test --lib ui::results_list::eyeball -- --nocapture`.
+    /// Asserts the floor too, so it is a test and not just a printer.
+    #[test]
+    fn print_the_results_list_at_three_list_lengths() {
+        for (n, selected) in [(3usize, 1usize), (5, 0), (40, 39)] {
+            let area = Rect::new(1, 1, 24, 6);
+            let mut buf = buffer(26, 8);
+            let rows = super::tests::items(n);
+            ResultsList {
+                items: &rows,
+                selected,
+                empty_message: "nothing here",
+                favorites: &Favorites::default(),
+                remote_starred: &HashSet::new(),
+                focused: true,
+                elapsed: Duration::ZERO,
+            }
+            .render(area, &mut buf);
+            println!(
+                "--- {n} rows in a 6-row pane at (1,1), selected {selected}\n{}",
+                grid(&buf)
+            );
+            // the selection is always on screen, and the pane is full
+            // whenever there are enough rows to fill it.
+            let painted = grid(&buf);
+            assert!(
+                painted.contains(&format!("track {selected}")),
+                "the selected row has to be visible\n{painted}"
+            );
+        }
+
+        // and the empty list, which is a message rather than a blank.
+        let mut buf = buffer(26, 8);
+        ResultsList {
+            items: &super::tests::items(0),
+            selected: 0,
+            empty_message: "nothing here",
+            favorites: &Favorites::default(),
+            remote_starred: &HashSet::new(),
+            focused: true,
+            elapsed: Duration::ZERO,
+        }
+        .render(Rect::new(1, 1, 24, 6), &mut buf);
+        println!("--- no rows at all\n{}", grid(&buf));
+        assert!(grid(&buf).contains("nothing here"), "{}", grid(&buf));
     }
 }

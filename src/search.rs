@@ -2737,6 +2737,75 @@ mod tests {
         "qqqxzz",
     ];
 
+    /// What the clone costs, which is the whole of what `App` holding
+    /// a `Ranking` instead of a `Vec<SearchItem>` stops paying:
+    /// `search` is `rank` plus exactly this.
+    ///
+    /// Materialization is timed **on its own**, with the ranking it
+    /// needs left outside the clock, for the reason `bench_phases`
+    /// gives: subtracting a `rank` minimum from a `search` minimum is
+    /// two independent measurements and lands on nonsense (negative
+    /// "clone" costs) whenever scoring dominates. Both halves in one
+    /// process, because this box's load moves absolute numbers by
+    /// more than the change does.
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_cpu_rank_vs_clone() {
+        for (label, size) in [("varied 40k", 40_000usize), ("varied 150k", 150_000)] {
+            let c = varied_corpus(size);
+            for query in BENCH_QUERIES {
+                let (ranked, hits) = bench_cpu(8, || c.rank(query).len());
+                let mut clone_t = std::time::Duration::MAX;
+                let mut rows = 0;
+                for _ in 0..8 {
+                    let ranking = c.rank(query);
+                    let start = cpu_now();
+                    let materialized: Vec<SearchItem> = ranking.rows(&c).cloned().collect();
+                    clone_t = clone_t.min(cpu_now().saturating_sub(start));
+                    rows = materialized.len();
+                }
+                assert_eq!(rows, hits, "the two halves must rank the same list");
+                println!(
+                    "{label:<12} {query:<14} rank {ranked:>10.3?}  clone {clone_t:>10.3?}  \
+                     ({hits} rows, clone is {:>5.1}% on top)",
+                    100.0 * clone_t.as_secs_f64() / ranked.as_secs_f64().max(f64::MIN_POSITIVE)
+                );
+            }
+        }
+    }
+
+    /// What a keystroke actually costs the app, not what `search`
+    /// costs: `set_query` is the typed path and `resync_results` is
+    /// the one a background sync lands on, and both used to re-rank
+    /// *and* clone a `SearchItem` per match. Cpu time, so the fan-out
+    /// does not make the number depend on how loaded the box is; the
+    /// scoring half is identical either way, so the difference across
+    /// commits is the materialization.
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_cpu_app_keystroke() {
+        for (label, size) in [("varied 40k", 40_000usize), ("varied 150k", 150_000)] {
+            let mut app = crate::app::App::new(varied_corpus(size));
+            for query in BENCH_QUERIES {
+                let (typed, hits) = bench_cpu(8, || {
+                    app.set_query(query);
+                    app.result_count()
+                });
+                // selection at the bottom, so the identity scan that
+                // restores it is the full walk and not a hit on row 0.
+                app.select_bottom();
+                let (resync, _) = bench_cpu(8, || {
+                    app.resync_results();
+                    app.result_count()
+                });
+                println!(
+                    "{label:<12} {query:<14} set_query {typed:>11.3?}  \
+                     resync {resync:>11.3?}  ({hits} hits)"
+                );
+            }
+        }
+    }
+
     /// Not an assertion: prints per-query wall time, since absolute
     /// numbers are machine-dependent. Run with
     /// `cargo test --release -- --ignored --nocapture bench_search`.
