@@ -817,8 +817,16 @@ conflicts.
 **Queued behind the lib split, in this order, because each needs
 `main.rs` and the split rewrites it:**
 1. the **undo tree** (hooks the single op dispatch; see below),
-2. **in-workspace sub-rect video** (needs ratatui taught to leave a
-   hole; `docs/video.md` has the analysis),
+2. **in-workspace sub-rect video**. the blocker recorded as "the real
+   work" was **wrong and is now gone**: ratatui's `flush` diffs the
+   previous buffer against the current one, so it has no idea what is
+   on the terminal and cannot "restore" cells mpv drew. a rect left
+   untouched in two consecutive frames emits nothing. `video::Hole`
+   plus five tests against ratatui's own `Buffer::diff` pin that, and
+   `Hole::painted` reports when an overlay or a resize repaint breaks
+   the promise so mpv can be asked to redraw. what is left is the
+   unglamorous half: keeping wim's widgets out of the rect (a layout
+   change in `main.rs`) and the redraw trigger. see `docs/video.md`.
 3. **cron scheduling** (`at(07:00) ...`), which needs the language
    work landed first.
 
