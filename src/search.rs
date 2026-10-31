@@ -689,19 +689,30 @@ impl Corpus {
     }
 
     /// Every distinct navidrome server already represented in the
-    /// corpus (deduped by base url), for firing a live `search3`
-    /// request against; a server only shows up here once something
-    /// from it has actually been indexed (artists/albums/playlists via
-    /// `fetch_navidrome_catalog`), which is also exactly when it's
-    /// safe to assume the connection is good.
+    /// corpus (deduped by base url, first-seen order), for firing a
+    /// live `search3` request against; a server only shows up here
+    /// once something from it has actually been indexed
+    /// (artists/albums/playlists via `fetch_navidrome_catalog`), which
+    /// is also exactly when it's safe to assume the connection is
+    /// good.
+    ///
+    /// Still a full walk, deliberately. It is a pure derivation of the
+    /// corpus, so there is nothing to invalidate and nothing that can
+    /// go stale; a memo would need a hook on every removal path
+    /// (`reconcile_server`, `drop_local`) and a missed one means
+    /// naming a server that no longer has anything indexed, which is
+    /// the contract above broken rather than a slow frame. What was
+    /// actually costing anything was the `String` per *item* the old
+    /// dedup allocated; the inner scan is over servers, of which there
+    /// are one or two, so it is a couple of comparisons per item and
+    /// no allocation at all. See `bench_remote_clients`, and
+    /// `the_render_layer_never_asks_which_servers_are_live` for the
+    /// guard that keeps this off the frame path.
     pub fn remote_clients(&self) -> Vec<Arc<Client>> {
-        let mut seen = HashSet::new();
-        let mut clients = Vec::new();
-        for item in self.items.iter().map(|e| &e.item) {
-            if let Some(client) = item.client() {
-                if seen.insert(client.base_url().to_string()) {
-                    clients.push(client.clone());
-                }
+        let mut clients: Vec<Arc<Client>> = Vec::new();
+        for client in self.items.iter().filter_map(|e| e.item.client()) {
+            if !clients.iter().any(|c| c.base_url() == client.base_url()) {
+                clients.push(client.clone());
             }
         }
         clients
@@ -1291,6 +1302,65 @@ mod tests {
 
         let total: usize = c.breakdown().iter().map(|(_, n)| n).sum();
         assert_eq!(total, 3, "one artist + one album + one playlist, not six");
+    }
+
+    /// One entry per server however many of its rows are indexed, in
+    /// first-seen order, and local files name no server at all.
+    #[test]
+    fn remote_clients_is_one_entry_per_server_in_first_seen_order() {
+        let mut c = Corpus::new();
+        c.add_local_tracks([LocalTrack {
+            path: PathBuf::from("/m/a.flac"),
+            title: "Local".into(),
+            artist: None,
+            album: None,
+            duration_secs: None,
+            kind: MediaKind::Music,
+        }]);
+        assert!(
+            c.remote_clients().is_empty(),
+            "a local file is not a server"
+        );
+
+        c.reconcile_server(catalog(&["a1", "a2"], &["al1"], &["p1"]), &other_client());
+        c.reconcile_server(catalog(&["b1"], &["bl1"], &[]), &test_client());
+        let clients = c.remote_clients();
+        let urls: Vec<&str> = clients.iter().map(|c| c.base_url()).collect();
+        assert_eq!(
+            urls,
+            vec!["https://other.invalid", "https://example.invalid"],
+            "five rows from the first server is still one entry, and the \
+             order is the order they were indexed in"
+        );
+    }
+
+    /// The scan is O(corpus) and uncached on purpose (see
+    /// `remote_clients`), which is only safe while nothing on the
+    /// render path asks. The render layer is `src/ui`; a source scan
+    /// rather than a timing assertion, because the thing to prevent is
+    /// a new call site, not a slow machine.
+    #[test]
+    fn the_render_layer_never_asks_which_servers_are_live() {
+        let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&ui).expect("src/ui must exist").flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if source.contains("remote_clients") {
+                offenders.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a whole-corpus walk reached the render path: {offenders:?}. \
+             it answers which servers are live, which a widget never needs \
+             to recompute per frame; resolve it where the event is handled."
+        );
     }
 
     #[test]
@@ -2191,6 +2261,23 @@ mod tests {
                      rank {rank_t:>10.3?}   cand {cand:>6} out {out:>6}"
                 );
             }
+        }
+    }
+
+    /// What the uncached whole-corpus walk in `remote_clients` costs,
+    /// since the argument for leaving it uncached rests on the number.
+    /// Run with `cargo test --release -- --ignored --nocapture
+    /// bench_remote_clients`.
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_remote_clients() {
+        for size in [40_000usize, 150_000] {
+            let c = varied_corpus(size);
+            let (per, clients) = bench(200, || c.remote_clients().len());
+            println!(
+                "{:>7} items  remote_clients {per:>10.3?}  ({clients} servers)",
+                c.items.len()
+            );
         }
     }
 
