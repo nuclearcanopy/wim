@@ -1184,25 +1184,83 @@ writing (two agents, one per file).
       `anullsrc` via `secs: *s as u64` and is reported as "a 0s
       silence plays next"; `: silence(1e20)` reports
       "5124095576030431h8m15s".
-- [ ] **`main.rs` ~274: `clamp(0, -1)` asserts.**
-      `move_wim_selection`'s suggestions branch is
-      `(at + d).clamp(0, count.saturating_sub(1) as i64)` and
-      `Ord::clamp` panics when `min > max`. run
-      `: view(suggestions)` on a cold or empty corpus (main.rs ~336
-      installs `Some(suggestions)` and takes focus even at zero) then
-      `: down()`. `: bottom()` instead writes `usize::MAX` into
-      `suggestions_selected`.
-      **this is the second copy of the rule and it is the unsafe
-      one**: the queue branch 15 lines below guards with
-      `if order.is_empty()`, and the keyboard j/k copy at ~4086 uses
-      `.min(...)`.
-- [ ] **`main.rs` ~2514: a config file can abort the app.**
-      `Duration::from_secs_f64(cfg.crossfade_seconds)` is the only
-      unguarded `from_secs_f64` in the tree (every other site uses
-      `.max(0.0)`), and `crossfade_seconds` is read straight from TOML
-      with no load-time validation. put `crossfade_seconds = -1` or
-      `= nan` in config.toml and set a sleep timer. the settings-menu
-      clamp at ~3347 bounds only the delta, not the loaded value.
+- [x] **one rule for moving a cursor in a list**
+      (`main.rs::step_in_list`), and **the audit was wrong about this
+      one**, which is worth recording as loudly as the findings that
+      held. it called the suggestions branch a process abort
+      (`clamp(0, count - 1)` at count 0); it is not. that
+      `saturating_sub(1)` runs in **usize** and the `as i64` cast
+      follows it, so the max is 0 rather than -1, `clamp(0, 0)` never
+      panics, and `: bottom()` on an empty pane writes 0 rather than
+      `usize::MAX`. reproduced against the bug-intact body and the
+      empty-list test passed.
+      **a real bug was underneath it**: the `at as i64`, which reads a
+      cursor sitting at `usize::MAX` as -1, so a down-step from a stale
+      cursor landed on the top row instead of the last one. the three
+      copies of "step, then stay inside the list" (suggestions, queue
+      view, the keyboard j/k pane) now call one saturating usize
+      helper, and the queue branch's `len() as i64 - 1` (genuinely -1
+      when empty, and safe only because of the `is_empty` guard above
+      it) went with them. pinned on an empty list, both ends, a page
+      jump, and a cursor past the end; mutation-checked by restoring
+      the `as i64` body.
+      `hit::wheel_select` is a fourth copy of the same rule for the
+      mouse wheel. it guards `len == 0` explicitly and is safe, so it
+      was left alone, but it is a fourth copy.
+- [ ] **`view(suggestions)` on an empty corpus is a dead-end pane.**
+      no longer a crash, but `main.rs` ~336 still installs
+      `Some(suggestions)` and takes `Focus::Workspace` at zero
+      entries, reporting "0 suggestions", where the queue branch
+      answers `op_fail("the queue is empty")`. it should refuse the
+      same way.
+- [x] **a config file could abort the process** (`crossfade_seconds`).
+      `Duration::from_secs_f64` panics on a negative, nan or infinite
+      value, and that sleep-timer fade was the only unguarded
+      `from_secs_f64` in the tree, so `crossfade_seconds = -1` plus a
+      sleep timer killed wim. the settings menu's clamp only ever
+      bounded its own 0.5 step, never the loaded value, and
+      `f64::clamp` passes a nan straight through anyway.
+      guarded at both ends: `config::crossfade_seconds` is the single
+      range (1 to 15, non-finite falls back to the 3s default), and the
+      menu's steps, load-time validation and `main.rs::fade_span` all
+      go through it. **`.max(0.0)` would not have been enough**, which
+      is the part worth remembering: nan is laundered by it but `inf`
+      and `1e300` overflow a `Duration` and panic too. that is what the
+      test pins.
+- [x] **a typo'd token path no longer disables a feature in silence.**
+      `listenbrainz_user_token_file` and `opensubtitles_api_key_file`
+      were read with `fs::read_to_string(path).ok()`, so one wrong path
+      meant onboarding said scrobbling was set up, the settings menu
+      kept showing the row, and nothing ever scrobbled with nothing
+      said. both read through `Result` twins shaped like
+      `resolve_password` now; the `Option` resolvers, whose callers
+      have nowhere to put an error, delegate to those, and load reports
+      the io error once by path ("scrobbling is off: reading
+      listenbrainz_user_token_file at ..."). pinned with a temp-dir
+      fixture, the readable path and the missing one.
+- [x] **config.toml validates on load, correcting rather than
+      refusing.** `libary_paths` (sic) parsed clean and was read by
+      nothing, so the library just looked empty, and
+      `scrobble.threshold_percent = 5000` meant nothing ever scrobbled.
+      every hand-editable number is pulled into the range its reader
+      can act on with each correction named, and an unrecognised key is
+      reported with the nearest real name through `namehint::closest`,
+      nested tables and `[[navidrome_servers]]` included.
+      **a warning and not `deny_unknown_fields`**, deliberately:
+      refusing to start over one stray key in a hand-edited file (or
+      over a key a newer wim wrote) is the worse failure, and that
+      attribute covers only whichever struct carries it, so
+      `[subtitles]`, `[scrobble]` and a `pasword` typo in a server
+      block would all have slipped through anyway. nothing is written
+      back, since `save` regenerates the file from the struct and would
+      drop a hand-edited one's comments; the correction holds for the
+      session and the next settings-menu save persists it.
+      the hand-written key list is pinned by a test that builds an
+      **exhaustive** `Config` literal with no `..Default::default()`,
+      so a new field fails to compile until it is accounted for, and
+      another asserts a config using the `cache_listens_threshold`
+      field alias loads with zero warnings (exactly the kind of thing
+      a hand-written list forgets).
 - [ ] **`shellsong.rs` ~2139: `repeat` nesting is an OOM abort.**
       `repeat` expands statically and `MAX_REPEAT = 256` bounds one
       level while `parse_call` recursion depth is unbounded.
