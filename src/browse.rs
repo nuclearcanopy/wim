@@ -670,6 +670,70 @@ impl Loader {
     /// Starts a new open: the generation moves, so every reply still in
     /// flight for the previous one is now stale. Split from `fetch` so
     /// tests can drive the two halves without a server.
+    /// The starred listing, opened the way an album is: a titled view
+    /// at once, the remote half as it arrives.
+    ///
+    /// It is not a `SearchItem`, so it needs its own entry point, but
+    /// it shares the generation guard and `Load::Tracks`, which is what
+    /// stops a slow server landing its answer in a view the user has
+    /// since closed. It used to fan out across servers and **join
+    /// before returning**, so the keypress paid for the slowest server.
+    ///
+    /// `local` is shown immediately because local favorites are a file
+    /// read, not a round trip; there is no reason to make them wait for
+    /// a network answer they do not need.
+    ///
+    /// Clients are resolved by the caller rather than here: `core` owns
+    /// `client_for`, and `core` already depends on this module.
+    pub fn open_starred(
+        &mut self,
+        local: Vec<SearchItem>,
+        clients: Vec<Arc<Client>>,
+    ) -> BrowseView {
+        self.invalidate();
+        let mut view = BrowseView {
+            title: "starred songs".to_string(),
+            // mixes artists, so rows name theirs
+            show_track_artist: true,
+            ..BrowseView::loading(false)
+        };
+        view.set_tracks(local.clone());
+
+        let sender = ReplySender {
+            tx: self.tx.clone(),
+            current: self.current.clone(),
+            generation: self.current.load(Ordering::SeqCst),
+        };
+        thread::spawn(move || {
+            // one thread owning a scoped fan-out: the servers are
+            // independent, so they run together, and the keypress is
+            // not waiting on any of them.
+            let per_server: Vec<Vec<SearchItem>> = thread::scope(|scope| {
+                clients
+                    .iter()
+                    .map(|client| {
+                        scope.spawn(|| {
+                            let songs = client.get_starred_songs().ok()?;
+                            Some(songs_to_items(songs, client))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or(None).unwrap_or_default())
+                    .collect()
+            });
+            // local first, so the order the user already saw does not
+            // shuffle under them when the remote half lands.
+            let mut tracks = local;
+            tracks.extend(per_server.into_iter().flatten());
+            if !sender.send(Load::Tracks { year: None, tracks }) {
+                return;
+            }
+            sender.send(Load::Done);
+        });
+        view
+    }
+
     fn begin(&mut self, item: &SearchItem) -> Option<BrowseView> {
         self.invalidate();
         Some(match item {
@@ -1520,5 +1584,63 @@ pub(crate) mod tests {
             "truncated line wider than the pane: {:?}",
             lines[1]
         );
+    }
+
+    // ------------------------------------------------ starred listing
+
+    fn local_track(title: &str) -> SearchItem {
+        SearchItem::LocalMusic {
+            path: std::path::PathBuf::from(format!("/music/{title}.flac")),
+            title: title.to_string(),
+            artist: None,
+            album: None,
+        }
+    }
+
+    /// The point of routing starred through the loader: the view comes
+    /// back at once, with the local half already in it, instead of the
+    /// keypress waiting on the slowest configured server.
+    #[test]
+    fn opening_starred_returns_with_the_local_half_already_shown() {
+        let mut loader = Loader::default();
+        let view = loader.open_starred(vec![local_track("a"), local_track("b")], Vec::new());
+        assert_eq!(view.title, "starred songs");
+        assert_eq!(
+            view.tracks.len(),
+            2,
+            "local favorites are a file read, not a round trip"
+        );
+        assert!(
+            view.show_track_artist,
+            "the listing mixes artists, so rows name theirs"
+        );
+    }
+
+    /// Starred is the loader's own view now, so the generation guard
+    /// covers it: a reply for the album that was open before must not
+    /// fold into the starred listing.
+    #[test]
+    fn opening_starred_disowns_a_reply_from_the_previous_open() {
+        let mut loader = Loader::default();
+        let _album_view = loader.begin(&test_album("kid a")).unwrap();
+        let stale = loader.generation();
+
+        let mut view = Some(loader.open_starred(vec![local_track("a")], Vec::new()));
+        loader.deliver(
+            stale,
+            Load::Tracks {
+                year: Some(2000),
+                tracks: songs_named(&["from the album"]),
+            },
+            &mut view,
+        );
+        let view = view.unwrap();
+        assert_eq!(view.title, "starred songs", "the view was replaced");
+        assert_eq!(
+            view.tracks.len(),
+            1,
+            "the album's late tracks must not land here"
+        );
+        assert_eq!(view.tracks[0].primary_name(), "a");
     }
 }

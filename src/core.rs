@@ -233,53 +233,31 @@ pub fn client_for(
     }
     Ok(Arc::new(subsonic::Client::new(nav)?))
 }
-pub fn open_starred_view(
+/// Opens the starred listing through the browse loader, so the
+/// keypress returns at once.
+///
+/// Local favorites are a file read and go into the view immediately;
+/// the per-server fetches run on the loader's thread and fold in when
+/// they answer. This used to fan out and join before returning, so
+/// pressing the key paid for the slowest configured server.
+pub fn open_starred(
+    loader: &mut browse::Loader,
     servers: &[config::NavidromeConfig],
     favorites: &favorites::Favorites,
     live: &[Arc<subsonic::Client>],
 ) -> browse::BrowseView {
-    let per_server: Vec<Vec<SearchItem>> = thread::scope(|scope| {
-        servers
-            .iter()
-            .map(|nav| {
-                scope.spawn(|| {
-                    let client = client_for(nav, live).ok()?;
-                    let songs = client.get_starred_songs().ok()?;
-                    Some(browse::songs_to_items(songs, &client))
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|handle| handle.join().unwrap_or(None).unwrap_or_default())
-            .collect()
-    });
-    let mut tracks: Vec<SearchItem> = per_server.into_iter().flatten().collect();
-    for path in favorites.paths() {
-        if let Some(item) = persistence::item_from_path(path) {
-            tracks.push(item);
-        }
-    }
-    let mut view = browse::BrowseView {
-        title: "starred songs".to_string(),
-        subtitle: String::new(),
-        year: None,
-        tracks: Vec::new(),
-        selected: 0,
-        art: None,
-        bio: None,
-        is_artist: false,
-        albums: Vec::new(),
-        albums_selected: 0,
-        albums_focused: false,
-        filter_query: String::new(),
-        filtering: false,
-        show_track_artist: true,
-        loading: false,
-    };
-    // through `set_tracks`, not a bare assignment: it re-clamps
-    // `selected` with the list it's an index into.
-    view.set_tracks(tracks);
-    view
+    let local: Vec<SearchItem> = favorites
+        .paths()
+        .filter_map(|path| persistence::item_from_path(path))
+        .collect();
+    // resolved here rather than in the loader: `client_for` lives in
+    // this module and reuses a live client instead of re-reading
+    // `password_file` and starting with a cold pool.
+    let clients: Vec<Arc<subsonic::Client>> = servers
+        .iter()
+        .filter_map(|nav| client_for(nav, live).ok())
+        .collect();
+    loader.open_starred(local, clients)
 }
 /// A subtitle file the background fetch wrote to disk. `sub_add` isn't
 /// called there: the `Mpv` handle isn't `Send`, so the main thread
