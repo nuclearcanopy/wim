@@ -11,6 +11,7 @@ pub mod config;
 pub mod core;
 pub mod coverart;
 pub mod download;
+pub mod enrich;
 pub mod eq;
 pub mod favorites;
 pub mod focus;

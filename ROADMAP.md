@@ -2028,9 +2028,24 @@ the order below is not a preference, it is a dependency.
       sync/channel plumbing, then a `struct Ui` for the ~35 loose
       locals, then the draw closure, and only then the input tiers
       (their ordering is load-bearing and heavily commented).
-      **the "~3.9k lines" in this entry was stale: it is 6.2k.** worth
-      knowing before picking the next step, since every slice above
-      has been adding to it.
+      **the "~3.9k lines" in this entry was stale: it was 6.2k when
+      the decomposition started.** down to 5.6k over three slices.
+      worth re-measuring rather than trusting, since every feature
+      slice adds to it.
+      - [x] **background enrichment -> `src/enrich.rs`** (461 lines
+        with its tests). the most self-contained part of the channel
+        plumbing the plan calls for: one job goes out over `job_rx`,
+        its answers come back over `event_tx`, and the main loop's
+        only involvement is draining them.
+        **main.rs 6062 -> 5622**, the biggest cut of the three so far,
+        and the whole `enrichment_plumbing_tests` module went with it
+        -- the same tell as `focus`: when the tests move wholesale,
+        the cut was at a seam.
+        the four `ENRICH_*` constants moved too. they are the real
+        bound on the work (twelve album round trips per job, four in
+        flight, one job at a time) and their reasoning is long, so
+        leaving them behind in main.rs would have split a decision
+        from the code that implements it.
       - [x] **the transport controls -> `src/transport.rs`** (160
         lines). `ScrubAt`, `TransportCtx`, `activate_transport`,
         `commit_scrub`, `audio_level` and `now_playing_is_video`. the
