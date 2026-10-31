@@ -31,7 +31,9 @@
 use std::time::Duration;
 
 use crate::app::{Action, LoopMode};
-use crate::core::{apply_eq_gains, load_playlist, resync_upcoming, CoreCtx, SessionStart};
+use crate::core::{
+    apply_eq_gains, load_playlist, notify_query_changed, resync_upcoming, CoreCtx, SessionStart,
+};
 use crate::eq;
 use crate::search::SearchItem;
 use crate::shellsong::Op;
@@ -57,18 +59,35 @@ use crate::{shellsong, shellsong_host};
 ///   was *asked for*; the crossfade ramp moves the real one around it
 ///   every frame. Restoring the instantaneous value would capture a
 ///   ramp artefact as if it were a decision.
+///
+/// `mute` *is* in here despite also living only in mpv, because unlike
+/// `paused` it cannot drift out of band: `mute()`/`unmute()` are its
+/// only mutation and both are recorded ops. See docs/undo.md.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     /// What was playing, so a restore can tell whether the current
     /// track survived and avoid restarting it if it did.
     pub current: Option<SearchItem>,
     pub upcoming: Vec<SearchItem>,
+    /// What skip-back goes to. Restored because it is state the ops
+    /// move: `next` makes the track it left the previous one, so an
+    /// undo that puts the track back and not this leaves skip-back
+    /// pointing at the track already playing.
+    pub previous_track: Option<SearchItem>,
     pub base_volume: f64,
+    /// `None` when mpv would not say, so a restore leaves it alone
+    /// rather than guessing "unmuted" and unmuting.
+    pub muted: Option<bool>,
     pub loop_mode: LoopMode,
     pub shuffle: bool,
     pub speed: f64,
     pub eq_source: Option<eq::Source>,
     pub eq_gains: [f64; 10],
+    /// Whether the gains have been nudged away from `eq_source`'s
+    /// curve. Both halves or neither: the name alone reads "flat" for
+    /// a modified curve, and the flag alone reads "flat (modified)"
+    /// for a restored clean one.
+    pub eq_custom: bool,
     pub crossfade: bool,
     pub gap_secs: f64,
     pub query: String,
@@ -81,19 +100,27 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Reads the current state. Pure: no ipc, which is the reason
-    /// `paused` and the live volume are out (both would need a
-    /// blocking `get_property` on what is otherwise the input path).
+    /// Reads the current state. One ipc read, for `mute`, which has no
+    /// host-side mirror to read instead; the rest is memory. That read
+    /// is once per recorded op rather than per frame, which is the
+    /// budget `paused` and the live volume were refused on.
     pub fn capture(core: &CoreCtx) -> Snapshot {
         Snapshot {
             current: core.queue.current().cloned(),
             upcoming: core.queue.upcoming().to_vec(),
+            previous_track: core.previous_track.clone(),
             base_volume: *core.base_volume,
+            muted: core
+                .player
+                .get_property("mute")
+                .ok()
+                .and_then(|v| v.as_bool()),
             loop_mode: core.app.loop_mode,
             shuffle: core.app.shuffle,
             speed: core.app.speed,
             eq_source: core.app.eq_source,
             eq_gains: core.app.eq_gains,
+            eq_custom: core.app.eq_custom,
             crossfade: *core.crossfade_enabled,
             gap_secs: core.between_tracks.gap_secs(),
             query: core.app.query.clone(),
@@ -115,17 +142,29 @@ impl Snapshot {
     ///   current file and rewrites only what comes after it.
     /// - a different track (or nothing) playing: `load_playlist` with
     ///   `SessionStart::Keep`, which does restart playback, and has to.
+    ///
+    /// **Known gap, and it needs a `Surface` to close**: the restart
+    /// case loads the playlist without firing the `track_started`
+    /// hooks, so a restored track gets no subtitle fetch, no
+    /// playing-now submission and no bound settings. See docs/undo.md.
     pub fn restore(&self, core: &mut CoreCtx) -> Result<(), String> {
         core.app.loop_mode = self.loop_mode;
         core.app.shuffle = self.shuffle;
         core.app.speed = self.speed;
         core.app.eq_source = self.eq_source;
         core.app.eq_gains = self.eq_gains;
+        core.app.eq_custom = self.eq_custom;
         *core.crossfade_enabled = self.crossfade;
         core.between_tracks.set_gap(self.gap_secs);
         *core.sleep_due = self.sleep_due;
         *core.base_volume = self.base_volume;
+        // `set_query` only re-filters the corpus already indexed; the
+        // debounced remote search is the caller's to kick, and
+        // `settle` has to be told or it reports a query settled that
+        // nothing was ever fired for (`src/app.rs`'s set_query).
         core.app.set_query(&self.query);
+        let fired = notify_query_changed(core.app, core.remote_search_tx);
+        core.settle.notified(fired, core.now);
 
         if *core.vars != self.vars {
             *core.vars = self.vars.clone();
@@ -144,19 +183,29 @@ impl Snapshot {
         let _ = core.player.set_loop_file(mpv_loop);
         let _ = core.player.set_speed(self.speed);
         let _ = core.player.set_volume(self.base_volume);
+        if let Some(muted) = self.muted {
+            let _ = core.player.set_property("mute", serde_json::json!(muted));
+        }
         apply_eq_gains(core.app, core.player, core.notifications);
 
-        self.restore_queue(core)
+        let restored = self.restore_queue(core);
+        // after the queue: `load_playlist`'s own caller
+        // (`start_session`) writes this slot while it rewrites the
+        // playlist, so restoring it first would be overwritten.
+        *core.previous_track = self.previous_track.clone();
+        restored
     }
 
     fn restore_queue(&self, core: &mut CoreCtx) -> Result<(), String> {
+        // every branch below rewrites the queue, so anything still
+        // being resolved for the old one has nowhere to go; hoisted
+        // out of the branches because the branch that forgot it
+        // appended a whole discography over a finished undo.
+        core.track_resolver.invalidate();
         let playing = core.queue.current().map(|i| i.identity());
         let wanted = self.current.as_ref().map(|i| i.identity());
         if playing == wanted {
             // the track survives, so only what comes after it moves.
-            // anything already resolved for the old queue has nowhere
-            // to go now, same reason `start_session` disowns it.
-            core.track_resolver.invalidate();
             let status =
                 resync_upcoming(core.player, core.cache, core.queue, self.upcoming.clone());
             if status.starts_with("error") {
@@ -168,7 +217,6 @@ impl Snapshot {
             // nothing was playing then, and something is now. stopping
             // playback is a bigger side effect than leaving it, so the
             // queue after it is restored and the track is left alone.
-            core.track_resolver.invalidate();
             let status =
                 resync_upcoming(core.player, core.cache, core.queue, self.upcoming.clone());
             if status.starts_with("error") {
@@ -951,5 +999,464 @@ impl Recorder {
 
     pub fn is_empty(&self) -> bool {
         self.tree.is_none()
+    }
+}
+
+/// `Snapshot::capture`/`restore` against a real mpv.
+///
+/// `#[ignore]`d for the reason core.rs's seam tests are: a `CoreCtx`
+/// holds a live mpv handle, so each of these spawns one (~400ms). Run
+/// with `cargo test --lib restore -- --ignored`. The two invariants
+/// that have a cheap source-level guard get one in `contract` below,
+/// which does run in ci.
+#[cfg(test)]
+mod restore {
+    use super::*;
+
+    use std::collections::HashSet;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Instant;
+
+    use crate::cache::{self, CacheIndex};
+    use crate::core::{
+        BetweenTracks, Intent, RemoteSearchQuery, ScrobbleState, StarFailed, SubtitleReady,
+        TrackResolver,
+    };
+    use crate::download::DownloadEvent;
+    use crate::notify::Notifications;
+    use crate::playqueue::PlayQueue;
+    use crate::search::Corpus;
+    use crate::shellsong::Console;
+    use crate::shellsong_host::SearchSettle;
+    use crate::{app, browse, config, eq_menu_keys, favorites, library, lyrics, mpv, subsonic};
+
+    /// Everything a `CoreCtx` needs that is not the mpv handle, owned.
+    ///
+    /// A near-copy of core.rs's own test harness, which is private to
+    /// that module's tests. Sharing it is a core.rs change; see
+    /// docs/undo.md.
+    struct Harness {
+        cfg: config::Config,
+        app: app::App,
+        notifications: Notifications,
+        queue: PlayQueue,
+        previous_track: Option<SearchItem>,
+        cache: Arc<Mutex<CacheIndex>>,
+        download_tx: mpsc::Sender<DownloadEvent>,
+        _download_rx: mpsc::Receiver<DownloadEvent>,
+        downloading: HashSet<String>,
+        scrobble: ScrobbleState,
+        subtitle_tx: mpsc::Sender<SubtitleReady>,
+        _subtitle_rx: mpsc::Receiver<SubtitleReady>,
+        console: Console,
+        now_playing: Option<SearchItem>,
+        favorites: favorites::Favorites,
+        remote_starred: HashSet<String>,
+        lyrics_client: lyrics::Client,
+        lyrics_loader: lyrics::Loader,
+        track_resolver: TrackResolver,
+        star_tx: mpsc::Sender<StarFailed>,
+        _star_rx: mpsc::Receiver<StarFailed>,
+        base_volume: f64,
+        crossfade_enabled: bool,
+        overridden: shellsong_host::Overridden,
+        undo: Recorder,
+        between_tracks: BetweenTracks,
+        fade_in_started_at: Option<Instant>,
+        fade: Option<shellsong_host::Ramp>,
+        sleep_due: Option<Duration>,
+        resume_due: Option<Duration>,
+        scan_rx: mpsc::Receiver<library::ScanBatch>,
+        _scan_tx: mpsc::Sender<library::ScanBatch>,
+        remote_search_tx: mpsc::Sender<RemoteSearchQuery>,
+        remote_search_rx: mpsc::Receiver<RemoteSearchQuery>,
+        settle: SearchSettle,
+        saved_queues: Vec<String>,
+        vars: shellsong::Scope,
+        bindings: shellsong_host::Bindings,
+    }
+
+    /// The reading every `CoreCtx` this harness builds carries, so a
+    /// test can ask `settle` about the same instant the restore used.
+    const NOW: Duration = Duration::from_secs(1);
+
+    impl Harness {
+        fn new() -> Harness {
+            let (download_tx, _download_rx) = mpsc::channel();
+            let (subtitle_tx, _subtitle_rx) = mpsc::channel();
+            let (_scan_tx, scan_rx) = mpsc::channel();
+            let (remote_search_tx, remote_search_rx) = mpsc::channel();
+            let (star_tx, _star_rx) = mpsc::channel();
+            Harness {
+                cfg: config::Config::default(),
+                app: app::App::new(Corpus::new()),
+                notifications: Notifications::default(),
+                queue: PlayQueue::default(),
+                previous_track: None,
+                cache: Arc::new(Mutex::new(CacheIndex::default())),
+                download_tx,
+                _download_rx,
+                downloading: HashSet::new(),
+                scrobble: ScrobbleState::default(),
+                subtitle_tx,
+                _subtitle_rx,
+                console: Console::empty(),
+                now_playing: None,
+                favorites: favorites::Favorites::default(),
+                remote_starred: HashSet::new(),
+                lyrics_client: lyrics::Client::new(),
+                lyrics_loader: lyrics::Loader::new(),
+                track_resolver: TrackResolver::new(),
+                star_tx,
+                _star_rx,
+                base_volume: 100.0,
+                crossfade_enabled: false,
+                overridden: shellsong_host::Overridden::default(),
+                undo: Recorder::default(),
+                between_tracks: BetweenTracks::new(0.0),
+                fade_in_started_at: None,
+                fade: None,
+                sleep_due: None,
+                resume_due: None,
+                scan_rx,
+                _scan_tx,
+                remote_search_tx,
+                remote_search_rx,
+                settle: SearchSettle::default(),
+                saved_queues: Vec::new(),
+                vars: shellsong::Scope::default(),
+                bindings: shellsong_host::Bindings::default(),
+            }
+        }
+
+        fn ctx<'a>(&'a mut self, player: &'a mpv::Mpv) -> CoreCtx<'a> {
+            CoreCtx {
+                cfg: &self.cfg,
+                player,
+                app: &mut self.app,
+                notifications: &mut self.notifications,
+                queue: &mut self.queue,
+                previous_track: &mut self.previous_track,
+                cache: &self.cache,
+                download_tx: &self.download_tx,
+                downloading: &mut self.downloading,
+                scrobble: &mut self.scrobble,
+                subtitle_tx: &self.subtitle_tx,
+                console: &mut self.console,
+                now: NOW,
+                now_playing: &self.now_playing,
+                favorites: &mut self.favorites,
+                remote_starred: &mut self.remote_starred,
+                lyrics_client: &self.lyrics_client,
+                lyrics_loader: &mut self.lyrics_loader,
+                star_tx: &self.star_tx,
+                track_resolver: &mut self.track_resolver,
+                base_volume: &mut self.base_volume,
+                crossfade_enabled: &mut self.crossfade_enabled,
+                overridden: &mut self.overridden,
+                undo: &mut self.undo,
+                between_tracks: &mut self.between_tracks,
+                fade_in_started_at: &mut self.fade_in_started_at,
+                fade: &mut self.fade,
+                sleep_due: &mut self.sleep_due,
+                resume_due: &mut self.resume_due,
+                scan_rx: &mut self.scan_rx,
+                remote_search_tx: &self.remote_search_tx,
+                settle: &mut self.settle,
+                saved_queues: &mut self.saved_queues,
+                vars: &mut self.vars,
+                bindings: &mut self.bindings,
+            }
+        }
+
+        fn capture(&mut self, player: &mpv::Mpv) -> Snapshot {
+            Snapshot::capture(&self.ctx(player))
+        }
+
+        /// What `restore` itself goes through for a queue, so a test
+        /// sets one up the same way rather than writing `queue`
+        /// behind mpv's back.
+        fn play(&mut self, player: &mpv::Mpv, items: Vec<SearchItem>) {
+            let core = self.ctx(player);
+            let (status, played) = load_playlist(
+                core.player,
+                core.cache,
+                core.queue,
+                items,
+                SessionStart::New,
+            );
+            assert!(played, "the fixture queue has to load: {status}");
+        }
+
+        fn restore(&mut self, player: &mpv::Mpv, snapshot: &Snapshot) {
+            let mut core = self.ctx(player);
+            snapshot.restore(&mut core).expect("the restore");
+        }
+    }
+
+    fn mpv() -> mpv::Mpv {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        // these run on a desktop that may have a real wim playing;
+        // never put the fixture on the speakers.
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        player
+    }
+
+    fn id(item: &SearchItem) -> String {
+        item.identity().1.into_owned()
+    }
+
+    /// An album, which is the one `SearchItem` kind whose resolution
+    /// fans out off-thread; its client answers nothing, so the
+    /// fan-out fails fast and the test only cares that a batch lands
+    /// at all.
+    fn album() -> SearchItem {
+        SearchItem::Album {
+            id: "al1".to_string(),
+            name: "a discography".to_string(),
+            artist: "a prolific artist".to_string(),
+            client: browse::fixtures::test_client(),
+        }
+    }
+
+    /// Blocks until the resolver hands back a batch, or `within`
+    /// elapses with nothing.
+    fn landed(resolver: &mut TrackResolver, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if resolver.poll().is_some() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // ------------------------------------------------- the queue half
+
+    /// The restore branch that restarts a track used to be the one of
+    /// the three that did not disown in-flight resolutions, so a
+    /// prolific artist queued before the undo landed seconds after it
+    /// and appended its whole discography over the restored queue.
+    ///
+    /// The control request is the load-bearing half of this test: it
+    /// proves a batch really does land in this environment, so the
+    /// `false` below means disowned rather than "nothing was ever in
+    /// flight".
+    #[test]
+    #[ignore]
+    fn a_restore_that_restarts_a_track_disowns_an_in_flight_fan_out() {
+        let player = mpv();
+        let mut h = Harness::new();
+        let songs = browse::fixtures::test_songs(2);
+
+        h.play(&player, vec![songs[0].clone()]);
+        let snapshot = h.capture(&player);
+        // something else is playing now, which is the branch that
+        // reloads mpv's playlist.
+        h.play(&player, vec![songs[1].clone()]);
+
+        h.track_resolver.request(&album(), Intent::Back);
+        assert!(
+            landed(&mut h.track_resolver, Duration::from_secs(20)),
+            "the control has to land or the assertion below proves nothing"
+        );
+
+        h.track_resolver.request(&album(), Intent::Back);
+        h.restore(&player, &snapshot);
+        assert_eq!(
+            h.queue.current().map(id),
+            Some(id(&songs[0])),
+            "the restore has to have taken the restart branch"
+        );
+        assert!(
+            !landed(&mut h.track_resolver, Duration::from_secs(2)),
+            "the fan-out was resolved against the queue this restore \
+             replaced; letting it land appends a whole discography on \
+             top of a finished undo"
+        );
+    }
+
+    /// Skip-back's target is state the ops move, so a restore that
+    /// puts the track back has to put it back too; otherwise back
+    /// reloads the track that is already playing.
+    #[test]
+    #[ignore]
+    fn a_restore_puts_the_skip_back_target_back() {
+        let player = mpv();
+        let mut h = Harness::new();
+        let songs = browse::fixtures::test_songs(3);
+
+        h.play(&player, vec![songs[0].clone()]);
+        h.previous_track = Some(songs[2].clone());
+        let snapshot = h.capture(&player);
+
+        // `next`: songs[1] plays, and the track it interrupted
+        // becomes what back goes to.
+        h.play(&player, vec![songs[1].clone()]);
+        h.previous_track = Some(songs[0].clone());
+
+        h.restore(&player, &snapshot);
+        assert_eq!(h.queue.current().map(id), Some(id(&songs[0])));
+        assert_eq!(
+            h.previous_track.as_ref().map(id),
+            Some(id(&songs[2])),
+            "back now reloads the track that is already playing"
+        );
+    }
+
+    // ------------------------------------------------ the state half
+
+    /// `App::set_query` only re-filters what is already indexed; the
+    /// contract it states is that the caller kicks the debounced
+    /// remote search. Without that a restored query comes back
+    /// missing every remote title while `settle` still reports
+    /// settled, so the `play(selection)` after it resolves against an
+    /// incomplete list.
+    #[test]
+    #[ignore]
+    fn a_restored_query_kicks_the_debounced_remote_search() {
+        let player = mpv();
+        let mut h = Harness::new();
+        // `notify_query_changed` sends nothing without an indexed
+        // server, so there has to be one for this to mean anything.
+        h.app.corpus.reconcile_server(
+            cache::ServerCatalog {
+                artists: vec![subsonic::Artist {
+                    id: "a1".to_string(),
+                    name: "bladee".to_string(),
+                }],
+                ..Default::default()
+            },
+            &browse::fixtures::test_client(),
+        );
+
+        h.app.set_query("bladee");
+        let snapshot = h.capture(&player);
+        h.app.set_query("drain");
+        h.settle.answered();
+
+        h.restore(&player, &snapshot);
+        assert_eq!(h.app.query, "bladee", "the text comes back either way");
+        assert_eq!(
+            h.remote_search_rx.try_recv().map(|q| q.query).ok(),
+            Some("bladee".to_string()),
+            "nothing was fired, so the restored list is missing every \
+             remote title"
+        );
+        assert!(
+            !h.settle.settled(NOW),
+            "a query with a request outstanding must not report settled"
+        );
+    }
+
+    /// `mute()` is one `set_property` and nothing else, so mpv is the
+    /// only place the state lives; a snapshot that skips it reports a
+    /// successful undo over music that is still silent.
+    #[test]
+    #[ignore]
+    fn undoing_a_mute_unmutes() {
+        let player = mpv();
+        let mut h = Harness::new();
+        let snapshot = h.capture(&player);
+        assert_eq!(
+            snapshot.muted,
+            Some(false),
+            "mpv has to answer the property for this to be restorable"
+        );
+
+        // exactly what `Op::Mute(true)` does.
+        let _ = player.set_property("mute", serde_json::json!(true));
+        h.restore(&player, &snapshot);
+
+        assert_eq!(
+            player.get_property("mute").ok().and_then(|v| v.as_bool()),
+            Some(false),
+            "undo said it worked and left the music muted"
+        );
+    }
+
+    /// The name and the modified flag are one piece of state in two
+    /// fields: restoring the name alone leaves a clean curve reading
+    /// "flat (modified)".
+    #[test]
+    #[ignore]
+    fn a_restored_curve_is_not_still_modified() {
+        let player = mpv();
+        let mut h = Harness::new();
+        let snapshot = h.capture(&player);
+        let label = eq_menu_keys::eq_label(&h.app, &h.cfg);
+
+        // a band nudge in the eq menu, which is all `eq_custom` ever
+        // means.
+        eq_menu_keys::adjust_eq_band(&mut h.app, &player, &mut h.notifications, 3, 1.0);
+        assert_ne!(eq_menu_keys::eq_label(&h.app, &h.cfg), label);
+
+        h.restore(&player, &snapshot);
+        assert_eq!(
+            eq_menu_keys::eq_label(&h.app, &h.cfg),
+            label,
+            "the gains came back but the curve still reads modified"
+        );
+        assert_eq!(h.app.eq_gains, snapshot.eq_gains);
+    }
+}
+
+/// Guards for the two restore invariants whose behavioural tests need
+/// a live mpv, and so are `#[ignore]`d out of ci. Reading the source
+/// is the weaker check; it is also the only one that runs.
+#[cfg(test)]
+mod contract {
+    fn body_of(name: &str) -> &'static str {
+        let src = include_str!("undo.rs");
+        let at = src
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} moved or was renamed"));
+        let body = &src[at..];
+        let end = body.find("\n    }\n").expect("an unterminated fn");
+        &body[..end]
+    }
+
+    /// One call, before the branching, because the branch that
+    /// forgot its own copy appended a whole discography on top of a
+    /// finished undo.
+    #[test]
+    fn every_restore_branch_disowns_in_flight_resolutions() {
+        let body = body_of("fn restore_queue(");
+        assert_eq!(
+            body.matches("track_resolver.invalidate()").count(),
+            1,
+            "one invalidate for every branch, not one per branch:\n{body}"
+        );
+        let at = body
+            .find("track_resolver.invalidate()")
+            .expect("counted above");
+        assert!(
+            !body[..at].contains("if playing == wanted"),
+            "the invalidate has to come before the branching:\n{body}"
+        );
+    }
+
+    /// `src/app.rs` states the contract on `set_query`: the caller
+    /// kicks the debounced remote search. Every other caller honours
+    /// it (`core.rs`'s `Op::Search`, main.rs's two typing paths).
+    #[test]
+    fn a_restored_query_is_notified_like_any_other() {
+        let body = body_of("pub fn restore(");
+        let at = body.find("set_query(").expect("restore sets the query");
+        assert!(
+            body[at..].contains("notify_query_changed("),
+            "set_query without the notify leaves the remote half of \
+             the restored list missing:\n{body}"
+        );
+        assert!(
+            body[at..].contains("settle.notified("),
+            "and settle has to be told, or it reports a query settled \
+             that nothing was fired for:\n{body}"
+        );
     }
 }
