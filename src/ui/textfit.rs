@@ -177,56 +177,88 @@ const COLUMN_GUTTER: usize = 2;
 /// worth the rows they save.
 const MIN_COLUMN: usize = 18;
 
-/// Packs `items` into up to `max_cols` columns of `width` cells, as
-/// the lines to print.
+/// Packs `items` into up to `max_cols` columns, as the lines to print.
 ///
 /// Column-major, like `ls`: reading *down* each column keeps a sorted
 /// or ranked list in order, where row-major would scatter it across
-/// the screen. Items wider than their column are ellipsised rather
-/// than wrapped, so every row is exactly one line and the grid cannot
-/// come apart.
+/// the screen.
 ///
-/// The column count is the most that keeps each one at least
-/// `MIN_COLUMN` wide, so a narrow terminal quietly falls back to one
-/// column instead of shredding every title into nothing.
+/// **Each column is sized to its own contents**, which is the whole
+/// algorithm. Dividing the width evenly is the obvious thing and it is
+/// wrong both ways: a list of eight-cell names wastes two thirds of
+/// every column, and a list of long titles gets chopped at the same
+/// arbitrary place whether or not there was room. So this tries three
+/// columns, then two, then one, and takes the first whose *actual*
+/// column widths fit; short names end up packed tight, long ones get
+/// the room they need.
+///
+/// Only when nothing fits untruncated does it fall back to dividing
+/// the width, and then only while each column stays at least
+/// `MIN_COLUMN` cells, so a narrow terminal drops to fewer columns
+/// rather than shredding every item into nothing. Items past that are
+/// ellipsised, never wrapped, so one item is always one row and the
+/// grid cannot come apart.
 pub fn columns(items: &[String], avail: usize, max_cols: usize) -> Vec<String> {
     if items.is_empty() || avail == 0 {
         return Vec::new();
     }
-    let room = |cols: usize| {
-        avail
-            .saturating_sub(COLUMN_GUTTER * (cols - 1))
-            .checked_div(cols)
-            .unwrap_or(0)
-    };
-    let cols = (1..=max_cols.max(1))
-        .rev()
-        .find(|&c| c <= items.len() && room(c) >= MIN_COLUMN)
-        .unwrap_or(1);
-    let col_w = room(cols).max(1);
-    // ceil: the last column is the short one, so every item has a row.
-    let rows = items.len().div_ceil(cols);
+    let max_cols = max_cols.max(1).min(items.len());
 
+    // the widths `cols` columns would actually need, column-major.
+    let natural = |cols: usize| -> (usize, Vec<usize>) {
+        let rows = items.len().div_ceil(cols);
+        let widths: Vec<usize> = (0..cols)
+            .map(|c| {
+                items
+                    .iter()
+                    .skip(c * rows)
+                    .take(rows)
+                    .map(|i| width(i))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        (
+            widths.iter().sum::<usize>() + COLUMN_GUTTER * (cols - 1),
+            widths,
+        )
+    };
+
+    let (cols, widths) = (1..=max_cols)
+        .rev()
+        .find_map(|c| {
+            let (total, widths) = natural(c);
+            (total <= avail).then_some((c, widths))
+        })
+        .unwrap_or_else(|| {
+            // nothing fits as-is, so share the width out and truncate,
+            // keeping columns readable rather than merely numerous.
+            let share = |c: usize| avail.saturating_sub(COLUMN_GUTTER * (c - 1)) / c;
+            let cols = (1..=max_cols)
+                .rev()
+                .find(|&c| share(c) >= MIN_COLUMN)
+                .unwrap_or(1);
+            (cols, vec![share(cols).max(1); cols])
+        });
+
+    let rows = items.len().div_ceil(cols);
     (0..rows)
         .map(|row| {
             let mut line = String::new();
-            for col in 0..cols {
-                // column-major indexing is the whole point; row-major
-                // would read across and lose the ranking.
+            for (col, col_w) in widths.iter().enumerate() {
+                // column-major indexing is the point; row-major would
+                // read across and lose the ranking.
                 let Some(item) = items.get(col * rows + row) else {
                     break;
                 };
-                let cell = truncate_with_ellipsis(item, col_w);
-                let last = col + 1 == cols || items.get((col + 1) * rows + row).is_none();
-                if last {
-                    line.push_str(&cell);
-                } else {
-                    // padded to the column, not to the item, so the
-                    // next column starts in the same place on every
-                    // row. measured in cells: a wide glyph costs two.
-                    let pad = col_w.saturating_sub(width(&cell)) + COLUMN_GUTTER;
-                    line.push_str(&cell);
-                    line.push_str(&" ".repeat(pad));
+                let cell = truncate_with_ellipsis(item, *col_w);
+                let more = items.get((col + 1) * rows + row).is_some();
+                line.push_str(&cell);
+                if more {
+                    // padded to the column, not the item, so the next
+                    // one starts in the same place on every row.
+                    // measured in cells: a wide glyph costs two.
+                    line.push_str(&" ".repeat(col_w.saturating_sub(width(&cell)) + COLUMN_GUTTER));
                 }
             }
             line
@@ -268,10 +300,44 @@ mod column_tests {
         assert!(lines[1].starts_with("item01"), "{:?}", lines[1]);
     }
 
+    /// Short names pack tight even in a narrow terminal, because the
+    /// columns are sized to the content: six 6-cell names need
+    /// 6+6+6+4 = 22 cells for three columns, so 24 is enough. An even
+    /// division would have given 8-cell columns and refused.
     #[test]
-    fn a_narrow_terminal_falls_back_to_one_column() {
+    fn short_names_pack_into_a_narrow_terminal() {
         let lines = columns(&items(6), 24, 3);
-        assert_eq!(lines.len(), 6, "one per row rather than 8-cell columns");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+    }
+
+    /// And long ones drop to a single column rather than three
+    /// unreadable slivers.
+    #[test]
+    fn long_names_fall_back_to_one_column() {
+        let long: Vec<String> = (0..6).map(|i| format!("a fairly long title {i}")).collect();
+        let lines = columns(&long, 30, 3);
+        assert_eq!(lines.len(), 6, "{lines:?}");
+    }
+
+    /// The payoff of content-sized columns: a column only takes the
+    /// room its own items need, so a short first column does not
+    /// reserve space a long second one could have used.
+    #[test]
+    fn a_column_is_only_as_wide_as_its_own_contents() {
+        let mixed = vec![
+            "ab".to_string(),
+            "cd".to_string(),
+            "a much longer title here".to_string(),
+            "another long one there".to_string(),
+        ];
+        // 2 rows, 2 columns: col 0 is 2 cells, col 1 is 24.
+        let lines = columns(&mixed, 40, 3);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].starts_with("ab  a much longer"),
+            "the long column starts right after the short one: {:?}",
+            lines[0]
+        );
     }
 
     #[test]
