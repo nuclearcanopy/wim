@@ -1170,6 +1170,7 @@ fn main() -> anyhow::Result<()> {
                     star_tx: &star_tx,
                     track_resolver: &mut track_resolver,
                     base_volume: &mut base_volume,
+                    muted: playback.muted,
                     crossfade_enabled: &mut crossfade_enabled,
                     overridden: &mut shellsong_overridden,
                     undo: &mut undo_tree,

@@ -38,6 +38,7 @@ macro_rules! core_ctx {
             star_tx: &$h.star_tx,
             track_resolver: &mut $h.track_resolver,
             base_volume: &mut $h.base_volume,
+            muted: $h.playback.muted,
             crossfade_enabled: &mut $h.crossfade_enabled,
             overridden: &mut $h.overridden,
             undo: &mut $h.undo,

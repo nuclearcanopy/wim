@@ -1887,6 +1887,13 @@ pub struct CoreCtx<'a> {
     pub track_resolver: &'a mut TrackResolver,
     // volume, and everything that ramps it.
     pub base_volume: &'a mut f64,
+    /// mpv's mute, from the observed `Playback` rather than asked for.
+    ///
+    /// `undo::Snapshot::capture` used to make one blocking
+    /// `get_property("mute")` per *recorded op*, on the input path,
+    /// because mute had no host-side mirror. `PROP_MUTE` is observed
+    /// now, so it has one, and `capture` is pure again.
+    pub muted: bool,
     pub crossfade_enabled: &'a mut bool,
     /// Which per-identity settings the user has since overridden by
     /// hand, so a binding does not fight them; see
@@ -3937,6 +3944,7 @@ mod seam_tests {
         star_tx: mpsc::Sender<StarFailed>,
         _star_rx: mpsc::Receiver<StarFailed>,
         base_volume: f64,
+        muted: bool,
         crossfade_enabled: bool,
         overridden: shellsong_host::Overridden,
         undo: undo::Recorder,
@@ -3985,6 +3993,7 @@ mod seam_tests {
                 star_tx,
                 _star_rx: star_rx,
                 base_volume: 100.0,
+                muted: false,
                 crossfade_enabled: false,
                 overridden: shellsong_host::Overridden::default(),
                 undo: undo::Recorder::default(),
@@ -4027,6 +4036,7 @@ mod seam_tests {
                 star_tx: &self.star_tx,
                 track_resolver: &mut self.track_resolver,
                 base_volume: &mut self.base_volume,
+                muted: self.muted,
                 crossfade_enabled: &mut self.crossfade_enabled,
                 overridden: &mut self.overridden,
                 undo: &mut self.undo,

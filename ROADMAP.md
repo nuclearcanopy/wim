@@ -1520,104 +1520,31 @@ a measurement.
       `seam_tests::Harness` is `pub(super)` now, so sibling test
       modules share it instead of carrying a near-copy (`undo.rs` has
       one, which is what the audit pointed at).
-- [ ] **docs that went stale tonight.** `docs/text-measurement.md`
-      82-84 says `controlsbar` is "still per-char" and "the next one to
-      route"; it is routed, and the `char_cells` justification at 72-75
-      now applies to `ui/lyrics_view.rs` alone.
-      `docs/undo.md` 152-156 says there is no mute indicator; there is
-      one, and 148-150's "a host-side `muted` mirror would remove the
-      read entirely" is what the `PROP_MUTE` observer just did, so
-      `Snapshot::capture`'s per-op ipc read can go.
-      `README.md` has no usage section and `wim [FILE...]` wants a line.
-
-### the untracked-defect audit (2026-10-31)
-
-Ran once the roadmap was down to 8 unchecked items, 5 of them blocked,
-to answer "what is not written down". 55 findings, verified reachable
-(the auditor reproduced the three top panics with a standalone probe
-rather than reasoning about them). **`[profile.release]` sets no
-`overflow-checks`, so release wraps where debug panics**, which is why
-the arithmetic findings are not purely theoretical.
-
-Four are already fixed and are checked off in their own sections
-above: the cleared-queue-vs-loop-all bug, `Op::RemoveFromQueue`'s
-ordering, the header's blind truncation, and `ArtProbe`'s dead-probe
-arm. The rest are below, grouped by how bad they are rather than by
-file, because several span two files.
-
-**these abort the process from ordinary use.** in flight as of this
-writing (two agents, one per file).
-
-- [x] **`enclosing()`: a multibyte char before `(` aborted the
-      process on one keystroke.** the call-name range came from
-      `rfind(pred).map(|j| j + 1)`, and `rfind` returns the matched
-      char's *first* byte, so `rós(` built `name=(2,4)` and the slice
-      panicked inside the `ó`. autopair meant one `(` did it, and
-      `site()`/`enclosing()` run per keystroke, so it was an instant
-      crash while typing in either binary.
-      now `char_indices().rev().find(pred)` plus `len_utf8()`, so the
-      start lands after the char rather than inside it; the name is
-      still the ascii ident tail (`rós(` gives `s`, `é(` gives
-      nothing). the same `rfind`-plus-one shape appears nowhere else in
-      the file: every other `+ 1` is keyed off a single-byte ascii
-      literal found with `find` or a byte scan that only acts on ascii.
-      **the test whose name gave false confidence is renamed.**
-      `multibyte_input_never_slices_mid_character` only ever covered
-      `edit_insert`/`edit_backspace`, so it is now
-      `multibyte_editing_never_slices_mid_character` and
-      `the_site_never_slices_a_multibyte_call_name` is its sibling,
-      sweeping `site()` over every char boundary of each autopaired
-      form.
-- [x] **`parse_time`: `inf` was a valid duration, and the player had
-      no way to refuse it.** `parse_time`'s bare-number branch is
-      `rest.parse::<f64>()` with only a `< 0.0` check, so `inf` and
-      `1e30` become `Pos::Seconds`. `: sleep(inf)`, `: pause(inf)`,
-      `: fade(out, inf)`, `: silence(inf)` all reached
-      `Duration::from_secs_f64(inf)`, which panics *inside the draw
-      loop*; the hook tore the terminal down and the queue went with
-      it, and `secs.max(0.0)` launders NaN but not infinity.
-      every seconds-valued exit of `parse_time` (bare, colon and unit
-      forms) now goes through one `seconds()` gate that refuses
-      non-finite and anything over `MAX_TIME_HOURS`. **24h was chosen**
-      as past any real sleep timer, gap, silence, fade or seek position
-      while staying ~10^13 clear of `Duration`'s overflow, so the host
-      can convert unconditionally; refused with a message rather than
-      clamped, matching the file's existing habit for a count above
-      256.
-      same boundary, same class, all fixed with it: a bare-number
-      `volume` is held to the `0..=100` the `%` spelling always was,
-      which is what kept `volume(nan)` out of `remember`'s persisted
-      settings; and `silence` rounds with `s.round().max(1.0)` instead
-      of truncating, so `silence(0.4s)` is a one-second silence rather
-      than a zero-second one and `silence(1e20)` can no longer saturate
-      the `u64` into "5124095576030431h8m15s".
-      **the test aborts exactly where the app did**: it runs every
-      emitted op through core.rs's own
-      `Duration::from_secs_f64(secs.max(0.0))` rather than asserting on
-      the parse alone.
-- [x] **one rule for moving a cursor in a list**
-      (`main.rs::step_in_list`), and **the audit was wrong about this
-      one**, which is worth recording as loudly as the findings that
-      held. it called the suggestions branch a process abort
-      (`clamp(0, count - 1)` at count 0); it is not. that
-      `saturating_sub(1)` runs in **usize** and the `as i64` cast
-      follows it, so the max is 0 rather than -1, `clamp(0, 0)` never
-      panics, and `: bottom()` on an empty pane writes 0 rather than
-      `usize::MAX`. reproduced against the bug-intact body and the
-      empty-list test passed.
-      **a real bug was underneath it**: the `at as i64`, which reads a
-      cursor sitting at `usize::MAX` as -1, so a down-step from a stale
-      cursor landed on the top row instead of the last one. the three
-      copies of "step, then stay inside the list" (suggestions, queue
-      view, the keyboard j/k pane) now call one saturating usize
-      helper, and the queue branch's `len() as i64 - 1` (genuinely -1
-      when empty, and safe only because of the `is_empty` guard above
-      it) went with them. pinned on an empty list, both ends, a page
-      jump, and a cursor past the end; mutation-checked by restoring
-      the `as i64` body.
-      `hit::wheel_select` is a fourth copy of the same rule for the
-      mouse wheel. it guards `len == 0` explicitly and is safe, so it
-      was left alone, but it is a fourth copy.
+- [x] **`Snapshot::capture` asks mpv for nothing now, and the docs it
+      falsified are corrected.** `capture` ran one blocking
+      `get_property("mute")` per *recorded op*, i.e. on the input path,
+      because mute had no host-side mirror. the mute indicator needed
+      `PROP_MUTE` observed anyway, so `CoreCtx::muted` is that mirror
+      and `capture` is pure.
+      **it is also less racy than the read was**, which is the part
+      worth keeping: a snapshot is taken *before* its op is applied and
+      the mirror still holds the pre-op value, where a `get_property`
+      issued after the apply could come back with the post-op one. the
+      field stays `Option<bool>`, because `None` still means "do not
+      touch mute on restore" and a snapshot taken before the first
+      property event legitimately wants that.
+      pinned by `capturing_a_snapshot_makes_no_ipc_call`, which reads
+      the source (the technique `track_started` uses, since `CoreCtx`
+      holds a live handle and a test cannot count round trips);
+      mutation-checked by putting the read back. the five mpv-gated
+      restore tests still pass with `--ignored`.
+      docs/undo.md's "the one ipc read `capture` makes" and "there is
+      no mute indicator anywhere in the ui" were both false and are
+      rewritten; docs/text-measurement.md called `controlsbar` "still
+      per-char" and "the next one to route" when it is routed (its
+      separate "still per-char" section is about the console's cursor
+      and is accurate); and README gained the usage block `wim --help`
+      makes true.
 - [ ] **`view(suggestions)` on an empty corpus is a dead-end pane.**
       no longer a crash, but `main.rs` ~336 still installs
       `Some(suggestions)` and takes `Focus::Workspace` at zero

@@ -76,12 +76,14 @@ that came from a tag.
 
 ## what else was downstream of it
 
-three writers hand-rolled the same per-char loop against `width`-derived
-budgets and now go through `draw::at`:
-`swimconsole::draw_str`, `ui::shellsong::text`, and
-`ui::draw::at_styled` itself. `ui/controlsbar.rs` has a fourth copy
-(`controlsbar.rs` ~715) that is still per-char; it only ever draws
-glyphs it owns, but it is the next one to route.
+four writers hand-rolled the same per-char loop against `width`-derived
+budgets and all now go through `draw::at`:
+`swimconsole::draw_str`, `ui::shellsong::text`,
+`ui::draw::at_styled` itself, and `ui::controlsbar::draw_chars`. The
+last was found after this doc was written, by the same measurement:
+it bought a cell per cluster component, so a zwj family painted six
+cells where the buffer counted two and ran onto the next pane, and a
+combining mark `set_char`'d over its own base and deleted the letter.
 
 ## the ghost guard, both halves of it
 
