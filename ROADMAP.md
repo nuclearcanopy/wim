@@ -1385,6 +1385,37 @@ a measurement.
       **literal on-disk fixture**, so a field rename fails instead of
       reading as "nothing to resume" on every install.
 
+- [x] **the test suite could write the user's real cache, and did.**
+      found by an agent that then checked its own damage: a
+      `cargo test --lib -- --ignored` run reaches `cache_dir()` through
+      `note_playback_started` -> `CacheIndex::save` from a harness that
+      starts at `CacheIndex::default()`, so it **overwrote a real
+      install's play index with the fixture's one row**. the already
+      downloaded files under `tracks/` survived but stopped being
+      referenced, so they would be re-streamed and re-downloaded and
+      `sweep_stale` no longer knew about them. a default
+      `cargo test --lib` does not do it; an `--ignored` run does, and
+      this repo's convention is that mpv-gated behavioural tests are
+      `#[ignore]`d, so "run them with `--ignored` rather than trusting
+      them" is advice that was actively harmful.
+      `cache_dir()` now **refuses a path outside the temp dir under
+      `cfg(test)`**. honouring `XDG_CACHE_HOME` was never the problem;
+      not noticing when a test had failed to set it was. a test that
+      wants a cache has to point it somewhere disposable and is told so
+      by name. verified by running all 50 `#[ignore]`d tests with the
+      guard in place: still green, because the write now fails where
+      the result was already discarded.
+      the better fix is still open and belongs to whoever owns
+      `core.rs` next: a `persist: &dyn Fn(&CacheIndex)` on
+      `DownloadCtx`, the shape `download::Sink` already uses, so the
+      save is injected rather than reached for.
+      **the data loss itself is the maintainer's to decide about.** the
+      two orphaned files are recoverable in principle (the filename
+      stem is the song id, so `cached_path` can be relinked) but the
+      play-day history is genuinely gone, and reconstructing an index
+      with invented counts is not a repair anyone should make on
+      someone else's behalf. see QUESTIONS.md.
+
 ### the untracked-defect audit (2026-10-31)
 
 Ran once the roadmap was down to 8 unchecked items, 5 of them blocked,

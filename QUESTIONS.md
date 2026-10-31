@@ -69,6 +69,32 @@ rasterization figure). Making it optional is the only plausible win
 left on wim's side of the frame budget, and it would touch `Style` and
 therefore `Memo`'s cache key.
 
+### your play index was overwritten by a test run, and the repair is yours
+
+While running this repo's `#[ignore]`d mpv-gated tests (which I had
+told agents to run rather than trust), `note_playback_started` reached
+the real `~/.cache/wim` and replaced the play index with the test
+harness's single fixture row. The root cause is fixed: `cache_dir()`
+now refuses a non-temp path under `cfg(test)`.
+
+**What survived:** the two downloaded files under `~/.cache/wim/tracks/`
+are intact, and their filenames are the song ids, so the
+"already cached, do not download again" link is reconstructible.
+
+**What is gone:** `play_count` and `play_days` for everything. That is
+what the auto-download threshold counts ("coming back to it on another
+day"), so until it rebuilds, nothing will auto-cache.
+
+**Why I did not just fix it.** Writing an index with `play_count: 0`
+and invented timestamps is not restoring your data, it is replacing it
+with a guess, and the two tracks would then look never-played. I
+started to do exactly that and the sandbox stopped me, correctly.
+
+Options, your call: leave it (the history rebuilds as you listen, and
+the two files get relinked the next time they are played); or have me
+relink just the two `cached_path` entries and leave the counts empty,
+which stops them being re-downloaded without inventing a history.
+
 ## defaults taken, recorded so they are not re-litigated
 
 ### a completion matched by folding types the ascii, not the diacritics

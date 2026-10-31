@@ -110,9 +110,35 @@ pub fn today() -> String {
 /// `~/.cache/wim`; the actual downloaded audio lives under its own
 /// `tracks/` subdirectory (see `tracks_dir`), the index file sits right
 /// alongside it.
+///
+/// **Under `cfg(test)` this refuses a path outside the temp dir**, and
+/// that is not paranoia. A `cargo test -- --ignored` run reached here
+/// through `note_playback_started` -> `CacheIndex::save` from a harness
+/// that starts at `CacheIndex::default()`, and overwrote a real
+/// install's play index with the fixture's one row. The already
+/// downloaded files under `tracks/` survived but were no longer
+/// referenced, so they would be re-streamed and re-downloaded and
+/// `sweep_stale` no longer knew about them.
+///
+/// Honouring `XDG_CACHE_HOME` was never the problem; *not noticing*
+/// when a test had failed to set it was. A test that wants this has to
+/// point it somewhere disposable, and gets told so rather than
+/// silently writing to the user's install.
 pub fn cache_dir() -> Result<PathBuf> {
     let dir = dirs::cache_dir().context("no cache dir found for this platform")?;
-    Ok(dir.join("wim"))
+    let dir = dir.join("wim");
+    #[cfg(test)]
+    {
+        let tmp = std::env::temp_dir();
+        anyhow::ensure!(
+            dir.starts_with(&tmp),
+            "a test asked for the real cache dir ({}); point XDG_CACHE_HOME at a \
+             directory under {} first, or this writes the user's play index",
+            dir.display(),
+            tmp.display()
+        );
+    }
+    Ok(dir)
 }
 
 pub fn tracks_dir() -> Result<PathBuf> {
