@@ -23,12 +23,12 @@ use ratatui_image::StatefulImage;
 use wim::app::LoopMode;
 use wim::cache::CacheIndex;
 use wim::core::{
-    append_resolved, apply_eq_gains, apply_eq_row, browse_session, client_for, current_eq_name,
-    current_volume, dispatch_action, download_resolved, download_tracks, drive, enqueue_track,
-    eq_preset_names, fire_scrobble, fire_subtitle_fetch, front_resolved, go_to_previous,
-    identity_settings, load_playlist, lyrics_query, note_playback_started, notify_query_changed,
-    op_done, op_fail, op_note, open_starred, playing_duration, print_listing, resync_upcoming,
-    retain_live_clients, save_playback_state, set_vid_for_item, shellsong_focus,
+    append_resolved, apply_eq_gains, apply_eq_row, apply_op, browse_session, client_for,
+    current_eq_name, current_volume, dispatch_action, download_resolved, download_tracks, drive,
+    enqueue_track, eq_preset_names, fire_scrobble, fire_subtitle_fetch, front_resolved,
+    go_to_previous, identity_settings, load_playlist, lyrics_query, note_playback_started,
+    notify_query_changed, op_done, op_fail, op_note, open_starred, playing_duration, print_listing,
+    resync_upcoming, retain_live_clients, save_playback_state, set_vid_for_item, shellsong_focus,
     spawn_background_search, start_session, start_tracking_playback, suggestion_starred_keys,
     sweep_cache, toggle_star, BetweenTracks, CoreCtx, Dispatch, DownloadCtx, Drive, GapAction,
     Intent, RemoteSearchOutcome, RemoteSearchQuery, Report, Resolution, ScrobbleState, SelectStep,
@@ -374,6 +374,7 @@ struct WimSurface<'a> {
     keybinds_menu_selected: &'a mut usize,
     eq_menu_open: &'a mut bool,
     eq_menu_selected: &'a mut usize,
+    undo_menu_open: &'a mut bool,
     bottombar_selected: Field,
 }
 
@@ -581,6 +582,15 @@ fn open_wim_screen(
                 core.app.eq_source,
                 core.cfg.eq_custom_presets.len(),
             );
+            op_done()
+        }
+        ViewTarget::Undo => {
+            if core.undo.is_empty() {
+                // an empty tree is a blank screen that reads as
+                // broken; saying so outright is the whole answer.
+                return op_fail("nothing has been done yet");
+            }
+            *surf.undo_menu_open = true;
             op_done()
         }
         ViewTarget::Lyrics => open_wim_lyrics(core),
@@ -2008,6 +2018,7 @@ fn main() -> anyhow::Result<()> {
     // cycling presets like the bare 'e' key does; full-workspace, same
     // treatment as the settings/keybinds menus.
     let mut eq_menu_open = false;
+    let mut undo_menu_open = false;
     let mut eq_menu_selected: usize = 0;
     // the eq menu's name editor, armed delete and message line; the
     // selection stays a loose `usize` above because the shellsong
@@ -2163,7 +2174,11 @@ fn main() -> anyhow::Result<()> {
             || help_open
             || settings_menu_open
             || keybinds_menu_open
-            || eq_menu_open;
+            || eq_menu_open
+            // not only for the animation gate: `overlay` also feeds
+            // `video::wanted`, and without it mpv would keep drawing
+            // a video straight over this modal.
+            || undo_menu_open;
         // whether mpv should be drawing the video right now; the whole
         // decision is `video::wanted`, including the guard that keeps
         // music on `vo=null`.
@@ -2848,6 +2863,21 @@ fn main() -> anyhow::Result<()> {
                         selected: eq_menu_selected,
                         state: &eq_menu,
                         elapsed: frame_elapsed,
+                    },
+                    top,
+                );
+            }
+
+            // the undo tree. drawn over the workspace like the eq
+            // menu, because the structure needs the width: a fork is
+            // unreadable in a sidebar-sized column.
+            if undo_menu_open {
+                let rows = undo_tree.rows(start.elapsed());
+                f.render_widget(
+                    ui::undo_tree::UndoTreeView {
+                        rows: &rows,
+                        elapsed: frame_elapsed,
+                        focused: true,
                     },
                     top,
                 );
@@ -3600,6 +3630,7 @@ fn main() -> anyhow::Result<()> {
                     keybinds_menu_selected: &mut keybinds_menu_selected,
                     eq_menu_open: &mut eq_menu_open,
                     eq_menu_selected: &mut eq_menu_selected,
+                    undo_menu_open: &mut undo_menu_open,
                     bottombar_selected,
                 }
             };
@@ -4500,6 +4531,62 @@ fn main() -> anyhow::Result<()> {
                 // the `Focus::BottomBar` block further down), not a
                 // dedicated keymap action of its own; esc is the only
                 // way to close it.
+                // the undo tree owns the keyboard while it is up, the
+                // same way the eq menu does. undo and redo go through
+                // `apply_op` rather than the recorder directly, so
+                // there stays exactly one path that records, refuses
+                // at a barrier and reports.
+                if undo_menu_open {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                        undo_menu_open = false;
+                        continue;
+                    }
+                    // the hint line reads these same constants, so it
+                    // cannot advertise a key this match does not act
+                    // on; k/j and the arrows are undocumented
+                    // synonyms, which is fine for a direction nobody
+                    // has to be told.
+                    let op = match key.code {
+                        KeyCode::Char(ui::undo_tree::UNDO_KEY)
+                        | KeyCode::Char('k')
+                        | KeyCode::Up => Some(shellsong::Op::Undo),
+                        KeyCode::Char(ui::undo_tree::REDO_KEY)
+                        | KeyCode::Char('j')
+                        | KeyCode::Down => Some(shellsong::Op::Redo),
+                        _ => None,
+                    };
+                    if let Some(op) = op {
+                        let mut surf = wim_surface!();
+                        let mut core = core_ctx!();
+                        apply_op(op, &mut core, &mut surf);
+                        continue;
+                    }
+                    // h/l walk across a fork, which is the one thing
+                    // that needs this view open to be usable at all.
+                    let across = match key.code {
+                        KeyCode::Char(ui::undo_tree::LEFT_KEY) | KeyCode::Left => Some(-1),
+                        KeyCode::Char(ui::undo_tree::RIGHT_KEY) | KeyCode::Right => Some(1),
+                        _ => None,
+                    };
+                    if let Some(delta) = across {
+                        let mut surf = wim_surface!();
+                        let mut core = core_ctx!();
+                        match core.undo.switch_branch(delta) {
+                            Some(snapshot) => {
+                                if let Err(why) = snapshot.restore(&mut core) {
+                                    core.notifications.push(Severity::Error, why);
+                                }
+                            }
+                            None => core
+                                .notifications
+                                .push(Severity::Info, "no other branch here"),
+                        }
+                        let _ = &mut surf;
+                        continue;
+                    }
+                    continue;
+                }
+
                 if eq_menu_open {
                     // the name editor owns every key while it's up, so
                     // a letter types instead of firing a menu action.

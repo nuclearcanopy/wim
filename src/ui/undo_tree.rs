@@ -33,6 +33,17 @@ use crate::undo::Row;
 /// one sits inside a tree whose alignment depends on single cells.
 const BARRIER_MARK: char = '!';
 
+/// The view's own keys, as constants both the hint line and main.rs's
+/// handler read.
+///
+/// Same reason `eq_menu` does it: a hint that spells its own letter
+/// can describe a key the handler never acts on, which is exactly how
+/// stale hints happened here before.
+pub const UNDO_KEY: char = 'u';
+pub const REDO_KEY: char = 'r';
+pub const LEFT_KEY: char = 'h';
+pub const RIGHT_KEY: char = 'l';
+
 /// Tree glyphs, from the same box-drawing block the dividers and
 /// junctions already use.
 const TEE: &str = "├─";
@@ -92,12 +103,16 @@ pub struct UndoTreeView<'a> {
 
 impl Widget for UndoTreeView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let inner = draw::framed_inner(area);
-        draw::frame(
-            buf,
-            area,
-            shade(if self.focused { MID } else { NEAR_BLACK }),
-        );
+        if area.width < 10 || area.height < 4 {
+            // too small to say anything: better blank than a frame
+            // full of clipped glyphs.
+            return;
+        }
+        // `overlay`, not a bare frame: it scrims every cell first, so
+        // the workspace underneath cannot show through the gaps
+        // between rows. a frame alone left it visible between the
+        // branch lines.
+        let inner = draw::overlay(buf, area);
         if inner.width < 8 || inner.height < 2 {
             return;
         }
@@ -116,8 +131,14 @@ impl Widget for UndoTreeView<'_> {
         // view exists to answer, and a toast would have scrolled away
         // by the time anyone opened it.
         let barrier = self.rows.iter().find(|r| r.current).and_then(|r| r.barrier);
-        let footer = barrier.filter(|_| inner.height >= 4);
-        let body_h = inner.height.saturating_sub(2 + u16::from(footer.is_some()));
+        let footer = barrier.filter(|_| inner.height >= 5);
+        // the hint owns the bottom row whenever there is one to spare.
+        // an undiscoverable modal is the failure mode this view was
+        // most likely to ship with: `u`, `r` and `h`/`l` are not
+        // guessable from a tree on screen.
+        let hint = inner.height >= 4;
+        let reserved = 2 + u16::from(footer.is_some()) + u16::from(hint);
+        let body_h = inner.height.saturating_sub(reserved);
         let body_y = inner.y + 2;
 
         // the current row is what has to stay on screen, so the window
@@ -146,8 +167,22 @@ impl Widget for UndoTreeView<'_> {
             self.draw_row(buf, inner, y, row, &spine);
         }
 
+        if hint {
+            let text = format!(
+                "{UNDO_KEY} undo · {REDO_KEY} redo · {LEFT_KEY}/{RIGHT_KEY} branch · esc close"
+            );
+            draw::at(
+                buf,
+                inner.x,
+                inner.bottom() - 1,
+                &truncate_with_ellipsis(&text, inner.width as usize),
+                shade(DIM),
+                inner.width as usize,
+            );
+        }
+
         if let Some(why) = footer {
-            let y = inner.bottom() - 1;
+            let y = inner.bottom() - 1 - u16::from(hint);
             let text = format!("{BARRIER_MARK} {why}");
             draw::at(
                 buf,
@@ -361,6 +396,36 @@ mod tests {
         let y = 1 + 2 + at as u16;
         let bg = buf.cell((3, y)).unwrap().bg;
         assert_eq!(bg, shade(anim::selection_bg(Duration::ZERO, true)));
+    }
+
+    /// The bug the first draft shipped with: a bare frame left the
+    /// workspace visible in the gaps between branch lines. `overlay`
+    /// scrims every cell, so an overlay owns its whole rect.
+    #[test]
+    fn the_workspace_cannot_show_through_between_the_rows() {
+        let (t, t0) = sample();
+        let rows = t.rows(t0);
+        let area = Rect::new(0, 0, 46, 12);
+        let mut buf = crate::ui::testbuf::plated_buffer(46, 12);
+        UndoTreeView {
+            rows: &rows,
+            elapsed: Duration::ZERO,
+            focused: true,
+        }
+        .render(area, &mut buf);
+        crate::ui::testbuf::assert_no_bleed_through(&buf, area);
+    }
+
+    /// `u`, `r` and `h`/`l` are not guessable from a tree on screen,
+    /// and the hint has to name the keys the handler actually acts on;
+    /// both read these constants.
+    #[test]
+    fn the_keys_are_advertised() {
+        let out = render(46, 12);
+        for key in [UNDO_KEY, REDO_KEY, LEFT_KEY, RIGHT_KEY] {
+            assert!(out.contains(key), "{key} unadvertised:\n{out}");
+        }
+        assert!(out.contains("esc"), "{out}");
     }
 
     #[test]

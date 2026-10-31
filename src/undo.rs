@@ -882,6 +882,16 @@ impl Recorder {
         }
     }
 
+    /// Moves to another branch off the same parent, returning what to
+    /// restore. `None` when there is no fork here to cross.
+    pub fn switch_branch(&mut self, delta: isize) -> Option<Snapshot> {
+        let tree = self.tree.as_mut()?;
+        match tree.switch_branch(delta) {
+            Moved::To(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
     /// Rows for the tree view, empty until something has been
     /// recorded.
     pub fn rows(&self, now: Duration) -> Vec<Row<'_>> {

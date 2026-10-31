@@ -316,6 +316,9 @@ pub enum ViewTarget {
     /// The per-identity settings, listed.
     Bindings,
     Eq,
+    /// The undo tree. A screen, not a listing: the structure is the
+    /// content, and a flat set of scrollback lines cannot show a fork.
+    Undo,
     /// The command listing: the one target whose content is generated
     /// by the language itself (`help_lines`, off `COMMANDS`) rather than
     /// read from the app, so `view(help)` and `help()` cannot drift. It
@@ -385,6 +388,8 @@ const VIEW_NAMES: &[ViewName] = &[
     view("bindings", ViewTarget::Bindings, true),
     view("eq", ViewTarget::Eq, true),
     view("equalizer", ViewTarget::Eq, false),
+    view("undo", ViewTarget::Undo, true),
+    view("tree", ViewTarget::Undo, false),
     view("help", ViewTarget::Help, true),
 ];
 
@@ -4737,6 +4742,7 @@ mod tests {
             ViewTarget::Vars,
             ViewTarget::Bindings,
             ViewTarget::Eq,
+            ViewTarget::Undo,
             ViewTarget::Help,
         ];
         fn spelling(t: ViewTarget) -> &'static str {
@@ -4754,6 +4760,7 @@ mod tests {
                 ViewTarget::Vars => "vars",
                 ViewTarget::Bindings => "bindings",
                 ViewTarget::Eq => "eq",
+                ViewTarget::Undo => "undo",
                 ViewTarget::Help => "help",
             }
         }
@@ -7257,6 +7264,7 @@ queue(morning)
                 "vars",
                 "bindings",
                 "eq",
+                "undo",
                 "help",
             ],
         );
