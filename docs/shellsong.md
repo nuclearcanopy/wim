@@ -122,6 +122,7 @@ messages come from, and (r12) what completion offers.
 | `indices` | one or more queue positions | nothing; hint only |
 | `speed` | a multiplier 0.25-3, or `up` / `down` / `reset` | nothing; hint only |
 | `duration` | a time literal, or `off` | nothing; hint only |
+| `span` | a positive length of time, no `off` | nothing; hint only |
 
 a parameter marked `?` in a signature is optional. when you pass
 exactly as many arguments as there are parameters they match strictly
@@ -158,6 +159,35 @@ seek(30s)      error: write seek(+30s) or moveto(30s)
 moveto(+30s)   error: moveto is absolute
 seek(+50%)     error: relative seek takes a time, not a percent
 ```
+
+## the queue timeline
+
+a queue entry does not have to be a track. `silence` puts a timed gap
+in it:
+
+```
+silence(15m)          append a 15 minute silence
+silence(10s, front)   insert one next, same position parameter as
+                      add_to_queue
+```
+
+it is a *real* entry, not a flag beside the queue: mpv loads
+`av://lavfi:anullsrc=d=N` as a file, so the silence occupies an index,
+reorders, removes, saves and loads like anything else, and the queue
+view shows it as `silence · 15m`.
+
+`silence` takes a `span`, not a `duration`, so there is no `off`:
+`sleep(off)` cancels a timer, and there is no silence of no length.
+`silence(0s)` is an error rather than a no-op.
+
+two things it deliberately does not do: it never scrobbles, and it
+never triggers a per-identity eq or volume change, because a gap must
+not change how the next track sounds.
+
+`silence` is its own command rather than something nestable inside
+`queue(...)`: `queue`'s parameter is `terms`, which means "names of
+things in the library", and letting it take a call form would make
+`terms` mean "names or calls" everywhere.
 
 ## volume
 
