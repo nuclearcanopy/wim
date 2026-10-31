@@ -2032,6 +2032,28 @@ the order below is not a preference, it is a dependency.
       the decomposition started.** down to 4.9k over six slices.
       worth re-measuring rather than trusting, since every feature
       slice adds to it.
+      - [x] **both art-protocol caches -> `graphics::ProtocolCache`.**
+        `player_art_protocol`, `real_art_protocol` and
+        `browse_art_key` become two instances of one type.
+        another duplication, not a grouping: the full player and the
+        browse view follow the *same* rule -- rebuild only when the art
+        or the tone changes, `ratatui-image` owning the per-instance
+        resize and encode caching -- and each had its own copy. the
+        code even said so ("the browse view's own protocol, same
+        rule").
+        **the browse copy was desync-by-construction**: it kept the key
+        in a separate local from the protocol, updated at different
+        sites, with nothing making them agree. a third site
+        (`browse_loader.poll` handing over art) set the protocol with
+        *no key at all*. `ensure(picker, key, || image)` makes the pair
+        inseparable, and that third site now clears instead, letting
+        the keyed path rebuild.
+        the image is a closure because building it is the expensive
+        half (`full-bw` greyscales a copy) and a cache hit must not pay
+        it -- pinned by a test that asserts the closure never runs on a
+        hit. two more: no picker holds nothing (so the first frame
+        after a probe lands does not think it is current), and clearing
+        forgets the key too (a stale key would suppress the rebuild).
       - [x] **the gap mechanism's three locals folded into
         `BetweenTracks`.** `gap_secs` and `keep_open_held` joined the
         hold timer, and `BetweenTracks::step` replaced the per-frame
