@@ -1544,6 +1544,52 @@ debounced search thread, and the local-favorites path is a file write.
         zeroing the per-chunk base fails that and the older
         item-fingerprint test both, but this one says "a chunk
         reported the wrong base" instead of "the list changed".
+      - [x] **the revision is an identity, and a `Ranking` carries
+        it.** an adversarial review of the slice above found the
+        counter did not do the job it was added for, and it was right:
+        `rev` was a per-instance mutation count starting at 0, so two
+        corpus states could share one. not hypothetical, because
+        onboarding's library-paths step replaces `app.corpus`
+        wholesale: a fresh corpus that indexes as many items as the old
+        one reached the same number, a held order compared equal, and
+        every index then named a different row. the derived `Clone`
+        copied it too, so two clones mutated apart while still
+        claiming to be the same state. it is now drawn from a
+        process-global `AtomicU64`, with `Clone` hand-written to take a
+        new one.
+        **and the order no longer travels without it.** `rank_indices`
+        returned a bare `Vec<u32>` while its own doc claimed the
+        revision came along, which left every caller to remember the
+        pairing: the exact failure the revision exists to prevent.
+        `Corpus::rank` now returns a `Ranking { rev, order }` whose
+        `row`/`rows` resolve against a corpus and **refuse on a
+        mismatch**, returning no rows rather than a partial list (a
+        short list reads as "the search found less", which is a
+        plausible lie).
+        three more fixes from the same review. `search`'s
+        `filter_map(item_at)` could never filter, since `rank_order`
+        already resolved every index to ask its category, so it
+        advertised a graceful degradation that would actually have
+        desynced `search` from `rank`; it indexes directly now.
+        `(u32, u32)` became `struct Scored { score, at }`, because the
+        reference version could not confuse the two and the index
+        version silently could (five sites read one or the other and a
+        swap compiled). and `threaded_scoring_reports_the_same_corpus_indices`
+        was **vacuous on a one-core box**: its guard was
+        `items.len() > thread_count()`, which passes with a single
+        chunk at base 0, correct by construction; it now skips loudly
+        on `thread_count() < 2`.
+        new tests, all mutation-checked: two corpora built identically
+        have different revisions (caught by restoring the derived
+        `Clone`), and a ranking read against a mutated corpus yields
+        no rows (caught by deleting the check in `row`).
+        still open from that review: `group_boundaries` takes
+        `&[SearchItem]` and is called from the results list, so the
+        draw-a-screenful caller needs an index-based counterpart or it
+        re-materializes exactly what it set out not to clone. and the
+        onboarding site that replaces `app.corpus` does not
+        `resync_results`, which is merely stale today and becomes a
+        wrong-rows trigger the moment `App` holds the order.
       - [x] **the api change itself: `results` is private.** fourteen
         external reads across main.rs, core.rs and both shellswim
         files now go through `results()` / `result(i)` /
