@@ -1625,11 +1625,34 @@ the order below is not a preference, it is a dependency.
         inheriting the earlier verdict. current measurement: 44 `Op`
         variants, 47 arms in `core::run_op`, 12 `dispatch_action`
         call sites.
-      - **the tree view**, which `Tree::rows` already feeds: depth,
-        label, age, current marker, and a fork count per node. the ux
-        self-check applies hardest here, and the monochrome rule means
-        brightness carries the hierarchy (current brightest, ancestors
-        mid, other branches dim) since there is no colour to spend.
+      - ~~**the tree view**~~ **built: `src/ui/undo_tree.rs`.**
+        box-drawing spines (not ascii pipes), the current row plated
+        with `anim::selection_bg` like every other selection in the
+        app so it breathes when focused and sits flat when not, a
+        right-aligned age column reserved up front so labels cannot
+        shove it around, and barrier rows marked `!` with the current
+        one's reason spelled out in a footer, because "why can I not
+        go further" is the question the view exists to answer and a
+        toast would have scrolled away by the time anyone opened it.
+        brightness carries the hierarchy as specified: current
+        `NEAR_WHITE`, ancestors `MID`, other branches `DIM`, and the
+        branch lines themselves stay dim even on the current row,
+        since they are structure rather than content.
+        `Tree::rows` grew `on_path` and `last_child` to feed it; the
+        first is the brightness tier, the second decides tee vs
+        corner.
+        **printing it found a bug ten passing tests did not.** the
+        spine column indexed ancestors from depth 0 rather than depth
+        1, so a child of a forked node drew a blank gap where its
+        parent's line should continue, reading as though that branch
+        had ended. the box-drawing assertion missed it completely
+        because every glyph drawn was still box-drawing.
+        `undo_tree::tests::print_the_tree` prints it at two widths;
+        `a_forked_parents_line_continues_through_its_children` pins
+        the fix.
+        what it still needs is a human at a real terminal for the one
+        thing a buffer cannot show: whether the plate pulse reads as
+        alive rather than restless next to a static tree.
 
 - [ ] **decompose main.rs** (~3.9k lines). a reviewed, ordered plan
       exists: extract focus/InputMode, then the playback free functions,

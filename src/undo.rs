@@ -308,11 +308,33 @@ impl<S> Tree<S> {
     /// it is current, and whether it is a barrier.
     pub fn rows(&self, now: Instant) -> Vec<Row<'_>> {
         let mut out = Vec::with_capacity(self.nodes.len());
-        self.walk(0, 0, now, &mut out);
+        let path = self.path_to_current();
+        self.walk(0, 0, true, now, &path, &mut out);
         out
     }
 
-    fn walk<'a>(&'a self, id: usize, depth: usize, now: Instant, out: &mut Vec<Row<'a>>) {
+    /// Every node from the root down to the current one. The view
+    /// spends brightness on this: current brightest, its ancestors
+    /// mid, everything else dim, since there is no colour to spend.
+    fn path_to_current(&self) -> Vec<usize> {
+        let mut path = vec![self.current];
+        let mut at = self.current;
+        while let Some(parent) = self.nodes[at].parent {
+            path.push(parent);
+            at = parent;
+        }
+        path
+    }
+
+    fn walk<'a>(
+        &'a self,
+        id: usize,
+        depth: usize,
+        last_child: bool,
+        now: Instant,
+        path: &[usize],
+        out: &mut Vec<Row<'a>>,
+    ) {
         let node = &self.nodes[id];
         out.push(Row {
             id,
@@ -320,11 +342,14 @@ impl<S> Tree<S> {
             label: &node.label,
             age: now.saturating_duration_since(node.at),
             current: id == self.current,
+            on_path: path.contains(&id),
+            last_child,
             barrier: node.barrier,
             branches: node.children.len(),
         });
-        for child in &node.children {
-            self.walk(*child, depth + 1, now, out);
+        let last = node.children.len().saturating_sub(1);
+        for (i, child) in node.children.iter().enumerate() {
+            self.walk(*child, depth + 1, i == last, now, path, out);
         }
     }
 }
@@ -337,6 +362,12 @@ pub struct Row<'a> {
     pub label: &'a str,
     pub age: Duration,
     pub current: bool,
+    /// On the root-to-current path: this node or one of its
+    /// ancestors.
+    pub on_path: bool,
+    /// Last of its parent's children, which is what decides whether
+    /// the tree glyph is a corner or a tee.
+    pub last_child: bool,
     pub barrier: Option<&'static str>,
     /// How many children; more than one is a fork, which the view has
     /// to show or branch navigation is unusable.
