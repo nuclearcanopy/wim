@@ -238,10 +238,9 @@ mod tests {
     use super::*;
     use crate::ui::testbuf::{buffer, grid};
     use crate::undo::Tree;
-    use std::time::Instant;
 
-    fn sample() -> (Tree<&'static str>, Instant) {
-        let t0 = Instant::now();
+    fn sample() -> (Tree<&'static str>, Duration) {
+        let t0 = Duration::ZERO;
         let mut t = Tree::new("start", t0);
         t.record("a", "played crest".into(), None, None, t0);
         t.record("b", "volume 60".into(), None, None, t0);
