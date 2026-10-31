@@ -942,27 +942,37 @@ mpv loaded, a generated silence source included".
 Asked for while testing, in the order they were asked. Everything
 above this line in the shellswim section is done.
 
-- [ ] **scrollback in shellswim.** asked three times; nothing written
-      yet. the console keeps the newest lines and drops the rest
-      (`SwimConsole::render` takes `lines[len - shown..]`), so output
-      that scrolls past is gone.
-      the design settled on: a `scroll` offset on `shellsong::Console`
-      (0 = the live tail), **PageUp/PageDown** for a page and
-      **shift+Up/shift+Down** for a line, because plain Up/Down are
-      history recall and cannot be it. handled in shellswim's key
-      loop, which is where `KeyModifiers` is visible; `Console::key`
-      only receives a `KeyCode`.
-      two things to get right: the offset has to clamp against the
-      *scrollback viewport*, which only the renderer knows (it
-      computes `spare` after the prompt and qualifier rows), so the
-      view should report its height back -- a `Cell<usize>` on
-      `Console` written during render is the contained way to do it.
-      and new output should snap to the live tail **only if already
-      there**, so arriving notes do not yank someone who is reading
-      back; a submitted line always snaps.
+- [x] **scrollback in shellswim.** a `scroll` offset on
+      `shellsong::Console` (0 = the live tail), **PageUp/PageDown** for
+      a page and **shift+Up/shift+Down** for a line. plain Up/Down stay
+      history recall and a test pins that, since taking them would
+      break the one thing a prompt must do. handled in `handle_key`,
+      which does see `KeyModifiers` -- the note here guessed it did
+      not.
+      **the offset clamps against the scrollback viewport, which only
+      the renderer knows**: the height left after the prompt and the
+      error/cycle/info rows varies per frame. the view reports it back
+      through a `Cell<usize>` on `Console`, which is the contained way
+      to do it when the widget is handed `&Console`; clamping against a
+      guessed height is how a scrollback ends up banking keypresses
+      that then have to be undone.
+      **arriving output holds the line, not the offset.** a
+      scrolled-back console gets `scroll += 1` per pushed line, so
+      reading back while a program prints is actually possible; at the
+      tail there is nothing to hold and it follows. a submitted line
+      always snaps, since you pressed enter to see what it did. buffer
+      trimming decrements the offset, or one parked on dropped lines
+      would point at unrelated text -- pinned. a page keeps one row of
+      overlap so the line being read stays on screen to orient by.
+      **printing it caught what the tests did not**: the notice
+      ellipsised mid-hint at 46 cells, so it is "N back · pgdn to catch
+      up". it exists at all because a scrolled console that said
+      nothing reads as a *frozen* one -- output arrives, the screen
+      does not move, nothing explains why -- and it claims a row only
+      while it is true.
       wim's own console (`ui::shellsong::ShellsongConsole`) has the
-      same limitation and would get it free if the state lives on
-      `Console`.
+      state for free now, since it lives on `Console`; what it still
+      needs is the key handling and the same notice row.
 - [ ] **`queue()` should decide between a song and an album
       dynamically**, with `k=song`/`k=album` as the strong assertions.
       the assertions exist now (`k=`, `k=a`, `k=s`); what is left is
