@@ -95,25 +95,45 @@ event loop the only reader of stdin.
 
 ## measured startup
 
-`WIM_STARTUP_TRACE=1`, warm cache, empty library, this machine under
-load from three other builds:
+`WIM_STARTUP_TRACE=1`, warm cache, one local path, isolated XDG dirs,
+on a machine under load from three other builds.
+
+interactive, under a pty:
 
 ```
-    2.884ms  config loaded
-    8.899ms  library scan: finished
-  388.119ms  mpv spawned
-  395.621ms  corpus warmed from cache
-  399.045ms  host ready (no terminal)
+    1.621ms  config loaded
+    4.014ms  library scan: finished
+  405.422ms  mpv spawned
+  415.214ms  corpus warmed from cache
+  419.153ms  terminal ready
+  419.992ms  first frame drawn
+  426.717ms  refresh rate probed
 ```
 
-and interactively, 388.7ms to first frame. **mpv's spawn is 380ms of
-it**; everything shellswim itself does costs about 8ms, and the frame
-after mpv answers is another 4ms. so the honest statement is that
-shellswim starts in single-digit milliseconds and then waits for mpv.
+one-shot (`-c`), which touches no terminal at all: 392.7 / 429.6 /
+395.0ms to host-ready over three runs.
 
-making the prompt usable *before* mpv answers is the obvious next
-move and is not done: `Mpv::spawn()` is the one blocking call left in
-`Host::start`.
+wim, same machine, for comparison:
+
+```
+    1.545ms  config loaded
+  339.978ms  mpv spawned
+  361.260ms  terminal ready
+  364.435ms  first frame drawn
+ 1361.831ms  graphics probe answered
+```
+
+two things to read off that. first, **`Mpv::spawn()` is ~400ms of
+both numbers** and is the only blocking call left in `Host::start`;
+everything shellswim itself does costs about 4ms, and the frame after
+mpv answers costs another 1ms. the honest statement is that shellswim
+starts in single-digit milliseconds and then waits for mpv. making the
+prompt usable *before* mpv answers is the obvious next move and is not
+done.
+
+second, wim's graphics probe answers at 1.36s, a full second after its
+own first frame, and for that whole second it is a second reader of
+stdin. shellswim has no such line at all.
 
 ## layout
 
