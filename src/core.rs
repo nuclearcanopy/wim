@@ -92,20 +92,28 @@ pub enum Resolution {
 /// queue key on a prolific artist froze the whole ui for the length of
 /// that fan-out.
 ///
-/// Same generation guard as `browse::Loader` and `lyrics::Loader`:
-/// bumped per request and on `invalidate`, checked by the worker before
-/// it sends and again in `poll`, so a batch the user has moved on from
-/// is dropped rather than landing in the queue behind their back. That
-/// last part matters more here than elsewhere: a late arrival does not
-/// just draw something stale, it *mutates the queue*.
+/// Guarded like `browse::Loader` and `lyrics::Loader`, but **the guard
+/// counts queue replacements, not requests**, and that difference is
+/// the whole design. Those two loaders fill one pane, so a newer
+/// request supersedes an older one and latest-wins is right. Queueing
+/// *accumulates*: queueing two albums in a row has to queue both, so a
+/// per-request counter dropped the first one silently (shipped that
+/// way; see ROADMAP).
+///
+/// So only `invalidate` bumps. Every worker captures the epoch it was
+/// spawned in and checks it before sending, and `poll` checks again, so
+/// any number of requests can be in flight at once, and replacing the
+/// queue disowns all of them. That last part matters more here than
+/// elsewhere: a late arrival does not just draw something stale, it
+/// *mutates the queue*.
 pub struct EnqueueResolver {
-    generation: Arc<AtomicU64>,
+    epoch: Arc<AtomicU64>,
     tx: mpsc::Sender<ResolvedBatch>,
     rx: mpsc::Receiver<ResolvedBatch>,
 }
 
 struct ResolvedBatch {
-    generation: u64,
+    epoch: u64,
     into: Enqueue,
     label: String,
     tracks: Result<Vec<SearchItem>, String>,
@@ -121,7 +129,7 @@ impl EnqueueResolver {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
         EnqueueResolver {
-            generation: Arc::new(AtomicU64::new(0)),
+            epoch: Arc::new(AtomicU64::new(0)),
             tx,
             rx,
         }
@@ -140,16 +148,18 @@ impl EnqueueResolver {
             return Resolution::Ready(resolve_tracks(item).unwrap_or_else(|_| vec![item.clone()]));
         }
         let label = item.primary_name().to_string();
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let (item, tx, shared) = (item.clone(), self.tx.clone(), Arc::clone(&self.generation));
+        // read, not bumped: a second request does not supersede the
+        // first, it joins it.
+        let epoch = self.epoch.load(Ordering::SeqCst);
+        let (item, tx, shared) = (item.clone(), self.tx.clone(), Arc::clone(&self.epoch));
         let sent = label.clone();
         thread::spawn(move || {
             let tracks = resolve_tracks(&item);
-            if shared.load(Ordering::SeqCst) != generation {
+            if shared.load(Ordering::SeqCst) != epoch {
                 return;
             }
             let _ = tx.send(ResolvedBatch {
-                generation,
+                epoch,
                 into,
                 label: sent,
                 tracks,
@@ -158,19 +168,21 @@ impl EnqueueResolver {
         Resolution::Fetching(label)
     }
 
-    /// Disowns anything in flight. Called when the queue is cleared or
-    /// replaced, so a batch requested against the old queue cannot
-    /// append itself to the new one.
+    /// Disowns everything in flight, because the queue they were
+    /// resolved against is gone. Called where the queue is replaced
+    /// wholesale (`start_session`) or emptied (`Op::ClearQueue`), not
+    /// per request.
     pub fn invalidate(&mut self) {
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// The next batch belonging to the current request, if one landed.
+    /// The next batch still belonging to the current queue, if one
+    /// landed.
     pub fn poll(&mut self) -> Option<(Enqueue, String, Result<Vec<SearchItem>, String>)> {
-        let current = self.generation.load(Ordering::SeqCst);
+        let current = self.epoch.load(Ordering::SeqCst);
         loop {
             match self.rx.try_recv() {
-                Ok(batch) if batch.generation != current => continue,
+                Ok(batch) if batch.epoch != current => continue,
                 Ok(batch) => return Some((batch.into, batch.label, batch.tracks)),
                 Err(_) => return None,
             }
@@ -178,9 +190,9 @@ impl EnqueueResolver {
     }
 
     #[cfg(test)]
-    fn deliver(&self, generation: u64, into: Enqueue, tracks: Vec<SearchItem>) {
+    fn deliver(&self, epoch: u64, into: Enqueue, tracks: Vec<SearchItem>) {
         let _ = self.tx.send(ResolvedBatch {
-            generation,
+            epoch,
             into,
             label: "test".into(),
             tracks: Ok(tracks),
@@ -188,8 +200,8 @@ impl EnqueueResolver {
     }
 
     #[cfg(test)]
-    fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
     }
 }
 
@@ -1783,6 +1795,9 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             // clearing the queue means; `entries` only mirrors it.
             match core.player.playlist_clear() {
                 Ok(()) => {
+                    // or a batch in flight refills the queue the user
+                    // just emptied, seconds after they emptied it.
+                    core.enqueue_resolver.invalidate();
                     core.queue.replace_upcoming(Vec::new());
                     if let Some(cursor) = surf.queue_cursor() {
                         *cursor = 0;
@@ -2156,6 +2171,10 @@ pub fn start_session(
     let Some(first) = items.first().cloned() else {
         return Err("nothing to play".to_string());
     };
+    // whatever was being resolved for the old queue has nowhere to go
+    // now; without this a slow artist fan-out would land in a session
+    // started after it was asked for.
+    core.enqueue_resolver.invalidate();
     let interrupted = core.queue.current().cloned();
     let (status, played) = load_playlist(
         core.player,
@@ -2838,12 +2857,17 @@ mod seam_tests {
         }
     }
 
-    /// The guard that matters most here. Elsewhere a stale reply draws
-    /// something out of date; a stale batch would **mutate the queue**,
-    /// appending tracks the user asked for against a queue that is
-    /// gone.
+    /// The bug this resolver shipped with, and the reason the guard
+    /// counts queue replacements instead of requests.
+    ///
+    /// Queueing is additive: asking for two albums in a row means
+    /// both. A per-request counter made the second request supersede
+    /// the first, so the first album's tracks were dropped on arrival
+    /// and nothing said so. Queueing an artist then an album is the
+    /// realistic way in, since the artist fan-out is slow enough to
+    /// still be running.
     #[test]
-    fn a_batch_from_a_superseded_request_never_arrives() {
+    fn two_albums_queued_in_a_row_both_arrive() {
         let mut r = EnqueueResolver::new();
         let album = crate::search::SearchItem::Album {
             id: "al1".into(),
@@ -2852,19 +2876,24 @@ mod seam_tests {
             client: crate::browse::tests::test_client(),
         };
         r.request(&album, Enqueue::Back);
-        let stale = r.generation();
+        let first = r.epoch();
         r.request(&album, Enqueue::Back);
 
-        r.deliver(stale, Enqueue::Back, test_songs(3));
-        assert!(
-            r.poll().is_none(),
-            "a batch for a superseded request would append to the queue"
+        r.deliver(first, Enqueue::Back, test_songs(3));
+        r.deliver(r.epoch(), Enqueue::Back, test_songs(2));
+        let landed: Vec<usize> = std::iter::from_fn(|| r.poll())
+            .map(|(_, _, tracks)| tracks.unwrap().len())
+            .collect();
+        assert_eq!(
+            landed,
+            vec![3, 2],
+            "both requests were asked for, so both must land, in order"
         );
     }
 
-    /// Clearing or replacing the queue has to disown anything in
-    /// flight, or a batch requested against the old queue lands in the
-    /// new one.
+    /// Replacing or emptying the queue has to disown what is in
+    /// flight, or a batch resolved against the old queue lands in the
+    /// new one. The only thing that bumps the epoch.
     #[test]
     fn invalidate_disowns_a_batch_in_flight() {
         let mut r = EnqueueResolver::new();
@@ -2875,9 +2904,31 @@ mod seam_tests {
             client: crate::browse::tests::test_client(),
         };
         r.request(&album, Enqueue::Back);
-        let gen = r.generation();
+        let before = r.epoch();
         r.invalidate();
-        r.deliver(gen, Enqueue::Back, test_songs(2));
+        r.deliver(before, Enqueue::Back, test_songs(2));
+        assert!(r.poll().is_none());
+    }
+
+    /// And it disowns *every* one of them, not just the newest: the
+    /// point of dropping the per-request bump is that several can be
+    /// outstanding at once, so clearing the queue has to clear them
+    /// all.
+    #[test]
+    fn invalidate_disowns_every_batch_in_flight_not_just_the_last() {
+        let mut r = EnqueueResolver::new();
+        let album = crate::search::SearchItem::Album {
+            id: "al1".into(),
+            name: "x".into(),
+            artist: "a".into(),
+            client: crate::browse::tests::test_client(),
+        };
+        r.request(&album, Enqueue::Back);
+        r.request(&album, Enqueue::Front);
+        let before = r.epoch();
+        r.invalidate();
+        r.deliver(before, Enqueue::Back, test_songs(2));
+        r.deliver(before, Enqueue::Front, test_songs(4));
         assert!(r.poll().is_none());
     }
 
@@ -2891,8 +2942,7 @@ mod seam_tests {
             client: crate::browse::tests::test_client(),
         };
         r.request(&album, Enqueue::Front);
-        let gen = r.generation();
-        r.deliver(gen, Enqueue::Front, test_songs(2));
+        r.deliver(r.epoch(), Enqueue::Front, test_songs(2));
         let (into, _, tracks) = r.poll().expect("a current batch lands");
         assert_eq!(into, Enqueue::Front, "it must queue where it was asked to");
         assert_eq!(tracks.unwrap().len(), 2);

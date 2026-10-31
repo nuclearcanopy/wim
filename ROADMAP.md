@@ -865,6 +865,34 @@ third.
       drain, for the same reason main.rs has one: the context borrows
       most of `Host` plus two locals, and a method cannot return a
       struct borrowing locals it just made.
+- [x] **that resolver shipped with a bug: queueing two things in a row
+      silently lost the first.** found reading it back, not from a
+      symptom. the generation guard was copied from `browse::Loader`
+      and `lyrics::Loader` wholesale, **including the per-request
+      bump**, which is right for those two and wrong here. they fill
+      one pane, so a newer request supersedes an older one; queueing
+      *accumulates*. so queueing an artist (slow fan-out) and then an
+      album while it ran made the album's request disown the artist's,
+      and the artist's tracks were dropped on arrival with nothing
+      said. the realistic way in, and it would have read as "wim just
+      ignored me".
+      the fix is the guard counting **queue replacements instead of
+      requests**: `request` reads the epoch, only `invalidate` bumps
+      it, and every worker checks the epoch it was spawned in. any
+      number of requests can now be outstanding at once, which is what
+      queueing means.
+      `invalidate` **was dead code until now** -- written for exactly
+      this and never called, which is how the per-request bump went
+      unnoticed: it looked like the guard was doing its job. wired into
+      the two places the queue is replaced wholesale (`start_session`)
+      or emptied (`Op::ClearQueue`), so a batch cannot refill a queue
+      the user just cleared.
+      the test that pinned this is gone, because it pinned the bug as
+      correct ("a batch from a superseded request never arrives", which
+      is precisely the wrong rule). replaced with both albums landing
+      in order, mutation-checked against the old `fetch_add`, plus one
+      that `invalidate` disowns *every* batch in flight rather than
+      only the newest, which only matters now that several can be.
 - [ ] **`Action::Play` on an album or artist still resolves
       synchronously.** the same `EnqueueResolver` shape applies, but
       playing has more to do on arrival than queueing (it loads the
