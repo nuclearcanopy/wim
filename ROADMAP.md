@@ -905,6 +905,42 @@ debounced search thread, and the local-favorites path is a file write.
       accessors; that is the `main.rs` decomposition item's lane. no
       cap was added, deliberately, since any cap is visible at all five
       sites.
+- [x] **catalog parse beyond ~100k rows: measured, and deliberately
+      not parallelised.** 34k, 100k and 300k rows timed. three measured
+      reasons against the fan-out: its own overhead with no parallelism
+      is **25-30% worse than not doing it at 34k**, so it would need a
+      row-count floor this machine was too loaded to calibrate
+      honestly; at the real size the win is tens of ms on a thread that
+      already overlaps the mpv spawn; and at the size that was the
+      worry it does not change the answer, since 100k rows is 300ms+
+      sequential and still 220ms+ threaded, both far past an mpv spawn.
+      that scale wants the parse off the startup path entirely rather
+      than divided by cores. the candidate implementation sits next to
+      the measurement as the evidence.
+      **what shipped instead is the better find:** `CatalogRow` was an
+      internally-tagged serde enum, which serde cannot deserialize in
+      one pass (every row is buffered into a `Content` tree, allocating
+      per field, before the variant is known). a flat struct with a `k`
+      discriminant and `Cow` fields is **identical bytes on disk and a
+      fifth cheaper**, with no machinery, and the old shape is kept as
+      an oracle.
+- [x] **`Corpus::remote_clients`: left an uncached walk, and my own
+      assessment of it was wrong.** i recorded it as "a guard against
+      drift onto a per-frame path, not a present emergency", on the
+      premise that a few milliseconds per keypress are invisible.
+      **the walk was never the cost.** the `HashSet<String>` dedup
+      allocated a `String` per *item* while deduping over one or two
+      servers; comparing `&str` against a `Vec` of servers found so far
+      allocates nothing. 40k items went 4.9ms to 0.8-1.8ms and 150k
+      went 24.3ms to 3.9-4.9ms, so the premise was borderline at 40k
+      and 24ms at 150k would have been a visible per-keypress stutter.
+      no memo, deliberately: it is a pure derivation of the corpus, so
+      a cache would need a hook on every removal path and a missed one
+      would name a server with nothing indexed, which breaks the
+      documented contract rather than merely dropping a frame. the
+      guard is a source scan asserting no `src/ui/*` file asks which
+      servers are live, since what needs preventing is a new call site.
+
 - [x] **album/artist identity joins on ids, with names as the
       fallback** (docs/identity.md). the three losses names caused are
       each fixed and each pinned: two same-titled albums by one artist
