@@ -202,6 +202,10 @@ pub struct PlayerView<'a> {
     pub elapsed_secs: Option<f64>,
     pub duration_secs: Option<f64>,
     pub paused: bool,
+    /// Seconds left of a between-track gap; see
+    /// `ControlsBar::gap_remaining` for why this reads here rather
+    /// than taking the cover panel.
+    pub gap_remaining: Option<f64>,
     pub loop_mode: LoopMode,
     pub shuffle_on: bool,
     pub speed: f64,
@@ -366,12 +370,20 @@ impl PlayerView<'_> {
                 track: None,
                 // lit means "audio is moving", same as the bar: the
                 // play triangle is the bright state.
-                lit: !self.paused,
-                text: match (detail, self.paused) {
-                    (Detail::Glyph, true) => GLYPH_PAUSE.to_string(),
-                    (Detail::Glyph, false) => GLYPH_PLAY.to_string(),
-                    (_, true) => format!("{GLYPH_PAUSE} paused"),
-                    (_, false) => format!("{GLYPH_PLAY} playing"),
+                lit: !self.paused && self.gap_remaining.is_none(),
+                text: match (detail, self.gap_remaining, self.paused) {
+                    // the gap wins the segment: "paused" is true but
+                    // it is not why, and it is not what happens next.
+                    (Detail::Glyph, Some(left), _) => {
+                        format!("{GLYPH_PAUSE}{}", left.max(0.0).ceil() as u64)
+                    }
+                    (_, Some(left), _) => {
+                        format!("{GLYPH_PAUSE} gap {}s", left.max(0.0).ceil() as u64)
+                    }
+                    (Detail::Glyph, None, true) => GLYPH_PAUSE.to_string(),
+                    (Detail::Glyph, None, false) => GLYPH_PLAY.to_string(),
+                    (_, None, true) => format!("{GLYPH_PAUSE} paused"),
+                    (_, None, false) => format!("{GLYPH_PLAY} playing"),
                 },
             },
             Element {
@@ -687,6 +699,7 @@ mod tests {
             art_key: "a:artist\u{1}album",
             art_mode: ArtMode::AsciiBw,
             gap: None,
+            gap_remaining: None,
             cell_aspect: 2.0,
             elapsed_secs: Some(30.0),
             duration_secs: Some(120.0),
@@ -777,6 +790,28 @@ mod tests {
                 "{mode:?} left the rect blank"
             );
         }
+    }
+
+    /// The full player's transport says the same thing the bar does:
+    /// a gap, not a bare "paused" that invites "did I do that?".
+    #[test]
+    fn the_transport_names_a_gap_rather_than_claiming_paused() {
+        let buf = render(90, 24, |v| {
+            v.paused = true;
+            v.gap_remaining = Some(6.2);
+        });
+        let text = grid(&buf);
+        assert!(text.contains("gap 7s"), "{text}");
+        assert!(
+            !text.contains("paused"),
+            "the gap replaces it, not sits beside it:\n{text}"
+        );
+    }
+
+    #[test]
+    fn with_no_gap_the_transport_is_unchanged() {
+        let buf = render(90, 24, |v| v.paused = true);
+        assert!(grid(&buf).contains("paused"));
     }
 
     fn col_of(buf: &Buffer, y: u16, ch: char) -> u16 {

@@ -232,6 +232,16 @@ pub struct ControlsBar<'a> {
     pub eq_active: bool,
     pub crossfade_on: bool,
     pub paused: bool,
+    /// Seconds left of a between-track gap, if one is running.
+    ///
+    /// During a gap mpv really is paused, so without this the bar
+    /// shows a bare pause glyph and the honest reading of the screen
+    /// is "something stopped this". The countdown replaces a
+    /// misleading indicator rather than covering anything up, which is
+    /// also why the gap does not take the album art panel the way
+    /// `silence` does: ten seconds of countdown over the cover, every
+    /// track, would be worse than the problem.
+    pub gap_remaining: Option<f64>,
     /// Playback position the scrubber draws from; while `scrubbing`
     /// this is the pending drag target rather than mpv's own
     /// `time-pos`, so the bar tracks the keypress and not the socket.
@@ -388,12 +398,16 @@ impl ControlsBar<'_> {
             Segment {
                 field: Some(Field::Pause),
                 // lit means "audio is moving", so the play triangle is
-                // the bright state and the pause bars the dim one.
-                lit: !self.paused,
-                body: Body::Glyph(if self.paused {
-                    GLYPH_PAUSE.to_string()
-                } else {
-                    GLYPH_PLAY.to_string()
+                // the bright state and the pause bars the dim one. a
+                // gap is dim too: nothing is moving, it is just going
+                // to on its own.
+                lit: !self.paused && self.gap_remaining.is_none(),
+                body: Body::Glyph(match self.gap_remaining {
+                    // ceil, not round: a gap with any time left reads
+                    // as at least 1s, never a 0s that sits there.
+                    Some(left) => format!("{GLYPH_PAUSE} {}s", left.max(0.0).ceil() as u64),
+                    None if self.paused => GLYPH_PAUSE.to_string(),
+                    None => GLYPH_PLAY.to_string(),
                 }),
             },
             Segment {
@@ -747,6 +761,7 @@ mod tests {
             eq_active: false,
             crossfade_on: false,
             paused: false,
+            gap_remaining: None,
             elapsed_secs: Some(30.0),
             duration_secs: Some(120.0),
             flash: None,
@@ -924,6 +939,59 @@ mod tests {
         assert_eq!(one.cell((digit_col, 1)).unwrap().symbol(), "1");
         let all_next = col_of(&all, 1, GLYPH_LOOP) + 1;
         assert_eq!(all.cell((all_next, 1)).unwrap().symbol(), " ");
+    }
+
+    /// During a gap mpv really is paused, so a bare pause glyph reads
+    /// as "something stopped this". The countdown says what is
+    /// actually happening, and stays dim because nothing is moving.
+    #[test]
+    fn a_gap_counts_down_where_the_pause_glyph_would_be() {
+        let gapping = bar_at(100, 2, |cb| {
+            cb.paused = true;
+            cb.gap_remaining = Some(6.2);
+        });
+        let line = grid(&gapping).lines().nth(1).unwrap().to_string();
+        assert!(line.contains(&format!("{GLYPH_PAUSE} 7s")), "{line}");
+        assert_eq!(fg_of(&gapping, 1, GLYPH_PAUSE), shade(DIM));
+    }
+
+    /// Ceil, not round: any time left reads as at least 1s. A "0s"
+    /// sitting on the bar would look stuck.
+    #[test]
+    fn a_nearly_finished_gap_still_reads_a_whole_second() {
+        let bar = bar_at(100, 2, |cb| {
+            cb.paused = true;
+            cb.gap_remaining = Some(0.2);
+        });
+        let line = grid(&bar).lines().nth(1).unwrap().to_string();
+        assert!(line.contains(&format!("{GLYPH_PAUSE} 1s")), "{line}");
+    }
+
+    /// And with no gap the bar is exactly what it was.
+    /// And with no gap the transport glyph is exactly what it was:
+    /// nothing trails it. Asserted on the cell after the glyph rather
+    /// than on the whole line, which carries other letters.
+    #[test]
+    fn no_gap_leaves_the_transport_glyph_alone() {
+        let playing = bar_at(100, 2, |_| {});
+        let at = col_of(&playing, 1, GLYPH_PLAY);
+        assert_eq!(playing.cell((at + 1, 1)).unwrap().symbol(), " ");
+    }
+
+    /// Prints the bar either way, so the countdown can be read in
+    /// place rather than inferred from a substring match:
+    /// `cargo test --lib controlsbar::tests::print -- --nocapture`.
+    #[test]
+    fn print_the_gap_bar() {
+        for gap in [None, Some(6.2)] {
+            let bar = bar_at(72, 2, |cb| {
+                cb.paused = gap.is_some();
+                cb.gap_remaining = gap;
+                cb.elapsed_secs = Some(44.0);
+                cb.duration_secs = Some(214.0);
+            });
+            println!("--- gap={gap:?}\n{}", grid(&bar));
+        }
     }
 
     #[test]

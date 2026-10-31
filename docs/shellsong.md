@@ -184,6 +184,27 @@ two things it deliberately does not do: it never scrobbles, and it
 never triggers a per-identity eq or volume change, because a gap must
 not change how the next track sounds.
 
+a default pause between *every* track is `gap`:
+
+```
+gap(10s)   ten seconds between tracks from now on
+gap(off)   back to gapless
+```
+
+`gap` takes a `duration`, not a `span`, which is the whole reason the
+two types exist separately: `off` is meaningful here and meaningless
+for `silence`.
+
+it is not implemented by putting a silence between every entry, which
+would double the queue's length and make every index you see wrong.
+mpv holds at the end of each file instead and wim waits the gap out
+before advancing, so the queue stays exactly what you put in it. the
+bottom bar counts the gap down where the play/pause glyph normally
+sits, and pressing play during one skips the rest of it.
+
+`gap` is a session setting, like `crossfade`: `gap_seconds` in the
+config is the value it starts at.
+
 `silence` is its own command rather than something nestable inside
 `queue(...)`: `queue`'s parameter is `terms`, which means "names of
 things in the library", and letting it take a call form would make

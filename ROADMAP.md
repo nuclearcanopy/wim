@@ -1009,17 +1009,48 @@ mpv loaded, a generated silence source included".
       frame or two later, and without the latch that stale `true`
       starts a second gap at once, so every track gets two. two tests
       cover it and both fail when the latch is removed.
-- [ ] **the `gap(10s)` command and the countdown**, the other half.
-      the config field (`gap_seconds`) and the mechanism are in; what
-      is missing is a way to set it without editing toml, and the
-      screen saying a gap is running rather than just showing a
-      paused player. `ui::gap::GapPanel` already draws exactly the
-      right thing for `silence`, and `BetweenTracks::remaining` is
-      already the countdown, so this is wiring plus a command.
-      also wanted: pressing play during a gap should mean "get on with
-      it" and skip the rest of it, since mpv is paused and unpausing
-      would otherwise resume a track that has already ended.
-      `BetweenTracks::cancel` is there for it.
+- [x] **the `gap(10s)` command and the countdown.** `gap(10s)` /
+      `gap(off)`, live for the session the way `crossfade` is, with
+      `config::gap_seconds` as the value it starts at.
+      it takes **`Ty::Duration`, not `Ty::Span`**, which is the whole
+      reason those two types are separate: `off` is meaningful here
+      and meaningless for `silence`. `gap(off)` also drops a hold
+      being waited out right now rather than letting it expire, since
+      "off" should not mean "off after this one".
+      **the ux problem worth naming: during a gap mpv really is
+      paused**, so the bar showed a bare pause glyph and the honest
+      reading of the screen was "something stopped this". the
+      countdown replaces that glyph (`‖ 7s`, dim, since nothing is
+      moving) on the bottom bar, and the full player's transport says
+      `‖ gap 7s` instead of `‖ paused`. ceil, not round, so any time
+      left reads as at least 1s and a stuck-looking "0s" never sits
+      there.
+      **the gap deliberately does *not* take the album art panel**,
+      which `silence` does. ten seconds of countdown thrown over the
+      cover on every single track would be worse than the problem it
+      solves; `silence` earns the panel because it is long and has no
+      cover to displace. the two therefore read differently on
+      purpose.
+      **pressing play during a gap skips the rest of it.** not a
+      flourish: mpv is paused at the end of a track that has already
+      finished, so unpausing resumes nothing and mpv would just report
+      the same end again. routed through `core::toggle_pause` so the
+      keybind, the bar click and enter on the player cannot disagree;
+      `activate_transport` already claimed to be the one place a
+      transport control is acted on, and now the gap case is there too.
+      looked at, not just tested: `controlsbar::tests::print_the_gap_bar`
+      prints the bar both ways, which is how the spacing and the
+      scrubber absorbing the three extra cells were checked.
+- [ ] **`gap` is unverified end to end against real playback.** the
+      mpv mechanism was measured on its own (hold, advance, unpause,
+      and `idle-active` going quiet), and the state machine and both
+      bars are unit-tested, but **nobody has played two real tracks
+      with `gap(10s)` set** and listened to the join. the things to
+      watch: whether the hold is audibly clean at the boundary, that
+      the last track still ends the queue rather than hanging, and
+      that loop-all still restarts (the `keep-open` toggle is what
+      protects both, and it is the part most likely to be subtly
+      wrong).
 
 ### the input-path freeze audit (complete, 2026-10-31)
 

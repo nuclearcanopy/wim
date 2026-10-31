@@ -8,7 +8,7 @@
 //! what a shell cannot show. See docs/library-seam.md and
 //! docs/shellswim.md.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
@@ -141,6 +141,10 @@ fn prompt() -> anyhow::Result<()> {
                 now_playing: &now_playing,
                 now: host.now(),
                 crossfade: host.crossfade_enabled,
+                gap_remaining: host
+                    .between_tracks
+                    .remaining(Instant::now())
+                    .map(|d| d.as_secs_f64()),
             },
         )?;
         if first_frame {
@@ -235,6 +239,9 @@ struct Screen<'a> {
     now_playing: &'a Option<SearchItem>,
     now: Duration,
     crossfade: bool,
+    /// Seconds left of a between-track gap; shellswim is mostly this
+    /// bar, so "paused with no reason given" is most of the screen.
+    gap_remaining: Option<f64>,
 }
 
 fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
@@ -280,6 +287,7 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
                 eq_active: s.app.eq_gains.iter().any(|g| *g != 0.0),
                 crossfade_on: s.crossfade,
                 paused: s.playback.paused,
+                gap_remaining: s.gap_remaining,
                 elapsed_secs: s.playback.elapsed_secs,
                 // the entry's own length where it knows better than
                 // mpv, which is a generated silence; see
