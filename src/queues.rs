@@ -58,14 +58,8 @@ pub enum Dropped {
 }
 
 impl Dropped {
-    /// One line naming what was lost and why, for a notification.
-    ///
-    /// Unused in the binary until `load_queue`'s handler in main.rs
-    /// adopts `load_report`, which is a `main.rs` change queued behind
-    /// the library split; the reasons and their tests are the
-    /// deliverable here. Same `cfg_attr` shape `video::Hole` and
-    /// `lyrics::Loader` use for a prepared primitive.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// One line naming what was lost and why, for the single-loss
+    /// case; `summarise` groups instead once there are several.
     pub fn describe(&self) -> String {
         match self {
             Dropped::Moved(title) => format!("{title}: file moved or gone"),
@@ -73,6 +67,38 @@ impl Dropped {
             Dropped::Unrecognised(title) => format!("{title}: unrecognised entry"),
         }
     }
+}
+
+/// What a load lost, in one line, for the status line a command is
+/// allowed (docs/shellsong.md R9).
+///
+/// One loss names itself, because the title is the useful part when
+/// there is only one. Several group by reason and count, because
+/// forty titles is not a status line and "38 missing" with no reason
+/// is the silent-shortening this exists to end.
+pub fn summarise(dropped: &[Dropped]) -> String {
+    if let [only] = dropped {
+        return only.describe();
+    }
+    let (mut moved, mut gone, mut odd) = (0usize, 0usize, 0usize);
+    for d in dropped {
+        match d {
+            Dropped::Moved(_) => moved += 1,
+            Dropped::ServerGone(_) => gone += 1,
+            Dropped::Unrecognised(_) => odd += 1,
+        }
+    }
+    let mut parts = Vec::new();
+    if gone > 0 {
+        parts.push(format!("{gone} with no configured server"));
+    }
+    if moved > 0 {
+        parts.push(format!("{moved} moved or gone"));
+    }
+    if odd > 0 {
+        parts.push(format!("{odd} unrecognised"));
+    }
+    parts.join(", ")
 }
 
 /// A load, including what it could not rebuild.
@@ -480,5 +506,39 @@ album = "y"
         })
         .unwrap();
         assert!(toml.contains("kind = \"remote\""), "{toml}");
+    }
+
+    #[test]
+    fn one_loss_names_itself_because_the_title_is_the_useful_part() {
+        let summary = summarise(&[Dropped::Moved("crest".into())]);
+        assert_eq!(summary, "crest: file moved or gone");
+    }
+
+    /// Forty titles is not a status line, so several group by reason.
+    #[test]
+    fn several_losses_group_by_reason_and_count() {
+        let dropped = vec![
+            Dropped::ServerGone("a".into()),
+            Dropped::ServerGone("b".into()),
+            Dropped::Moved("c".into()),
+        ];
+        assert_eq!(
+            summarise(&dropped),
+            "2 with no configured server, 1 moved or gone"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_entry_is_counted_separately() {
+        let dropped = vec![
+            Dropped::Unrecognised("x".into()),
+            Dropped::Unrecognised("y".into()),
+        ];
+        assert_eq!(summarise(&dropped), "2 unrecognised");
+    }
+
+    #[test]
+    fn nothing_lost_summarises_to_nothing() {
+        assert_eq!(summarise(&[]), "");
     }
 }

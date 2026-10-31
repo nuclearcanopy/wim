@@ -818,9 +818,14 @@ mpv loaded, a generated silence source included".
         unrecognised), `load` delegates to it so nothing changed for
         existing callers, and all four reasons fail their tests if the
         silent drop is restored.
-        still to do, and it needs `main.rs`: `load_queue`'s handler
-        should call `load_report` and put the losses on the status line
-        instead of quietly handing over a shorter queue.
+        **done:** `load_queue` calls `load_report` now and says what it
+        lost. one loss names itself, since the title is the useful part
+        when there is only one; several group by reason and count,
+        because forty titles is not a status line and a bare "38
+        missing" with no reason is most of the way back to the silent
+        shortening. a queue that loads nothing distinguishes "it is
+        empty" from "nothing in it loaded: 38 with no configured
+        server".
 
 ### the input-path freeze audit (complete, 2026-10-31)
 
