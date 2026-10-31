@@ -3738,6 +3738,20 @@ fn main() -> anyhow::Result<()> {
         // belonging to a superseded request, which matters more here
         // than elsewhere: a late arrival would not just draw something
         // stale, it would append to the queue behind the user's back.
+        // the undo tree's root, planted once before any key is read.
+        // it cannot be planted lazily from `dispatch_action` the way
+        // `apply_op` does it: `app.handle_key` has already applied
+        // loop/shuffle/speed by the time an action arrives, so a
+        // "before" captured there is really an "after", and undoing
+        // the first keypress of a session would restore what it had
+        // just left.
+        if undo_tree.is_unrooted() {
+            let core = core_ctx!();
+            let root = wim::undo::Snapshot::capture(&core);
+            let now = core.now;
+            core.undo.plant(root, now);
+        }
+
         while let Some((into, label, tracks)) = track_resolver.poll() {
             let mut surf = wim_surface!();
             let mut core = core_ctx!();
