@@ -1,9 +1,11 @@
 //! Fullscreen video: mpv draws it, wim stops drawing.
 //!
-//! Nothing here rasterizes a frame. mpv has terminal video outputs of
-//! its own (`tct`, `kitty`) and this module only decides which one to
-//! ask for; see `docs/video.md` for why pulling frames out of mpv over
-//! json ipc is not an option.
+//! Nothing here rasterizes a frame, which is a division of labour and
+//! not a limitation: mpv has terminal video outputs of its own (`tct`,
+//! `kitty`) and this module only picks which one to ask for. wim's own
+//! frames come from `crate::framesource`. The one thing that is
+//! genuinely impossible is `screenshot-raw` over the json ipc socket,
+//! and only that; see `docs/video.md` for both halves.
 
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::Rect;

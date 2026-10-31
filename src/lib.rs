@@ -17,6 +17,7 @@ pub mod eq;
 pub mod eq_menu_keys;
 pub mod favorites;
 pub mod focus;
+pub mod framesource;
 pub mod graphics;
 pub mod hit;
 pub mod keymap;

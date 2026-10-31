@@ -10,8 +10,11 @@ ever crosses the ipc socket.
 
 that last clause is about the *json ipc socket* and nothing wider. a
 frame source for an ascii renderer does exist; four of them do, three
-measured working on this machine. see "a frame source does exist"
-below, and `examples/frame_probe.rs` for one that runs.
+measured working on this machine, and one of them is **built**:
+`src/framesource.rs`, a second headless mpv on a fifo. see "a frame
+source does exist" for the comparison, "the frame source as built" for
+the module, and `examples/frame_probe.rs` for the 150-line prototype
+the module came out of.
 
 ## why `screenshot-raw` cannot come over json ipc
 
@@ -102,7 +105,12 @@ that is not disk latency, it is mpv no longer waiting for anything.
 instance's vo it is strictly worse than rawvideo (a png encode and a
 file per frame instead of neither).
 
-### the recommended source: a second mpv writing rawvideo to a fifo
+### the chosen source: a second mpv writing rawvideo to a fifo
+
+**this is built: `src/framesource.rs`.** the sketch below is the
+prototype's version of the command; the shipped filter chain differs in
+one way that matters, see "the filter chain is not the prototype's"
+below.
 
 ```
 mpv --no-config --no-terminal
@@ -176,6 +184,220 @@ the costs, stated plainly:
 - **no new nix dependency.** mpv is already a runtime `PATH` dep via
   the flake's `wrapProgram`, nothing is linked, and `src/mpv.rs` does
   not change: mpv stays a subprocess.
+
+## the frame source as built
+
+`src/framesource.rs`, plus `tests/framesource_alloc.rs` for the one
+measurement that needs its own allocator. three types and no more:
+
+- **`Grid`** is a cell rect plus the terminal's cell aspect, and it
+  owns all the geometry: `pixels()` is the frame size handed to mpv,
+  `frame_len()` is exactly how many bytes a frame is, and `vf()` is the
+  filter chain. nothing else computes a size.
+- **`Schedule`** is the arithmetic, and it is pure: `step(now)` answers
+  `Hold`, `Advance(n)` or `Restart(at)` for a media time, with no io
+  anywhere near it. every sync decision is testable without spawning
+  anything, which is most of the test file.
+- **`FrameSource`** owns the child, the fifo, the temp dir and the read
+  loop. `pull()` takes whatever has arrived, `advance_to(now)` is the
+  one call a host needs per ui frame, `restart(at)` is a seek,
+  `resize(grid)` follows a pane, and `Drop` takes all of it down.
+
+`paint()` goes through `ui::raster`, the album-art rasterizer, with
+**no change to it at all**. that was not the expected answer: `raster`
+takes a `&DynamicImage` and the frames are raw bytes. the trick is that
+`FrameSource` keeps its two buffers *as* `DynamicImage::ImageRgb8` and
+reads the fifo straight into one of them, so handing a frame to the
+rasterizer is a borrow, not a conversion. `raster` is a 2x2 quadrant
+rasterizer (its own module doc and docs/raster.md still say
+half-blocks; they are stale), so `Grid` asks mpv for `2cols x 2rows`
+pixels and paints with `Fit::Stretch`, which at that size is a 1:1 copy
+with nothing left to resample. a half-block renderer is the same code
+with `cols x 2rows`: each cell's two horizontal samples then come from
+one source column, `quantize` can only pick the top/bottom split, and
+`QUADRANTS` degenerates to `▀`/`▄`/`█`. no second rasterizer.
+
+### the filter chain is not the prototype's
+
+the prototype letterboxed for **square pixels**, and a terminal cell is
+not square. the shipped chain is two scales:
+
+```
+scale=2cols:H:force_original_aspect_ratio=decrease,
+pad=2cols:H:-1:-1:color=black,
+scale=2cols:2rows,format=rgb24          where H = round(2rows * cell_aspect)
+```
+
+fit the picture inside the sample grid's *physical* shape, pad to that,
+then squash by exactly the cell aspect to land on the sample grid.
+measured, a 16:9 source into a 160x48 cell grid (320x96 samples):
+
+| chain | lit sample rows | lit sample columns |
+| --- | --- | --- |
+| two scales (shipped) | 90 of 96 | 320 of 320 |
+| one scale (prototype) | 96 of 96 | 170 of 320 |
+
+the prototype's version pillarboxes a widescreen source and stretches
+it 2x vertically. the 94.8%-non-black figure recorded above for the
+probe is consistent with that: it is correct only if 320x192 is
+displayed as square pixels, which in a terminal it never is. the second
+scale costs nothing measurable (it is 320x192 to 320x96, against a
+1080p decode). `pad` still does the job it did: every frame is the same
+size whatever the source aspect is, so the reader never renegotiates.
+
+### three things the prototype could not have found
+
+**the fifo gotcha was real and is handled**: `Ok(0)` on a fifo with no
+writer yet is a clean eof, not `WouldBlock`, so zero means "wait" and
+only `try_wait` on the child says it is over. a mutation that reads
+zero as eof is caught.
+
+**a media time exactly on a frame boundary used to stall forever.**
+this is the bug worth knowing about, because it is invisible until it
+is total. `step` turns a media time into a frame index by flooring
+`(now - start) * fps`, a host drives `now` from `time-pos`, which lands
+on exact frame boundaries, and `7.0 / 25.0 * 25.0` is
+`6.999999999999999`. floored, that names the frame already on screen,
+so `step` says hold, so nothing is read, so `time-pos` never moves
+either: a permanent freeze, at frame 29 for 25fps. `FRAME_EPS`, a
+millionth of a frame on the floor, is the fix; the resolution of the
+whole scheme is one frame, so it costs nothing.
+
+**`--hr-seek` is a pin, not a fix.** `--start=5.37` on a 300-frame
+1080p h264 file: mpv's *default* lands on frame 161 (t=5.3667, exact),
+`--hr-seek=no` lands on frame **0**, a 5.4 second error, because the
+only keyframe before it is the first one. so the default is already
+right and `--hr-seek=yes` only stops that changing. a wrong `start` is
+a permanent sync offset rather than a glitch, which is why it is named
+rather than left implicit. note the corollary for the arithmetic: mpv
+lands on `floor(start * fps)`, so `Schedule::new` snaps `start` onto
+the frame grid, or every frame time is wrong by up to a frame for the
+life of the instance. and `--start=0` is still a *seek*, which drops
+the first frame, so `--start` is omitted when it would be zero.
+
+### teardown, including the paths `Drop` does not reach
+
+`Drop` kills this source's own child by its own pid, reaps it, closes
+the read end and removes the fifo and the temp dir. never a
+pattern-matched kill; nothing it did not spawn.
+
+`Drop` runs while unwinding, so a panic is covered, which is what
+`src/term.rs`'s guard discipline needs: the terminal restore would
+otherwise be outlived by a decoder writing into a dead pipe. for the
+paths that skip `Drop` entirely (`abort`, `process::exit`) there is a
+second line of defence that costs nothing: the kernel closes the read
+end at exit anyway, and **a frame instance with no reader takes SIGPIPE
+on its next write.** measured, exit status 141. so a leaked instance is
+bounded by one pipe buffer of work, not by the length of the film.
+
+### the numbers
+
+mpv 0.41.0, real h264 generated with `--ovc=libx264 preset=veryfast
+crf=28`, `cargo test --release -- --ignored --nocapture
+bench_frame_source`. "decode" is `RUSAGE_CHILDREN`, i.e. mpv's own cpu,
+which does not appear in this process at all; "read" and "raster" are
+`CLOCK_PROCESS_CPUTIME_ID`, i.e. wim's.
+
+ranges are two runs, one on an idle machine and one with the rest of
+the repo compiling beside it; the cpu-time columns barely move between
+them, which is the point of measuring cpu rather than wall clock.
+
+| source | cell grid | ceiling | decode | read | raster | rss |
+| --- | --- | --- | --- | --- | --- | --- |
+| 640x480@25 | 80x24 | 568-804 fps | 2.9-3.1 ms/f | 24 µs/f | 228-233 µs/f | 70 MB |
+| 640x480@25 | 160x48 | 349-633 fps | 3.8-3.9 ms/f | 56-61 µs/f | 0.56-0.93 ms/f | 71 MB |
+| 640x480@25 | 320x96 | 314-451 fps | 5.5-5.6 ms/f | 162-190 µs/f | 2.1-3.7 ms/f | 73 MB |
+| 1920x1080@30 | 80x24 | 230-284 fps | 11.9-12.4 ms/f | 43-47 µs/f | 126-241 µs/f | 115 MB |
+| 1920x1080@30 | 160x48 | 170-268 fps | 13.1-13.4 ms/f | 75-76 µs/f | 0.56-0.96 ms/f | 117 MB |
+| 1920x1080@30 | 320x96 | 137-189 fps | 15.7-16.1 ms/f | 182-186 µs/f | 3.4-3.9 ms/f | 120 MB |
+
+read at 24fps on the worst row: mpv is 16ms x 24 = **38-39% of one
+core**, which is exactly the figure recorded for 320x192 above; wim's
+reads are **0.4%** and wim's rasterization is **8-9%**. so the decode
+dominates by an order of magnitude and it is in another process; wim's
+own share of a 320x96 cell grid at video rate is under a tenth of a
+core, and the frame-budget item's fear of cooking a core turns out to
+be about the decode, which `--vf=scale` already bounded.
+
+the ceiling is 137-189fps on the 1080p file, i.e. 4.6-6.3x real time,
+so catching up by read-and-discard is genuinely faster than playing,
+which is what makes `Step::Advance` a real option rather than a stall.
+
+per cell, rasterization is 2.1-3.9ms for 30720 cells (68-127ns),
+0.56-0.96ms for 7680 (73-125ns) and 126-241µs for 1920 (66-125ns), so
+it is linear in cells and the grid size is not hiding a cliff. note
+`raster`'s unsharp pass is unconditional and not switchable, so it is
+inside those numbers; for a 1:1 frame it is pure cost, and making it
+optional is the one plausible win left on wim's side of the budget.
+
+**allocations per frame: zero, counted.** `tests/framesource_alloc.rs`
+wraps `System` in a counting `GlobalAlloc` and reports 0 allocations
+and 0 bytes over 50 frames at both 40x20 and 160x48, read and painted.
+it is a separate test binary because a `#[global_allocator]` is
+per-binary and in the lib's test binary the counters would be a race
+with whatever ran in parallel. the three suspects the roadmap names are
+all structurally absent: mpv downscales once to the cell grid, the read
+goes into a pre-sized buffer, completing a frame swaps two pointers,
+and `raster`'s scratch is thread-local and kept. the only allocating
+operations on the whole surface are `spawn` and `resize`.
+
+a dead end worth recording, because it looked like the cheap proof:
+pointer identity **cannot** tell a swap from a copy. mutating
+`mem::swap(&mut front, &mut back)` into `front = back.clone()` still
+alternates between exactly two addresses, because the clone allocates
+while the old buffer is live (so it cannot reuse that chunk) and the
+next frame's clone gets the chunk just freed. the pointer test passes
+on the mutant; only the counter catches it.
+
+### what a seek costs
+
+`bench_restart`, best and worst of six respawns:
+
+| source | cell grid | best | worst | worst, machine busy |
+| --- | --- | --- | --- | --- |
+| 640x480@25 | 80x24 | 156 ms | 254 ms | 593 ms |
+| 640x480@25 | 320x96 | 208 ms | 313 ms | 749 ms |
+| 1920x1080@30 | 80x24 | 304 ms | 593 ms | 974 ms |
+| 1920x1080@30 | 160x48 | 405 ms | 1.05 s | 1.07 s |
+| 1920x1080@30 | 320x96 | 430 ms | 1.48 s | 1.86 s |
+
+unlike the cpu columns this one is wall clock and has to be, since what
+is being measured is how long the pane is black; it therefore moves a
+lot with machine load, which the last column is.
+
+worse at the top end than the 180-550ms recorded from the probe: a
+respawn is a process start, a demuxer open, an exact seek and a first
+decode, and at 1080p the tail is over a second. that is the design's
+one real wart and it is why `Schedule::step` would rather read than
+restart. the threshold is `MAX_CATCHUP = 1.0`s: closing a `g`-second
+gap by read-and-discard costs about `g / 5.7` seconds at 1080p, so
+break-even against a ~400ms respawn is around a second, and a catch-up
+at least keeps the picture moving where a respawn blanks it.
+
+a backwards seek smaller than the same limit **holds** rather than
+respawning: the frame on screen is a little way into the future and the
+clock walks back up to it, which costs nothing and beats a third of a
+second of black.
+
+### colour or monochrome: not decided here
+
+`FrameSource::paint` takes a `raster::Tone`, so colour and greyscale
+are the same call with a different argument and both work today
+(tested, both ways). the default this ships with is `Tone::Mono`,
+which is what `src/ui/albumart.rs` already says the video pane does:
+"`Tone::Mono` everywhere but the album-art `ascii-color` mode; the
+video pane stays monochrome with the rest of the ui".
+
+that matches the existing rule rather than settling it. the rule in
+docs/architecture.md is that album art is the *one* sanctioned
+exception to the monochrome ui, authorised by the maintainer directly,
+and the exemption video already has in this file is narrower than it
+looks: it covers **mpv's** pixels, drawn by `tct`/`kitty`, on the
+grounds that they are not wim's. an ascii renderer paints wim's own
+cells, so it is not covered by that, and a second exception is the
+maintainer's call. nothing needs to change to take it either way; if
+colour is allowed it wants a config variant next to `AlbumArtMode`'s
+`ascii-bw`/`ascii-color` pair, following `browse::ArtMode::tone()`.
 
 ### the two that also work, and why they are not it
 
