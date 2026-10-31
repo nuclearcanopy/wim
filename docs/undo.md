@@ -93,18 +93,67 @@ A snapshot is:
 - the play queue: entries in order, plus `pos` (order matters on its
   own, because `ToggleShuffle` reshuffles rather than just setting a
   flag),
-- `paused`, volume, mute,
+- the skip-back target, which is not part of the queue: wim keeps one
+  step of history beside it (`core::go_to_previous`), and `next` moves
+  it,
+- `base_volume` and mute,
 - loop mode, shuffle flag,
 - speed,
-- eq `Source` plus the live gains (both: a nudged curve is "rock,
-  modified" and the name alone would lose the nudge),
+- eq `Source`, the live gains, **and the modified flag** (all three: a
+  nudged curve is "rock, modified", the name alone would lose the
+  nudge, and the flag alone would leave a restored clean curve reading
+  "rock (modified)"),
 - crossfade on/off,
 - the search query,
-- any live sleep timer or fade.
+- any live sleep timer,
+- the live `let` scope and the per-identity bindings; see the
+  classification section for why those are not barriers.
 
 Plus, per node: the label from `Op::describe()`, which every op already
 has, so the tree gets human-readable rows for free; a timestamp; the
 parent; and the children in visit order.
+
+### what is deliberately not in a snapshot
+
+This list said `paused` and "any live fade" were in, and both are
+wrong; each would make undo worse.
+
+- **`paused`.** `TogglePause` is undoable and it is, but *restoring* it
+  is not what anyone wants: undo would start or stop the music as a
+  side effect of reversing something else, which reads as a bug.
+  Pressing play is already the undo of pressing pause. It is also the
+  one piece of this that drifts out of band: a track ending, a gap
+  hold and `activate_transport`'s own keypress all move it without an
+  op, so a snapshot of it is stale as often as not.
+- **a live fade.** A `Ramp` is a position in a transition, not state;
+  restoring one mid-flight would resume a fade towards a volume nobody
+  asked for any more.
+- **mpv's instantaneous volume.** `base_volume` is what was *asked
+  for*; the crossfade ramp moves the real one around it every frame, so
+  restoring the live value captures a ramp artefact as if it were a
+  decision. Same reasoning as `track_started`'s restore point.
+
+**`mute` is in, and it is the one ipc read `capture` makes.** It has no
+host-side mirror: `Op::Mute` is a single `set_property` and mpv is the
+only place the state lives, so capturing it means a blocking
+`get_property`. That read is what `paused` and the live volume were
+refused on, and the difference is that mute cannot drift: `mute()` and
+`unmute()` are its only mutation and both are recorded ops, so one read
+per recorded op (not per frame) buys a value that is always the one the
+user chose. The cost is one round trip, which `src/mpv.rs` puts at
+~2ms and `Mpv::command` bounds with `REPLY_TIMEOUT`, so a wedged mpv
+costs the timeout once and not a hang. It is an `Option<bool>`, so a
+read mpv would not answer leaves the restore alone rather than guessing
+"unmuted" and unmuting.
+A host-side `muted` mirror on `CoreCtx` would remove the read
+entirely and is the better shape if anything else ever needs the
+state; it is a core.rs change, so it is not done here.
+
+Unrelated and worth writing down somewhere: **there is no mute
+indicator anywhere in the ui.** `mute` appears in no widget, so muted
+and "volume is at zero for some other reason" are indistinguishable on
+screen, and undoing a mute has no visible confirmation beyond the
+sound coming back.
 
 The snapshot is the state **after** the op applied, and the root holds
 the state the session started in.
@@ -223,6 +272,90 @@ Without this the tree fills with noise and the feature dies.
 skip: restore entries and position, and **do not restart the current
 track if it survives the restore**. Only reload mpv's playlist when the
 restored queue's current entry differs from what is playing.
+
+## what a restore owes the rest of the app
+
+A snapshot restore is not just a write of fields. Three obligations
+belong to whoever rewrites that state, and `Snapshot::restore` had
+missed all three; each was reachable by a sequence anyone would type.
+
+**1. Disown whatever is still being resolved.** `TrackResolver` fans an
+album or artist out off-thread and the batch lands later, in
+`append_resolved`, which *mutates the queue*. Any restore replaces the
+queue, so every in-flight batch has to be disowned, which is what
+`TrackResolver::invalidate` is for (`start_session` does the same, for
+the same reason). This was written per branch and the restart branch
+did not have it: queue a prolific artist, press next, undo, and the
+fan-out lands seconds after the undo finished and appends the whole
+discography with a "queued 847 tracks" toast, visibly un-doing the
+undo. The call now sits above the branching, once, because a guard
+each branch has to remember is a guard one branch will forget.
+`undo::contract` pins that at the source level, since the behavioural
+test needs a live mpv.
+
+**2. Kick the debounced remote search.** `App::set_query` only
+re-filters the corpus already indexed; firing the remote `search3` is
+stated as the caller's job (`src/app.rs`), and `core.rs`'s `Op::Search`
+and main.rs's two typing paths all do it. A restore that only wrote the
+text brought the query back with every remote title missing, while
+`SearchSettle` still reported settled because nothing had told it a
+request was outstanding; a `play(selection)` right after then resolved
+against the short list. So the restore does the same three lines every
+other caller does: `set_query`, `notify_query_changed`,
+`settle.notified`.
+
+**3. Fire the track-start hooks when it restarts a track. Not done
+yet, and it needs a `Surface`.** `core::track_started` exists precisely
+so the hook set is in one place; `start_session` is `load_playlist` plus
+`track_started` plus carrying the per-identity ops on through
+`Surface::queue_program`. The restart branch calls `load_playlist`
+directly, so a restored track gets no subtitle fetch, no playing-now
+submission, a `listened_at` from whenever the previous track started,
+and none of its bound eq/volume/speed.
+
+Calling `track_started` from `restore` as it stands would be worse than
+the gap, which is why it is not done: `identity_settings` mutates
+`Overridden` as it decides what to apply and hands the actual changes
+back as ops. With nowhere to put them (`restore` has no surface) the
+ops are dropped while `Overridden` has already recorded them as
+applied, so the *next* unbound track restores to a value that was never
+set.
+
+The fix is to thread the surface in, which is small: both call sites
+already hold one (`run_op` takes `surf`, and main.rs's branch-switch
+key builds `wim_surface!()` right before `core_ctx!()`).
+
+```
+-    pub fn restore(&self, core: &mut CoreCtx) -> Result<(), String> {
++    pub fn restore(&self, core: &mut CoreCtx, surf: &mut dyn Surface) -> …
+-        let (status, played) = load_playlist(…, SessionStart::Keep);
+-        if played { Ok(()) } else { Err(status) }
++        restart_session(items, core, surf).map(|_| ())
+```
+
+Two consequences to settle when it is, neither a no-op:
+
+- `start_session` ends with `surf.minimize_player(minimize)`, which in
+  wim writes `player_minimized`. An undo must not move that: it is the
+  pane layout, not undoable state. So the usable shape is a split, with
+  the load-plus-hooks half (`restart_session`, say) called by both
+  `start_session` and the restore, and only `start_session` touching
+  the pane.
+- `start_session` hardcodes `SessionStart::New`, where the restart
+  branch uses `Keep`. `New` resets `PlayQueue::session`, which is
+  loop-all's restart point. `New` is the better answer and worth
+  taking deliberately: with `Keep`, playing album A, then clearing and
+  playing album B, then undoing leaves the queue on A while loop-all
+  still restarts B.
+
+### the snapshot's own test harness
+
+The behavioural tests for all of this build a `CoreCtx`, which holds a
+live mpv handle, so they spawn one and are `#[ignore]`d like core.rs's
+seam tests. They also need a `CoreCtx` harness, and core.rs's is
+private to that module's tests, so `src/undo.rs` has a near-copy.
+Promoting one shared harness (a `pub(crate) mod fixtures` beside
+`browse::fixtures`) is the obvious cleanup and is a core.rs change.
 
 ## the tree view
 
