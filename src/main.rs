@@ -233,6 +233,30 @@ impl Surface for WimSurface<'_> {
     }
 }
 
+/// How long the sleep timer's fade-out runs for, which is the
+/// crossfade length. Clamped on the way in because this value comes
+/// from the config file: `Duration::from_secs_f64` aborts the process
+/// on a negative, nan or infinite one, and the settings menu only ever
+/// bounded its own steps.
+fn fade_span(secs: f64) -> Duration {
+    Duration::from_secs_f64(config::crossfade_seconds(secs))
+}
+
+/// Where a cursor over `count` rows lands after `step`. The one rule
+/// for it: every list pane and every j/k copy goes through here, so
+/// there is no second version to get the empty case wrong. Stays in
+/// usize and saturates, so an empty list has no negative last row and
+/// a cursor left past the end comes back to it.
+fn step_in_list(at: usize, count: usize, step: SelectStep) -> usize {
+    let last = count.saturating_sub(1);
+    match step {
+        SelectStep::By(d) if d < 0 => at.saturating_sub(d.unsigned_abs() as usize).min(last),
+        SelectStep::By(d) => at.saturating_add(d as usize).min(last),
+        SelectStep::Top => 0,
+        SelectStep::Bottom => last,
+    }
+}
+
 /// The selection `up()`/`down()`/`top()`/`bottom()` move is whichever
 /// pane owns the keyboard, exactly as j/k and gg/G do: a focused
 /// browse view, suggestions menu or queue view owns its own cursor,
@@ -268,14 +292,8 @@ fn move_wim_selection(
             return op_done();
         }
         if let Some(sug) = surf.suggestions.as_ref() {
-            let last = ui::suggestions::count(sug).saturating_sub(1) as i64;
-            let at = *surf.suggestions_selected as i64;
-            let to = match step {
-                SelectStep::By(d) => (at + i64::from(d)).clamp(0, last),
-                SelectStep::Top => 0,
-                SelectStep::Bottom => last,
-            };
-            *surf.suggestions_selected = to as usize;
+            let count = ui::suggestions::count(sug);
+            *surf.suggestions_selected = step_in_list(*surf.suggestions_selected, count, step);
             return op_done();
         }
         if *surf.queue_view_open {
@@ -286,14 +304,8 @@ fn move_wim_selection(
             let at = order
                 .iter()
                 .position(|i| *i == *surf.queue_selected)
-                .unwrap_or(0) as i64;
-            let last = order.len() as i64 - 1;
-            let to = match step {
-                SelectStep::By(d) => (at + i64::from(d)).clamp(0, last),
-                SelectStep::Top => 0,
-                SelectStep::Bottom => last,
-            };
-            *surf.queue_selected = order[to as usize];
+                .unwrap_or(0);
+            *surf.queue_selected = order[step_in_list(at, order.len(), step)];
             return op_done();
         }
     }
@@ -562,7 +574,13 @@ fn main() -> anyhow::Result<()> {
     }
     trace::init();
     let is_first_run = !config::config_path()?.exists();
-    let mut cfg = config::load_or_init()?;
+    // held until the notification area exists (the terminal is not up
+    // yet), then said once: a key nothing reads, a number that had to
+    // be corrected, a credential file that would not open.
+    let config::Loaded {
+        mut cfg,
+        warnings: config_warnings,
+    } = config::load_reporting()?;
     trace::mark("config loaded");
     // the local scan is the biggest single startup cost (a blocking tag
     // read per music file); it streams into the corpus from its own
@@ -718,6 +736,9 @@ fn main() -> anyhow::Result<()> {
     // ring (just truncate the front) rather than growing forever.
     let mut level_history: Vec<f32> = Vec::new();
     let mut notifications = Notifications::default();
+    for warning in config_warnings {
+        notifications.push(Severity::Alert, warning);
+    }
     // track play counts/last-played/on-disk cache state (cache.rs);
     // shared with background download threads, so it's behind a
     // mutex rather than owned outright the way `app`/`player` are.
@@ -2510,7 +2531,7 @@ fn main() -> anyhow::Result<()> {
             let _ = player.set_pause(false);
         }
         if let Some(due) = sleep_due {
-            let fade_over = Duration::from_secs_f64(cfg.crossfade_seconds);
+            let fade_over = fade_span(cfg.crossfade_seconds);
             match shellsong_host::sleep_step(due, fade_over, base_volume, shellsong_now) {
                 SleepStep::Waiting => {}
                 SleepStep::Fading(level) => {
@@ -3343,10 +3364,12 @@ fn main() -> anyhow::Result<()> {
                             crossfade_enabled = true;
                         }
                         KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 2 => {
-                            cfg.crossfade_seconds = (cfg.crossfade_seconds - 0.5).clamp(1.0, 15.0);
+                            cfg.crossfade_seconds =
+                                config::crossfade_seconds(cfg.crossfade_seconds - 0.5);
                         }
                         KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 2 => {
-                            cfg.crossfade_seconds = (cfg.crossfade_seconds + 0.5).clamp(1.0, 15.0);
+                            cfg.crossfade_seconds =
+                                config::crossfade_seconds(cfg.crossfade_seconds + 0.5);
                         }
                         KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 3 => {
                             cfg.cache_days_threshold =
@@ -4084,10 +4107,11 @@ fn main() -> anyhow::Result<()> {
                     match key.code {
                         KeyCode::Char('j') | KeyCode::Down => {
                             suggestions_selected =
-                                (suggestions_selected + 1).min(total.saturating_sub(1));
+                                step_in_list(suggestions_selected, total, SelectStep::By(1));
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
-                            suggestions_selected = suggestions_selected.saturating_sub(1);
+                            suggestions_selected =
+                                step_in_list(suggestions_selected, total, SelectStep::By(-1));
                         }
                         KeyCode::Enter => {
                             // a suggestion is a plain SearchItem, so
@@ -4720,6 +4744,65 @@ mod video_wiring_tests {
             Some(library::MediaKind::Music),
             "music must not classify as video"
         );
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    /// `: view(suggestions)` installs the pane and takes focus even
+    /// with nothing to suggest (a cold or empty corpus), so every move
+    /// below is one keypress away from that. The clamp this rule
+    /// replaced took `0..=-1` and aborted the process on `: down()`,
+    /// and `: bottom()` wrote usize::MAX into the cursor.
+    #[test]
+    fn an_empty_list_has_nowhere_to_move_to() {
+        assert_eq!(step_in_list(0, 0, SelectStep::By(1)), 0);
+        assert_eq!(step_in_list(0, 0, SelectStep::By(-1)), 0);
+        assert_eq!(step_in_list(0, 0, SelectStep::Top), 0);
+        assert_eq!(step_in_list(0, 0, SelectStep::Bottom), 0);
+    }
+
+    #[test]
+    fn a_step_stops_at_each_end_rather_than_wrapping() {
+        assert_eq!(step_in_list(1, 3, SelectStep::By(1)), 2);
+        assert_eq!(step_in_list(2, 3, SelectStep::By(1)), 2);
+        assert_eq!(step_in_list(1, 3, SelectStep::By(-1)), 0);
+        assert_eq!(step_in_list(0, 3, SelectStep::By(-1)), 0);
+        assert_eq!(step_in_list(0, 3, SelectStep::Bottom), 2);
+        assert_eq!(step_in_list(2, 3, SelectStep::Top), 0);
+        // a page jump lands on the end it ran into, not past it.
+        assert_eq!(step_in_list(0, 3, SelectStep::By(10)), 2);
+        assert_eq!(step_in_list(2, 3, SelectStep::By(-10)), 0);
+    }
+
+    /// A cursor can outlive the list it pointed into (a suggestion
+    /// pane reopened over a smaller corpus, a queue that shrank), so
+    /// the arithmetic has to hold at the extremes rather than wrap
+    /// through an `as i64` cast.
+    #[test]
+    fn a_cursor_past_the_end_comes_back_to_the_last_row() {
+        assert_eq!(step_in_list(9, 3, SelectStep::By(1)), 2);
+        assert_eq!(step_in_list(usize::MAX, 4, SelectStep::By(1)), 3);
+        assert_eq!(step_in_list(usize::MAX, 4, SelectStep::By(-1)), 3);
+        assert_eq!(step_in_list(0, 4, SelectStep::By(i32::MIN)), 0);
+        assert_eq!(step_in_list(0, 4, SelectStep::By(i32::MAX)), 3);
+    }
+
+    /// Both the sleep timer's fade and the settings menu read this,
+    /// and a hand-written `crossfade_seconds` reaches it unfiltered:
+    /// `Duration::from_secs_f64` aborts the process on a negative,
+    /// `nan` or `inf` value, all three of which toml parses happily.
+    #[test]
+    fn a_fade_span_holds_for_any_value_a_config_can_carry() {
+        assert_eq!(fade_span(3.0), Duration::from_secs_f64(3.0));
+        let lo = Duration::from_secs_f64(config::CROSSFADE_MIN);
+        let hi = Duration::from_secs_f64(config::CROSSFADE_MAX);
+        for bad in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e300] {
+            let got = fade_span(bad);
+            assert!(got >= lo && got <= hi, "crossfade_seconds = {bad}");
+        }
     }
 }
 
