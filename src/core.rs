@@ -43,6 +43,29 @@ pub fn playable_path(item: &SearchItem) -> Option<String> {
     }
 }
 
+/// How long what is playing actually is: the entry's own answer where
+/// it has one, mpv's reported `duration` otherwise.
+///
+/// mpv reports ~1s for a generated silence whatever length was asked
+/// for (measured, see `silence_url`), so a 15m gap drew as a
+/// one-second track with a scrubber that filled and sat full for the
+/// rest of it. The entry is authoritative *only* where it genuinely
+/// knows better; for a real file mpv is the one that has read the
+/// container, so this must not become a general-purpose override.
+///
+/// Used for everything that means "the length of what is playing":
+/// the readouts, the scrubber, a scrub's seek target, and the
+/// crossfade ramp. The ramp is not cosmetic either: with a 1s
+/// duration, `remaining` stayed negative for the whole silence, so it
+/// wrote a volume to mpv on **every frame for fifteen minutes**
+/// instead of over the last few seconds.
+pub fn playing_duration(item: Option<&SearchItem>, reported: Option<f64>) -> Option<f64> {
+    match item {
+        Some(SearchItem::Silence { secs }) => Some(*secs as f64),
+        _ => reported,
+    }
+}
+
 /// The ffmpeg source mpv loads for a timed silence.
 ///
 /// **Measured, because the obvious reading of this is wrong.** mpv

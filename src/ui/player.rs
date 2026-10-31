@@ -12,6 +12,7 @@ use crate::ui::controlsbar::{
     GLYPH_PLAY, GLYPH_SHUFFLE, GLYPH_SPEED, SCRUB_BG, SELECT_BG, TRACK_MIN,
 };
 use crate::ui::draw;
+use crate::ui::gap::{Gap, GapPanel};
 use crate::ui::progress::readouts;
 use crate::ui::textfit::{truncate_with_ellipsis, width};
 
@@ -188,6 +189,10 @@ pub struct PlayerView<'a> {
     /// overlay, which goes on the `PlayerLayout::art` rect this view
     /// used; same contract as `BrowseListView`.
     pub art_mode: ArtMode,
+    /// `Some` while a timed silence is playing, which has no cover and
+    /// never will. The cover rect goes to a countdown instead of being
+    /// left blank for the length of the gap; see `ui::gap`.
+    pub gap: Option<Gap>,
     /// The terminal's real cell height:width ratio
     /// (`main::cell_aspect`), threaded to `layout` and `CachedArt` so
     /// both agree on what "square" means here.
@@ -214,7 +219,10 @@ pub struct PlayerView<'a> {
 
 impl Widget for PlayerView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let has_art = self.art.is_some() && self.art_mode != ArtMode::Off;
+        // a gap claims the cover rect the same way a cover does, so
+        // the layout reserves it. `ArtMode::Off` still means off: a
+        // user who turned the panel off did not ask for a big clock.
+        let has_art = (self.art.is_some() || self.gap.is_some()) && self.art_mode != ArtMode::Off;
         let Some(l) = layout(
             area,
             has_art,
@@ -224,14 +232,24 @@ impl Widget for PlayerView<'_> {
             return;
         };
 
-        if let Some(rect) = l.art.filter(|_| self.art_mode.is_ascii()) {
-            CachedArt {
-                image: self.art,
-                cell_aspect: self.cell_aspect,
-                key: self.art_key,
-                tone: self.art_mode.tone(),
+        if let Some(rect) = l.art {
+            // checked before the cover, not after: a silence has no
+            // art, so the two cannot both apply, and ordering it this
+            // way means a future entry kind with both still draws
+            // something deterministic. drawn in every art mode,
+            // including the `Full*` ones, because the host has no
+            // image to overlay for a gap.
+            if let Some(gap) = self.gap {
+                GapPanel { gap }.render(rect, buf);
+            } else if self.art_mode.is_ascii() {
+                CachedArt {
+                    image: self.art,
+                    cell_aspect: self.cell_aspect,
+                    key: self.art_key,
+                    tone: self.art_mode.tone(),
+                }
+                .render(rect, buf);
             }
-            .render(rect, buf);
         }
 
         draw_centered(buf, area, l.title_y, self.title, shade(NEAR_WHITE));
@@ -668,6 +686,7 @@ mod tests {
             art,
             art_key: "a:artist\u{1}album",
             art_mode: ArtMode::AsciiBw,
+            gap: None,
             cell_aspect: 2.0,
             elapsed_secs: Some(30.0),
             duration_secs: Some(120.0),
@@ -694,6 +713,70 @@ mod tests {
         let mut buf = buffer(w, h);
         v.render(area, &mut buf);
         buf
+    }
+
+    /// A gap has no cover and never will, so it takes the cover rect
+    /// rather than leaving the biggest thing on screen blank for
+    /// fifteen minutes.
+    #[test]
+    fn a_gap_puts_a_countdown_where_the_cover_goes() {
+        let buf = render(60, 24, |v| {
+            v.art = None;
+            v.gap = Some(Gap {
+                remaining_secs: 900.0,
+            });
+        });
+        let text = grid(&buf);
+        assert!(text.contains("remaining"), "{text}");
+        assert!(
+            text.contains('\u{2588}'),
+            "the countdown is drawn large:\n{text}"
+        );
+    }
+
+    /// And only a gap does: an ordinary track with no art shows no
+    /// clock, which would be a bizarre thing to invent for it.
+    #[test]
+    fn a_track_with_no_cover_gets_no_countdown() {
+        let buf = render(60, 24, |v| {
+            v.art = None;
+            v.gap = None;
+        });
+        assert!(!grid(&buf).contains("remaining"));
+    }
+
+    /// `art = off` means the panel is off. A user who turned the cover
+    /// panel off did not ask to be given a big clock instead.
+    #[test]
+    fn art_off_suppresses_the_countdown_too() {
+        let buf = render(60, 24, |v| {
+            v.art = None;
+            v.art_mode = ArtMode::Off;
+            v.gap = Some(Gap {
+                remaining_secs: 900.0,
+            });
+        });
+        assert!(!grid(&buf).contains("remaining"));
+    }
+
+    /// The `Full*` modes leave the cover rect to the host's image
+    /// overlay, but there is no image for a gap, so the countdown has
+    /// to draw itself in those modes as well or the rect stays blank.
+    #[test]
+    fn a_gap_draws_in_the_full_art_modes_as_well() {
+        for mode in [ArtMode::FullBw, ArtMode::FullColor] {
+            let buf = render(60, 24, |v| {
+                v.art = None;
+                v.art_mode = mode;
+                v.gap = Some(Gap {
+                    remaining_secs: 900.0,
+                });
+            });
+            assert!(
+                grid(&buf).contains("remaining"),
+                "{mode:?} left the rect blank"
+            );
+        }
     }
 
     fn col_of(buf: &Buffer, y: u16, ch: char) -> u16 {

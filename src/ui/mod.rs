@@ -5,6 +5,7 @@ pub mod controlsbar;
 pub mod divider;
 pub mod draw;
 pub mod eq_menu;
+pub mod gap;
 pub mod header;
 pub mod help;
 pub mod helpbox;
