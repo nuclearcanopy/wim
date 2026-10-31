@@ -9,7 +9,7 @@ use crate::suggest::{Reason, Suggestions};
 use crate::theme::{shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::draw;
 use crate::ui::header::draw_header;
-use crate::ui::results_list::{fill_row_bg, label};
+use crate::ui::results_list::{fill_row_bg, label, scroll_cues};
 use crate::ui::scroll;
 use crate::ui::textfit::truncate_with_ellipsis;
 
@@ -72,10 +72,67 @@ fn row_of(rows: &[Row], selected: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// How many suggestions there are to move between; the caller clamps
+/// First drawn row of the window. One derivation, shared by the render
+/// and `row_items`.
+///
+/// Anchored on the selected suggestion's *reason* row, not its title:
+/// the reason is the whole feature (see the type doc) and it is drawn
+/// below the title, so anchoring on the title parked the cursor on the
+/// last visible row with its own explanation off screen, under a `▾`
+/// that was telling the truth about it. With one row to give, the
+/// title wins.
+fn offset_of(rows: &[Row], selected: usize, body_height: usize) -> usize {
+    let title = row_of(rows, selected);
+    let anchor = if body_height >= 2 { title + 1 } else { title };
+    scroll::offset_for(anchor, body_height)
+}
+
+/// How many suggestions there are to move between; the caller steps
 /// its cursor against this rather than against the drawn row count.
 pub fn count(s: &Suggestions) -> usize {
     s.len()
+}
+
+/// Which row the cursor is on, as something that survives a rebuild.
+/// `SearchItem::identity`, owned, because the list is replaced while a
+/// borrow of the old one would still be live (`app.rs::anchor` carries
+/// it the same way and for the same reason).
+pub fn anchor(s: &Suggestions, selected: usize) -> Option<Anchor> {
+    s.flat().nth(selected).map(|(_, sug)| {
+        let (kind, id) = sug.item.identity();
+        (kind, id.into_owned())
+    })
+}
+
+/// A row that can be found again: `SearchItem::identity`'s kind tag
+/// and key.
+pub type Anchor = (u8, String);
+
+/// Where `selected` goes once the engine has handed back a rebuilt
+/// list. The cursor follows the row it was on, not its index: a
+/// rebuild re-runs dedup and diversification, so a reply landing
+/// mid-session reorders the sections ("best section first") and moves
+/// rows between them, and a clamped flat index lands on a *different*
+/// suggestion with no sign on screen that it moved. Enter then acts
+/// on the replacement, which for a `Song` is `start_session` and
+/// clears the queue.
+///
+/// Three arms, same as `app::restore_selection`: the row if it is
+/// still there, else the old index clamped (it existed and is gone, so
+/// stay where the eye is), else the top (there was no row to anchor).
+pub fn reconcile(refreshed: &Suggestions, anchor: Option<Anchor>, selected: usize) -> usize {
+    let last = count(refreshed).saturating_sub(1);
+    let found = anchor.as_ref().and_then(|(tag, key)| {
+        refreshed.flat().position(|(_, sug)| {
+            let (t, k) = sug.item.identity();
+            t == *tag && k == *key
+        })
+    });
+    match found {
+        Some(at) => at,
+        None if anchor.is_some() => selected.min(last),
+        None => 0,
+    }
 }
 
 /// Rows `draw_header` eats above the body: its text line plus the rule
@@ -105,7 +162,7 @@ pub fn row_items(suggestions: &Suggestions, selected: usize, area: Rect) -> Vec<
         return Vec::new();
     }
     let rows = rows(suggestions);
-    let offset = scroll::offset_for(row_of(&rows, selected), body_height);
+    let offset = offset_of(&rows, selected, body_height);
     (0..body_height)
         .map(|row| match rows.get(offset + row) {
             // the reason line is part of the suggestion above it (the
@@ -158,15 +215,25 @@ impl Widget for SuggestionsView<'_> {
         }
 
         let rows = rows(self.suggestions);
-        let offset = scroll::offset_for(row_of(&rows, self.selected), body_height);
+        let offset = offset_of(&rows, self.selected, body_height);
         let flat: Vec<_> = self.suggestions.flat().collect();
+        // one column of gutter for the scroll cue, and only while there
+        // is one: this pane shows a window onto up to `max_items` rows
+        // two lines each, so most of the list was off screen with
+        // nothing saying so. same `▴`/`▾` gutter every other windowed
+        // list uses.
+        let scrolls = rows.len() > body_height;
+        let cols = Rect {
+            width: area.width.saturating_sub(u16::from(scrolls)),
+            ..area
+        };
 
         for (i, row) in rows.iter().skip(offset).take(body_height).enumerate() {
             let y = body_top + i as u16;
             match row {
                 Row::Gap => {}
                 Row::Section(reason) => {
-                    draw::line(buf, area, y, &format!(" {}", reason.title()), shade(MID));
+                    draw::line(buf, cols, y, &format!(" {}", reason.title()), shade(MID));
                 }
                 Row::Item(idx) | Row::Reason(idx) => {
                     // `rows` numbers its items by walking the same
@@ -206,11 +273,21 @@ impl Widget for SuggestionsView<'_> {
                         (_, true) => NEAR_WHITE * 0.6,
                         (_, false) => NEAR_BLACK,
                     };
-                    let fitted = truncate_with_ellipsis(&text, area.width as usize);
-                    draw::line(buf, area, y, &fitted, shade(level));
+                    let fitted = truncate_with_ellipsis(&text, cols.width as usize);
+                    draw::line(buf, cols, y, &fitted, shade(level));
                 }
             }
         }
+        scroll_cues(
+            buf,
+            Rect {
+                y: body_top,
+                height: body_height as u16,
+                ..area
+            },
+            offset,
+            rows.len(),
+        );
     }
 }
 
@@ -238,7 +315,7 @@ mod tests {
         }
     }
 
-    fn two_sections() -> Suggestions {
+    pub(super) fn two_sections() -> Suggestions {
         Suggestions {
             sections: vec![
                 Section {
@@ -290,7 +367,7 @@ mod tests {
     /// Sections of uneven length, including an empty one, so the
     /// numbering below is tested across section boundaries rather than
     /// inside one list.
-    fn uneven_sections() -> Suggestions {
+    pub(super) fn uneven_sections() -> Suggestions {
         let items = |n: usize, tag: &str| {
             (0..n)
                 .map(|i| suggestion(&format!("{tag}{i}"), &format!("because {tag}{i}")))
@@ -349,6 +426,81 @@ mod tests {
             // lets either row of a suggestion pick it.
             assert_eq!(picked(false), expect, "reason rows");
         }
+    }
+
+    /// The engine's own section ordering, rerun: the same rows come
+    /// back with a stronger section in front, which is what moves
+    /// every flat index.
+    pub(super) fn reordered(s: &Suggestions) -> Suggestions {
+        let mut sections = s.sections.clone();
+        sections.rotate_right(1);
+        Suggestions { sections }
+    }
+
+    /// What the cursor is actually pointing at, so a test can say "the
+    /// same row" without saying "the same index".
+    fn row_at(s: &Suggestions, at: usize) -> String {
+        s.flat()
+            .nth(at)
+            .map(|(_, sug)| label(&sug.item))
+            .unwrap_or_default()
+    }
+
+    /// The defect: open suggestions, press `j` seven times, let an
+    /// in-flight enrichment reply land, press enter. The rebuild
+    /// reorders the sections, so a clamped flat index points at a
+    /// different suggestion and enter acts on that one; for a `Song`
+    /// that is `start_session`, which clears the queue.
+    #[test]
+    fn the_cursor_follows_its_row_when_the_engine_reorders_the_sections() {
+        let before = uneven_sections();
+        let after = reordered(&before);
+        for selected in 0..count(&before) {
+            let was = row_at(&before, selected);
+            let a = anchor(&before, selected);
+            let at = reconcile(&after, a, selected);
+            assert_eq!(
+                row_at(&after, at),
+                was,
+                "cursor on {selected} ({was}) landed on {at} after the rebuild"
+            );
+        }
+        // and the clamp it replaced really does move: this is the bug,
+        // not a hypothetical.
+        let clamped = 4usize.min(count(&after).saturating_sub(1));
+        assert_ne!(
+            row_at(&after, clamped),
+            row_at(&before, 4),
+            "if the clamp agreed, the fixture does not reorder"
+        );
+    }
+
+    /// A row that genuinely went (deduped into a stronger reason,
+    /// dropped by the diversification caps) leaves the cursor where
+    /// the eye already is rather than flinging it to the top.
+    #[test]
+    fn a_vanished_row_clamps_instead_of_jumping_to_the_top() {
+        let before = one_long_section();
+        let mut after = before.clone();
+        after.sections[0].items.retain(|s| label(&s.item) != "t7");
+        let a = anchor(&before, 7);
+        assert_eq!(reconcile(&after, a, 7), 7, "stays at the same depth");
+        // and a list that shrank past the cursor comes back to its end.
+        let mut tiny = before.clone();
+        tiny.sections[0].items.truncate(3);
+        assert_eq!(reconcile(&tiny, anchor(&before, 27), 27), 2);
+    }
+
+    #[test]
+    fn an_empty_or_unanchored_rebuild_lands_on_the_top_row() {
+        let s = two_sections();
+        // nothing was selected to begin with (an empty pane), so there
+        // is no row to follow.
+        assert_eq!(reconcile(&s, None, 9), 0);
+        assert!(anchor(&Suggestions::default(), 0).is_none());
+        assert!(anchor(&s, 99).is_none(), "a cursor past the end anchors on nothing");
+        // and a rebuild that came back empty has no row to land on.
+        assert_eq!(reconcile(&Suggestions::default(), anchor(&s, 1), 1), 0);
     }
 
     #[test]
@@ -468,7 +620,7 @@ mod tests {
     /// Thirty suggestions in one section, named so that no title or
     /// reason is a substring of another's (`t2` inside `t27` would let a
     /// wrong answer pass the painted-text check below).
-    fn one_long_section() -> Suggestions {
+    pub(super) fn one_long_section() -> Suggestions {
         Suggestions {
             sections: vec![Section {
                 title: Reason::DailyRotation.title().to_string(),
@@ -516,7 +668,9 @@ mod tests {
                     );
                 }
                 None => {
-                    let blank = text.chars().all(|c| c == '.');
+                    // the scroll cue lives in the gutter column, so a
+                    // row holding only that is still a blank row.
+                    let blank = text.chars().all(|c| c == '.' || c == '\u{25B4}' || c == '\u{25BE}');
                     let heading = s
                         .sections
                         .iter()
@@ -556,13 +710,13 @@ mod tests {
     #[test]
     fn row_items_follows_the_scroll_offset() {
         let s = one_long_section();
-        // a window this far down holds no heading and no gap, and it
-        // opens on a reason line rather than a title, which an offset of
-        // 0 would get wrong in both directions.
+        // a window this far down holds no heading and no gap, which an
+        // offset of 0 would get wrong in both directions. it closes on
+        // the selected suggestion's reason line, not its title: that
+        // line is the feature, so the window follows it.
         assert_eq!(
             row_items(&s, 27, Rect::new(0, 0, 60, 10)),
             vec![
-                Some(23),
                 Some(24),
                 Some(24),
                 Some(25),
@@ -570,15 +724,16 @@ mod tests {
                 Some(26),
                 Some(26),
                 Some(27),
+                Some(27),
             ]
         );
         assert_agrees(&s, 27, 60, 10);
 
-        // and with the selection on the very last suggestion.
+        // and with the selection on the very last suggestion, where
+        // there is nothing below to scroll into.
         assert_eq!(
             row_items(&s, 29, Rect::new(0, 0, 60, 10)),
             vec![
-                Some(25),
                 Some(26),
                 Some(26),
                 Some(27),
@@ -586,9 +741,34 @@ mod tests {
                 Some(28),
                 Some(28),
                 Some(29),
+                Some(29),
             ]
         );
         assert_agrees(&s, 29, 60, 10);
+    }
+
+    /// The row the cursor is on is drawn with its reason, both rows,
+    /// at every selection and every height that can hold two. The
+    /// eyeball found this: on the last suggestion of a scrolled list
+    /// the plate covered the title alone and the explanation was below
+    /// the fold, under a `▾` that was telling the truth about it.
+    #[test]
+    fn the_selected_row_is_never_half_on_screen() {
+        for s in [one_long_section(), uneven_sections(), two_sections()] {
+            for selected in 0..count(&s) {
+                for (w, h) in [(60u16, 20u16), (60, 10), (60, 5), (60, 4), (34, 9)] {
+                    let map = row_items(&s, selected, Rect::new(0, 0, w, h));
+                    if map.is_empty() {
+                        continue;
+                    }
+                    let mine = map.iter().filter(|m| **m == Some(selected)).count();
+                    assert_eq!(
+                        mine, 2,
+                        "{w}x{h} cursor {selected}: {mine} of its two rows are on screen"
+                    );
+                }
+            }
+        }
     }
 
     /// Every selection, at sizes that scroll and sizes that do not, on
@@ -663,4 +843,103 @@ mod tests {
             .render(area, &mut buf);
         }
     }
+}
+
+#[cfg(test)]
+mod eyeball {
+    use super::tests::{one_long_section, reordered, two_sections, uneven_sections};
+    use super::*;
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
+
+    fn paint(s: &Suggestions, selected: usize, w: u16, h: u16) -> Buffer {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = buffer(w, h);
+        SuggestionsView {
+            suggestions: s,
+            selected,
+            focused: true,
+            elapsed: Duration::ZERO,
+            enriching: false,
+        }
+        .render(area, &mut buf);
+        assert_outside_untouched(&buf, area);
+        buf
+    }
+
+    /// The defect as the screen showed it: the same cursor index
+    /// before and after an enrichment reply lands, which is a
+    /// different suggestion under an unmoved plate. Then the same
+    /// pair with the cursor reconciled.
+    /// `cargo test --lib ui::suggestions::eyeball -- --nocapture`.
+    #[test]
+    fn print_the_pane_across_a_rebuild() {
+        let before = uneven_sections();
+        let after = reordered(&before);
+        let at = 4usize;
+        for (w, h) in [(60u16, 14u16), (60, 8), (34, 9), (60, 24)] {
+            println!("=== {w}x{h}");
+            println!("--- before, cursor {at}\n{}", grid(&paint(&before, at, w, h)));
+            println!(
+                "--- after the reply, same index {at}\n{}",
+                grid(&paint(&after, at, w, h))
+            );
+            let moved = reconcile(&after, anchor(&before, at), at);
+            println!(
+                "--- after the reply, cursor reconciled to {moved}\n{}",
+                grid(&paint(&after, moved, w, h))
+            );
+        }
+    }
+
+    /// Every cursor position at the awkward sizes, printed once, so
+    /// the gutter cue and the two-row plate can be read in place.
+    #[test]
+    fn print_the_scrolled_pane_at_the_awkward_sizes() {
+        let s = one_long_section();
+        for (w, h) in [(60u16, 10u16), (24, 10), (60, 5), (60, 4), (120, 30)] {
+            for selected in [0usize, 14, 29] {
+                let buf = paint(&s, selected, w, h);
+                println!("--- {w}x{h} cursor {selected}\n{}", grid(&buf));
+            }
+        }
+    }
+
+    /// Most of this list is off screen (up to `max_items` rows, two
+    /// lines each, in a pane that fits a handful), and nothing said
+    /// so: no bar, no count, no cue.
+    #[test]
+    fn a_windowed_list_says_there_is_more_above_and_below_it() {
+        let s = one_long_section();
+        let top = grid(&paint(&s, 0, 60, 10));
+        assert!(!top.contains('▴'), "nothing is above the first row:\n{top}");
+        assert!(top.contains('▾'), "27 more suggestions are below:\n{top}");
+
+        let mid = grid(&paint(&s, 14, 60, 10));
+        assert!(mid.contains('▴'), "{mid}");
+        assert!(mid.contains('▾'), "{mid}");
+
+        let end = grid(&paint(&s, 29, 60, 10));
+        assert!(end.contains('▴'), "{end}");
+        assert!(!end.contains('▾'), "that is the last suggestion:\n{end}");
+
+        // a list that fits keeps its full width and gets no cue.
+        let short = grid(&paint(&two_sections(), 0, 60, 12));
+        assert!(!short.contains('▴') && !short.contains('▾'), "{short}");
+    }
+
+    /// The cue sits in a gutter the rows gave up, not on top of a
+    /// title: at a width where a row fills the pane, the last column
+    /// is the cue and the text stops one short of it.
+    #[test]
+    fn the_cue_never_lands_on_a_row_of_text() {
+        let g = grid(&paint(&one_long_section(), 14, 24, 10));
+        for line in g.lines().skip(crate::ui::header::ROWS as usize) {
+            let last = line.chars().last().unwrap();
+            assert!(
+                last == '.' || last == '▴' || last == '▾',
+                "the gutter column holds {last:?}:\n{g}"
+            );
+        }
+    }
+
 }
