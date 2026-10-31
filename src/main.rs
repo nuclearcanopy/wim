@@ -369,9 +369,6 @@ struct WimSurface<'a> {
     keybinds_menu_selected: &'a mut usize,
     eq_menu_open: &'a mut bool,
     eq_menu_selected: &'a mut usize,
-    lyrics_lines: &'a mut Option<Vec<String>>,
-    lyrics_track: &'a mut String,
-    lyrics_scroll: &'a mut usize,
     bottombar_selected: Field,
 }
 
@@ -581,7 +578,7 @@ fn open_wim_screen(
             );
             op_done()
         }
-        ViewTarget::Lyrics => open_wim_lyrics(core, surf),
+        ViewTarget::Lyrics => open_wim_lyrics(core),
         // `is_screen()` routes the five listings to
         // `core::print_listing` before this is called; honoured here
         // too rather than unreachable, so the two cannot drift.
@@ -611,34 +608,26 @@ fn open_wim_screen(
     }
 }
 
-/// `view(lyrics)`: the same blocking lookup the lyrics keybind does,
-/// reporting into the console instead of a toast.
-fn open_wim_lyrics(core: &mut CoreCtx, surf: &mut WimSurface) -> (Dispatch, Report) {
+/// `view(lyrics)`: asks for the same fetch the lyrics keybind does and
+/// returns at once; the reply opens the pane from the main loop's
+/// drain, so the console gets "fetching" rather than a frozen ui.
+fn open_wim_lyrics(core: &mut CoreCtx) -> (Dispatch, Report) {
     let Some(item) = core.now_playing.clone() else {
         return op_fail("nothing is playing");
     };
     let Some((artist, title, album)) = lyrics_query(&item) else {
         return op_fail("no lyrics for this item");
     };
-    match core.lyrics_client.lookup(&artist, &title, &album, None) {
-        Ok(Some(l)) => {
-            // the api's own `instrumental` flag, not "both fields
-            // happened to be empty".
-            let text = if l.instrumental {
-                "(instrumental, no lyrics)".to_string()
-            } else {
-                l.plain
-                    .or(l.synced)
-                    .unwrap_or_else(|| "(no lyrics text available)".to_string())
-            };
-            *surf.lyrics_lines = Some(text.lines().map(str::to_string).collect());
-            *surf.lyrics_track = label(&item);
-            *surf.lyrics_scroll = 0;
-            op_done()
-        }
-        Ok(None) => op_fail("no lyrics found"),
-        Err(e) => op_fail(format!("lyrics lookup failed: {e}")),
-    }
+    let name = label(&item);
+    core.lyrics_loader.request(
+        core.lyrics_client,
+        name.clone(),
+        &artist,
+        &title,
+        &album,
+        None,
+    );
+    op_note(format!("fetching lyrics for {name}"))
 }
 
 /// Current output level, 0..1, for the now-playing level meter. Reads
@@ -1694,6 +1683,8 @@ fn main() -> anyhow::Result<()> {
     // doesn't kick off a duplicate transfer of the same file.
     let mut downloading: HashSet<String> = HashSet::new();
     let lyrics_client = lyrics::Client::new();
+    // the fetch runs off-thread; the key handler only asks.
+    let mut lyrics_loader = lyrics::Loader::new();
     // the shellsong console: ':' opens it, and while it is open it
     // claims every key and every paste (see its input tier, which sits
     // at the same tier `editing_query` does and for the same reason).
@@ -3246,6 +3237,26 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        // a lyrics fetch landed. the loader has already dropped any
+        // reply for a track the user moved past, so whatever arrives
+        // here belongs to the request still standing.
+        if let Some((track, result)) = lyrics_loader.poll() {
+            match result {
+                Ok(Some(l)) => {
+                    lyrics_lines = Some(
+                        wim::core::lyrics_text(&l)
+                            .lines()
+                            .map(str::to_string)
+                            .collect(),
+                    );
+                    lyrics_track = track;
+                    lyrics_scroll = 0;
+                }
+                Ok(None) => notifications.push(Severity::Info, format!("no lyrics for {track}")),
+                Err(e) => notifications.push(Severity::Error, format!("lyrics lookup failed: {e}")),
+            }
+        }
+
         // drain whatever the live remote-search thread answered since
         // the last frame; merged unconditionally and re-filtered
         // against whatever's actually typed right now (see
@@ -3434,6 +3445,7 @@ fn main() -> anyhow::Result<()> {
                     favorites: &mut favorites,
                     remote_starred: &mut remote_starred,
                     lyrics_client: &lyrics_client,
+                    lyrics_loader: &mut lyrics_loader,
                     base_volume: &mut base_volume,
                     crossfade_enabled: &mut crossfade_enabled,
                     fade_in_started_at: &mut fade_in_started_at,
@@ -3467,9 +3479,6 @@ fn main() -> anyhow::Result<()> {
                     keybinds_menu_selected: &mut keybinds_menu_selected,
                     eq_menu_open: &mut eq_menu_open,
                     eq_menu_selected: &mut eq_menu_selected,
-                    lyrics_lines: &mut lyrics_lines,
-                    lyrics_track: &mut lyrics_track,
-                    lyrics_scroll: &mut lyrics_scroll,
                     bottombar_selected,
                 }
             };
@@ -5273,34 +5282,17 @@ fn main() -> anyhow::Result<()> {
                     match &now_playing {
                         Some(item) => match lyrics_query(item) {
                             Some((artist, title, album)) => {
-                                match lyrics_client.lookup(&artist, &title, &album, None) {
-                                    Ok(Some(l)) => {
-                                        // the api's own `instrumental`
-                                        // flag, not just "plain/synced
-                                        // both happened to be empty";
-                                        // a real track with genuinely
-                                        // missing lyrics data shouldn't
-                                        // be mislabeled instrumental.
-                                        let text = if l.instrumental {
-                                            "(instrumental, no lyrics)".to_string()
-                                        } else {
-                                            l.plain.or(l.synced).unwrap_or_else(|| {
-                                                "(no lyrics text available)".to_string()
-                                            })
-                                        };
-                                        lyrics_lines =
-                                            Some(text.lines().map(str::to_string).collect());
-                                        lyrics_track = label(item);
-                                        lyrics_scroll = 0;
-                                    }
-                                    Ok(None) => {
-                                        notifications.push(Severity::Info, "no lyrics found")
-                                    }
-                                    Err(e) => notifications.push(
-                                        Severity::Error,
-                                        format!("lyrics lookup failed: {e}"),
-                                    ),
-                                }
+                                // asks and returns; the reply lands in
+                                // the main loop's drain. pressing this
+                                // used to block the whole ui on lrclib.
+                                lyrics_loader.request(
+                                    &lyrics_client,
+                                    label(item),
+                                    &artist,
+                                    &title,
+                                    &album,
+                                    None,
+                                );
                             }
                             None => notifications.push(Severity::Info, "no lyrics for this item"),
                         },
