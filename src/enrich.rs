@@ -480,3 +480,128 @@ mod enrichment_plumbing_tests {
         assert_eq!(fetches.len(), 3);
     }
 }
+
+/// The four flags that decide when the suggestions menu re-runs and
+/// when a warm-up batch goes out.
+///
+/// A `struct Ui` slice (see ROADMAP): these were four loose `bool`s in
+/// the main loop, and the bug they invite is firing a fetch while one
+/// is already in flight, or re-running the engine on a frame where
+/// nothing arrived. Keeping them together makes the one real rule --
+/// **at most one job at a time, and only while the menu is open** --
+/// a method rather than a condition spelled out at each site.
+#[derive(Debug, Default)]
+pub struct Warmup {
+    /// Something changed that could make a fetch worth firing (menu
+    /// opened, batch finished, corpus grew). Picking targets costs a
+    /// corpus walk, so it only happens when this is set.
+    probe: bool,
+    in_flight: bool,
+    /// An answer landed, so the menu owes exactly one re-run.
+    stale: bool,
+    open_last_frame: bool,
+}
+
+impl Warmup {
+    /// Something happened that might be worth a fetch.
+    pub fn poke(&mut self) {
+        self.probe = true;
+    }
+
+    /// An answer arrived: the menu owes a re-run.
+    pub fn answered(&mut self) {
+        self.stale = true;
+    }
+
+    /// A batch finished, so another may go out.
+    pub fn job_done(&mut self) {
+        self.in_flight = false;
+        self.probe = true;
+    }
+
+    pub fn is_enriching(&self) -> bool {
+        self.in_flight
+    }
+
+    /// Whether the engine owes a re-run this frame; clears the debt.
+    pub fn take_stale(&mut self) -> bool {
+        std::mem::take(&mut self.stale)
+    }
+
+    /// Notices the menu opening, which is itself worth a probe, and
+    /// answers whether a job should be picked now.
+    ///
+    /// One call rather than three statements, because the ordering
+    /// matters: the open-edge has to be seen *before* the probe is
+    /// consumed, or opening the menu fires nothing until the next
+    /// unrelated poke.
+    pub fn should_fetch(&mut self, menu_open: bool) -> bool {
+        if menu_open && !self.open_last_frame {
+            self.probe = true;
+        }
+        self.open_last_frame = menu_open;
+        // never two at once, and never while the menu is shut: these
+        // are network calls for one feature.
+        if self.probe && !self.in_flight && menu_open {
+            self.probe = false;
+            return true;
+        }
+        self.probe = false;
+        false
+    }
+
+    /// A job actually went out.
+    pub fn sent(&mut self, ok: bool) {
+        self.in_flight = ok;
+    }
+}
+
+#[cfg(test)]
+mod warmup_tests {
+    use super::*;
+
+    #[test]
+    fn opening_the_menu_is_worth_a_fetch() {
+        let mut w = Warmup::default();
+        assert!(w.should_fetch(true), "the open edge probes");
+        assert!(!w.should_fetch(true), "and only once");
+    }
+
+    /// The rule this type exists for: one job at a time.
+    #[test]
+    fn a_second_job_waits_for_the_first() {
+        let mut w = Warmup::default();
+        assert!(w.should_fetch(true));
+        w.sent(true);
+        w.poke();
+        assert!(!w.should_fetch(true), "one in flight already");
+        w.job_done();
+        assert!(w.should_fetch(true), "and the next goes out after it");
+    }
+
+    /// A send that failed is not in flight, or the warm-up would stop
+    /// forever on one dropped channel.
+    #[test]
+    fn a_failed_send_does_not_block_the_next() {
+        let mut w = Warmup::default();
+        w.should_fetch(true);
+        w.sent(false);
+        w.poke();
+        assert!(w.should_fetch(true));
+    }
+
+    #[test]
+    fn a_shut_menu_never_fetches() {
+        let mut w = Warmup::default();
+        w.poke();
+        assert!(!w.should_fetch(false));
+    }
+
+    #[test]
+    fn a_stale_menu_owes_exactly_one_rerun() {
+        let mut w = Warmup::default();
+        w.answered();
+        assert!(w.take_stale());
+        assert!(!w.take_stale(), "the debt is paid once");
+    }
+}

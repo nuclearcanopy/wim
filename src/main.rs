@@ -39,7 +39,7 @@ use wim::core::{
 use wim::download::DownloadEvent;
 use wim::enrich::{
     next_enrichment_job, recompute_suggestions, spawn_background_enrichment, EnrichmentEvent,
-    EnrichmentJob,
+    EnrichmentJob, Warmup,
 };
 use wim::eq_menu_keys::{
     adjust_eq_band, eq_label, eq_menu_editor_key, eq_saved_row_hint, persist_eq,
@@ -831,14 +831,7 @@ fn main() -> anyhow::Result<()> {
     let mut enrichment = suggest::EnrichmentCache::load();
     // album ids already asked about this session; see
     // `next_enrichment_job` for why this is not persisted.
-    let mut suggestions_open_last_frame = false;
-    // an answer landed, so the menu owes exactly one re-run.
-    let mut suggestions_stale = false;
-    // something changed that could make a fetch worth firing (menu
-    // opened, batch finished, corpus grew). picking targets costs a
-    // corpus walk, so it only happens when this is set.
-    let mut enrich_probe = false;
-    let mut enrich_job_in_flight = false;
+    let mut warmup = Warmup::default();
     let mut lyrics = LyricsPane::default();
     // where the last frame put everything, filled in by the draw pass
     // below and read by the next mouse event; same reason
@@ -1810,7 +1803,7 @@ fn main() -> anyhow::Result<()> {
                         elapsed: frame_elapsed,
                         // a thin list must not read as the whole
                         // answer while fetches are still landing.
-                        enriching: enrich_job_in_flight,
+                        enriching: warmup.is_enriching(),
                     },
                     main_content,
                 );
@@ -2344,7 +2337,7 @@ fn main() -> anyhow::Result<()> {
                     remote_starred.extend(starred);
                     // a freshly indexed server brings artists and
                     // albums the last enrichment probe never saw.
-                    enrich_probe = true;
+                    warmup.poke();
                     if server_reachable.insert(sr.url.clone(), true) == Some(false) {
                         notifications.push(Severity::Info, format!("{} is back online", sr.url));
                     }
@@ -2431,7 +2424,7 @@ fn main() -> anyhow::Result<()> {
             app.resync_results();
             // a wider corpus can mean more artists and albums worth
             // enriching than the last probe found.
-            enrich_probe = true;
+            warmup.poke();
             // an answer is in, so the results for whatever is typed are
             // as complete as a shellsong program should wait for.
             settle.answered();
@@ -2447,7 +2440,7 @@ fn main() -> anyhow::Result<()> {
                 EnrichmentEvent::ArtistInfo { id, info } => {
                     enrichment.add_artist_info(&id, &info);
                     enrichment_grew = true;
-                    suggestions_stale = true;
+                    warmup.answered();
                 }
                 EnrichmentEvent::TopSongs {
                     artist,
@@ -2457,7 +2450,7 @@ fn main() -> anyhow::Result<()> {
                     suggest_catalog.ingest_songs(&songs, &client);
                     enrichment.add_top_songs(&artist, &songs);
                     enrichment_grew = true;
-                    suggestions_stale = true;
+                    warmup.answered();
                 }
                 EnrichmentEvent::Album {
                     artist,
@@ -2473,12 +2466,11 @@ fn main() -> anyhow::Result<()> {
                         suggest_catalog.mark_album_asked(&artist, &name);
                     } else {
                         suggest_catalog.ingest_album(&artist, &name, &songs, &client);
-                        suggestions_stale = true;
+                        warmup.answered();
                     }
                 }
                 EnrichmentEvent::JobDone => {
-                    enrich_job_in_flight = false;
-                    enrich_probe = true;
+                    warmup.job_done();
                 }
             }
         }
@@ -2487,8 +2479,8 @@ fn main() -> anyhow::Result<()> {
             // answer; a failed write only ever costs a re-fetch.
             let _ = enrichment.save();
         }
-        if suggestions_stale {
-            if suggestions.is_some() {
+        if warmup.take_stale() && suggestions.is_some() {
+            {
                 let starred = suggestion_starred_keys(&remote_starred, &favorites);
                 let refreshed = recompute_suggestions(
                     &mut suggest_catalog,
@@ -2504,25 +2496,18 @@ fn main() -> anyhow::Result<()> {
                     suggestions_selected.min(ui::suggestions::count(&refreshed).saturating_sub(1));
                 suggestions = Some(refreshed);
             }
-            suggestions_stale = false;
         }
-        if suggestions.is_some() && !suggestions_open_last_frame {
-            enrich_probe = true;
-        }
-        suggestions_open_last_frame = suggestions.is_some();
         // warm up only while the menu is open: these are network calls
         // for one feature, nobody should pay for them unprompted, and
         // the next batch is only picked once the last one finished.
-        if enrich_probe && !enrich_job_in_flight {
-            enrich_probe = false;
-            if suggestions.is_some() {
-                let starred = suggestion_starred_keys(&remote_starred, &favorites);
-                let guard = cache_index.lock().expect("cache mutex poisoned");
-                let job = next_enrichment_job(&suggest_catalog, &guard, &starred, &enrichment);
-                drop(guard);
-                if !job.is_empty() {
-                    enrich_job_in_flight = enrich_job_tx.send(job).is_ok();
-                }
+        // all of that rule lives in `Warmup::should_fetch`.
+        if warmup.should_fetch(suggestions.is_some()) {
+            let starred = suggestion_starred_keys(&remote_starred, &favorites);
+            let guard = cache_index.lock().expect("cache mutex poisoned");
+            let job = next_enrichment_job(&suggest_catalog, &guard, &starred, &enrichment);
+            drop(guard);
+            if !job.is_empty() {
+                warmup.sent(enrich_job_tx.send(job).is_ok());
             }
         }
 
