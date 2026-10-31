@@ -977,11 +977,49 @@ mpv loaded, a generated silence source included".
       the epoch alone (which catches that mutation) and one asserting
       `poll` hands both batches over. both mutation-checked again
       after the split.
-- [ ] **`gap(10s)`, the default between tracks**, is still open and is
-      *not* simply "insert a silence between every entry": that would
-      double the queue's length and make every index the user sees
-      wrong. likely a property of the session applied on advance
-      instead, which needs its own think.
+- [x] **`gap`, the default pause between tracks: the mechanism.** a
+      property of the session applied at the join, as guessed, and the
+      hook is mpv's own `keep-open`, which was found by measuring
+      rather than reasoning.
+      `keep-open=always` makes mpv **hold at the end of every file
+      instead of rolling into the next one**, which is the right place
+      for the pause: it lands in the join, not a few milliseconds into
+      the next track. the obvious alternative (notice the advance, then
+      pause) is a frame of ipc too late and leaks the start of the next
+      track as a tick.
+      **three things measured that each would have shipped broken.**
+      `always`, not `yes`: `yes` holds only on the *last* entry, the
+      exact opposite of what this needs. mpv **stays paused across
+      `playlist-next`** once it has held, so whoever advances must
+      unpause too, or the first gap is also the last. and under
+      `keep-open=always` mpv **never goes idle at all**, so
+      `idle-active` stops firing and the end-of-playlist and loop-all
+      handling never runs; verified by watching the pushed property
+      changes, where `idle-active` stayed false through two files
+      ending.
+      so `keep-open` is **toggled, not pinned**: on only while a gap is
+      wanted *and* something is queued after this track. the last
+      track therefore ends exactly as it does today and the loop-all
+      block is untouched. the written value is cached, so evaluating
+      it every frame costs mpv nothing until the answer changes.
+      `core::BetweenTracks` is the state machine, pure apart from the
+      `Instant` it is handed. the part worth knowing is the
+      **re-arm latch**: `Release` sends `playlist-next`, but
+      `eof-reached` stays true locally until mpv's change arrives a
+      frame or two later, and without the latch that stale `true`
+      starts a second gap at once, so every track gets two. two tests
+      cover it and both fail when the latch is removed.
+- [ ] **the `gap(10s)` command and the countdown**, the other half.
+      the config field (`gap_seconds`) and the mechanism are in; what
+      is missing is a way to set it without editing toml, and the
+      screen saying a gap is running rather than just showing a
+      paused player. `ui::gap::GapPanel` already draws exactly the
+      right thing for `silence`, and `BetweenTracks::remaining` is
+      already the countdown, so this is wiring plus a command.
+      also wanted: pressing play during a gap should mean "get on with
+      it" and skip the rest of it, since mpv is paused and unpausing
+      would otherwise resume a track that has already ended.
+      `BetweenTracks::cancel` is there for it.
 
 ### the input-path freeze audit (complete, 2026-10-31)
 

@@ -21,6 +21,7 @@ const OBS_TIME_POS: u64 = 3;
 const OBS_DURATION: u64 = 4;
 const OBS_PAUSE: u64 = 5;
 const OBS_LEVEL_RMS: u64 = 6;
+const OBS_EOF_REACHED: u64 = 7;
 
 /// How long any one blocking command waits for mpv's reply.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -40,6 +41,21 @@ pub const PROP_IDLE_ACTIVE: &str = "idle-active";
 pub const PROP_TIME_POS: &str = "time-pos";
 pub const PROP_DURATION: &str = "duration";
 pub const PROP_PAUSE: &str = "pause";
+/// True while mpv is sitting at the end of a file it has decided not
+/// to close, which only happens under `keep-open`. That is the hook
+/// the between-track gap hangs off: mpv stops *before* loading the
+/// next file, so the pause lands in the join rather than a few
+/// milliseconds into the next track.
+///
+/// Measured, because two things about it are not obvious.
+/// `keep-open=always` makes mpv pause itself and hold (`pause` goes
+/// true), and **`pause` stays true after `playlist-next`**, so
+/// whoever advances has to unpause as well. And under
+/// `keep-open=always` mpv **never goes idle at all**, so
+/// `PROP_IDLE_ACTIVE` stops firing and the end-of-playlist and
+/// loop-all path never runs; `set_keep_open` is therefore toggled per
+/// track rather than pinned on.
+pub const PROP_EOF_REACHED: &str = "eof-reached";
 /// RMS output level in dBFS, from the labeled `astats` tap
 /// `eq::build_af_filter` puts at the end of the af chain; drives the
 /// now-playing level meter. Spelled out rather than built with
@@ -84,6 +100,9 @@ pub struct Playback {
     pub elapsed_secs: Option<f64>,
     pub duration_secs: Option<f64>,
     pub paused: bool,
+    /// mpv is holding at the end of a file under `keep-open`; see
+    /// `PROP_EOF_REACHED`.
+    pub eof_reached: bool,
     /// Last pushed `astats` RMS reading and when it landed; private
     /// because the pair is only meaningful together, see `level`.
     level_db: Option<f64>,
@@ -101,6 +120,8 @@ impl Playback {
             // an absent `pause` means nothing is loaded, which reads
             // as not-paused everywhere downstream.
             PROP_PAUSE => self.paused = value.as_bool().unwrap_or(false),
+            // absent reads as "not at a held end", same as `pause`.
+            PROP_EOF_REACHED => self.eof_reached = value.as_bool().unwrap_or(false),
             PROP_LEVEL_RMS => {
                 // mpv hands af-metadata values through as the strings
                 // the filter wrote; `as_f64` alone reads every one of
@@ -505,6 +526,7 @@ impl Mpv {
             (OBS_DURATION, PROP_DURATION),
             (OBS_PAUSE, PROP_PAUSE),
             (OBS_LEVEL_RMS, PROP_LEVEL_RMS),
+            (OBS_EOF_REACHED, PROP_EOF_REACHED),
         ]
         .into_iter()
         .map(|(id, name)| vec![json!("observe_property"), json!(id), json!(name)])
@@ -579,6 +601,14 @@ impl Mpv {
         Ok(())
     }
 
+    /// Paused or not, explicitly. `toggle_pause` is the right call
+    /// for a user pressing play/pause; this is for the paths that know
+    /// which state they want, such as releasing a between-track gap
+    /// (mpv stays paused across `playlist-next` once it has held).
+    pub fn set_pause(&self, paused: bool) -> Result<()> {
+        self.set_property(PROP_PAUSE, json!(paused))
+    }
+
     /// `"weak"`: a no-op (not an error) if there's nothing further
     /// along mpv's own playlist, since it already holds every queued
     /// track (see `playlist_append`) and knows better than we do
@@ -586,6 +616,19 @@ impl Mpv {
     pub fn playlist_next(&self) -> Result<()> {
         self.command(&[json!("playlist-next"), json!("weak")])
             .map(|_| ())
+    }
+
+    /// Whether mpv should hold at the end of every file instead of
+    /// rolling straight into the next one.
+    ///
+    /// `always`, not `yes`: `yes` holds only on the *last* entry,
+    /// which is the opposite of what a between-track gap needs. Only
+    /// ever turned on while a gap is actually wanted and there is a
+    /// next track, because holding also means mpv never goes idle,
+    /// and `PROP_IDLE_ACTIVE` going quiet would take the
+    /// end-of-playlist and loop-all handling with it.
+    pub fn set_keep_open(&self, hold: bool) -> Result<()> {
+        self.set_property("keep-open", json!(if hold { "always" } else { "no" }))
     }
 
     pub fn set_volume(&self, vol: f64) -> Result<()> {
