@@ -13,6 +13,7 @@ pub mod coverart;
 pub mod download;
 pub mod eq;
 pub mod favorites;
+pub mod focus;
 pub mod hit;
 pub mod keymap;
 pub mod layout;

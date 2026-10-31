@@ -34,6 +34,7 @@ use wim::core::{
     SessionStart, StarFailed, SubtitleReady, Surface, TrackChangeCtx, TrackResolver,
 };
 use wim::download::DownloadEvent;
+use wim::focus::{focus_direction_key, focus_in_direction, InputMode};
 use wim::keymap::{KeyAction, Keymap};
 use wim::layout::{PanelLayout, ResizePanel};
 use wim::navmanager::{NavManager, NavManagerStep};
@@ -1248,59 +1249,6 @@ fn rebuild_corpus(cfg: &config::Config) -> search::Corpus {
     let mut corpus = search::Corpus::new();
     corpus.add_local_tracks(library::scan(&cfg.library_paths));
     corpus
-}
-
-/// shift+<direction>'s sway/i3-style transition: which neighboring
-/// pane (if any) lies in that direction from `current`. Every
-/// direction/state combination not listed here has nowhere further
-/// to go that way and is deliberately a no-op (returns `current`
-/// unchanged), not an arbitrary fallback to some other pane.
-/// Whether the keyboard is currently moving focus between panes, or
-/// acting on whatever pane already has it. Two explicit modes rather
-/// than one modifier-key shortcut: a chord that silently moves focus
-/// gives you no way to tell, before pressing anything else, which
-/// pane the next keypress is going to land in. In `Move` nothing
-/// except focus responds at all (no scrolling, no playback, no
-/// keybinds), and both the bottom bar's indicator and the focused
-/// pane's own borders say so the whole time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InputMode {
-    Move,
-    Interact,
-}
-
-/// wasd and the arrow keys both mean the same directional move;
-/// normalizes either into the arrow key `focus_in_direction` matches
-/// on, or `None` for a key that isn't a direction at all. wasd
-/// because that's what sway is configured with for exactly this job
-/// (focus the neighboring window), arrows because they're the obvious
-/// guess if you've never read the keybind list. Only consulted in
-/// `InputMode::Move`, so these stay free for their normal meaning
-/// everywhere else.
-fn focus_direction_key(code: KeyCode) -> Option<KeyCode> {
-    match code {
-        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => Some(code),
-        // shift+w arrives as an uppercase char, but match both cases
-        // rather than trusting every terminal to agree on that.
-        KeyCode::Char(c) => match c.to_ascii_lowercase() {
-            'a' => Some(KeyCode::Left),
-            'd' => Some(KeyCode::Right),
-            'w' => Some(KeyCode::Up),
-            's' => Some(KeyCode::Down),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn focus_in_direction(current: Focus, direction: KeyCode) -> Focus {
-    match (current, direction) {
-        (Focus::Sidebar, KeyCode::Right) => Focus::Workspace,
-        (Focus::Workspace, KeyCode::Left) => Focus::Sidebar,
-        (Focus::Sidebar | Focus::Workspace, KeyCode::Down) => Focus::BottomBar,
-        (Focus::BottomBar, KeyCode::Up) => Focus::Sidebar,
-        _ => current,
-    }
 }
 
 /// A built-in or saved curve's name, that name plus "(modified)" once
@@ -5749,110 +5697,6 @@ mod video_wiring_tests {
             library::classify("flac"),
             Some(library::MediaKind::Music),
             "music must not classify as video"
-        );
-    }
-}
-
-#[cfg(test)]
-mod focus_tests {
-    use super::*;
-
-    #[test]
-    fn sidebar_right_reaches_workspace_and_back_left() {
-        assert_eq!(
-            focus_in_direction(Focus::Sidebar, KeyCode::Right),
-            Focus::Workspace
-        );
-        assert_eq!(
-            focus_in_direction(Focus::Workspace, KeyCode::Left),
-            Focus::Sidebar
-        );
-    }
-
-    #[test]
-    fn down_from_sidebar_or_workspace_reaches_the_bottom_bar() {
-        assert_eq!(
-            focus_in_direction(Focus::Sidebar, KeyCode::Down),
-            Focus::BottomBar
-        );
-        assert_eq!(
-            focus_in_direction(Focus::Workspace, KeyCode::Down),
-            Focus::BottomBar
-        );
-    }
-
-    #[test]
-    fn up_from_the_bottom_bar_always_reaches_the_sidebar() {
-        assert_eq!(
-            focus_in_direction(Focus::BottomBar, KeyCode::Up),
-            Focus::Sidebar
-        );
-    }
-
-    #[test]
-    fn wasd_and_arrows_are_the_same_four_directions() {
-        for (letter, arrow) in [
-            ('a', KeyCode::Left),
-            ('d', KeyCode::Right),
-            ('w', KeyCode::Up),
-            ('s', KeyCode::Down),
-        ] {
-            assert_eq!(focus_direction_key(KeyCode::Char(letter)), Some(arrow));
-            // shift+w arrives uppercase on most terminals.
-            assert_eq!(
-                focus_direction_key(KeyCode::Char(letter.to_ascii_uppercase())),
-                Some(arrow)
-            );
-            assert_eq!(focus_direction_key(arrow), Some(arrow));
-        }
-    }
-
-    #[test]
-    fn keys_that_are_not_directions_are_rejected() {
-        // tab/enter/esc in particular: move mode reads those as "leave
-        // move mode", so they must never also register as a move.
-        for code in [
-            KeyCode::Char('j'),
-            KeyCode::Char('q'),
-            KeyCode::Enter,
-            KeyCode::Esc,
-            KeyCode::Tab,
-        ] {
-            assert_eq!(focus_direction_key(code), None);
-        }
-    }
-
-    #[test]
-    fn directions_with_nowhere_to_go_are_a_no_op() {
-        // nothing is further left than the sidebar, further right
-        // than the workspace, or further down than the bottom bar.
-        assert_eq!(
-            focus_in_direction(Focus::Sidebar, KeyCode::Left),
-            Focus::Sidebar
-        );
-        assert_eq!(
-            focus_in_direction(Focus::Sidebar, KeyCode::Up),
-            Focus::Sidebar
-        );
-        assert_eq!(
-            focus_in_direction(Focus::Workspace, KeyCode::Right),
-            Focus::Workspace
-        );
-        assert_eq!(
-            focus_in_direction(Focus::Workspace, KeyCode::Up),
-            Focus::Workspace
-        );
-        assert_eq!(
-            focus_in_direction(Focus::BottomBar, KeyCode::Down),
-            Focus::BottomBar
-        );
-        assert_eq!(
-            focus_in_direction(Focus::BottomBar, KeyCode::Left),
-            Focus::BottomBar
-        );
-        assert_eq!(
-            focus_in_direction(Focus::BottomBar, KeyCode::Right),
-            Focus::BottomBar
         );
     }
 }

@@ -473,6 +473,17 @@ accident.
       subsystem, so none were built. `FramePump`'s public surface does
       not change under any replacement source, so this is a swap of the
       source only. see QUESTIONS.md.
+**the four items below are blocked, not merely unstarted**, which is
+worth saying so a build loop stops picking at them: `video plays as
+real video` needs someone at a real terminal, and the other three
+chain off an ascii video renderer that **has no frame source**.
+`screenshot-raw` cannot work over json ipc (measured; see the closed
+BLOCKER above) and `FramePump` is deleted, so "ascii video" needs a
+new frame subsystem before its layout and frame-budget items mean
+anything. `in-workspace (sub-rect) video` is the one with a real path
+(kitty-only, via `video::Hole`) and it also needs a real terminal to
+develop against.
+
 - [ ] **video plays as real video in the workspace.** confirm the
       maximized-song path actually shows a real video surface for a
       video file, not the album-art fallback and not ascii.
@@ -2012,11 +2023,28 @@ the order below is not a preference, it is a dependency.
         thing a buffer cannot show: whether the plate pulse reads as
         alive rather than restless next to a static tree.
 
-- [ ] **decompose main.rs** (~3.9k lines). a reviewed, ordered plan
-      exists: extract focus/InputMode, then the playback free functions,
-      then the sync/channel plumbing, then a `struct Ui` for the ~35
-      loose locals, then the draw closure, and only then the input
-      tiers (their ordering is load-bearing and heavily commented).
+- [ ] **decompose main.rs.** the plan's order holds: ~~focus/
+      InputMode~~, then the playback free functions, then the
+      sync/channel plumbing, then a `struct Ui` for the ~35 loose
+      locals, then the draw closure, and only then the input tiers
+      (their ordering is load-bearing and heavily commented).
+      **the "~3.9k lines" in this entry was stale: it is 6.2k.** worth
+      knowing before picking the next step, since every slice above
+      has been adding to it.
+      - [x] **focus/InputMode -> `src/focus.rs`** (155 lines with its
+        tests). the cheapest possible first slice and chosen for that:
+        `InputMode`, `focus_direction_key` and `focus_in_direction`
+        are pure, self-contained, and already had six tests, so
+        nothing load-bearing moved and the diff is almost entirely
+        relocation. main.rs lost its whole `focus_tests` module, which
+        is the tell that the cut was at a real seam rather than
+        through the middle of something.
+        one thing to watch for in the next slices: the doc comment
+        above `focus_in_direction` travelled separately from the
+        function and landed above `InputMode`, because a
+        walk-backwards over `///` lines does not stop at a blank line
+        between two doc blocks. check the docs line up with what they
+        document after each move.
 - [x] **the render path no longer polls mpv.** `time-pos`, `duration`
       and `pause` are observed properties now, folded into
       `mpv::Playback` as change events arrive on the channel the loop
