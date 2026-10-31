@@ -677,6 +677,31 @@ report, not in a batch at the end.
       also: the app had quietly supported `'foo`, `^foo` and `foo$`
       all along and said so nowhere, so the help overlay has a "search
       syntax" block now instead of leaving it folklore.
+- [ ] **pressing the lyrics key freezes the app on the network.**
+      `lyrics::Client::lookup` is a round trip to lrclib and it is
+      called **synchronously from the input path** at two sites in
+      `main.rs`: the `OpenLyrics` key handler and the shellsong op. the
+      same class of freeze as the album open fixed earlier today, and
+      just as visible.
+      `lyrics::Loader` is built and tested: one generation counter,
+      bumped on every request and on `invalidate`, checked by the
+      worker before it sends and again in `poll`, so a reply for a
+      track the user has moved past is dropped rather than appearing
+      over the new one. both stale paths pinned, and the guard
+      mutation-checked by deleting the check and watching exactly those
+      two tests fail. `cfg_attr(not(test), allow(dead_code))` until
+      wired.
+      **what is left is two call sites**: replace each `lookup` with
+      `request`, drain `poll` next to the other channel drains in the
+      main loop, and `invalidate` when the lyrics view closes or the
+      track changes. blocked only because `main.rs` is owned by the
+      library split tonight.
+      **while in there, audit the input path for the same pattern.**
+      the two found so far (album/artist open, lyrics) were both a
+      client call straight from a key handler, so grepping for network
+      calls reachable from `dispatch_action` and `run_shellsong_op` is
+      the cheap way to find the third.
+
 - [ ] **the remaining search cost is the result clone, and it needs an
       api change to fix.** for a broad query at 40k items, 3-5ms of a
       ~7ms search is `rank` cloning ~15k `SearchItem`s. cutting it
@@ -817,8 +842,16 @@ conflicts.
 **Queued behind the lib split, in this order, because each needs
 `main.rs` and the split rewrites it:**
 1. the **undo tree** (hooks the single op dispatch; see below),
-2. **in-workspace sub-rect video** (needs ratatui taught to leave a
-   hole; `docs/video.md` has the analysis),
+2. **in-workspace sub-rect video**. the blocker recorded as "the real
+   work" was **wrong and is now gone**: ratatui's `flush` diffs the
+   previous buffer against the current one, so it has no idea what is
+   on the terminal and cannot "restore" cells mpv drew. a rect left
+   untouched in two consecutive frames emits nothing. `video::Hole`
+   plus five tests against ratatui's own `Buffer::diff` pin that, and
+   `Hole::painted` reports when an overlay or a resize repaint breaks
+   the promise so mpv can be asked to redraw. what is left is the
+   unglamorous half: keeping wim's widgets out of the rect (a layout
+   change in `main.rs`) and the redraw trigger. see `docs/video.md`.
 3. **cron scheduling** (`at(07:00) ...`), which needs the language
    work landed first.
 
@@ -855,13 +888,22 @@ the order below is not a preference, it is a dependency.
       then doing something new does not destroy the branch you left;
       it becomes a sibling you can walk back to, the way vim's undo
       tree works. thematically right for an app called wim.
-      **why this app can do it properly and others cannot:** every
-      state change already funnels through one choke point,
-      `apply_shellsong_op`, and every op already has
-      `Op::describe()`. so there is exactly one place to record
-      history, which is the difference between complete undo and
-      best-effort undo, and every node gets a human-readable label for
-      free. a branch of the tree is then *already* a list of ops, which
+      **correction to what this entry first claimed.** it said every
+      state change funnels through one choke point,
+      `apply_shellsong_op`. it does not, and the difference matters:
+      `run_shellsong_op` has 40 op arms, **12 delegate to
+      `dispatch_action` and 28 act directly**, and the 28 include
+      `ClearQueue`, which is the single most valuable thing to be able
+      to undo. hooking either function alone misses half the mutations;
+      hooking both double-records the 12. the fix is to give those 28
+      `Action` variants so there really is one choke point, which is
+      cheapest to do **during the library split**, since that is
+      already moving the mutation surface into a core. `Op::describe()`
+      does exist for every op, so the labels really are free.
+      the full design, including an op-by-op classification into
+      snapshot-restorable, irreversible-side-effect (undo must refuse
+      with a reason rather than restore around it) and not-recorded, is
+      in **docs/undo.md**. a branch of the tree is then *already* a list of ops, which
       is to say **a `.shg` script**: exporting a branch is close to
       free once scripts exist, and that ties the two headline features
       together.
