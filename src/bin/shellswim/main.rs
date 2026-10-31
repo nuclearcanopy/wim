@@ -281,7 +281,15 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
                 crossfade_on: s.crossfade,
                 paused: s.playback.paused,
                 elapsed_secs: s.playback.elapsed_secs,
-                duration_secs: s.playback.duration_secs,
+                // the entry's own length where it knows better than
+                // mpv, which is a generated silence; see
+                // `core::playing_duration`. shellswim is mostly this
+                // bar, so a 15m gap drawing as a full one-second
+                // track is most of what is on screen.
+                duration_secs: wim::core::playing_duration(
+                    s.queue.current(),
+                    s.playback.duration_secs,
+                ),
                 flash: None,
                 selected: None,
                 scrubbing: false,

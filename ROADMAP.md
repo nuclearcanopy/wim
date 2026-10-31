@@ -918,15 +918,51 @@ mpv loaded, a generated silence source included".
       two existing guard tests caught the addition by design (the
       pinned completion list, and the one asserting every parameter
       type in the table is covered), which is what they are for.
-- [ ] **the playing silence still draws from mpv's duration**, so a
-      15m gap shows as a one-second track on the bar and the scrubber
-      fills instantly. the fix is known (read `Silence { secs }`) and
-      is a ui slice: `now_playing`'s length comes from the `duration`
-      property, so it needs a path for "the entry knows better than
-      mpv". **this is the one part a human should look at**, since it
-      is the only visible half of the feature.
-- [ ] **three racy tests of my own, fixed while here, worth the
-      note.** the resolver tests mixed a real `request` (which spawns
+- [x] **the playing silence drew from mpv's duration.** fixed by
+      `core::playing_duration(item, reported)`, which prefers what the
+      entry knows and falls back to mpv for everything else; kept
+      narrow on purpose, since for a real file mpv is the one that has
+      read the container.
+      applied at **five** sites, not one: the frame's display binding,
+      the crossfade ramp, both scrub-handler contexts (a drag resolves
+      its seek target against the duration, so scrubbing a gap landed
+      nowhere), and shellswim's bar, which matters most because
+      shellswim *is* mostly that bar.
+      the crossfade one was not cosmetic: with a 1s duration
+      `remaining` stayed negative for the whole gap, so it wrote a
+      volume to mpv **every frame for fifteen minutes** instead of
+      over the last few seconds.
+- [x] **the gap panel: the cover rect is a countdown while a silence
+      plays.** a silence has no cover and never will, so the biggest
+      rect on the full player sat blank for the length of the gap. it
+      now draws the remaining time large, which is the one thing
+      anyone wants off that screen during a gap, with `remaining`
+      under it in the dimmest shade so a bare number cannot be read as
+      elapsed.
+      `src/ui/gap.rs`: a hand-authored 3x5 block digit font (nothing
+      to reuse; `logos::LOGOS` is figlet art for the word "WIM" and
+      has no digits). three scales, picked largest-that-fits, and a
+      plain `m:ss` fallback when even the smallest will not fit. the
+      scale ladder keeps x at twice y throughout, which is not taste:
+      a cell is about twice as tall as it is wide, so a 3x5 glyph at
+      one cell per pixel is physically 3 wide and 10 tall, a sliver.
+      the caption is dropped *before* the digits shrink, since the
+      number is what was asked for.
+      only a gap claims the rect, `art = off` still means off, and it
+      draws in the `Full*` modes too because the host has no image to
+      overlay for a gap. all four pinned.
+      **looked at, not just tested.** `ui::gap::eyeball` prints the
+      panel at three sizes (`cargo test --lib eyeball -- --nocapture`)
+      and reading it found a real bug no assertion here would have
+      caught: the `1` glyph was right-aligned in its three-column slot
+      like a seven-segment display's, which left a four-cell notch and
+      shoved the whole number visibly off-centre against the caption.
+      centred now. the print test asserts a floor as well, so it is
+      not a test that cannot fail.
+      still worth a human's eyes on a real terminal for the one thing
+      a buffer cannot show: whether the countdown reads as calm rather
+      than alarming at full size.
+- [x] **three racy tests of my own, fixed, worth the note.** the resolver tests mixed a real `request` (which spawns
       a worker that tries to reach the fixture client's host) with a
       staged `deliver`, so the real reply raced the fake one. they
       passed for two sessions because dns failed slower than the test
