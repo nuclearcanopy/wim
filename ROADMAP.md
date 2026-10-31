@@ -973,23 +973,43 @@ above this line in the shellswim section is done.
       wim's own console (`ui::shellsong::ShellsongConsole`) has the
       state for free now, since it lives on `Console`; what it still
       needs is the key handling and the same notice row.
-- [ ] **`queue()` should decide between a song and an album
-      dynamically**, with `k=song`/`k=album` as the strong assertions.
-      the assertions exist now (`k=`, `k=a`, `k=s`); what is left is
-      the *default*. today bare `queue` is song-only by a recorded
-      decision ("playing an album is ordinary, building a queue out of
-      albums is not. do not fix the asymmetry") and r7 says the whole
-      mechanism is "ambiguity resolution, not filtering".
-      **the maintainer has now asked for the opposite twice**, so the
-      asymmetry note is overruled; what needs care is that "decide
-      dynamically" means the best-scoring match wins *regardless of
-      kind*, which is a different mechanism from the preference ladder
-      rather than another rung on it. `best_match` currently walks
-      `prefs` in order and takes the first kind present; a dynamic
-      default wants the top-scoring result whatever it is. r7 and the
-      `play`/`queue` asymmetry note both need rewriting, not deleting:
-      the reasoning is still why the *ladder* exists for the explicit
-      forms.
+- [x] **`queue()` decides between a song and an album dynamically**,
+      with `k=song`/`k=album` as the assertions.
+      the mechanism changed rather than gaining a rung, as the note
+      above predicted. `Pick::Best` takes the acceptable result
+      *nearest the front* of the list, and that is exactly "whichever
+      kind scored better" because `Corpus::search` sorts by score and
+      *then* groups categories, keeping each category's first
+      appearance. so the dynamic default is one `position` call.
+      `Pick::InOrder` keeps the old walk for **`view`**, which is the
+      one command whose preference list is a real order: `view(q,
+      bladee)` must open the artist's page even when a song scored
+      higher. gated on the same `widenable()` predicate `kind=` is,
+      for the same reason -- the rungs widen *from songs* and `view`
+      does not start there.
+      **`kind=` rungs became filter sets**: `song` is `{Song}`,
+      `album` is `{Album}`, and neither falls back, because an
+      assertion that quietly accepts the other kind is not one. a
+      `k=album` with no album match now reports that.
+      `_aa` still desugars to `kind=album` so scripts parse, but its
+      name ("allow album") no longer describes it -- albums are
+      allowed by default and the suffix asserts. kept rather than
+      removed, since dropping a documented suffix breaks scripts
+      silently; docs point at `k=a` instead.
+      **eight tests pinned the old semantics and were rewritten, one
+      found a real bug.** `add_to_queue(back, x)` must lower
+      identically to `queue(x)`, and a test comparing the two
+      lowerings caught them diverging when only `queue` was changed --
+      the kind set had to move on both. the kind-preference test has
+      now been inverted twice (song-preferring, then
+      album-preferring, now score-deciding); both earlier versions
+      were approximations of this, and the comment says so rather than
+      pretending the first was wrong in isolation.
+      r7 and the `play`/`queue` asymmetry note are rewritten, not
+      deleted: the bare command still *resolves* ambiguity, which is
+      what r7 was about, and `kind=` filters, which is what it denied.
+      `SONG` fell out of the command table entirely -- nothing is
+      song-only any more, since that is what `k=song` is for.
 - [ ] **shellswim never handles `idle-active`.** the other half of the
       `skip()` report. its event drain watches `PROP_PLAYLIST_POS` and
       nothing else, so when mpv's playlist genuinely runs out the
