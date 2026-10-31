@@ -3153,8 +3153,16 @@ pub enum ConsoleAction {
 
 const MAX_SCROLLBACK: usize = 200;
 const MAX_HISTORY: usize = 200;
-/// Completion runs on every keystroke, so the candidate list is capped
-/// rather than however many a wide query matches.
+/// Completion runs on every keystroke, so a candidate list that the
+/// *user* or the corpus can grow is capped rather than however many a
+/// wide query matches.
+///
+/// The lists the command table itself bounds (command names, a keyword
+/// set) are deliberately **not** capped: there are more than 50 written
+/// command names, so capping them made every name alphabetically past
+/// "random" unreachable by tab from an empty token, `view` and `volume`
+/// included. The overlay already ellipsis-truncates the row it draws
+/// them in, so a long list costs nothing on screen.
 const MAX_CANDIDATES: usize = 50;
 
 /// What the console may ask the host about the world, behind a trait so
@@ -3518,11 +3526,12 @@ impl Console {
     fn candidates_at(&self, here: &Site, cand: &dyn Candidates) -> Vec<String> {
         let mut seen = match here.completes {
             Completes::Hint(_) => return Vec::new(),
+            // uncapped: bounded by the table, not by the library.
             Completes::Words(set) => {
-                keep_extensions(&here.token, set.options().iter().copied(), MAX_CANDIDATES)
+                keep_extensions(&here.token, set.options().iter().copied(), usize::MAX)
             }
             Completes::CommandNames => {
-                keep_extensions(&here.token, every_name().iter().copied(), MAX_CANDIDATES)
+                keep_extensions(&here.token, every_name().iter().copied(), usize::MAX)
             }
             // fuzzy discovery, so a subsequence or typo match surfaces
             // things a prefix scan would miss; the prefix filter below
@@ -3552,7 +3561,7 @@ impl Console {
             Completes::SettingNames => keep_extensions(
                 &here.token,
                 Words::Setting.options().iter().copied(),
-                MAX_CANDIDATES,
+                usize::MAX,
             ),
             Completes::SavedQueues => keep_extensions(
                 &here.token,
@@ -5777,6 +5786,34 @@ mod tests {
         }
     }
 
+    /// The command-name list is bounded by the table, not by the
+    /// library, so capping it only ever hides real commands: with more
+    /// than `MAX_CANDIDATES` written names, every one alphabetically
+    /// past the cut became unreachable by tab from an empty token,
+    /// `view` and `volume` among them.
+    #[test]
+    fn every_command_name_is_reachable_by_tab_from_an_empty_token() {
+        let fake = Fake::new(&[]);
+        let c = Console::empty();
+        let here = site("", 0);
+        let offered = c.candidates_at(&here, &fake);
+        assert!(
+            every_name().len() > MAX_CANDIDATES,
+            "the table no longer exceeds the cap, so this test is about nothing"
+        );
+        for name in every_name() {
+            assert!(
+                offered.contains(&(*name).to_string()),
+                "'{name}' cannot be reached by tab"
+            );
+        }
+        // the corpus is the half that still has to be capped: it is as
+        // long as the library.
+        let wide = Fake::new(&["flatline"]);
+        let here = site("play(", 5);
+        assert!(c.candidates_at(&here, &wide).len() <= MAX_CANDIDATES);
+    }
+
     #[test]
     fn a_keyword_set_only_ever_offers_something_that_parses() {
         for c in COMMANDS {
@@ -7030,6 +7067,39 @@ queue(morning)
                 "queue",
                 "quit",
                 "random",
+                "randomize",
+                "remember",
+                "remove",
+                "repeat",
+                "repeat_mode",
+                "rescan",
+                "run",
+                "save_queue",
+                "search",
+                "seek",
+                "select",
+                "show",
+                "shuf",
+                "shuffle",
+                "shuffle_queue",
+                "skip",
+                "sleep",
+                "speed",
+                "star",
+                "tempo",
+                "toggle",
+                "top",
+                "unfav",
+                "unfavorite",
+                "unlike",
+                "unmute",
+                "unset",
+                "unstar",
+                "up",
+                "view",
+                "vol",
+                "volume",
+                "xfade",
             ],
         );
         pin(
@@ -7218,6 +7288,39 @@ queue(morning)
                 "queue",
                 "quit",
                 "random",
+                "randomize",
+                "remember",
+                "remove",
+                "repeat",
+                "repeat_mode",
+                "rescan",
+                "run",
+                "save_queue",
+                "search",
+                "seek",
+                "select",
+                "show",
+                "shuf",
+                "shuffle",
+                "shuffle_queue",
+                "skip",
+                "sleep",
+                "speed",
+                "star",
+                "tempo",
+                "toggle",
+                "top",
+                "unfav",
+                "unfavorite",
+                "unlike",
+                "unmute",
+                "unset",
+                "unstar",
+                "up",
+                "view",
+                "vol",
+                "volume",
+                "xfade",
             ],
         );
         pin(
@@ -7501,6 +7604,39 @@ queue(morning)
                 "queue",
                 "quit",
                 "random",
+                "randomize",
+                "remember",
+                "remove",
+                "repeat",
+                "repeat_mode",
+                "rescan",
+                "run",
+                "save_queue",
+                "search",
+                "seek",
+                "select",
+                "show",
+                "shuf",
+                "shuffle",
+                "shuffle_queue",
+                "skip",
+                "sleep",
+                "speed",
+                "star",
+                "tempo",
+                "toggle",
+                "top",
+                "unfav",
+                "unfavorite",
+                "unlike",
+                "unmute",
+                "unset",
+                "unstar",
+                "up",
+                "view",
+                "vol",
+                "volume",
+                "xfade",
             ],
         );
         pin(

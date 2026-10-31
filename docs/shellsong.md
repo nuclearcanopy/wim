@@ -741,8 +741,17 @@ deterministic.
 
 completion runs on every keystroke, so it uses the **local corpus
 only** and never triggers a remote search; typing would otherwise spam
-the server. candidates are capped at 50 and the existing optimised
-`Corpus::search` does the scoring rather than a second scorer. the host
+the server. a list the corpus or the user can grow is capped at 50 and
+the existing optimised `Corpus::search` does the scoring rather than a
+second scorer.
+
+the lists the command table itself bounds (command names, a keyword
+set) are deliberately **not** capped. there are more than 50 written
+command names, so capping them hid every name alphabetically past the
+cut from tab on an empty token, `view` and `volume` included; the
+overlay already ellipsis-truncates the row it draws candidates in, so a
+long list costs nothing on screen. a test walks `every_name()` and
+fails if any of them stops being reachable. the host
 supplies the corpus behind a small provider trait, which is also what
 lets the completer be tested with no corpus, no network and no
 terminal.
