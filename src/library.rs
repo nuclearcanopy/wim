@@ -260,6 +260,27 @@ impl ScanReport {
     }
 }
 
+/// Restarts the scan against `paths`, replacing `rx` with the new
+/// channel's receiver.
+///
+/// **Replacing the receiver is the load-bearing part.** A scan signs
+/// off by dropping its sender, so an old receiver cannot be reused;
+/// worse, the previous scan's remaining batches are still in flight
+/// and would drain into whatever corpus is current now, listing every
+/// local track twice for the rest of the session. `Op::Rescan` got
+/// this right and the onboarding library-paths step did not, which is
+/// why the rule lives here rather than in each caller.
+///
+/// The caller still owns the corpus side: drop the local half (not the
+/// whole corpus, or the navidrome catalog goes with it until the next
+/// sync) and resync the results.
+pub fn restart_scan(paths: Vec<String>, rx: &mut mpsc::Receiver<ScanBatch>) -> ScanReport {
+    let (tx, fresh) = mpsc::channel::<ScanBatch>();
+    let report = spawn_scan(paths, tx);
+    *rx = fresh;
+    report
+}
+
 /// Scans on its own thread, streaming batches over `tx`; the sender is
 /// dropped when the scan finishes, which is how the main thread knows
 /// (a disconnected channel) to stop reporting "scanning". Never blocks
@@ -1013,5 +1034,54 @@ mod tests {
             );
             fs::remove_dir_all(&root).ok();
         }
+    }
+}
+
+/// `restart_scan`'s one real rule, which is the receiver and not the
+/// thread.
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    /// The previous scan's in-flight batches must not land in the
+    /// corpus the restart is building.
+    ///
+    /// This is the bug the onboarding library-paths step had: it built
+    /// a fresh corpus and left `scan_rx` alone, so the startup scan's
+    /// remaining batches drained straight into it and **every local
+    /// track was listed twice for the rest of the session**. Swapping
+    /// the receiver is what makes them go nowhere; dropping the old one
+    /// is the entire mechanism, so it is worth a test that would catch
+    /// someone "simplifying" it back to reusing the channel.
+    #[test]
+    fn a_restart_leaves_the_old_scans_batches_nowhere_to_land() {
+        let (old_tx, mut rx) = mpsc::channel::<ScanBatch>();
+
+        // a batch already queued on the old channel, i.e. a scan that
+        // has not finished signing off yet.
+        old_tx.send(Vec::new()).expect("the old receiver is still up");
+
+        // nothing to scan, so the new thread finishes immediately and
+        // the test does not depend on the filesystem.
+        let _report = restart_scan(Vec::new(), &mut rx);
+
+        // the queued batch went with the receiver it was queued on.
+        // whatever the new scan does, it cannot be that batch.
+        let mut from_old = 0;
+        while let Ok(_batch) = rx.try_recv() {
+            from_old += 1;
+        }
+        assert_eq!(
+            from_old, 0,
+            "a batch from the previous scan reached the new receiver, \
+             which is how every local track got listed twice"
+        );
+
+        // and the old sender now talks to nobody, rather than to the
+        // channel the main loop is reading.
+        assert!(
+            old_tx.send(Vec::new()).is_err(),
+            "the old sender still reaches a live receiver"
+        );
     }
 }
