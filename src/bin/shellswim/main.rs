@@ -17,10 +17,10 @@ use wim::core::{self, Drive};
 use wim::playqueue::PlayQueue;
 use wim::search::SearchItem;
 use wim::shellsong::{Console, ConsoleAction, LineKind};
-use wim::swimconsole::{SwimConsole, TrackLine};
-use wim::ui::controlsbar::ControlsBar;
+use wim::swimconsole::{SwimBar, SwimConsole};
+use wim::ui::divider::HorizontalRule;
 use wim::ui::results_list::label;
-use wim::{anim, app, config, mpv, term, trace};
+use wim::{anim, config, mpv, term, trace};
 
 mod cli;
 mod host;
@@ -136,11 +136,9 @@ fn prompt() -> anyhow::Result<()> {
             &Screen {
                 console: &host.console,
                 playback: &host.playback,
-                app: &host.app,
                 queue: &host.play_queue,
                 now_playing: &now_playing,
                 now: host.now(),
-                crossfade: host.crossfade_enabled,
                 gap_remaining: host
                     .between_tracks
                     .remaining(Instant::now())
@@ -234,11 +232,9 @@ fn banner(console: &mut Console, cfg: &config::Config) {
 struct Screen<'a> {
     console: &'a Console,
     playback: &'a mpv::Playback,
-    app: &'a app::App,
     queue: &'a PlayQueue,
     now_playing: &'a Option<SearchItem>,
     now: Duration,
-    crossfade: bool,
     /// Seconds left of a between-track gap; shellswim is mostly this
     /// bar, so "paused with no reason given" is most of the screen.
     gap_remaining: Option<f64>,
@@ -247,16 +243,16 @@ struct Screen<'a> {
 fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
     let cursor_visible = anim::blink(s.now, anim::CURSOR_BLINK);
     let title = s.now_playing.as_ref().map(label);
-    let upcoming = s
-        .queue
-        .pos()
-        .map_or(0, |p| s.queue.entries().len().saturating_sub(p + 1));
     guard.draw_unless_video(false, |f| {
         // the console takes everything; the bar keeps two rows, the
         // track name over the transport strip. that is all the chrome
         // there is.
-        let [body, name, bar] = Layout::vertical([
+        // a rule, then space / bar / space, so the bar is delimited
+        // rather than jammed against the console's last line.
+        let [body, rule, _, bar, _] = Layout::vertical([
             Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -269,39 +265,24 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
             body,
         );
         f.render_widget(
-            TrackLine {
-                title: title.as_deref(),
-                upcoming,
+            HorizontalRule {
+                highlighted: false,
+                junctions: Vec::new(),
             },
-            name,
+            rule,
         );
         f.render_widget(
-            ControlsBar {
-                move_mode: false,
-                focus_label: "shell",
-                focused: false,
-                queue_len: s.queue.entries().len(),
-                loop_mode: s.app.loop_mode,
-                shuffle_on: s.app.shuffle,
-                speed: s.app.speed,
-                eq_active: s.app.eq_gains.iter().any(|g| *g != 0.0),
-                crossfade_on: s.crossfade,
-                paused: s.playback.paused,
-                gap_remaining: s.gap_remaining,
+            SwimBar {
+                title: title.as_deref(),
                 elapsed_secs: s.playback.elapsed_secs,
                 // the entry's own length where it knows better than
                 // mpv, which is a generated silence; see
-                // `core::playing_duration`. shellswim is mostly this
-                // bar, so a 15m gap drawing as a full one-second
-                // track is most of what is on screen.
+                // `core::playing_duration`.
                 duration_secs: wim::core::playing_duration(
                     s.queue.current(),
                     s.playback.duration_secs,
                 ),
-                flash: None,
-                selected: None,
-                scrubbing: false,
-                resize_hint: None,
+                gap_remaining: s.gap_remaining,
             },
             bar,
         );
