@@ -32,12 +32,32 @@ pub const OPEN_KEY: KeyCode = KeyCode::Char(':');
 /// instantly with no indexed server.
 const AWAIT_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Upper bound on `repeat(n, ...)`; the expansion is static, so an
-/// absurd `n` would otherwise allocate an absurd program.
+/// Upper bound on the `n` of one `repeat(n, ...)`; the expansion is
+/// static, so an absurd `n` would otherwise allocate an absurd program.
+/// This bounds one level only, and `repeat` nests: what a program can
+/// actually expand to is bounded by `MAX_EXPANSION`.
 const MAX_REPEAT: u32 = 256;
+
+/// Upper bound on the nodes a program may expand to, checked inside
+/// `repeat` because nesting is the only way to reach it. `MAX_REPEAT`
+/// bounds each level, so nested levels multiply: 256 twice over is 65k
+/// nodes, three times is 16.7M (over a gigabyte) built synchronously in
+/// `submit` with the ui frozen, and four is an allocation failure there
+/// is no recovering from. 4096 is far past any real `repeat` (a flat
+/// `repeat(256, queue(x))` is 512) and small enough to build instantly.
+///
+/// Checked per iteration, so the guarantee is this plus whatever the
+/// iteration that crossed it was already building, not this exactly.
+const MAX_EXPANSION: usize = 4096;
 
 /// Default ramp for `fade(in|out)` when no duration is given.
 const DEFAULT_FADE_SECS: f64 = 5.0;
+
+/// Longest time any command accepts, in hours. A day is already past
+/// anything a sleep timer, a gap or a seek means, and the bound is what
+/// keeps `Duration::from_secs_f64` out of reach of a typed `1e30`: it
+/// aborts the process on a value that is non-finite or too big.
+const MAX_TIME_HOURS: f64 = 24.0;
 
 // ---------------------------------------------------------------- kinds
 
@@ -2052,6 +2072,9 @@ struct Lowering<'a> {
     read: Option<ScriptReader<'a>>,
     /// How many `run(...)` frames are open, for `MAX_SCRIPT_DEPTH`.
     depth: usize,
+    /// Set once an expansion hit `MAX_EXPANSION`, so the loops that
+    /// enclose it stop instead of reporting it again per iteration.
+    refused: bool,
 }
 
 impl<'a> Lowering<'a> {
@@ -2062,6 +2085,7 @@ impl<'a> Lowering<'a> {
             scope: world.scope.clone(),
             read: world.read,
             depth: 0,
+            refused: false,
         }
     }
 
@@ -2072,6 +2096,7 @@ impl<'a> Lowering<'a> {
             scope: self.scope.clone(),
             read: self.read,
             depth: self.depth,
+            refused: self.refused,
         }
     }
 
@@ -2137,6 +2162,14 @@ impl<'a> Lowering<'a> {
                     return;
                 };
                 for _ in 0..*n {
+                    // the total, not this level: `n` is already bounded,
+                    // and it is the product of the nested levels that
+                    // allocates. checked before the iteration, so
+                    // nothing oversized is ever built.
+                    if self.refused || self.nodes.len() >= MAX_EXPANSION {
+                        self.refuse_expansion();
+                        return;
+                    }
                     self.lower(inner, false);
                 }
             }
@@ -2160,6 +2193,20 @@ impl<'a> Lowering<'a> {
             "help" => self.lower_help(call),
             _ => self.lower_plain(call),
         }
+    }
+
+    /// One message however deep the nesting went, and every enclosing
+    /// `repeat` stops rather than reporting the same refusal 256 more
+    /// times. A `Fail` node, like `MAX_SCRIPT_DEPTH`'s: the rest of the
+    /// program still runs, with this in the scrollback.
+    fn refuse_expansion(&mut self) {
+        if self.refused {
+            return;
+        }
+        self.refused = true;
+        self.nodes.push(Node::Fail(format!(
+            "repeat would expand past {MAX_EXPANSION} steps; nest fewer repeats"
+        )));
     }
 
     /// Inlines a `.shg` file: every line is parsed on its own and
@@ -2491,9 +2538,11 @@ impl Call {
             },
             "silence" => match first {
                 // rounded to whole seconds: the lavfi source takes an
-                // integer and nobody queues a 1.5 second gap.
+                // integer and nobody queues a 1.5 second gap. rounded
+                // rather than truncated, and never to zero: `Ty::Span`
+                // already refused a length of none, so neither may this.
                 Some(Arg::Span(s)) => Op::Silence {
-                    secs: *s as u64,
+                    secs: s.round().max(1.0) as u64,
                     front: self.keyword(Words::Position) == Some("front"),
                 },
                 _ => return None,
@@ -3277,13 +3326,13 @@ fn parse_time(text: &str) -> Result<(Option<char>, Pos), String> {
             }
             secs = secs * 60.0 + v;
         }
-        return Ok((sign, Pos::Seconds(secs)));
+        return Ok((sign, seconds(rest, secs)?));
     }
     if let Ok(secs) = rest.parse::<f64>() {
         if secs < 0.0 {
             return Err(format!("'{rest}' is negative; put the sign in front"));
         }
-        return Ok((sign, Pos::Seconds(secs)));
+        return Ok((sign, seconds(rest, secs)?));
     }
     // unit form: h then m then s, each at most once.
     const UNITS: [(char, f64); 3] = [('h', 3600.0), ('m', 60.0), ('s', 1.0)];
@@ -3319,7 +3368,25 @@ fn parse_time(text: &str) -> Result<(Option<char>, Pos), String> {
     if !saw_any {
         return Err(format!("'{text}' is not a time"));
     }
-    Ok((sign, Pos::Seconds(secs)))
+    Ok((sign, seconds(rest, secs)?))
+}
+
+/// The one gate every seconds-valued time goes through. `f64::parse`
+/// happily returns `inf` and `nan`, and both of those reach
+/// `Duration::from_secs_f64` in the host and abort the process; an
+/// absurd-but-finite `1e30` does the same. Refused here rather than
+/// clamped: a time nobody could have meant is a typo to tell the user
+/// about, not a value to guess at.
+fn seconds(text: &str, secs: f64) -> Result<Pos, String> {
+    if !secs.is_finite() {
+        return Err(format!("'{text}' is not a time"));
+    }
+    if secs > MAX_TIME_HOURS * 3600.0 {
+        return Err(format!(
+            "'{text}' is longer than {MAX_TIME_HOURS:.0}h; use a shorter time"
+        ));
+    }
+    Ok(Pos::Seconds(secs))
 }
 
 fn parse_level(text: &str) -> Result<Level, String> {
@@ -3327,8 +3394,10 @@ fn parse_level(text: &str) -> Result<Level, String> {
     let value = match pos {
         Pos::Percent(p) => p,
         // a bare number is a percent here, since that is the only
-        // thing a volume could mean.
-        Pos::Seconds(s) => s,
+        // thing a volume could mean, so it is held to the same range
+        // the `%` spelling is rather than to `parse_time`'s.
+        Pos::Seconds(s) if (0.0..=100.0).contains(&s) => s,
+        Pos::Seconds(s) => return Err(format!("{s}% is outside 0-100")),
     };
     Ok(match sign {
         Some('-') => Level::Delta(-value),
@@ -4063,9 +4132,15 @@ fn enclosing(input: &str, at: usize) -> Option<(&str, usize)> {
             _ if quoted => {}
             '(' => {
                 let end = i;
+                // the name starts *after* the last non-ident char, which
+                // is its own length past it: `rfind`'s index is that
+                // char's first byte, so a flat `+ 1` lands inside a
+                // multibyte one and the slice below aborts the process.
                 let start = before[..end]
-                    .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                    .map(|j| j + 1)
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_'))
+                    .map(|(j, c)| j + c.len_utf8())
                     .unwrap_or(0);
                 stack.push(Frame::Call {
                     name: (start, end),
@@ -5263,6 +5338,61 @@ mod tests {
             .contains("positive whole number"));
     }
 
+    /// `MAX_REPEAT` bounds one level, but the expansion is static and
+    /// nests, so what gets allocated is the *product*: two levels of
+    /// 256 is 65k nodes, three is 16.7M (over a gigabyte) built
+    /// synchronously in `submit` with the ui frozen, and four is an
+    /// allocation failure there is no recovering from. Only a bound on
+    /// the total can hold that, so this pins the total.
+    #[test]
+    fn nested_repeat_is_bounded_by_the_total_it_expands_to() {
+        // the budget is checked per iteration, so the iteration that
+        // crosses it still finishes: one inner call's worth of nodes,
+        // plus the refusal itself.
+        let slack = 128;
+        for input in [
+            "repeat(256, repeat(256, skip()))",
+            "repeat(256, repeat(256, repeat(256, skip())))",
+            "repeat(256, repeat(256, repeat(256, repeat(256, skip()))))",
+            "repeat(256, repeat(16, queue([hex, crest])))",
+        ] {
+            let program = Program::parse(input).expect("should parse");
+            assert!(
+                program.nodes.len() <= MAX_EXPANSION + slack,
+                "{input} lowered to {} nodes",
+                program.nodes.len()
+            );
+            // read off the nodes rather than stepped: the refusal is the
+            // last node of a program thousands of steps long.
+            let refused = program
+                .nodes
+                .iter()
+                .any(|n| matches!(n, Node::Fail(text) if text.contains("expand")));
+            assert!(
+                refused,
+                "{input} expanded past the budget without saying so"
+            );
+        }
+        // one level is untouched: the bound is on the product, and a
+        // flat `repeat(256, ...)` is well inside it.
+        let flat = Program::parse("repeat(256, skip())").expect("should parse");
+        assert_eq!(flat.nodes.len(), 256);
+        assert!(!flat.nodes.iter().any(|n| matches!(n, Node::Fail(_))));
+
+        // `dry` plans through the same lowering, so it is held to the
+        // same bound and reports the refusal in the plan.
+        let plan = Program::parse("dry(repeat(256, repeat(256, skip())))").expect("should parse");
+        assert!(
+            plan.nodes.len() <= MAX_EXPANSION + slack,
+            "{}",
+            plan.nodes.len()
+        );
+        assert!(plan
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Node::Note(text) if text.contains("expand"))));
+    }
+
     #[test]
     fn repeat_nests_inside_dry_and_dry_emits_nothing() {
         assert!(
@@ -6070,6 +6200,103 @@ mod tests {
         );
     }
 
+    /// `f64::parse` accepts `inf` and `nan`, and the host turns every
+    /// seconds-valued op into a `Duration`, which aborts the process on
+    /// a non-finite or overflowing value. `secs.max(0.0)` launders nan
+    /// but not inf, so nothing downstream can save it: whatever parses
+    /// here has to survive this conversion.
+    #[test]
+    fn a_time_that_parses_survives_the_hosts_duration_conversion() {
+        // the expression core.rs applies, verbatim.
+        let host = |secs: f64| Duration::from_secs_f64(secs.max(0.0));
+        for input in [
+            "sleep(inf)",
+            "sleep(nan)",
+            "sleep(1e30)",
+            "pause(inf)",
+            "pause(1e30)",
+            "gap(inf)",
+            "gap(1e30)",
+            "fade(out, inf)",
+            "fade(out, 1e30)",
+            "silence(inf)",
+            "silence(1e20)",
+            "moveto(inf)",
+            "moveto(inf:0)",
+            "seek(+inf)",
+            "speed(inf)",
+            "volume(nan)",
+            "volume(1e30)",
+        ] {
+            let Ok(program) = Program::parse(input) else {
+                continue;
+            };
+            for op in ops_of(&program) {
+                match op {
+                    Op::PauseFor(s) | Op::Fade { secs: s, .. } => {
+                        host(s);
+                    }
+                    Op::Sleep(Some(s)) | Op::SetGap(Some(s)) => {
+                        host(s);
+                    }
+                    // the host hands these to mpv and persistence, which
+                    // both need a real number too.
+                    Op::SeekAbsolute(Pos::Seconds(s) | Pos::Percent(s))
+                    | Op::SeekRelative(s)
+                    | Op::SetSpeed(s)
+                    | Op::SetVolume(Level::Absolute(s) | Level::Delta(s)) => {
+                        assert!(s.is_finite(), "{input} emitted {s}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// The same hazard from the other side: each of these is refused at
+    /// the parse boundary with something the user can act on, rather
+    /// than becoming a value the player has to cope with.
+    #[test]
+    fn a_non_finite_or_absurd_time_is_refused_with_a_reason() {
+        for (input, want) in [
+            ("sleep(inf)", "not a time"),
+            ("sleep(nan)", "not a time"),
+            ("sleep(1e30)", "longer than"),
+            ("pause(inf)", "not a time"),
+            ("pause(1e30)", "longer than"),
+            ("gap(inf)", "not a time"),
+            ("silence(inf)", "not a time"),
+            ("silence(1e20)", "longer than"),
+            ("fade(out, inf)", "not a time"),
+            ("moveto(inf)", "not a time"),
+            ("moveto(inf:0)", "not a time"),
+            ("moveto(99999h)", "longer than"),
+            ("seek(+inf)", "not a time"),
+            ("volume(nan)", "not a time"),
+            ("volume(1e30)", "longer than"),
+            // a bare number is a percent for volume, so it is held to
+            // the same 0-100 the `%` spelling always was.
+            ("volume(101)", "outside 0-100"),
+            ("volume(+200)", "outside 0-100"),
+        ] {
+            let e = error(input);
+            assert!(
+                e.message.contains(want),
+                "{input} said '{}', expected '{want}'",
+                e.message
+            );
+        }
+        // and the whole-second rounding `silence` does cannot round a
+        // real length down to a silence of no length.
+        assert_eq!(
+            ops("silence(0.4s)"),
+            vec![Op::Silence {
+                secs: 1,
+                front: false
+            }]
+        );
+    }
+
     #[test]
     fn every_op_describes_itself_for_the_scrollback() {
         // R9: nothing is silent, so no op may describe itself as "".
@@ -6156,7 +6383,7 @@ mod tests {
     }
 
     #[test]
-    fn multibyte_input_never_slices_mid_character() {
+    fn multibyte_editing_never_slices_mid_character() {
         let (buf, cursor) = typed("queue([日本");
         assert_eq!(buf, "queue([日本])");
         assert_eq!(cursor, 13);
@@ -6164,6 +6391,28 @@ mod tests {
         let mut cursor = cursor;
         edit_backspace(&mut buf, &mut cursor);
         assert_eq!(buf, "queue([日])");
+    }
+
+    /// The other half of the same hazard, and the one that actually
+    /// crashed: the call name before a `(` is a byte range, and a
+    /// non-ascii char in front of it used to push its start into the
+    /// middle of that char. Autopair means `rós` plus one `(` keystroke
+    /// gets here, and `site` runs on every keystroke.
+    #[test]
+    fn the_site_never_slices_a_multibyte_call_name() {
+        // the name is the ascii ident tail, cut at the non-ascii char
+        // rather than one byte into it.
+        assert_eq!(enclosing("rós(", 5), Some(("s", 0)));
+        assert_eq!(enclosing("é(", 3), Some(("", 0)));
+        assert_eq!(enclosing("Țara(", 6), Some(("ara", 0)));
+        assert_eq!(enclosing("queue([日本(", 17), Some(("", 0)));
+        // and every cursor position of every one of them is reachable
+        // by typing, so none of them may panic.
+        for input in ["rós()", "é()", "Țara()", "queue([日本()", "a(ó()"] {
+            for cursor in (0..=input.len()).filter(|c| input.is_char_boundary(*c)) {
+                let _ = site(input, cursor);
+            }
+        }
     }
 
     // ------------------------------------------------------- the site

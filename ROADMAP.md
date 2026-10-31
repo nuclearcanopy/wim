@@ -1158,32 +1158,53 @@ file, because several span two files.
 **these abort the process from ordinary use.** in flight as of this
 writing (two agents, one per file).
 
-- [ ] **`shellsong.rs` ~4088, root cause ~4067: one keystroke
-      crashes the console.** `enclosing()` builds a call-name range
-      with `rfind(pred).map(|j| j + 1)`, and `str::rfind` returns the
-      *first* byte of the matched char, so for a multi-byte char the
-      `+1` lands mid-codepoint and the slice panics. type any
-      non-ascii char immediately followed by `(`: `rós(`, `é(`,
-      `Țara(`. autopair means one keystroke does it, and
-      `site()`/`enclosing()` run on every keystroke, so it is an
-      instant crash while typing. hits both binaries. verified:
-      `"rós"` yields `name=(2,4)`, panic.
-      **`multibyte_input_never_slices_mid_character` (~6158) gives
-      false confidence**: it only covers `edit_insert`/`edit_backspace`.
-- [ ] **`shellsong.rs` ~3282 into `core.rs` 2555/2574/2024: `inf` is
-      a valid duration.** `parse_time`'s bare-number branch is
+- [x] **`enclosing()`: a multibyte char before `(` aborted the
+      process on one keystroke.** the call-name range came from
+      `rfind(pred).map(|j| j + 1)`, and `rfind` returns the matched
+      char's *first* byte, so `rós(` built `name=(2,4)` and the slice
+      panicked inside the `ó`. autopair meant one `(` did it, and
+      `site()`/`enclosing()` run per keystroke, so it was an instant
+      crash while typing in either binary.
+      now `char_indices().rev().find(pred)` plus `len_utf8()`, so the
+      start lands after the char rather than inside it; the name is
+      still the ascii ident tail (`rós(` gives `s`, `é(` gives
+      nothing). the same `rfind`-plus-one shape appears nowhere else in
+      the file: every other `+ 1` is keyed off a single-byte ascii
+      literal found with `find` or a byte scan that only acts on ascii.
+      **the test whose name gave false confidence is renamed.**
+      `multibyte_input_never_slices_mid_character` only ever covered
+      `edit_insert`/`edit_backspace`, so it is now
+      `multibyte_editing_never_slices_mid_character` and
+      `the_site_never_slices_a_multibyte_call_name` is its sibling,
+      sweeping `site()` over every char boundary of each autopaired
+      form.
+- [x] **`parse_time`: `inf` was a valid duration, and the player had
+      no way to refuse it.** `parse_time`'s bare-number branch is
       `rest.parse::<f64>()` with only a `< 0.0` check, so `inf` and
       `1e30` become `Pos::Seconds`. `: sleep(inf)`, `: pause(inf)`,
-      `: fade(out, inf)`, `: silence(inf)` all reach
+      `: fade(out, inf)`, `: silence(inf)` all reached
       `Duration::from_secs_f64(inf)`, which panics *inside the draw
-      loop*; the hook tears the terminal down and the queue is lost.
-      `secs.max(0.0)` launders NaN but not infinity. same boundary:
-      `: volume(nan)` parses and is persistable into `bindings.toml`,
-      after which every later play of that track attempts a NaN
-      volume write; `: silence(0.4s)` truncates to a 0-second
-      `anullsrc` via `secs: *s as u64` and is reported as "a 0s
-      silence plays next"; `: silence(1e20)` reports
-      "5124095576030431h8m15s".
+      loop*; the hook tore the terminal down and the queue went with
+      it, and `secs.max(0.0)` launders NaN but not infinity.
+      every seconds-valued exit of `parse_time` (bare, colon and unit
+      forms) now goes through one `seconds()` gate that refuses
+      non-finite and anything over `MAX_TIME_HOURS`. **24h was chosen**
+      as past any real sleep timer, gap, silence, fade or seek position
+      while staying ~10^13 clear of `Duration`'s overflow, so the host
+      can convert unconditionally; refused with a message rather than
+      clamped, matching the file's existing habit for a count above
+      256.
+      same boundary, same class, all fixed with it: a bare-number
+      `volume` is held to the `0..=100` the `%` spelling always was,
+      which is what kept `volume(nan)` out of `remember`'s persisted
+      settings; and `silence` rounds with `s.round().max(1.0)` instead
+      of truncating, so `silence(0.4s)` is a one-second silence rather
+      than a zero-second one and `silence(1e20)` can no longer saturate
+      the `u64` into "5124095576030431h8m15s".
+      **the test aborts exactly where the app did**: it runs every
+      emitted op through core.rs's own
+      `Duration::from_secs_f64(secs.max(0.0))` rather than asserting on
+      the parse alone.
 - [x] **one rule for moving a cursor in a list**
       (`main.rs::step_in_list`), and **the audit was wrong about this
       one**, which is worth recording as loudly as the findings that
@@ -1261,15 +1282,28 @@ writing (two agents, one per file).
       another asserts a config using the `cache_listens_threshold`
       field alias loads with zero warnings (exactly the kind of thing
       a hand-written list forgets).
-- [ ] **`shellsong.rs` ~2139: `repeat` nesting is an OOM abort.**
-      `repeat` expands statically and `MAX_REPEAT = 256` bounds one
-      level while `parse_call` recursion depth is unbounded.
-      `: repeat(256, repeat(256, repeat(256, skip())))` allocates
-      ~16.7M nodes (~1.2 GB) synchronously in `submit` with the ui
-      frozen; one more level is an unrecoverable
-      `handle_alloc_error`. `MAX_REPEAT`'s own doc claims this is
-      prevented, so the doc is currently a lie. the bound has to be on
-      the *total* expansion, not per level.
+- [x] **`repeat` expanded as the product of its levels, and
+      `MAX_REPEAT` claimed otherwise.** the expansion is static and
+      `MAX_REPEAT` bounds one level, so
+      `: repeat(256, repeat(256, repeat(256, skip())))` built ~16.7M
+      nodes (over a gigabyte) synchronously in `submit` with the ui
+      frozen, and one more level was an unrecoverable
+      `handle_alloc_error`.
+      `MAX_EXPANSION` (4096 nodes) is checked inside the `repeat` loop
+      against the program's *total*, with a `refused` flag so one
+      `Node::Fail` is reported however deep the nesting went and every
+      enclosing loop stops rather than spinning 256^depth no-op
+      iterations. `dry` inherits it, since it plans through the same
+      lowering. four levels lower to ~4.1k nodes instead of 4.3
+      billion; a flat `repeat(256, skip())` is untouched; and
+      `MAX_REPEAT`'s doc now says what it actually bounds and points at
+      the constant that bounds the total.
+- [ ] **`parse_call` recursion is still unbounded**, independently of
+      lowering: a balanced deep nest (`dry(dry(dry(...)))`, pasted or
+      in a `.shg` line) recurses once per level at *parse* time, before
+      `MAX_EXPANSION` can see it. unverified, because a stack overflow
+      aborts the test harness; flagged rather than expanded into scope.
+      a depth counter in `parse_call` would close it.
 
 **silent desync and stale replies.** none of these crash; all of them
 do the wrong thing quietly, which is worse to diagnose.

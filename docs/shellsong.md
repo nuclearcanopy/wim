@@ -127,9 +127,11 @@ messages come from, and (r12) what completion offers.
 | `call` | a nested call | the command table |
 | keyword sets | one of an enumerated list | that list |
 | `pos` | an unsigned time literal (absolute) | nothing; hint only |
+| | every time literal is refused above 24h, and `inf`/`nan` are refused outright: the player converts these to a `Duration`, which aborts on a non-finite or over-long value | |
 | `offset` | a signed time literal (relative) | nothing; hint only |
 | `level` | a percent, absolute or signed | nothing; hint only |
 | `count` | a whole number, 1 to 256 | nothing; hint only |
+| | `repeat` also refuses when the *total* expansion would pass 4096 steps, so nesting counts multiply rather than each being bounded on its own | |
 | `index` | a 1-based queue position | nothing; hint only |
 | `indices` | one or more queue positions | nothing; hint only |
 | `speed` | a multiplier 0.25-3, or `up` / `down` / `reset` | nothing; hint only |
@@ -243,7 +245,8 @@ things in the library", and letting it take a call form would make
 
 ```
 volume(50%)    set it to 50
-volume(50)     the same; a bare number is a percent
+volume(50)     the same; a bare number is a percent, and is held to
+               0-100 exactly as the `%` spelling is
 volume(+10%)   10 points louder than it is now
 volume(-10%)   10 points quieter
 ```
