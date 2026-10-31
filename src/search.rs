@@ -59,10 +59,20 @@ impl Category {
 /// junction marks so the two can never disagree about where a header
 /// actually lands on screen.
 pub fn group_boundaries(items: &[SearchItem]) -> Vec<(usize, Category)> {
+    boundaries_of(items.iter().map(|item| item.category()))
+}
+
+/// The run-length scan both `group_boundaries` and
+/// `Ranking::group_boundaries` are, over categories alone.
+///
+/// Split out because a header's position depends on nothing but the
+/// sequence of categories, which is what lets the ranked-index caller
+/// answer the question without building a single `SearchItem`; two
+/// copies of this loop could disagree about where a header lands.
+fn boundaries_of(cats: impl Iterator<Item = Category>) -> Vec<(usize, Category)> {
     let mut boundaries = Vec::new();
     let mut last = None;
-    for (i, item) in items.iter().enumerate() {
-        let cat = item.category();
+    for (i, cat) in cats.enumerate() {
         if last != Some(cat) {
             boundaries.push((i, cat));
             last = Some(cat);
@@ -617,6 +627,25 @@ impl Ranking {
             return None;
         }
         corpus.item_at(*self.order.get(at)?)
+    }
+
+    /// Where a section header lands, without materializing a row.
+    ///
+    /// The draw path's one real need for the whole list was this, and
+    /// it only ever depended on the *categories*: cloning a row to
+    /// ask `item.category()` is precisely the cost the index list
+    /// exists to avoid. Empty for a corpus this ranking does not
+    /// address, matching `rows`.
+    pub fn group_boundaries(&self, corpus: &Corpus) -> Vec<(usize, Category)> {
+        if !self.addresses(corpus) {
+            return Vec::new();
+        }
+        boundaries_of(
+            self.order
+                .iter()
+                .filter_map(|&at| corpus.item_at(at))
+                .map(|item| item.category()),
+        )
     }
 
     /// Every row in order, or nothing at all when the corpus has moved
@@ -2488,6 +2517,25 @@ mod tests {
         assert!(ranking.row(&c, 0).is_none(), "no row from the wrong state");
         assert_eq!(ranking.rows(&c).count(), 0, "and not a partial list");
         assert_eq!(ranking.len(), ranking.len(), "the order itself is intact");
+    }
+
+    /// The headers a ranking reports must land exactly where the
+    /// list-of-items version puts them, since main.rs's sidebar
+    /// divider draws its junction marks off one and the results list
+    /// draws the headers off the other; a one-row disagreement is a
+    /// junction mark against a blank row.
+    #[test]
+    fn ranked_group_boundaries_match_the_materialized_ones() {
+        let c = varied_corpus(2_000);
+        for query in GUARD_QUERIES {
+            let ranking = c.rank(query);
+            let items = c.search(query);
+            assert_eq!(
+                ranking.group_boundaries(&c),
+                group_boundaries(&items),
+                "{query:?}: headers land on different rows"
+            );
+        }
     }
 
     /// The per-chunk base arithmetic, stated directly.
