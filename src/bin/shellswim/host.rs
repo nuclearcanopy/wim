@@ -382,8 +382,12 @@ impl Host {
                 let _ = &mut surf;
                 s
             };
+            // through the same slot `queue_program` writes, so the
+            // two routes cannot diverge: assigning `self.program`
+            // here used to cut a typed program short on a track
+            // change, where the slot waits its turn instead.
             if !started.ops.is_empty() {
-                self.program = Some(Box::new(wim::shellsong::Program::of(started.ops)));
+                self.swim.queued = Some(Box::new(wim::shellsong::Program::of(started.ops)));
             }
             if let Some(bound) = started.bound {
                 self.console.note(bound);
@@ -491,6 +495,12 @@ impl Host {
     /// from disjoint fields of `self`, which is the whole reason
     /// `CoreCtx` and `Surface` are separate arguments.
     pub fn step(&mut self) -> Drive {
+        // the same rule wim's loop uses: a program the core queued
+        // starts only once nothing else is running, so bound settings
+        // cannot interrupt something the user typed.
+        if self.program.is_none() {
+            self.program = self.swim.queued.take();
+        }
         let Some(program) = self.program.as_mut() else {
             return Drive::Done;
         };
