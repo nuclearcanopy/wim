@@ -87,7 +87,12 @@ impl LoopMode {
 pub struct App {
     pub corpus: Corpus,
     pub query: String,
-    pub results: Vec<SearchItem>,
+    /// The ranked rows for `query`. Private, and reached through the
+    /// accessors below, because the plan for the remaining search cost
+    /// is to stop materializing rows nobody scrolled to; see the
+    /// result-clone item in ROADMAP.md. A `pub` field makes that
+    /// change touch every reader instead of this file.
+    results: Vec<SearchItem>,
     pub selected: usize,
     pub editing_query: bool,
     pub loop_mode: LoopMode,
@@ -148,6 +153,42 @@ impl App {
         }
     }
 
+    /// Every row, as a slice.
+    ///
+    /// The only accessor that hands out the whole list, so it is the
+    /// only one a lazy `results` would have to materialize for. The
+    /// others ask about one row or a count, which an index list can
+    /// answer without building a `SearchItem` at all; keeping them
+    /// separate is the point of this seam, not ceremony.
+    pub fn results(&self) -> &[SearchItem] {
+        &self.results
+    }
+
+    /// One row by index, or `None` past the end. Takes an index rather
+    /// than letting callers slice, so an out-of-range row stays a
+    /// `None` and never a panic.
+    pub fn result(&self, at: usize) -> Option<&SearchItem> {
+        self.results.get(at)
+    }
+
+    pub fn result_count(&self) -> usize {
+        self.results.len()
+    }
+
+    pub fn has_results(&self) -> bool {
+        !self.results.is_empty()
+    }
+
+    /// The row the cursor is on.
+    ///
+    /// `selected` is clamped by `move_selection`, but nothing stops it
+    /// pointing past the end after the corpus shrinks under it, so
+    /// this is `Option` and the three key paths that play or enqueue
+    /// the selection all read it here rather than indexing themselves.
+    pub fn selected_result(&self) -> Option<&SearchItem> {
+        self.results.get(self.selected)
+    }
+
     /// Cycles loop mode (off -> one -> all -> off); shared by the
     /// `CycleLoop` keymap path and `Focus::BottomBar`'s enter-to-tweak
     /// on the Loop field, so both apply the exact same mutation.
@@ -201,7 +242,7 @@ impl App {
             // which just read as "enter doesn't work."
             KeyCode::Enter => {
                 self.editing_query = false;
-                if let Some(item) = self.results.get(self.selected) {
+                if let Some(item) = self.selected_result() {
                     return Action::Play(item.clone());
                 }
             }
@@ -241,7 +282,7 @@ impl App {
                 return Action::None;
             }
             KeyCode::Enter => {
-                if let Some(item) = self.results.get(self.selected) {
+                if let Some(item) = self.selected_result() {
                     return Action::Play(item.clone());
                 }
                 return Action::None;
@@ -252,7 +293,7 @@ impl App {
         if key == keymap.get(KeyAction::StartSearch) {
             self.editing_query = true;
         } else if key == keymap.get(KeyAction::Enqueue) {
-            if let Some(item) = self.results.get(self.selected) {
+            if let Some(item) = self.selected_result() {
                 return Action::Queued(item.clone());
             }
         } else if key == keymap.get(KeyAction::CycleLoop) {
@@ -351,7 +392,7 @@ impl App {
     /// previously selected item is found again by identity; if it's
     /// genuinely gone from the new list, the index is clamped instead.
     pub fn resync_results(&mut self) {
-        let previous = self.results.get(self.selected).map(|item| {
+        let previous = self.selected_result().map(|item| {
             let (tag, key) = item.identity();
             (tag, key.into_owned())
         });
@@ -440,13 +481,13 @@ mod tests {
     #[test]
     fn typing_a_query_populates_and_resets_selection() {
         let app = app_with_three_results();
-        assert_eq!(app.results.len(), 3);
+        assert_eq!(app.result_count(), 3);
         assert_eq!(app.selected, 0);
         assert!(!app.editing_query);
     }
 
     fn selected_title(app: &App) -> String {
-        match app.results.get(app.selected) {
+        match app.selected_result() {
             Some(SearchItem::LocalMusic { title, .. }) => title.clone(),
             other => panic!("expected a local music result, got {other:?}"),
         }
@@ -473,7 +514,7 @@ mod tests {
         }]);
         app.resync_results();
 
-        assert_eq!(app.results.len(), 4);
+        assert_eq!(app.result_count(), 4);
         assert_eq!(
             selected_title(&app),
             "matchable track 2",
@@ -496,6 +537,38 @@ mod tests {
         app.selected = 3;
         app.resync_results();
         assert_eq!(app.selected, 2);
+    }
+
+    /// The count and the slice are two answers to the same question,
+    /// and the lazy `results` this seam exists for would compute them
+    /// from different things: the count from the ranked index list,
+    /// the slice from the prefix actually built. Pinned now, while
+    /// they cannot disagree, so the day they can this fails.
+    #[test]
+    fn the_count_and_the_slice_agree() {
+        let app = app_with_three_results();
+        assert_eq!(app.result_count(), app.results().len());
+        assert_eq!(app.has_results(), !app.results().is_empty());
+        for at in 0..app.result_count() {
+            let (tag, key) = app.result(at).expect("a row in range").identity();
+            let (t, k) = app.results()[at].identity();
+            assert_eq!((tag, key), (t, k), "row {at} differs between the two");
+        }
+        assert!(
+            app.result(app.result_count()).is_none(),
+            "nothing past the end"
+        );
+    }
+
+    /// `selected` can point past the end (the corpus shrank under it),
+    /// so the accessor the play and enqueue paths read is `Option`.
+    /// Returning a row here would play whatever landed at the clamped
+    /// index instead, which is the wrong song, not a missing one.
+    #[test]
+    fn a_selection_past_the_end_reads_as_no_row() {
+        let mut app = app_with_three_results();
+        app.selected = 9;
+        assert!(app.selected_result().is_none());
     }
 
     #[test]
@@ -529,7 +602,7 @@ mod tests {
         app.paste_into_query(" track");
         assert_eq!(app.query, format!("{before} track"));
         assert_eq!(
-            app.results.len(),
+            app.result_count(),
             3,
             "pasted text must refresh results same as typing"
         );

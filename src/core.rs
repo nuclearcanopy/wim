@@ -1875,7 +1875,7 @@ pub fn shellsong_env(
     shellsong::Env {
         now,
         query: app.query.clone(),
-        results: app.results.iter().map(shellsong::Kind::of).collect(),
+        results: app.results().iter().map(shellsong::Kind::of).collect(),
         search_settled: settled,
         queue_len: queue.entries().len(),
         browsing: surf.browsing(),
@@ -1888,7 +1888,7 @@ pub fn shellsong_env(
 /// view owns the highlight, otherwise the sidebar does).
 fn shellsong_item(target: Target, core: &CoreCtx, surf: &dyn Surface) -> Option<SearchItem> {
     match target {
-        Target::Index(i) => core.app.results.get(i).cloned(),
+        Target::Index(i) => core.app.result(i).cloned(),
         Target::Selection => surf.selection(core),
     }
 }
@@ -2176,7 +2176,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             surf.show_results();
             op_note(format!(
                 "search: {query} ({} results so far)",
-                core.app.results.len()
+                core.app.result_count()
             ))
         }
         Op::MoveSelection(delta) => surf.move_selection(SelectStep::By(delta), core),
@@ -3100,7 +3100,7 @@ pub trait Surface {
     /// should answer with the head of the current result set, which is
     /// where wim's highlight starts.
     fn selection(&self, core: &CoreCtx) -> Option<SearchItem> {
-        core.app.results.first().cloned()
+        core.app.result(0).cloned()
     }
 
     /// `Focus` as the interpreter sees it; `go()` resolves against it.

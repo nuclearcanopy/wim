@@ -355,7 +355,7 @@ impl Host {
         if self.swim.echo_results && self.settle.settled(self.start.elapsed()) {
             self.swim.echo_results = false;
             let mut shown = HashSet::new();
-            let lines = core::echo_lines(&self.app.results, &mut shown, self.console_width());
+            let lines = core::echo_lines(self.app.results(), &mut shown, self.console_width());
             if lines.is_empty() {
                 self.console.note("no matches".to_string());
             }
@@ -450,7 +450,7 @@ impl Host {
             let avail = self.console_width();
             if let Some((query, shown)) = self.echoed.as_mut() {
                 if *query == self.app.query {
-                    let lines = core::echo_lines(&self.app.results, shown, avail);
+                    let lines = core::echo_lines(self.app.results(), shown, avail);
                     if !lines.is_empty() {
                         self.console.note("...and from the servers:".to_string());
                         for line in lines {
