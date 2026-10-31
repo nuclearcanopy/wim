@@ -312,6 +312,7 @@ impl Host {
             }
         }
 
+        let mut drained = false;
         while let Ok(ev) = self.player.events().try_recv() {
             let mpv::Event::PropertyChange { name, value } = ev else {
                 continue;
@@ -326,6 +327,38 @@ impl Host {
                     if let Some(track) = self.play_queue.current().cloned() {
                         self.console.note(format!("now playing: {}", label(&track)));
                     }
+                }
+            } else if name == mpv::PROP_IDLE_ACTIVE {
+                // this was not handled at all, so a queue that ran out
+                // left the bar showing a track that had finished and
+                // `now_playing` never cleared.
+                drained = value.as_bool().unwrap_or(false);
+            }
+        }
+        if drained {
+            // the same decision wim makes, from the same function.
+            match core::drained(
+                &self.player,
+                &self.cache_index,
+                &mut self.play_queue,
+                self.app.loop_mode,
+            ) {
+                core::Drained::Stale => {}
+                core::Drained::Cleared => self.console.note("queue finished".to_string()),
+                core::Drained::Failed(why) => self.console.fail(why),
+                core::Drained::Restarted(track) => {
+                    // the hooks a restart owes, as far as shellswim
+                    // has any: wim additionally re-applies
+                    // per-identity settings and the crossfade ramp,
+                    // neither of which shellswim does on an ordinary
+                    // advance either. see ROADMAP.
+                    let now = self.start.elapsed();
+                    let np = Some(track.clone());
+                    let core = core_ctx!(self, now, np);
+                    core::fire_subtitle_fetch(core.cfg, core.subtitle_tx, &track);
+                    core::start_tracking_playback(core.cfg, &track, core.scrobble);
+                    self.console
+                        .note(format!("looped back to: {}", label(&track)));
                 }
             }
         }

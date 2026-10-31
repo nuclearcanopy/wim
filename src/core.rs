@@ -2677,6 +2677,100 @@ pub fn drive(
     }
 }
 
+/// What `drained` did about mpv running out of playlist.
+#[derive(Debug)]
+pub enum Drained {
+    /// A stale report: something is still queued, so mpv's idle
+    /// predates whatever just loaded. Nothing to do.
+    Stale,
+    /// The queue ran out and was cleared; the caller drops its
+    /// now-playing.
+    Cleared,
+    /// "loop all" restarted the session from the top. The caller runs
+    /// its own track-change hooks for this track, which is the one
+    /// part the two front-ends genuinely do differently.
+    Restarted(SearchItem),
+    /// The restart could not load; the caller reports it.
+    Failed(String),
+}
+
+/// mpv went back to idling, so its playlist really did run out.
+///
+/// Shared because it is a *decision* about the queue, not a piece of
+/// either front-end: "loop all" replaying from the top is wim's own
+/// bookkeeping (`PlayQueue::session`), mpv having no concept of the
+/// session that was built. shellswim did not handle mpv going idle at
+/// all, so a queue that ran out left the bar showing a track that had
+/// finished; it gets the same answer as wim now rather than a second
+/// copy of it.
+///
+/// The upcoming-empty check is here rather than at the call sites: it
+/// guards against acting on an idle report from *before* something
+/// loaded, and a guard every caller has to remember is a guard one
+/// caller will forget.
+/// Takes its four pieces rather than a `CoreCtx`, for two reasons:
+/// wim's call site sits above where its `core_ctx!` is defined, and
+/// the whole decision is testable this way without spawning mpv for
+/// the half of it that never touches the socket.
+pub fn drained(
+    player: &mpv::Mpv,
+    cache: &Arc<Mutex<CacheIndex>>,
+    queue: &mut PlayQueue,
+    loop_mode: LoopMode,
+) -> Drained {
+    match drain_decision(queue.upcoming_len(), loop_mode, queue.session().is_empty()) {
+        Decision::Stale => return Drained::Stale,
+        Decision::Clear => {
+            queue.clear();
+            return Drained::Cleared;
+        }
+        Decision::Restart => {}
+    }
+    let session = queue.session().to_vec();
+    {
+        let first = session[0].clone();
+        let (status, played) = load_playlist(
+            player,
+            cache,
+            queue,
+            session,
+            // `Keep`, not `New`: the restart point is the session
+            // itself, and resetting it would make loop-all replay only
+            // from wherever it last restarted.
+            SessionStart::Keep,
+        );
+        if !played {
+            return Drained::Failed(status);
+        }
+        Drained::Restarted(first)
+    }
+}
+
+/// What to do about an idle report, with no mpv in the room.
+///
+/// Split out so the decision is testable without a socket: the only
+/// part of `drained` that needs mpv is reloading the playlist for a
+/// restart, and that is one call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    Stale,
+    Clear,
+    Restart,
+}
+
+fn drain_decision(upcoming: usize, loop_mode: LoopMode, session_empty: bool) -> Decision {
+    if upcoming > 0 {
+        // an idle report from before whatever just loaded. acting on
+        // it would clear a queue that is about to play.
+        return Decision::Stale;
+    }
+    if loop_mode == LoopMode::All && !session_empty {
+        Decision::Restart
+    } else {
+        Decision::Clear
+    }
+}
+
 /// Starts a freshly built session: mpv's playlist is replaced and
 /// every "a track just started" hook fires for the first track. One
 /// place, so a shellsong-built session can't quietly skip a hook the
@@ -3582,6 +3676,46 @@ mod seam_tests {
         }
         assert_eq!(h.gap_secs, 10.0, "and redo walks back down");
         assert_eq!(h.undo.len(), 2);
+    }
+
+    /// The end-of-playlist decision, which is the part both
+    /// front-ends share. shellswim did not make it at all before: mpv
+    /// going idle was unobserved, so a finished queue left the bar
+    /// showing a track that had stopped.
+    #[test]
+    fn a_drained_queue_clears_unless_loop_all_has_a_session() {
+        assert_eq!(
+            drain_decision(0, LoopMode::Off, false),
+            Decision::Clear,
+            "loop off: the queue is over"
+        );
+        assert_eq!(
+            drain_decision(0, LoopMode::One, false),
+            Decision::Clear,
+            "loop one is mpv's own loop-file and does not replay a queue"
+        );
+        assert_eq!(drain_decision(0, LoopMode::All, false), Decision::Restart);
+        assert_eq!(
+            drain_decision(0, LoopMode::All, true),
+            Decision::Clear,
+            "loop all with nothing to replay has to clear, not restart from nothing"
+        );
+    }
+
+    /// The guard that keeps a *stale* idle report from clearing a
+    /// queue that just got refilled. It lives inside the shared
+    /// function rather than at each call site, because a guard every
+    /// caller has to remember is one a caller will forget -- which is
+    /// how shellswim came to have no end-of-playlist handling at all.
+    #[test]
+    fn a_stale_idle_report_leaves_a_live_queue_alone() {
+        for mode in [LoopMode::Off, LoopMode::One, LoopMode::All] {
+            assert_eq!(
+                drain_decision(3, mode, false),
+                Decision::Stale,
+                "{mode:?} acted on a stale report"
+            );
+        }
     }
 
     /// The bar's controls are commands, and this is the one table

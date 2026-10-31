@@ -1010,15 +1010,54 @@ above this line in the shellswim section is done.
       what r7 was about, and `kind=` filters, which is what it denied.
       `SONG` fell out of the command table entirely -- nothing is
       song-only any more, since that is what `k=song` is for.
-- [ ] **shellswim never handles `idle-active`.** the other half of the
-      `skip()` report. its event drain watches `PROP_PLAYLIST_POS` and
-      nothing else, so when mpv's playlist genuinely runs out the
-      queue still thinks the last track is playing: the bar keeps its
-      name and `now_playing` never clears. wim handles this
-      (`playlist_drained`, plus the loop-all restart), and that block
-      is long and duplicated-looking -- worth extracting into `core`
-      so both front-ends share one end-of-playlist path rather than
-      shellswim growing a second copy.
+- [x] **shellswim never handled `idle-active`** -- the other half of
+      the `skip()` report. its event drain watched `PROP_PLAYLIST_POS`
+      and nothing else, so when mpv's playlist genuinely ran out the
+      queue still thought the last track was playing: the bar kept its
+      name and `now_playing` never cleared.
+      `core::drained` is the shared answer, and it is shared because it
+      is a *decision about the queue* rather than a piece of either
+      front-end: "loop all" replaying from the top is wim's own
+      bookkeeping (`PlayQueue::session`), mpv having no concept of the
+      session that was built. it returns `Stale`/`Cleared`/
+      `Restarted(track)`/`Failed`, so each front-end runs the hooks it
+      actually has instead of one of them pretending to have the
+      other's.
+      it takes its four pieces rather than a `CoreCtx`, for two
+      reasons that both turned up while writing it: wim's call site
+      sits *above* where its `core_ctx!` is defined, and the decision
+      is then testable without spawning mpv.
+      **the stale-report guard lives inside the shared function**, not
+      at the call sites. that is not tidiness: a guard every caller
+      has to remember is one a caller will forget, which is precisely
+      how shellswim ended up with no end-of-playlist handling at all.
+      `drain_decision` is split out from the ipc so all of it is
+      testable; only reloading the playlist for a restart needs mpv.
+      pinned including `LoopMode::One`, which does *not* replay a queue
+      (it is mpv's own `loop-file`), and loop-all with an empty session
+      clearing rather than restarting from nothing.
+- [ ] **track-change hooks are not at parity across the three paths
+      that start a track**, found while extracting the above and worth
+      fixing before it bites:
+      - wim's **ordinary advance** and its **loop-all restart** both
+        fire `fire_subtitle_fetch`, `note_playback_started`,
+        `start_tracking_playback`, `identity_settings` (per-identity
+        eq/volume) and the crossfade ramp.
+      - **`core::start_session`** -- which is what `play()` and
+        `Action::Play` go through -- fires the first three and
+        **not** `identity_settings` or the ramp. so per-identity eq
+        applies when a track arrives by advancing but not when you
+        ask for it by name, which is the kind of difference nobody
+        would guess at.
+      - **shellswim** fires none of them on an ordinary advance (it
+        prints a line), and now fires two on a restart.
+      the fix is one `track_started(track, core, surf)` in `core` that
+      every path calls, with the front-end-specific parts behind
+      `Surface`. `TrackChangeCtx` already exists and is the start of
+      this; `identity_settings` returning ops for the host to queue is
+      the part that needs a home, since `shellsong_queued` is a
+      main.rs local.
+
 
 ### stage 4: the queue timeline (started)
 
