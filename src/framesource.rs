@@ -289,6 +289,59 @@ pub enum Pull {
     Ended,
 }
 
+/// What the host already has, so `plan` can tell "nothing yet" from
+/// "the wrong thing".
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Have<'a> {
+    /// The file the live source is decoding, if there is one.
+    pub media: Option<&'a Path>,
+    /// The grid it was spawned or last resized for.
+    pub grid: Option<Grid>,
+}
+
+/// What the host should do about its frame source this frame.
+///
+/// The lifecycle is four decisions and none of them need io, so they
+/// live here and are tested outright rather than being four
+/// conditions spread through the draw loop. The same reasoning as
+/// `Schedule`: the arithmetic is separable from the child process, so
+/// separate it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Plan {
+    /// Nothing to do.
+    Keep,
+    /// There should be no source; drop the one there is.
+    Stop,
+    /// Start one at this size. Also the answer when the *file*
+    /// changed: encode mode has no socket to seek over, so a new file
+    /// is a new instance, where a seek within one file is
+    /// `advance_to`'s own restart.
+    Start { grid: Grid },
+    /// Keep the instance, at a new size, which a pane resize needs.
+    Resize { grid: Grid },
+}
+
+/// `want_ascii` is `video::Showing::is_ascii`; `media` is what is
+/// playing, `None` for anything that is not a local video.
+pub fn plan(want_ascii: bool, media: Option<&Path>, grid: Grid, have: Have) -> Plan {
+    let Some(media) = media.filter(|_| want_ascii) else {
+        // `Stop` only when there is something to stop, so an idle
+        // frame is `Keep` and the host has no work at all.
+        return if have.media.is_some() {
+            Plan::Stop
+        } else {
+            Plan::Keep
+        };
+    };
+    if have.media != Some(media) {
+        return Plan::Start { grid };
+    }
+    if have.grid != Some(grid) {
+        return Plan::Resize { grid };
+    }
+    Plan::Keep
+}
+
 /// A second, headless mpv decoding to a fifo, plus the read loop that
 /// paces it.
 ///
@@ -656,6 +709,126 @@ fn mkfifo(path: &Path) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+/// The frame source's lifecycle, which is four decisions and no io.
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn grid(cols: u16, rows: u16) -> Grid {
+        Grid::new(cols, rows, 2.0)
+    }
+
+    fn path(p: &str) -> &Path {
+        Path::new(p)
+    }
+
+    /// An idle frame has to be `Keep`, not `Stop`: a host that got
+    /// `Stop` every frame with nothing running would do pointless work
+    /// forever, and `Stop` would stop meaning anything.
+    #[test]
+    fn nothing_wanted_and_nothing_running_is_no_work_at_all() {
+        let g = grid(80, 24);
+        assert_eq!(plan(false, None, g, Have::default()), Plan::Keep);
+        assert_eq!(
+            plan(false, Some(path("/v/a.mkv")), g, Have::default()),
+            Plan::Keep,
+            "ascii is off, so a video playing changes nothing"
+        );
+        assert_eq!(
+            plan(true, None, g, Have::default()),
+            Plan::Keep,
+            "ascii is on but a music track is playing"
+        );
+    }
+
+    /// Turning it off, or playing something that is not a video, stops
+    /// the instance rather than leaving a child decoding into a pipe
+    /// nobody reads.
+    #[test]
+    fn a_running_source_is_stopped_when_it_is_no_longer_wanted() {
+        let g = grid(80, 24);
+        let running = Have {
+            media: Some(path("/v/a.mkv")),
+            grid: Some(g),
+        };
+        assert_eq!(plan(false, Some(path("/v/a.mkv")), g, running), Plan::Stop);
+        assert_eq!(
+            plan(true, None, g, running),
+            Plan::Stop,
+            "a music track has no frames to pull"
+        );
+    }
+
+    /// A different file is a new instance, not a seek: encode mode has
+    /// no socket to seek over, which is why `restart` takes a time and
+    /// not a path.
+    #[test]
+    fn a_new_file_starts_a_new_instance() {
+        let g = grid(80, 24);
+        assert_eq!(
+            plan(true, Some(path("/v/a.mkv")), g, Have::default()),
+            Plan::Start { grid: g },
+            "nothing running yet"
+        );
+        assert_eq!(
+            plan(
+                true,
+                Some(path("/v/b.mkv")),
+                g,
+                Have {
+                    media: Some(path("/v/a.mkv")),
+                    grid: Some(g),
+                }
+            ),
+            Plan::Start { grid: g },
+            "the track changed, so the instance has to be replaced"
+        );
+    }
+
+    /// A pane resize keeps the instance and re-sizes it, because the
+    /// filter chain is what has to change and the decode does not.
+    #[test]
+    fn a_resized_pane_keeps_the_instance() {
+        let a = grid(80, 24);
+        let b = grid(120, 40);
+        let running = Have {
+            media: Some(path("/v/a.mkv")),
+            grid: Some(a),
+        };
+        assert_eq!(
+            plan(true, Some(path("/v/a.mkv")), b, running),
+            Plan::Resize { grid: b }
+        );
+        assert_eq!(
+            plan(true, Some(path("/v/a.mkv")), a, running),
+            Plan::Keep,
+            "the same pane and the same file is no work"
+        );
+    }
+
+    /// The cell aspect is part of the size, so a font change resizes.
+    /// Getting it wrong is a 2x vertical stretch, not a rounding
+    /// error, which is why `Grid` carries it at all.
+    #[test]
+    fn a_changed_cell_aspect_is_a_resize() {
+        let square = Grid::new(80, 24, 1.0);
+        let tall = Grid::new(80, 24, 2.0);
+        assert_ne!(square, tall);
+        assert_eq!(
+            plan(
+                true,
+                Some(path("/v/a.mkv")),
+                tall,
+                Have {
+                    media: Some(path("/v/a.mkv")),
+                    grid: Some(square),
+                }
+            ),
+            Plan::Resize { grid: tall }
+        );
     }
 }
 
