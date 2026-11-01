@@ -1910,6 +1910,28 @@ a measurement.
       three more conditions, so nearly everything reaches
       `best_typo_score`, which is where that 3.9ms goes.
 
+### two entry points, one rule (2026-11-01)
+
+- [x] **the `R` key opened the suggestions pane at zero rows while
+      `view(suggestions)` refused to.** The refusal exists because the
+      empty pane took focus with nothing in it, so j/k and enter all
+      did nothing and esc was the only key that worked; main.rs's own
+      comment calls it a dead end. Only the shellsong path ever got
+      that fix, so the dead end stayed reachable from the key the help
+      overlay advertises. `suggestions_or_reason` is the rule now and
+      both paths go through it, so a third entry point cannot get it
+      wrong.
+      found by following up the polish agent's report that main.rs
+      carried a different wording for the same empty state; the
+      wording was a symptom, the disagreeing entry points were the
+      cause.
+      the old source guard **passed while the arm it guarded no longer
+      refused at all**, because it searched for the literal
+      `empty_suggestions_reason` and the refactor had moved that name
+      behind the shared helper. it now checks the rule's own body, both
+      call sites, and the ordering at the install, and three mutations
+      confirm each.
+
 ### the queue seam, audited 2026-11-01
 
 - [x] **deleting the playing track, when it was the last one,

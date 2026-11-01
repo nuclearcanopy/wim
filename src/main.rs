@@ -362,15 +362,13 @@ fn open_wim_screen(
                 cache::now_secs(),
             ));
             drop(guard);
+            // refused rather than installed, by the one rule both
+            // entry points share; see `suggestions_or_reason`.
+            let suggestions = match suggestions_or_reason(suggestions, core.app) {
+                Ok(built) => built,
+                Err(why) => return op_fail(why),
+            };
             let total = ui::suggestions::count(&suggestions);
-            // refused rather than installed. it used to open the pane
-            // and take focus at zero rows, reporting "0 suggestions",
-            // so j/k and enter all did nothing and esc was the only
-            // key that worked: a dead end. the queue's own empty case
-            // refuses for exactly this reason.
-            if total == 0 {
-                return op_fail(empty_suggestions_reason(core.app));
-            }
             *surf.suggestions = Some(suggestions);
             *surf.suggestions_selected = 0;
             *surf.focus = Focus::Workspace;
@@ -542,6 +540,23 @@ fn loading_message(scanning_library: bool, syncing_servers: bool) -> Option<&'st
 /// is not set up"; and a full corpus with no suggestions is the only
 /// one that is actually about suggestions, since they are built from
 /// what has been played.
+/// A built suggestion set, or why it is not worth opening.
+///
+/// The rule is one function because the two entry points disagreed: the
+/// `view(suggestions)` path refused at zero rows (the pane took focus
+/// with nothing in it, so j/k and enter all did nothing and esc was the
+/// only key that worked) and the `R` key installed it anyway. A third
+/// entry point cannot get it wrong now.
+fn suggestions_or_reason(
+    built: suggest::Suggestions,
+    app: &app::App,
+) -> Result<suggest::Suggestions, String> {
+    if ui::suggestions::count(&built) == 0 {
+        return Err(empty_suggestions_reason(app));
+    }
+    Ok(built)
+}
+
 fn empty_suggestions_reason(app: &app::App) -> String {
     if app.corpus.is_empty() {
         return loading_message(app.scanning_library, app.syncing_servers)
@@ -4482,15 +4497,25 @@ fn main() -> anyhow::Result<()> {
                         // by the main loop's enrichment probe, and the
                         // menu refills itself as they land.
                         let starred = suggestion_starred_keys(&remote_starred, &favorites);
-                        suggestions = Some(recompute_suggestions(
+                        let built = recompute_suggestions(
                             &mut suggest_catalog,
                             &app.corpus,
                             &cache_index,
                             &starred,
                             &enrichment,
-                        ));
-                        suggestions_selected = 0;
-                        focus = Focus::Workspace;
+                        );
+                        // the same refusal `view(suggestions)` makes:
+                        // this key used to open the pane at zero rows
+                        // and take focus, which is the dead end the
+                        // other path already refused.
+                        match suggestions_or_reason(built, &app) {
+                            Ok(built) => {
+                                suggestions = Some(built);
+                                suggestions_selected = 0;
+                                focus = Focus::Workspace;
+                            }
+                            Err(why) => notifications.push(Severity::Alert, why),
+                        }
                     }
                     continue;
                 }
@@ -5304,27 +5329,46 @@ mod startup_tests {
         }
     }
 
-    /// The refusal is wired, not just written.
+    /// The refusal is wired at **every** entry point, not just
+    /// written.
     ///
     /// Removing the `total == 0` check left every message test above
     /// green, which is the pattern this repo keeps hitting: the
-    /// function is pinned and the call site that matters is not.
-    /// `open_wim_screen` needs a live mpv and the whole host state, so
-    /// this reads the source, the same technique `track_started` and
+    /// function is pinned and the call site that matters is not. These
+    /// need a live mpv and the whole host state, so this reads the
+    /// source, the same technique `track_started` and
     /// `Snapshot::capture` use for the same reason.
+    ///
+    /// Two entry points, which is how the bug got in: `view
+    /// (suggestions)` refused and the `R` key installed the pane
+    /// anyway, so the dead end one path had fixed was still reachable
+    /// from the other. The rule is `suggestions_or_reason` now and
+    /// both have to go through it.
     #[test]
-    fn the_suggestions_arm_refuses_before_it_installs_the_pane() {
+    fn every_entry_point_refuses_before_it_installs_the_pane() {
         let src = include_str!("main.rs");
-        let at = src
+        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
+
+        // the rule itself has to be the empty case.
+        let at = code
+            .find("fn suggestions_or_reason(")
+            .expect("the shared rule is gone, so the two paths can disagree again");
+        let rule = &code[at..(at + 400).min(code.len())];
+        assert!(
+            rule.contains("count(&built) == 0") && rule.contains("empty_suggestions_reason"),
+            "the rule no longer refuses the empty case with a reason:\n{rule}"
+        );
+
+        // the shellsong path.
+        let at = code
             .find("ViewTarget::Suggestions => {")
             .expect("the arm moved or was renamed");
-        let arm = &src[at..];
+        let arm = &code[at..];
         let end = arm.find("\n        ViewTarget::").expect("an unterminated arm");
         let arm = &arm[..end];
-
         let refusal = arm
-            .find("empty_suggestions_reason")
-            .expect("the arm installs the pane with no refusal at all");
+            .find("suggestions_or_reason(")
+            .expect("the arm installs the pane without the shared rule");
         let install = arm
             .find("*surf.suggestions = Some(")
             .expect("the arm no longer installs the pane");
@@ -5332,9 +5376,15 @@ mod startup_tests {
             refusal < install,
             "the refusal has to come first, or the pane is already up:\n{arm}"
         );
+
+        // and the key path, which is the one that used to skip it.
+        let at = code
+            .find("keymap.get(KeyAction::OpenSuggestions)")
+            .expect("the suggestions key is unbound");
+        let press = &code[at..(at + 1400).min(code.len())];
         assert!(
-            arm.contains("total == 0"),
-            "and it has to be the empty case it refuses on:\n{arm}"
+            press.contains("suggestions_or_reason("),
+            "the key installs the pane at zero rows again:\n{press}"
         );
     }
 
