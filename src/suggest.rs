@@ -17,6 +17,7 @@
 //! input (last.fm-proxied similar artists, `getArtistInfo2`) arrives
 //! through the `Enrichment` trait so tests fake it.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -894,17 +895,30 @@ impl Catalog {
     /// the credit string, and its own normalised credit otherwise.
     /// One definition so the two cannot bucket differently.
     fn track_artist_key(&self, index: usize) -> String {
+        self.track_artist_key_ref(index).into_owned()
+    }
+
+    /// The same key without owning it, for the passes that only read
+    /// it: the cold start buckets every track in the library, and a
+    /// key it borrows is a key it does not allocate. Owned only where
+    /// there is no artist slot to borrow from, which is a track whose
+    /// credit resolved to nothing.
+    fn track_artist_key_ref(&self, index: usize) -> Cow<'_, str> {
         match self.track_artist.get(index).copied().flatten() {
-            Some(slot) => self.artists[slot].key.clone(),
-            None => norm(&self.tracks[index].artist),
+            Some(slot) => Cow::Borrowed(&self.artists[slot].key),
+            None => Cow::Owned(norm(&self.tracks[index].artist)),
         }
     }
 
     /// Same for an album row.
     fn album_artist_key(&self, slot: usize) -> String {
+        self.album_artist_key_ref(slot).into_owned()
+    }
+
+    fn album_artist_key_ref(&self, slot: usize) -> Cow<'_, str> {
         match self.albums[slot].artist_slot {
-            Some(artist) => self.artists[artist].key.clone(),
-            None => self.albums[slot].key.0.clone(),
+            Some(artist) => Cow::Borrowed(&self.artists[artist].key),
+            None => Cow::Borrowed(&self.albums[slot].key.0),
         }
     }
 
@@ -2272,8 +2286,8 @@ fn group(picked: Vec<Candidate>, tuning: &Tuning) -> Vec<Section> {
 /// Starred items first, since those are real stated interest, then a
 /// stratified sample across artists so the screen is never empty and
 /// never the same three rows twice.
-fn cold_start(model: &Model<'_>, req: &Request<'_>) -> Suggestions {
-    let catalog = model.catalog;
+fn cold_start<'cat>(model: &Model<'cat>, req: &Request<'_>) -> Suggestions {
+    let catalog: &'cat Catalog = model.catalog;
     let mut sections = Vec::new();
 
     let mut starred: Vec<usize> = (0..catalog.tracks.len())
@@ -2301,24 +2315,27 @@ fn cold_start(model: &Model<'_>, req: &Request<'_>) -> Suggestions {
     // one row per artist, round-robin over a seeded artist order:
     // picking the globally "first" N rows would show the same three
     // albums by the same artist on every open.
-    let mut by_artist: Vec<(String, Vec<SearchItem>)> = Vec::new();
-    let mut index_of: HashMap<String, usize> = HashMap::new();
-    let mut push = |artist_key: &str, item: &SearchItem| {
-        let slot = *index_of
-            .entry(artist_key.to_string())
-            .or_insert_with(|| by_artist.len());
-        if slot == by_artist.len() {
-            by_artist.push((artist_key.to_string(), Vec::new()));
+    //
+    // this buckets every album and every track in the library to put
+    // six rows on screen, so the buckets hold borrowed items and
+    // borrowed keys: nothing is cloned until it is one of the six.
+    let mut by_artist: Vec<(Cow<'cat, str>, Vec<&'cat SearchItem>)> = Vec::new();
+    let mut index_of: HashMap<Cow<'cat, str>, usize> = HashMap::new();
+    let mut push = |artist_key: Cow<'cat, str>, item: &'cat SearchItem| {
+        let next = by_artist.len();
+        let slot = *index_of.entry(artist_key.clone()).or_insert(next);
+        if slot == next {
+            by_artist.push((artist_key, Vec::new()));
         }
-        by_artist[slot].1.push(item.clone());
+        by_artist[slot].1.push(item);
     };
     for (slot, album) in catalog.albums.iter().enumerate() {
         if let Some(item) = &album.item {
-            push(&catalog.album_artist_key(slot), item);
+            push(catalog.album_artist_key_ref(slot), item);
         }
     }
     for (index, track) in catalog.tracks.iter().enumerate() {
-        push(&catalog.track_artist_key(index), &track.item);
+        push(catalog.track_artist_key_ref(index), &track.item);
     }
 
     let artist_total = catalog.artists.len().max(by_artist.len());
@@ -2338,7 +2355,7 @@ fn cold_start(model: &Model<'_>, req: &Request<'_>) -> Suggestions {
                 continue;
             };
             sampled.push(Suggestion {
-                item: item.clone(),
+                item: (*item).clone(),
                 reason_text: format!(
                     "nothing played yet; {} is 1 of {artist_total} artists you have",
                     if artist.is_empty() { "this" } else { artist }
@@ -4574,6 +4591,131 @@ mod cost {
         assert_eq!(shape(&fast), shape(&album_neighbours_hashed(&model)));
     }
 
+    /// `cold_start` as it was before the buckets held references:
+    /// every album and every track in the library cloned into a
+    /// bucket, with two fresh key strings apiece, to put six rows on
+    /// screen.
+    fn cold_start_cloning(model: &Model<'_>, req: &Request<'_>) -> Suggestions {
+        let catalog = model.catalog;
+        let mut sections = Vec::new();
+
+        let mut starred: Vec<usize> = (0..catalog.tracks.len())
+            .filter(|&i| model.tracks[i].starred)
+            .collect();
+        starred.sort_by(|&a, &b| catalog.tracks[a].key.cmp(&catalog.tracks[b].key));
+        shuffle(&mut starred, req.seed);
+        if !starred.is_empty() {
+            let items = starred
+                .into_iter()
+                .take(req.tuning.section_max_items)
+                .map(|index| Suggestion {
+                    item: catalog.tracks[index].item.clone(),
+                    reason_text: format!("starred, by {}", catalog.tracks[index].artist),
+                    score: 1.0,
+                })
+                .collect();
+            sections.push(Section {
+                title: Reason::ColdStartStarred.title().to_string(),
+                reason: Reason::ColdStartStarred,
+                items,
+            });
+        }
+
+        let mut by_artist: Vec<(String, Vec<SearchItem>)> = Vec::new();
+        let mut index_of: HashMap<String, usize> = HashMap::new();
+        let mut push = |artist_key: &str, item: &SearchItem| {
+            let slot = *index_of
+                .entry(artist_key.to_string())
+                .or_insert_with(|| by_artist.len());
+            if slot == by_artist.len() {
+                by_artist.push((artist_key.to_string(), Vec::new()));
+            }
+            by_artist[slot].1.push(item.clone());
+        };
+        for (slot, album) in catalog.albums.iter().enumerate() {
+            if let Some(item) = &album.item {
+                push(&catalog.album_artist_key(slot), item);
+            }
+        }
+        for (index, track) in catalog.tracks.iter().enumerate() {
+            push(&catalog.track_artist_key(index), &track.item);
+        }
+
+        let artist_total = catalog.artists.len().max(by_artist.len());
+        let mut order: Vec<usize> = (0..by_artist.len()).collect();
+        order.sort_by(|&a, &b| by_artist[a].0.cmp(&by_artist[b].0));
+        shuffle(&mut order, req.seed);
+        for (_, items) in by_artist.iter_mut() {
+            shuffle(items, req.seed);
+        }
+
+        let mut sampled: Vec<Suggestion> = Vec::new();
+        let depth = by_artist.iter().map(|(_, i)| i.len()).max().unwrap_or(0);
+        'outer: for round in 0..depth {
+            for &slot in &order {
+                let (artist, items) = &by_artist[slot];
+                let Some(item) = items.get(round) else {
+                    continue;
+                };
+                sampled.push(Suggestion {
+                    item: item.clone(),
+                    reason_text: format!(
+                        "nothing played yet; {} is 1 of {artist_total} artists you have",
+                        if artist.is_empty() { "this" } else { artist }
+                    ),
+                    score: 0.5,
+                });
+                if sampled.len() >= req.tuning.section_max_items {
+                    break 'outer;
+                }
+            }
+        }
+        if !sampled.is_empty() {
+            sections.push(Section {
+                title: Reason::ColdStartSample.title().to_string(),
+                reason: Reason::ColdStartSample,
+                items: sampled,
+            });
+        }
+
+        Suggestions { sections }
+    }
+
+    /// A fixture with nothing played, which is the cold start's own
+    /// path: a brand new library, where this is the whole menu.
+    fn unplayed(albums: usize, per_album: usize) -> Fixture {
+        let mut fixture = Fixture::new(albums, per_album);
+        fixture.cache = CacheIndex::default();
+        fixture
+    }
+
+    /// The sample is a seeded round-robin over seeded per-artist
+    /// orders, so "the same six rows" only holds if the buckets are
+    /// built in the same order and shuffled over the same lengths.
+    /// Over a corpus with both album rows and track rows, and some
+    /// artist keys that have to be owned rather than borrowed.
+    #[test]
+    fn the_borrowed_cold_start_picks_what_the_cloning_one_picked() {
+        let fixture = unplayed(300, 12);
+        let req = fixture.request();
+        let model = Model::build(&req);
+        assert_eq!(model.total_plays, 0, "the cold start is the path taken");
+        let borrowed = cold_start(&model, &req);
+        let sample = borrowed
+            .sections
+            .iter()
+            .find(|s| s.reason == Reason::ColdStartSample)
+            .expect("the sample section");
+        assert_eq!(
+            sample.items.len(),
+            req.tuning.section_max_items,
+            "the sample has to fill its section or there is nothing to compare"
+        );
+        assert_eq!(rows(&borrowed), rows(&cold_start_cloning(&model, &req)));
+        // and through `suggest`, which is the one route a host takes.
+        assert_eq!(rows(&suggest(&req)), rows(&borrowed));
+    }
+
     /// A model whose genre rollups came from the three keyed maps
     /// rather than from the slot pass, for the old-against-new
     /// ranking comparison. The slots are in first-seen order and the
@@ -4801,6 +4943,33 @@ mod cost {
             println!("  {:<26} {tail_new:>9.0} {tail_old:>9.0}", "generation + selection");
             println!("  {:<26} {new:>9.0} {old:>9.0}us  {:.2}x", "pass", old / new);
         }
+    }
+
+    /// The borrowed cold start against the cloning one, alternating
+    /// in one process. This is a new library's first open, where the
+    /// whole menu is six rows and the old pass cloned every album and
+    /// every track in the library to choose them.
+    #[test]
+    #[ignore = "a measurement; run it explicitly"]
+    fn what_the_cold_start_costs() {
+        let fixture = unplayed(2_200, 14);
+        let req = fixture.request();
+        let model = Model::build(&req);
+        println!("--- cold start, {}", fixture.describe());
+        let (borrowed, cloning) = best_each(
+            5,
+            5,
+            &mut || {
+                let _ = cold_start(&model, &req);
+            },
+            &mut || {
+                let _ = cold_start_cloning(&model, &req);
+            },
+        );
+        println!(
+            "  borrowed {borrowed:.0}us  cloning {cloning:.0}us  {:.2}x",
+            cloning / borrowed
+        );
     }
 
     /// What is left: the play-history lookup per track, which is the
