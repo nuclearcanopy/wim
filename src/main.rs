@@ -361,6 +361,14 @@ fn open_wim_screen(
             ));
             drop(guard);
             let total = ui::suggestions::count(&suggestions);
+            // refused rather than installed. it used to open the pane
+            // and take focus at zero rows, reporting "0 suggestions",
+            // so j/k and enter all did nothing and esc was the only
+            // key that worked: a dead end. the queue's own empty case
+            // refuses for exactly this reason.
+            if total == 0 {
+                return op_fail(empty_suggestions_reason(core.app));
+            }
             *surf.suggestions = Some(suggestions);
             *surf.suggestions_selected = 0;
             *surf.focus = Focus::Workspace;
@@ -515,6 +523,29 @@ fn loading_message(scanning_library: bool, syncing_servers: bool) -> Option<&'st
         (false, true) => Some("connecting to navidrome..."),
         (false, false) => None,
     }
+}
+
+/// Why there is nothing to suggest, in the voice
+/// `empty_results_message` sets: a refusal that does not say what to do
+/// instead is barely better than the dead-end pane it replaced.
+///
+/// The three cases are genuinely different. An empty corpus mid-scan
+/// is "wait"; an empty corpus with nothing in flight is "your library
+/// is not set up"; and a full corpus with no suggestions is the only
+/// one that is actually about suggestions, since they are built from
+/// what has been played.
+fn empty_suggestions_reason(app: &app::App) -> String {
+    if app.corpus.is_empty() {
+        return loading_message(app.scanning_library, app.syncing_servers)
+            .unwrap_or(
+                "no library yet: check library_paths in config, or set up navidrome (n)",
+            )
+            .to_string();
+    }
+    // kept short on purpose: `ui::notify` sizes a box to its text and
+    // caps it at the pane width, so a 92-cell sentence is simply cut
+    // on an 80-column terminal.
+    "nothing to suggest yet: these build from what you play".to_string()
 }
 
 /// What the results list should say instead of rendering nothing when
@@ -4926,6 +4957,130 @@ mod cursor_tests {
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    /// Prints the three refusals as the notification area shows them,
+    /// because the wording *is* the feature here. Run with
+    /// `cargo test --bin wim eyeball_suggestions -- --nocapture`.
+    #[test]
+    fn eyeball_suggestions_refusals() {
+        let mut app = app::App::new(search::Corpus::new());
+        let mut rows = Vec::new();
+
+        app.scanning_library = true;
+        rows.push(("cold, scanning", empty_suggestions_reason(&app)));
+        app.scanning_library = false;
+        app.syncing_servers = true;
+        rows.push(("cold, connecting", empty_suggestions_reason(&app)));
+        app.syncing_servers = false;
+        rows.push(("cold, idle", empty_suggestions_reason(&app)));
+        app.corpus.add_local_tracks([library::LocalTrack {
+            path: std::path::PathBuf::from("/music/a.flac"),
+            title: "a".into(),
+            artist: None,
+            album: None,
+            duration_secs: None,
+            kind: library::MediaKind::Music,
+        }]);
+        rows.push(("library, no history", empty_suggestions_reason(&app)));
+
+        println!("--- view(suggestions) when there is nothing to show");
+        for (case, said) in &rows {
+            println!("  {case:<20} [x] {said}");
+        }
+        // the floor: each case says something different, or one of
+        // them is the wrong message.
+        let texts: Vec<&String> = rows.iter().map(|(_, t)| t).collect();
+        for (i, a) in texts.iter().enumerate() {
+            for b in texts.iter().skip(i + 1) {
+                assert_ne!(a, b, "two cases give the same answer");
+            }
+        }
+        // and none may be so long the notification box has to cut it.
+        for (case, said) in &rows {
+            assert!(
+                wim::ui::textfit::width(said) <= 72,
+                "{case}: {} cells, too long for a box: {said}",
+                wim::ui::textfit::width(said)
+            );
+        }
+    }
+
+    /// The refusal is wired, not just written.
+    ///
+    /// Removing the `total == 0` check left every message test above
+    /// green, which is the pattern this repo keeps hitting: the
+    /// function is pinned and the call site that matters is not.
+    /// `open_wim_screen` needs a live mpv and the whole host state, so
+    /// this reads the source, the same technique `track_started` and
+    /// `Snapshot::capture` use for the same reason.
+    #[test]
+    fn the_suggestions_arm_refuses_before_it_installs_the_pane() {
+        let src = include_str!("main.rs");
+        let at = src
+            .find("ViewTarget::Suggestions => {")
+            .expect("the arm moved or was renamed");
+        let arm = &src[at..];
+        let end = arm.find("\n        ViewTarget::").expect("an unterminated arm");
+        let arm = &arm[..end];
+
+        let refusal = arm
+            .find("empty_suggestions_reason")
+            .expect("the arm installs the pane with no refusal at all");
+        let install = arm
+            .find("*surf.suggestions = Some(")
+            .expect("the arm no longer installs the pane");
+        assert!(
+            refusal < install,
+            "the refusal has to come first, or the pane is already up:\n{arm}"
+        );
+        assert!(
+            arm.contains("total == 0"),
+            "and it has to be the empty case it refuses on:\n{arm}"
+        );
+    }
+
+    /// Three different situations, three different answers.
+    ///
+    /// `view(suggestions)` used to install the pane and take focus at
+    /// zero rows, so j/k and enter did nothing and esc was the only
+    /// key that worked. It refuses now, and a refusal that does not
+    /// say what to do instead is barely better than the dead end.
+    #[test]
+    fn an_empty_suggestions_pane_says_which_of_the_three_reasons_it_is() {
+        let mut app = app::App::new(search::Corpus::new());
+
+        app.scanning_library = true;
+        assert_eq!(
+            empty_suggestions_reason(&app),
+            "scanning local library...",
+            "mid-scan the answer is wait, not a complaint about the library"
+        );
+
+        app.scanning_library = false;
+        let said = empty_suggestions_reason(&app);
+        assert!(said.contains("library_paths"), "{said}");
+        assert!(said.contains("navidrome"), "and the other way in: {said}");
+
+        // a corpus with something in it is the only case that is
+        // actually about suggestions.
+        app.corpus.add_local_tracks([library::LocalTrack {
+            path: std::path::PathBuf::from("/music/a.flac"),
+            title: "a".into(),
+            artist: None,
+            album: None,
+            duration_secs: None,
+            kind: library::MediaKind::Music,
+        }]);
+        let said = empty_suggestions_reason(&app);
+        assert!(
+            said.contains("what you play"),
+            "it has to name what suggestions are built from: {said}"
+        );
+        assert!(
+            !said.contains("library_paths"),
+            "the library is fine; do not blame it: {said}"
+        );
+    }
 
     #[test]
     fn loading_message_names_whatever_is_still_in_flight() {
