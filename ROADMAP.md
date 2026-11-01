@@ -2048,6 +2048,46 @@ same-process ratios are quoted.
       several width walks of static art per frame), which was out of
       scope and is the obvious next slice.
 
+### the console box, and a measurement artefact worth knowing about
+
+- [x] **the console's interior fill is 3.4x faster**, which takes the
+      box from ~62% of a console frame to 40% and the whole frame from
+      11.46us to 8.67us at 60x14 (1.32x; 13.93 to 10.30 at 76x40).
+      It blanked its interior with one bounds-checked `put` per cell,
+      884 of them at 68x13 against 160 of border, where the interior is
+      one blank cell repeated: `Rect::intersection` clips once and each
+      row is a `slice::fill`. Interior alone 5.285us to 1.558us.
+      identity is asserted cell-for-cell **and style-for-style** against
+      the loop it replaced, via `Buffer`'s own `PartialEq`, at five box
+      positions across four buffer sizes including boxes hanging off
+      the right and bottom edges. Printed over a `.`-prefilled screen
+      too, which is what shows that the box still owns every cell
+      inside its border.
+      four mutations, and **the fourth initially passed**: removing the
+      size guard was invisible because the test's smallest box was
+      2x2, where `w - 2` is 0 and the fill is simply empty. The guard
+      exists for width 0 and 1, where `w - 2` underflows, so those
+      three sizes are in the test now with the reason written next to
+      them.
+- [x] **the row loop was the obvious target and was the wrong one.**
+      One allocation per visible row per frame, which is the shape that
+      was 44% of a `results_list` paint. Measured here: 1.11-1.36x over
+      60 rows, but the console draws at most `SCROLLBACK_ROWS` (8), so
+      the real saving is ~0.15-0.8us of an 11.5us frame, **about 1%**.
+      Not landed, for the same reason the packed search prefilter was
+      not: a good ratio on a small share is not a win. `truncate_into`
+      exists for the call sites where the share is real.
+- [x] **a measurement artefact that invalidated a number by 5x**, worth
+      recording because every bench in this repo is exposed to it.
+      The first reading of a console frame was 51-62us. The honest
+      figure is 11.5-13.9us. The difference was **cargo running the two
+      timing tests in parallel**: `-- --ignored` runs every bench at
+      once across the thread pool, and they inflate each other.
+      So an `#[ignore]`d timing test needs `--test-threads=1` when run
+      alongside another, and a number taken without it is not a
+      measurement. The sibling suggestions bench already did this; it
+      is now written down rather than folklore.
+
 ### found by the six-agent run, not yet done
 
 Each of these was measured by an agent that could not reach the file it
