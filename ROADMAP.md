@@ -2346,16 +2346,39 @@ stray paint.
       the server reason. the last had no test until I wrote one, which
       is the same pinned-the-fix-not-the-wiring slip as the suggestions
       refusal earlier.
-- [ ] **the rest of the nine are still open.** `core.rs` 887/900
-      (every scrobble failure forever, so a revoked token is
+- [x] **skip-next, the fourth of the nine, and the same shape as the
+      pause keybind.** the keybind did a bare
+      `let _ = player.playlist_next()`, so it had **none** of
+      `Op::SkipNext`'s guards: `playlist-next weak` on the last entry
+      replies with an error (measured; recorded in
+      `Mpv::playlist_next`), and discarding it meant skip on the last
+      track **did nothing and said nothing**, while `skip()` in the
+      console has always explained itself.
+      every guard moved into `core::skip_next`, returning a `Skipped`
+      the two callers report their own way: the queue is asked before
+      mpv (`entries` *is* mpv's playlist by invariant, so nothing
+      upcoming here means nothing for mpv to skip to), and a skip past
+      the end lands on the last track rather than refusing, since
+      asking to go forward four with two left plainly means "the end".
+      three mutations caught, two against a real mpv: the keybind
+      reverting to a bare `playlist_next`, the last-track guard going,
+      and the clamp going so it overshoots.
+      **and the restored-queue refill counts what it lost.** that was
+      also on the list of nine, but the audit's symptom for it was
+      wrong: it said a moved library shows a full queue in the ui and
+      an empty playlist in mpv, and that cannot happen, because
+      `loadfile` accepts any path (the same measurement the frame-source
+      work turned up). what the discarded result actually hid is a
+      refill coming back short with no word, so it is counted and
+      reported now, the discipline `append_resolved` already uses.
+- [ ] **three of the nine are still open.** `core.rs` 887/900 (every
+      scrobble failure forever, so a revoked token is
       indistinguishable from working; the shape is written up under the
       scrobble-metadata item), 784-797 (four consecutive silent returns
       in subtitle auto-fetch, so a wrong key looks identical to "no
-      subtitles exist"), `main.rs` ~2062 (the restored-queue refill
-      discards every per-track status, so a moved library shows a full
-      queue in the ui and an empty playlist in mpv), and `main.rs`
-      ~4331 (skip-next has neither the last-track guard nor the message
-      `Op::SkipNext` has).
+      subtitles exist"), and `main.rs` ~2062's sibling cases where a
+      per-track status is still dropped on a path other than the
+      first-frame refill.
 - [x] ~~resolved by the overnight run~~ **two hardcoded keys in rendered text.** `ui/queue.rs` ~188
       hardcodes `'a'` for the remappable `Enqueue` ("enter on a song
       to start, 'a' to add"), the exact bug class
