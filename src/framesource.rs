@@ -342,6 +342,206 @@ pub fn plan(want_ascii: bool, media: Option<&Path>, grid: Grid, have: Have) -> P
     Plan::Keep
 }
 
+/// The host's half: owns at most one instance and applies `plan` to it,
+/// so the draw loop gets one call and no lifecycle branches.
+///
+/// A spawn that fails is latched against the file that failed, so a
+/// file mpv cannot decode costs one error and not one per frame; a
+/// different file clears the latch and tries again.
+#[derive(Debug, Default)]
+pub struct Ascii {
+    live: Option<FrameSource>,
+    refused: Option<PathBuf>,
+    attempts: u32,
+}
+
+impl Ascii {
+    /// The whole per-frame call: reconcile the instance with what is
+    /// playing, then drive it to media time `now`.
+    ///
+    /// `fps` is a closure because reading `container-fps` is an ipc
+    /// round trip on the audible instance, and only a spawn needs it;
+    /// an ordinary frame must not pay for it.
+    pub fn update<F>(
+        &mut self,
+        want_ascii: bool,
+        media: Option<&Path>,
+        grid: Grid,
+        now: f64,
+        fps: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce() -> f64,
+    {
+        // the latch means something only while that file is the one
+        // being asked for. it cannot be cleared on `Stop` instead: a
+        // spawn that failed leaves nothing running, so turning ascii
+        // off is `Keep` and the latch would outlive the request.
+        if !want_ascii || media != self.refused.as_deref() {
+            self.refused = None;
+        }
+        let have = Have {
+            media: self.live.as_ref().map(FrameSource::media),
+            grid: self.live.as_ref().map(FrameSource::grid),
+        };
+        match plan(want_ascii, media, grid, have) {
+            Plan::Keep => {}
+            Plan::Stop => {
+                // dropping it kills the child and takes the fifo.
+                self.live = None;
+                return Ok(());
+            }
+            Plan::Start { grid } => {
+                // `plan` cannot ask to start without a path; this is
+                // the type lining up, not a case to handle.
+                let Some(path) = media else { return Ok(()) };
+                if self.refused.as_deref() == Some(path) {
+                    return Ok(());
+                }
+                // dropped before the spawn, so two instances never
+                // decode at once even for the moment one takes.
+                self.live = None;
+                self.attempts += 1;
+                match FrameSource::spawn(path, grid, now, fps()) {
+                    Ok(src) => self.live = Some(src),
+                    Err(e) => {
+                        self.refused = Some(path.to_path_buf());
+                        return Err(e);
+                    }
+                }
+            }
+            Plan::Resize { grid } => {
+                if let Some(src) = self.live.as_mut() {
+                    src.resize(grid)?;
+                }
+            }
+        }
+        if let Some(src) = self.live.as_mut() {
+            src.advance_to(now)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the host should paint frames instead of its own ui.
+    pub fn active(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// Draws the current frame, or nothing at all if there is no
+    /// instance. Painting nothing rather than leaving the cells alone
+    /// is the caller's business: `active` is the question it asks.
+    pub fn paint(&self, area: Rect, tone: Tone, buf: &mut Buffer) {
+        if let Some(src) = self.live.as_ref() {
+            src.paint(area, tone, buf);
+        }
+    }
+
+    /// How many spawns have been attempted. Exists so the latch can be
+    /// told from a retry that happened to fail the same way.
+    #[cfg(test)]
+    fn attempts(&self) -> u32 {
+        self.attempts
+    }
+}
+
+/// The instance holder, whose reachable half is the no-op paths and
+/// the latch: a spawn is rejected for a degenerate grid before any
+/// process starts, which is what makes the failure path testable at
+/// all without a live mpv.
+#[cfg(test)]
+mod ascii_tests {
+    use super::*;
+
+    /// Grids `spawn` refuses outright, so no child is ever started.
+    fn no_cells() -> Grid {
+        Grid::new(0, 0, 2.0)
+    }
+
+    fn never_asked() -> f64 {
+        panic!("fps was read without a spawn to spend it on");
+    }
+
+    /// The fps closure is the assertion here: an ordinary frame must
+    /// not pay an ipc round trip, so reading it at all is the bug.
+    #[test]
+    fn an_idle_frame_costs_nothing() {
+        let mut ascii = Ascii::default();
+        ascii
+            .update(false, Some(Path::new("/v/a.mkv")), no_cells(), 0.0, never_asked)
+            .expect("ascii off is not an error");
+        ascii
+            .update(true, None, no_cells(), 0.0, never_asked)
+            .expect("a music track is not an error");
+        assert_eq!(ascii.attempts(), 0);
+        assert!(!ascii.active());
+    }
+
+    /// One error per file, not one per frame. The latch is the whole
+    /// point: `plan` says `Start` again on the very next frame, since
+    /// nothing is running and a video is still playing.
+    #[test]
+    fn a_file_that_cannot_be_decoded_is_only_attempted_once() {
+        let mut ascii = Ascii::default();
+        let a = Path::new("/v/a.mkv");
+        ascii
+            .update(true, Some(a), no_cells(), 0.0, || 25.0)
+            .expect_err("a grid with no cells has no frame to decode");
+        assert_eq!(ascii.attempts(), 1);
+        for _ in 0..5 {
+            ascii
+                .update(true, Some(a), no_cells(), 0.0, never_asked)
+                .expect("the latch answers without retrying");
+        }
+        assert_eq!(ascii.attempts(), 1, "it kept respawning the same file");
+        assert!(!ascii.active());
+    }
+
+    /// The latch is against the file, so the next track still gets its
+    /// turn; one undecodable video must not disable ascii for the
+    /// session.
+    #[test]
+    fn a_new_file_is_attempted_even_after_one_was_refused() {
+        let mut ascii = Ascii::default();
+        ascii
+            .update(true, Some(Path::new("/v/a.mkv")), no_cells(), 0.0, || 25.0)
+            .expect_err("still a grid with no cells");
+        ascii
+            .update(true, Some(Path::new("/v/b.mkv")), no_cells(), 0.0, || 25.0)
+            .expect_err("b fails the same way, which is not the point");
+        assert_eq!(ascii.attempts(), 2);
+    }
+
+    /// Turning ascii off clears the latch, so a user who hits the key
+    /// twice gets a real second attempt rather than silence.
+    #[test]
+    fn turning_it_off_clears_the_latch() {
+        let mut ascii = Ascii::default();
+        let a = Path::new("/v/a.mkv");
+        ascii
+            .update(true, Some(a), no_cells(), 0.0, || 25.0)
+            .expect_err("grid with no cells");
+        ascii
+            .update(false, Some(a), no_cells(), 0.0, never_asked)
+            .expect("stopping is not an error");
+        ascii
+            .update(true, Some(a), no_cells(), 0.0, || 25.0)
+            .expect_err("and it tried again");
+        assert_eq!(ascii.attempts(), 2);
+    }
+
+    /// Nothing running paints nothing, and in particular does not
+    /// panic or touch a cell: the host asks `active` first, and a
+    /// paint that leaked would be painted over its own ui.
+    #[test]
+    fn painting_with_no_instance_leaves_the_buffer_alone() {
+        let ascii = Ascii::default();
+        let mut buf = crate::ui::testbuf::buffer(12, 4);
+        let before = crate::ui::testbuf::grid(&buf);
+        ascii.paint(Rect::new(0, 0, 12, 4), Tone::Mono, &mut buf);
+        assert_eq!(crate::ui::testbuf::grid(&buf), before);
+    }
+}
+
 /// A second, headless mpv decoding to a fifo, plus the read loop that
 /// paces it.
 ///
@@ -467,6 +667,12 @@ impl FrameSource {
         );
         self.filled = 0;
         Ok(())
+    }
+
+    /// The file this instance is decoding, which `plan` compares
+    /// against what is playing now.
+    pub fn media(&self) -> &Path {
+        &self.media
     }
 
     pub fn grid(&self) -> Grid {
