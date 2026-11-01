@@ -570,12 +570,28 @@ and `in-workspace (sub-rect) video` is still kitty-only via
         four mutations caught: `Auto` falling through to nothing,
         ascii being indistinguishable from off, mpv drawing over the
         cells wim is painting, and ascii skipping the screen gates.
-      - [ ] **the pane, which is the rest of it.** `FrameSource::paint`
-        writes into a `Buffer`, so the draw path can take it; what is
-        missing is the host owning a source, starting and stopping it
-        off `showing(..).is_ascii()`, resizing it on a pane resize, and
-        restarting it on a seek. a shellsong command and a key to
-        toggle the mode want to come with it.
+      - [x] **the lifecycle decision, `framesource::plan`.** four
+        outcomes (`Keep`, `Stop`, `Start{grid}`, `Resize{grid}`) from
+        what the host wants and what it already `Have`s, pure and with
+        no io, the same split `Schedule` uses to keep arithmetic out of
+        the child process. `Start` covers both "none yet" and "the file
+        changed" deliberately: encode mode has no socket to seek over,
+        which is why `restart` takes a time and not a path, so a new
+        file is a new child. `Stop` is only returned when something is
+        actually running, so an idle frame is `Keep` and the host does
+        no work when ascii is off. `Grid`'s cell aspect is part of the
+        comparison, because getting it wrong is a 2x vertical stretch
+        and not a rounding error.
+        four mutations caught: an idle frame reporting `Stop` forever, a
+        track change keeping the old instance, a pane resize being
+        ignored, and the opt-in being ignored so it pulls frames even
+        with ascii off.
+      - [ ] **the host wiring, which is the rest of it.**
+        `FrameSource::paint` writes into a `Buffer`, so the draw path
+        can take it; what is missing is the host owning the source,
+        calling `plan` each frame and acting on it, and restarting on a
+        seek. a shellsong command and a key to toggle the mode want to
+        come with it.
 - [ ] **usable at absurd zoom-out.** ascii video is only watchable
       once the font is small enough to give a few hundred cells across,
       so the layout has to survive that: sidebar and bottom bar must
