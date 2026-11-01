@@ -834,12 +834,51 @@ mouse audit's follow-up commits.
 **1492 tests** (1458 lib, 27 bin, 6 shellswim, 1 alloc) and clippy
 `-D warnings` clean as of 2026-11-01.
 
-**not fmt clean, and that claim here was stale.** `cargo fmt --check`
-reports diffs in 20 files, `core.rs` and `main.rs` worst. not fixed in
-passing on purpose: running it over `framesource.rs` alone reflowed 843
-lines of code nobody is changing and broke a source guard that was
-matching an exact call expression, and three agents hold edits in four
-of those files right now. it wants its own commit on a quiet tree.
+### ci was red for every commit of 2026-11-01, and the loop never looked
+
+Fixed, and worth recording as a process failure rather than a bug.
+`.github/workflows/ci.yml` runs four steps in order: `cargo fmt
+--check`, `cargo clippy --all-targets -- -D warnings`, `cargo test
+--locked`, `nix build .#default`. **fmt is first**, so a formatting diff
+fails the job before the other three ever run; a green local
+`build`/`clippy`/`test` proved nothing. Every push in the overnight run
+and all morning was red, around thirty of them, and the maintainer found
+it rather than the loop.
+
+Two real failures were hiding behind the formatter:
+
+1. **the tree was not formatted** (20 files). The entry below had even
+   recorded that and deferred it as cosmetic. It is not cosmetic when it
+   is the gate.
+2. **`nix build` ran the suite with no mpv.** `buildRustPackage` runs
+   `cargo test` in the sandbox with only the declared inputs, and the
+   derivation had mpv in `postInstall`'s wrapper and in the dev shell
+   but **not** in `nativeCheckInputs`, so 19 `framesource` tests that
+   spawn a real mpv and read rawvideo off a fifo failed there. Locally
+   `nix build` passed off a cached output, which is why this never
+   showed up. Fixed by declaring `nativeCheckInputs = [ pkgs.mpv ]`,
+   which also means CI now genuinely exercises the frame source rather
+   than skipping it: the check phase runs for 1m25s.
+   gating those 19 behind `#[ignore]` was the other option and was
+   rejected: the convention in `docs/testing.md` exists for tests that
+   need a *live player session*, and these spawn and own their own
+   child, so declaring the dependency is honest where hiding them is
+   not.
+   that fix is in the `merge wt/draw` commit rather than its own,
+   because a `git add -A` while resolving a merge conflict swept it in.
+   noted here because `git log` will not show it where a reader looks.
+
+The standing rule now: run CI's four steps locally **in CI's order**
+before pushing, and check `gh run list` after. `cargo test --locked` and
+`nix build .#default` are the two this loop habitually skips.
+
+**~~not fmt clean, and that claim here was stale.~~ fixed 2026-11-01**,
+see the ci entry above. this said it "wants its own commit on a quiet
+tree", which was wrong twice over: it is what ci gates on, so there was
+no quiet tree to wait for, and the reflow it was avoiding (843 lines in
+`framesource.rs`) is the cost of being formatted at all. the source
+guard that broke on the reflow now matches two short tokens instead of a
+whole call expression, which is the durable fix.
 the guard is fixed either way: it matches two tokens instead of a whole
 line, because a guard a formatter can break is a guard that fails for
 the wrong reason.
