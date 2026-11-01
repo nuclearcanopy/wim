@@ -3,11 +3,11 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
 use crate::config::VideoOutput;
-use ratatui_image::picker::ProtocolType;
 use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
 use crate::ui::results_list::scroll_cues;
+use ratatui_image::picker::ProtocolType;
 
 /// A row, named rather than numbered.
 ///
@@ -268,7 +268,18 @@ mod tests {
         render(
             area,
             &mut buf,
-            ["on", "auto (tct)", "the file's own rate", "off", "3", "7", "30", "50", "240", "set"],
+            [
+                "on",
+                "auto (tct)",
+                "the file's own rate",
+                "off",
+                "3",
+                "7",
+                "30",
+                "50",
+                "240",
+                "set",
+            ],
         );
         assert_eq!(grid(&buf), SNAPSHOT.join("\n"));
     }
@@ -302,7 +313,11 @@ mod tests {
     fn a_wide_value_does_not_shift_the_glyphs_after_it() {
         let area = Rect::new(0, 0, 60, 17);
         let mut buf = buffer(60, 17);
-        render(area, &mut buf, ["日本x", "", "", "", "", "", "", "", "", ""]);
+        render(
+            area,
+            &mut buf,
+            ["日本x", "", "", "", "", "", "", "", "", ""],
+        );
         let g = grid(&buf);
         let row: Vec<char> = g
             .lines()
@@ -646,6 +661,10 @@ mod eyeball_video {
         over[2] = ascii_fps_value(Some(15.0));
         let borrowed: Vec<&str> = over.iter().map(String::as_str).collect();
         show("shift+v override active, rate capped", &borrowed, 80);
-        show("the same at 62 wide, where the value column has to fit", &borrowed, 62);
+        show(
+            "the same at 62 wide, where the value column has to fit",
+            &borrowed,
+            62,
+        );
     }
 }

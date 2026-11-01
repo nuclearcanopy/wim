@@ -1287,7 +1287,12 @@ mod tests {
             let found: Vec<FoundMedia> = (0..files)
                 .map(|i| {
                     found(
-                        &format!("/home/u/Music/artist {}/album {}/{:02} - song.flac", i / 170, i / 17, i % 17),
+                        &format!(
+                            "/home/u/Music/artist {}/album {}/{:02} - song.flac",
+                            i / 170,
+                            i / 17,
+                            i % 17
+                        ),
                         MediaKind::Music,
                         Some(1_700_000_000_000_000_000 + i as u64),
                     )
@@ -1467,7 +1472,9 @@ mod restart_tests {
 
         // a batch already queued on the old channel, i.e. a scan that
         // has not finished signing off yet.
-        old_tx.send(Vec::new()).expect("the old receiver is still up");
+        old_tx
+            .send(Vec::new())
+            .expect("the old receiver is still up");
 
         // nothing to scan, so the new thread finishes immediately and
         // the test does not depend on the filesystem.

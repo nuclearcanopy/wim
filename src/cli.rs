@@ -150,7 +150,9 @@ pub fn parse_wim<I: IntoIterator<Item = String>>(args: I) -> Result<WimRun, Stri
 pub fn resolve_files(files: &[PathBuf]) -> Result<Vec<crate::search::SearchItem>, String> {
     files
         .iter()
-        .map(|p| crate::persistence::item_from_path(&p.to_string_lossy()).ok_or_else(|| unplayable(p)))
+        .map(|p| {
+            crate::persistence::item_from_path(&p.to_string_lossy()).ok_or_else(|| unplayable(p))
+        })
         .collect()
 }
 

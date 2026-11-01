@@ -1713,11 +1713,7 @@ mod bench {
     /// hours apart. Alternating makes every variant see the same
     /// machine, so the ratio is a measurement even when the absolute
     /// numbers are not.
-    fn best_each<const N: usize>(
-        batches: u32,
-        n: u32,
-        mut f: impl FnMut(usize),
-    ) -> [Duration; N] {
+    fn best_each<const N: usize>(batches: u32, n: u32, mut f: impl FnMut(usize)) -> [Duration; N] {
         let mut best = [Duration::MAX; N];
         for _ in 0..batches {
             for (i, slot) in best.iter_mut().enumerate() {
@@ -1778,9 +1774,7 @@ mod bench {
                     busy().render(area, &mut buf);
                 }
             });
-            println!(
-                "{w}x2: frame {both:>9.3?}  (render {render:>9.3?}  layout {layout:>9.3?})"
-            );
+            println!("{w}x2: frame {both:>9.3?}  (render {render:>9.3?}  layout {layout:>9.3?})");
         }
     }
 
@@ -1798,23 +1792,24 @@ mod bench {
             let bar = busy();
             let segs = bar.segments(None);
             let placed = place(&segs, area, 1);
-            let [segments, placing, painting, mode] = best_each::<4>(6, 2000, |which| match which {
-                0 => {
-                    std::hint::black_box(bar.segments(None));
-                }
-                1 => {
-                    std::hint::black_box(place(&segs, area, 1));
-                }
-                2 => {
-                    for p in &placed {
-                        draw_placed(&mut buf, area, p, bar.flash, bar.selected, bar.scrubbing);
+            let [segments, placing, painting, mode] =
+                best_each::<4>(6, 2000, |which| match which {
+                    0 => {
+                        std::hint::black_box(bar.segments(None));
                     }
-                }
-                _ => {
-                    std::hint::black_box(bar.mode_label());
-                    std::hint::black_box(console_hint());
-                }
-            });
+                    1 => {
+                        std::hint::black_box(place(&segs, area, 1));
+                    }
+                    2 => {
+                        for p in &placed {
+                            draw_placed(&mut buf, area, p, bar.flash, bar.selected, bar.scrubbing);
+                        }
+                    }
+                    _ => {
+                        std::hint::black_box(bar.mode_label());
+                        std::hint::black_box(console_hint());
+                    }
+                });
             println!(
                 "{w}x2: segments {segments:>9.3?}  place {placing:>9.3?}  \
                  paint {painting:>9.3?}  mode line {mode:>9.3?}"
