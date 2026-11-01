@@ -832,16 +832,21 @@ mod tests {
 
     #[test]
     fn renders_without_panicking_at_degenerate_sizes() {
-        for (w, h) in [(1, 1), (1, 0), (200, 1), (3, 3), (0, 10)] {
-            let area = Rect::new(0, 0, w, h);
-            let mut buf = Buffer::empty(area);
-            let keymap = Keymap::default();
-            HelpOverlay {
-                keymap: &keymap,
-                mouse: true,
-                scroll: 0,
+        for (w, h) in [(1, 1), (1, 0), (200, 1), (3, 3), (2, 3), (6, 4), (0, 10)] {
+            // every scroll a caller could hand over, including one
+            // past the end: the cue rows are derived from `rows`, which
+            // a pane this small leaves at zero.
+            for scroll in [0usize, 1, usize::MAX] {
+                let area = Rect::new(0, 0, w, h);
+                let mut buf = Buffer::empty(area);
+                let keymap = Keymap::default();
+                HelpOverlay {
+                    keymap: &keymap,
+                    mouse: true,
+                    scroll,
+                }
+                .render(area, &mut buf);
             }
-            .render(area, &mut buf);
         }
     }
 

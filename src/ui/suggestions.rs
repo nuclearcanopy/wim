@@ -355,7 +355,7 @@ mod tests {
     use super::*;
     use crate::search::SearchItem;
     use crate::suggest::{Section, Suggestion};
-    use crate::ui::testbuf::{buffer, char_at, grid};
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, char_at, grid};
 
     fn song(title: &str) -> SearchItem {
         SearchItem::LocalMusic {
@@ -1059,18 +1059,22 @@ mod tests {
 
     #[test]
     fn renders_at_degenerate_sizes_without_panicking() {
-        let s = two_sections();
-        for (w, h) in [(1, 1), (0, 5), (5, 0), (3, 2), (80, 1), (80, 2)] {
-            let area = Rect::new(0, 0, w, h);
-            let mut buf = buffer(w.max(1), h.max(1));
-            SuggestionsView {
-                suggestions: &s,
-                selected: 0,
-                focused: false,
-                elapsed: Duration::ZERO,
-                enriching: false,
+        for s in [two_sections(), Suggestions::default()] {
+            for (w, h) in [(1, 1), (0, 5), (5, 0), (3, 2), (2, 3), (80, 1), (80, 2)] {
+                for enriching in [false, true] {
+                    let area = Rect::new(0, 0, w, h);
+                    let mut buf = buffer(w.max(1), h.max(1));
+                    SuggestionsView {
+                        suggestions: &s,
+                        selected: 0,
+                        focused: false,
+                        elapsed: Duration::ZERO,
+                        enriching,
+                    }
+                    .render(area, &mut buf);
+                    assert_outside_untouched(&buf, area);
+                }
             }
-            .render(area, &mut buf);
         }
     }
 }
