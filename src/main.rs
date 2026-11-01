@@ -4506,7 +4506,16 @@ fn main() -> anyhow::Result<()> {
                 // ruled out above, so this only ever sees it as a
                 // transport command.
                 if key.code == keymap.get(KeyAction::TogglePause) && now_playing.is_some() {
-                    let _ = player.toggle_pause();
+                    // through `core::toggle_pause`, not mpv directly:
+                    // during a between-track gap, play means "get on
+                    // with it", and mpv is already paused at a
+                    // finished eof. toggling it there unpaused at an
+                    // end that immediately reports itself again, left
+                    // `holding()` true so the countdown kept drawing,
+                    // and played nothing until the gap expired. the
+                    // bar click and enter on the player always did the
+                    // right thing, which is what made it confusing.
+                    let _ = wim::core::toggle_pause(&player, &mut between_tracks);
                     continue;
                 }
 
