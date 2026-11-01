@@ -4,6 +4,47 @@
 the video pane (`src/framesource.rs`) uses the same code, which is why
 nothing in it knows what a cover is.
 
+## quantize: the branch stays, and why
+
+`quantize` is the largest remaining per-cell cost (about 5.8 of 7.8 ns
+in mono, once the glyph write stopped building a `CompactString`). The
+obvious change is to make it branchless, since `v >= mid` is a coin
+flip along every edge: multiply by the predicate instead of branching,
+and take the background sum off the total rather than accumulating it.
+
+**Measured, it is not a win, and it was not shipped.** Both benches are
+`#[ignore]`d; run them with `cargo test --release -- --ignored
+--nocapture`.
+
+`quantize_cost` times the two in one process, alternating batches:
+
+| quads | shipped | branchless | |
+| --- | --- | --- | --- |
+| unpredictable | 12.3 ns/cell | 8.2 | 1.50x |
+| flat | 6.5 ns/cell | 7.7 | **0.85x** |
+
+The branch predictor wins outright on a flat cell, and real covers are
+mostly flat cells. `flat_cell_fraction_of_real_covers` counts them, via
+the fact that a full block is mask `0b1111` and that happens *only*
+when a cell is flat (`mid` is the midpoint of the cell's own range, so
+a non-flat cell always has a sample below it):
+
+| fixture | 26x13 | 70x35 |
+| --- | --- | --- |
+| disc (large uniform areas) | 72% | 90% |
+| ramp (pure gradient) | 0% | 17% |
+
+Weighting the times by that mix: at 90% flat the branchless version is
+about 8% **slower**, at 72% it is 4% faster, and it only wins clearly
+on a gradient. Album art is far more like the disc than the ramp, so
+the branch stays.
+
+`branchless_quantize` is kept in the test module with an
+output-equality test against the shipped one, so this stays a checkable
+measurement rather than becoming folklore. Anyone revisiting it should
+change the *content* assumption first: this conclusion is entirely
+about how flat real covers are.
+
 ## the technique
 
 one cell carries four luma samples, not one. the glyph comes from the
