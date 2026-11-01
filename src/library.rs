@@ -421,6 +421,13 @@ fn mtime_of(path: &Path, follow: bool) -> Option<u64> {
     meta.ok().as_ref().and_then(mtime_nanos)
 }
 
+/// A video is never tagged, so it is never indexed and `resolve_known`
+/// never looks at its mtime: stat'ing one is pure waste, once per file
+/// in a video library.
+fn needs_mtime(found: &FoundMedia) -> bool {
+    found.1 == MediaKind::Music
+}
+
 /// Fills in every entry's mtime across a pool sized to the machine.
 /// Chunked by index over both slices at once, so a worker can only
 /// ever write the mtime of the path it stat'd; a misalignment here
@@ -432,7 +439,9 @@ fn fill_mtimes(found: &mut [FoundMedia], follows: &[bool]) {
         .min(found.len());
     if workers <= 1 {
         for (slot, follow) in found.iter_mut().zip(follows) {
-            slot.2 = mtime_of(&slot.0, *follow);
+            if needs_mtime(slot) {
+                slot.2 = mtime_of(&slot.0, *follow);
+            }
         }
         return;
     }
@@ -441,7 +450,9 @@ fn fill_mtimes(found: &mut [FoundMedia], follows: &[bool]) {
         for (part, part_follows) in found.chunks_mut(chunk).zip(follows.chunks(chunk)) {
             scope.spawn(move || {
                 for (slot, follow) in part.iter_mut().zip(part_follows) {
-                    slot.2 = mtime_of(&slot.0, *follow);
+                    if needs_mtime(slot) {
+                        slot.2 = mtime_of(&slot.0, *follow);
+                    }
                 }
             });
         }
@@ -1001,7 +1012,7 @@ mod tests {
     /// artist/album/track layout, so the walk measures a real stat
     /// storm rather than one flat directory. Its own temp dir; nothing
     /// here touches the user's media or `~/.cache/wim`.
-    fn media_tree(label: &str, files: usize) -> PathBuf {
+    fn media_tree(label: &str, files: usize, ext: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1019,7 +1030,7 @@ mod tests {
                 if album * per_album + t >= files {
                     break;
                 }
-                fs::write(dir.join(format!("{t:02} - some song title.flac")), b"").unwrap();
+                fs::write(dir.join(format!("{t:02} - some song title.{ext}")), b"").unwrap();
             }
         }
         root
@@ -1112,7 +1123,7 @@ mod tests {
     /// for another's.
     #[test]
     fn the_pooled_walk_finds_exactly_what_the_inline_stat_did() {
-        let root = media_tree("statparity", 40);
+        let root = media_tree("statparity", 40, "flac");
         let as_str = root.to_string_lossy().into_owned();
         let serial = walk_root_serial_stat(&as_str);
         let pooled = walk_root(&as_str);
@@ -1125,6 +1136,32 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// The mtime of a video is never read, so it is never taken: a
+    /// video library's worth of stats that bought nothing. The paths
+    /// and kinds still have to come out exactly as the stat'ing walk
+    /// found them, which is what makes this a skipped stat rather than
+    /// a skipped file.
+    #[test]
+    fn a_video_is_walked_but_never_stat_d() {
+        let root = media_tree("videostat", 30, "mkv");
+        let as_str = root.to_string_lossy().into_owned();
+        let serial = walk_root_serial_stat(&as_str);
+        let pooled = walk_root(&as_str);
+        assert_eq!(pooled.len(), 30, "precondition: the tree was walked");
+        assert!(
+            serial.iter().all(|(_, k, m)| *k == MediaKind::Video && m.is_some()),
+            "precondition: the stat'ing walk did read every one of these"
+        );
+        assert!(
+            pooled.iter().all(|(_, _, m)| m.is_none()),
+            "a video's mtime is never read, so it must never be taken"
+        );
+        let paths: Vec<_> = pooled.iter().map(|(p, k, _)| (p, k)).collect();
+        let was: Vec<_> = serial.iter().map(|(p, k, _)| (p, k)).collect();
+        assert_eq!(paths, was, "same files, same order, one fewer syscall each");
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// The mtime a pooled chunk writes has to be the one belonging to
     /// its own path, and a tree written in one go is no test of that:
     /// the kernel's file timestamps move in ~ms ticks, so every file
@@ -1133,7 +1170,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pooled_mtimes_land_on_the_path_they_were_read_for() {
-        let root = media_tree("mtimealign", 300);
+        let root = media_tree("mtimealign", 300, "flac");
         let at = root.to_string_lossy().into_owned();
         let mut want: HashMap<PathBuf, Option<u64>> = HashMap::new();
         for (i, (path, _, _)) in walk_root(&at).into_iter().enumerate() {
@@ -1186,7 +1223,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_track_is_cached_against_its_targets_mtime() {
-        let root = media_tree("symlinked", 1);
+        let root = media_tree("symlinked", 1, "flac");
         let target = root.join("real song.flac");
         let link = root.join("artist 0").join("album 0").join("linked song.flac");
         fs::write(&target, b"").unwrap();
@@ -1222,7 +1259,7 @@ mod tests {
     fn warm_walk_legs() {
         println!("--- walk legs, {} build", profile());
         for files in [5_000usize, 34_000] {
-            let root = media_tree("walklegs", files);
+            let root = media_tree("walklegs", files, "flac");
             let at = root.to_string_lossy().into_owned();
             assert_eq!(walk_root_no_stat(&at).len(), files);
 
@@ -1261,15 +1298,35 @@ mod tests {
                     walk_root(&at);
                 },
             );
+            // and the video half, where the stat is not pooled but
+            // dropped: nothing reads a video's mtime. Read on the cpu
+            // clock, since this is strictly less work rather than the
+            // same work spread out.
+            let videos = media_tree("walklegs-video", files, "mkv");
+            let video_at = videos.to_string_lossy().into_owned();
+            assert_eq!(walk_root(&video_at).len(), files);
+            let (video_serial, video_skipped) = best_each_cpu(
+                6,
+                1,
+                &mut || {
+                    walk_root_serial_stat(&video_at);
+                },
+                &mut || {
+                    walk_root(&video_at);
+                },
+            );
             println!(
                 "{files:>6} files  cpu: readdir only {readdir_cpu:>9.0}us  serial \
                  {serial_cpu:>9.0}us/{serial_cpu_again:>9.0}us  pooled {pooled_cpu:>9.0}us \
                  ({:+.0}%)\n              wall: serial {serial:>9.0}us  pooled \
-                 {pooled:>9.0}us  {:.2}x",
+                 {pooled:>9.0}us  {:.2}x\n              all video, cpu: stat'ing \
+                 {video_serial:>9.0}us  skipped {video_skipped:>9.0}us  {:.2}x",
                 (pooled_cpu / serial_cpu_again - 1.0) * 100.0,
                 serial / pooled,
+                video_serial / video_skipped,
             );
             fs::remove_dir_all(&root).ok();
+            fs::remove_dir_all(&videos).ok();
         }
     }
 
@@ -1524,7 +1581,7 @@ mod tests {
     #[ignore = "measurement, run explicitly"]
     fn warm_scan_phases() {
         for files in [5_000usize, 34_000] {
-            let root = media_tree("warm", files);
+            let root = media_tree("warm", files, "flac");
             let roots = vec![root.to_string_lossy().into_owned()];
             let (walk_wall, found) = best(3, || walk_media(&roots));
             let (walk_cpu, _) = best_cpu(3, || walk_media(&roots));
