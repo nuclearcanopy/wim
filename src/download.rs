@@ -167,6 +167,20 @@ fn transfer_failed(e: ureq::Error) -> String {
     }
 }
 
+/// Whether a response body is plainly not audio. Subsonic refuses a
+/// `stream` request with an error document rather than an http error
+/// ("returns binary data on success, or an XML document on error, in
+/// which case the HTTP content type will start with text/xml"), and
+/// caching that marks the track cached and reports it downloaded.
+/// Anything binary is let through, including a missing header: this
+/// refuses what is known to be wrong, not everything unrecognized.
+fn is_error_document(ct: Option<&str>) -> bool {
+    let ct = ct.unwrap_or_default().trim().to_ascii_lowercase();
+    ct.starts_with("text/")
+        || ct.starts_with("application/xml")
+        || ct.starts_with("application/json")
+}
+
 /// One agent for a whole batch: stall timeouts, and a pool big enough
 /// that the workers reuse connections instead of each track paying a
 /// fresh tcp+tls handshake (`ureq::get` builds a throwaway agent per
@@ -197,7 +211,11 @@ fn download_one(
     let total = resp
         .header("Content-Length")
         .and_then(|v| v.parse::<u64>().ok());
-    let ext = ext_for_content_type(resp.header("Content-Type"));
+    let content_type = resp.header("Content-Type");
+    if is_error_document(content_type) {
+        return Err("the server sent an error document, not audio".to_string());
+    }
+    let ext = ext_for_content_type(content_type);
     let dest = dest_for(id, ext).map_err(|e| e.to_string())?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -365,6 +383,9 @@ mod tests {
         /// A server-side error on every request, so a whole batch fails
         /// the way an unreachable navidrome does.
         Failing,
+        /// 200 with an xml error document, which is how subsonic
+        /// refuses a `stream` request.
+        ErrorDocument,
     }
 
     /// Minimal http/1.1 server for the download path, same shape as
@@ -470,6 +491,16 @@ mod tests {
                 let body = "nope";
                 let head = format!(
                     "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                writer.write_all(head.as_bytes()).is_ok()
+            }
+            Mode::ErrorDocument => {
+                let body = "<subsonic-response status=\"failed\" version=\"1.16.1\">\
+                    <error code=\"40\" message=\"Wrong username or password\"/>\
+                    </subsonic-response>";
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n\r\n{body}",
                     body.len()
                 );
                 writer.write_all(head.as_bytes()).is_ok()
@@ -608,6 +639,70 @@ mod tests {
         rx.into_iter().collect()
     }
 
+    /// What a refusal has to look like from the outside.
+    struct Refused {
+        failed: usize,
+        /// How many times the index was saved, which is also how many
+        /// tracks were marked cached: `persist` is called under the same
+        /// lock, right after `mark_cached`.
+        saves: usize,
+    }
+
+    /// Runs one track from a `mode` server beside one that works. The
+    /// good track is the positive control for the "nothing was cached"
+    /// half: a run where nothing lands at all cannot tell a refusal
+    /// from a batch that never ran.
+    fn run_beside_a_good_track(mode: Mode, dir: &TempDir) -> Refused {
+        let good = ByteServer::start(Mode::Body(512));
+        let bad = ByteServer::start(mode);
+        let tracks = vec![
+            (
+                "good".to_string(),
+                "good track".to_string(),
+                good.url_for("good"),
+            ),
+            (
+                "bad".to_string(),
+                "bad track".to_string(),
+                bad.url_for("bad"),
+            ),
+        ];
+        let saves = Arc::new(AtomicUsize::new(0));
+        let counted = saves.clone();
+        let cache = Arc::new(Mutex::new(CacheIndex::default()));
+        let dest = dir.dest_for();
+        let sink = Sink {
+            cache: &cache,
+            dest_for: &dest,
+            // counted rather than written: never the real index file
+            persist: &move |_: &CacheIndex| {
+                counted.fetch_add(1, Ordering::Relaxed);
+            },
+        };
+        let (tx, rx) = mpsc::channel();
+        download_tracks(&tracks, &sink, &tx, &batch_agent());
+        drop(tx);
+        let events: Vec<DownloadEvent> = rx.into_iter().collect();
+        let (done, failed) = outcomes(&events);
+        assert_eq!(
+            done,
+            ["good track"],
+            "the real body lands and nothing else does"
+        );
+        assert!(
+            cache.lock().unwrap().cached_path("good").is_some(),
+            "and still be in the index"
+        );
+        assert!(
+            failed.iter().all(|(label, _)| *label == "bad track"),
+            "only the refused track may fail"
+        );
+        Refused {
+            failed: failed.len(),
+            saves: saves.load(Ordering::Relaxed),
+        }
+    }
+
     fn outcomes(events: &[DownloadEvent]) -> (Vec<&str>, Vec<(&str, &str)>) {
         let mut done = Vec::new();
         let mut failed = Vec::new();
@@ -632,6 +727,23 @@ mod tests {
         assert_eq!(ext_for_content_type(Some("audio/mp4")), "m4a");
         assert_eq!(ext_for_content_type(None), "audio");
         assert_eq!(ext_for_content_type(Some("text/html")), "audio");
+    }
+
+    #[test]
+    fn an_error_document_is_told_from_a_binary_body() {
+        assert!(is_error_document(Some("text/xml")));
+        assert!(is_error_document(Some("text/xml; charset=utf-8")));
+        assert!(is_error_document(Some("Text/HTML")));
+        assert!(is_error_document(Some("application/json")));
+        assert!(!is_error_document(Some("audio/mpeg")));
+        assert!(
+            !is_error_document(Some("application/octet-stream")),
+            "a server that will not name the codec still sends audio"
+        );
+        assert!(
+            !is_error_document(None),
+            "a missing header is not evidence of anything"
+        );
     }
 
     #[test]
@@ -844,6 +956,29 @@ mod tests {
             error.to_lowercase().contains("connection"),
             "the cause still has to survive"
         );
+    }
+
+    /// Subsonic refuses a `stream` request with an error document rather
+    /// than a transport failure: the spec's own wording is "returns
+    /// binary data on success, or an XML document on error (in which
+    /// case the HTTP content type will start with text/xml)". Trusting
+    /// that body wrote a few hundred bytes of xml into the cache, marked
+    /// the track cached and toasted "downloaded", so nothing ever
+    /// re-downloaded it and the next offline play was mpv on an xml file.
+    #[test]
+    fn an_error_document_is_refused_instead_of_cached_as_the_track() {
+        let dir = TempDir::new("error-doc");
+        let refused = run_beside_a_good_track(Mode::ErrorDocument, &dir);
+        assert_eq!(
+            refused.failed, 1,
+            "a wrong password answers 200: an error document is not a download"
+        );
+        assert_eq!(
+            dir.entries(),
+            ["good.mp3"],
+            "an error document must not be cached as the track"
+        );
+        assert_eq!(refused.saves, 1, "and the index must not learn about it");
     }
 
     /// Successes collapse the same way, so downloading a 30-track
