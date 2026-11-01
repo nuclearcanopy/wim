@@ -191,9 +191,6 @@ impl FetchedCatalog {
     }
 }
 
-/// Pings before fetching; a typo'd url/password surfaces as an error
-/// rather than silently returning an empty catalog. Pure network I/O,
-/// safe to call from any thread.
 /// One catalog fetch's outcome. A panicked thread and a failed request
 /// are the same thing to the caller: we do not know what this server
 /// has, so nothing may be reconciled against it.
@@ -208,6 +205,10 @@ pub fn fetched<T>(
     }
 }
 
+/// The three catalog listings for one server, plus the startup cache
+/// write they feed. A typo'd url or password surfaces as an error
+/// rather than as an empty catalog, which would be a claim that the
+/// server has nothing. Pure network I/O, safe to call from any thread.
 pub fn fetch_navidrome_catalog(
     nav: &config::NavidromeConfig,
     live: &[Arc<subsonic::Client>],
