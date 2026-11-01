@@ -609,10 +609,34 @@ and `in-workspace (sub-rect) video` is still kitty-only via
         the vo deciding separately, a branch that never paints, no
         latch, a latch that outlives the request, an unrecorded
         failure, and a paint with no instance touching a cell).
-      - [ ] **a key and a shellsong command to toggle it.** the mode is
-        `config.video_output` only, so trying it means editing the
-        config and restarting; a runtime override wants to live beside
-        `video_fullscreen`.
+      - [x] **a key to toggle it.** shift-`v`, beside `v` for the mode
+        it switches. `video::effective(configured, override)` is what
+        the decision reads, so the runtime override is a `None` beside
+        `video_fullscreen` and a restart goes back to config.toml.
+        `toggle_ascii` only names a mode in the one case that cannot
+        clear (ascii *is* the config, where `Auto` is the other half);
+        otherwise off clears the override, so editing the config and
+        coming back picks the new value up.
+        the press turns fullscreen on in the same stroke, because the
+        pane only draws fullscreen and the first press otherwise looks
+        like nothing happened; it also says which way it went, since a
+        monochrome cell picture of a dark frame is not self-evidently
+        "it worked". `off` in config still refuses, with the same
+        message the `v` key gives.
+        the property test is the one that matters: one press flips
+        whether ascii is in force, from either starting point and under
+        all five configured modes. the first version of that test
+        asserted "a press from `None` reaches ascii" and was wrong, not
+        the code: with `video_output = "ascii"` the first press turns it
+        *off*.
+        the source guard grew two facts and caught six mutations. one
+        of them it initially missed: `code.contains("effective(..)")`
+        passed file-wide because the key handler calls it too, so it is
+        anchored at the `video::showing(` call instead. that is the
+        anchor rule in `docs/testing.md`, and I broke it again.
+      - [ ] **the crumbs.** `ui/help.rs`'s curated list does not mention
+        shift-`v` (the keybinds menu lists it automatically off
+        `ALL_ACTIONS`), and there is no shellsong command for the mode.
 - [ ] **usable at absurd zoom-out.** ascii video is only watchable
       once the font is small enough to give a few hundred cells across,
       so the layout has to survive that: sidebar and bottom bar must
