@@ -23,6 +23,10 @@ pub struct ShellsongConsole<'a> {
 /// a command and what it reported without covering the whole screen.
 const SCROLLBACK_ROWS: usize = 8;
 
+/// Same glyph `swimconsole` marks a scrolled-back console with, so the
+/// two consoles do not teach two symbols for one thing.
+const SCROLL_MARK: char = '^';
+
 /// Narrow enough that a split pane still gets a usable console; past
 /// this there is nowhere to put the input line and the box is skipped.
 const MIN_WIDTH: u16 = 14;
@@ -67,11 +71,25 @@ impl Widget for ShellsongConsole<'_> {
         let show_cycle = claim(self.console.cycle().is_some());
         let show_error = claim(self.console.error.is_some());
         let show_info = claim(info.is_some());
+        // a scrolled-back console that said nothing would read as a
+        // frozen one: output arrives, the screen does not move, and
+        // nothing explains why. only claimed while it is true, the
+        // same rule `swimconsole` applies.
+        let show_back = claim(self.console.scroll() > 0);
         let rows = (spare as usize)
             .min(SCROLLBACK_ROWS)
             .min(self.console.lines.len());
-        let h =
-            3 + u16::from(show_cycle) + u16::from(show_error) + u16::from(show_info) + rows as u16;
+        // the view is the only thing that knows the height the scroll
+        // offset is clamped against; see `Console::viewport`. without
+        // this `scroll_pages` paged by one line and `scroll_lines`
+        // clamped against zero, so PageUp here was a dead key.
+        self.console.saw_viewport(rows);
+        let h = 3
+            + u16::from(show_cycle)
+            + u16::from(show_error)
+            + u16::from(show_info)
+            + u16::from(show_back)
+            + rows as u16;
 
         let x = area.x + (area.width - w) / 2;
         let y = area.y + (area.height - h) / 2;
@@ -80,7 +98,13 @@ impl Widget for ShellsongConsole<'_> {
         frame(buf, x, y, w, h, border);
 
         let mut row = y + 1;
-        for line in self.console.lines.iter().rev().take(rows).rev() {
+        // `scroll` is lines back from the live tail, already clamped,
+        // but against *last* frame's height: a pane that just got
+        // taller would otherwise index past the start.
+        let total = self.console.lines.len();
+        let back = self.console.scroll().min(total - rows);
+        let end = total - back;
+        for line in self.console.lines[end - rows..end].iter() {
             let color = shade(match line.kind {
                 LineKind::Command => BRIGHT,
                 LineKind::Note => MID,
@@ -92,6 +116,21 @@ impl Widget for ShellsongConsole<'_> {
                 row,
                 &truncate_with_ellipsis(&line.text, inner),
                 color,
+                inner,
+            );
+            row += 1;
+        }
+        if show_back {
+            // short, and naming one key: the overlay is narrower than
+            // shellswim's full-width row, so a longer hint is the
+            // thing that gets ellipsised.
+            let hint = format!("{SCROLL_MARK} {back} back · pgdn");
+            text(
+                buf,
+                x + 2,
+                row,
+                &truncate_with_ellipsis(&hint, inner),
+                shade(MID),
                 inner,
             );
             row += 1;
@@ -306,7 +345,12 @@ fn label(buf: &mut Buffer, x: u16, y: u16, w: u16, color: Color) {
     if needed > w as usize {
         return;
     }
-    let mut col = x + 1;
+    // a `─` lead-in when there is room for one, so the corner and the
+    // tab are not two line-drawing glyphs butted together; the same
+    // fix `ui::searchbox` took, and additive, so the narrowest box
+    // keeps its label rather than losing it.
+    let lead = u16::from(needed < w as usize);
+    let mut col = x + 1 + lead;
     put(buf, col, y, '┤', color);
     col += 1;
     put(buf, col, y, ' ', color);
@@ -758,5 +802,106 @@ mod tests {
         for row in out.lines() {
             assert_eq!(row.chars().count(), 40, "a row overflowed: {row}");
         }
+    }
+}
+
+/// The overlay console's scrollback, which was a dead key until the
+/// view started reading `Console::scroll`.
+#[cfg(test)]
+mod scrollback {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::shellsong::{Console, LineKind, NoCandidates};
+    use crate::ui::testbuf::{buffer, grid};
+
+    fn loaded(n: usize) -> Console {
+        let mut c = Console::empty();
+        for i in 0..n {
+            c.push(LineKind::Note, format!("line {i}"));
+        }
+        c
+    }
+
+    fn render(c: &Console, w: u16, h: u16) -> String {
+        let mut buf = buffer(w, h);
+        ShellsongConsole {
+            console: c,
+            cursor_visible: true,
+        }
+        .render(Rect::new(0, 0, w, h), &mut buf);
+        grid(&buf)
+    }
+
+    fn page_up(c: &mut Console, times: usize) {
+        for _ in 0..times {
+            c.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &NoCandidates);
+        }
+    }
+
+    /// PageUp was a dead key: the keys reached `Console` and moved
+    /// `scroll`, but the view never read it, so the live tail was
+    /// drawn every frame. It also never reported its height, so
+    /// `scroll_pages` paged by *one line* and the clamp had nothing
+    /// real to clamp against.
+    #[test]
+    fn paging_back_shows_older_lines() {
+        let mut c = loaded(40);
+        let tail = render(&c, 60, 24);
+        assert!(tail.contains("line 39"), "the newest line is on screen:\n{tail}");
+
+        page_up(&mut c, 1);
+        let back = render(&c, 60, 24);
+        assert_ne!(back, tail, "PageUp changed nothing on screen");
+        assert!(
+            !back.contains("line 39"),
+            "a full page back still shows the newest line, so it paged \
+             by one row at most:\n{back}"
+        );
+        assert!(back.contains("line 3"), "and older lines came up:\n{back}");
+    }
+
+    /// A scrolled console that said nothing would read as a frozen
+    /// one. The row is only there while it is true.
+    #[test]
+    fn a_scrolled_console_says_how_far_back_it_is() {
+        let mut c = loaded(40);
+        assert!(
+            !render(&c, 60, 24).contains(SCROLL_MARK),
+            "nothing to say at the tail"
+        );
+        page_up(&mut c, 1);
+        let back = render(&c, 60, 24);
+        assert!(back.contains(SCROLL_MARK), "no marker:\n{back}");
+        assert!(back.contains("back"), "{back}");
+        assert!(back.contains("pgdn"), "it has to name the way out:\n{back}");
+    }
+
+    /// Paging back and then forward lands exactly where it started,
+    /// which is what makes the hint ("pgdn to catch up") true.
+    #[test]
+    fn paging_forward_again_returns_to_the_live_tail() {
+        let mut c = loaded(40);
+        let tail = render(&c, 60, 24);
+        page_up(&mut c, 2);
+        for _ in 0..2 {
+            c.handle_key(
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                &NoCandidates,
+            );
+        }
+        assert_eq!(render(&c, 60, 24), tail, "pgdn did not catch up");
+    }
+
+    #[test]
+    fn eyeball_the_scrolled_overlay() {
+        let mut c = loaded(40);
+        println!("--- at the tail\n{}", render(&c, 56, 18));
+        page_up(&mut c, 1);
+        println!("--- one page back\n{}", render(&c, 56, 18));
+        page_up(&mut c, 20);
+        println!("--- as far back as it goes\n{}", render(&c, 56, 18));
+        let g = render(&c, 56, 18);
+        assert!(g.contains("line 0"), "the oldest line is reachable:\n{g}");
     }
 }

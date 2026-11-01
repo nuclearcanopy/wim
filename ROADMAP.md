@@ -506,7 +506,7 @@ mpv's dev output is not on the include path).
 and `in-workspace (sub-rect) video` is still kitty-only via
 `video::Hole`, but **the ascii chain is now ordinary work.**
 
-- [ ] **frame source: a second mpv, rawvideo on a fifo.** spawn a
+- [x] ~~built: `src/framesource.rs`~~ **frame source: a second mpv, rawvideo on a fifo.** spawn a
       headless `--of=rawvideo --ovc=rawvideo --ovcopts=pix_fmt=rgb24`
       instance with `--vf=scale` to the cell grid plus a `pad` so every
       frame is the same size, and read exactly `w * h * 3` bytes per
@@ -2115,7 +2115,7 @@ do the wrong thing quietly, which is worse to diagnose.
       its own doc, and `a_batch_that_answered_early_waits_for_the_one_asked_for_first`
       passes. the entry was left open only because the ticket work
       landed in the same stretch and nobody confirmed the overlap.
-- [ ] **`main.rs` ~2356 / `shellsong_host.rs` ~569: a settle can
+- [x] ~~fixed: the settle holds the outstanding query~~ **a settle can
       answer the wrong query.** `SearchSettle::answered` clears
       `pending_since` unconditionally and `RemoteSearchOutcome`
       carries no query. type `cre`, then within the round trip type
@@ -2241,22 +2241,32 @@ stray paint.
       `eq_menu` and `banner`, the four that lacked it, each with an
       eyeball printer at the broken sizes. every guard was
       mutation-checked individually.
-- [ ] **`ui/shellsong.rs` ~69: the overlay console cannot scroll.**
-      it never calls `Console::saw_viewport(rows)` and never reads
-      `Console::scroll()`, so it always renders the live tail: open
-      `:` and press PageUp and the keys are visibly dead even though
-      `handle_key` moved `scroll`. knock-ons: `viewport` stays 0 so
-      `scroll_pages` pages by one line; `scroll > 0` makes
-      `following()` false so every later `push` increments `scroll`
-      with nothing resetting it; and `SCROLLBACK_ROWS = 8` hides
-      everything older with no indicator, where `swimconsole.rs` ~67
-      prints `^ N back · pgdn to catch up`. `Console::viewport`'s own
-      doc says the renderer must report this because it is the only
-      thing that knows.
-
-**tests that hide risk.** the pattern this repo keeps hitting
-("pinned the function not the wiring") plus two new ones.
-
+- [x] **wim's overlay console can scroll.** `:` opens a full console
+      in wim too, and PageUp was a **dead key**: the keys did reach
+      `Console` and did move `scroll`, but the view never read it, so
+      the live tail was drawn every frame. it also never called
+      `saw_viewport`, so `scroll_pages` paged by *one line*
+      (`viewport.saturating_sub(1).max(1)` on a zero) and `scroll_max`
+      clamped against nothing real. `SCROLLBACK_ROWS = 8` then hid
+      everything older with no indicator, where `swimconsole` has said
+      `^ N back` all along.
+      all three halves fixed, following `swimconsole` rather than
+      inventing a second idiom: the view reports its height, draws the
+      window `scroll` names, and claims one row for
+      `^ N back · pgdn` **only while it is true**. the hint is shorter
+      than shellswim's because the overlay is narrower and a longer
+      one is what gets ellipsised.
+      four tests, three mutations, each caught: never reporting the
+      viewport, always drawing the tail, and scrolling back silently.
+      an eyeball printer at the tail, one page back and as far back as
+      it goes; reading it confirmed the one-row overlap
+      `scroll_pages` documents (line 32 in both views) and that
+      `^ 32 back` is the correct clamp at 40 lines in an 8-row window.
+      **and the printed frame showed one more thing**: the overlay
+      header was `┌┤ shellsong ├`, two line-drawing glyphs butted
+      together, which `ui::searchbox` was fixed for earlier for
+      exactly that reason. it has the same `─` lead-in now, additive,
+      so the narrowest box keeps its label.
 - [ ] **`core.rs` ~1012, tests at ~4198/~4217: the pairing is tested,
       the wiring is not.** the `resolve_all` tests' doc claims to
       cover "the latent desync at the seam where it lived", but
@@ -3044,7 +3054,7 @@ debounced search thread, and the local-favorites path is a file write.
       calling `resolve_tracks`, reachable from `dispatch_action` or
       `run_shellsong_op` without a channel in between.
 
-- [ ] **the remaining search cost is the result clone, and it needs an
+- [x] ~~fixed: `App` holds the `Ranking`~~ **the remaining search cost is the result clone, and it needed an
       api change to fix.** for a broad query at 40k items, 3-5ms of a
       ~7ms search is `rank` cloning ~15k `SearchItem`s. cutting it
       means not materializing rows nobody scrolled to, which cannot be
