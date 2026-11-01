@@ -2957,6 +2957,13 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                     tier.label()
                 ));
             };
+            // a binding is only worth keeping if it can be applied: an
+            // eq name resolves at apply time, so a typo in one used to
+            // be stored, reported as remembered, and then fail on
+            // every track start that resolved it.
+            if let Some(why) = setting_refusal(&setting, core.cfg) {
+                return op_fail(why);
+            }
             let report = format!(
                 "{} {} remembered for {} '{name}'",
                 setting.kind().label(),
@@ -3553,6 +3560,27 @@ pub fn current_eq_name(app: &app::App, cfg: &config::Config) -> String {
         .map(str::to_string)
         .or_else(|| cfg.eq_preset.clone())
         .unwrap_or_else(|| eq::PRESETS[0].name.to_string())
+}
+
+/// Why a setting cannot be remembered, when it cannot.
+///
+/// An eq is the one that can be: a saved curve exists only at runtime,
+/// so `eq(...)` resolves at apply time (see `Op::SetEqPreset`) and the
+/// parser never sees a typo in one. A volume and a speed are numbers
+/// and always apply, so refusing one would refuse a working binding.
+///
+/// The same message `eq(...)` itself gives, because it is the same
+/// resolution failing.
+pub fn setting_refusal(setting: &shellsong::Setting, cfg: &config::Config) -> Option<String> {
+    match setting {
+        shellsong::Setting::Eq(name) => {
+            let saved = &cfg.eq_custom_presets;
+            eq::resolve(name, saved)
+                .is_none()
+                .then(|| eq::resolve_failure(name, saved))
+        }
+        shellsong::Setting::Volume(_) | shellsong::Setting::Speed(_) => None,
+    }
 }
 
 /// What the per-identity settings want for a track that just started:
@@ -4288,7 +4316,7 @@ mod seam_tests {
         scrobble: ScrobbleState,
         subtitle_tx: mpsc::Sender<SubtitleOutcome>,
         _subtitle_rx: mpsc::Receiver<SubtitleOutcome>,
-        console: Console,
+        pub(super) console: Console,
         now_playing: Option<SearchItem>,
         favorites: favorites::Favorites,
         remote_starred: HashSet<String>,
@@ -4314,7 +4342,7 @@ mod seam_tests {
         settle: SearchSettle,
         saved_queues: Vec<String>,
         vars: shellsong::Scope,
-        bindings: shellsong_host::Bindings,
+        pub(super) bindings: shellsong_host::Bindings,
     }
 
     impl Harness {
@@ -6069,6 +6097,113 @@ mod index_map_tests {
         }
         assert_eq!(queue.entries().len(), 7);
         assert_eq!(queue.pos(), Some(0), "shuffling in never moves what plays");
+    }
+}
+
+/// Which settings are fit to be remembered at all.
+#[cfg(test)]
+mod rememberable_setting_tests {
+    use super::seam_tests::Harness;
+    use super::*;
+    use crate::shellsong::{Setting, Tier};
+
+    /// A saved curve exists only at runtime, so `eq(...)` resolves at
+    /// apply time and the parser never sees a typo in one. That is
+    /// what makes an eq the one setting that can be unrememberable.
+    #[test]
+    fn an_eq_name_that_does_not_resolve_is_refused() {
+        let cfg = config::Config::default();
+        let why = setting_refusal(&Setting::Eq("nope".into()), &cfg)
+            .expect("there is no preset called nope");
+        assert!(why.contains("eq preset"), "it has to say what is wrong: {why}");
+
+        // a built-in resolves, and so does a saved curve, which is the
+        // half a parse-time check could not see.
+        assert_eq!(setting_refusal(&Setting::Eq("rock".into()), &cfg), None);
+        let mut cfg = config::Config::default();
+        cfg.eq_custom_presets.insert("my bass curve", [0.0; 10]);
+        assert_eq!(
+            setting_refusal(&Setting::Eq("my bass curve".into()), &cfg),
+            None
+        );
+    }
+
+    /// A volume and a speed are numbers: they always apply, so
+    /// refusing one would refuse a binding that works.
+    #[test]
+    fn a_volume_or_a_speed_is_always_rememberable() {
+        let cfg = config::Config::default();
+        assert_eq!(setting_refusal(&Setting::Volume(25.0), &cfg), None);
+        assert_eq!(setting_refusal(&Setting::Speed(1.25), &cfg), None);
+    }
+
+    /// The wiring, which is the bug: `remember(track, eq(nope))`
+    /// stored the name, said "remembered", saved it to disk, and then
+    /// `identity_settings` emitted `eq(nope)` on every track start
+    /// that resolved the binding, failing each time, until it was
+    /// found and `forget`ten.
+    ///
+    /// `#[ignore]` for the usual reason: `CoreCtx` holds a live mpv.
+    #[test]
+    #[ignore]
+    fn remembering_an_eq_that_does_not_exist_is_refused_and_not_stored() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let mut surf = Headless;
+        {
+            let mut core = h.ctx(&player);
+            apply_op(
+                Op::Remember {
+                    tier: Tier::Track,
+                    setting: Setting::Eq("nope".into()),
+                },
+                &mut core,
+                &mut surf,
+            );
+        }
+        let last = h.console.lines.last().expect("one line per op").clone();
+        assert_eq!(
+            last.kind,
+            crate::shellsong::LineKind::Error,
+            "a binding that cannot apply is a refusal: {last:?}"
+        );
+        assert!(
+            last.text.contains("eq preset"),
+            "and it says which name: {}",
+            last.text
+        );
+        assert!(
+            h.bindings.is_empty(),
+            "a binding nothing can ever apply was stored and written to disk"
+        );
+    }
+
+    /// The positive control: a name that does resolve is remembered,
+    /// so the refusal above is not the whole arm being dead.
+    ///
+    /// `#[ignore]` for the usual reason: `CoreCtx` holds a live mpv.
+    #[test]
+    #[ignore]
+    fn remembering_an_eq_that_exists_still_works() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let mut surf = Headless;
+        {
+            let mut core = h.ctx(&player);
+            apply_op(
+                Op::Remember {
+                    tier: Tier::Track,
+                    setting: Setting::Eq("rock".into()),
+                },
+                &mut core,
+                &mut surf,
+            );
+        }
+        let last = h.console.lines.last().expect("one line per op").clone();
+        assert_eq!(last.kind, crate::shellsong::LineKind::Note, "{last:?}");
+        assert!(!h.bindings.is_empty(), "it has to actually bind");
     }
 }
 
