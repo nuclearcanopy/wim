@@ -514,9 +514,8 @@ pub(crate) fn draw_header_row(buf: &mut Buffer, area: Rect, y: u16, label: &str)
 /// cost, which is why the build is the first thing printed.
 #[cfg(test)]
 mod frame_budget {
+    use super::tests::{ranked, Walked};
     use super::*;
-    use crate::library::{LocalTrack, MediaKind};
-    use crate::search::Ranking;
     use crate::ui::testbuf::buffer;
     use std::time::Instant;
 
@@ -545,29 +544,6 @@ mod frame_budget {
         best
     }
 
-    /// `n` tracks ranked the way `App` holds them, alternating music
-    /// and video so the order has two category runs and the layout has
-    /// headers to place (`rank_order` groups by category, so the run
-    /// count is bounded by `Category`'s variants however long the list
-    /// gets).
-    fn ranked(n: usize) -> (Corpus, Ranking) {
-        let mut corpus = Corpus::new();
-        corpus.add_local_tracks((0..n).map(|i| LocalTrack {
-            path: format!("/m/{i}.flac").into(),
-            title: format!("track {i}"),
-            artist: Some(format!("artist {}", i % 97)),
-            album: None,
-            duration_secs: None,
-            kind: if i % 2 == 0 {
-                MediaKind::Music
-            } else {
-                MediaKind::Video
-            },
-        }));
-        let ranking = corpus.rank("track");
-        (corpus, ranking)
-    }
-
     /// A sidebar's worth: the real pane is about this wide and this is
     /// a tall terminal's row count.
     const PANE: Rect = Rect {
@@ -593,6 +569,32 @@ mod frame_budget {
             elapsed: Duration::ZERO,
         }
         .render(PANE, buf);
+    }
+
+    /// One screenful of geometry, which is what each of a frame's
+    /// three geometry calls does: lay the window out, then ask for
+    /// every row in it.
+    ///
+    /// A function, and `screenful_materialized` below is another one,
+    /// because an "old" shape written as a branch inside the timing
+    /// loop gets inlined and specialized while the real path stays an
+    /// ordinary call, and the A/B then lies (see the bottom bar's
+    /// bench, where that cost a day).
+    fn screenful(rows: &dyn Rows, selected: usize) {
+        let l = layout(rows, selected, PANE.height as usize);
+        for row in 0..PANE.height as usize {
+            std::hint::black_box(l.get(l.scroll_offset + row));
+        }
+    }
+
+    /// The same screenful out of the display-row `Vec` that
+    /// `RowLayout` replaced, i.e. one entry per row in the whole match
+    /// set.
+    fn screenful_materialized(rows: &dyn Rows, selected: usize) {
+        let (seq, offset) = super::tests::eager_layout(rows, selected, PANE.height as usize);
+        for row in 0..PANE.height as usize {
+            std::hint::black_box(seq.get(offset + row));
+        }
     }
 
     #[test]
@@ -636,38 +638,59 @@ mod frame_budget {
             };
             let count = long.count();
             let runs = long.boundaries().len();
-            let mut long_buf = buffer(PANE.width, PANE.height);
-            let mut small_buf = buffer(PANE.width, PANE.height);
-            let mut on_long = || frame(&long, 0, &mut long_buf);
-            let mut on_small = || frame(&small, 0, &mut small_buf);
-            let (big, ctrl) = best_each(5, 20, &mut on_long, &mut on_small);
-            println!(
-                "  {n:>6} tracks -> {count:>6} matches in {runs} category runs: frame {big:>8.1}us ({:>5.1}% of budget)   {} on screen {ctrl:>7.1}us   {:.1}x",
-                big / budget * 100.0,
-                PANE.height,
-                big / ctrl,
-            );
-            // the geometry on its own, against the materializing
-            // shape it replaced: this is the call main.rs makes three
-            // times a frame, so the gap is paid three times.
-            let mut lazy = || {
-                let l = layout(&long, 0, PANE.height as usize);
-                for row in 0..PANE.height as usize {
-                    std::hint::black_box(l.get(l.scroll_offset + row));
-                }
-            };
-            let mut eager = || {
-                let (rows, offset) = super::tests::eager_layout(&long, 0, PANE.height as usize);
-                for row in 0..PANE.height as usize {
-                    std::hint::black_box(rows.get(offset + row));
-                }
-            };
-            let (fast, slow) = best_each(5, 20, &mut lazy, &mut eager);
-            println!(
-                "            one screenful of geometry: boundaries-only {fast:>8.1}us   materialized {slow:>8.1}us   {:.1}x",
-                slow / fast,
-            );
+            let mut buf_a = buffer(PANE.width, PANE.height);
+            let mut buf_b = buffer(PANE.width, PANE.height);
+            {
+                let mut on_long = || frame(&long, 0, &mut buf_a);
+                let mut on_small = || frame(&small, 0, &mut buf_b);
+                let (big, ctrl) = best_each(5, 20, &mut on_long, &mut on_small);
+                println!(
+                    "  {n:>6} tracks -> {count:>6} matches in {runs} category runs: frame {big:>8.1}us ({:>5.1}% of budget)   {} on screen {ctrl:>7.1}us   {:.1}x",
+                    big / budget * 100.0,
+                    PANE.height,
+                    big / ctrl,
+                );
+            }
+            // the same frame off the runs `rank_order` recorded and
+            // off a walk of the order, which is the only thing that
+            // differs between the two (`Walked` is the real path with
+            // the old boundary source). Both selections, since the walk
+            // the recorded runs replace is the whole match set either
+            // way; three geometry calls a frame pay the gap three
+            // times.
+            let walked = Walked(Ranked {
+                ranking: &ranking,
+                corpus: &corpus,
+            });
+            for (label, selected) in [("row 0", 0usize), ("last row", count - 1)] {
+                let (stored, walk) = {
+                    let mut a = || frame(&long, selected, &mut buf_a);
+                    let mut b = || frame(&walked, selected, &mut buf_b);
+                    best_each(5, 20, &mut a, &mut b)
+                };
+                let (geo_stored, geo_walk) =
+                    best_each(5, 20, &mut || screenful(&long, selected), &mut || {
+                        screenful(&walked, selected)
+                    });
+                let (_, materialized) =
+                    best_each(5, 20, &mut || screenful(&walked, selected), &mut || {
+                        screenful_materialized(&walked, selected)
+                    });
+                println!(
+                    "            selection on the {label:<8}: frame {stored:>8.1}us vs {walk:>8.1}us walked ({:.1}x)   one screenful of geometry: recorded runs {geo_stored:>8.1}us   walked {geo_walk:>8.1}us   materialized {materialized:>8.1}us",
+                    walk / stored,
+                );
+            }
         }
+
+        // Measured and NOT taken, kept so it is not retried: a
+        // `Rows::boundaries_upto(limit)` so `layout` walks only as far
+        // as its own window. Against the walked source that was 17.8x
+        // on a 15k frame with the selection on row 0 and 1.0x with it
+        // on the last row, whose headers have to be counted either
+        // way. The recorded runs win at both ends, and they cost no
+        // narrowing of `RowLayout`, which answers only inside its
+        // window once the walk stops there.
 
         // the row text, which the paint builds once per visible row:
         // one reused buffer and a borrowed label against the `String`
@@ -817,6 +840,51 @@ mod tests {
             .collect()
     }
 
+    /// A ranked source that walks the order for its boundaries instead
+    /// of reading the runs `rank_order` recorded, i.e. what `Ranked`
+    /// was. Everything else is the real path, so a frame through this
+    /// and a frame through `Ranked` differ in exactly one thing: where
+    /// the category boundaries came from.
+    pub(super) struct Walked<'a>(pub(super) Ranked<'a>);
+
+    impl Rows for Walked<'_> {
+        fn count(&self) -> usize {
+            self.0.count()
+        }
+
+        fn boundaries(&self) -> Vec<(usize, Category)> {
+            self.0.ranking.walked_group_boundaries(self.0.corpus)
+        }
+
+        fn row(&self, at: usize) -> Option<&SearchItem> {
+            self.0.row(at)
+        }
+    }
+
+    /// `n` tracks ranked the way `App` holds them, alternating music
+    /// and video so the order has two category runs and the layout has
+    /// headers to place (`rank_order` groups by category, so the run
+    /// count is bounded by `Category`'s variants however long the list
+    /// gets). Shared with `frame_budget`.
+    pub(super) fn ranked(n: usize) -> (Corpus, Ranking) {
+        use crate::library::{LocalTrack, MediaKind};
+        let mut corpus = Corpus::new();
+        corpus.add_local_tracks((0..n).map(|i| LocalTrack {
+            path: format!("/m/{i}.flac").into(),
+            title: format!("track {i}"),
+            artist: Some(format!("artist {}", i % 97)),
+            album: None,
+            duration_secs: None,
+            kind: if i % 2 == 0 {
+                MediaKind::Music
+            } else {
+                MediaKind::Video
+            },
+        }));
+        let ranking = corpus.rank("track");
+        (corpus, ranking)
+    }
+
     /// What `layout` used to be: the display-row sequence as a `Vec`
     /// the length of the whole list, plus a linear scan for the
     /// selected row. Kept as the definition `RowLayout` has to agree
@@ -878,6 +946,120 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The production row source is `Ranked` over a corpus, and its
+    /// boundaries now come off the runs `rank_order` recorded rather
+    /// than off a walk of the order. A frame through it has to be
+    /// byte-identical to the same frame through that walk and to one
+    /// through the owned list `search` returns, whose `Rows` impl is
+    /// the untouched `group_boundaries`: every painted cell, the
+    /// junction marks main.rs draws off `header_rows`, and the click
+    /// map.
+    #[test]
+    fn a_ranked_frame_is_identical_through_either_boundary_source() {
+        let area = Rect::new(1, 1, 26, 8);
+        for n in [8usize, 40, 137, 1000] {
+            let (corpus, ranking) = ranked(n);
+            let rows = Ranked {
+                ranking: &ranking,
+                corpus: &corpus,
+            };
+            let count = rows.count();
+            assert_eq!(count, n, "precondition: every track has to match");
+            assert!(
+                rows.boundaries().len() > 1,
+                "precondition: a header inside the list, not just at the top"
+            );
+            let walked = Walked(Ranked {
+                ranking: &ranking,
+                corpus: &corpus,
+            });
+            let owned: Vec<SearchItem> = ranking.rows(&corpus).cloned().collect();
+            for selected in [0usize, 1, 7, count / 2, count - 1, count + 3] {
+                let at = format!("{n} rows, selected {selected}");
+                for (how, other) in [
+                    ("walked", &walked as &dyn Rows),
+                    ("materialized", &owned as &dyn Rows),
+                ] {
+                    assert_eq!(
+                        header_rows(&rows, selected, area),
+                        header_rows(other, selected, area),
+                        "header rows vs {how}: {at}"
+                    );
+                    assert_eq!(
+                        row_items(&rows, selected, area),
+                        row_items(other, selected, area),
+                        "row map vs {how}: {at}"
+                    );
+                    let (stored, want) =
+                        (painted_buf(&rows, selected), painted_buf(other, selected));
+                    assert_eq!(
+                        crate::ui::testbuf::grid(&stored),
+                        crate::ui::testbuf::grid(&want),
+                        "painted vs {how}: {at}"
+                    );
+                    // and the styles, which the chars above cannot
+                    // show: the selection plate is a background and
+                    // nothing else.
+                    assert!(
+                        stored == want,
+                        "same chars, different styles vs {how}: {at}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// And the production source's painted rows as literals, so the
+    /// headers are pinned where they land rather than only against
+    /// another computation of the same thing. The 1000-row ranking has
+    /// its videos run starting at 500, which is the boundary the
+    /// mid-list selection sits across.
+    #[test]
+    fn a_ranked_frame_paints_the_rows_recorded_here() {
+        let (corpus, ranking) = ranked(1000);
+        let rows = Ranked {
+            ranking: &ranking,
+            corpus: &corpus,
+        };
+        assert_eq!(
+            ranking.group_boundaries(&corpus),
+            vec![(0, Category::Songs), (500, Category::Videos)],
+            "the runs this grid was recorded against"
+        );
+        assert_eq!(
+            painted(&rows, 499),
+            [
+                "............................",
+                ".  [fs] track 984...........",
+                ".  [fs] track 986...........",
+                ".  [fs] track 988...........",
+                ".  [fs] track 990...........",
+                ".  [fs] track 992...........",
+                ".  [fs] track 994...........",
+                ".  [fs] track 996...........",
+                ".> [fs] track 998 · artist….",
+                "............................",
+            ]
+            .join("\n")
+        );
+        assert_eq!(
+            painted(&rows, 500),
+            [
+                "............................",
+                ".  [fs] track 988...........",
+                ".  [fs] track 990...........",
+                ".  [fs] track 992...........",
+                ".  [fs] track 994...........",
+                ".  [fs] track 996...........",
+                ".  [fs] track 998...........",
+                ".───────── VIDEOS ─────────.",
+                ".> [fv] track 1.............",
+                "............................",
+            ]
+            .join("\n")
+        );
     }
 
     /// What the row text used to cost: a `String` for the label, a
@@ -1025,6 +1207,106 @@ mod tests {
             ]
             .join("\n")
         );
+    }
+
+    /// The list painted into a pane with a row of untouched buffer
+    /// around it, so a recorded grid pins where the rows stop as well
+    /// as what they say. `pub(super)` for the `eyeball` module, which
+    /// prints the same grids.
+    pub(super) fn painted_buf(rows: &dyn Rows, selected: usize) -> Buffer {
+        let area = Rect::new(1, 1, 26, 8);
+        let mut buf = buffer(28, 10);
+        ResultsList {
+            items: rows,
+            selected,
+            empty_message: "nothing here",
+            favorites: &Favorites::default(),
+            remote_starred: &HashSet::new(),
+            focused: true,
+            elapsed: Duration::ZERO,
+        }
+        .render(area, &mut buf);
+        assert_outside_untouched(&buf, area);
+        buf
+    }
+
+    /// The same pane as chars, for a recorded literal and for a
+    /// failure message that can be read.
+    pub(super) fn painted(rows: &dyn Rows, selected: usize) -> String {
+        crate::ui::testbuf::grid(&painted_buf(rows, selected))
+    }
+
+    /// The four selections worth pinning: a list shorter than the
+    /// pane, then the selection on row 0, mid-list and on the last row
+    /// (the scrolled case) of a list far longer than it.
+    pub(super) const RECORDED: [(usize, usize); 4] = [(5, 0), (137, 0), (137, 68), (137, 136)];
+
+    /// Every cell of the painted pane at the four `RECORDED`
+    /// selections, as the full-boundary walk drew them: literals taken
+    /// off the old code, so a change to how the geometry is computed
+    /// has to reproduce the rows rather than merely stay
+    /// self-consistent. `eyeball::print_the_recorded_grids` prints the
+    /// same four.
+    #[test]
+    fn the_painted_grid_is_what_the_full_boundary_walk_drew() {
+        let expected = [
+            [
+                "............................",
+                ".───────── SONGS ──────────.",
+                ".> [fs] track 0.............",
+                ".  [fs] track 1.............",
+                ".  [fs] track 2.............",
+                ".  [fs] track 3.............",
+                ".  [fs] track 4.............",
+                "............................",
+                "............................",
+                "............................",
+            ],
+            [
+                "............................",
+                ".───────── SONGS ──────────.",
+                ".> [fs] track 0.............",
+                ".  [fs] track 1.............",
+                ".  [fs] track 2.............",
+                ".  [fs] track 3.............",
+                ".  [fs] track 4.............",
+                ".  [fs] track 5.............",
+                ".  [fs] track 6.............",
+                "............................",
+            ],
+            [
+                "............................",
+                ".  [fs] track 62............",
+                ".───────── VIDEOS ─────────.",
+                ".  [fv] clip 63.............",
+                ".  [fv] clip 64.............",
+                ".  [fv] clip 65.............",
+                ".  [fv] clip 66.............",
+                ".  [fv] clip 67.............",
+                ".> [fv] clip 68.............",
+                "............................",
+            ],
+            [
+                "............................",
+                ".  [fs] track 130...........",
+                ".  [fs] track 131...........",
+                ".  [fs] track 132...........",
+                ".───────── VIDEOS ─────────.",
+                ".  [fv] clip 133............",
+                ".  [fv] clip 134............",
+                ".  [fv] clip 135............",
+                ".> [fv] clip 136............",
+                "............................",
+            ],
+        ];
+        for (&(n, selected), want) in RECORDED.iter().zip(expected) {
+            let rows = mixed(n);
+            assert_eq!(
+                painted(&rows, selected),
+                want.join("\n"),
+                "{n} rows, selected {selected}"
+            );
+        }
     }
 
     fn render(selected: usize, focused: bool, elapsed: Duration) -> Buffer {
@@ -1277,6 +1559,35 @@ mod eyeball {
         let mut buf = buffer(20, 6);
         draw_header_row(&mut buf, Rect::new(0, 2, 20, 1), 2, "ALBUMS");
         assert!(grid(&buf).contains("ALBUMS"), "{}", grid(&buf));
+    }
+
+    /// The grids `the_painted_grid_is_what_the_full_boundary_walk_drew`
+    /// and `a_ranked_frame_paints_the_rows_recorded_here` pin, printed
+    /// so they can be read rather than diffed out of an assert
+    /// failure:
+    /// `cargo test --lib ui::results_list::eyeball -- --nocapture`.
+    #[test]
+    fn print_the_recorded_grids() {
+        for (n, selected) in super::tests::RECORDED {
+            let rows = super::tests::mixed(n);
+            println!(
+                "--- {n} rows in a 26x8 pane at (1,1), selected {selected}\n{}",
+                super::tests::painted(&rows, selected)
+            );
+        }
+        // and the production source, either side of its one boundary.
+        let (corpus, ranking) = super::tests::ranked(1000);
+        let rows = Ranked {
+            ranking: &ranking,
+            corpus: &corpus,
+        };
+        println!("--- a 1000-row ranking, runs {:?}", rows.boundaries());
+        for selected in [499usize, 500] {
+            println!(
+                "--- ranked, selected {selected}\n{}",
+                super::tests::painted(&rows, selected)
+            );
+        }
     }
 
     /// The whole list, printed at three heights against a 6-row pane:
