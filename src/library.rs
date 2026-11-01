@@ -899,6 +899,43 @@ mod tests {
         best
     }
 
+    /// `best_each` on the process cpu clock instead of the wall clock,
+    /// for the pairs where both sides are single-threaded. This box's
+    /// other cores are not idle during a bench run (load average 28
+    /// observed, wall 6x cpu on the same work), so wall clock moves
+    /// several-fold between batches while the work done does not. A
+    /// pooled candidate still has to be read on the wall clock, since
+    /// cpu time is exactly what it trades away.
+    fn best_each_cpu(
+        rounds: usize,
+        iters: usize,
+        a: &mut dyn FnMut(),
+        b: &mut dyn FnMut(),
+    ) -> (f64, f64) {
+        let cpu_now = || {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: clock_gettime only writes the timespec we hand it.
+            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+            ts.tv_sec as f64 * 1e6 + ts.tv_nsec as f64 / 1e3
+        };
+        let mut best = (f64::MAX, f64::MAX);
+        let time = |f: &mut dyn FnMut()| {
+            let at = cpu_now();
+            for _ in 0..iters {
+                f();
+            }
+            (cpu_now() - at) / iters as f64
+        };
+        for _ in 0..rounds {
+            best.0 = best.0.min(time(a));
+            best.1 = best.1.min(time(b));
+        }
+        best
+    }
+
     /// Which profile a measurement ran in. `cargo test` defaults to
     /// `opt-level = 0`, where one of these paths measured 11x its
     /// release cost, and a debug number quoted as the cost is how a
@@ -1090,7 +1127,7 @@ mod tests {
                     walk_root_parallel_stat(&at);
                 },
             );
-            let (serial_again, readdir) = best_each(
+            let (serial_again, readdir) = best_each_cpu(
                 3,
                 1,
                 &mut || {
@@ -1101,9 +1138,9 @@ mod tests {
                 },
             );
             println!(
-                "{files:>6} files  readdir only {readdir:>9.0}us  serial {serial:>9.0}us \
-                 (re-measured {serial_again:>9.0}us)  pooled stat {pooled:>9.0}us  \
-                 {:.2}x",
+                "{files:>6} files  cpu: readdir only {readdir:>9.0}us serial \
+                 {serial_again:>9.0}us   wall: serial {serial:>9.0}us pooled stat \
+                 {pooled:>9.0}us  {:.2}x",
                 serial / pooled
             );
             fs::remove_dir_all(&root).ok();
@@ -1265,9 +1302,9 @@ mod tests {
                 parse_index_rows(&rows).entries
             );
 
-            let (as_json, as_rows) = best_each(
-                3,
-                3,
+            let (as_json, as_rows) = best_each_cpu(
+                6,
+                2,
                 &mut || {
                     serde_json::from_slice::<TagIndex>(&json).unwrap_or_default();
                 },
@@ -1276,8 +1313,8 @@ mod tests {
                 },
             );
             let (as_rows_again, pooled) = best_each(
-                3,
-                3,
+                6,
+                2,
                 &mut || {
                     parse_index_rows(&rows);
                 },
@@ -1286,12 +1323,13 @@ mod tests {
                 },
             );
             println!(
-                "{files:>6} files  json {:>8}B {as_json:>9.0}us  ndjson {:>8}B {as_rows:>9.0}us \
-                 (re-measured {as_rows_again:>9.0}us) {:.2}x  pooled {pooled:>9.0}us {:.2}x",
+                "{files:>6} files  cpu: json {:>8}B {as_json:>9.0}us  ndjson {:>8}B \
+                 {as_rows:>9.0}us {:.2}x   wall: ndjson {as_rows_again:>9.0}us pooled \
+                 {pooled:>9.0}us {:.2}x",
                 json.len(),
                 rows.len(),
                 as_json / as_rows,
-                as_json / pooled,
+                as_rows_again / pooled,
             );
         }
     }
