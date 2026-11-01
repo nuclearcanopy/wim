@@ -738,12 +738,28 @@ pub fn toggle_star(
     favorites: &mut favorites::Favorites,
     remote_starred: &mut HashSet<String>,
     star_tx: &mpsc::Sender<StarFailed>,
+    // `persist` is injected rather than reached for: `favorites::save`
+    // resolves its own path, so a test starring a *local* item would
+    // write the real `~/.local/state/wim/favorites.toml`. the same
+    // shape `DownloadCtx::persist` took after that hazard cost a real
+    // play index.
+    persist: fn(&favorites::Favorites) -> anyhow::Result<()>,
 ) -> Result<bool, String> {
     match item {
         SearchItem::Silence { .. } => Err("a silence cannot be starred".to_string()),
         SearchItem::LocalMusic { path, .. } | SearchItem::LocalVideo { path, .. } => {
-            let now_starred = favorites.toggle(&path.to_string_lossy());
-            let _ = favorites::save(favorites);
+            let key = path.to_string_lossy().into_owned();
+            let now_starred = favorites.toggle(&key);
+            // reverted and reported on a failed write, which is what
+            // the remote arm below already does through `StarFailed`.
+            // this discarded the result, so the star stayed lit for
+            // the whole session and was simply gone next launch: the
+            // file is the source of truth here exactly as the server
+            // is there.
+            if let Err(why) = persist(favorites) {
+                favorites.toggle(&key);
+                return Err(format!("couldn't save favorites: {why}"));
+            }
             Ok(now_starred)
         }
         SearchItem::Song { id, client, .. } => {
@@ -823,12 +839,19 @@ pub fn client_for(
 /// the per-server fetches run on the loader's thread and fold in when
 /// they answer. This used to fan out and join before returning, so
 /// pressing the key paid for the slowest configured server.
+/// Returns the view plus **whatever the caller owes the user**: a
+/// server whose client could not be built is silently missing from a
+/// starred list otherwise, and `client_for` returns a `Result`
+/// precisely so the cause survives (its own doc says "connection
+/// failed with no cause is a worse error than the one this
+/// replaced"). `.ok()` threw that away, so an unreadable
+/// `password_file` showed a short list and said nothing.
 pub fn open_starred(
     loader: &mut browse::Loader,
     servers: &[config::NavidromeConfig],
     favorites: &favorites::Favorites,
     live: &[Arc<subsonic::Client>],
-) -> browse::BrowseView {
+) -> (browse::BrowseView, Vec<String>) {
     let local: Vec<SearchItem> = favorites
         .paths()
         .filter_map(|path| persistence::item_from_path(path))
@@ -836,11 +859,15 @@ pub fn open_starred(
     // resolved here rather than in the loader: `client_for` lives in
     // this module and reuses a live client instead of re-reading
     // `password_file` and starting with a cold pool.
-    let clients: Vec<Arc<subsonic::Client>> = servers
-        .iter()
-        .filter_map(|nav| client_for(nav, live).ok())
-        .collect();
-    loader.open_starred(local, clients)
+    let mut clients: Vec<Arc<subsonic::Client>> = Vec::new();
+    let mut warnings = Vec::new();
+    for nav in servers {
+        match client_for(nav, live) {
+            Ok(client) => clients.push(client),
+            Err(why) => warnings.push(format!("{}: {why}", nav.url)),
+        }
+    }
+    (loader.open_starred(local, clients), warnings)
 }
 /// A subtitle file the background fetch wrote to disk. `sub_add` isn't
 /// called there: the `Mpv` handle isn't `Send`, so the main thread
@@ -2489,7 +2516,13 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             if is_starred(&item, core.favorites, core.remote_starred) == on {
                 return op_note(format!("'{}' is already {verb}", item.primary_name()));
             }
-            match toggle_star(&item, core.favorites, core.remote_starred, core.star_tx) {
+            match toggle_star(
+                &item,
+                core.favorites,
+                core.remote_starred,
+                core.star_tx,
+                favorites::save,
+            ) {
                 Ok(_) => op_note(format!("{verb} '{}'", item.primary_name())),
                 Err(why) => op_fail(why),
             }
@@ -4090,6 +4123,87 @@ mod seam_tests {
 
     // ----------------------------------------------- optimistic stars
 
+    /// Writes nowhere, so no test can touch the real favorites file;
+    /// starring a local item used to resolve `favorites::save`'s own
+    /// path.
+    fn star_nowhere(_: &favorites::Favorites) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// A server that cannot be reached is named, not quietly dropped.
+    ///
+    /// `open_starred` built its clients with
+    /// `filter_map(|nav| client_for(nav, live).ok())`, throwing away
+    /// the error `client_for` returns a `Result` specifically to
+    /// preserve (its own doc: "connection failed with no cause is a
+    /// worse error than the one this replaced"). So an unreadable
+    /// `password_file` showed a short starred list and said nothing.
+    #[test]
+    fn a_starred_server_that_cannot_be_built_is_reported() {
+        let mut loader = browse::Loader::default();
+        let favorites = favorites::Favorites::default();
+        let nav = config::NavidromeConfig {
+            url: "https://example.invalid".to_string(),
+            username: "u".to_string(),
+            password: None,
+            // nothing is at this path, so `client_for` fails the way a
+            // typo'd or agenix-unmounted secret fails.
+            password_file: Some("/nonexistent/wim-test-secret".to_string()),
+            max_bitrate_kbps: None,
+            transcode_format: None,
+        };
+
+        let (_view, warnings) = open_starred(&mut loader, &[nav], &favorites, &[]);
+        assert_eq!(warnings.len(), 1, "one server, one reason: {warnings:?}");
+        assert!(
+            warnings[0].contains("example.invalid"),
+            "it has to name which server: {warnings:?}"
+        );
+
+        // and a configuration with nothing to reach says nothing.
+        let (_view, quiet) = open_starred(&mut loader, &[], &favorites, &[]);
+        assert!(quiet.is_empty());
+    }
+
+    /// A local star that cannot be written goes back, and says why.
+    ///
+    /// It used to `let _ =` the save, so the star stayed lit for the
+    /// whole session and was simply gone next launch. The remote arm
+    /// has always reverted and reported, through `StarFailed`; the
+    /// file is the source of truth here exactly as the server is
+    /// there, so the two now agree.
+    #[test]
+    fn a_local_star_that_cannot_be_saved_is_reverted_and_reported() {
+        fn refuse(_: &favorites::Favorites) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("read-only file system"))
+        }
+        let (star_tx, _star_rx) = mpsc::channel();
+        let mut favorites = favorites::Favorites::default();
+        let mut starred = HashSet::new();
+        let item = SearchItem::LocalMusic {
+            path: std::path::PathBuf::from("/music/a.flac"),
+            title: "a".into(),
+            artist: None,
+            album: None,
+        };
+
+        let why = toggle_star(&item, &mut favorites, &mut starred, &star_tx, refuse)
+            .expect_err("a refused write is a refusal");
+        assert!(why.contains("read-only"), "it has to say why: {why}");
+        assert_eq!(
+            favorites.paths().count(),
+            0,
+            "the star is still set, so the ui shows one that will not survive"
+        );
+
+        // and the same flip succeeds when the write does.
+        assert!(
+            toggle_star(&item, &mut favorites, &mut starred, &star_tx, star_nowhere)
+                .expect("a writable store stars it"),
+        );
+        assert_eq!(favorites.paths().count(), 1);
+    }
+
     /// The point of the change: the local set flips before any network
     /// call can have answered, so the next frame already shows it.
     /// This used to be a round trip on the keypress.
@@ -4104,13 +4218,13 @@ mod seam_tests {
         };
         let id = id.clone();
 
-        let now = toggle_star(&item, &mut favorites, &mut starred, &star_tx)
+        let now = toggle_star(&item, &mut favorites, &mut starred, &star_tx, star_nowhere)
             .expect("a song can be starred");
         assert!(now, "it reports the new state at once");
         assert!(starred.contains(&id), "and the set already holds it");
 
         let now =
-            toggle_star(&item, &mut favorites, &mut starred, &star_tx).expect("and unstarred");
+            toggle_star(&item, &mut favorites, &mut starred, &star_tx, star_nowhere).expect("and unstarred");
         assert!(!now);
         assert!(!starred.contains(&id));
     }
@@ -4160,7 +4274,7 @@ mod seam_tests {
             artist: None,
             album: None,
         };
-        assert!(toggle_star(&item, &mut favorites, &mut starred, &star_tx).unwrap());
+        assert!(toggle_star(&item, &mut favorites, &mut starred, &star_tx, star_nowhere).unwrap());
         assert!(starred.is_empty(), "a local star is not a remote one");
     }
 
@@ -4174,7 +4288,7 @@ mod seam_tests {
             name: "mix".into(),
             client: crate::browse::tests::test_client(),
         };
-        assert!(toggle_star(&item, &mut favorites, &mut starred, &star_tx).is_err());
+        assert!(toggle_star(&item, &mut favorites, &mut starred, &star_tx, star_nowhere).is_err());
     }
 
     // ------------------------------------------- the enqueue resolver

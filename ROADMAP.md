@@ -2318,23 +2318,44 @@ stray paint.
       because `Suggestion`'s doc states "always a pure extension of
       what was typed, never a replacement" and a test enforces it, and
       because the folded line resolves anyway.
-- [ ] **nine discarded results the user would expect feedback from.**
-      `core.rs` 887/900 (every scrobble failure forever, so a revoked
-      token is indistinguishable from working); ~640 (a failed
-      favorites write while the star stays lit all session, where the
-      remote path next to it correctly reverts and reports); 784-797
-      (four consecutive silent returns in subtitle auto-fetch, so a
-      wrong key looks identical to "no subtitles exist"); ~735
-      (`open_starred` drops the `password_file` error `client_for`
-      returns a `Result` to preserve); `main.rs` ~2062 (the
-      restored-queue refill discards every per-track status, so a
-      moved library shows a full queue in the ui and an empty playlist
-      in mpv); `main.rs` ~4331 (skip-next has neither the last-track
-      guard nor the message `Op::SkipNext` has); `catalog.rs` ~188 /
-      `library.rs` ~392 / `core.rs` ~1150 (a full disk silently kills
-      the startup cache, the queue resume and download bookkeeping).
-      `config::save_or_warn` is the established pattern and is used
-      correctly at all 16 settings sites.
+- [x] **two of the nine: both stars.** `catalog.rs`, `library.rs` and
+      `core.rs` ~1150 (the full-disk group) went in the startup pass;
+      these two are the starred feature, and both discarded a `Result`
+      with a doc right next to them saying it mattered.
+      **a local star that could not be written stayed lit.** the arm
+      did `let _ = favorites::save(..)`, so the star showed for the
+      whole session and was simply gone next launch, while the remote
+      arm one match later has always reverted and reported through
+      `StarFailed`. the file is the source of truth here exactly as the
+      server is there, so it reverts and reports too.
+      the save is **injected** rather than reached for, the shape
+      `DownloadCtx::persist` took after that hazard cost a real play
+      index: `favorites::save` resolves its own path, so a test
+      starring a *local* item would have written the real
+      `~/.local/state/wim/favorites.toml`. the existing star tests only
+      used remote songs, so nothing had hit it yet; now nothing can.
+      **and `open_starred` dropped the reason a server was missing.**
+      it built clients with `filter_map(|nav| client_for(nav, live).ok())`,
+      throwing away exactly what `client_for` returns a `Result` to
+      preserve (its own doc: "connection failed with no cause is a
+      worse error than the one this replaced"), so an unreadable
+      `password_file` showed a short starred list and said nothing. it
+      returns the reasons now and both call sites report them.
+      three mutations, and **the third was not caught at first**:
+      discarding the save, reporting without reverting, and dropping
+      the server reason. the last had no test until I wrote one, which
+      is the same pinned-the-fix-not-the-wiring slip as the suggestions
+      refusal earlier.
+- [ ] **the rest of the nine are still open.** `core.rs` 887/900
+      (every scrobble failure forever, so a revoked token is
+      indistinguishable from working; the shape is written up under the
+      scrobble-metadata item), 784-797 (four consecutive silent returns
+      in subtitle auto-fetch, so a wrong key looks identical to "no
+      subtitles exist"), `main.rs` ~2062 (the restored-queue refill
+      discards every per-track status, so a moved library shows a full
+      queue in the ui and an empty playlist in mpv), and `main.rs`
+      ~4331 (skip-next has neither the last-track guard nor the message
+      `Op::SkipNext` has).
 - [x] ~~resolved by the overnight run~~ **two hardcoded keys in rendered text.** `ui/queue.rs` ~188
       hardcodes `'a'` for the remappable `Enqueue` ("enter on a song
       to start, 'a' to add"), the exact bug class
