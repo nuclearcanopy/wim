@@ -2491,11 +2491,17 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             // cache: this runs once per command, not per frame, and a
             // percent target must resolve against the duration as of
             // now rather than whatever the last pushed change said.
-            let duration = core
+            let reported = core
                 .player
                 .get_property(mpv::PROP_DURATION)
                 .ok()
                 .and_then(|v| v.as_f64());
+            // through `playing_duration`, the same reading the
+            // scrubber's target comes from: mpv reports ~1s for a
+            // generated silence, so asking it directly put
+            // `moveto(50%)` in a 15m gap at half a second and refused
+            // `moveto(5m)` as past the end.
+            let duration = playing_duration(core.now_playing.as_ref(), reported);
             match shellsong_host::seek_target(pos, duration) {
                 Ok(secs) => match core.player.seek(secs, false) {
                     Ok(()) => op_note(format!("moved to {secs:.0}s")),
@@ -2957,6 +2963,13 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                     tier.label()
                 ));
             };
+            // a binding is only worth keeping if it can be applied: an
+            // eq name resolves at apply time, so a typo in one used to
+            // be stored, reported as remembered, and then fail on
+            // every track start that resolved it.
+            if let Some(why) = setting_refusal(&setting, core.cfg) {
+                return op_fail(why);
+            }
             let report = format!(
                 "{} {} remembered for {} '{name}'",
                 setting.kind().label(),
@@ -3439,10 +3452,31 @@ pub fn enqueue_next(item: &SearchItem, core: &mut CoreCtx) -> Result<(), String>
     }
     let from = core.queue.entries().len().saturating_sub(1);
     let to = core.queue.pos().map_or(0, |p| p + 1);
-    if to < from && core.queue.move_entry(from, to) {
-        if let Err(e) = core.player.playlist_move(from, to) {
-            return Err(format!("error moving: {e}"));
-        }
+    move_in_step(core.queue, from, to, |f, t| core.player.playlist_move(f, t))
+}
+
+/// Moves one entry on both sides, or on neither.
+///
+/// `entries` *is* mpv's playlist by index, so a local move mpv refused
+/// leaves every later operation addressing the wrong track: the kind of
+/// drift `enqueue_track` puts back for a refused shuffle slot and this
+/// pairing did not.
+///
+/// Takes the mpv call as a closure because the only path that matters
+/// is the one mpv declines, and that is unreachable with a live socket.
+fn move_in_step(
+    queue: &mut PlayQueue,
+    from: usize,
+    to: usize,
+    ask_mpv: impl FnOnce(usize, usize) -> anyhow::Result<()>,
+) -> Result<(), String> {
+    // already where it belongs, or nothing moved.
+    if to >= from || !queue.move_entry(from, to) {
+        return Ok(());
+    }
+    if let Err(e) = ask_mpv(from, to) {
+        queue.move_entry(to, from);
+        return Err(format!("error moving: {e}"));
     }
     Ok(())
 }
@@ -3532,6 +3566,27 @@ pub fn current_eq_name(app: &app::App, cfg: &config::Config) -> String {
         .map(str::to_string)
         .or_else(|| cfg.eq_preset.clone())
         .unwrap_or_else(|| eq::PRESETS[0].name.to_string())
+}
+
+/// Why a setting cannot be remembered, when it cannot.
+///
+/// An eq is the one that can be: a saved curve exists only at runtime,
+/// so `eq(...)` resolves at apply time (see `Op::SetEqPreset`) and the
+/// parser never sees a typo in one. A volume and a speed are numbers
+/// and always apply, so refusing one would refuse a working binding.
+///
+/// The same message `eq(...)` itself gives, because it is the same
+/// resolution failing.
+pub fn setting_refusal(setting: &shellsong::Setting, cfg: &config::Config) -> Option<String> {
+    match setting {
+        shellsong::Setting::Eq(name) => {
+            let saved = &cfg.eq_custom_presets;
+            eq::resolve(name, saved)
+                .is_none()
+                .then(|| eq::resolve_failure(name, saved))
+        }
+        shellsong::Setting::Volume(_) | shellsong::Setting::Speed(_) => None,
+    }
 }
 
 /// What the per-identity settings want for a track that just started:
@@ -4267,8 +4322,8 @@ mod seam_tests {
         scrobble: ScrobbleState,
         subtitle_tx: mpsc::Sender<SubtitleOutcome>,
         _subtitle_rx: mpsc::Receiver<SubtitleOutcome>,
-        console: Console,
-        now_playing: Option<SearchItem>,
+        pub(super) console: Console,
+        pub(super) now_playing: Option<SearchItem>,
         favorites: favorites::Favorites,
         remote_starred: HashSet<String>,
         lyrics_client: lyrics::Client,
@@ -4293,7 +4348,7 @@ mod seam_tests {
         settle: SearchSettle,
         saved_queues: Vec<String>,
         vars: shellsong::Scope,
-        bindings: shellsong_host::Bindings,
+        pub(super) bindings: shellsong_host::Bindings,
     }
 
     impl Harness {
@@ -4783,11 +4838,23 @@ mod seam_tests {
         // the lie, pinned. mpv reports ~1s whatever `d` says, at every
         // spelling tried, which is why anything drawing the length of
         // a silence must read `Silence { secs }` instead.
-        let reported = player
-            .get_property("duration")
-            .ok()
-            .and_then(|v| v.as_f64())
-            .expect("a duration is reported, it is just wrong");
+        //
+        // polled, not read once: the codec name arrives before the
+        // duration does, and this read came back empty once with a
+        // dozen other mpv instances on the machine, which is a flake
+        // and not a finding.
+        let mut reported = None;
+        for _ in 0..50 {
+            reported = player
+                .get_property("duration")
+                .ok()
+                .and_then(|v| v.as_f64());
+            if reported.is_some() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(40));
+        }
+        let reported = reported.expect("a duration is reported, it is just wrong");
         assert!(
             reported < 600.0 * 0.5,
             "mpv reported {reported}s for a 600s silence; if this now \
@@ -6048,6 +6115,319 @@ mod index_map_tests {
         }
         assert_eq!(queue.entries().len(), 7);
         assert_eq!(queue.pos(), Some(0), "shuffling in never moves what plays");
+    }
+}
+
+/// Which length a `moveto(...)` resolves against, which is the one
+/// the scrubber already uses.
+#[cfg(test)]
+mod seek_length_tests {
+    use super::seam_tests::Harness;
+    use super::*;
+    use crate::shellsong::Pos;
+
+    fn silence() -> SearchItem {
+        SearchItem::Silence { secs: 600 }
+    }
+
+    /// mpv reports ~1s for a generated silence whatever length was
+    /// asked for (measured; see `silence_url`), so resolving a
+    /// position against its reading puts the seek in the wrong place
+    /// and refuses legal ones outright.
+    #[test]
+    fn mpvs_reading_of_a_silence_resolves_a_seek_to_the_wrong_place() {
+        let entry = silence();
+        let lie = Some(1.0);
+        let real = playing_duration(Some(&entry), lie);
+        assert_eq!(real, Some(600.0), "the entry knows its own length");
+
+        assert_eq!(shellsong_host::seek_target(Pos::Percent(50.0), lie), Ok(0.5));
+        assert_eq!(
+            shellsong_host::seek_target(Pos::Percent(50.0), real),
+            Ok(300.0),
+            "half of ten minutes is five, not half a second"
+        );
+
+        assert!(
+            shellsong_host::seek_target(Pos::Seconds(300.0), lie).is_err(),
+            "five minutes into a ten minute gap was refused as past the end"
+        );
+        assert_eq!(shellsong_host::seek_target(Pos::Seconds(300.0), real), Ok(300.0));
+    }
+
+    /// And the wiring, which is where the two paths disagreed: the
+    /// scrubber hands `activate_transport` a `playing_duration`
+    /// (main.rs), while this arm asked mpv. so dragging the bar to the
+    /// middle of a `silence(10m)` moved to 5:00 and `moveto(50%)`
+    /// moved to half a second.
+    ///
+    /// mpv honours either seek, which is what makes this a wrong
+    /// position rather than a refusal: measured, `--start=300` into a
+    /// 600s `anullsrc` plays from 00:05:00.
+    ///
+    /// `#[ignore]` for the usual reason: `CoreCtx` holds a live mpv.
+    #[test]
+    #[ignore]
+    fn a_seek_in_a_silence_resolves_against_the_entrys_own_length() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let _ = player.set_property("vo", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let mut surf = Headless;
+        h.now_playing = Some(silence());
+        {
+            let core = h.ctx(&player);
+            let (status, played) = load_playlist(
+                core.player,
+                core.cache,
+                core.queue,
+                vec![silence()],
+                SessionStart::New,
+            );
+            assert!(played, "{status}");
+        }
+        // the seek needs the file actually open, or it fails for a
+        // reason that has nothing to do with the duration.
+        let mut loaded = false;
+        for _ in 0..50 {
+            if player.get_property("audio-codec-name").is_ok() {
+                loaded = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(40));
+        }
+        assert!(loaded, "the silence never became the playing file");
+
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::SeekAbsolute(Pos::Percent(50.0)), &mut core, &mut surf);
+        }
+        assert_eq!(
+            h.console.lines.last().expect("one line per op").text,
+            "moved to 300s",
+            "a percent resolved against mpv's ~1s reading: {:?}",
+            h.console.lines
+        );
+
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::SeekAbsolute(Pos::Seconds(300.0)), &mut core, &mut surf);
+        }
+        let last = h.console.lines.last().expect("one line per op").clone();
+        assert_eq!(
+            last.kind,
+            crate::shellsong::LineKind::Note,
+            "a position inside the gap was refused as past its end: {last:?}"
+        );
+    }
+}
+
+/// Which settings are fit to be remembered at all.
+#[cfg(test)]
+mod rememberable_setting_tests {
+    use super::seam_tests::Harness;
+    use super::*;
+    use crate::shellsong::{Setting, Tier};
+
+    /// A saved curve exists only at runtime, so `eq(...)` resolves at
+    /// apply time and the parser never sees a typo in one. That is
+    /// what makes an eq the one setting that can be unrememberable.
+    #[test]
+    fn an_eq_name_that_does_not_resolve_is_refused() {
+        let cfg = config::Config::default();
+        let why = setting_refusal(&Setting::Eq("nope".into()), &cfg)
+            .expect("there is no preset called nope");
+        assert!(why.contains("eq preset"), "it has to say what is wrong: {why}");
+
+        // a built-in resolves, and so does a saved curve, which is the
+        // half a parse-time check could not see.
+        assert_eq!(setting_refusal(&Setting::Eq("rock".into()), &cfg), None);
+        let mut cfg = config::Config::default();
+        cfg.eq_custom_presets.insert("my bass curve", [0.0; 10]);
+        assert_eq!(
+            setting_refusal(&Setting::Eq("my bass curve".into()), &cfg),
+            None
+        );
+    }
+
+    /// A volume and a speed are numbers: they always apply, so
+    /// refusing one would refuse a binding that works.
+    #[test]
+    fn a_volume_or_a_speed_is_always_rememberable() {
+        let cfg = config::Config::default();
+        assert_eq!(setting_refusal(&Setting::Volume(25.0), &cfg), None);
+        assert_eq!(setting_refusal(&Setting::Speed(1.25), &cfg), None);
+    }
+
+    /// The wiring, which is the bug: `remember(track, eq(nope))`
+    /// stored the name, said "remembered", saved it to disk, and then
+    /// `identity_settings` emitted `eq(nope)` on every track start
+    /// that resolved the binding, failing each time, until it was
+    /// found and `forget`ten.
+    ///
+    /// `#[ignore]` for the usual reason: `CoreCtx` holds a live mpv.
+    #[test]
+    #[ignore]
+    fn remembering_an_eq_that_does_not_exist_is_refused_and_not_stored() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let mut surf = Headless;
+        {
+            let mut core = h.ctx(&player);
+            apply_op(
+                Op::Remember {
+                    tier: Tier::Track,
+                    setting: Setting::Eq("nope".into()),
+                },
+                &mut core,
+                &mut surf,
+            );
+        }
+        let last = h.console.lines.last().expect("one line per op").clone();
+        assert_eq!(
+            last.kind,
+            crate::shellsong::LineKind::Error,
+            "a binding that cannot apply is a refusal: {last:?}"
+        );
+        assert!(
+            last.text.contains("eq preset"),
+            "and it says which name: {}",
+            last.text
+        );
+        assert!(
+            h.bindings.is_empty(),
+            "a binding nothing can ever apply was stored and written to disk"
+        );
+    }
+
+    /// The positive control: a name that does resolve is remembered,
+    /// so the refusal above is not the whole arm being dead.
+    ///
+    /// `#[ignore]` for the usual reason: `CoreCtx` holds a live mpv.
+    #[test]
+    #[ignore]
+    fn remembering_an_eq_that_exists_still_works() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let mut surf = Headless;
+        {
+            let mut core = h.ctx(&player);
+            apply_op(
+                Op::Remember {
+                    tier: Tier::Track,
+                    setting: Setting::Eq("rock".into()),
+                },
+                &mut core,
+                &mut surf,
+            );
+        }
+        let last = h.console.lines.last().expect("one line per op").clone();
+        assert_eq!(last.kind, crate::shellsong::LineKind::Note, "{last:?}");
+        assert!(!h.bindings.is_empty(), "it has to actually bind");
+    }
+}
+
+/// What a move mpv refused leaves behind, which is the half of the
+/// index-map invariant `index_map_tests` cannot reach: with a live
+/// socket a valid `playlist-move` does not fail.
+#[cfg(test)]
+mod refused_move_tests {
+    use super::*;
+
+    fn silence(secs: u64) -> SearchItem {
+        SearchItem::Silence { secs }
+    }
+
+    fn lengths(queue: &PlayQueue) -> Vec<u64> {
+        queue
+            .entries()
+            .iter()
+            .map(|item| match item {
+                SearchItem::Silence { secs } => *secs,
+                other => panic!("the fixture is silences only: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// A local move mpv will not follow is not a failed move, it is a
+    /// *drifted* one: `entries` is mpv's playlist by index, so every
+    /// later remove, reorder or `playlist-pos` addresses the wrong
+    /// track from then on, and the only sign is a wrong title on the
+    /// bar. `enqueue_track` puts its refused shuffle move back for
+    /// exactly this reason; this pairing kept it and reported an
+    /// error.
+    #[test]
+    fn a_move_mpv_refuses_leaves_the_index_map_alone() {
+        let mut queue = PlayQueue::default();
+        queue.reset(vec![silence(1), silence(2), silence(3)]);
+        // what `enqueue_next` has in hand after its append: the new
+        // entry is last and wants to sit behind what is playing.
+        queue.append(silence(4), false);
+        let before = lengths(&queue);
+
+        let why = move_in_step(&mut queue, 3, 1, |_, _| Err(anyhow::anyhow!("mpv said no")))
+            .expect_err("a refused move is a refusal");
+        assert!(why.contains("mpv said no"), "it has to say why: {why}");
+        assert_eq!(
+            lengths(&queue),
+            before,
+            "the index map moved and mpv's playlist did not"
+        );
+        assert_eq!(queue.pos(), Some(0), "and what is playing is still index 0");
+
+        // the positive control, in the same run: a move mpv takes does
+        // move both sides.
+        move_in_step(&mut queue, 3, 1, |_, _| Ok(())).expect("mpv took it");
+        assert_eq!(lengths(&queue), vec![1, 4, 2, 3]);
+    }
+
+    /// Nothing to move must not ask mpv anything: `playlist-move` of
+    /// an entry onto its own index is an error reply, which would be
+    /// reported as a failed enqueue.
+    #[test]
+    fn an_entry_already_behind_what_plays_is_not_moved() {
+        let mut queue = PlayQueue::default();
+        queue.reset(vec![silence(1)]);
+        queue.append(silence(2), false);
+        let mut asked = false;
+        move_in_step(&mut queue, 1, 1, |_, _| {
+            asked = true;
+            Ok(())
+        })
+        .expect("nothing to do is not a failure");
+        assert!(!asked, "mpv was asked to move an entry onto itself");
+        assert_eq!(lengths(&queue), vec![1, 2]);
+    }
+
+    /// And the wiring, because a pure helper covers nothing about its
+    /// caller: the local move must happen only inside the pairing,
+    /// which is where the revert is. Reads the source, since
+    /// `enqueue_next` takes a `CoreCtx` and so a live mpv.
+    #[test]
+    fn the_front_enqueue_goes_through_the_paired_move() {
+        let src = include_str!("core.rs");
+        let at = src
+            .find("pub fn enqueue_next(")
+            .expect("enqueue_next moved or was renamed");
+        // anchored in real code: ahead of the first test module, not
+        // merely somewhere in the file (docs/testing.md).
+        assert!(
+            at < src.find("#[cfg(test)]\nmod ").unwrap_or(src.len()),
+            "the anchor is in test code, so this guards nothing"
+        );
+        let body = &src[at..];
+        let body = &body[..body.find("\n}\n").expect("an unterminated fn")];
+        assert!(
+            body.contains("move_in_step("),
+            "the front enqueue moves the two sides apart again:\n{body}"
+        );
+        assert!(
+            !body.contains("move_entry("),
+            "a local move inline here is one with no revert, which is \
+             the drift itself:\n{body}"
+        );
     }
 }
 
