@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -282,23 +283,45 @@ pub fn label(item: &SearchItem) -> String {
 /// Same as `label`, but the artist/album metadata only shows on the
 /// hovered (selected) row; everywhere else just the bare title, so a
 /// long results list doesn't read as a wall of repeated artist names.
-fn row_label(item: &SearchItem, hovered: bool) -> String {
+///
+/// Borrowed for every row but the hovered one, which is the row the
+/// paint wants: a clone per row was one allocation and one title copy
+/// per visible row, every frame.
+fn row_label(item: &SearchItem, hovered: bool) -> Cow<'_, str> {
     if hovered {
-        return label(item);
+        return Cow::Owned(label(item));
     }
     match item {
-        SearchItem::LocalMusic { title, .. } => title.clone(),
-        SearchItem::LocalVideo { title, .. } => title.clone(),
-        SearchItem::Artist { name, .. } => name.clone(),
-        SearchItem::Album { name, .. } => name.clone(),
-        SearchItem::Song { title, .. } => title.clone(),
-        SearchItem::Playlist { name, .. } => name.clone(),
+        SearchItem::LocalMusic { title, .. } => Cow::Borrowed(title),
+        SearchItem::LocalVideo { title, .. } => Cow::Borrowed(title),
+        SearchItem::Artist { name, .. } => Cow::Borrowed(name),
+        SearchItem::Album { name, .. } => Cow::Borrowed(name),
+        SearchItem::Song { title, .. } => Cow::Borrowed(title),
+        SearchItem::Playlist { name, .. } => Cow::Borrowed(name),
         // the one row that keeps its metadata unhovered. for every
         // other item the title is the identity and the artist is
         // decoration; for a silence the *duration* is the identity,
         // and a column of bare "silence" rows would be unreadable.
-        SearchItem::Silence { .. } => label(item),
+        SearchItem::Silence { .. } => Cow::Owned(label(item)),
     }
+}
+
+/// `[sk] title` for one row, written into `out` rather than returned:
+/// the paint hands the same buffer to every row, where a `format!`
+/// per row was an allocation per visible row every frame. Clears
+/// `out` itself, so a caller cannot leak the previous row into this
+/// one.
+fn write_row_text(out: &mut String, item: &SearchItem, hovered: bool, starred: bool) {
+    out.clear();
+    out.push_str(if hovered { "> " } else { "  " });
+    out.push('[');
+    out.push(source_code(item));
+    out.push(kind_code(item));
+    out.push_str("] ");
+    if starred {
+        out.push_str("* ");
+    }
+    out.push_str(&row_label(item, hovered));
 }
 
 /// Only tracks are starrable (see `main.rs::is_starred`); this is a
@@ -357,6 +380,9 @@ impl Widget for ResultsList<'_> {
 
         let visible_rows = area.height as usize;
         let rows = layout(self.items, self.selected, visible_rows);
+        // one buffer for every row of the frame; it reaches the widest
+        // row's length on the first screenful and stops reallocating.
+        let mut text = String::new();
 
         for row in 0..visible_rows {
             let Some(display_row) = rows.get(rows.scroll_offset + row) else {
@@ -387,21 +413,15 @@ impl Widget for ResultsList<'_> {
                     } else {
                         shade(DIM)
                     };
-                    let marker = if is_selected { "> " } else { "  " };
-                    let star = if is_starred(item, self.favorites, self.remote_starred) {
-                        "* "
-                    } else {
-                        ""
-                    };
-                    let full = format!(
-                        "{marker}[{}{}] {star}{}",
-                        source_code(item),
-                        kind_code(item),
-                        row_label(item, is_selected)
+                    write_row_text(
+                        &mut text,
+                        item,
+                        is_selected,
+                        is_starred(item, self.favorites, self.remote_starred),
                     );
-                    let text = truncate_with_ellipsis(&full, area.width as usize);
+                    let fitted = truncate_with_ellipsis(&text, area.width as usize);
 
-                    crate::ui::draw::line(buf, area, y, &text, fg);
+                    crate::ui::draw::line(buf, area, y, &fitted, fg);
                 }
             }
         }
@@ -599,6 +619,15 @@ mod frame_budget {
             ranking: &small_ranking,
             corpus: &small_corpus,
         };
+        // printed, because the weak-match cutoff can prune a ranking
+        // and a control that turned out to hold three rows would make
+        // every ratio below it look better than it is.
+        println!(
+            "    control: {} tracks -> {} matches, {} category runs",
+            PANE.height,
+            small.count(),
+            small.boundaries().len()
+        );
         for n in [2_000usize, 8_000, 15_000] {
             let (corpus, ranking) = ranked(n);
             let long = Ranked {
@@ -639,6 +668,108 @@ mod frame_budget {
                 slow / fast,
             );
         }
+
+        // the row text, which the paint builds once per visible row:
+        // one reused buffer and a borrowed label against the `String`
+        // + `format!` pair it replaced. Same rows either way, and the
+        // hovered one is in there, since that is the row that still
+        // has to own its label.
+        let rows = super::tests::with_artists(PANE.height as usize);
+        let mut buf = String::new();
+        let mut borrowed = || {
+            for (i, item) in rows.iter().enumerate() {
+                write_row_text(&mut buf, item, i == 0, false);
+                std::hint::black_box(&buf);
+            }
+        };
+        let mut formatted = || {
+            for (i, item) in rows.iter().enumerate() {
+                std::hint::black_box(super::tests::eager_row_text(item, i == 0, false));
+            }
+        };
+        let (reused, fresh) = best_each(5, 200, &mut borrowed, &mut formatted);
+        println!(
+            "  {} rows of row text: one buffer {reused:>7.2}us   a String per row {fresh:>7.2}us   {:.1}x",
+            PANE.height,
+            fresh / reused,
+        );
+
+        // Measured and NOT taken, kept so it is not retried: drawing
+        // a row that already fits straight out of its buffer, instead
+        // of through `truncate_with_ellipsis`' unconditional copy.
+        // 1.8x where rows fit, but 0.8x where they do not (one extra
+        // width walk), and ~1us either way against a 6944us budget.
+        // A `truncate_into(&mut String, ..)` in `ui::textfit` would
+        // win both cases; a branch here wins one and loses the other.
+        let texts: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let mut s = String::new();
+                write_row_text(&mut s, item, i == 0, false);
+                s
+            })
+            .collect();
+        for (case, w) in [("fits", PANE.width as usize), ("too long", 10)] {
+            let mut borrowed = || {
+                for t in &texts {
+                    if crate::ui::textfit::width(t) <= w {
+                        std::hint::black_box(t.as_str());
+                    } else {
+                        std::hint::black_box(truncate_with_ellipsis(t, w));
+                    }
+                }
+            };
+            let mut copied = || {
+                for t in &texts {
+                    std::hint::black_box(truncate_with_ellipsis(t, w));
+                }
+            };
+            let (keep, copy) = best_each(5, 200, &mut borrowed, &mut copied);
+            println!(
+                "  {} rows, {case} in {w} cols: borrow when it fits {keep:>7.2}us   always a String {copy:>7.2}us   {:.2}x",
+                PANE.height,
+                copy / keep,
+            );
+        }
+
+        // and the whole paint, which is what that sits inside: the
+        // geometry is a rounding error at a pane's worth of rows, so
+        // this is where the rest of a frame goes.
+        let mut pane = buffer(PANE.width, PANE.height);
+        let mut paint = || {
+            ResultsList {
+                items: &rows,
+                selected: 0,
+                empty_message: "",
+                favorites: &Favorites::default(),
+                remote_starred: &HashSet::new(),
+                focused: true,
+                elapsed: Duration::ZERO,
+            }
+            .render(PANE, &mut pane);
+        };
+        let mut geometry = || {
+            std::hint::black_box(row_items(&rows, 0, PANE));
+        };
+        let (painted, geo) = best_each(5, 200, &mut paint, &mut geometry);
+        println!(
+            "  {} rows painted {painted:>7.2}us ({:>4.1}% of budget)   geometry alone {geo:>7.2}us",
+            PANE.height,
+            painted / budget * 100.0,
+        );
+        // the floor, so this is a test and not just a printer: a
+        // render that drew nothing would measure beautifully. The
+        // last row rather than a named index, because the header
+        // `layout` inserts pushes the 40th item off a 40-row pane.
+        let grid = crate::ui::testbuf::grid(&pane);
+        assert!(grid.contains("> [fs] track 0"), "nothing painted:\n{grid}");
+        assert!(
+            grid.lines()
+                .last()
+                .is_some_and(|r| r.contains("[fs] track")),
+            "the pane is not full to its last row:\n{grid}"
+        );
     }
 }
 
@@ -747,6 +878,153 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// What the row text used to cost: a `String` for the label, a
+    /// `format!` for the row, both per visible row per frame. Kept as
+    /// the definition `write_row_text` has to agree with, and as the
+    /// benchmark's other half.
+    pub(super) fn eager_row_text(item: &SearchItem, hovered: bool, starred: bool) -> String {
+        let marker = if hovered { "> " } else { "  " };
+        let star = if starred { "* " } else { "" };
+        let owned: String = if hovered {
+            label(item)
+        } else {
+            match item {
+                SearchItem::LocalMusic { title, .. } => title.clone(),
+                SearchItem::LocalVideo { title, .. } => title.clone(),
+                SearchItem::Artist { name, .. } => name.clone(),
+                SearchItem::Album { name, .. } => name.clone(),
+                SearchItem::Song { title, .. } => title.clone(),
+                SearchItem::Playlist { name, .. } => name.clone(),
+                SearchItem::Silence { .. } => label(item),
+            }
+        };
+        format!(
+            "{marker}[{}{}] {star}{}",
+            source_code(item),
+            kind_code(item),
+            owned
+        )
+    }
+
+    /// The borrowed, one-buffer row text has to spell the same row as
+    /// the `format!` it replaced, for every variant and both hover
+    /// and star states; a silence is in here because it is the one
+    /// item that keeps its metadata unhovered.
+    #[test]
+    fn the_row_text_says_what_a_formatted_one_said() {
+        let client = crate::browse::fixtures::test_client();
+        let items = [
+            SearchItem::LocalMusic {
+                path: "/m/a.flac".into(),
+                title: "a title".into(),
+                artist: Some("an artist".into()),
+                album: Some("an album".into()),
+            },
+            SearchItem::LocalMusic {
+                path: "/m/b.flac".into(),
+                title: "no artist".into(),
+                artist: None,
+                album: None,
+            },
+            SearchItem::LocalVideo {
+                path: "/v/c.mkv".into(),
+                title: "a clip".into(),
+            },
+            SearchItem::Silence { secs: 930 },
+            SearchItem::Artist {
+                id: "1".into(),
+                name: "an artist".into(),
+                client: client.clone(),
+            },
+            SearchItem::Album {
+                id: "2".into(),
+                name: "an album".into(),
+                artist: "an artist".into(),
+                client: client.clone(),
+            },
+            SearchItem::Song {
+                id: "3".into(),
+                title: "a song".into(),
+                artist: "an artist".into(),
+                album: "an album".into(),
+                client: client.clone(),
+            },
+            SearchItem::Playlist {
+                id: "4".into(),
+                name: "a playlist".into(),
+                client,
+            },
+        ];
+        let mut out = String::new();
+        for item in &items {
+            for hovered in [false, true] {
+                for starred in [false, true] {
+                    // the same buffer across every case, so a missing
+                    // `clear` shows up as the previous row's text
+                    // still being in front.
+                    write_row_text(&mut out, item, hovered, starred);
+                    assert_eq!(
+                        out,
+                        eager_row_text(item, hovered, starred),
+                        "{item:?} hovered {hovered} starred {starred}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Rows with an artist each, so the hovered row's metadata is
+    /// visible and the others' absence is too.
+    pub(super) fn with_artists(n: usize) -> Vec<SearchItem> {
+        (0..n)
+            .map(|i| SearchItem::LocalMusic {
+                path: format!("/m/{i}.flac").into(),
+                title: format!("track {i}"),
+                artist: Some(format!("artist {i}")),
+                album: None,
+            })
+            .collect()
+    }
+
+    /// The exact text of every row, hovered and not: the artist shows
+    /// on the selected row only, and every other row is the bare
+    /// title, which is what keeps a long list from reading as a wall
+    /// of repeated artist names.
+    ///
+    /// Pinned as the whole painted grid rather than as a `contains`,
+    /// because the row text is assembled from five pieces (marker,
+    /// source code, kind code, star, label) and a `contains` on the
+    /// title stays green while any of the other four moves.
+    #[test]
+    fn only_the_hovered_row_shows_its_artist() {
+        let rows = with_artists(3);
+        let area = Rect::new(0, 0, 26, 4);
+        let mut buf = buffer(26, 4);
+        ResultsList {
+            items: &rows,
+            selected: 1,
+            empty_message: "",
+            favorites: &Favorites::default(),
+            remote_starred: &HashSet::new(),
+            focused: true,
+            elapsed: Duration::ZERO,
+        }
+        .render(area, &mut buf);
+        assert_eq!(
+            crate::ui::testbuf::grid(&buf),
+            // the '.'s are cells nothing drew into (`testbuf::buffer`
+            // fills with them), so this pins where each row's text
+            // stops as well as what it says.
+            [
+                "───────── SONGS ──────────",
+                "  [fs] track 0............",
+                "> [fs] track 1 · artist 1.",
+                "  [fs] track 2............",
+            ]
+            .join("\n")
+        );
     }
 
     fn render(selected: usize, focused: bool, elapsed: Duration) -> Buffer {
