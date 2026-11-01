@@ -524,7 +524,12 @@ mod frame_budget {
     /// runs on this box differ 1.6-1.8x under load, so two separate
     /// measurements are not comparable and this is the only shape that
     /// is; same harness as `framesource::frame_budget`.
-    fn best_each(rounds: usize, iters: usize, a: &mut dyn FnMut(), b: &mut dyn FnMut()) -> (f64, f64) {
+    fn best_each(
+        rounds: usize,
+        iters: usize,
+        a: &mut dyn FnMut(),
+        b: &mut dyn FnMut(),
+    ) -> (f64, f64) {
         let mut best = (f64::MAX, f64::MAX);
         let time = |f: &mut dyn FnMut()| {
             let at = Instant::now();
@@ -754,10 +759,17 @@ mod frame_budget {
             painted / budget * 100.0,
         );
         // the floor, so this is a test and not just a printer: a
-        // render that drew nothing would measure beautifully.
+        // render that drew nothing would measure beautifully. The
+        // last row rather than a named index, because the header
+        // `layout` inserts pushes the 40th item off a 40-row pane.
         let grid = crate::ui::testbuf::grid(&pane);
-        assert!(grid.contains("track 0"), "the paint drew nothing:\n{grid}");
-        assert!(grid.contains("track 39"), "the pane is not full:\n{grid}");
+        assert!(grid.contains("> [fs] track 0"), "nothing painted:\n{grid}");
+        assert!(
+            grid.lines()
+                .last()
+                .is_some_and(|r| r.contains("[fs] track")),
+            "the pane is not full to its last row:\n{grid}"
+        );
     }
 }
 
