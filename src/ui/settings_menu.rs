@@ -100,16 +100,10 @@ pub fn video_output_value(
     said
 }
 
-/// The bare config word, for the override note. Not `Debug`: that
-/// would print `Tct` where config.toml says `tct`.
+/// The bare config word, for the override note. Lives on
+/// `VideoOutput` now, so `video()`'s report and this row cannot drift.
 fn config_word(mode: VideoOutput) -> &'static str {
-    match mode {
-        VideoOutput::Auto => "auto",
-        VideoOutput::Tct => "tct",
-        VideoOutput::Kitty => "kitty",
-        VideoOutput::Ascii => "ascii",
-        VideoOutput::Off => "off",
-    }
+    mode.word()
 }
 
 /// What the rate row reads. Unset is the common case and says what it

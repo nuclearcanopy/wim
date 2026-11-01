@@ -2611,6 +2611,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 _ => op_note("no gap between tracks".to_string()),
             }
         }
+        Op::SetVideoOutput(mode) => surf.set_video_output(mode, core),
         Op::ToggleCrossfade => {
             *core.crossfade_enabled = !*core.crossfade_enabled;
             if !*core.crossfade_enabled {
@@ -4129,6 +4130,20 @@ pub trait Surface {
     /// Whether a standalone play takes over the full player pane.
     fn minimize_player(&mut self, minimize: bool) {
         let _ = minimize;
+    }
+
+    /// `video(...)`. The host owns this rather than `CoreCtx` because
+    /// setting the mode has to clear the runtime override shift-`v`
+    /// sets, which is a frame-loop local: without that the mode would
+    /// be set and the screen would not change, which is the trap the
+    /// settings menu's own row already had to avoid.
+    fn set_video_output(
+        &mut self,
+        mode: crate::config::VideoOutput,
+        core: &mut CoreCtx,
+    ) -> (Dispatch, Report) {
+        let _ = (mode, core);
+        self.decline("video()")
     }
 
     /// The queue view's cursor, for the two ops that have to reclamp
