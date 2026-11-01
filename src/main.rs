@@ -4,6 +4,7 @@
 
 use wim::cli;
 use wim::framesource;
+use wim::ui::settings_menu::Field as SettingsField;
 use wim::{
     anim, app, browse, cache, config, coverart, eq, favorites, hit, keymap, library, listenbrainz,
     lyrics, mpv, persistence, queues, search, shellsong, shellsong_host, suggest, term, trace, ui,
@@ -2034,28 +2035,37 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     "not set (enter to add)".to_string()
                 };
-                let values = [
-                    format!("{art_mode_label} ('i' also cycles this)"),
-                    if crossfade_enabled { "on" } else { "off" }.to_string(),
-                    format!("{:.1}s", cfg.crossfade_seconds),
-                    format!("{} days played", cfg.cache_days_threshold),
-                    format!("{} days", cfg.cache_eviction_days),
-                    format!("{:.0}%", cfg.scrobble.threshold_percent),
-                    format!("{:.0}s", cfg.scrobble.threshold_seconds),
-                    token_value,
-                ];
+                // in `FIELDS` order, and the compiler holds them to
+                // it: `values` is indexed by the same enum the rows
+                // are drawn from.
+                let values = ui::settings_menu::FIELDS.map(|field| match field {
+                    SettingsField::AlbumArt => format!("{art_mode_label} ('i' also cycles this)"),
+                    SettingsField::VideoOutput => ui::settings_menu::video_output_value(
+                        cfg.video_output,
+                        video_over,
+                        art.protocol_type(),
+                    ),
+                    SettingsField::AsciiFps => {
+                        ui::settings_menu::ascii_fps_value(cfg.ascii_fps)
+                    }
+                    SettingsField::Crossfade => if crossfade_enabled { "on" } else { "off" }.to_string(),
+                    SettingsField::CrossfadeSeconds => format!("{:.1}s", cfg.crossfade_seconds),
+                    SettingsField::CacheDaysThreshold => {
+                        format!("{} days played", cfg.cache_days_threshold)
+                    }
+                    SettingsField::CacheEvictionDays => format!("{} days", cfg.cache_eviction_days),
+                    SettingsField::ScrobblePercent => {
+                        format!("{:.0}%", cfg.scrobble.threshold_percent)
+                    }
+                    SettingsField::ScrobbleSeconds => {
+                        format!("{:.0}s", cfg.scrobble.threshold_seconds)
+                    }
+                    SettingsField::ListenbrainzToken => token_value.clone(),
+                });
+                let shown: Vec<&str> = values.iter().map(String::as_str).collect();
                 f.render_widget(
                     ui::settings_menu::SettingsMenu {
-                        values: [
-                            values[0].as_str(),
-                            values[1].as_str(),
-                            values[2].as_str(),
-                            values[3].as_str(),
-                            values[4].as_str(),
-                            values[5].as_str(),
-                            values[6].as_str(),
-                            values[7].as_str(),
-                        ],
+                        values: &shown,
                         selected: settings_menu_selected,
                         keymap: &keymap,
                     },
@@ -3594,6 +3604,10 @@ fn main() -> anyhow::Result<()> {
                         }
                         continue;
                     }
+                    // named, not numbered: the arms below used to
+                    // match on the index, so inserting a row moved
+                    // every adjuster under it onto the wrong setting.
+                    let settings_field = || ui::settings_menu::field_at(settings_menu_selected);
                     if key.code == KeyCode::Esc
                         || key.code == keymap.get(KeyAction::OpenSettingsMenu)
                     {
@@ -3618,59 +3632,83 @@ fn main() -> anyhow::Result<()> {
                         // does, rather than adding a second
                         // reverse-cycle method just for this.
                         KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right
-                            if settings_menu_selected == 0 =>
+                            if settings_field() == SettingsField::AlbumArt =>
                         {
                             if let Some(alert) = art.cycle() {
                                 notifications.push(Severity::Alert, alert);
                             }
                         }
-                        KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 1 => {
+                        // the video output is a cycle too, and a short
+                        // one, so both directions step it.
+                        KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right
+                            if settings_field() == SettingsField::VideoOutput =>
+                        {
+                            cfg.video_output = config::next_video_output(cfg.video_output);
+                            // the override would otherwise win and the
+                            // row the user just changed would have no
+                            // effect on the screen.
+                            video_over = None;
+                            config::save_or_warn(&cfg, &mut notifications);
+                        }
+                        KeyCode::Char('h') | KeyCode::Left
+                            if settings_field() == SettingsField::AsciiFps =>
+                        {
+                            cfg.ascii_fps = config::step_ascii_fps(cfg.ascii_fps, -1);
+                            config::save_or_warn(&cfg, &mut notifications);
+                        }
+                        KeyCode::Char('l') | KeyCode::Right
+                            if settings_field() == SettingsField::AsciiFps =>
+                        {
+                            cfg.ascii_fps = config::step_ascii_fps(cfg.ascii_fps, 1);
+                            config::save_or_warn(&cfg, &mut notifications);
+                        }
+                        KeyCode::Char('h') | KeyCode::Left if settings_field() == SettingsField::Crossfade => {
                             crossfade_enabled = false;
                             fade_in_started_at = None;
                             let _ = player.set_volume(base_volume);
                         }
-                        KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 1 => {
+                        KeyCode::Char('l') | KeyCode::Right if settings_field() == SettingsField::Crossfade => {
                             crossfade_enabled = true;
                         }
-                        KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 2 => {
+                        KeyCode::Char('h') | KeyCode::Left if settings_field() == SettingsField::CrossfadeSeconds => {
                             cfg.crossfade_seconds =
                                 config::crossfade_seconds(cfg.crossfade_seconds - 0.5);
                         }
-                        KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 2 => {
+                        KeyCode::Char('l') | KeyCode::Right if settings_field() == SettingsField::CrossfadeSeconds => {
                             cfg.crossfade_seconds =
                                 config::crossfade_seconds(cfg.crossfade_seconds + 0.5);
                         }
-                        KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 3 => {
+                        KeyCode::Char('h') | KeyCode::Left if settings_field() == SettingsField::CacheDaysThreshold => {
                             cfg.cache_days_threshold =
                                 cfg.cache_days_threshold.saturating_sub(1).max(1);
                         }
-                        KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 3 => {
+                        KeyCode::Char('l') | KeyCode::Right if settings_field() == SettingsField::CacheDaysThreshold => {
                             cfg.cache_days_threshold = (cfg.cache_days_threshold + 1).min(20);
                         }
-                        KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 4 => {
+                        KeyCode::Char('h') | KeyCode::Left if settings_field() == SettingsField::CacheEvictionDays => {
                             cfg.cache_eviction_days =
                                 cfg.cache_eviction_days.saturating_sub(1).max(1);
                         }
-                        KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 4 => {
+                        KeyCode::Char('l') | KeyCode::Right if settings_field() == SettingsField::CacheEvictionDays => {
                             cfg.cache_eviction_days = (cfg.cache_eviction_days + 1).min(90);
                         }
-                        KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 5 => {
+                        KeyCode::Char('h') | KeyCode::Left if settings_field() == SettingsField::ScrobblePercent => {
                             cfg.scrobble.threshold_percent =
                                 (cfg.scrobble.threshold_percent - 5.0).clamp(5.0, 100.0);
                         }
-                        KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 5 => {
+                        KeyCode::Char('l') | KeyCode::Right if settings_field() == SettingsField::ScrobblePercent => {
                             cfg.scrobble.threshold_percent =
                                 (cfg.scrobble.threshold_percent + 5.0).clamp(5.0, 100.0);
                         }
-                        KeyCode::Char('h') | KeyCode::Left if settings_menu_selected == 6 => {
+                        KeyCode::Char('h') | KeyCode::Left if settings_field() == SettingsField::ScrobbleSeconds => {
                             cfg.scrobble.threshold_seconds =
                                 (cfg.scrobble.threshold_seconds - 15.0).clamp(15.0, 600.0);
                         }
-                        KeyCode::Char('l') | KeyCode::Right if settings_menu_selected == 6 => {
+                        KeyCode::Char('l') | KeyCode::Right if settings_field() == SettingsField::ScrobbleSeconds => {
                             cfg.scrobble.threshold_seconds =
                                 (cfg.scrobble.threshold_seconds + 15.0).clamp(15.0, 600.0);
                         }
-                        KeyCode::Enter if settings_menu_selected == 7 => {
+                        KeyCode::Enter if settings_field() == SettingsField::ListenbrainzToken => {
                             settings_token_editing = true;
                             settings_token_input.clear();
                         }
@@ -5371,6 +5409,50 @@ mod startup_tests {
             let msg = loading_message(scanning, syncing).unwrap();
             assert!(msg.len() <= 30, "{msg:?} would be truncated in the sidebar");
         }
+    }
+}
+
+/// The settings menu's video rows, whose wiring needs a terminal and a
+/// key press to reach any other way.
+#[cfg(test)]
+mod settings_video_tests {
+    /// Changing the output in the menu has to clear the runtime
+    /// override, or the row the user just changed has no effect on the
+    /// screen and the menu then has to explain itself with a
+    /// `(config: ...)` note about a value the user is actively
+    /// setting. Found by reasoning, not by a failure, so it is pinned
+    /// here rather than trusted.
+    #[test]
+    fn setting_the_output_clears_the_shift_v_override() {
+        let src = include_str!("main.rs");
+        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
+        let at = code
+            .find("config::next_video_output(cfg.video_output)")
+            .expect("the settings menu no longer cycles the video output");
+        let arm = &code[at..(at + 400).min(code.len())];
+        assert!(
+            arm.contains("video_over = None;"),
+            "the override survives, so the setting does nothing:\n{arm}"
+        );
+        assert!(
+            arm.contains("config::save_or_warn"),
+            "the mode is changed for this run only:\n{arm}"
+        );
+    }
+
+    /// The adjust keys match on the named field. They matched on the
+    /// selected index before, so inserting a row (which this slice
+    /// did, twice) moved every adjuster below it onto the wrong
+    /// setting with nothing to catch it.
+    #[test]
+    fn the_adjust_keys_are_keyed_on_the_field_not_the_index() {
+        let src = include_str!("main.rs");
+        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
+        assert!(
+            !code.contains("settings_menu_selected =="),
+            "an adjuster is still keyed on a row number"
+        );
+        assert!(code.contains("settings_field() == SettingsField::"));
     }
 }
 
