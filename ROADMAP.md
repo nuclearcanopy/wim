@@ -1915,156 +1915,26 @@ do the wrong thing quietly, which is worse to diagnose.
       out and settle going unsettled; the two halves have teeth
       independently (dropping the notify failed the first, dropping
       only `settle.notified` failed the second).
-- [ ] **`main.rs` ~4326: the pause keybind bypasses
-      `core::toggle_pause`,** whose doc at `core.rs` ~54 claims "the
-      keybind, the bar click and enter on the player cannot disagree".
-      set `gap(5s)`, let a track end, press space during the
-      countdown: mpv unpauses at an already-finished eof,
-      `between.cancel()` never runs so `holding()` stays true and the
-      countdown keeps drawing, and nothing plays until the gap
-      expires. clicking the bar's pause glyph in the same moment does
-      the right thing.
-- [x] ~~done in the overnight run~~ **`main.rs` ~2421: the suggestions cursor is reconciled by
-      clamping a flat index** while `suggest_with` rebuilds and
-      reorders every section ("best section first"). open suggestions,
-      press `j` seven times, let an in-flight enrichment reply land,
-      press enter: the highlighted row's content changed under the
-      cursor and enter acts on the replacement (for a `Song` that is
-      `start_session`, which clears the queue). `browse.rs` ~640
-      already anchors its cursor on `song_id` for exactly this.
-- [x] ~~done in the overnight run~~ **`lyrics.rs` ~224: `Loader::invalidate` has no production
-      caller.** only the test at ~333; `main.rs` ~4042 calls
-      `lyrics.close()`, which drops lines only, and no track-change
-      hook touches the loader. the
-      `#[cfg_attr(not(test), allow(dead_code))]` is why nothing
-      flagged it. press the lyrics key, press esc while lrclib is
-      still answering, wait: the pane reopens itself and swallows
-      j/k/esc again. or press it 3s before a track ends and let it
-      auto-advance: the pane opens unprompted over the next track.
-      the comment at `main.rs` ~2323 asserts the opposite of what the
-      code does.
-- [x] **`overlay` was a second copy of the modal list, and it was
-      wrong in both directions *and* answering two different
-      questions.** `hit::Tiers` already held the list once.
-      direction one: `console` and `subtitle_menu` cover the screen and
-      were missing from `overlay`, which feeds `video::wanted`, so mpv
-      kept drawing a video over them. play a local video, press `v`,
-      press the subtitle-menu key: **the one menu that exists for video
-      was invisible while claiming every key.**
-      direction two: `undo_menu_open` was in `overlay` with no `Tiers`
-      entry, so with the undo tree drawn over the workspace a click or
-      a wheel notch resolved against the pane behind it.
-      **and the conflation, which is the part the audit did not see.**
-      `animating` read `!overlay && (.. || console_open || ..)`, so one
-      flag was answering "is something painted over the video" *and*
-      "is there nothing left worth repainting". those differ on exactly
-      the console: it covers the screen and is simultaneously the
-      reason to keep animating, because its caret blinks. adding the
-      console to `overlay` to fix direction one would have frozen its
-      own caret. so `Modal` gained `animates()` beside
-      `covers_screen()`, and `Tiers` answers both questions from one
-      literal built once per frame: `covers_screen()` for mpv,
-      `static_modal()` for the animation gate.
-      `Modal::UndoMenu` sits between `SettingsMenu` and `EqMenu`,
-      matching main.rs's key cascade, which is the order `TIERS`
-      exists to mirror.
-      four tests, each mutation-checked: every modal is reachable
-      through `Tiers` and is frontmost alone (direction two), a
-      screen-covering tier takes the screen back with the console and
-      subtitle menu named explicitly (direction one), a text box drawn
-      inside a visible pane does *not* (the two the old flag was right
-      about by omission), and a tier with a caret covers the screen
-      without freezing it (the conflation). making the console static
-      fails the last one; making it not cover the screen fails two.
-- [x] **a restore point taken mid fade-out muted the next track.**
-      `identity_settings` stores what it is handed as the level to
-      restore to when a binding stops applying, and `track_started`
-      handed it `current_volume(core.player)`. that runs at a track
-      boundary, i.e. mid crossfade fade-out, so a bound track captured
-      something near zero and **the next unbound track was restored to
-      that**: silent until you typed `volume(50%)`. same root cause at
-      `Op::SetVolume`, where a relative nudge measured against the live
-      reading made `: volume(+10%)` in the last seconds of a track give
-      10 instead of 90, and that became the new `base_volume`.
-      both sites take `*core.base_volume` now, which *is* the chosen
-      level by construction (every `SetVolume` writes it, and the code
-      already called it "the ceiling the crossfade and fade ramps scale
-      against"). the live reading survives in exactly one place,
-      `Op::Fade`'s starting point, where it is correct.
-      `identity_settings` had **no tests at all**; it has a module of
-      its own now rather than joining an existing one (see the accreted
-      -test-module item). the behavioural test is the two-track
-      sequence, because that is the only shape the bug appears in: a
-      single bound track looks fine, and it is the *next* one that goes
-      quiet. it keys the binding through `identity_of` so a change to
-      how a track identity is spelled cannot silently unbind it and
-      leave the test passing for nothing.
-      the call site itself needs a live mpv, so the guard on it reads
-      the source. **the first draft of that guard was worthless**: it
-      checked only the argument list, and the mutation that moved the
-      transient one line up into the local it reads passed happily. it
-      checks the whole function body now, and catches it.
-- [x] ~~done in the overnight run~~ **`Op::Remember` still never seeds `overridden`** (`core.rs`
-      2508/2780 against the single writer at ~3063). at volume 80,
-      `: remember(album, volume(25%))` then `: skip()` onto another
-      album: `settle` sees `active == None` and restores nothing, so
-      you stay at 25 for the session, contradicting the documented
-      rule. separate from the fix above, which was about *what* gets
-      captured rather than whether anything is.
-- [x] **`BetweenTracks::step` never retried a lost keep-open write.**
-      it did `let _ = player.set_keep_open(..)` and then set
-      `self.keep_open` unconditionally, while the write is gated on the
-      field differing. the field *is* "what mpv has been told", so
-      recording a failed write means it is never retried: one dropped
-      ipc message of `false` left `keep-open` pinned on, mpv never went
-      idle, and `idle-active` going quiet took end-of-playlist and
-      loop-all with it for the rest of the session.
-      the write needs a live mpv, so the memo rule is split into
-      `needs_keep_open` / `keep_open_written` and tested on its own;
-      `step` is three lines around them. the test covers both
-      directions, because the one that pins keep-open *on* is turning
-      it back off. mutation-checked by recording the write
-      unconditionally again.
-- [x] **`mute` and `eq_custom` were in docs/undo.md's snapshot and
-      not in `Snapshot`.** `mute()` then `undo()` reported success over
-      music that was still silent, and a restored flat curve read "flat
-      (modified)". both snapshotted rather than struck from the doc.
-      `eq_custom` is free (an `App` field). `mute` has no host-side
-      mirror, `Op::Mute` being one `set_property` with mpv the only
-      place it lives, so `capture` makes one bounded `get_property`:
-      **the budget `paused` and the live volume were refused on**, and
-      the difference is that mute cannot drift out of band, since
-      `mute()`/`unmute()` are its only mutation and both are recorded
-      ops. stored as `Option<bool>`, so a read mpv refuses leaves the
-      restore alone instead of unmuting, and `capture`'s purity claim
-      was updated rather than quietly broken.
-      the tests read what the user reads: the mute one mutes with the
-      same single call `Op::Mute` makes and reads the property back,
-      and the eq one nudges a band through the real `adjust_eq_band`
-      and asserts on `eq_label`, failing "flat (modified)" against
-      "flat".
-      **docs/undo.md's list was wrong in two more places** and is
-      corrected: `paused` and a live fade are deliberately out. it also
-      now records that **there is no mute indicator anywhere in the
-      ui**, so muted is indistinguishable on screen from volume at
-      zero.
-- [x] **`enqueue_track`'s shuffle move was fire and forget.** it
-      appended, let `append` pick a shuffle slot (mutating `entries`),
-      and only then asked mpv with `let _ = player.playlist_move(..)`.
-      `entries` and mpv's playlist agree by **index**, so a refused
-      move left them permanently one apart and every later remove,
-      move and jump addressed the wrong track, with nothing said.
-      the same ordering lesson as `Op::RemoveFromQueue`, but it cannot
-      take the same shape: `append` picks the destination *as* it
-      moves, so there is nothing to ask mpv about beforehand. so the
-      local move is reversed on refusal and the failure is reported
-      ("queued X, but could not shuffle it in").
-      the reversal has to be exact including the play position, which
-      is what the test pins: at three different positions, append with
-      shuffle, reverse, and assert the order matches a plain append and
-      the playing track did not move. it asserts the shuffle actually
-      moved something first, so a position with nowhere to go cannot
-      make it vacuous.
+- [x] **the pause keybind went straight to mpv, so it had none of the
+      gap handling.** set `gap(5s)`, let a track end, press play during
+      the countdown: mpv unpaused at an eof that **immediately reports
+      itself again**, `between.cancel()` never ran so the countdown
+      kept drawing, and nothing played until the gap expired. the bar
+      click and enter on the player were always right, since both come
+      through `Op::TogglePause`, which is what made this look like a
+      gap bug rather than a keybind one.
+      the keybind goes through `core::toggle_pause` now, where play
+      during a hold means "get on with it" and the gap is dropped.
+      **and `toggle_pause`'s own doc was the lie that hid it**: it said
+      the three paths "cannot disagree" and named
+      `activate_transport` as the one caller, which was neither true
+      nor the actual call site. it now says what was wrong and points
+      at the test.
+      two source-level guards, both mutation-checked: the keybind
+      calling mpv directly again, and the op stopping sharing it. the
+      arm needs a live mpv and the whole host loop, and a bypass is
+      exactly what a behavioural test in the wrong place misses, which
+      is how this survived in the first place.
 - [ ] **two smaller ones from the same group are still open.**
       `core.rs` ~1539 `persist_eq` is the only writer of
       `cfg.eq_preset`/`eq_gains` and all three call sites are inside
