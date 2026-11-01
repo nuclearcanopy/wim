@@ -925,13 +925,52 @@ fn shades() -> &'static [Color; 256] {
     SHADES.get_or_init(|| std::array::from_fn(|i| shade(i as f32 / 255.0)))
 }
 
+/// What a sampling was keyed by, kept as two variants rather than one
+/// string for two reasons: a frame number must not have to be
+/// formatted (a video misses 25 times a second, and `framesource`'s
+/// allocation test is the one that noticed), and a number that
+/// happened to spell a cover's name would hand a frame back in place
+/// of the cover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Keyed {
+    Name(String),
+    Frame(u64),
+}
+
+/// The borrowed half of `Keyed`: what a caller passes, with no
+/// allocation on the hit path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyRef<'a> {
+    Name(&'a str),
+    Frame(u64),
+}
+
+impl KeyRef<'_> {
+    fn same_as(self, kept: &Keyed) -> bool {
+        match (self, kept) {
+            (KeyRef::Name(a), Keyed::Name(b)) => a == b,
+            (KeyRef::Frame(a), Keyed::Frame(b)) => a == *b,
+            _ => false,
+        }
+    }
+
+    /// Only ever called on a miss, which is where the one allocation
+    /// of the string path lives.
+    fn owned(self) -> Keyed {
+        match self {
+            KeyRef::Name(n) => Keyed::Name(n.to_string()),
+            KeyRef::Frame(f) => Keyed::Frame(f),
+        }
+    }
+}
+
 /// Everything a sampling depends on. Two renders agreeing on all of
 /// it produce byte-identical grids, which is the entire basis for
 /// `Memo` skipping the second one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Sampled {
     /// Names the *image*. Not the track, not the rect: see `Memo`.
-    key: String,
+    key: Keyed,
     /// The rect's size only. The same grid moved elsewhere on screen
     /// is the same rasterization, so a pane sliding sideways is not a
     /// resample.
@@ -995,13 +1034,46 @@ impl Memo {
         style: Style,
         buf: &mut Buffer,
     ) -> bool {
+        self.render_keyed(KeyRef::Name(key), img, area, cell_aspect, style, buf)
+    }
+
+    /// `render` for a video frame, keyed by a frame number that only
+    /// ever moves forwards.
+    ///
+    /// Not a `render` with a formatted key: this path misses once per
+    /// decoded frame, so building a `String` there would put an
+    /// allocation in a steady frame rate, which `framesource`'s own
+    /// allocation test forbids. The variant also makes a collision
+    /// with a cover's name unrepresentable rather than merely
+    /// unlikely.
+    pub fn render_frame(
+        &mut self,
+        stamp: u64,
+        img: &DynamicImage,
+        area: Rect,
+        cell_aspect: f32,
+        style: Style,
+        buf: &mut Buffer,
+    ) -> bool {
+        self.render_keyed(KeyRef::Frame(stamp), img, area, cell_aspect, style, buf)
+    }
+
+    fn render_keyed(
+        &mut self,
+        key: KeyRef<'_>,
+        img: &DynamicImage,
+        area: Rect,
+        cell_aspect: f32,
+        style: Style,
+        buf: &mut Buffer,
+    ) -> bool {
         let aspect = cell_aspect.to_bits();
         let sharpen = self.sharpen;
         // compared field by field rather than against a built
         // `Sampled`, so a hit (the common case, every frame) does not
         // allocate a copy of the key just to throw it away.
         let resampled = !self.last.as_ref().is_some_and(|l| {
-            l.key == key
+            key.same_as(&l.key)
                 && l.width == area.width
                 && l.height == area.height
                 && l.aspect == aspect
@@ -1012,7 +1084,7 @@ impl Memo {
             self.raster
                 .sample_with(img, area, cell_aspect, style, sharpen);
             self.last = Some(Sampled {
-                key: key.to_string(),
+                key: key.owned(),
                 width: area.width,
                 height: area.height,
                 aspect,
