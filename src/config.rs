@@ -85,6 +85,16 @@ pub enum VideoOutput {
     Auto,
     Tct,
     Kitty,
+    /// wim paints the frames itself, as cells, from
+    /// `framesource::FrameSource`; mpv keeps `vo=null` and is only the
+    /// audio clock.
+    ///
+    /// **Explicit only: `Auto` never picks this.** The maintainer
+    /// asked for it that way, and it is the right default anyway,
+    /// since a real protocol beats a cell grid wherever one exists.
+    /// It is for terminals with no image protocol at all, where the
+    /// alternative is no video.
+    Ascii,
     Off,
 }
 
@@ -1089,6 +1099,36 @@ pasword = "x"
         assert_eq!(cfg.cache_days_threshold, 4);
         let cfg: Config = toml::from_str("").expect("an empty config is all defaults");
         assert_eq!(cfg.cache_days_threshold, 2);
+    }
+
+    /// `video_output = "ascii"` parses, and the default is untouched.
+    ///
+    /// The variant is opt-in by design, so a config that does not name
+    /// it has to keep resolving to `Auto`; `video::auto_never_resolves_to_ascii`
+    /// pins the other half, that `Auto` will not pick it either.
+    #[test]
+    fn the_ascii_video_output_is_spelled_the_way_it_reads() {
+        let cfg: Config =
+            toml::from_str("video_output = \"ascii\"\n").expect("ascii has to parse");
+        assert_eq!(cfg.video_output, VideoOutput::Ascii);
+
+        for (raw, want) in [
+            ("auto", VideoOutput::Auto),
+            ("tct", VideoOutput::Tct),
+            ("kitty", VideoOutput::Kitty),
+            ("off", VideoOutput::Off),
+        ] {
+            let cfg: Config = toml::from_str(&format!("video_output = \"{raw}\"\n"))
+                .unwrap_or_else(|e| panic!("{raw} stopped parsing: {e}"));
+            assert_eq!(cfg.video_output, want, "{raw}");
+        }
+
+        let cfg: Config = toml::from_str("").expect("an empty config is all defaults");
+        assert_eq!(
+            cfg.video_output,
+            VideoOutput::Auto,
+            "adding a variant must not move the default"
+        );
     }
 
     /// A config written before the four art modes existed names a

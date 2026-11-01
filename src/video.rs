@@ -48,7 +48,9 @@ impl Vo {
 /// including a probe that has not answered yet (`None`).
 pub fn drawing_vo(want: VideoOutput, probed: Option<ProtocolType>) -> Option<Vo> {
     match want {
-        VideoOutput::Off => None,
+        // wim is painting it, so mpv must not; `showing` is the
+        // decision that can tell those apart.
+        VideoOutput::Off | VideoOutput::Ascii => None,
         VideoOutput::Tct => Some(Vo::Tct),
         VideoOutput::Kitty => Some(Vo::Kitty),
         VideoOutput::Auto if probed == Some(ProtocolType::Kitty) => Some(Vo::Kitty),
@@ -80,11 +82,58 @@ pub struct Screen {
 /// an audio file blanks the whole ui to show a picture that does not
 /// exist. `overlay` takes the screen back on purpose too; a menu nobody
 /// can see is a hang as far as the user is concerned.
-pub fn wanted(screen: Screen, want: VideoOutput, probed: Option<ProtocolType>) -> Option<Vo> {
-    if !screen.fullscreen || screen.minimized || screen.overlay || !screen.is_video {
-        return None;
+/// What should be on screen where the video goes.
+///
+/// Three answers, not two: "mpv draws nothing" and "there is no video"
+/// used to be the same `None`, and they are not. In `Ascii` wim paints
+/// the cells itself and mpv stays on `vo=null` as the audio clock, so
+/// a caller that only asked "which vo" could not tell that apart from
+/// a paused music track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Showing {
+    /// Not fullscreen, minimized, an overlay is up, or what is playing
+    /// is not a video.
+    Nothing,
+    /// mpv draws over the ui with this vo.
+    Mpv(Vo),
+    /// wim pulls frames and paints them as cells; see
+    /// `framesource::FrameSource`.
+    Ascii,
+}
+
+impl Showing {
+    /// The vo to hand mpv, which is `None` for ascii as much as for
+    /// nothing: in both cases mpv must not draw.
+    pub fn mpv_vo(self) -> Option<Vo> {
+        match self {
+            Showing::Mpv(vo) => Some(vo),
+            Showing::Nothing | Showing::Ascii => None,
+        }
     }
-    drawing_vo(want, probed)
+
+    pub fn is_ascii(self) -> bool {
+        self == Showing::Ascii
+    }
+}
+
+/// The same screen gates apply to ascii as to a real vo: 'v' is on,
+/// the player is not collapsed, no menu is over it, and what plays is
+/// a video. Non-fullscreen video is the separate sub-rect item.
+pub fn showing(screen: Screen, want: VideoOutput, probed: Option<ProtocolType>) -> Showing {
+    if !screen.fullscreen || screen.minimized || screen.overlay || !screen.is_video {
+        return Showing::Nothing;
+    }
+    if want == VideoOutput::Ascii {
+        return Showing::Ascii;
+    }
+    match drawing_vo(want, probed) {
+        Some(vo) => Showing::Mpv(vo),
+        None => Showing::Nothing,
+    }
+}
+
+pub fn wanted(screen: Screen, want: VideoOutput, probed: Option<ProtocolType>) -> Option<Vo> {
+    showing(screen, want, probed).mpv_vo()
 }
 
 /// A rect wim deliberately leaves unpainted, so mpv's own output can
@@ -236,6 +285,131 @@ mod tests {
                 None,
                 "{want:?} over audio"
             );
+        }
+    }
+
+    /// Ascii is an opt-in, and `Auto` never picks it.
+    ///
+    /// A real protocol beats a cell grid wherever one exists, so
+    /// probing into ascii would be a downgrade. It is for terminals
+    /// with no image protocol at all, where the alternative is no
+    /// video.
+    #[test]
+    fn auto_never_resolves_to_ascii() {
+        for probed in [
+            None,
+            Some(ProtocolType::Kitty),
+            Some(ProtocolType::Sixel),
+            Some(ProtocolType::Iterm2),
+        ] {
+            let got = showing(playing_video(), VideoOutput::Auto, probed);
+            assert!(
+                !got.is_ascii(),
+                "auto picked ascii with {probed:?} available: {got:?}"
+            );
+            assert!(
+                matches!(got, Showing::Mpv(_)),
+                "auto has to land on a real vo: {got:?}"
+            );
+        }
+        assert!(showing(playing_video(), VideoOutput::Ascii, None).is_ascii());
+    }
+
+    /// The distinction the third variant exists for: "mpv draws
+    /// nothing" is not "there is no video".
+    ///
+    /// Both answer `None` to "which vo", which is why a caller that
+    /// only asked that could not tell an ascii frame pull from a
+    /// paused music track.
+    #[test]
+    fn ascii_hands_mpv_no_vo_and_is_still_not_nothing() {
+        let ascii = showing(playing_video(), VideoOutput::Ascii, None);
+        let off = showing(playing_video(), VideoOutput::Off, None);
+        let audio = showing(
+            Screen {
+                is_video: false,
+                ..playing_video()
+            },
+            VideoOutput::Ascii,
+            None,
+        );
+
+        assert_eq!(ascii.mpv_vo(), None, "wim paints it, so mpv must not");
+        assert_eq!(off.mpv_vo(), None);
+        assert_eq!(audio.mpv_vo(), None);
+
+        assert!(ascii.is_ascii());
+        assert!(!off.is_ascii(), "off means off, not painted by wim");
+        assert!(
+            !audio.is_ascii(),
+            "a music track must not start a frame pull"
+        );
+        assert_eq!(off, Showing::Nothing);
+        assert_eq!(audio, Showing::Nothing);
+    }
+
+    /// Ascii is behind the same screen gates as a real vo, so a menu
+    /// over it stops the pull rather than being painted under frames.
+    #[test]
+    fn ascii_is_behind_the_same_screen_gates() {
+        for (label, screen) in [
+            (
+                "not fullscreen",
+                Screen {
+                    fullscreen: false,
+                    ..playing_video()
+                },
+            ),
+            (
+                "minimized",
+                Screen {
+                    minimized: true,
+                    ..playing_video()
+                },
+            ),
+            (
+                "an overlay is up",
+                Screen {
+                    overlay: true,
+                    ..playing_video()
+                },
+            ),
+        ] {
+            assert_eq!(
+                showing(screen, VideoOutput::Ascii, None),
+                Showing::Nothing,
+                "{label}: the pull has to stop"
+            );
+        }
+    }
+
+    /// `wanted` is `showing(..).mpv_vo()`, so the two cannot drift;
+    /// every existing caller asks the old question and gets the old
+    /// answer.
+    #[test]
+    fn wanted_still_answers_exactly_what_showing_does() {
+        for want in [
+            VideoOutput::Auto,
+            VideoOutput::Tct,
+            VideoOutput::Kitty,
+            VideoOutput::Ascii,
+            VideoOutput::Off,
+        ] {
+            for probed in [None, Some(ProtocolType::Kitty)] {
+                for screen in [
+                    playing_video(),
+                    Screen {
+                        overlay: true,
+                        ..playing_video()
+                    },
+                ] {
+                    assert_eq!(
+                        wanted(screen, want, probed),
+                        showing(screen, want, probed).mpv_vo(),
+                        "{want:?} {probed:?}"
+                    );
+                }
+            }
         }
     }
 

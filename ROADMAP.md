@@ -546,11 +546,36 @@ and `in-workspace (sub-rect) video` is still kitty-only via
 - [ ] **video plays as real video in the workspace.** confirm the
       maximized-song path actually shows a real video surface for a
       video file, not the album-art fallback and not ascii.
-- [ ] **ascii video renderer, opt-in.** same technique as album art,
-      via the shared rasterizer being extracted on `perf/art`:
-      half-block glyphs so one cell carries two vertical samples.
-      toggled by the user (config key plus a shellsong command plus a
-      key binding); default off.
+- [ ] **ascii video renderer, opt-in.** the frame source and the
+      rasterizer both exist (`framesource.rs`, and `ui::raster` needed
+      no change), so what is left is wiring.
+      - [x] **the opt-in itself.** `VideoOutput::Ascii` parses as
+        `video_output = "ascii"`, and the decision grew a **third
+        answer**: "mpv draws nothing" and "there is no video" were the
+        same `None`, and they are not. in ascii, mpv keeps `vo=null`
+        as the audio clock while wim paints the cells, so a caller
+        asking only "which vo" could not tell that apart from a paused
+        music track. `video::showing` answers
+        `Nothing | Mpv(vo) | Ascii`, and `wanted` is
+        `showing(..).mpv_vo()` so the two cannot drift (a test walks
+        every variant against every probe and asserts they agree).
+        **`Auto` never picks it**, which the maintainer asked for and
+        is right anyway: a real protocol beats a cell grid wherever
+        one exists, so probing into ascii would be a downgrade. it is
+        for terminals with no image protocol at all.
+        the same screen gates apply as to a real vo (fullscreen, not
+        minimized, no overlay, is a video), so a menu over it stops
+        the pull rather than being painted under frames;
+        non-fullscreen video stays the separate sub-rect item.
+        four mutations caught: `Auto` falling through to nothing,
+        ascii being indistinguishable from off, mpv drawing over the
+        cells wim is painting, and ascii skipping the screen gates.
+      - [ ] **the pane, which is the rest of it.** `FrameSource::paint`
+        writes into a `Buffer`, so the draw path can take it; what is
+        missing is the host owning a source, starting and stopping it
+        off `showing(..).is_ascii()`, resizing it on a pane resize, and
+        restarting it on a seek. a shellsong command and a key to
+        toggle the mode want to come with it.
 - [ ] **usable at absurd zoom-out.** ascii video is only watchable
       once the font is small enough to give a few hundred cells across,
       so the layout has to survive that: sidebar and bottom bar must
