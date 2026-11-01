@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use crossterm::event::KeyCode;
@@ -294,12 +295,12 @@ impl Widget for ControlsBar<'_> {
         }
 
         let (y, inline_mode) = self.control_row(area);
-        let mode_label = self.mode_label();
         let mode_on_its_own_row = inline_mode.is_none();
         if mode_on_its_own_row {
             // the row directly above the controls, which `control_row`
             // already accounted for.
             let y = y - 1;
+            let mode_label = self.mode_label();
             let hint = if self.move_mode {
                 "wasd/arrows: focus pane, enter: interact".to_string()
             } else if self.scrubbing {
@@ -565,18 +566,47 @@ pub struct BarLayout {
     pub track: Option<Rect>,
 }
 
-/// One element as the row draws it: the text at the width the scrubber
-/// ended up with, the columns it occupies, and (for the scrubber) the
-/// track cells inside those.
+/// One element as the row draws it: the columns it occupies and (for
+/// the scrubber) the track cells inside those.
+///
+/// No text: the hit layout wants none of it, and building the
+/// scrubber's meant a `String` per cell of the track and then a walk
+/// back over it to measure, on both of a frame's two passes.
+/// `body_text` builds it at paint time instead.
 struct Placed<'s> {
     seg: &'s Segment,
-    text: String,
     rect: Rect,
     track: Option<Rect>,
     /// Cells `track` was built at, which stays right even where the
     /// rect above got clipped by the bar's right edge; the drag redraw
     /// has to ask for the same width or the row shifts mid-drag.
     track_cells: usize,
+}
+
+/// What the element paints, at the width the scrubber ended up with.
+/// The drag head is a different glyph, so this is the one thing
+/// `place` cannot answer: it has no business knowing the mode.
+fn body_text(seg: &Segment, track_cells: usize, dragging: bool) -> Cow<'_, str> {
+    match &seg.body {
+        Body::Glyph(s) => Cow::Borrowed(s),
+        Body::Track {
+            elapsed,
+            total,
+            frac,
+        } => {
+            // one string at its final size: the readouts either side
+            // of a track that is already the row's longest element.
+            let mut out = String::with_capacity(
+                elapsed.len() + total.len() + 2 + track_cells * TRACK_DONE.len_utf8(),
+            );
+            out.push_str(elapsed);
+            out.push(' ');
+            track_into(&mut out, *frac, track_cells, dragging);
+            out.push(' ');
+            out.push_str(total);
+            Cow::Owned(out)
+        }
+    }
 }
 
 /// Lays the control line out once. `render` paints from this and
@@ -603,21 +633,16 @@ fn place<'s>(segments: &'s [Segment], area: Rect, y: u16) -> Vec<Placed<'s>> {
         if x >= limit {
             break;
         }
-        let (text, track_cells) = match &seg.body {
-            Body::Glyph(s) => (s.clone(), None),
-            Body::Track {
-                elapsed,
-                total,
-                frac,
-            } => {
-                let cells = TRACK_MIN + slack;
-                (
-                    format!("{elapsed} {} {total}", track(*frac, cells, false)),
-                    Some((width(elapsed) + 1, cells)),
-                )
-            }
+        // arithmetic, not measured: a glyph body is exactly its own
+        // minimum, and the scrubber is that plus the slack it absorbs.
+        // measuring instead meant building the row's text here and
+        // walking every cell of the track to count it, on the hit pass
+        // as well as the paint one.
+        let track_cells = match &seg.body {
+            Body::Glyph(_) => None,
+            Body::Track { elapsed, .. } => Some((width(elapsed) + 1, TRACK_MIN + slack)),
         };
-        let drawn = (width(&text) as u16).min(limit - x);
+        let drawn = ((mins[i] + track_cells.map_or(0, |_| slack)) as u16).min(limit - x);
         out.push(Placed {
             seg,
             track_cells: track_cells.map_or(TRACK_MIN, |(_, cells)| cells),
@@ -636,7 +661,6 @@ fn place<'s>(segments: &'s [Segment], area: Rect, y: u16) -> Vec<Placed<'s>> {
                 width: drawn,
                 height: 1,
             },
-            text,
         });
         x += drawn;
     }
@@ -684,23 +708,7 @@ fn draw_placed(
     if x > area.x {
         draw_chars(buf, x - 2, limit, y, "  ", shade(DIM), None);
     }
-    // the drag head is a different glyph, so the text has to be built
-    // knowing the mode; `place` has no business knowing it, which is
-    // the one thing redrawn here rather than reused.
-    let text = match (&seg.body, dragging) {
-        (
-            Body::Track {
-                elapsed,
-                total,
-                frac,
-            },
-            true,
-        ) => format!(
-            "{elapsed} {} {total}",
-            track(*frac, placed.track_cells, true)
-        ),
-        _ => placed.text.clone(),
-    };
+    let text = body_text(seg, placed.track_cells, dragging);
     // the plate is exactly `placed.rect`, which is also exactly what
     // `layout` reports as this control's clickable cells. it used to
     // pad a cell each side so a single-glyph element read as a plate
@@ -726,6 +734,16 @@ fn draw_placed(
 /// only in the plate behind it. `pub` for the maximized player, which
 /// draws the same scrubber at its own width.
 pub fn track(frac: f64, cells: usize, dragging: bool) -> String {
+    let mut out = String::new();
+    track_into(&mut out, frac, cells, dragging);
+    out
+}
+
+/// `track` onto the end of `out`, so a row that puts a readout either
+/// side of it builds one string rather than three. Reserves what it
+/// needs: collecting the glyphs grew the string from the iterator's
+/// lower bound of one byte a cell, where each of these is three.
+pub fn track_into(out: &mut String, frac: f64, cells: usize, dragging: bool) {
     let cells = cells.max(TRACK_MIN);
     let head = if dragging {
         TRACK_HEAD_DRAG
@@ -733,13 +751,14 @@ pub fn track(frac: f64, cells: usize, dragging: bool) -> String {
         TRACK_HEAD
     };
     let pos = ((frac.clamp(0.0, 1.0) * (cells - 1) as f64).round() as usize).min(cells - 1);
-    (0..cells)
-        .map(|i| match i.cmp(&pos) {
+    out.reserve(cells * TRACK_DONE.len_utf8());
+    for i in 0..cells {
+        out.push(match i.cmp(&pos) {
             Ordering::Less => TRACK_DONE,
             Ordering::Equal => head,
             Ordering::Greater => TRACK_LEFT,
-        })
-        .collect()
+        });
+    }
 }
 
 /// One row of plate between two columns; `pub` for the player's
@@ -1646,6 +1665,48 @@ mod tests {
         assert!(rows[2].contains(GLYPH_QUEUE), "{:?}", rows[2]);
     }
 
+    /// `place` sizes each element by arithmetic (a glyph body is its
+    /// own minimum, the scrubber is that plus the slack) rather than by
+    /// measuring the text it builds, which cost a walk over every cell
+    /// of the track on both of a frame's passes. The two have to agree
+    /// exactly: the rect is the plate, the hit target and the cursor's
+    /// own idea of where the row ends.
+    #[test]
+    fn the_width_place_computes_is_the_width_of_the_text_drawn() {
+        for width_cells in [8u16, 12, 20, 30, 46, 60, 100, 160, 200] {
+            let mut bar = plain_bar();
+            bar.queue_len = 17;
+            bar.loop_mode = LoopMode::One;
+            bar.speed = 1.25;
+            bar.gap_remaining = Some(6.2);
+            let area = Rect::new(0, 0, width_cells, 2);
+            let segments = bar.segments(None);
+            let placed = place(&segments, area, 1);
+            assert!(!placed.is_empty(), "{width_cells} cells placed nothing");
+            for p in &placed {
+                for dragging in [false, true] {
+                    let text = body_text(p.seg, p.track_cells, dragging);
+                    // exactly, not clipped to the right edge: the fit
+                    // pass places only elements that fit whole, so a
+                    // rect the edge had to cut back would already mean
+                    // the arithmetic and the text had diverged.
+                    assert_eq!(
+                        usize::from(p.rect.width),
+                        width(&text),
+                        "{:?} at {width_cells} cells: {text:?}",
+                        p.seg.field,
+                    );
+                }
+                assert!(
+                    p.rect.x + p.rect.width <= area.x + area.width,
+                    "{:?} at {width_cells} cells runs past the bar: {:?}",
+                    p.seg.field,
+                    p.rect
+                );
+            }
+        }
+    }
+
     /// The invariant the padding broke: every cell the selection plate
     /// lights is a cell `layout` reports as that control's, and every
     /// cell it reports is lit. Clicking what looks highlighted has to
@@ -1810,16 +1871,125 @@ mod bench {
                         draw_placed(&mut buf, area, p, bar.flash, bar.selected, bar.scrubbing);
                     }
                 }
+                // the row above the controls, as `render` builds and
+                // paints it: two labels resolved from the keymap and
+                // three writes.
                 _ => {
-                    std::hint::black_box(bar.mode_label());
-                    std::hint::black_box(console_hint());
+                    let label = bar.mode_label();
+                    let hint = format!(
+                        "arrows: pick, enter: use, tab: move focus, {}",
+                        console_hint()
+                    );
+                    let x = draw_chars(&mut buf, area.x, w, 0, &label, shade(DIM), None);
+                    draw_chars(&mut buf, x, w, 0, "  ", shade(DIM), None);
+                    draw_chars(&mut buf, x + 2, w, 0, &hint, shade(NEAR_BLACK), None);
                 }
             });
             println!(
                 "{w}x2: segments {segments:>9.3?}  place {placing:>9.3?}  \
-                 paint {painting:>9.3?}  mode line {mode:>9.3?}"
+                 paint {painting:>9.3?}  mode row {mode:>9.3?}"
             );
         }
+    }
+
+    /// `place`'s geometry with each element sized by measuring the text
+    /// it builds, which is the shape it replaced: the hit pass paid for
+    /// a `String` per cell of the track and a walk back over it, and so
+    /// did the paint pass.
+    /// `the_width_place_computes_is_the_width_of_the_text_drawn` pins
+    /// that the arithmetic and this agree, so the only difference here
+    /// is the cost.
+    fn measuring_place(segments: &[Segment], area: Rect, y: u16) -> Vec<Rect> {
+        let limit = area.x + area.width;
+        let avail = area.width as usize;
+        let mins: Vec<usize> = segments.iter().map(Segment::min_width).collect();
+        let fits = segments_that_fit(&mins, avail, 2);
+        let used: usize = mins[..fits].iter().sum::<usize>() + fits.saturating_sub(1) * 2;
+        let slack = avail.saturating_sub(used);
+        let mut out = Vec::with_capacity(fits);
+        let mut x = area.x;
+        for (i, seg) in segments.iter().take(fits).enumerate() {
+            if i > 0 {
+                x += 2;
+            }
+            if x >= limit {
+                break;
+            }
+            let cells = match &seg.body {
+                Body::Glyph(_) => TRACK_MIN,
+                Body::Track { .. } => TRACK_MIN + slack,
+            };
+            let drawn = (width(&body_text(seg, cells, false)) as u16).min(limit - x);
+            out.push(Rect {
+                x,
+                y,
+                width: drawn,
+                height: 1,
+            });
+            x += drawn;
+        }
+        out
+    }
+
+    /// The fit-and-place pass, arithmetic against measured. It runs
+    /// twice a frame (the hit layout and then the paint), so this ratio
+    /// lands on the frame twice.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn place_cost() {
+        println!("\n== controlsbar place ({}) ==", profile());
+        for w in WIDTHS {
+            let area = Rect::new(0, 0, w, 2);
+            let segs = busy().segments(None);
+            let [arithmetic, measured] = best_each::<2>(6, 5000, |which| match which {
+                0 => {
+                    std::hint::black_box(place(&segs, area, 1));
+                }
+                _ => {
+                    std::hint::black_box(measuring_place(&segs, area, 1));
+                }
+            });
+            println!("{w}x2: arithmetic {arithmetic:>9.3?}  measured {measured:>9.3?}");
+        }
+    }
+
+    /// The scrubber on its own, since it is the one element whose text
+    /// is as long as the bar: what it costs to build, to measure, to
+    /// paint and to plate. The paint is `draw::at_styled`'s and is the
+    /// floor here; everything around it has been taken off the frame.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn scrubber_cost() {
+        let w = 200u16;
+        let area = Rect::new(0, 0, w, 2);
+        let mut buf = buffer(w, 2);
+        let bar = busy();
+        let segs = bar.segments(None);
+        let placed = place(&segs, area, 1);
+        let scrubber = placed.last().expect("a 200-cell bar keeps the scrubber");
+        let cells = scrubber.track_cells;
+        let text = body_text(scrubber.seg, cells, false).into_owned();
+        println!(
+            "\n== controlsbar scrubber ({}) == {cells} track cells, {} chars of text",
+            profile(),
+            text.chars().count(),
+        );
+        let [build, measure, paint, plate] = best_each::<4>(6, 2000, |which| match which {
+            0 => {
+                std::hint::black_box(body_text(scrubber.seg, cells, false));
+            }
+            1 => {
+                std::hint::black_box(width(&text));
+            }
+            2 => {
+                std::hint::black_box(draw_chars(&mut buf, 0, w, 1, &text, shade(BRIGHT), None));
+            }
+            _ => fill_bg(&mut buf, 0, w, 1, shade(SELECT_BG)),
+        });
+        println!(
+            "build {build:>9.3?}  measure {measure:>9.3?}  paint {paint:>9.3?}  \
+             plate {plate:>9.3?}"
+        );
     }
 
     /// The scrubber's track, against the `collect`-from-chars shape it
