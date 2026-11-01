@@ -50,7 +50,12 @@ mod frame_budget {
     /// Alternating batches in one process, best of each; sequential
     /// runs on this box differ 1.6-1.8x under load. Same harness as
     /// `framesource::frame_budget`.
-    fn best_each(rounds: usize, iters: usize, a: &mut dyn FnMut(), b: &mut dyn FnMut()) -> (f64, f64) {
+    fn best_each(
+        rounds: usize,
+        iters: usize,
+        a: &mut dyn FnMut(),
+        b: &mut dyn FnMut(),
+    ) -> (f64, f64) {
         let mut best = (f64::MAX, f64::MAX);
         let time = |f: &mut dyn FnMut()| {
             let at = Instant::now();
