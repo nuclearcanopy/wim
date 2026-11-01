@@ -99,42 +99,91 @@ impl Rows for Ranked<'_> {
 /// carrying its index into the row source so the caller can map back
 /// to it (`self.selected` stays a plain row index; headers never get
 /// one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayRow {
     Header(Category),
     Item(usize),
 }
 
-/// Flattens `rows` (already grouped into category runs by the
-/// ranking) into a display-row sequence with a header before each
-/// run, plus the scroll offset keeping `selected` visible within
-/// `visible_rows`. The one place both this widget's own render and
-/// main.rs's sidebar-divider header-junction marks compute this, so
-/// they can't disagree about where a header actually lands.
+/// Where every display row of a list lands, as an answer per row
+/// rather than as a sequence.
+///
+/// The whole sequence is a function of the category boundaries alone:
+/// header `k` sits at display row `boundary[k] + k`, strictly
+/// increasing, so one binary search over the headers places any row.
+/// `search::rank_order` groups the order by category, which caps the
+/// header count at `Category`'s variants however long the list gets,
+/// so this is a handful of entries where the sequence was one per
+/// match. main.rs asks for this geometry three times a frame, and a
+/// `Vec` the length of the match set cost 28% of a 144hz frame at 15k
+/// matches (see `frame_budget`).
+pub struct RowLayout {
+    /// `(display row, category)` per section header, ascending.
+    headers: Vec<(usize, Category)>,
+    count: usize,
+    /// First display row of the pane, keeping `selected` on screen.
+    pub scroll_offset: usize,
+}
+
+impl RowLayout {
+    /// Display rows in total: one per row plus one per header.
+    fn len(&self) -> usize {
+        self.count + self.headers.len()
+    }
+
+    /// The display row at `at`, or `None` past the end.
+    pub fn get(&self, at: usize) -> Option<DisplayRow> {
+        if at >= self.len() {
+            return None;
+        }
+        // headers at or before `at`: the last of them *is* `at` when
+        // `at` is a header row, and otherwise counts how far the
+        // headers above have pushed this row past its row index.
+        let before = self.headers.partition_point(|&(row, _)| row <= at);
+        match before.checked_sub(1).and_then(|k| self.headers.get(k)) {
+            Some(&(row, cat)) if row == at => Some(DisplayRow::Header(cat)),
+            _ => Some(DisplayRow::Item(at - before)),
+        }
+    }
+}
+
+/// Lays `rows` (already grouped into category runs by the ranking)
+/// out as display rows with a header before each run, plus the scroll
+/// offset keeping `selected` visible within `visible_rows`. The one
+/// place both this widget's own render and main.rs's sidebar-divider
+/// header-junction marks compute this, so they can't disagree about
+/// where a header actually lands.
 ///
 /// Reads nothing but the count and the boundaries, which is why it
 /// takes `&dyn Rows` rather than a list of rows.
-pub fn layout(rows: &dyn Rows, selected: usize, visible_rows: usize) -> (Vec<DisplayRow>, usize) {
+pub fn layout(rows: &dyn Rows, selected: usize, visible_rows: usize) -> RowLayout {
     let count = rows.count();
     let boundaries = rows.boundaries();
-    let mut display = Vec::with_capacity(count + boundaries.len());
-    let mut next_boundary = boundaries.into_iter().peekable();
-    for i in 0..count {
-        if let Some((idx, cat)) = next_boundary.peek() {
-            if *idx == i {
-                display.push(DisplayRow::Header(*cat));
-                next_boundary.next();
-            }
+    let mut headers = Vec::with_capacity(boundaries.len());
+    // a row's display position is its index plus the headers above it,
+    // which is also what `selected`'s own position needs. a boundary
+    // at or past `count` names no row, so it gets no header.
+    let mut selected_row = selected;
+    for (k, (idx, cat)) in boundaries
+        .into_iter()
+        .take_while(|&(idx, _)| idx < count)
+        .enumerate()
+    {
+        headers.push((idx + k, cat));
+        if idx <= selected {
+            selected_row += 1;
         }
-        display.push(DisplayRow::Item(i));
     }
-    let selected_row = display
-        .iter()
-        .position(|r| matches!(r, DisplayRow::Item(i) if *i == selected))
-        .unwrap_or(0);
-    (
-        display,
-        crate::ui::scroll::offset_for(selected_row, visible_rows),
-    )
+    // `selected` naming no row scrolls to the top, same answer the
+    // position scan this replaced gave by failing to find it.
+    if selected >= count {
+        selected_row = 0;
+    }
+    RowLayout {
+        headers,
+        count,
+        scroll_offset: crate::ui::scroll::offset_for(selected_row, visible_rows),
+    }
 }
 
 /// Absolute rows of `area` on which `render` draws a section-header
@@ -147,9 +196,14 @@ pub fn header_rows(items: &dyn Rows, selected: usize, area: Rect) -> Vec<u16> {
         return Vec::new();
     }
     let visible_rows = area.height as usize;
-    let (rows, scroll_offset) = layout(items, selected, visible_rows);
+    let rows = layout(items, selected, visible_rows);
     (0..visible_rows)
-        .filter(|row| matches!(rows.get(scroll_offset + row), Some(DisplayRow::Header(_))))
+        .filter(|row| {
+            matches!(
+                rows.get(rows.scroll_offset + row),
+                Some(DisplayRow::Header(_))
+            )
+        })
         .map(|row| area.y + row as u16)
         .collect()
 }
@@ -163,10 +217,10 @@ pub fn row_items(items: &dyn Rows, selected: usize, area: Rect) -> Vec<Option<us
         return Vec::new();
     }
     let visible_rows = area.height as usize;
-    let (rows, scroll_offset) = layout(items, selected, visible_rows);
+    let rows = layout(items, selected, visible_rows);
     (0..visible_rows)
-        .map(|row| match rows.get(scroll_offset + row) {
-            Some(DisplayRow::Item(idx)) => Some(*idx),
+        .map(|row| match rows.get(rows.scroll_offset + row) {
+            Some(DisplayRow::Item(idx)) => Some(idx),
             _ => None,
         })
         .collect()
@@ -302,10 +356,10 @@ impl Widget for ResultsList<'_> {
         }
 
         let visible_rows = area.height as usize;
-        let (rows, scroll_offset) = layout(self.items, self.selected, visible_rows);
+        let rows = layout(self.items, self.selected, visible_rows);
 
         for row in 0..visible_rows {
-            let Some(display_row) = rows.get(scroll_offset + row) else {
+            let Some(display_row) = rows.get(rows.scroll_offset + row) else {
                 break;
             };
             let y = area.y + row as u16;
@@ -316,10 +370,10 @@ impl Widget for ResultsList<'_> {
                     // `count()` covered this index a moment ago, so a
                     // miss is a corpus that moved mid-render; draw
                     // nothing rather than guess at a row.
-                    let Some(item) = self.items.row(*idx) else {
+                    let Some(item) = self.items.row(idx) else {
                         continue;
                     };
-                    let is_selected = *idx == self.selected;
+                    let is_selected = idx == self.selected;
 
                     // the selection reads off the row's background,
                     // not its borders; the marker and brightness bump
@@ -426,6 +480,163 @@ pub(crate) fn draw_header_row(buf: &mut Buffer, area: Rect, y: u16, label: &str)
     crate::ui::draw::centered(buf, row, y, &text, shade(DIM));
 }
 
+/// What a frame of this list costs, and whether it costs it per
+/// *visible row* or per row in the whole result set. main.rs asks for
+/// the row geometry three times a frame (the sidebar divider's
+/// junction marks, then the click map, then the paint), so anything in
+/// here that scales with the match count is paid for three times at
+/// the display's rate.
+///
+/// A measurement, not an assertion: the numbers move with the box and
+/// a ceiling here would be a flake. Run it with
+/// `cargo test --release --lib ui::results_list::frame_budget -- --ignored --nocapture`;
+/// the dev profile is `opt-level = 0` and reads about 10x the shipping
+/// cost, which is why the build is the first thing printed.
+#[cfg(test)]
+mod frame_budget {
+    use super::*;
+    use crate::library::{LocalTrack, MediaKind};
+    use crate::search::Ranking;
+    use crate::ui::testbuf::buffer;
+    use std::time::Instant;
+
+    /// Alternating batches in one process, best of each. Sequential
+    /// runs on this box differ 1.6-1.8x under load, so two separate
+    /// measurements are not comparable and this is the only shape that
+    /// is; same harness as `framesource::frame_budget`.
+    fn best_each(rounds: usize, iters: usize, a: &mut dyn FnMut(), b: &mut dyn FnMut()) -> (f64, f64) {
+        let mut best = (f64::MAX, f64::MAX);
+        let time = |f: &mut dyn FnMut()| {
+            let at = Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            at.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+        for _ in 0..rounds {
+            best.0 = best.0.min(time(a));
+            best.1 = best.1.min(time(b));
+        }
+        best
+    }
+
+    /// `n` tracks ranked the way `App` holds them, alternating music
+    /// and video so the order has two category runs and the layout has
+    /// headers to place (`rank_order` groups by category, so the run
+    /// count is bounded by `Category`'s variants however long the list
+    /// gets).
+    fn ranked(n: usize) -> (Corpus, Ranking) {
+        let mut corpus = Corpus::new();
+        corpus.add_local_tracks((0..n).map(|i| LocalTrack {
+            path: format!("/m/{i}.flac").into(),
+            title: format!("track {i}"),
+            artist: Some(format!("artist {}", i % 97)),
+            album: None,
+            duration_secs: None,
+            kind: if i % 2 == 0 {
+                MediaKind::Music
+            } else {
+                MediaKind::Video
+            },
+        }));
+        let ranking = corpus.rank("track");
+        (corpus, ranking)
+    }
+
+    /// A sidebar's worth: the real pane is about this wide and this is
+    /// a tall terminal's row count.
+    const PANE: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 28,
+        height: 40,
+    };
+
+    /// One frame's work on this list: the two geometry calls main.rs
+    /// makes outside the widget, plus the paint (which lays the
+    /// geometry out a third time itself).
+    fn frame(rows: &dyn Rows, selected: usize, buf: &mut Buffer) {
+        let _ = header_rows(rows, selected, PANE);
+        let _ = row_items(rows, selected, PANE);
+        ResultsList {
+            items: rows,
+            selected,
+            empty_message: "",
+            favorites: &Favorites::default(),
+            remote_starred: &HashSet::new(),
+            focused: true,
+            elapsed: Duration::ZERO,
+        }
+        .render(PANE, buf);
+    }
+
+    #[test]
+    #[ignore = "a measurement; run it explicitly"]
+    fn what_a_frame_of_the_results_list_costs() {
+        // 144hz is `anim::MAX_HZ`, the fastest the poll loop will ever
+        // redraw at, so it is the tightest deadline this path has.
+        let budget = 1e6 / crate::anim::MAX_HZ as f64;
+        println!(
+            "--- results list, {} rows visible, budget {budget:.0}us at {}hz, {} build",
+            PANE.height,
+            crate::anim::MAX_HZ,
+            if cfg!(debug_assertions) {
+                "DEBUG (not the shipping cost; re-run with --release)"
+            } else {
+                "release"
+            }
+        );
+        // the short list is the control: a pane's worth of rows and
+        // nothing more. Any gap between the two is work the frame did
+        // on rows that are not on screen.
+        let (small_corpus, small_ranking) = ranked(PANE.height as usize);
+        let small = Ranked {
+            ranking: &small_ranking,
+            corpus: &small_corpus,
+        };
+        for n in [2_000usize, 8_000, 15_000] {
+            let (corpus, ranking) = ranked(n);
+            let long = Ranked {
+                ranking: &ranking,
+                corpus: &corpus,
+            };
+            let count = long.count();
+            let runs = long.boundaries().len();
+            let mut long_buf = buffer(PANE.width, PANE.height);
+            let mut small_buf = buffer(PANE.width, PANE.height);
+            let mut on_long = || frame(&long, 0, &mut long_buf);
+            let mut on_small = || frame(&small, 0, &mut small_buf);
+            let (big, ctrl) = best_each(5, 20, &mut on_long, &mut on_small);
+            println!(
+                "  {n:>6} tracks -> {count:>6} matches in {runs} category runs: frame {big:>8.1}us ({:>5.1}% of budget)   {} on screen {ctrl:>7.1}us   {:.1}x",
+                big / budget * 100.0,
+                PANE.height,
+                big / ctrl,
+            );
+            // the geometry on its own, against the materializing
+            // shape it replaced: this is the call main.rs makes three
+            // times a frame, so the gap is paid three times.
+            let mut lazy = || {
+                let l = layout(&long, 0, PANE.height as usize);
+                for row in 0..PANE.height as usize {
+                    std::hint::black_box(l.get(l.scroll_offset + row));
+                }
+            };
+            let mut eager = || {
+                let (rows, offset) = super::tests::eager_layout(&long, 0, PANE.height as usize);
+                for row in 0..PANE.height as usize {
+                    std::hint::black_box(rows.get(offset + row));
+                }
+            };
+            let (fast, slow) = best_each(5, 20, &mut lazy, &mut eager);
+            println!(
+                "            one screenful of geometry: boundaries-only {fast:>8.1}us   materialized {slow:>8.1}us   {:.1}x",
+                slow / fast,
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +654,94 @@ mod tests {
                 album: None,
             })
             .collect()
+    }
+
+    /// Rows whose category flips every 7th, so the geometry has a
+    /// string of header runs to place rather than the single one a
+    /// flat list has. More runs than a real ranking can produce
+    /// (`rank_order` groups by category), which is the point: the
+    /// header arithmetic is what is under test.
+    pub(super) fn mixed(n: usize) -> Vec<SearchItem> {
+        (0..n)
+            .map(|i| {
+                if (i / 7) % 2 == 0 {
+                    SearchItem::LocalMusic {
+                        path: format!("/m/{i}.flac").into(),
+                        title: format!("track {i}"),
+                        artist: None,
+                        album: None,
+                    }
+                } else {
+                    SearchItem::LocalVideo {
+                        path: format!("/v/{i}.mkv").into(),
+                        title: format!("clip {i}"),
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// What `layout` used to be: the display-row sequence as a `Vec`
+    /// the length of the whole list, plus a linear scan for the
+    /// selected row. Kept as the definition `RowLayout` has to agree
+    /// with at every index; `frame_budget` next door times the two
+    /// against each other, which is the only reason the old shape is
+    /// worth keeping around.
+    pub(super) fn eager_layout(
+        rows: &dyn Rows,
+        selected: usize,
+        visible_rows: usize,
+    ) -> (Vec<DisplayRow>, usize) {
+        let count = rows.count();
+        let boundaries = rows.boundaries();
+        let mut display = Vec::with_capacity(count + boundaries.len());
+        let mut next_boundary = boundaries.into_iter().peekable();
+        for i in 0..count {
+            if let Some((idx, cat)) = next_boundary.peek() {
+                if *idx == i {
+                    display.push(DisplayRow::Header(*cat));
+                    next_boundary.next();
+                }
+            }
+            display.push(DisplayRow::Item(i));
+        }
+        let selected_row = display
+            .iter()
+            .position(|r| matches!(r, DisplayRow::Item(i) if *i == selected))
+            .unwrap_or(0);
+        (
+            display,
+            crate::ui::scroll::offset_for(selected_row, visible_rows),
+        )
+    }
+
+    /// `RowLayout` answers one display row at a time out of the
+    /// category boundaries instead of out of a `Vec` as long as the
+    /// list. It has to give the same answer at every index, the same
+    /// total, and the same scroll offset, including at a `selected`
+    /// that names no row at all (which scrolls to the top).
+    #[test]
+    fn the_row_geometry_answers_what_a_materialized_one_would() {
+        for n in [0usize, 1, 3, 7, 8, 14, 40, 137] {
+            let rows = mixed(n);
+            for selected in [0usize, 1, 6, 7, n / 2, n.saturating_sub(1), n, n + 9] {
+                for visible in [0usize, 1, 7, 40, 200] {
+                    let (eager, offset) = eager_layout(&rows, selected, visible);
+                    let lazy = layout(&rows, selected, visible);
+                    let at = format!("n {n}, selected {selected}, visible {visible}");
+                    assert_eq!(lazy.scroll_offset, offset, "scroll offset: {at}");
+                    // three past the end, so "past the end" is pinned
+                    // as `None` on both sides rather than unasked.
+                    for row in 0..eager.len() + 3 {
+                        assert_eq!(
+                            lazy.get(row),
+                            eager.get(row).copied(),
+                            "display row {row} of {at}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn render(selected: usize, focused: bool, elapsed: Duration) -> Buffer {
