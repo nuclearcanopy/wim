@@ -1721,14 +1721,20 @@ fn track_gap(model: &Model<'_>) -> Vec<Candidate> {
 /// can fire this.
 fn album_neighbours(model: &Model<'_>) -> Vec<Candidate> {
     let mut out = Pool::new(model.tuning.per_generator_candidates);
-    // one map reused across albums, cleared rather than reallocated:
-    // positions are per album, so clearing is the same map.
-    let mut by_position: HashMap<usize, usize> = HashMap::new();
+    // positions are a tracklist's own 0..n, so they index a vec
+    // directly instead of hashing; one vec reused across albums,
+    // cleared rather than reallocated. Its length is the largest
+    // position `ingest_album` enumerated for that album, so nothing
+    // here can ask for a huge one.
+    let mut by_position: Vec<Option<usize>> = Vec::new();
     for album in &model.catalog.albums {
         by_position.clear();
         for &index in &album.tracks {
             if let Some(position) = model.catalog.tracks[index].position {
-                by_position.insert(position, index);
+                if position >= by_position.len() {
+                    by_position.resize(position + 1, None);
+                }
+                by_position[position] = Some(index);
             }
         }
         for &index in &album.tracks {
@@ -1741,8 +1747,8 @@ fn album_neighbours(model: &Model<'_>) -> Vec<Candidate> {
             let best = [position.checked_sub(1), Some(position + 1)]
                 .into_iter()
                 .flatten()
-                .filter_map(|p| by_position.get(&p))
-                .map(|&n| (model.tracks[n].score, n))
+                .filter_map(|p| by_position.get(p).copied().flatten())
+                .map(|n| (model.tracks[n].score, n))
                 .filter(|(score, n)| *score > 0.0 && model.tracks[*n].plays > 0)
                 .max_by(|a, b| a.0.total_cmp(&b.0));
             let Some((score, neighbour)) = best else {
@@ -4057,7 +4063,6 @@ mod cost {
     /// runs on this box differ 1.6-1.8x under load, so two separate
     /// measurements are not comparable and this is the only shape that
     /// is.
-    #[allow(dead_code)]
     fn best_each(
         rounds: usize,
         iters: usize,
@@ -4072,6 +4077,145 @@ mod cost {
         out
     }
 
+    /// A whole request's worth of owned inputs, since `Request`
+    /// borrows all of them.
+    struct Fixture {
+        catalog: Catalog,
+        cache: CacheIndex,
+        starred: HashSet<String>,
+        enrichment: EnrichmentCache,
+        tuning: Tuning,
+    }
+
+    impl Fixture {
+        /// History over the first half of the albums, so half the
+        /// library is a gap and half has something to rank.
+        fn new(albums: usize, per_album: usize) -> Fixture {
+            Fixture {
+                catalog: library(albums, per_album),
+                cache: history(albums / 2, per_album),
+                starred: starred(&[
+                    &song_id(1, 1),
+                    &song_id(2, 2),
+                    &song_id(albums - 1, 3),
+                    &song_id(albums - 2, 4),
+                ]),
+                enrichment: EnrichmentCache::new(),
+                tuning: Tuning::default(),
+            }
+        }
+
+        fn request(&self) -> Request<'_> {
+            Request {
+                catalog: &self.catalog,
+                cache: &self.cache,
+                starred: &self.starred,
+                now_secs: NOW,
+                seed: 7,
+                enrichment: &self.enrichment,
+                tuning: &self.tuning,
+            }
+        }
+
+        fn describe(&self) -> String {
+            format!(
+                "{} tracks / {} albums / {} artists, {} build",
+                self.catalog.track_count(),
+                self.catalog.albums.len(),
+                self.catalog.artist_count(),
+                profile()
+            )
+        }
+    }
+
+    /// Every field of a candidate that the stages after it read, so
+    /// "the fast path answers what the plain one did" is a comparison
+    /// of all of it and not just the order.
+    fn shape(candidates: &[Candidate]) -> Vec<String> {
+        candidates
+            .iter()
+            .map(|c| {
+                format!(
+                    "{:?} {:?} {:08x} {:?} {:?} {:?} {}",
+                    c.reason,
+                    c.identity,
+                    c.raw.to_bits(),
+                    c.artist_key,
+                    c.album_key,
+                    c.genre_key,
+                    c.reason_text
+                )
+            })
+            .collect()
+    }
+
+    /// `album_neighbours` as it was before the position map became a
+    /// vec: the baseline both for the ratio and for "same answer".
+    fn album_neighbours_hashed(model: &Model<'_>) -> Vec<Candidate> {
+        let mut out = Pool::new(model.tuning.per_generator_candidates);
+        let mut by_position: HashMap<usize, usize> = HashMap::new();
+        for album in &model.catalog.albums {
+            by_position.clear();
+            for &index in &album.tracks {
+                if let Some(position) = model.catalog.tracks[index].position {
+                    by_position.insert(position, index);
+                }
+            }
+            for &index in &album.tracks {
+                if model.tracks[index].plays > 0 {
+                    continue;
+                }
+                let Some(position) = model.catalog.tracks[index].position else {
+                    continue;
+                };
+                let best = [position.checked_sub(1), Some(position + 1)]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| by_position.get(&p))
+                    .map(|&n| (model.tracks[n].score, n))
+                    .filter(|(score, n)| *score > 0.0 && model.tracks[*n].plays > 0)
+                    .max_by(|a, b| a.0.total_cmp(&b.0));
+                let Some((score, neighbour)) = best else {
+                    continue;
+                };
+                if !out.wants(score) {
+                    continue;
+                }
+                let text = format!(
+                    "sits right next to \"{}\", which you played on {} days",
+                    model.catalog.tracks[neighbour].title, model.tracks[neighbour].days
+                );
+                out.push(track_candidate(
+                    model,
+                    Reason::AlbumNeighbour,
+                    index,
+                    score,
+                    text,
+                ));
+            }
+        }
+        out.into_vec()
+    }
+
+    /// The neighbour pool is picked by score with ties going to the
+    /// later position, which a map and a vec only agree on if both are
+    /// walked the same way; this is over a few thousand tracks, where
+    /// hundreds of albums have a neighbour pair, so a disagreement
+    /// about either the winner or the order shows up.
+    #[test]
+    fn the_vec_indexed_neighbour_map_answers_what_the_hashed_one_did() {
+        let fixture = Fixture::new(300, 12);
+        let req = fixture.request();
+        let model = Model::build(&req);
+        let fast = album_neighbours(&model);
+        assert!(
+            fast.len() >= 32,
+            "{} neighbours is too few to prove anything",
+            fast.len()
+        );
+        assert_eq!(shape(&fast), shape(&album_neighbours_hashed(&model)));
+    }
+
     /// Where one pass spends its time, stage by stage. Not an
     /// assertion: this is the map that says what is worth optimizing,
     /// and the `tail` line is everything after candidate generation
@@ -4080,31 +4224,9 @@ mod cost {
     #[ignore = "a measurement; run it explicitly"]
     fn where_a_suggestion_pass_spends_its_time() {
         for (albums, per_album) in [(700usize, 14usize), (2_200, 14)] {
-            let catalog = library(albums, per_album);
-            let cache = history(albums / 2, per_album);
-            let starred = starred(&[
-                &song_id(1, 1),
-                &song_id(2, 2),
-                &song_id(900, 3),
-                &song_id(901, 4),
-            ]);
-            let enrichment = EnrichmentCache::new();
-            let tuning = Tuning::default();
-            let req = Request {
-                catalog: &catalog,
-                cache: &cache,
-                starred: &starred,
-                now_secs: NOW,
-                seed: 7,
-                enrichment: &enrichment,
-                tuning: &tuning,
-            };
-            println!(
-                "--- {} tracks / {albums} albums / {} artists, {} build",
-                catalog.track_count(),
-                catalog.artist_count(),
-                profile()
-            );
+            let fixture = Fixture::new(albums, per_album);
+            let req = fixture.request();
+            println!("--- {}", fixture.describe());
             let rounds = 5;
             let iters = 10;
             let total = best(rounds, iters, &mut || {
@@ -4137,5 +4259,27 @@ mod cost {
             }
             println!("  {:<28} {total:>10.1}us", "total");
         }
+    }
+
+    /// The vec-indexed position map against the hashed one it
+    /// replaced, alternating in one process.
+    #[test]
+    #[ignore = "a measurement; run it explicitly"]
+    fn what_the_neighbour_map_costs() {
+        let fixture = Fixture::new(2_200, 14);
+        let req = fixture.request();
+        let model = Model::build(&req);
+        println!("--- album_neighbours, {}", fixture.describe());
+        let (fast, hashed) = best_each(
+            5,
+            10,
+            &mut || {
+                let _ = album_neighbours(&model);
+            },
+            &mut || {
+                let _ = album_neighbours_hashed(&model);
+            },
+        );
+        println!("  vec {fast:.1}us  hashmap {hashed:.1}us  {:.2}x", hashed / fast);
     }
 }
