@@ -266,6 +266,112 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// Alternating batches in one process, best of each, on the
+    /// process cpu clock: both sides here are single-threaded. Same
+    /// shape as `framesource::frame_budget::best_each`, different
+    /// clock. This box's
+    /// other cores are not idle during a bench run (load average 28
+    /// observed, wall 6x cpu on the same work), so wall clock moves
+    /// several-fold between batches while the work done does not. A
+    /// pooled candidate still has to be read on the wall clock, since
+    /// cpu time is exactly what it trades away.
+    fn best_each_cpu(
+        rounds: usize,
+        iters: usize,
+        a: &mut dyn FnMut(),
+        b: &mut dyn FnMut(),
+    ) -> (f64, f64) {
+        let cpu_now = || {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: clock_gettime only writes the timespec we hand it.
+            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+            ts.tv_sec as f64 * 1e6 + ts.tv_nsec as f64 / 1e3
+        };
+        let mut best = (f64::MAX, f64::MAX);
+        let time = |f: &mut dyn FnMut()| {
+            let at = cpu_now();
+            for _ in 0..iters {
+                f();
+            }
+            (cpu_now() - at) / iters as f64
+        };
+        for _ in 0..rounds {
+            best.0 = best.0.min(time(a));
+            best.1 = best.1.min(time(b));
+        }
+        best
+    }
+
+    fn profile() -> &'static str {
+        if cfg!(debug_assertions) {
+            "DEBUG (not the shipping cost; re-run with --release)"
+        } else {
+            "release"
+        }
+    }
+
+    /// A saved queue the size a real one reaches: `main.rs` notes ~200
+    /// on a real session, and queueing an artist's discography makes
+    /// it thousands.
+    fn long_state(queued: usize) -> PlaybackState {
+        PlaybackState {
+            now_playing_path: Some("/home/u/Music/Bladee/Crest/01 - Wiking.flac".to_string()),
+            queue_paths: (0..queued)
+                .map(|i| {
+                    format!(
+                        "/home/u/Music/artist {}/album {}/{:02} - some song title.flac",
+                        i / 170,
+                        i / 17,
+                        i % 17
+                    )
+                })
+                .collect(),
+            position_secs: Some(91.5),
+            volume: Some(73.0),
+        }
+    }
+
+    /// The resume state is read on the main thread before the first
+    /// frame, so its parse is first-frame time. Is toml costing
+    /// anything worth a format change at the sizes a real queue
+    /// reaches? `cargo test --release -- --ignored --nocapture
+    /// resume_state_parse`.
+    #[test]
+    #[ignore = "measurement, run explicitly"]
+    fn resume_state_parse() {
+        println!("--- resume state parse, {} build", profile());
+        for queued in [200usize, 2_000] {
+            let state = long_state(queued);
+            let as_toml = toml::to_string_pretty(&state).unwrap();
+            let as_json = serde_json::to_string(&state).unwrap();
+            assert_eq!(
+                toml::from_str::<PlaybackState>(&as_toml).unwrap(),
+                serde_json::from_str::<PlaybackState>(&as_json).unwrap()
+            );
+
+            let (from_toml, from_json) = best_each_cpu(
+                8,
+                5,
+                &mut || {
+                    toml::from_str::<PlaybackState>(&as_toml).unwrap();
+                },
+                &mut || {
+                    serde_json::from_str::<PlaybackState>(&as_json).unwrap();
+                },
+            );
+            println!(
+                "{queued:>5} queued  cpu: toml {:>7}B {from_toml:>9.1}us  json {:>7}B \
+                 {from_json:>9.1}us  {:.2}x",
+                as_toml.len(),
+                as_json.len(),
+                from_toml / from_json,
+            );
+        }
+    }
+
     /// The case `.ok()?` hid: the file is there, it does not parse, and
     /// the user's queue is gone. That has to be said, not silently
     /// read as a first launch.
