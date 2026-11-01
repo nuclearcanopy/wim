@@ -1692,12 +1692,32 @@ writing (two agents, one per file).
       `hit::wheel_select` is a fourth copy of the same rule for the
       mouse wheel. it guards `len == 0` explicitly and is safe, so it
       was left alone, but it is a fourth copy.
-- [ ] **`view(suggestions)` on an empty corpus is a dead-end pane.**
-      no longer a crash, but `main.rs` ~336 still installs
-      `Some(suggestions)` and takes `Focus::Workspace` at zero
-      entries, reporting "0 suggestions", where the queue branch
-      answers `op_fail("the queue is empty")`. it should refuse the
-      same way.
+- [x] **`view(suggestions)` refuses instead of opening a dead end.**
+      it installed the pane and took `Focus::Workspace` at zero rows,
+      reporting "0 suggestions", so j/k and enter all did nothing and
+      esc was the only key that worked. the queue's own empty case
+      already refused.
+      the refusal **says which of three situations it is**, following
+      `empty_results_message`'s own standard ("a blank screen with no
+      explanation is a dead end, never the right default"): an empty
+      corpus mid-scan is "wait", an empty corpus with nothing in
+      flight is "your library is not set up", and a full corpus with
+      no suggestions is the only one actually about suggestions, since
+      they are built from what has been played.
+      **printing the four messages as the notification area shows them
+      caught a real problem**: the first wording was 92 cells, and
+      `ui::notify` sizes a box to its text and caps it at the pane
+      width, so it was simply cut on an 80-column terminal. the test
+      floor is 72 cells now, and the eyeball test also asserts no two
+      cases give the same answer.
+      **and the first mutation was not caught, which is the lesson.**
+      deleting the `total == 0` refusal left every message test green:
+      the function was pinned and the call site that mattered was not,
+      the exact pattern recorded elsewhere in this file. a source-level
+      guard now asserts the refusal appears *before* the install in
+      that arm, the technique `track_started` and `Snapshot::capture`
+      already use, since `open_wim_screen` needs a live mpv and the
+      whole host state.
 - [x] **a config file could abort the process** (`crossfade_seconds`).
       `Duration::from_secs_f64` panics on a negative, nan or infinite
       value, and that sleep-timer fade was the only unguarded
