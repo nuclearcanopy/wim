@@ -2147,15 +2147,21 @@ stray paint.
       together, which `ui::searchbox` was fixed for earlier for
       exactly that reason. it has the same `─` lead-in now, additive,
       so the narrowest box keeps its label.
-- [ ] **`core.rs` ~1012, tests at ~4198/~4217: the pairing is tested,
-      the wiring is not.** the `resolve_all` tests' doc claims to
-      cover "the latent desync at the seam where it lived", but
-      `load_playlist` and `resync_upcoming`, the two functions the
-      `core.rs` ~1035 "the pairing is the fix" comment names, have
-      **zero test call sites**. collapsing the `refused` loop back to
-      `map(|(i, _)| i).collect()` leaves both tests green and restores
-      the exact off-by-one (wrong title, wrong scrobble, wrong art)
-      the comment says shipped once.
+- [x] ~~already covered, and the premise was wrong~~ **`load_playlist`
+      and `resync_upcoming` had zero test call sites.** they have four
+      now (`index_map_tests`, mpv-gated and passing), asserting the
+      invariant the "pairing is the fix" comment names: `entries[i]`
+      resolves to exactly mpv's `playlist[i]`, after a load with an
+      unresolvable entry in the middle, after a resync, and after a
+      plain and a shuffled enqueue.
+      **the mutation this entry proposed is unreachable**, which is
+      why it stayed open looking undone: collapsing the `refused` loop
+      cannot be caught, because a live mpv never refuses a `loadfile`
+      (probed: an empty path, a 200k-char path, a NUL byte and a
+      missing file all answer success). pinning that branch would need
+      the append behind an injected closure. the reachable half is
+      pinned; the unreachable half is recorded as such rather than
+      left as a debt.
 - [x] ~~resolved by the overnight run~~ **`subsonic.rs` 1845/1865/1880 test a dead function.**
       `artist_albums_with_tracks` is `#[allow(dead_code)]` and its own
       doc says nothing calls it; the live artist page uses
@@ -2187,15 +2193,32 @@ stray paint.
       garbage goes to a public ListenBrainz profile with no failing
       test and, because `core.rs` 887/900 discard the submit result,
       no runtime signal either.
-- [ ] **the undo seam is only covered by `#[ignore]`d tests.**
-      `core.rs` 3220/3759/3819/3954/3979/4021: six behavioural (not
-      benchmark) `seam_tests` need a live mpv, and they are the only
-      coverage of undo recording through the real `apply_op`
-      (`core.rs` ~3753 says so outright). a default `cargo test`
-      verifies none of `recordable`, `coalesce_kind(&op)`, the
-      `!matches!(report, Report::Failed(_))` guard, or suspension
-      around delegated ops. reading `core.rs` the seam looks covered;
-      in a normal run it is not.
+- [x] **the undo seam's decisions are covered without mpv now.** six
+      `#[ignore]`d tests needing a live player were its *only*
+      coverage, so a default `cargo test` verified none of it: not
+      whether an op is recordable, not the coalesce kind, not the
+      barrier reason, not the rule that a failed op records nothing.
+      reading `apply_op` the seam looked covered; in a normal run it
+      was not.
+      **none of those four decisions needs a player**, so they are
+      `UndoHook::of(&op)` plus `hook.records(&report)` and are tested
+      outright. four tests plus a source guard that `apply_op` goes
+      through them, since inlining it again would quietly un-cover the
+      lot.
+      the fifth thing it listed, suspension, is `Recorder::suspend`'s
+      nesting: it returns what it replaced so a delegated op puts back
+      what was there, where a bare `suspend(false)` on the way out
+      would un-suspend an outer frame and land a second row. that is
+      pure and now tested.
+      **one test I wrote asserted something false and would not
+      compile, which is the useful part**: `Recorder::record` does
+      *not* consult `suspended`. the reader is
+      `core::dispatch_action`. a flag on the recorder reads as though
+      the recorder honours it, so `suspend`'s doc now says where it is
+      actually read.
+      four mutations caught: a failed op getting a row, undoing
+      recording a row for undoing, `suspend` forgetting what it
+      replaced, and the hook drifting back inline.
 - [x] ~~done in the overnight run~~ **three functions with no test call sites and stringly-typed
       contracts.** `core.rs` ~1082 `enqueue_track`: callers branch on
       `status.starts_with("error")` (~2386) versus
