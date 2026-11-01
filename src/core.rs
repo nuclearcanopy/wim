@@ -52,7 +52,11 @@ pub fn playable_path(item: &SearchItem) -> Option<String> {
 /// next track starts.
 ///
 /// Shared so the keybind, the bar click and enter on the player cannot
-/// disagree; `activate_transport` is the one place that calls it.
+/// disagree. That was a claim rather than a fact for a while: the
+/// keybind called `Mpv::toggle_pause` directly and so had none of the
+/// gap handling above, while the other two came through
+/// `Op::TogglePause`. All three go through here now, which
+/// `the_pause_keybind_goes_through_the_shared_toggle` pins.
 pub fn toggle_pause(player: &mpv::Mpv, between: &mut BetweenTracks) -> anyhow::Result<()> {
     if between.holding() {
         between.cancel();
@@ -5605,6 +5609,56 @@ mod index_map_tests {
 ///
 /// `#[ignore]`: the function takes an mpv handle even on the path that
 /// refuses before touching it.
+/// The three paths that pause, which `toggle_pause`'s doc says cannot
+/// disagree.
+#[cfg(test)]
+mod shared_toggle_tests {
+    /// The keybind has to come through `core::toggle_pause`.
+    ///
+    /// It called `Mpv::toggle_pause` directly, so it had none of the
+    /// gap handling: set `gap(5s)`, let a track end, press play during
+    /// the countdown, and mpv unpaused at an eof that immediately
+    /// reported itself again, `between.cancel()` never ran so the
+    /// countdown kept drawing, and nothing played until the gap
+    /// expired. the bar click and enter on the player were always
+    /// right, which is what made it look like a gap bug rather than a
+    /// keybind one.
+    ///
+    /// Reads the source, the technique `track_started` and
+    /// `Snapshot::capture` use: the arm needs a live mpv and the whole
+    /// host loop, and a bypass is exactly the kind of thing a
+    /// behavioural test in the wrong place would miss.
+    #[test]
+    fn the_pause_keybind_goes_through_the_shared_toggle() {
+        let host = include_str!("main.rs");
+        let at = host
+            .find("key.code == keymap.get(KeyAction::TogglePause)")
+            .expect("the pause keybind moved or was renamed");
+        let arm = &host[at..at + 900];
+        let end = arm.find("\n                if ").unwrap_or(arm.len());
+        let arm = &arm[..end];
+        assert!(
+            arm.contains("toggle_pause(&player, &mut between_tracks)"),
+            "the keybind pauses mpv directly again, so it has no gap \
+             handling:\n{arm}"
+        );
+    }
+
+    /// And the op the bar click and enter both reach.
+    #[test]
+    fn the_transport_op_goes_through_it_too() {
+        let src = include_str!("core.rs");
+        let at = src
+            .find("Op::TogglePause =>")
+            .expect("Op::TogglePause moved or was renamed");
+        let arm = &src[at..at + 400];
+        assert!(
+            arm.contains("toggle_pause(core.player, core.between_tracks)"),
+            "the op stopped sharing the toggle:\n{arm}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod enqueue_status_tests {
     use super::seam_tests::Harness;
