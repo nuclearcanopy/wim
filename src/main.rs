@@ -2184,8 +2184,23 @@ fn main() -> anyhow::Result<()> {
         if !first_frame_drawn {
             first_frame_drawn = true;
             trace::mark("first frame drawn");
+            // counted rather than discarded: a saved queue whose
+            // files mpv refuses would otherwise come back short with
+            // no word, the same way `append_resolved` used to report
+            // the requested count instead of the appended one.
+            let mut lost = 0usize;
             for item in pending_enqueue.drain(..) {
-                let _ = enqueue_track(&player, &item, &cache_index, &mut play_queue, app.shuffle);
+                let done =
+                    enqueue_track(&player, &item, &cache_index, &mut play_queue, app.shuffle);
+                if !done.is_queued() {
+                    lost += 1;
+                }
+            }
+            if lost > 0 {
+                notifications.push(
+                    Severity::Alert,
+                    format!("{lost} of the saved queue could not be restored"),
+                );
             }
             trace::mark("mpv playlist refilled");
         }
@@ -4530,7 +4545,19 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if key.code == keymap.get(KeyAction::SkipNext) && now_playing.is_some() {
-                    let _ = player.playlist_next();
+                    // through the shared guard, not a bare
+                    // `playlist_next`: `playlist-next weak` errors on
+                    // the last entry, and discarding that made the key
+                    // do nothing and say nothing, where `skip()` in
+                    // the console has always explained itself.
+                    match wim::core::skip_next(&player, &play_queue, 1) {
+                        wim::core::Skipped::All | wim::core::Skipped::Short { .. } => {}
+                        wim::core::Skipped::AtTheEnd => notifications
+                            .push(Severity::Info, "nothing to skip to; this is the last track"),
+                        wim::core::Skipped::Failed(why) => {
+                            notifications.push(Severity::Error, why)
+                        }
+                    }
                     continue;
                 }
 
