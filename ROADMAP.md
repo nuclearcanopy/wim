@@ -1583,6 +1583,27 @@ a measurement.
       from the renderer's side. reading it confirmed the wide glyphs
       step two columns and the `é` steps one, each in a single press.
 
+- [x] **a settle could be cleared by an answer to a different
+      query.** type `cre`, then `st` inside the round trip:
+      `SearchSettle::answered` cleared unconditionally and
+      `RemoteSearchOutcome` carried no query, so `cre`'s answer settled
+      the window opened for `crest` **before a request for it had left
+      the debounce**, and a shellsong program gated on
+      `search_settled` ran against the wrong result set.
+      the outcome carries its query now (the producing thread already
+      had it in scope) and the settle holds the outstanding query
+      beside its timestamp, so only its own answer clears it. a late
+      answer to an older query is still merged into the corpus, which
+      is right; it just is not the answer being waited on.
+      `a_newer_query_restarts_the_window` could not catch this: it
+      notifies twice and never answers.
+      **and shellswim was clearing the settle after a local scan
+      batch**, which is not an answer to a remote query at all, so a
+      program could proceed while the search was still outstanding.
+      wim never did that; the two front-ends agree now.
+      two mutations caught: clearing unconditionally again, and
+      forgetting which query is outstanding.
+
 ### the untracked-defect audit (2026-10-31)
 
 Ran once the roadmap was down to 8 unchecked items, 5 of them blocked,
@@ -2052,11 +2073,11 @@ do the wrong thing quietly, which is worse to diagnose.
       op. wired in both drains, so shellswim gets it too.
       the three synchronous `Resolution::Ready` paths need nothing:
       their op records after the tracks are already in.
-- [ ] **the resolver still reads the epoch rather than ordering
-      `Intent::Front` batches**, so queue-front album A then album B
-      and the order is nondeterministic run to run. (a ticket scheme
-      landed for this; this entry survives only if the Front case is
-      still open, which wants re-checking against `core.rs` ~450.)
+- [x] **`Intent::Front` ordering: re-checked and already fixed.** the
+      ticket scheme names `add_to_queue(front, a)` then `(front, b)` in
+      its own doc, and `a_batch_that_answered_early_waits_for_the_one_asked_for_first`
+      passes. the entry was left open only because the ticket work
+      landed in the same stretch and nobody confirmed the overlap.
 - [ ] **`main.rs` ~2356 / `shellsong_host.rs` ~569: a settle can
       answer the wrong query.** `SearchSettle::answered` clears
       `pending_since` unconditionally and `RemoteSearchOutcome`

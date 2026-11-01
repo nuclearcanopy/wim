@@ -194,7 +194,7 @@ fn prompt() -> anyhow::Result<()> {
                 host.console = console;
                 match action {
                     ConsoleAction::Run(p) => {
-                        host.settle.notified(false, host.now());
+                        host.settle.notified("", false, host.now());
                         host.program = Some(p);
                     }
                     // nothing to close: the console *is* the screen.

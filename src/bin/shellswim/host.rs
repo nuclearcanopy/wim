@@ -439,8 +439,12 @@ impl Host {
             }
         }
         if scanned > 0 {
+            // deliberately does *not* settle: a local scan batch is
+            // not an answer to the remote query the window is waiting
+            // on, and clearing it here let a program proceed while the
+            // search was still outstanding. wim never did this, so the
+            // two front-ends now agree.
             self.app.resync_results();
-            self.settle.answered();
         }
         let mut answered = false;
         while let Ok(outcome) = self.remote_search_result_rx.try_recv() {
@@ -450,7 +454,7 @@ impl Host {
             self.app.resync_results();
             // an answer is in, so the results for whatever was asked
             // are as complete as a program should wait for.
-            self.settle.answered();
+            self.settle.answered(&outcome.query);
             answered = true;
         }
         // a server that answered *after* the settle window already

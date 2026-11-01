@@ -162,7 +162,7 @@ impl Snapshot {
         // nothing was ever fired for (`src/app.rs`'s set_query).
         core.app.set_query(&self.query);
         let fired = notify_query_changed(core.app, core.remote_search_tx);
-        core.settle.notified(fired, core.now);
+        core.settle.notified(&self.query, fired, core.now);
 
         if *core.vars != self.vars {
             *core.vars = self.vars.clone();
@@ -1434,7 +1434,7 @@ mod restore {
         h.app.set_query("bladee");
         let snapshot = h.capture(&player);
         h.app.set_query("drain");
-        h.settle.answered();
+        h.settle.answered(&h.app.query);
 
         h.restore(&player, &snapshot);
         assert_eq!(h.app.query, "bladee", "the text comes back either way");

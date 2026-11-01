@@ -604,29 +604,43 @@ pub const SETTLE_WINDOW: Duration = Duration::from_millis(1200);
 /// nothing at all (see `spawn_background_search`), so there is no
 /// honest count to wait for. A second server's late answer still gets
 /// merged into the corpus; it just does not hold the program up.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchSettle {
-    /// When the outstanding query was notified; `None` when nothing is
-    /// outstanding, which is the settled state.
-    pending_since: Option<Duration>,
+    /// The outstanding query and when it was notified; `None` when
+    /// nothing is outstanding, which is the settled state.
+    ///
+    /// **The query is half the state, not decoration.** `answered`
+    /// used to clear unconditionally: type `cre`, then `st` inside the
+    /// round trip, and `cre`'s answer settled the window opened for
+    /// `crest` before a request for it had left the debounce, so a
+    /// shellsong program gated on `search_settled` ran against the
+    /// wrong result set.
+    pending: Option<(String, Duration)>,
 }
 
 impl SearchSettle {
     /// The query changed. `fired` is whether a remote search actually
     /// went out for it.
-    pub fn notified(&mut self, fired: bool, now: Duration) {
-        self.pending_since = fired.then_some(now);
+    pub fn notified(&mut self, query: &str, fired: bool, now: Duration) {
+        self.pending = fired.then(|| (query.to_string(), now));
     }
 
-    /// An outcome arrived off `remote_search_result_rx`.
-    pub fn answered(&mut self) {
-        self.pending_since = None;
+    /// An outcome arrived off `remote_search_result_rx`, for `query`.
+    ///
+    /// Only an answer to the query actually outstanding settles it. A
+    /// late answer to an older one is still merged into the corpus by
+    /// the caller, which is right; it just is not the answer being
+    /// waited on.
+    pub fn answered(&mut self, query: &str) {
+        if self.pending.as_ref().is_some_and(|(q, _)| q == query) {
+            self.pending = None;
+        }
     }
 
     pub fn settled(&self, now: Duration) -> bool {
-        match self.pending_since {
+        match &self.pending {
             None => true,
-            Some(since) => now.saturating_sub(since) >= SETTLE_WINDOW,
+            Some((_, since)) => now.saturating_sub(*since) >= SETTLE_WINDOW,
         }
     }
 }
@@ -1029,17 +1043,17 @@ mod tests {
         // anyway would make every `play(x)` on a local-only library
         // sit out the whole window for no reason.
         let mut settle = SearchSettle::default();
-        settle.notified(false, secs(10));
+        settle.notified("crest", false, secs(10));
         assert!(settle.settled(secs(10)));
     }
 
     #[test]
     fn a_notified_query_is_unsettled_until_an_outcome_lands() {
         let mut settle = SearchSettle::default();
-        settle.notified(true, secs(10));
+        settle.notified("crest", true, secs(10));
         assert!(!settle.settled(secs(10)));
         assert!(!settle.settled(secs(10) + millis(400)));
-        settle.answered();
+        settle.answered("crest");
         assert!(settle.settled(secs(10) + millis(400)));
     }
 
@@ -1050,7 +1064,7 @@ mod tests {
         // out there reads as "the search subsystem is broken" rather
         // than "that server is slow".
         let mut settle = SearchSettle::default();
-        settle.notified(true, secs(10));
+        settle.notified("crest", true, secs(10));
         assert!(!settle.settled(secs(10) + SETTLE_WINDOW - millis(1)));
         assert!(settle.settled(secs(10) + SETTLE_WINDOW));
         assert!(settle.settled(secs(30)));
@@ -1062,10 +1076,48 @@ mod tests {
         // one's nearly-elapsed window and settle instantly on stale
         // results, which is the exact bug `search_settled` exists for.
         let mut settle = SearchSettle::default();
-        settle.notified(true, secs(10));
-        settle.notified(true, secs(11));
+        settle.notified("crest", true, secs(10));
+        settle.notified("crest", true, secs(11));
         assert!(!settle.settled(secs(11) + SETTLE_WINDOW - millis(1)));
         assert!(settle.settled(secs(11) + SETTLE_WINDOW));
+    }
+
+    /// An answer to the query *before* the one being waited on must
+    /// not settle it.
+    ///
+    /// Type `cre`, then `st` inside the round trip. `answered` used to
+    /// clear unconditionally, so `cre`'s answer settled the window
+    /// opened for `crest` before a request for it had left the
+    /// debounce, and a program gated on `search_settled` ran against
+    /// the wrong result set. `a_newer_query_restarts_the_window` above
+    /// cannot see this: it only ever notifies twice and never answers.
+    #[test]
+    fn a_stale_answer_does_not_settle_the_query_it_is_not_for() {
+        let mut settle = SearchSettle::default();
+        settle.notified("cre", true, secs(10));
+        settle.notified("crest", true, secs(11));
+
+        settle.answered("cre");
+        assert!(
+            !settle.settled(secs(11)),
+            "an answer to the older query settled the newer one"
+        );
+        // and the newer one's own window is intact, not restarted.
+        assert!(!settle.settled(secs(11) + SETTLE_WINDOW - millis(1)));
+
+        settle.answered("crest");
+        assert!(settle.settled(secs(11)), "its own answer does settle it");
+    }
+
+    /// Every server answers the same query, so the second outcome
+    /// arrives with nothing outstanding and must be harmless.
+    #[test]
+    fn a_second_answer_for_a_settled_query_changes_nothing() {
+        let mut settle = SearchSettle::default();
+        settle.notified("crest", true, secs(10));
+        settle.answered("crest");
+        settle.answered("crest");
+        assert!(settle.settled(secs(10)));
     }
 
     /// Coupled to the constant rather than to a copy of its value: the
@@ -1082,7 +1134,7 @@ mod tests {
         // and the behaviour the margin exists for: a query whose
         // request has only just left is still unsettled.
         let mut settle = SearchSettle::default();
-        settle.notified(true, secs(10));
+        settle.notified("crest", true, secs(10));
         assert!(!settle.settled(secs(10) + debounce));
     }
 
