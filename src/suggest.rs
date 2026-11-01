@@ -2184,7 +2184,13 @@ fn attributes_of(pool: &[Candidate]) -> (Vec<Attrs>, usize, usize, usize, usize)
             },
         })
         .collect();
-    (attrs, artists.len(), albums.len(), genres.len(), reasons.len())
+    (
+        attrs,
+        artists.len(),
+        albums.len(),
+        genres.len(),
+        reasons.len(),
+    )
 }
 
 /// Greedy MMR-ish selection: hard caps per artist and per album, plus a
@@ -4005,8 +4011,22 @@ mod cost {
     ];
 
     const NOUNS: [&str; 16] = [
-        "Mirror", "Drain", "Static", "Ember", "Cathedral", "Window", "Spiral", "Hollow", "Signal",
-        "Vapour", "Garden", "Machine", "Threnody", "Halo", "Pulse", "Lantern",
+        "Mirror",
+        "Drain",
+        "Static",
+        "Ember",
+        "Cathedral",
+        "Window",
+        "Spiral",
+        "Hollow",
+        "Signal",
+        "Vapour",
+        "Garden",
+        "Machine",
+        "Threnody",
+        "Halo",
+        "Pulse",
+        "Lantern",
     ];
 
     const ADJECTIVES: [&str; 12] = [
@@ -4120,11 +4140,7 @@ mod cost {
                     let title = match t % 5 {
                         0 => rng.pick(&TITLES).to_string(),
                         1 => format!("{} {}", rng.pick(&ADJECTIVES), rng.pick(&NOUNS)),
-                        2 => format!(
-                            "{} (feat. {})",
-                            rng.pick(&TITLES),
-                            rng.pick(&ARTISTS)
-                        ),
+                        2 => format!("{} (feat. {})", rng.pick(&TITLES), rng.pick(&ARTISTS)),
                         3 => format!("{} - Remastered {}", rng.pick(&TITLES), 2004 + rng.upto(20)),
                         _ => format!("{} {}", rng.pick(&NOUNS), rng.pick(&NOUNS)),
                     };
@@ -4455,8 +4471,7 @@ mod cost {
                 if candidate.album_key.is_some() && album_count >= tuning.max_per_album {
                     continue;
                 }
-                if sections.get(&candidate.reason).copied().unwrap_or(0)
-                    >= tuning.section_max_items
+                if sections.get(&candidate.reason).copied().unwrap_or(0) >= tuning.section_max_items
                 {
                     continue;
                 }
@@ -4559,10 +4574,7 @@ mod cost {
             interned.len()
         );
         assert_eq!(
-            interned
-                .iter()
-                .filter(|c| c.artist_key.is_empty())
-                .count(),
+            interned.iter().filter(|c| c.artist_key.is_empty()).count(),
             4,
             "every untagged row has to be selectable; the empty key is not a key"
         );
@@ -4829,7 +4841,10 @@ mod cost {
             let mut stages = vec![("model", model)];
             let mut gens = 0.0;
             for (name, run) in [
-                ("daily_rotation", &daily_rotation as &dyn Fn(&Model) -> Vec<Candidate>),
+                (
+                    "daily_rotation",
+                    &daily_rotation as &dyn Fn(&Model) -> Vec<Candidate>,
+                ),
                 ("album_gap", &album_gap),
                 ("track_gap", &track_gap),
                 ("album_neighbours", &album_neighbours),
@@ -4870,7 +4885,10 @@ mod cost {
                 let _ = album_neighbours_hashed(&model);
             },
         );
-        println!("  vec {fast:.1}us  hashmap {hashed:.1}us  {:.2}x", hashed / fast);
+        println!(
+            "  vec {fast:.1}us  hashmap {hashed:.1}us  {:.2}x",
+            hashed / fast
+        );
     }
 
     /// Genre slots against the three keyed maps they replaced,
@@ -4892,7 +4910,10 @@ mod cost {
                 let _ = genre_maps(&fixture.catalog, &model.tracks);
             },
         );
-        println!("  slots {slots:.1}us  maps {maps:.1}us  {:.2}x", maps / slots);
+        println!(
+            "  slots {slots:.1}us  maps {maps:.1}us  {:.2}x",
+            maps / slots
+        );
     }
 
     /// What a whole pass costs, old against new. Composed from parts
@@ -4938,10 +4959,20 @@ mod cost {
             let new = affinities + genre_new + tail_new;
             let old = affinities + genre_old + tail_old;
             println!("  {:<26} {:>9} {:>9}", "", "new", "old");
-            println!("  {:<26} {affinities:>9.0} {affinities:>9.0}", "affinity + rollups");
+            println!(
+                "  {:<26} {affinities:>9.0} {affinities:>9.0}",
+                "affinity + rollups"
+            );
             println!("  {:<26} {genre_new:>9.0} {genre_old:>9.0}", "genre rollup");
-            println!("  {:<26} {tail_new:>9.0} {tail_old:>9.0}", "generation + selection");
-            println!("  {:<26} {new:>9.0} {old:>9.0}us  {:.2}x", "pass", old / new);
+            println!(
+                "  {:<26} {tail_new:>9.0} {tail_old:>9.0}",
+                "generation + selection"
+            );
+            println!(
+                "  {:<26} {new:>9.0} {old:>9.0}us  {:.2}x",
+                "pass",
+                old / new
+            );
         }
     }
 
