@@ -39,13 +39,17 @@ const AWAIT_TIMEOUT: Duration = Duration::from_secs(8);
 /// actually expand to is bounded by `MAX_EXPANSION`.
 const MAX_REPEAT: u32 = 256;
 
-/// Upper bound on the nodes a program may expand to, checked inside
-/// `repeat` because nesting is the only way to reach it. `MAX_REPEAT`
+/// Upper bound on the nodes a program may expand to. `MAX_REPEAT`
 /// bounds each level, so nested levels multiply: 256 twice over is 65k
 /// nodes, three times is 16.7M (over a gigabyte) built synchronously in
 /// `submit` with the ui frozen, and four is an allocation failure there
 /// is no recovering from. 4096 is far past any real `repeat` (a flat
 /// `repeat(256, queue(x))` is 512) and small enough to build instantly.
+///
+/// Three paths expand, not one: `repeat` nesting, `run` fan-out (a
+/// script's lines times its depth) and a chain of `let`s composing one
+/// another. Each checks this, and the comment here said only `repeat`
+/// for as long as the other two were unbounded.
 ///
 /// Checked per iteration, so the guarantee is this plus whatever the
 /// iteration that crossed it was already building, not this exactly.
@@ -2126,6 +2130,11 @@ impl<'a> Lowering<'a> {
             parse_statement(input, offset, text, &world)?
         };
         self.track(&call);
+        // the latch is per statement, not per submission: it exists so
+        // one blown expansion reports once instead of 256 times, and
+        // leaving it set made the next statement's `repeat` lower to
+        // nothing at all with nothing said.
+        self.refused = false;
         self.lower(&call, false);
         Ok(())
     }
@@ -2180,7 +2189,9 @@ impl<'a> Lowering<'a> {
                     // allocates. checked before the iteration, so
                     // nothing oversized is ever built.
                     if self.refused || self.nodes.len() >= MAX_EXPANSION {
-                        self.refuse_expansion();
+                        self.refuse_expansion(format!(
+                            "repeat would expand past {MAX_EXPANSION} steps; nest fewer repeats"
+                        ));
                         return;
                     }
                     self.lower(inner, false);
@@ -2209,17 +2220,16 @@ impl<'a> Lowering<'a> {
     }
 
     /// One message however deep the nesting went, and every enclosing
-    /// `repeat` stops rather than reporting the same refusal 256 more
-    /// times. A `Fail` node, like `MAX_SCRIPT_DEPTH`'s: the rest of the
-    /// program still runs, with this in the scrollback.
-    fn refuse_expansion(&mut self) {
+    /// `repeat` or script frame stops rather than reporting the same
+    /// refusal again per iteration. A `Fail` node, like
+    /// `MAX_SCRIPT_DEPTH`'s: the rest of the program still runs, with
+    /// this in the scrollback. Reset per statement in `absorb`.
+    fn refuse_expansion(&mut self, why: String) {
         if self.refused {
             return;
         }
         self.refused = true;
-        self.nodes.push(Node::Fail(format!(
-            "repeat would expand past {MAX_EXPANSION} steps; nest fewer repeats"
-        )));
+        self.nodes.push(Node::Fail(why));
     }
 
     /// Inlines a `.shg` file: every line is parsed on its own and
@@ -2236,6 +2246,15 @@ impl<'a> Lowering<'a> {
             self.nodes.push(Node::Fail(format!(
                 "{label}: scripts nest more than {MAX_SCRIPT_DEPTH} deep; stopped here"
             )));
+            return;
+        }
+        // depth is not the whole bound: a file holding `b` `run` lines
+        // inlines `b^depth` frames, so a handful of lines is millions
+        // of nodes. the total is what has to be held, same as `repeat`.
+        if self.refused || self.nodes.len() >= MAX_EXPANSION {
+            self.refuse_expansion(format!(
+                "{label}: scripts would expand past {MAX_EXPANSION} steps; stopped here"
+            ));
             return;
         }
         self.depth += 1;
@@ -3082,15 +3101,24 @@ fn check_remember(
 /// over no time is not one, and `simple_op` only ever matched
 /// `Some(secs)`, so `fade(out, off)` silently faded over the default 5s
 /// instead of saying that `off` means nothing here.
+/// `0` is the same instruction as `off` in a different spelling, and
+/// the host's ramp short-circuits a zero length to "already finished",
+/// so `fade(out, 0)` slammed the volume down on the first frame and
+/// called it a fade.
 fn check_fade(input: &str, args: &[Arg], positional: &[(usize, &str)]) -> Result<(), ParseError> {
-    let Some(at) = args.iter().position(|a| matches!(a, Arg::Duration(None))) else {
+    let nothing = |a: &Arg| match a {
+        Arg::Duration(None) => true,
+        Arg::Duration(Some(secs)) => *secs <= 0.0,
+        _ => false,
+    };
+    let Some(at) = args.iter().position(nothing) else {
         return Ok(());
     };
     Err(err(
         input,
         positional.get(at).map(|(o, _)| *o).unwrap_or(0),
         positional.get(at).map(|(_, t)| *t).unwrap_or("off"),
-        "fade has no off; write fade(out, 2s), or fade(out) for the default",
+        "fade has no off and no zero; write fade(out, 2s), or fade(out) for the default",
     ))
 }
 
@@ -3229,7 +3257,19 @@ fn coerce(
             // the one place variables expand, which is why every
             // terms-taking command gets them with no code of its own and
             // why `dry()` reports the expanded plan.
-            Ok(Arg::Terms(world.scope.expand(&items)))
+            let terms = world.scope.expand(&items);
+            // expansion is eager, so there is no cycle to detect but
+            // there is still a width: each `let` naming an already-bound
+            // variable multiplies, and eight ten-item levels is 10^8
+            // terms built synchronously with the ui frozen.
+            if terms.len() > MAX_EXPANSION {
+                return Err(bad(format!(
+                    "{}: that expands to {} terms, past the {MAX_EXPANSION} allowed",
+                    command.name,
+                    terms.len()
+                )));
+            }
+            Ok(Arg::Terms(terms))
         }
         Ty::VarName => {
             let name = unquote(text);
@@ -3322,7 +3362,12 @@ fn coerce(
             // zero is refused here rather than at apply time: a
             // silence of no length is a typo, not an instruction.
             Ok((None, Pos::Seconds(s))) if s > 0.0 => Ok(Arg::Span(s)),
-            Ok((None, Pos::Seconds(_))) => Err(bad("a silence needs a length".into())),
+            // named for the command that asked, since `pause` shares
+            // this type: "a silence needs a length" answered `pause(0)`
+            // with a command the user never typed.
+            Ok((None, Pos::Seconds(_))) => {
+                Err(bad(format!("{}: needs a length above 0", command.name)))
+            }
             Ok(_) => Err(expected()),
             Err(why) => Err(bad(format!("{}: {why}", command.name))),
         },
@@ -3498,16 +3543,32 @@ fn seconds(text: &str, secs: f64) -> Result<Pos, String> {
     Ok(Pos::Seconds(secs))
 }
 
+/// `50%`, a bare `50` meaning the same, or a signed `+10%` nudge.
+///
+/// Deliberately not routed through `parse_time`: that grammar also
+/// accepts `30s`, `1m` and `1:30`, so a level built on it read
+/// `volume(1m)` as 60% and answered `volume(2h)` with "7200% is
+/// outside 0-100". A duration is not a quieter spelling of a percent.
 fn parse_level(text: &str) -> Result<Level, String> {
-    let (sign, pos) = parse_time(text)?;
-    let value = match pos {
-        Pos::Percent(p) => p,
-        // a bare number is a percent here, since that is the only
-        // thing a volume could mean, so it is held to the same range
-        // the `%` spelling is rather than to `parse_time`'s.
-        Pos::Seconds(s) if (0.0..=100.0).contains(&s) => s,
-        Pos::Seconds(s) => return Err(format!("{s}% is outside 0-100")),
+    let (sign, rest) = match text.strip_prefix('+') {
+        Some(r) => (Some('+'), r),
+        None => match text.strip_prefix('-') {
+            Some(r) => (Some('-'), r),
+            None => (None, text),
+        },
     };
+    let number = rest.strip_suffix('%').unwrap_or(rest);
+    let value: f64 = number
+        .parse()
+        .map_err(|_| format!("'{text}' is not a percent"))?;
+    // `f64::parse` takes "nan" and "inf", and a level reaches mpv's
+    // volume property, so neither may get past here.
+    if !value.is_finite() {
+        return Err(format!("'{text}' is not a percent"));
+    }
+    if !(0.0..=100.0).contains(&value) {
+        return Err(format!("'{text}' is outside 0-100"));
+    }
     Ok(match sign {
         Some('-') => Level::Delta(-value),
         Some(_) => Level::Delta(value),
@@ -3879,6 +3940,7 @@ impl Console {
     pub fn paste(&mut self, text: &str, cand: &dyn Candidates) {
         let text: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
         self.cycle = None;
+        self.error = None;
         self.input.insert_str(self.cursor, &text);
         self.cursor += text.len();
         self.refresh(cand);
@@ -3952,6 +4014,9 @@ impl Console {
         };
         self.recall = Some(next);
         self.input = self.history[next].clone();
+        // the line the error was reported for is gone, so the error
+        // goes with it; same reasoning as `Delete`'s.
+        self.error = None;
         self.cursor = self.input.len();
     }
 
@@ -3964,6 +4029,7 @@ impl Console {
             self.recall = None;
             self.input = std::mem::take(&mut self.draft);
         }
+        self.error = None;
         self.cursor = self.input.len();
     }
 
@@ -3972,6 +4038,13 @@ impl Console {
     /// one local corpus search, capped at `MAX_CANDIDATES`.
     fn refresh(&mut self, cand: &dyn Candidates) {
         let here = site(&self.input, self.cursor);
+        // a cycle is only valid for the token it opened on. the cursor
+        // keys and history recall left it open, so the next tab built a
+        // remainder against a token that had moved and the accept
+        // spliced it in mid-word, breaking `Cycle`'s own invariant.
+        if self.cycle.as_ref().is_some_and(|c| c.typed != here.token) {
+            self.cycle = None;
+        }
         let mut next = Suggestion {
             signature: here.signature.clone(),
             ..Suggestion::default()
@@ -4941,6 +5014,32 @@ mod tests {
         );
     }
 
+    /// Eager expansion removes the recursion but not the *width*: each
+    /// `let` whose value names an already-bound variable multiplies, so
+    /// a chain of eight ten-item bindings is 10^8 terms built
+    /// synchronously in `submit` with the ui frozen. Bounded like every
+    /// other expansion here, and reported rather than attempted.
+    #[test]
+    fn composing_variables_is_bounded_by_the_width_it_expands_to() {
+        // five levels, not the eight that actually exhausts memory: the
+        // bound has to bite well before the point of no return, and a
+        // test may not be the thing that reaches it.
+        let mut line = String::from("let a0 = [x, x, x, x, x, x, x, x, x, x]");
+        for i in 1..5 {
+            let prev = format!("a{}", i - 1);
+            let items = [prev.as_str(); 10].join(", ");
+            line.push_str(&format!("; let a{i} = [{items}]"));
+        }
+        let e = Program::parse(&line).expect_err("a 10^5-term expansion must be refused");
+        assert!(e.message.contains("terms"), "{}", e.message);
+        // and a composition anyone would actually write is untouched.
+        let scope = scope_of(&[("a", &["crest", "hex"])]);
+        assert_eq!(
+            terms_in("play([a, gods])", &scope),
+            vec!["crest", "hex", "gods"]
+        );
+    }
+
     #[test]
     fn unset_names_the_variable_it_drops() {
         let scope = scope_of(&[("mix", &["hex"])]);
@@ -5675,6 +5774,38 @@ mod tests {
             .nodes
             .iter()
             .any(|n| matches!(n, Node::Note(text) if text.contains("expand"))));
+    }
+
+    /// The refusal is latched so one blown expansion reports once
+    /// rather than 256 times, but the latch is per `Lowering` and a
+    /// `Lowering` spans the whole submission: the next statement's
+    /// `repeat` saw the latch, returned without pushing anything, and
+    /// lowered to nothing at all with nothing said.
+    #[test]
+    fn a_statement_refused_for_expansion_says_so_rather_than_vanishing() {
+        let program =
+            Program::parse("repeat(256, repeat(256, skip())); repeat(2, pause()); mute()")
+                .expect("should parse");
+        let refusals = program
+            .nodes
+            .iter()
+            .filter(|n| matches!(n, Node::Fail(t) if t.contains("expand")))
+            .count();
+        assert_eq!(
+            refusals, 2,
+            "each refused statement reports once: not none, not 256 times"
+        );
+        // read off the nodes rather than stepped, like the nested-repeat
+        // bound is: the program is thousands of steps long.
+        let emitted = |op: Op| program.nodes.contains(&Node::Emit(op));
+        // positive control: the program is not simply dead after the
+        // first refusal, so "nothing ran" cannot be mistaken for "the
+        // budget stopped everything".
+        assert!(emitted(Op::Mute(true)), "a later plain statement still ran");
+        assert!(
+            !emitted(Op::TogglePause),
+            "the refused statement emitted nothing, which is the bound working"
+        );
     }
 
     #[test]
@@ -6442,6 +6573,43 @@ mod tests {
         );
     }
 
+    /// A level is a percent, and `Ty::Level` used to reach it through
+    /// `parse_time`, which accepts the unit and colon forms too: so
+    /// `volume(1m)` set the volume to 60 and said "volume: 60%", and
+    /// `volume(2h)` reported "7200% is outside 0-100". A duration is
+    /// not a quieter spelling of a percent.
+    #[test]
+    fn a_level_is_a_percent_and_never_a_duration() {
+        for input in [
+            "volume(30s)",
+            "volume(1m)",
+            "volume(1:30)",
+            "volume(0:50)",
+            "volume(+1m)",
+            "volume(2h)",
+        ] {
+            let e = error(input);
+            assert!(
+                e.message.contains("not a percent"),
+                "{input} said '{}'",
+                e.message
+            );
+        }
+        // the spellings that are percents still are, sign and all.
+        assert_eq!(
+            ops("volume(50)"),
+            vec![Op::SetVolume(Level::Absolute(50.0))]
+        );
+        assert_eq!(
+            ops("volume(12.5%)"),
+            vec![Op::SetVolume(Level::Absolute(12.5))]
+        );
+        assert_eq!(
+            ops("volume(-10%)"),
+            vec![Op::SetVolume(Level::Delta(-10.0))]
+        );
+    }
+
     #[test]
     fn sleep_takes_a_duration_or_cancels() {
         assert_eq!(ops("sleep(30m)"), vec![Op::Sleep(Some(1800.0))]);
@@ -6522,6 +6690,51 @@ mod tests {
         assert!(e.message.contains("fade(out, 2s)"), "{}", e.message);
     }
 
+    /// `0` is the same mistake as `off` in a different spelling, and
+    /// `check_fade` only looked for `off`: a ramp of no length is a cut,
+    /// which the host's `Ramp` short-circuits to "already finished", so
+    /// `fade(out, 0)` slammed the volume to zero on the first frame and
+    /// called it a fade.
+    #[test]
+    fn fade_refuses_a_ramp_of_no_length() {
+        for input in ["fade(out, 0)", "fade(in, 0s)", "fade(out, 0:00)"] {
+            let e = error(input);
+            assert!(
+                e.message.contains("fade(out, 2s)"),
+                "{input} said '{}'",
+                e.message
+            );
+        }
+        // a real ramp is untouched, and so is the default.
+        assert_eq!(
+            ops("fade(out, 0.5s)"),
+            vec![Op::Fade {
+                into: false,
+                secs: 0.5
+            }]
+        );
+        assert_eq!(
+            ops("fade(out)"),
+            vec![Op::Fade {
+                into: false,
+                secs: DEFAULT_FADE_SECS
+            }]
+        );
+    }
+
+    /// `Ty::Span` is shared by `silence` and `pause`, and its
+    /// zero-length refusal was written for `silence` alone: asking to
+    /// `pause(0)` answered "a silence needs a length", which names a
+    /// command the user did not type.
+    #[test]
+    fn a_zero_span_names_the_command_that_asked_for_it() {
+        let e = error("pause(0)");
+        assert!(e.message.starts_with("pause:"), "{}", e.message);
+        assert!(e.message.contains("needs a length"), "{}", e.message);
+        let e = error("silence(0s)");
+        assert!(e.message.starts_with("silence:"), "{}", e.message);
+    }
+
     /// `f64::parse` accepts `inf` and `nan`, and the host turns every
     /// seconds-valued op into a `Duration`, which aborts the process on
     /// a non-finite or overflowing value. `secs.max(0.0)` launders nan
@@ -6594,8 +6807,11 @@ mod tests {
             ("moveto(inf:0)", "not a time"),
             ("moveto(99999h)", "longer than"),
             ("seek(+inf)", "not a time"),
-            ("volume(nan)", "not a time"),
-            ("volume(1e30)", "longer than"),
+            // a level has its own parser, so these are refused as
+            // percents rather than as times; routing them through the
+            // time grammar is what let `volume(1m)` mean 60%.
+            ("volume(nan)", "not a percent"),
+            ("volume(1e30)", "outside 0-100"),
             // a bare number is a percent for volume, so it is held to
             // the same 0-100 the `%` spelling always was.
             ("volume(101)", "outside 0-100"),
@@ -6828,6 +7044,116 @@ mod tests {
                 let _ = site(input, cursor);
             }
         }
+    }
+
+    // ------------------------------------------------ generated corpus
+
+    /// A 64-bit LCG, seeded by a constant on purpose: a generated
+    /// corpus is only useful in-tree if a failure reproduces, and a
+    /// clock- or entropy-seeded one gives a different corpus per run,
+    /// so the run that found something is not the run anyone debugs.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 16
+        }
+
+        fn pick<'a, T>(&mut self, from: &'a [T]) -> &'a T {
+            &from[(self.next() % from.len() as u64) as usize]
+        }
+    }
+
+    /// Fragments chosen for the hazards rather than for realism: the
+    /// delimiters the byte scanners key on, multibyte and combining and
+    /// zwj text to slice across, a NUL, and the literals that `f64`
+    /// accepts but nothing downstream survives.
+    const FRAGMENTS: &[&str] = &[
+        "queue(", "play(", "volume(", "moveto(", "repeat(", "dry(", "run(", "silence(", "fade(",
+        "let", "kind=", "=", "(", ")", "[", "]", ",", ";", "#", "\"", " ", "\n", "\t", "a", "2",
+        "+", "-", "%", "s", "m", "h", ":", ".", "nan", "inf", "1e30", "off", "é", "\u{301}",
+        "👩\u{200d}👧", "日本", "\0", "ı", "İ",
+    ];
+    /// Enough to cover the delimiters in combination without making the
+    /// suite slow; the seed is fixed, so this is a corpus, not a dice
+    /// roll that happened to pass.
+    const FUZZ_ROUNDS: usize = 400;
+
+    /// The panic classes this file has actually hit are all about an
+    /// index: a byte offset used to slice a `&str` somewhere it is not
+    /// a char boundary. Every one of them is reachable by typing, so
+    /// the guard is a generated corpus pushed through the real
+    /// keystroke path rather than through the helpers one at a time.
+    #[test]
+    fn no_generated_line_can_panic_the_parser_or_the_editor() {
+        let fake = Fake::new(&["flatline", "floor"]);
+        let mut rng = Lcg(0x5eed_1337);
+        let mut parsed = 0usize;
+        for _ in 0..FUZZ_ROUNDS {
+            let pieces = 1 + (rng.next() % 12) as usize;
+            let mut line = String::new();
+            for _ in 0..pieces {
+                line.push_str(rng.pick(FRAGMENTS));
+            }
+            if Program::parse(&line).is_ok() {
+                parsed += 1;
+            }
+            // `site` runs on every keystroke, at whatever offset the
+            // cursor happens to be.
+            for cursor in (0..=line.len()).filter(|c| line.is_char_boundary(*c)) {
+                let _ = site(&line, cursor);
+            }
+            // and the editor has to survive the same text arriving one
+            // key at a time, then being taken back out again.
+            let mut console = Console::empty();
+            for ch in line.chars() {
+                press(&mut console, &fake, KeyCode::Char(ch));
+            }
+            assert!(
+                console.input.is_char_boundary(console.cursor),
+                "cursor {} is mid-character in {:?}",
+                console.cursor,
+                console.input
+            );
+            // taken back out from the end, which is the backward
+            // boundary walk; autopairing means the typed line is not the
+            // generated one, so this has to run on what is actually
+            // there.
+            press(&mut console, &fake, KeyCode::End);
+            while !console.input.is_empty() {
+                let was = console.input.len();
+                press(&mut console, &fake, KeyCode::Backspace);
+                assert!(
+                    console.input.len() < was,
+                    "backspace made no progress on {:?}",
+                    console.input
+                );
+            }
+            // and forwards from the start, which is the other walk and
+            // reaches `Delete` and `paste` with the text verbatim.
+            console.paste(&line, &fake);
+            press(&mut console, &fake, KeyCode::Home);
+            while !console.input.is_empty() {
+                let was = console.input.len();
+                press(&mut console, &fake, KeyCode::Delete);
+                assert!(
+                    console.input.len() < was,
+                    "delete made no progress on {:?}",
+                    console.input
+                );
+            }
+        }
+        // positive control: the generator has to be producing real
+        // programs, or "nothing panicked" would only mean "nothing
+        // reached the parser".
+        assert!(
+            parsed > FUZZ_ROUNDS / 100,
+            "only {parsed} of {FUZZ_ROUNDS} lines parsed; the corpus is all noise"
+        );
     }
 
     // ------------------------------------------------------- the site
@@ -7181,6 +7507,85 @@ mod tests {
         press(&mut c, &fake, KeyCode::Char('a'));
         assert!(c.cycle().is_none());
         assert_eq!(c.input, "queue(fla)");
+    }
+
+    /// `Cycle`'s own invariant is that every item extends `typed`, so
+    /// cycling cannot overwrite what was typed. That holds only while
+    /// `typed` is still the token under the cursor: the cursor keys and
+    /// history recall left the cycle open, so the next tab computed a
+    /// remainder against a token that had moved and the accept spliced
+    /// it in mid-word.
+    #[test]
+    fn moving_the_cursor_retires_an_open_cycle() {
+        let fake = Fake::new(&["flatline", "floor", "flowers"]);
+        let mut c = console_with(&fake, "queue(fl");
+        press(&mut c, &fake, KeyCode::Tab);
+        assert!(c.cycle().is_some(), "a cycle should be open to retire");
+        press(&mut c, &fake, KeyCode::Left);
+        assert!(c.cycle().is_none(), "the token under the cursor changed");
+        // and the end-to-end consequence: whatever tab then offers is
+        // an extension of the token it is actually sitting on.
+        press(&mut c, &fake, KeyCode::Tab);
+        let chosen = {
+            let cycle = c.cycle().expect("a fresh cycle for the new token");
+            cycle.items[cycle.at].clone()
+        };
+        ctrl(&mut c, &fake, 'f');
+        assert!(
+            c.input[..c.cursor].ends_with(&chosen),
+            "accepted {chosen} but the line reads {:?}",
+            c.input
+        );
+    }
+
+    /// Up and down replace the whole line, so the same reasoning holds
+    /// there: `recall_back` kept the cycle, and `Right` at the end of
+    /// the recalled line then accepted the previous line's remainder.
+    #[test]
+    fn recalling_a_line_retires_an_open_cycle() {
+        let fake = Fake::new(&["flatline", "floor", "flowers"]);
+        let mut c = Console::empty();
+        c.history = vec!["pause()".into(), "queue(gods)".into()];
+        type_in(&mut c, &fake, "queue(fl");
+        press(&mut c, &fake, KeyCode::Tab);
+        assert!(c.cycle().is_some());
+        press(&mut c, &fake, KeyCode::Up);
+        assert_eq!(c.input, "queue(gods)");
+        assert!(c.cycle().is_none(), "the recalled line is a new token");
+    }
+
+    /// An error belongs to the line it was reported for, so anything
+    /// that replaces the line retires it. `Delete` was fixed for this
+    /// once; recall and paste replace *the whole line* and did not.
+    #[test]
+    fn replacing_the_line_retires_the_error_it_reported() {
+        let fake = Fake::new(&[]);
+        let mut c = Console::empty();
+        c.history = vec!["pause()".into()];
+        type_in(&mut c, &fake, "shufle()");
+        press(&mut c, &fake, KeyCode::Enter);
+        assert!(c.error.is_some(), "the bad line should have reported");
+        press(&mut c, &fake, KeyCode::Up);
+        assert_eq!(c.input, "pause()");
+        assert!(c.error.is_none(), "the error accused a line that is gone");
+        // down restores the parked draft, which is just as much a
+        // different line than the one that failed.
+        let mut c = Console::empty();
+        c.history = vec!["mute()".into()];
+        press(&mut c, &fake, KeyCode::Up);
+        type_in(&mut c, &fake, "x");
+        press(&mut c, &fake, KeyCode::Enter);
+        assert!(c.error.is_some(), "mute()x should not parse");
+        press(&mut c, &fake, KeyCode::Down);
+        assert_eq!(c.input, "", "the empty draft comes back");
+        assert!(c.error.is_none());
+
+        // and so does a paste, for the same reason.
+        let mut c = console_with(&fake, "shufle()");
+        press(&mut c, &fake, KeyCode::Enter);
+        assert!(c.error.is_some());
+        c.paste("x", &fake);
+        assert!(c.error.is_none());
     }
 
     #[test]
@@ -7971,6 +8376,44 @@ queue(morning)
             ops_of(&program).len(),
             MAX_SCRIPT_DEPTH,
             "one pause() per frame, then the bound"
+        );
+    }
+
+    /// `MAX_SCRIPT_DEPTH` bounds how deep the frames go, not how many
+    /// there are: a file that runs itself *twice* per frame expands
+    /// breadth-to-the-depth, so a handful of lines is millions of nodes
+    /// and a wedged ui. Only a bound on the total holds that, so this
+    /// pins the total the way the nested-`repeat` test does.
+    #[test]
+    fn script_breadth_is_bounded_by_the_total_it_expands_to() {
+        let slack = 128;
+        for lines in ["run(loop)\nrun(loop)\n", &"run(loop)\n".repeat(4)] {
+            let program = run_script("run(loop)", &[("loop", lines)]);
+            assert!(
+                program.nodes.len() <= MAX_EXPANSION + slack,
+                "{lines:?} lowered to {} nodes",
+                program.nodes.len()
+            );
+        }
+        // and the refusal is said out loud, not just stopped at.
+        let program = run_script("run(loop)", &[("loop", &"run(loop)\n".repeat(4))]);
+        assert!(
+            program
+                .nodes
+                .iter()
+                .any(|n| matches!(n, Node::Fail(text) if text.contains("expand"))),
+            "expanded past the budget without saying so"
+        );
+        // a script well inside the budget is untouched: four frames of
+        // one `pause()` each, plus the depth refusal, is not a refusal
+        // to expand.
+        let small = run_script("run(s)", &[("s", "pause()\nrun(s)\n")]);
+        assert!(
+            !small
+                .nodes
+                .iter()
+                .any(|n| matches!(n, Node::Fail(text) if text.contains("expand"))),
+            "a small script must not be refused"
         );
     }
 
