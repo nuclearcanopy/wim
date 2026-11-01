@@ -1997,6 +1997,50 @@ same-process ratios are quoted.
       several width walks of static art per frame), which was out of
       scope and is the obvious next slice.
 
+### found by the six-agent run, not yet done
+
+Each of these was measured by an agent that could not reach the file it
+needed, so the number is real and the work is scoped.
+
+- [ ] **`CacheIndex::entry` is 44% of a suggestions pass**, and 92% of
+      the affinity stage: 9412us per-track against 767us with the
+      lookup removed. The flip (walk the ~10k index entries instead of
+      30.8k tracks) is not a win while it pays both a `by_key` and an
+      `entry` lookup, so it needs `CacheIndex::entries()` in
+      `cache.rs`. That is now the largest single cost in the menu.
+- [ ] **`play_days` is where a big play index goes.** 20k tracks parse
+      in 36-41ms at 4 play days and **256-271ms at 64**, nine tenths of
+      it allocating `Vec<String>`s of `YYYY-MM-DD` on the main thread
+      before the first frame. Only `.len()` and `.first()` are read
+      outside `cache.rs` (`suggest.rs:1100,1103`), so a packed
+      representation takes it back; it changes a `pub` field, which is
+      why the agent stopped.
+- [ ] **the resume queue's cost is the stats, not the parse.**
+      `main.rs:1067-1072` calls `item_from_path` once per saved path,
+      a `stat` each, on the main thread before the frame, while the
+      matching mpv appends were already deferred past it. The toml
+      parse it sits next to is 144us, so the format is not the
+      problem; this is.
+- [ ] **`banner.rs` is the real per-frame logo cost.** `logos.rs` is
+      compile-time data only, but the banner re-walks every line's
+      width each frame (up to 50 rows for `figlet: doh`), plus a
+      `Vec<(String, &str)>`, a `" ".repeat()` and a `format!` per menu
+      row, then `width()` again over those: ~17 allocations a frame of
+      static art, all derivable once per (logo index, keymap) change.
+- [ ] **`textfit::truncate_into(&mut String, ..)`.** Drawing an
+      already-fitting row straight out of its buffer is 1.96x where
+      rows fit and 0.82x where they do not, because the second case
+      pays an extra width walk; the version that wins both is an
+      in-place truncate, so the paint can hold one buffer end to end.
+- [ ] **`search::Ranking::group_boundaries_upto`.** `boundaries()` is
+      O(total matches) and is now the whole remaining geometry cost of
+      a results frame; `layout` only needs boundaries up to
+      `max(selected, visible_rows)`, which would make a 15k list with
+      the selection near the top walk ~40 items instead of 15000.
+- [ ] **main.rs computes the results geometry three times a frame**
+      (junction marks, click map, paint). Passing one `RowLayout` cuts
+      it to one: ~280us a frame down to ~93us at 15k matches.
+
 ### measured and rejected: a packed search prefilter (2026-11-01)
 
 - [x] **`Entry` is 168 bytes and the prefilter reads 12 of them**, so
