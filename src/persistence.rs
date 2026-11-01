@@ -150,6 +150,75 @@ mod tests {
         }
     }
 
+    /// What rebuilding a saved queue costs before the first frame.
+    ///
+    /// `item_from_path` stats every path (`is_file`), and main.rs runs
+    /// the whole loop ahead of the first draw while the mpv appends it
+    /// feeds are already deferred past it. This prices the stats, with
+    /// the present-and-missing split because a saved queue outlives
+    /// the files in it.
+    ///
+    /// `cargo test --release -- --ignored --nocapture bench_cpu_queue_rebuild`
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_cpu_queue_rebuild() {
+        let dir = scratch_dir("rebuild-bench");
+        let present: Vec<String> = (0..200)
+            .map(|i| {
+                let p = dir.join(format!("{i:03} - track.flac"));
+                fs::write(&p, b"x").unwrap();
+                p.to_string_lossy().into_owned()
+            })
+            .collect();
+        let missing: Vec<String> = (0..200)
+            .map(|i| {
+                dir.join(format!("gone-{i:03}.flac"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        println!(
+            "--- saved queue rebuild, {} build",
+            if cfg!(debug_assertions) {
+                "DEBUG (not the shipping cost)"
+            } else {
+                "release"
+            }
+        );
+        for (label, paths) in [("present", &present), ("missing", &missing)] {
+            // cpu clock: this is syscalls plus a path walk, and the
+            // wall clock on this box moves 2x with load.
+            let mut best = std::time::Duration::MAX;
+            let mut got = 0;
+            for _ in 0..8 {
+                let at = cpu_now();
+                got = paths.iter().filter_map(|p| item_from_path(p)).count();
+                best = best.min(cpu_now().saturating_sub(at));
+            }
+            println!(
+                "  {label:<8} {:>4} paths  {best:>10.3?}  ({:>7.3?} each, {got} rebuilt)",
+                paths.len(),
+                best / paths.len() as u32,
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Process cpu time, so another build on the box cannot flatter a
+    /// syscall-bound measurement.
+    fn cpu_now() -> std::time::Duration {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: a valid timespec, and the clock id is a constant.
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts);
+        }
+        std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+
     #[test]
     fn item_from_path_rejects_missing_files() {
         assert!(item_from_path("/definitely/does/not/exist.mp3").is_none());
