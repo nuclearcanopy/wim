@@ -38,7 +38,7 @@ const MAX_TRACKED_DAYS: usize = 64;
 
 /// Per-track bookkeeping, keyed by the track's stable navidrome id
 /// (`SearchItem::Song::id`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheEntry {
     #[serde(default)]
     pub play_count: u32,
@@ -202,8 +202,14 @@ fn index_body(index: &CacheIndex) -> String {
     body
 }
 
+/// Pre-sized off the line count (one memchr pass over the file, next
+/// to nothing) rather than grown: this runs on the main thread before
+/// the first frame, and a map grown from empty rehashes every id it
+/// already holds a dozen times on the way up.
 fn parse_index_body(raw: &str) -> CacheIndex {
-    let mut index = CacheIndex::default();
+    let mut index = CacheIndex {
+        entries: HashMap::with_capacity(raw.lines().count()),
+    };
     for row in raw
         .lines()
         .filter_map(|line| serde_json::from_str::<PlayRow>(line).ok())
@@ -1430,6 +1436,203 @@ mod tests {
             best = best.min(cpu_now().saturating_sub(start));
         }
         (best, last)
+    }
+
+    /// Alternating batches in one process, best of each, in
+    /// microseconds. Same helper and the same reason as
+    /// `framesource::frame_budget::best_each`: sequential runs on this
+    /// box differ 1.6-1.8x under load, so two numbers from two runs
+    /// are not comparable and this is the only shape that is.
+    fn best_each(
+        rounds: usize,
+        iters: usize,
+        a: &mut dyn FnMut(),
+        b: &mut dyn FnMut(),
+    ) -> (f64, f64) {
+        let mut best = (f64::MAX, f64::MAX);
+        let time = |f: &mut dyn FnMut()| {
+            let at = std::time::Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            at.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+        for _ in 0..rounds {
+            best.0 = best.0.min(time(a));
+            best.1 = best.1.min(time(b));
+        }
+        best
+    }
+
+    /// `best_each` on the process cpu clock instead of the wall clock,
+    /// for the pairs where both sides are single-threaded. This box's
+    /// other cores are not idle during a bench run (load average 28
+    /// observed, wall 6x cpu on the same work), so wall clock moves
+    /// several-fold between batches while the work done does not. A
+    /// pooled candidate still has to be read on the wall clock, since
+    /// cpu time is exactly what it trades away.
+    fn best_each_cpu(
+        rounds: usize,
+        iters: usize,
+        a: &mut dyn FnMut(),
+        b: &mut dyn FnMut(),
+    ) -> (f64, f64) {
+        let cpu_now = || {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: clock_gettime only writes the timespec we hand it.
+            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+            ts.tv_sec as f64 * 1e6 + ts.tv_nsec as f64 / 1e3
+        };
+        let mut best = (f64::MAX, f64::MAX);
+        let time = |f: &mut dyn FnMut()| {
+            let at = cpu_now();
+            for _ in 0..iters {
+                f();
+            }
+            (cpu_now() - at) / iters as f64
+        };
+        for _ in 0..rounds {
+            best.0 = best.0.min(time(a));
+            best.1 = best.1.min(time(b));
+        }
+        best
+    }
+
+    /// Which profile a measurement ran in. `cargo test` defaults to
+    /// `opt-level = 0`, where one of these paths measured 11x its
+    /// release cost, and a debug number quoted as the cost is how a
+    /// non-problem becomes a blocker.
+    fn profile() -> &'static str {
+        if cfg!(debug_assertions) {
+            "DEBUG (not the shipping cost; re-run with --release)"
+        } else {
+            "release"
+        }
+    }
+
+    /// `parse_index_body` as it was before the map was pre-sized:
+    /// kept as the baseline `play_index_parse_legs` measures against.
+    fn parse_index_body_growing(raw: &str) -> CacheIndex {
+        let mut index = CacheIndex::default();
+        for row in raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<PlayRow>(line).ok())
+        {
+            index.entries.insert(
+                row.id.into_owned(),
+                CacheEntry {
+                    play_count: row.play_count,
+                    play_days: row.play_days.into_iter().map(Cow::into_owned).collect(),
+                    last_played_secs: row.last_played_secs,
+                    cached_path: row.cached_path.map(Cow::into_owned),
+                    cached_at_secs: row.cached_at_secs,
+                },
+            );
+        }
+        index
+    }
+
+    /// The same parse with the serde half chunked over a pool; the map
+    /// insert stays serial, since hashing every id once is the
+    /// irreducible part.
+    fn parse_index_body_parallel(raw: &str) -> CacheIndex {
+        let lines: Vec<&str> = raw.lines().collect();
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(lines.len().max(1));
+        let chunk = lines.len().div_ceil(workers.max(1)).max(1);
+        let parts: Vec<Vec<(String, CacheEntry)>> = std::thread::scope(|scope| {
+            lines
+                .chunks(chunk)
+                .map(|part| {
+                    scope.spawn(move || {
+                        part.iter()
+                            .filter_map(|line| serde_json::from_str::<PlayRow>(line).ok())
+                            .map(|row| {
+                                (
+                                    row.id.into_owned(),
+                                    CacheEntry {
+                                        play_count: row.play_count,
+                                        play_days: row
+                                            .play_days
+                                            .into_iter()
+                                            .map(Cow::into_owned)
+                                            .collect(),
+                                        last_played_secs: row.last_played_secs,
+                                        cached_path: row.cached_path.map(Cow::into_owned),
+                                        cached_at_secs: row.cached_at_secs,
+                                    },
+                                )
+                            })
+                            .collect()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+        let mut entries = HashMap::with_capacity(lines.len());
+        entries.extend(parts.into_iter().flatten());
+        CacheIndex { entries }
+    }
+
+    /// `CacheIndex::load` is the one startup read still on the **main
+    /// thread**, before the first frame and with nothing overlapping
+    /// it, so every microsecond here is a microsecond of first frame.
+    /// Prices the growing map against the pre-sized one and against a
+    /// pooled parse. `cargo test --release -- --ignored --nocapture
+    /// play_index_parse_legs`.
+    #[test]
+    #[ignore = "measurement, run explicitly"]
+    fn play_index_parse_legs() {
+        println!("--- play index parse, {} build", profile());
+        for (tracks, days) in [(2_000usize, 3usize), (5_000, 4), (20_000, 64)] {
+            let raw = index_body(&play_index(tracks, days));
+            assert_eq!(
+                parse_index_body_growing(&raw).entries,
+                parse_index_body(&raw).entries,
+                "pre-sizing the map must not change what it holds"
+            );
+            assert_eq!(
+                parse_index_body_parallel(&raw).entries,
+                parse_index_body(&raw).entries,
+                "nor may chunking it"
+            );
+
+            let (growing, sized) = best_each_cpu(
+                8,
+                2,
+                &mut || {
+                    parse_index_body_growing(&raw);
+                },
+                &mut || {
+                    parse_index_body(&raw);
+                },
+            );
+            let (sized_again, pooled) = best_each(
+                8,
+                2,
+                &mut || {
+                    parse_index_body(&raw);
+                },
+                &mut || {
+                    parse_index_body_parallel(&raw);
+                },
+            );
+            println!(
+                "{tracks:>6} tracks x {days:>2} days ({:>9}B)  cpu: growing map \
+                 {growing:>9.0}us pre-sized {sized:>9.0}us {:.2}x   wall: pre-sized \
+                 {sized_again:>9.0}us pooled {pooled:>9.0}us {:.2}x",
+                raw.len(),
+                growing / sized,
+                sized_again / pooled,
+            );
+        }
     }
 
     /// Does the row parse need parallelising? It is on the startup
