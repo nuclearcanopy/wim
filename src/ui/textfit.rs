@@ -974,11 +974,7 @@ mod bench {
     /// the discipline `ui::player::bench` states: back-to-back runs on
     /// this machine came out 1.6x apart with other builds running,
     /// which is larger than the split being measured.
-    fn best_each<const N: usize>(
-        batches: u32,
-        n: u32,
-        mut f: impl FnMut(usize),
-    ) -> [Duration; N] {
+    fn best_each<const N: usize>(batches: u32, n: u32, mut f: impl FnMut(usize)) -> [Duration; N] {
         let mut best = [Duration::MAX; N];
         for _ in 0..batches {
             for (i, slot) in best.iter_mut().enumerate() {
