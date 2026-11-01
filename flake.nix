@@ -1,5 +1,5 @@
 {
-  description = "wim — terminal omniplayer for music and video";
+  description = "wim, a terminal omniplayer for music and video";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -18,9 +18,16 @@
 
             nativeBuildInputs = [ pkgs.makeWrapper ];
 
+            # the frame source spawns a real mpv and reads rawvideo
+            # back off a fifo, so its tests need the binary at check
+            # time, not only at runtime. without this the sandbox has
+            # no mpv and 19 of them fail, which is what `nix build`
+            # was failing on while the fmt step hid it.
+            nativeCheckInputs = [ pkgs.mpv ];
+
             # mpv is a runtime subprocess dependency (driven over its
             # json ipc socket, see docs/architecture.md), not a linked
-            # library — wrap the binary so it's on PATH without needing
+            # library: wrap the binary so it's on PATH without needing
             # it installed system-wide.
             postInstall = ''
               wrapProgram $out/bin/wim --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.mpv ]}
