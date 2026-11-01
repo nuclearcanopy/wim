@@ -1114,7 +1114,7 @@ mod restore {
 
     use crate::cache::{self, CacheIndex};
     use crate::core::{
-        BetweenTracks, Intent, RemoteSearchQuery, ScrobbleState, StarFailed, SubtitleReady,
+        BetweenTracks, Intent, RemoteSearchQuery, ScrobbleState, StarFailed, SubtitleOutcome,
         TrackResolver,
     };
     use crate::download::DownloadEvent;
@@ -1141,8 +1141,8 @@ mod restore {
         _download_rx: mpsc::Receiver<DownloadEvent>,
         downloading: HashSet<String>,
         scrobble: ScrobbleState,
-        subtitle_tx: mpsc::Sender<SubtitleReady>,
-        _subtitle_rx: mpsc::Receiver<SubtitleReady>,
+        subtitle_tx: mpsc::Sender<SubtitleOutcome>,
+        _subtitle_rx: mpsc::Receiver<SubtitleOutcome>,
         console: Console,
         now_playing: Option<SearchItem>,
         favorites: favorites::Favorites,
