@@ -3244,7 +3244,19 @@ fn coerce(
             // the one place variables expand, which is why every
             // terms-taking command gets them with no code of its own and
             // why `dry()` reports the expanded plan.
-            Ok(Arg::Terms(world.scope.expand(&items)))
+            let terms = world.scope.expand(&items);
+            // expansion is eager, so there is no cycle to detect but
+            // there is still a width: each `let` naming an already-bound
+            // variable multiplies, and eight ten-item levels is 10^8
+            // terms built synchronously with the ui frozen.
+            if terms.len() > MAX_EXPANSION {
+                return Err(bad(format!(
+                    "{}: that expands to {} terms, past the {MAX_EXPANSION} allowed",
+                    command.name,
+                    terms.len()
+                )));
+            }
+            Ok(Arg::Terms(terms))
         }
         Ty::VarName => {
             let name = unquote(text);
@@ -4953,6 +4965,32 @@ mod tests {
                 name: "b".to_string(),
                 terms: vec!["crest".into(), "hex".into(), "gods".into()],
             }]
+        );
+    }
+
+    /// Eager expansion removes the recursion but not the *width*: each
+    /// `let` whose value names an already-bound variable multiplies, so
+    /// a chain of eight ten-item bindings is 10^8 terms built
+    /// synchronously in `submit` with the ui frozen. Bounded like every
+    /// other expansion here, and reported rather than attempted.
+    #[test]
+    fn composing_variables_is_bounded_by_the_width_it_expands_to() {
+        // five levels, not the eight that actually exhausts memory: the
+        // bound has to bite well before the point of no return, and a
+        // test may not be the thing that reaches it.
+        let mut line = String::from("let a0 = [x, x, x, x, x, x, x, x, x, x]");
+        for i in 1..5 {
+            let prev = format!("a{}", i - 1);
+            let items = [prev.as_str(); 10].join(", ");
+            line.push_str(&format!("; let a{i} = [{items}]"));
+        }
+        let e = Program::parse(&line).expect_err("a 10^5-term expansion must be refused");
+        assert!(e.message.contains("terms"), "{}", e.message);
+        // and a composition anyone would actually write is untouched.
+        let scope = scope_of(&[("a", &["crest", "hex"])]);
+        assert_eq!(
+            terms_in("play([a, gods])", &scope),
+            vec!["crest", "hex", "gods"]
         );
     }
 
