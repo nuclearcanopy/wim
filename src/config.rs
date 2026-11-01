@@ -780,6 +780,21 @@ fn restrict_to_owner(_path: &Path) -> Result<()> {
 /// Persists config, surfacing a failure instead of swallowing it: a
 /// read-only config dir or a full disk used to mean every setting
 /// silently reverted on the next launch with nothing said about it.
+impl VideoOutput {
+    /// The word config.toml uses. Not `Debug`, which prints `Tct`
+    /// where the file says `tct`, and shared so the settings row and
+    /// `video()`'s report cannot drift apart.
+    pub fn word(self) -> &'static str {
+        match self {
+            VideoOutput::Auto => "auto",
+            VideoOutput::Tct => "tct",
+            VideoOutput::Kitty => "kitty",
+            VideoOutput::Ascii => "ascii",
+            VideoOutput::Off => "off",
+        }
+    }
+}
+
 /// The settings menu's video-output cycle. `ascii` is in it: `Auto`
 /// never *picks* it, because a real protocol beats a cell grid, but a
 /// user on a terminal with neither protocol has to be able to choose
