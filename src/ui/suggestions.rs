@@ -6,7 +6,7 @@ use ratatui::widgets::Widget;
 
 use crate::anim;
 use crate::suggest::{Reason, Suggestions};
-use crate::theme::{shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE};
+use crate::theme::{lerp, shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::draw;
 use crate::ui::header::draw_header;
 use crate::ui::results_list::{fill_row_bg, label, scroll_cues};
@@ -33,6 +33,39 @@ pub struct SuggestionsView<'a> {
     /// flight, so the footer can say the list is still filling out
     /// rather than letting a thin list look like the whole answer.
     pub enriching: bool,
+}
+
+/// Leads in the reason line. The same glyph `ui::shellsong` marks a
+/// read-only information row with, and for the same reason: it is
+/// context about the row above it, never something a keypress acts on.
+const INFO_MARK: char = '›';
+
+/// A section heading: its name, then a rule out to the section's own
+/// edge. `NEAR_BLACK`, the level `draw::frame` uses, because a rule as
+/// bright as the name it follows reads as noise rather than as
+/// structure; the gap row above a heading was the only thing dividing
+/// the sections, so a window that opened mid-list showed none of them.
+/// Stops a cell short of the edge so the `▴`/`▾` cue is never butted
+/// straight onto it.
+fn draw_section(buf: &mut Buffer, cols: Rect, y: u16, title: &str) {
+    if y < cols.y || y >= cols.y + cols.height {
+        return;
+    }
+    let budget = cols.width as usize;
+    // `draw::at` hands back the x it reached, so the rule starts where
+    // the name stopped: a wide glyph in a section title would put a
+    // recomputed offset a cell out.
+    let end = draw::at(
+        buf,
+        cols.x,
+        y,
+        &truncate_with_ellipsis(&format!(" {title}"), budget),
+        shade(MID),
+        budget,
+    );
+    let left = budget.saturating_sub(end.saturating_sub(cols.x) as usize);
+    let rule = format!(" {}", "─".repeat(left.saturating_sub(2)));
+    draw::at(buf, end, y, &rule, shade(NEAR_BLACK), left);
 }
 
 /// One drawn row. A suggestion occupies two (`Item` then `Reason`), so
@@ -252,9 +285,7 @@ impl Widget for SuggestionsView<'_> {
             let y = body_top + i as u16;
             match row {
                 Row::Gap => {}
-                Row::Section(reason) => {
-                    draw::line(buf, cols, y, &format!(" {}", reason.title()), shade(MID));
-                }
+                Row::Section(reason) => draw_section(buf, cols, y, reason.title()),
                 Row::Item(idx) | Row::Reason(idx) => {
                     // `rows` numbers its items by walking the same
                     // sections in the same order `flat` does, so every
@@ -281,17 +312,25 @@ impl Widget for SuggestionsView<'_> {
                             )
                         }
                         // the reason is indented past the title it
-                        // explains, so the eye reads title-then-cause.
-                        _ => format!("      {}", suggestion.reason_text),
+                        // explains, so the eye reads title-then-cause,
+                        // and led in by the same `›` the console marks
+                        // a read-only information row with: it ties the
+                        // line to the title above it rather than
+                        // leaving it floating in white space.
+                        _ => format!("    {INFO_MARK} {}", suggestion.reason_text),
                     };
                     let level = match (row, is_selected) {
                         (Row::Item(_), true) => BRIGHT,
                         (Row::Item(_), false) => DIM,
-                        // only legible on the row you're on: every
-                        // reason at full brightness would compete with
-                        // the titles for attention.
+                        // brightest on the row you're on: every reason
+                        // at full brightness would compete with the
+                        // titles for attention. `NEAR_BLACK` off it was
+                        // the other extreme, the level the frame is
+                        // drawn at, so the feature was invisible on 29
+                        // rows of 30; this is the console ghost's level,
+                        // under the titles and still legible.
                         (_, true) => NEAR_WHITE * 0.6,
-                        (_, false) => NEAR_BLACK,
+                        (_, false) => lerp(NEAR_BLACK, DIM, 0.75),
                     };
                     let fitted = truncate_with_ellipsis(&text, cols.width as usize);
                     draw::line(buf, cols, y, &fitted, shade(level));
@@ -697,6 +736,81 @@ mod tests {
         }
     }
 
+    /// The reason is the whole feature (see the type doc) and it was
+    /// painted at `NEAR_BLACK` off the cursor, the level the *frame* is
+    /// drawn at, so on 29 rows of 30 it was not there. It recedes under
+    /// its own title; it does not vanish. The `›` is what ties it to
+    /// the title rather than leaving it floating in white space.
+    #[test]
+    fn a_reason_off_the_cursor_is_dimmer_than_its_title_and_still_visible() {
+        let buf = render_into(&two_sections(), 0, 60, 12);
+        let g = grid(&buf);
+        let row_of = |needle: &str| {
+            g.lines()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} missing from:\n{g}")) as u16
+        };
+        // the unselected pair: "Crest" and its own reason
+        let title = row_of("Crest");
+        let reason = row_of("28 plays, nothing from this album");
+        assert_eq!(reason, title + 1, "the reason follows its title");
+        let line = g.lines().nth(reason as usize).unwrap();
+        assert!(
+            line.starts_with(&format!("    {INFO_MARK} ")),
+            "the reason has no lead-in tying it to its title:\n{line}"
+        );
+        // column 4 is the mark, column 2 the title's first letter.
+        let reason_level = level_at(&buf, 4, reason);
+        let title_level = level_at(&buf, 2, title);
+        assert!(
+            reason_level < title_level,
+            "the reason competes with its title: {reason_level} vs {title_level}"
+        );
+        assert!(
+            reason_level > NEAR_BLACK,
+            "the reason is painted at the frame's own level: {reason_level}"
+        );
+        // and it brightens with the row the cursor is on, which is the
+        // behaviour the type doc claims.
+        let on = render_into(&two_sections(), 1, 60, 12);
+        assert!(
+            level_at(&on, 4, reason) > reason_level,
+            "the selected row's reason is no brighter than the rest"
+        );
+    }
+
+    /// A gap row was the only thing dividing the sections, so a window
+    /// that opened mid-list showed no structure at all; the rule is
+    /// what makes a heading read as a heading. `NEAR_BLACK`, the level
+    /// `draw::frame` uses, because a rule as bright as the name it
+    /// follows is noise rather than structure.
+    #[test]
+    fn a_section_heading_carries_a_rule_darker_than_its_own_name() {
+        for (w, h) in [(60u16, 12u16), (34, 12), (80, 20)] {
+            let buf = render_into(&two_sections(), 0, w, h);
+            let g = grid(&buf);
+            let y = g
+                .lines()
+                .position(|l| l.contains("your daily rotation"))
+                .expect("the heading") as u16;
+            let line: Vec<char> = g.lines().nth(y as usize).unwrap().chars().collect();
+            let rule = line
+                .iter()
+                .position(|c| *c == '─')
+                .unwrap_or_else(|| panic!("{w}x{h}: the heading has no rule:\n{g}"));
+            assert!(
+                level_at(&buf, rule as u16, y) < level_at(&buf, 1, y),
+                "{w}x{h}: the rule is as bright as the name it follows"
+            );
+            // and it stops short of the pane, so the `▴`/`▾` gutter is
+            // never butted straight onto the end of it.
+            assert_eq!(
+                line[w as usize - 1], '.',
+                "{w}x{h}: the rule ran into the cue column:\n{g}"
+            );
+        }
+    }
+
     #[test]
     fn a_still_filling_list_says_so_in_the_title() {
         let s = two_sections();
@@ -1080,6 +1194,26 @@ mod eyeball {
             .join("\n")
     }
 
+    /// The heading, the selected title, its reason, and an unselected
+    /// pair, as brightnesses. Four levels have to come out of it, and
+    /// the heading's rule has to be darker than all of them.
+    #[test]
+    fn print_the_brightness_of_the_rows() {
+        let buf = paint(&two_sections(), 0, 60, 10);
+        println!("--- 60x10 cursor 0\n{}\n{}", grid(&buf), levels(&buf));
+        let digits: std::collections::BTreeSet<char> = levels(&buf)
+            .lines()
+            .skip(crate::ui::header::ROWS as usize)
+            .flat_map(str::chars)
+            .collect();
+        assert!(
+            digits.len() >= 4,
+            "heading, title, reason and the rows off the cursor are not \
+             four levels:\n{}",
+            levels(&buf)
+        );
+    }
+
     /// The two states nothing ever printed: a pane with nothing in it
     /// (the first thing a new library sees) and a pane holding exactly
     /// one suggestion, where there is no list for the eye to compare
@@ -1124,4 +1258,41 @@ mod eyeball {
         }
     }
 
+    /// Wide cjk and an emoji cluster in a title and in a reason, at the
+    /// widths where they land on the right edge. Two cells a glyph in
+    /// one measuring model and one cluster in the other; conflating
+    /// them is what pushes a row past its own column.
+    #[test]
+    fn print_wide_glyph_rows() {
+        let wide = |title: &str, reason: &str| crate::suggest::Suggestion {
+            item: crate::search::SearchItem::LocalMusic {
+                path: "/m/x.flac".into(),
+                title: title.to_string(),
+                artist: Some("\u{65e5}\u{672c}".to_string()),
+                album: None,
+            },
+            reason_text: reason.to_string(),
+            score: 0.5,
+        };
+        let s = Suggestions {
+            sections: vec![crate::suggest::Section {
+                title: Reason::DailyRotation.title().to_string(),
+                reason: Reason::DailyRotation,
+                items: vec![
+                    wide(
+                        "\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30b9}\u{30c8}",
+                        "\u{1f469}\u{200d}\u{1f469}\u{200d}\u{1f467} \u{306e}\u{305f}\u{3081}",
+                    ),
+                    wide("Beyonce\u{301}", "\u{2764}\u{fe0f} 28 plays"),
+                    wide("\u{1f3b5}\u{1f3b5}\u{1f3b5}", "\u{1100}\u{1161}\u{11a8} song"),
+                ],
+            }],
+        };
+        for (w, h) in [(60u16, 10u16), (20, 10), (13, 9), (9, 8)] {
+            for selected in [0usize, 2] {
+                let buf = paint(&s, selected, w, h);
+                println!("--- wide {w}x{h} cursor {selected}\n{}", grid(&buf));
+            }
+        }
+    }
 }
