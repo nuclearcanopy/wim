@@ -132,6 +132,26 @@ pub fn showing(screen: Screen, want: VideoOutput, probed: Option<ProtocolType>) 
     }
 }
 
+/// The mode actually in force: a runtime override if the user set one,
+/// the config otherwise.
+pub fn effective(configured: VideoOutput, over: Option<VideoOutput>) -> VideoOutput {
+    over.unwrap_or(configured)
+}
+
+/// What the ascii toggle leaves the override at.
+///
+/// Turning it off clears the override rather than naming a mode, so a
+/// user who edits `video_output` and comes back gets the new value; the
+/// one case that cannot clear is ascii being what the config says, and
+/// there `Auto` is the honest other half of the toggle.
+pub fn toggle_ascii(configured: VideoOutput, over: Option<VideoOutput>) -> Option<VideoOutput> {
+    if effective(configured, over) == VideoOutput::Ascii {
+        (configured == VideoOutput::Ascii).then_some(VideoOutput::Auto)
+    } else {
+        Some(VideoOutput::Ascii)
+    }
+}
+
 pub fn wanted(screen: Screen, want: VideoOutput, probed: Option<ProtocolType>) -> Option<Vo> {
     showing(screen, want, probed).mpv_vo()
 }
@@ -188,6 +208,66 @@ impl Hole {
             }
         }
         false
+    }
+}
+
+/// The ascii toggle's two directions, which are not symmetric: off
+/// means "whatever the config says now", and that cannot be expressed
+/// when the config itself says ascii.
+#[cfg(test)]
+mod toggle_tests {
+    use super::*;
+
+    /// The ordinary case: no override until the user asks, and asking
+    /// twice puts it back to following the config.
+    #[test]
+    fn the_toggle_returns_to_the_config_it_came_from() {
+        let on = toggle_ascii(VideoOutput::Auto, None);
+        assert_eq!(on, Some(VideoOutput::Ascii));
+        assert_eq!(effective(VideoOutput::Auto, on), VideoOutput::Ascii);
+
+        let off = toggle_ascii(VideoOutput::Auto, on);
+        assert_eq!(off, None, "off has to stop overriding, not pick a mode");
+        assert_eq!(effective(VideoOutput::Auto, off), VideoOutput::Auto);
+    }
+
+    /// Clearing the override here would turn ascii straight back on,
+    /// so the toggle would do nothing at all; `Auto` is the only other
+    /// mode that can still produce a picture.
+    #[test]
+    fn turning_it_off_works_even_when_the_config_says_ascii() {
+        let off = toggle_ascii(VideoOutput::Ascii, None);
+        assert_eq!(off, Some(VideoOutput::Auto));
+        assert_ne!(effective(VideoOutput::Ascii, off), VideoOutput::Ascii);
+
+        let on = toggle_ascii(VideoOutput::Ascii, off);
+        assert_eq!(effective(VideoOutput::Ascii, on), VideoOutput::Ascii);
+    }
+
+    /// The property both cases above are instances of: one press
+    /// flips whether ascii is in force, from either starting point and
+    /// whatever the config says. A toggle that no-ops for one
+    /// configured mode is the bug worth pinning.
+    #[test]
+    fn one_press_flips_whether_ascii_is_in_force() {
+        for configured in [
+            VideoOutput::Auto,
+            VideoOutput::Off,
+            VideoOutput::Kitty,
+            VideoOutput::Tct,
+            VideoOutput::Ascii,
+        ] {
+            let mut over = None;
+            for press in 0..4 {
+                let before = effective(configured, over) == VideoOutput::Ascii;
+                over = toggle_ascii(configured, over);
+                let after = effective(configured, over) == VideoOutput::Ascii;
+                assert_ne!(
+                    before, after,
+                    "{configured:?} did not flip on press {press}"
+                );
+            }
+        }
     }
 }
 

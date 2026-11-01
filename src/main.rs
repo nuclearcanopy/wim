@@ -782,6 +782,10 @@ fn main() -> anyhow::Result<()> {
     // mpv only reads it on init. see docs/video.md.
     let mut video_fullscreen = false;
     let mut video_vo: Option<video::Vo> = None;
+    // the runtime half of `video_output`: `None` follows config.toml,
+    // and the ascii key is the only thing that sets it, so a restart
+    // goes back to whatever is configured.
+    let mut video_over: Option<config::VideoOutput> = None;
     // the ascii pane's instance, which is nothing until a video plays
     // with `video_output = "ascii"`. kept out here so it survives the
     // frame: dropping it would kill the child and respawn per frame.
@@ -1375,7 +1379,7 @@ fn main() -> anyhow::Result<()> {
                 overlay,
                 is_video: now_playing_is_video(&now_playing),
             },
-            cfg.video_output,
+            video::effective(cfg.video_output, video_over),
             art.protocol_type(),
         );
         let want_vo = showing.mpv_vo();
@@ -4593,6 +4597,34 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                // ascii frames are the one mode a terminal cannot be
+                // probed for, so it is a key rather than something
+                // `Auto` picks. it turns fullscreen on in the same
+                // press: the pane only draws fullscreen, so otherwise
+                // the first press looks like nothing happened.
+                if key.code == keymap.get(KeyAction::ToggleAsciiVideo)
+                    && now_playing_is_video(&now_playing)
+                {
+                    if cfg.video_output == config::VideoOutput::Off && video_over.is_none() {
+                        notifications
+                            .push(Severity::Alert, "video: video_output is off in config.toml");
+                    } else {
+                        video_over = video::toggle_ascii(cfg.video_output, video_over);
+                        let on = video::effective(cfg.video_output, video_over)
+                            == config::VideoOutput::Ascii;
+                        video_fullscreen = on || video_fullscreen;
+                        notifications.push(
+                            Severity::Info,
+                            if on {
+                                "video: text cells"
+                            } else {
+                                "video: back to the configured output"
+                            },
+                        );
+                    }
+                    continue;
+                }
+
                 if key.code == keymap.get(KeyAction::ToggleCrossfade) {
                     crossfade_enabled = !crossfade_enabled;
                     if !crossfade_enabled {
@@ -5371,6 +5403,27 @@ fn the_loop_drives_the_ascii_pane_off_one_decision() {
     assert!(
         call.contains("showing.is_ascii()"),
         "the pane re-derives whether ascii is wanted instead of taking it:\n{call}"
+    );
+
+    // anchored at the decision, not file-wide: the key handler reads
+    // `effective` too, so a file-wide search here passes while the
+    // decision ignores the override entirely.
+    let at = code
+        .find("video::showing(")
+        .expect("nothing decides what is on the screen");
+    let decision = &code[at..(at + 400).min(code.len())];
+    assert!(
+        decision.contains("video::effective(cfg.video_output, video_over)"),
+        "the decision reads the config directly, so the ascii key does nothing:\n{decision}"
+    );
+
+    let at = code
+        .find("video::toggle_ascii(cfg.video_output, video_over)")
+        .expect("nothing toggles the mode, so it is config-only again");
+    let press = &code[at..(at + 500).min(code.len())];
+    assert!(
+        press.contains("video_fullscreen = on || video_fullscreen"),
+        "turning it on leaves the pane hidden, so the press looks like a no-op:\n{press}"
     );
 
     let at = code
