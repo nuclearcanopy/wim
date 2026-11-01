@@ -88,6 +88,23 @@ Two rules make them honest:
   computes the live curve" passed while the comparison was deleted;
   "it compares *and* saves" did not.
 
+## a timing test needs the machine to itself
+
+`cargo test -- --ignored` runs every benchmark at once across the
+thread pool, and they inflate each other. A console frame measured
+51-62us that way and 11.5-13.9us with `--test-threads=1`: a **5x**
+error, in the direction that invents a bottleneck.
+
+So: run a timing bench with `--test-threads=1`, or alone by name. And
+the standing rule it supports, which this repo has relearned twice:
+**alternate batches of the two implementations in one process and take
+the best of each.** Sequential runs on this box differ 1.6-2.1x under
+load, so two numbers from two runs are not a comparison. Both sides of
+the pair must also be ordinary functions; an "old" implementation
+written as a branch inside the timing loop gets inlined and
+specialized, which once read as 19% slower and became 7% faster when
+both sides became functions.
+
 ## mpv-gated tests
 
 `CoreCtx` holds a live mpv handle, so behavioural tests through it are
