@@ -259,6 +259,12 @@ fn download_one(
         }
     }
     drop(file);
+    // a transcode that produced nothing still answers 200 with audio
+    // headers; renaming that in would cache a zero-byte file that
+    // `cached_path` treats as the download from then on.
+    if downloaded == 0 {
+        return abandon("the server sent an empty body".to_string());
+    }
     if let Err(e) = std::fs::rename(&part_path, &dest) {
         return abandon(e.to_string());
     }
@@ -386,6 +392,9 @@ mod tests {
         /// 200 with an xml error document, which is how subsonic
         /// refuses a `stream` request.
         ErrorDocument,
+        /// 200 with audio headers and no body at all, which is what a
+        /// transcode that produced nothing answers.
+        Empty,
     }
 
     /// Minimal http/1.1 server for the download path, same shape as
@@ -503,6 +512,11 @@ mod tests {
                     "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n\r\n{body}",
                     body.len()
                 );
+                writer.write_all(head.as_bytes()).is_ok()
+            }
+            Mode::Empty => {
+                let head =
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: 0\r\n\r\n";
                 writer.write_all(head.as_bytes()).is_ok()
             }
             Mode::Stall => {
@@ -977,6 +991,25 @@ mod tests {
             dir.entries(),
             ["good.mp3"],
             "an error document must not be cached as the track"
+        );
+        assert_eq!(refused.saves, 1, "and the index must not learn about it");
+    }
+
+    /// A transcode that produced nothing (navidrome whose ffmpeg is
+    /// missing) still answers 200 with audio headers and an empty body.
+    /// Renaming that into place marked the track cached and toasted
+    /// "downloaded", so the cache held a zero-byte file that nothing
+    /// would ever replace: `cached_path` only asks whether the file is
+    /// there, so every later play resolved to it.
+    #[test]
+    fn an_empty_body_is_refused_instead_of_cached_as_the_track() {
+        let dir = TempDir::new("empty-body");
+        let refused = run_beside_a_good_track(Mode::Empty, &dir);
+        assert_eq!(refused.failed, 1, "zero bytes is not a track");
+        assert_eq!(
+            dir.entries(),
+            ["good.mp3"],
+            "an empty body must not be cached as the track"
         );
         assert_eq!(refused.saves, 1, "and the index must not learn about it");
     }
