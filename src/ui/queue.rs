@@ -1376,7 +1376,7 @@ mod legibility_tests {
     fn glyph_on(buf: &Buffer, what: &str, pick: impl Fn(&str) -> bool) -> (u16, u16) {
         let y = grid(buf)
             .lines()
-            .position(|l| pick(l))
+            .position(pick)
             .unwrap_or_else(|| panic!("no row is {what}:\n{}", grid(buf))) as u16;
         let x = (0..buf.area.width)
             .find(|x| !matches!(buf.cell((*x, y)).unwrap().symbol(), "." | " "))
@@ -1535,9 +1535,13 @@ mod scroll_feedback_tests {
     /// A footer over one visible entry is a pane reporting on itself
     /// instead of showing anything, so a body this short keeps all of
     /// its rows.
+    /// The heights are literals, not `0..FOOTER_FLOOR`: a loop bounded
+    /// by the constant under test iterates nothing the moment that
+    /// constant goes to zero, which is the whole subject of this test
+    /// (see docs/testing.md).
     #[test]
     fn a_body_too_short_for_a_footer_keeps_every_row_for_the_queue() {
-        for body_height in 0..FOOTER_FLOOR {
+        for body_height in [0usize, 1, 2] {
             assert_eq!(
                 body_split(500, body_height),
                 Body {
@@ -1545,6 +1549,21 @@ mod scroll_feedback_tests {
                     footer: false
                 },
                 "body of {body_height}"
+            );
+        }
+        // and the property behind those three, at every height: a
+        // footer always leaves at least two rows of queue under it,
+        // and never claims more rows than the body has.
+        for body_height in 0..=12usize {
+            let split = body_split(500, body_height);
+            assert!(
+                !split.footer || split.rows >= 2,
+                "body of {body_height}: {split:?} is a footer over {} rows",
+                split.rows
+            );
+            assert!(
+                split.rows <= body_height,
+                "body of {body_height}: {split:?}"
             );
         }
         // 4 rows of pane is 2 of body, so nothing but entries.

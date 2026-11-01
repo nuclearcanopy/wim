@@ -209,13 +209,53 @@ fn filtered_tracks(view: &BrowseView) -> Option<Vec<usize>> {
     (!view.filter_query.is_empty()).then(|| view.visible_track_indices())
 }
 
+/// How a list area splits: rows the items get, and whether the last
+/// one is the scroll footer.
+///
+/// The footer is only owed when the list does not fit, so a short one
+/// loses no row to it (the rule `help`'s hint row follows). One
+/// direction only, so it cannot oscillate: taking a row away can only
+/// leave more hidden, never make it fit.
+///
+/// Byte for byte `ui::queue`'s own `body_split`. `ui::scroll` is where
+/// the shared copy belongs: it already owns the one
+/// clamp-to-selection rule every custom-painted list here uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Body {
+    rows: usize,
+    footer: bool,
+}
+
+/// A list this short keeps every row for its items: a footer saying
+/// how much is hidden, over one visible row, is a column that reports
+/// on itself instead of showing anything.
+const FOOTER_FLOOR: usize = 3;
+
+fn list_split(total: usize, height: usize) -> Body {
+    if height < FOOTER_FLOOR || total <= height {
+        return Body {
+            rows: height,
+            footer: false,
+        };
+    }
+    Body {
+        rows: height - 1,
+        footer: true,
+    }
+}
+
 /// Which track each visible row of `area` shows, at the
-/// clamp-to-selection offset `draw_track_list` draws from.
+/// clamp-to-selection offset `draw_track_list` draws from; `None` on
+/// the footer row, which is not a track and so is nothing to click.
 fn track_rows(area: Rect, shown: Shown, selected: usize) -> Vec<Option<usize>> {
     let visible_rows = area.height as usize;
-    let offset = scroll::offset_for(shown.row_of(selected), visible_rows);
+    let split = list_split(shown.len(), visible_rows);
+    let offset = scroll::offset_for(shown.row_of(selected), split.rows);
     (0..visible_rows)
-        .map(|row| shown.get(offset + row))
+        .map(|row| match row < split.rows {
+            true => shown.get(offset + row),
+            false => None,
+        })
         .collect()
 }
 
@@ -226,8 +266,10 @@ fn track_rows(area: Rect, shown: Shown, selected: usize) -> Vec<Option<usize>> {
 /// what the hit map it feeds indexes by row.
 fn simple_rows(area: Rect, len: usize, selected: usize) -> impl Iterator<Item = Option<usize>> {
     let visible_rows = area.height as usize;
-    let offset = scroll::offset_for(selected, visible_rows);
-    (0..visible_rows).map(move |row| (offset + row < len).then_some(offset + row))
+    let split = list_split(len, visible_rows);
+    let offset = scroll::offset_for(selected, split.rows);
+    (0..visible_rows)
+        .map(move |row| (row < split.rows && offset + row < len).then_some(offset + row))
 }
 
 fn is_starred(track: &SearchItem, favorites: &Favorites, remote_starred: &HashSet<String>) -> bool {
@@ -331,7 +373,7 @@ impl Widget for BrowseListView<'_> {
 
         if self.view.tracks.is_empty() {
             let msg = crate::browse::pane_message(self.view.loading, false, "tracks");
-            draw_line(buf, list_area, y, &msg, shade(DIM));
+            draw_info(buf, list_area, y, &msg);
             return;
         }
         // an album or playlist has no filter box, so every track shows
@@ -364,7 +406,7 @@ impl BrowseListView<'_> {
 
         if self.view.albums.is_empty() {
             let msg = crate::browse::pane_message(self.view.loading, false, "albums");
-            draw_line(buf, albums_rect, albums_rect.y, &msg, shade(DIM));
+            draw_info(buf, albums_rect, albums_rect.y, &msg);
         } else {
             draw_simple_list(
                 buf,
@@ -398,7 +440,7 @@ impl BrowseListView<'_> {
                 !self.view.filter_query.is_empty(),
                 "tracks",
             );
-            draw_line(buf, songs_rect, songs_rect.y, &msg, shade(DIM));
+            draw_info(buf, songs_rect, songs_rect.y, &msg);
             return;
         }
         draw_track_list(
@@ -438,6 +480,12 @@ fn draw_simple_list(
     // `format!` plus a `truncate` was two allocations per visible row.
     let mut text = String::new();
     let mut fitted = String::new();
+    let names = Rect {
+        width: area.width.saturating_sub(COLUMN_GUTTER),
+        ..area
+    };
+    let split = list_split(items.len(), area.height as usize);
+    let mut drawn = 0usize;
     for (row, idx) in simple_rows(area, items.len(), selected).enumerate() {
         let Some(item) = idx.and_then(|i| items.get(i)) else {
             break;
@@ -458,7 +506,117 @@ fn draw_simple_list(
             shade(DIM)
         };
         write_album_text(&mut text, item, is_selected);
-        draw_fitted(buf, area, y, &text, color, &mut fitted);
+        draw_fitted(buf, names, y, &text, color, &mut fitted);
+        drawn = row + 1;
+    }
+    // an album's row is its own index, so the cursor's row is the
+    // selection itself; `simple_rows` above draws from the same offset.
+    let offset = scroll::offset_for(selected, split.rows);
+    scroll_feedback(
+        buf,
+        area,
+        Rect {
+            // one cell in from the right, so the air after the cue is
+            // what meets the songs column.
+            width: area.width.saturating_sub(COLUMN_GUTTER - 1),
+            height: drawn as u16,
+            ..area
+        },
+        split,
+        offset,
+        items.len(),
+        &mut text,
+        &mut fitted,
+    );
+}
+
+/// Cells the albums column holds back off its right edge: one for its
+/// `▴`/`▾` cue and one of air after it.
+///
+/// Both are owed because the songs column begins in the very next
+/// cell. Without the cue column a full-width album name ran straight
+/// into the song titles; without the air after it the `▾` did, and a
+/// cue butted onto the row beside it reads as part of that row (the
+/// same cell of air `help`'s headings keep off their own cue).
+const COLUMN_GUTTER: u16 = 2;
+
+/// `▴`/`▾` for which way there is more and a footer for how much, the
+/// pair every windowed list in the ui carries (`help`, `suggestions`,
+/// `lyrics_view`, `queue`). Nothing at all when the list fits, so a
+/// short one loses neither a row nor a column to it.
+///
+/// `cues` is the rect whose last column the cues go in, over the rows
+/// that were actually drawn; the albums column narrows it by one more
+/// cell than it drew its names in (see `COLUMN_GUTTER`).
+#[allow(clippy::too_many_arguments)]
+fn scroll_feedback(
+    buf: &mut Buffer,
+    area: Rect,
+    cues: Rect,
+    split: Body,
+    offset: usize,
+    total: usize,
+    text: &mut String,
+    fitted: &mut String,
+) {
+    if !split.footer {
+        return;
+    }
+    crate::ui::results_list::scroll_cues(buf, cues, offset, total);
+    draw_footer(
+        buf,
+        area,
+        area.y + split.rows as u16,
+        total.saturating_sub(offset + split.rows),
+        text,
+        fitted,
+    );
+}
+
+/// `21 more below · j/k, wheel`, right-aligned, which is the footer
+/// `ui::help` carries and the count the `▴`/`▾` cannot give. The short
+/// forms are for a column too narrow for the long one rather than an
+/// ellipsis eating the number, which is the one part of it that
+/// matters; the artist page's albums column is a third of the pane.
+fn draw_footer(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    left: usize,
+    text: &mut String,
+    fitted: &mut String,
+) {
+    use std::fmt::Write;
+    if y < area.y || y >= area.y + area.height {
+        return;
+    }
+    let budget = area.width as usize;
+    for form in 0..3 {
+        text.clear();
+        let _ = match (left, form) {
+            // scrolled to the bottom: "0 more below" is a count where
+            // the answer is that there is no more, which is what the
+            // missing `▾` says and what this has to agree with.
+            (0, 0) => write!(text, "end of the list · k, wheel up "),
+            (0, 1) => write!(text, "end of the list "),
+            (0, _) => write!(text, "end "),
+            (_, 0) => write!(text, "{left} more below · j/k, wheel "),
+            (_, 1) => write!(text, "{left} more below "),
+            (_, _) => write!(text, "+{left} "),
+        };
+        if crate::ui::textfit::width(text) <= budget || form == 2 {
+            truncate_into(fitted, text, budget);
+            let used = crate::ui::textfit::width(fitted) as u16;
+            crate::ui::draw::at(
+                buf,
+                area.x + area.width.saturating_sub(used),
+                y,
+                fitted,
+                shade(DIM),
+                used as usize,
+            );
+            return;
+        }
     }
 }
 
@@ -497,13 +655,25 @@ fn draw_track_list(
 ) {
     // same clamp-to-selection scroll as ResultsList: a long album
     // shouldn't be unreachable past the bottom of the pane.
-    let offset = scroll::offset_for(shown.row_of(selected), area.height as usize);
+    let split = list_split(shown.len(), area.height as usize);
+    let offset = scroll::offset_for(shown.row_of(selected), split.rows);
+    // the last column goes to the `▾` when the list scrolls, so the
+    // cue never lands on a title.
+    let list = Rect {
+        width: area.width.saturating_sub(u16::from(split.footer)),
+        ..area
+    };
+    // the track number column is sized to the listing, so a 120-track
+    // album does not run its numbers into the cursor's own column the
+    // way a fixed two digits did.
+    let gutter = digits(tracks.len()).max(2);
     // one pair of buffers for every row of the frame, where a label,
     // a `format!` and a `truncate` was three allocations per visible
     // row.
     let mut text = String::new();
     let mut fitted = String::new();
-    for row in 0..area.height as usize {
+    let mut drawn = 0usize;
+    for row in 0..split.rows {
         let Some(idx) = shown.get(offset + row) else {
             break;
         };
@@ -520,10 +690,11 @@ fn draw_track_list(
             is_selected,
             show_artist,
             is_starred(track, favorites, remote_starred),
+            gutter,
         );
         draw_fitted(
             buf,
-            area,
+            list,
             area.y + row as u16,
             &text,
             if is_selected && focused {
@@ -533,7 +704,29 @@ fn draw_track_list(
             },
             &mut fitted,
         );
+        drawn = row + 1;
     }
+    scroll_feedback(
+        buf,
+        area,
+        Rect {
+            height: drawn as u16,
+            ..area
+        },
+        split,
+        offset,
+        shown.len(),
+        &mut text,
+        &mut fitted,
+    );
+}
+
+/// Decimal digits in a positive number, which is the track-number
+/// column's width; `to_string().len()` is the same answer and an
+/// allocation. A copy of `ui::queue`'s own, for the same reason
+/// `list_split` is.
+fn digits(n: usize) -> usize {
+    n.max(1).ilog10() as usize + 1
 }
 
 /// `>  7. * a title · an artist` for one track row, written into `out`
@@ -546,13 +739,15 @@ fn write_track_text(
     selected: bool,
     show_artist: bool,
     starred: bool,
+    gutter: usize,
 ) {
     use std::fmt::Write;
     out.clear();
     out.push_str(if selected { "> " } else { "  " });
-    // right-aligned in two columns by hand, which is what `{:>2}` did.
+    // right-aligned by hand: `{:>gutter$}` would do it, but only
+    // through a second `format!`.
     let number = idx + 1;
-    if number < 10 {
+    for _ in digits(number)..gutter {
         out.push(' ');
     }
     // writing into a `String` cannot fail.
@@ -574,6 +769,23 @@ fn write_track_text(
 
 fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
     crate::ui::draw::line(buf, area, y, text, color);
+}
+
+/// Leads in a row that is context rather than something a keypress
+/// acts on; the same glyph `ui::suggestions` and `ui::shellsong` mark
+/// one with. All three of this pane's "nothing here" rows are that: a
+/// bare "(no tracks)" at the left edge read as the first row of a
+/// list, which is exactly what it is saying there is not.
+const INFO_MARK: char = '\u{203a}';
+
+fn draw_info(buf: &mut Buffer, area: Rect, y: u16, text: &str) {
+    let mut out = String::with_capacity(text.len() + 4);
+    out.push(' ');
+    out.push(INFO_MARK);
+    out.push(' ');
+    out.push_str(text);
+    let mut fitted = String::new();
+    draw_fitted(buf, area, y, &out, shade(DIM), &mut fitted);
 }
 
 /// One row of `area`, clipped to its width with an ellipsis where
@@ -755,14 +967,14 @@ mod frame_budget {
         for (case, show_artist) in [("title only", false), ("title and artist", true)] {
             let mut reused = || {
                 for (i, t) in view.tracks.iter().enumerate() {
-                    write_track_text(&mut text, t, i, i == 0, show_artist, false);
+                    write_track_text(&mut text, t, i, i == 0, show_artist, false, 2);
                     truncate_into(&mut fitted, &text, PANE.width as usize);
                     std::hint::black_box(&fitted);
                 }
             };
             let mut formatted = || {
                 for (i, t) in view.tracks.iter().enumerate() {
-                    let line = eager_track_text(t, i, i == 0, show_artist, false);
+                    let line = eager_track_text(t, i, i == 0, show_artist, false, 2);
                     std::hint::black_box(crate::ui::textfit::truncate_with_ellipsis(
                         &line,
                         PANE.width as usize,
@@ -878,7 +1090,7 @@ mod tests {
                 "Bladee │ enter: play fr…",
                 "───────┴────────────────",
                 "........................",
-                "(no tracks).............",
+                " › (no tracks)..........",
                 "........................",
             ]
             .join("\n")
@@ -903,7 +1115,7 @@ mod tests {
                 "Bladee · loading..............",
                 "──────────────────────────────",
                 "..............................",
-                "loading tracks................",
+                " › loading tracks.............",
                 "..............................",
             ]
             .join("\n")
@@ -974,11 +1186,11 @@ mod tests {
                 "└───────────────┼───────┴────────────────────────────────",
                 "................│........................................",
                 "................├─── ALBUMS ──────────── SONGS ──────────",
-                "................│(no albums).............................",
+                "................│ › (no albums)..........................",
                 "................│..............┌─┤ filter songs ├───────┐",
                 "................│..............│........................│",
                 "................│..............└────────────────────────┘",
-                "................│..............(no tracks)...............",
+                "................│.............. › (no tracks)............",
                 "................│........................................",
                 "................│........................................",
             ]
@@ -1075,6 +1287,7 @@ mod tests {
         selected: bool,
         show_artist: bool,
         starred: bool,
+        gutter: usize,
     ) -> String {
         let marker = if selected { "> " } else { "  " };
         let label = match track {
@@ -1083,7 +1296,11 @@ mod tests {
             _ => String::new(),
         };
         let star = if starred { "* " } else { "" };
-        format!("{marker}{:>2}. {star}{label}", idx + 1)
+        format!(
+            "{marker}{:>gutter$}. {star}{label}",
+            idx + 1,
+            gutter = gutter
+        )
     }
 
     /// Same for the albums column's rows.
@@ -1140,12 +1357,24 @@ mod tests {
                             // the same buffer across every case, so a
                             // missing `clear` shows up as the previous
                             // row's text still being in front.
-                            write_track_text(&mut out, item, idx, selected, show_artist, starred);
-                            assert_eq!(
-                                out,
-                                eager_track_text(item, idx, selected, show_artist, starred),
-                                "{item:?} idx {idx} selected {selected} artist {show_artist} starred {starred}"
-                            );
+                            for gutter in [1usize, 2, 3, 4] {
+                                write_track_text(
+                                    &mut out,
+                                    item,
+                                    idx,
+                                    selected,
+                                    show_artist,
+                                    starred,
+                                    gutter,
+                                );
+                                assert_eq!(
+                                    out,
+                                    eager_track_text(
+                                        item, idx, selected, show_artist, starred, gutter
+                                    ),
+                                    "{item:?} idx {idx} gutter {gutter} selected {selected} artist {show_artist} starred {starred}"
+                                );
+                            }
                         }
                     }
                     write_album_text(&mut out, item, selected);
@@ -1257,8 +1486,10 @@ mod tests {
                     text.contains(&format!("{:>2}. ", i + 1)),
                     "songs row {row} maps to {i} but reads {text:?}"
                 ),
+                // a row the map names no track on is either blank or
+                // the scroll footer, never a track it failed to name.
                 None => assert!(
-                    text.trim().is_empty(),
+                    text.trim().is_empty() || text.contains("more below"),
                     "songs row {row} maps to nothing but reads {text:?}"
                 ),
             }
@@ -1499,6 +1730,343 @@ mod tests {
     }
 }
 
+/// The feedback a windowed list owes: which way there is more, and
+/// how much. Neither of this pane's lists had any, so eight rows of a
+/// 120-track album read as the whole album.
+#[cfg(test)]
+mod scroll_feedback_tests {
+    use super::tests::{long_album, test_albums};
+    use super::*;
+    use crate::browse::tests::{test_songs, test_view};
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
+
+    fn painted(view: &BrowseView, w: u16, h: u16) -> String {
+        let mut buf = buffer(w, h);
+        BrowseListView {
+            view,
+            favorites: &Favorites::default(),
+            remote_starred: &HashSet::new(),
+            art_mode: ArtMode::Off,
+            cell_aspect: 2.0,
+            cursor_visible: false,
+            focused: true,
+            elapsed: Duration::ZERO,
+        }
+        .render(Rect::new(0, 0, w, h), &mut buf);
+        grid(&buf)
+    }
+
+    /// A list that fits loses no row to a footer it has nothing to say
+    /// on; one that does not gets the row and the count.
+    #[test]
+    fn only_a_list_that_does_not_fit_pays_for_a_footer() {
+        assert_eq!(
+            list_split(10, 10),
+            Body {
+                rows: 10,
+                footer: false
+            }
+        );
+        assert_eq!(
+            list_split(11, 10),
+            Body {
+                rows: 9,
+                footer: true
+            }
+        );
+        let fits = painted(&test_view(test_songs(6)), 60, 10);
+        assert!(
+            !fits.contains("more below") && !fits.contains('\u{25be}'),
+            "a list that fits says nothing about scrolling:\n{fits}"
+        );
+        assert!(
+            fits.contains("6. song 5"),
+            "every track is on screen:\n{fits}"
+        );
+    }
+
+    /// A footer over one visible row is a column reporting on itself
+    /// instead of showing anything, so a list this short keeps all of
+    /// its rows.
+    ///
+    /// The heights are literals, not `0..FOOTER_FLOOR`: a loop bounded
+    /// by the constant under test iterates nothing the moment that
+    /// constant goes to zero, which is the whole subject of this test
+    /// (see docs/testing.md).
+    #[test]
+    fn a_list_too_short_for_a_footer_keeps_every_row_for_its_items() {
+        for height in [0usize, 1, 2] {
+            assert_eq!(
+                list_split(500, height),
+                Body {
+                    rows: height,
+                    footer: false
+                },
+                "height {height}"
+            );
+        }
+        // and the property behind those three, at every height: a
+        // footer always leaves at least two rows of items under it,
+        // and never claims more rows than the area has.
+        for height in 0..=12usize {
+            let split = list_split(500, height);
+            assert!(
+                !split.footer || split.rows >= 2,
+                "height {height}: {split:?} is a footer over {} rows",
+                split.rows
+            );
+            assert!(split.rows <= height, "height {height}: {split:?}");
+        }
+    }
+
+    /// The `▴`/`▾` say which way, the footer says how much, and both
+    /// have to agree with where the window actually is.
+    #[test]
+    fn the_cues_point_the_way_there_is_more_and_the_footer_counts_it() {
+        let top = painted(&long_album(120, 0), 60, 12);
+        assert!(!top.contains('\u{25b4}'), "nothing is above row 0:\n{top}");
+        assert!(top.contains('\u{25be}'), "{top}");
+        assert!(top.contains("113 more below"), "{top}");
+
+        let middle = painted(&long_album(120, 60), 60, 12);
+        assert!(
+            middle.contains('\u{25b4}') && middle.contains('\u{25be}'),
+            "{middle}"
+        );
+        assert!(middle.contains("59 more below"), "{middle}");
+
+        let end = painted(&long_album(120, 119), 60, 12);
+        assert!(end.contains('\u{25b4}'), "{end}");
+        assert!(!end.contains('\u{25be}'), "that is the last track:\n{end}");
+        // at the bottom the count is zero, and "0 more below" is a
+        // number where the answer is that there is no more.
+        assert!(!end.contains("0 more below"), "{end}");
+        assert!(end.contains("end of the list"), "{end}");
+    }
+
+    /// Both of the artist page's columns are windowed and both scroll
+    /// independently, so each owes its own pair.
+    #[test]
+    fn each_column_of_an_artist_page_reports_its_own_window() {
+        let mut view = long_album(30, 25);
+        view.is_artist = true;
+        view.albums = test_albums(30);
+        view.albums_selected = 20;
+        let g = painted(&view, 70, 16);
+        assert_eq!(
+            g.matches('\u{25be}').count(),
+            2,
+            "one cue per scrolling column:\n{g}"
+        );
+        // the albums column is a third of the pane, too narrow for the
+        // keys, so it keeps the count alone.
+        assert!(g.contains("9 more below"), "the albums column:\n{g}");
+        assert!(
+            g.contains("4 more below \u{b7} j/k, wheel"),
+            "the songs column:\n{g}"
+        );
+    }
+
+    /// The count is the part of the footer that matters, so a column
+    /// too narrow for the keys drops the keys rather than letting an
+    /// ellipsis eat the number.
+    #[test]
+    fn a_narrow_footer_keeps_the_count_and_drops_the_keys() {
+        let view = long_album(40, 0);
+        let wide = painted(&view, 60, 10);
+        assert!(wide.contains("35 more below \u{b7} j/k, wheel"), "{wide}");
+        let narrow = painted(&view, 20, 8);
+        assert!(narrow.contains("37 more below"), "{narrow}");
+        assert!(!narrow.contains("j/k, wheel"), "{narrow}");
+        let cramped = painted(&view, 12, 7);
+        assert!(cramped.contains("+38"), "{cramped}");
+    }
+
+    /// The footer writes through `draw::at`, which `Buffer`
+    /// bounds-checks and the rect does not: a row outside the rect is
+    /// a row of some other pane. Not reachable through `render` (the
+    /// split keeps the row inside), so it is exercised directly, same
+    /// as `results_list::a_section_rule_outside_its_rect_paints_nothing`.
+    #[test]
+    fn a_footer_outside_its_rect_paints_nothing() {
+        for (h, y) in [(0u16, 2u16), (0, 3), (1, 3), (2, 9), (3, 1), (3, 5)] {
+            let area = Rect::new(1, 2, 18, h);
+            let mut buf = buffer(22, 10);
+            draw_footer(
+                &mut buf,
+                area,
+                y,
+                12,
+                &mut String::new(),
+                &mut String::new(),
+            );
+            assert_outside_untouched(&buf, area);
+        }
+        // and the row it must draw on, so this is not a test that
+        // passes because the painter does nothing at all.
+        let area = Rect::new(1, 2, 18, 2);
+        let mut buf = buffer(22, 10);
+        draw_footer(
+            &mut buf,
+            area,
+            3,
+            12,
+            &mut String::new(),
+            &mut String::new(),
+        );
+        assert!(grid(&buf).contains("12 more"), "{}", grid(&buf));
+        assert_outside_untouched(&buf, area);
+    }
+
+    /// And nothing escapes at any size, cues and footers included.
+    #[test]
+    fn the_cues_and_footers_stay_inside_the_pane() {
+        for (w, h) in [(1u16, 1u16), (2, 3), (6, 5), (20, 8), (70, 16), (120, 40)] {
+            for artist in [false, true] {
+                let area = Rect::new(2, 1, w, h);
+                let mut buf = buffer(w + 5, h + 3);
+                let mut view = long_album(120, 60);
+                view.is_artist = artist;
+                view.albums = test_albums(40);
+                view.albums_selected = 30;
+                BrowseListView {
+                    view: &view,
+                    favorites: &Favorites::default(),
+                    remote_starred: &HashSet::new(),
+                    art_mode: ArtMode::Off,
+                    cell_aspect: 2.0,
+                    cursor_visible: false,
+                    focused: true,
+                    elapsed: Duration::ZERO,
+                }
+                .render(area, &mut buf);
+                assert_outside_untouched(&buf, area);
+            }
+        }
+    }
+}
+
+/// The two columns this pane aligns by hand: the album names against
+/// the songs column that starts in the very next cell, and the track
+/// numbers against the cursor's own column.
+#[cfg(test)]
+mod column_alignment_tests {
+    use super::tests::long_album;
+    use super::*;
+    use crate::ui::testbuf::{buffer, grid};
+
+    /// A full-width album name ran straight into the song titles
+    /// beside it, and once the cue column existed the `▾` did. Both
+    /// cells stay clear of the songs column.
+    #[test]
+    fn the_albums_column_keeps_its_gutter_off_the_songs_column() {
+        let mut view = long_album(3, 0);
+        view.is_artist = true;
+        view.albums = (0..30)
+            .map(|i| SearchItem::Album {
+                id: format!("a{i}"),
+                name: format!("an album name far longer than a third of the pane {i}"),
+                artist: "artist".to_string(),
+                client: crate::browse::tests::test_client(),
+            })
+            .collect();
+        view.albums_selected = 20;
+        let area = Rect::new(0, 0, 70, 16);
+        let mut buf = buffer(70, 16);
+        BrowseListView {
+            view: &view,
+            favorites: &Favorites::default(),
+            remote_starred: &HashSet::new(),
+            art_mode: ArtMode::Off,
+            cell_aspect: 2.0,
+            cursor_visible: false,
+            focused: true,
+            elapsed: Duration::ZERO,
+        }
+        .render(area, &mut buf);
+        let map = rows(area, &view, ArtMode::Off, 2.0);
+        let (albums, album_rows) = map.albums.expect("an artist profile has an albums column");
+        // precondition: the names really are too long to fit, so this
+        // is about the gutter and not about short names.
+        assert!(album_rows.iter().flatten().count() > 1, "{album_rows:?}");
+        let right = albums.x + albums.width - 1;
+        let g = grid(&buf);
+        for (row, idx) in album_rows.iter().enumerate() {
+            if idx.is_none() {
+                continue;
+            }
+            let y = albums.y + row as u16;
+            // the last cell is always air, whatever is in the one
+            // before it.
+            assert_eq!(
+                buf.cell((right, y)).unwrap().symbol(),
+                ".",
+                "row {row} reaches the songs column:\n{g}"
+            );
+            // and the one before it is the cue column: a name never
+            // gets there either.
+            let cue = buf.cell((right - 1, y)).unwrap().symbol();
+            assert!(
+                matches!(cue, "." | "\u{25b4}" | "\u{25be}"),
+                "row {row} put {cue:?} in the cue column:\n{g}"
+            );
+        }
+        assert!(g.contains('\u{25be}'), "the column scrolls:\n{g}");
+    }
+
+    /// `{:>2}` ran a three-digit number into the cursor's own column,
+    /// so a 120-track album had no gap between `>` and its number.
+    /// The column is sized to the listing instead.
+    #[test]
+    fn the_track_number_column_is_sized_to_the_listing() {
+        // the cursor is on track 1, so one row carries the marker and
+        // the rest are the same columns with blanks in its place.
+        for (n, cursor, plain) in [
+            (9usize, ">  1. song 0", "   2. song 1"),
+            (40, ">  1. song 0", "   2. song 1"),
+            // three digits: the number used to eat the marker's cell.
+            (120, ">   1. song 0", "    2. song 1"),
+        ] {
+            let mut buf = buffer(40, 20);
+            let view = long_album(n, 0);
+            BrowseListView {
+                view: &view,
+                favorites: &Favorites::default(),
+                remote_starred: &HashSet::new(),
+                art_mode: ArtMode::Off,
+                cell_aspect: 2.0,
+                cursor_visible: false,
+                focused: true,
+                elapsed: Duration::ZERO,
+            }
+            .render(Rect::new(0, 0, 40, 20), &mut buf);
+            let g = grid(&buf);
+            assert!(
+                g.contains(cursor),
+                "{n} tracks: no row reads {cursor:?}\n{g}"
+            );
+            assert!(g.contains(plain), "{n} tracks: no row reads {plain:?}\n{g}");
+            // and the marker always keeps a cell of its own: a number
+            // that filled the gutter used to butt straight onto it.
+            for line in g.lines().filter(|l| l.contains(". song")) {
+                assert!(
+                    line.starts_with("> ") || line.starts_with("  "),
+                    "{n} tracks: {line:?} has no room for the cursor"
+                );
+            }
+        }
+    }
+
+    /// Longest-listing guard on the gutter itself, which the grids
+    /// above only reach through the paint.
+    #[test]
+    fn the_gutter_width_is_the_decimal_length_of_the_count() {
+        for n in [0usize, 1, 9, 10, 99, 100, 101, 999, 15_000] {
+            assert_eq!(digits(n), n.max(1).to_string().len(), "{n}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod eyeball {
     use super::*;
@@ -1568,5 +2136,146 @@ mod eyeball {
         let mut buf = buffer(40, 8);
         render_into(&test_view(test_songs(3)), Rect::new(0, 0, 40, 6), &mut buf);
         assert!(grid(&buf).contains("album"), "{}", grid(&buf));
+    }
+
+    /// The states the squeezed heights do not show: empty, one item, a
+    /// listing exactly as long as its pane and one far longer, both of
+    /// the artist page's columns scrolling at once, album names longer
+    /// than their column, and the two widths the footer changes form
+    /// at. Read it:
+    /// `cargo test --lib ui::browse::eyeball -- --nocapture`.
+    #[test]
+    fn print_the_pane_at_every_length_and_width() {
+        use super::tests::{long_album, test_albums};
+
+        print("album, empty", &test_view(vec![]), 60, 10);
+        print("album, one track", &test_view(test_songs(1)), 60, 10);
+        // six tracks in the six rows a 10-row pane leaves: the case
+        // either side of which a footer appears.
+        print("album, exactly fills the pane", &long_album(6, 2), 60, 10);
+        print("album, one row over", &long_album(7, 2), 60, 10);
+        print("album, 120 tracks at the top", &long_album(120, 0), 60, 12);
+        print(
+            "album, 120 tracks at the end",
+            &long_album(120, 119),
+            60,
+            12,
+        );
+        print("album, cramped", &long_album(40, 0), 20, 8);
+        print("album, very cramped", &long_album(40, 0), 12, 7);
+        let mut artists = long_album(4, 0);
+        artists.show_track_artist = true;
+        print("album, very wide with artists", &artists, 110, 9);
+
+        let mut both = long_album(30, 25);
+        both.is_artist = true;
+        both.albums = test_albums(30);
+        both.albums_selected = 20;
+        print("artist, both columns scrolling", &both, 70, 16);
+        let mut empty = test_view(vec![]);
+        empty.is_artist = true;
+        print("artist, empty", &empty, 70, 14);
+        let mut one = long_album(1, 0);
+        one.is_artist = true;
+        one.albums = test_albums(1);
+        print("artist, one of each", &one, 70, 14);
+        let mut wide_names = long_album(3, 0);
+        wide_names.is_artist = true;
+        wide_names.albums = (0..9)
+            .map(|i| SearchItem::Album {
+                id: format!("a{i}"),
+                name: format!("an album name far longer than a third of the pane {i}"),
+                artist: "artist".to_string(),
+                client: test_client(),
+            })
+            .collect();
+        print("artist, names longer than the column", &wide_names, 70, 14);
+
+        // wide glyphs: two cells each, and the two width models the
+        // cut and the cell advance use are different ones.
+        let mut wide = test_view(vec![
+            SearchItem::Song {
+                id: "1".into(),
+                title: "日本語のタイトル".into(),
+                artist: "アーティスト".into(),
+                album: "a".into(),
+                client: test_client(),
+            },
+            SearchItem::Song {
+                id: "2".into(),
+                title: "🎵🎶 emoji".into(),
+                artist: "🎤".into(),
+                album: "a".into(),
+                client: test_client(),
+            },
+        ]);
+        wide.show_track_artist = true;
+        print("album, cjk and emoji", &wide, 34, 8);
+
+        // the floor: the longest case says how much is hidden, which
+        // is the whole point of the footer.
+        let mut buf = buffer(60, 12);
+        render_into(&long_album(120, 0), Rect::new(0, 0, 60, 12), &mut buf);
+        assert!(grid(&buf).contains("more below"), "{}", grid(&buf));
+    }
+
+    /// Every cell's brightness as a digit, foreground over background.
+    ///
+    /// The printer that found the sibling pane's two legibility bugs,
+    /// neither of which was visible in the chars: a surface drawn at
+    /// one flat level, and a feature drawn at the level of the frame
+    /// around it. This pane came out clean (names and numbers at
+    /// `DIM`, the cursor's row at `BRIGHT`, the rules at `NEAR_BLACK`),
+    /// and it is kept so the next change here can be looked at the
+    /// same way:
+    /// `cargo test --lib ui::browse::eyeball -- --nocapture`.
+    #[test]
+    fn print_the_shade_map() {
+        use super::tests::{long_album, test_albums};
+
+        let mut view = long_album(30, 25);
+        view.is_artist = true;
+        view.albums = test_albums(30);
+        view.albums_selected = 20;
+        let mut buf = buffer(70, 16);
+        render_into(&view, Rect::new(0, 0, 70, 16), &mut buf);
+        let digit = |c: ratatui::style::Color| match c {
+            ratatui::style::Color::Rgb(r, _, _) => {
+                char::from_digit((r as u32 * 9 + 127) / 255, 10).unwrap_or('9')
+            }
+            // `Reset` is the terminal's own background, i.e. nothing
+            // was painted into this cell at all.
+            _ => '.',
+        };
+        println!(
+            "--- 70x16 artist page, chars then fg | bg shades\n{}",
+            grid(&buf)
+        );
+        for y in 0..buf.area.height {
+            let fg: String = (0..buf.area.width)
+                .map(|x| {
+                    let cell = buf.cell((x, y)).unwrap();
+                    match cell.symbol() {
+                        "." | " " => ' ',
+                        _ => digit(cell.fg),
+                    }
+                })
+                .collect();
+            let bg: String = (0..buf.area.width)
+                .map(|x| digit(buf.cell((x, y)).unwrap().bg))
+                .collect();
+            println!("{fg} | {bg}");
+        }
+        // the floor: more than one brightness is in use, which is what
+        // "a whole surface at one flat level" fails.
+        let levels: std::collections::HashSet<char> = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| !matches!(buf.cell((*x, *y)).unwrap().symbol(), "." | " "))
+            .map(|(x, y)| digit(buf.cell((x, y)).unwrap().fg))
+            .collect();
+        assert!(
+            levels.len() >= 3,
+            "the pane reads as one flat shade: {levels:?}"
+        );
     }
 }
