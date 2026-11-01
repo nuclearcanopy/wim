@@ -2312,6 +2312,48 @@ fn shellsong_item(target: Target, core: &CoreCtx, surf: &dyn Surface) -> Option<
 /// The report is `Op::describe()` unless the host knew something
 /// better; `Op::closes_console` is consulted here, in one place,
 /// rather than by each view-opener remembering to.
+/// Everything `apply_op`'s undo hook decides *before* it touches mpv.
+///
+/// Split out because the hook's only coverage was six `#[ignore]`d
+/// tests needing a live mpv, so a default `cargo test` verified none
+/// of it: not whether an op is recordable, not the coalesce kind, not
+/// the barrier reason, not the rule that a failed op records nothing.
+/// Reading `apply_op` the seam looked covered; in a normal run it was
+/// not. None of those four decisions needs a player, so they live
+/// here and are tested outright.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoHook {
+    /// False for an op the tree ignores outright, which also means no
+    /// root gets planted for it.
+    pub recordable: bool,
+    /// What this op coalesces with, so a burst is one row.
+    pub kind: Option<&'static str>,
+    /// Why it cannot be undone, when it cannot.
+    pub barrier: Option<&'static str>,
+}
+
+impl UndoHook {
+    pub fn of(op: &Op) -> UndoHook {
+        let how = undo::classify(op);
+        UndoHook {
+            recordable: how != undo::Reversibility::Ignored,
+            kind: undo::coalesce_kind(op),
+            barrier: match how {
+                undo::Reversibility::Barrier(why) => Some(why),
+                _ => None,
+            },
+        }
+    }
+
+    /// Whether the op actually gets a row, given how it went.
+    ///
+    /// A failed op changed nothing, so recording it would put a row in
+    /// the tree that undoes to the state it is already in.
+    pub fn records(&self, report: &Report) -> bool {
+        self.recordable && !matches!(report, Report::Failed(_))
+    }
+}
+
 pub fn apply_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> Dispatch {
     let described = op.describe();
     let closes = op.closes_console();
@@ -2319,10 +2361,8 @@ pub fn apply_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> Dispatch 
     // `run_op` recurses into itself three times (a bar field, a
     // browse-row `go`, a settings call) and never back through here,
     // so one record per intent needs no re-entrance guard.
-    let how = undo::classify(&op);
-    let kind = undo::coalesce_kind(&op);
-    let recordable = how != undo::Reversibility::Ignored;
-    if recordable && core.undo.is_unrooted() {
+    let hook = UndoHook::of(&op);
+    if hook.recordable && core.undo.is_unrooted() {
         let before = undo::Snapshot::capture(core);
         core.undo.plant(before, core.now);
     }
@@ -2332,16 +2372,10 @@ pub fn apply_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> Dispatch 
     let was = core.undo.suspend(true);
     let (dispatch, report) = run_op(op, core, surf);
     core.undo.suspend(was);
-    // a failed op changed nothing, so recording it would put a row in
-    // the tree that undoes to the state it is already in.
-    if recordable && !matches!(report, Report::Failed(_)) {
+    if hook.records(&report) {
         let after = undo::Snapshot::capture(core);
-        let barrier = match how {
-            undo::Reversibility::Barrier(why) => Some(why),
-            _ => None,
-        };
         core.undo
-            .record(after, described.clone(), kind, barrier, core.now);
+            .record(after, described.clone(), hook.kind, hook.barrier, core.now);
     }
     // only on success: closing the console to make room for a screen
     // that then failed to open would take the error message with it.
@@ -6017,6 +6051,111 @@ mod skip_next_tests {
         assert!(
             op.contains("skip_next(core.player, core.queue, n)"),
             "the op stopped sharing it:\n{op}"
+        );
+    }
+}
+
+/// The undo hook's decisions, which a default `cargo test` used to
+/// verify none of.
+#[cfg(test)]
+mod undo_hook_tests {
+    use super::*;
+
+    /// Every op classifies, and the hook agrees with `undo::classify`
+    /// about which ones the tree ignores. An op added without a
+    /// classification would otherwise silently stop being undoable.
+    #[test]
+    fn an_ignored_op_is_not_recordable_and_nothing_else_is_ignored() {
+        // `Op::Undo` is itself ignored: walking the tree is not a move
+        // in it.
+        let walking = UndoHook::of(&Op::Undo);
+        assert!(
+            !walking.recordable,
+            "undo must not record a row for undoing"
+        );
+        assert!(!UndoHook::of(&Op::Redo).recordable);
+
+        // a plain transport op is.
+        assert!(UndoHook::of(&Op::TogglePause).recordable);
+        assert!(UndoHook::of(&Op::SkipNext(1)).recordable);
+    }
+
+    /// A failed op changed nothing, so it must not get a row: undoing
+    /// to it would restore the state it is already in.
+    #[test]
+    fn a_failed_op_records_nothing_even_when_recordable() {
+        let hook = UndoHook::of(&Op::TogglePause);
+        assert!(hook.recordable, "the op itself is recordable");
+
+        assert!(hook.records(&Report::Described));
+        assert!(hook.records(&Report::Note("paused".into())));
+        assert!(
+            !hook.records(&Report::Failed("nothing is playing".into())),
+            "a refusal must not land a row"
+        );
+
+        // and an ignored op records on no report at all.
+        let ignored = UndoHook::of(&Op::Undo);
+        assert!(!ignored.records(&Report::Described));
+        assert!(!ignored.records(&Report::Failed("x".into())));
+    }
+
+    /// The coalesce kind is what makes a burst of one gesture a single
+    /// row; it comes off the op, not off the report.
+    #[test]
+    fn the_coalesce_kind_comes_off_the_op() {
+        assert_eq!(
+            UndoHook::of(&Op::SetVolume(shellsong::Level::Absolute(50.0))).kind,
+            Some("volume")
+        );
+        assert_eq!(UndoHook::of(&Op::SpeedUp).kind, Some("speed"));
+        assert_eq!(
+            UndoHook::of(&Op::TogglePause).kind,
+            None,
+            "pausing twice is two deliberate acts, not one gesture"
+        );
+    }
+
+    /// A barrier carries the reason undo stops there, which is the
+    /// only thing that lets the tree explain itself.
+    #[test]
+    fn a_barrier_op_carries_why_it_cannot_be_reversed() {
+        // every op the tree calls a barrier has to say why, or the
+        // refusal reads as a bug.
+        let mut barriers = 0;
+        for op in [
+            Op::Download(shellsong::Target::Selection),
+            Op::Quit,
+        ] {
+            let hook = UndoHook::of(&op);
+            if let undo::Reversibility::Barrier(why) = undo::classify(&op) {
+                barriers += 1;
+                assert_eq!(hook.barrier, Some(why));
+                assert!(!why.is_empty(), "{op:?} is a barrier with no reason");
+                assert!(hook.recordable, "a barrier is still a row");
+            }
+        }
+        assert!(barriers > 0, "this test is about nothing if none are");
+
+        assert_eq!(UndoHook::of(&Op::TogglePause).barrier, None);
+    }
+
+    /// `apply_op` has to go through the shared decision, or it drifts
+    /// back inline and the tests above stop meaning anything. Reads
+    /// the source, like the pause and skip pairs, because `apply_op`
+    /// needs a live mpv.
+    #[test]
+    fn apply_op_uses_the_shared_hook() {
+        let src = include_str!("core.rs");
+        let at = src
+            .find("pub fn apply_op(op: Op,")
+            .expect("apply_op moved or was renamed");
+        let body = &src[at..];
+        let body = &body[..body.find("\n}\n").expect("an unterminated fn")];
+        assert!(
+            body.contains("UndoHook::of(&op)") && body.contains("hook.records(&report)"),
+            "the hook is inline again, so none of it is covered without \
+             a live mpv:\n{body}"
         );
     }
 }

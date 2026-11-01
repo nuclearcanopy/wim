@@ -667,6 +667,38 @@ mod tests {
         t.record(s, s.to_string(), None, None, now);
     }
 
+    /// Suspension nests, which is why `suspend` returns the previous
+    /// value rather than taking a bare bool.
+    ///
+    /// Twelve of `run_op`'s arms call `dispatch_action`, which records
+    /// on its own for a keypress, so `apply_op` suspends around
+    /// `run_op` and restores *what was there* instead of clearing. a
+    /// plain `suspend(false)` on the way out would un-suspend an outer
+    /// frame that was deliberately suspended, and the delegated op
+    /// would get a second row. this was only covered by `#[ignore]`d
+    /// tests needing a live mpv.
+    #[test]
+    fn suspension_restores_what_it_replaced_rather_than_clearing() {
+        let mut r = Recorder::default();
+        assert!(!r.is_suspended(), "nothing suspended to begin with");
+
+        let outer = r.suspend(true);
+        assert!(!outer, "it reports what it replaced");
+        assert!(r.is_suspended());
+
+        // a nested frame, as a delegated op produces.
+        let inner = r.suspend(true);
+        assert!(inner, "the outer frame was already suspended");
+        r.suspend(inner);
+        assert!(
+            r.is_suspended(),
+            "restoring the inner frame must not un-suspend the outer one"
+        );
+
+        r.suspend(outer);
+        assert!(!r.is_suspended(), "and the outermost frame clears it");
+    }
+
     /// An async effect lands on the row that caused it.
     ///
     /// Queueing an album records its row immediately and the fan-out
@@ -1013,6 +1045,15 @@ impl Recorder {
     /// Stops `dispatch_action` recording while an op it was called
     /// from is already being recorded. Returns the previous value, so
     /// the caller restores rather than assumes.
+    /// Sets the flag and reports what it replaced, so a nested frame
+    /// can put back what was there rather than clearing.
+    ///
+    /// **`record` does not consult it.** The reader is
+    /// `core::dispatch_action`, which is the keyboard's half of the
+    /// tree; `apply_op` suspends around `run_op` precisely so the
+    /// twelve arms that delegate to `dispatch_action` do not each land
+    /// a second row. Worth saying because a flag on the recorder reads
+    /// as though the recorder honours it.
     pub fn suspend(&mut self, on: bool) -> bool {
         std::mem::replace(&mut self.suspended, on)
     }
