@@ -112,6 +112,33 @@ is documented as the type's in `docs/shellsong.md`, so this reads as a
 shared limit rather than a wrong message; a separate skip ceiling is
 yours to name if you want one.
 
+### a faster hasher for the two hot maps, which trades away DoS resistance
+
+`Catalog::by_key` and `CacheIndex`'s entry map are keyed by 32-char
+navidrome ids and local paths, and `std`'s SipHash-1-3 is about 4x the
+cost of a non-cryptographic hasher on keys that shape. Measured in one
+process at release: hashing 10266 ids **1350us to 388us**, `by_key`
+probes **2900us to 2120us (1.37x)** and 1145us to 479us (2.39x),
+`cache.entry` per track **5255us to 3506us (1.50x)**. `by_key` probes
+are now 1086-3028us of a 2201-5294us suggestions stage, i.e. the
+largest remaining cost in the menu.
+
+**Not done, and it needs you.** It removes a security property, which
+is not mine to remove on a perf argument. The case for it is that
+neither map takes a key from a stranger: the ids come from your own
+navidrome server and the paths from your own disk, so there is no
+adversary to be resistant to. The case against is that this is exactly
+the reasoning that is wrong later, when something keys a map on a value
+a remote peer chose, and the hasher is already there and already looks
+fine.
+
+Both maps are in `cache.rs` and `suggest.rs`, and neither has a
+load-bearing iteration order (the ndjson line order is not pinned by
+any test). If you want it, the shape is `rustc-hash`'s `FxHasher`
+behind a `FastMap` alias, with a doc stating the rule that anything
+keyed on remote input keeps the default. A sandbox check stopped me
+writing it unprompted, correctly.
+
 ---
 
 ## defaults taken, recorded so they are not re-litigated
