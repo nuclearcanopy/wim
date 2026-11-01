@@ -3,6 +3,7 @@
 //! focus and menus lives in the library, not here.
 
 use wim::cli;
+use wim::framesource;
 use wim::{
     anim, app, browse, cache, config, coverart, eq, favorites, hit, keymap, library, listenbrainz,
     lyrics, mpv, persistence, queues, search, shellsong, shellsong_host, suggest, term, trace, ui,
@@ -781,6 +782,10 @@ fn main() -> anyhow::Result<()> {
     // mpv only reads it on init. see docs/video.md.
     let mut video_fullscreen = false;
     let mut video_vo: Option<video::Vo> = None;
+    // the ascii pane's instance, which is nothing until a video plays
+    // with `video_output = "ascii"`. kept out here so it survives the
+    // frame: dropping it would kill the child and respawn per frame.
+    let mut ascii = framesource::Ascii::default();
     let mut video_geometry: (u16, u16) = (0, 0);
     // full keybind reference, opened with '?'; takes over the whole
     // screen the same way onboarding/the nav manager do.
@@ -1359,10 +1364,11 @@ fn main() -> anyhow::Result<()> {
             keybinds_menu: keybinds_menu_open,
         };
         let overlay = tiers.covers_screen();
-        // whether mpv should be drawing the video right now; the whole
-        // decision is `video::wanted`, including the guard that keeps
-        // music on `vo=null`.
-        let want_vo = video::wanted(
+        // what should be on the screen right now; the whole decision is
+        // `video::showing`, including the guard that keeps music on
+        // `vo=null`. ascii and a drawing vo are the two halves of the
+        // same answer, so they come from one call and cannot disagree.
+        let showing = video::showing(
             video::Screen {
                 fullscreen: video_fullscreen,
                 minimized: player_minimized,
@@ -1372,6 +1378,7 @@ fn main() -> anyhow::Result<()> {
             cfg.video_output,
             art.protocol_type(),
         );
+        let want_vo = showing.mpv_vo();
         let size = guard
             .terminal
             .size()
@@ -1412,6 +1419,39 @@ fn main() -> anyhow::Result<()> {
                 video_geometry = size;
             }
         }
+        // the ascii pane, driven off the same `elapsed_secs` every
+        // widget reads, so the picture and the scrubber cannot drift.
+        // the fifo is the clock: a paused player stops advancing this,
+        // so nothing is read and the frame instance blocks in `write`.
+        let ascii_media = match &now_playing {
+            Some(SearchItem::LocalVideo { path, .. }) => Some(path.as_path()),
+            _ => None,
+        };
+        if let Err(e) = ascii.update(
+            showing.is_ascii(),
+            ascii_media,
+            framesource::Grid::for_area(
+                Rect::new(0, 0, size.0, size.1),
+                aspect,
+            ),
+            // an unknown position is the start of the file, which is
+            // what a just-loaded track is anyway.
+            elapsed_secs.unwrap_or(0.0),
+            // one ipc round trip per spawn, never per frame.
+            || {
+                player
+                    .get_property("container-fps")
+                    .ok()
+                    .and_then(|v| v.as_f64())
+                    .filter(|fps| fps.is_finite() && *fps > 0.0)
+                    .unwrap_or(framesource::FALLBACK_FPS)
+            },
+        ) {
+            // `Ascii` latches the file it failed on, so this is once per
+            // video and not once per frame.
+            notifications.push(Severity::Alert, format!("video: ascii frames failed: {e}"));
+            video_fullscreen = false;
+        }
         // cleared here and refilled by the draw below, so a mouse
         // event is always answered by the frame the user clicked on.
         // `hit::front` resolves the tier from the key cascade's own
@@ -1428,6 +1468,21 @@ fn main() -> anyhow::Result<()> {
         // screen holding no wim widgets at all.
         guard.draw_unless_video(video_vo.is_some(), |f| {
             let area = f.area();
+
+            // ascii video owns the whole screen, the same as a drawing
+            // vo would, except wim is the one painting so notifications
+            // still land on top; an alert behind the picture is an
+            // alert the user never sees.
+            if ascii.active() {
+                ascii.paint(area, ui::raster::Tone::Mono, f.buffer_mut());
+                f.render_widget(
+                    NotificationOverlay {
+                        items: notifications.visible(),
+                    },
+                    area,
+                );
+                return;
+            }
 
             // onboarding takes the whole screen; no divider/status bar
             // competing with a guided first-run sequence.
@@ -5285,4 +5340,50 @@ mod startup_tests {
             assert!(msg.len() <= 30, "{msg:?} would be truncated in the sidebar");
         }
     }
+}
+
+/// The ascii video pane's wiring in the frame loop, which is three
+/// facts about how the draw and the vo handover agree with each other.
+#[cfg(test)]
+mod ascii_pane_tests {
+/// The ascii pane's three wiring facts, which need a terminal and a
+/// player to reach any other way. Reads the source above the test
+/// modules, for the reason the test above records.
+///
+/// What a behavioural test elsewhere cannot catch here is a
+/// *bypass*: the pane re-deriving its own answer instead of taking
+/// `showing`'s, or the draw falling through and painting the ui
+/// under the frames.
+#[test]
+fn the_loop_drives_the_ascii_pane_off_one_decision() {
+    let src = include_str!("main.rs");
+    let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
+
+    assert!(
+        code.contains("let want_vo = showing.mpv_vo();"),
+        "the vo and the ascii pane are deciding separately, so they can disagree"
+    );
+
+    let at = code
+        .find("ascii.update(")
+        .expect("nothing drives the frame source, so the pane is dead code");
+    let call = &code[at..(at + 300).min(code.len())];
+    assert!(
+        call.contains("showing.is_ascii()"),
+        "the pane re-derives whether ascii is wanted instead of taking it:\n{call}"
+    );
+
+    let at = code
+        .find("if ascii.active() {")
+        .expect("the draw never checks for frames, so the ui is drawn over them");
+    let branch = &code[at..(at + 400).min(code.len())];
+    assert!(
+        branch.contains("ascii.paint("),
+        "it branches on frames and never paints them:\n{branch}"
+    );
+    assert!(
+        branch.contains("return;"),
+        "it paints frames and then falls through into the ui:\n{branch}"
+    );
+}
 }
