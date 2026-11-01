@@ -689,6 +689,45 @@ mod frame_budget {
             fresh / reused,
         );
 
+        // Measured and NOT taken, kept so it is not retried: drawing
+        // a row that already fits straight out of its buffer, instead
+        // of through `truncate_with_ellipsis`' unconditional copy.
+        // 1.8x where rows fit, but 0.8x where they do not (one extra
+        // width walk), and ~1us either way against a 6944us budget.
+        // A `truncate_into(&mut String, ..)` in `ui::textfit` would
+        // win both cases; a branch here wins one and loses the other.
+        let texts: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let mut s = String::new();
+                write_row_text(&mut s, item, i == 0, false);
+                s
+            })
+            .collect();
+        for (case, w) in [("fits", PANE.width as usize), ("too long", 10)] {
+            let mut borrowed = || {
+                for t in &texts {
+                    if crate::ui::textfit::width(t) <= w {
+                        std::hint::black_box(t.as_str());
+                    } else {
+                        std::hint::black_box(truncate_with_ellipsis(t, w));
+                    }
+                }
+            };
+            let mut copied = || {
+                for t in &texts {
+                    std::hint::black_box(truncate_with_ellipsis(t, w));
+                }
+            };
+            let (keep, copy) = best_each(5, 200, &mut borrowed, &mut copied);
+            println!(
+                "  {} rows, {case} in {w} cols: borrow when it fits {keep:>7.2}us   always a String {copy:>7.2}us   {:.2}x",
+                PANE.height,
+                copy / keep,
+            );
+        }
+
         // and the whole paint, which is what that sits inside: the
         // geometry is a rounding error at a pane's worth of rows, so
         // this is where the rest of a frame goes.
@@ -714,6 +753,11 @@ mod frame_budget {
             PANE.height,
             painted / budget * 100.0,
         );
+        // the floor, so this is a test and not just a printer: a
+        // render that drew nothing would measure beautifully.
+        let grid = crate::ui::testbuf::grid(&pane);
+        assert!(grid.contains("track 0"), "the paint drew nothing:\n{grid}");
+        assert!(grid.contains("track 39"), "the pane is not full:\n{grid}");
     }
 }
 
