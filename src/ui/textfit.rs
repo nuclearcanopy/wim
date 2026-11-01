@@ -149,6 +149,15 @@ pub fn truncate_to_width(s: &str, max_width: usize) -> String {
         }
     }
     let mut out = String::new();
+    push_truncated(&mut out, s, max_width);
+    out
+}
+
+/// The grapheme walk both fits fall back to: pushes the longest prefix
+/// of `s` that fits in `max_width` onto `out`, and returns the cells it
+/// came to. One copy, so `truncate_into`'s answer cannot drift from
+/// `truncate_to_width`'s.
+fn push_truncated(out: &mut String, s: &str, max_width: usize) -> usize {
     let mut used = 0;
     for c in clusters(s) {
         let cw = cluster_cells(c);
@@ -164,7 +173,7 @@ pub fn truncate_to_width(s: &str, max_width: usize) -> String {
         out.push_str(c);
         used += cw;
     }
-    out
+    used
 }
 
 /// Returns the last `max_width` cells' worth of `s`, or all of it if
@@ -201,8 +210,78 @@ pub fn tail_fit(s: &str, max_width: usize) -> String {
 /// Never wider than `max_width` once drawn; `eyeball` holds that
 /// contract against a real `Buffer` rather than against `width`.
 pub fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
+    match ellipsis_fit(s, max_width) {
+        Fit::Empty => String::new(),
+        Fit::Whole(_) => s.to_string(),
+        Fit::Head(head, _) => with_ellipsis(head),
+        Fit::Walk(budget) => {
+            let mut out = truncate_to_width(s, budget);
+            out.push(ELLIPSIS);
+            out
+        }
+    }
+}
+
+/// `truncate_with_ellipsis` into a buffer the caller keeps, and the
+/// display width written, which the decision below already knows.
+///
+/// What a paint wants: a row that already fits is a memcpy into `out`
+/// and a row that does not pays the same cut it always did, neither of
+/// them an allocation once the buffer has held the widest row. The
+/// width is the other half: a caller padding a column would otherwise
+/// walk the result again to find out how wide it came out. `out` is
+/// cleared first and keeps its capacity.
+///
+/// The borrow this replaces (draw an already-fitting row straight out
+/// of the caller's own buffer, copy only when it does not fit) was
+/// 1.96x where rows fit and 0.82x where they did not; the extra width
+/// walk it paid to choose is the walk the fit itself does.
+pub fn truncate_into(out: &mut String, s: &str, max_width: usize) -> usize {
+    out.clear();
+    match ellipsis_fit(s, max_width) {
+        Fit::Empty => 0,
+        Fit::Whole(cells) => {
+            out.reserve(s.len());
+            out.push_str(s);
+            cells
+        }
+        Fit::Head(head, cells) => {
+            out.reserve(head.len() + ELLIPSIS.len_utf8());
+            out.push_str(head);
+            out.push(ELLIPSIS);
+            cells + 1
+        }
+        Fit::Walk(budget) => {
+            let used = push_truncated(out, s, budget);
+            out.push(ELLIPSIS);
+            used + 1
+        }
+    }
+}
+
+/// What `max_width` does to `s`. Shared because this is where the
+/// unicode part of the decision lives; the two writers above are a
+/// `to_string` and a `push_str`, and each keeps its own so neither
+/// pays for the other's allocation (delegating one to the other
+/// measured 11% onto `truncate_with_ellipsis`).
+enum Fit<'a> {
+    /// A zero budget: nothing fits, not even the marker.
+    Empty,
+    /// `s` whole, this many cells.
+    Whole(usize),
+    /// This prefix of `s`, this many cells, then the ellipsis.
+    Head(&'a str, usize),
+    /// Only the grapheme walk can cut it; the budget for the head.
+    Walk(usize),
+}
+
+// inlined into both writers on purpose: returned across a call it is
+// a four-word value, and the fast path (a row that fits) is then a
+// construct and a match rather than a comparison.
+#[inline(always)]
+fn ellipsis_fit(s: &str, max_width: usize) -> Fit<'_> {
     if max_width == 0 {
-        return String::new();
+        return Fit::Empty;
     }
     // measuring and then cutting ran the same two gates twice over the
     // same str, and built the result at the cut's size before pushing
@@ -212,26 +291,25 @@ pub fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
     // front of the ellipsis, so the cut is at zero.
     if plain_ascii(s) {
         if s.len() <= max_width {
-            return s.to_string();
+            return Fit::Whole(s.len());
         }
-        return with_ellipsis(&s[..max_width - 1]);
+        return Fit::Head(&s[..max_width - 1], max_width - 1);
     }
     if let Some(cells) = one_cell_count(s) {
         if cells <= max_width {
-            return s.to_string();
+            return Fit::Whole(cells);
         }
         // `None` means the cut lands inside a cluster, where a cell
-        // count is not a byte index; the grapheme walk below answers.
+        // count is not a byte index; the grapheme walk answers.
         if let Some(at) = char_cut(s, max_width - 1) {
-            return with_ellipsis(&s[..at]);
+            return Fit::Head(&s[..at], max_width - 1);
         }
     }
-    if clusters(s).map(cluster_cells).sum::<usize>() <= max_width {
-        return s.to_string();
+    let cells = clusters(s).map(cluster_cells).sum::<usize>();
+    if cells <= max_width {
+        return Fit::Whole(cells);
     }
-    let mut out = truncate_to_width(s, max_width - 1);
-    out.push('…');
-    out
+    Fit::Walk(max_width - 1)
 }
 
 /// `head` plus the ellipsis, in one allocation sized for both.
@@ -491,6 +569,42 @@ mod tests {
                     slow_ellipsis(s, max),
                     "truncate_with_ellipsis {s:?}/{max}"
                 );
+                // the in-place one is the same three paths writing
+                // into a buffer that already holds something, and it
+                // reports the width it wrote rather than leaving the
+                // caller to walk it again.
+                let mut into = String::from("a stale row, longer than any of these");
+                let cells = truncate_into(&mut into, s, max);
+                assert_eq!(into, slow_ellipsis(s, max), "truncate_into {s:?}/{max}");
+                assert_eq!(cells, width(&into), "truncate_into width {s:?}/{max}");
+            }
+        }
+    }
+
+    /// The point of the buffer: once it has held the widest row,
+    /// nothing later reallocates it. Pointer identity is the
+    /// assertion, since a counting allocator needs a test binary of
+    /// its own (`tests/framesource_alloc.rs` is one).
+    #[test]
+    fn a_kept_buffer_stops_allocating_once_it_has_held_the_widest_row() {
+        let rows = [
+            "Into Dust (Remastered) \u{b7} Mazzy Star",
+            "\u{65E5}\u{672C}\u{8A9E}\u{306E}\u{30BF}\u{30A4}\u{30C8}\u{30EB}",
+            "Beyonce\u{301} \u{b7} Renaissance",
+            "short",
+            "",
+        ];
+        let mut buf = String::new();
+        // the widest row first, so the capacity it needs is in hand.
+        truncate_into(&mut buf, rows[0], 60);
+        let (at, cap) = (buf.as_ptr(), buf.capacity());
+        for _ in 0..3 {
+            for row in rows {
+                for max in [60usize, 20, 8, 1, 0] {
+                    truncate_into(&mut buf, row, max);
+                    assert_eq!(buf.as_ptr(), at, "{row:?}/{max} moved its buffer");
+                    assert_eq!(buf.capacity(), cap, "{row:?}/{max} regrew it");
+                }
             }
         }
     }
@@ -500,11 +614,16 @@ mod tests {
     /// family all used to come back wider than asked for.
     #[test]
     fn no_fit_returns_more_cells_than_it_was_given() {
+        let mut into = String::new();
         for (_, s) in eyeball::SAMPLES {
             for max in 0..14 {
                 assert!(width(&truncate_to_width(s, max)) <= max, "{s:?}/{max}");
                 assert!(width(&truncate_with_ellipsis(s, max)) <= max, "{s:?}/{max}");
                 assert!(width(&tail_fit(s, max)) <= max, "{s:?}/{max}");
+                // including the width it claims to have written, which
+                // is what a caller pads a column from.
+                assert!(truncate_into(&mut into, s, max) <= max, "{s:?}/{max}");
+                assert_eq!(width(&into), truncate_into(&mut into, s, max));
             }
         }
     }
@@ -543,9 +662,48 @@ pub fn columns(items: &[String], avail: usize, max_cols: usize) -> Vec<String> {
     if items.is_empty() || avail == 0 {
         return Vec::new();
     }
+    let (cols, widths) = column_widths(items, avail, max_cols);
+    column_grid(items, cols, &widths)
+}
+
+/// The rows, once the geometry is decided. One buffer for every cell
+/// of the grid, rather than a `String` per cell and a `" ".repeat()`
+/// per gutter.
+fn column_grid(items: &[String], cols: usize, widths: &[usize]) -> Vec<String> {
+    let rows = items.len().div_ceil(cols);
+    let mut cell = String::new();
+    (0..rows)
+        .map(|row| {
+            let mut line = String::new();
+            for (col, col_w) in widths.iter().enumerate() {
+                // column-major indexing is the point; row-major would
+                // read across and lose the ranking.
+                let Some(item) = items.get(col * rows + row) else {
+                    break;
+                };
+                let cells = truncate_into(&mut cell, item, *col_w);
+                let more = items.get((col + 1) * rows + row).is_some();
+                line.push_str(&cell);
+                if more {
+                    // padded to the column, not the item, so the next
+                    // one starts in the same place on every row.
+                    // measured in cells: a wide glyph costs two.
+                    for _ in 0..col_w.saturating_sub(cells) + COLUMN_GUTTER {
+                        line.push(' ');
+                    }
+                }
+            }
+            line
+        })
+        .collect()
+}
+
+/// How many columns `items` get and the width of each, column-major.
+/// `items` must not be empty; `columns` has already returned by then.
+fn column_widths(items: &[String], avail: usize, max_cols: usize) -> (usize, Vec<usize>) {
     let max_cols = max_cols.max(1).min(items.len());
 
-    // the widths `cols` columns would actually need, column-major.
+    // the widths `cols` columns would actually need.
     let natural = |cols: usize| -> (usize, Vec<usize>) {
         let rows = items.len().div_ceil(cols);
         let widths: Vec<usize> = (0..cols)
@@ -565,7 +723,7 @@ pub fn columns(items: &[String], avail: usize, max_cols: usize) -> Vec<String> {
         )
     };
 
-    let (cols, widths) = (1..=max_cols)
+    (1..=max_cols)
         .rev()
         .find_map(|c| {
             let (total, widths) = natural(c);
@@ -580,31 +738,7 @@ pub fn columns(items: &[String], avail: usize, max_cols: usize) -> Vec<String> {
                 .find(|&c| share(c) >= MIN_COLUMN)
                 .unwrap_or(1);
             (cols, vec![share(cols).max(1); cols])
-        });
-
-    let rows = items.len().div_ceil(cols);
-    (0..rows)
-        .map(|row| {
-            let mut line = String::new();
-            for (col, col_w) in widths.iter().enumerate() {
-                // column-major indexing is the point; row-major would
-                // read across and lose the ranking.
-                let Some(item) = items.get(col * rows + row) else {
-                    break;
-                };
-                let cell = truncate_with_ellipsis(item, *col_w);
-                let more = items.get((col + 1) * rows + row).is_some();
-                line.push_str(&cell);
-                if more {
-                    // padded to the column, not the item, so the next
-                    // one starts in the same place on every row.
-                    // measured in cells: a wide glyph costs two.
-                    line.push_str(&" ".repeat(col_w.saturating_sub(width(&cell)) + COLUMN_GUTTER));
-                }
-            }
-            line
         })
-        .collect()
 }
 
 #[cfg(test)]
@@ -715,6 +849,45 @@ mod column_tests {
         assert!(columns(&items(3), 0, 3).is_empty());
     }
 
+    /// The kept buffer is a performance change, so the grid it builds
+    /// has to be character-for-character the grid a `String` per cell
+    /// and a `" ".repeat()` per gutter built, including where the
+    /// columns are shared out and every cell is cut, and with wide and
+    /// nfd items so the padding is measured in cells.
+    #[test]
+    fn the_grid_is_the_grid_a_string_per_cell_built() {
+        let mixed: Vec<String> = (0..37)
+            .map(|i| match i % 4 {
+                0 => format!("artist {i}"),
+                1 => format!("\u{65E5}\u{672C}\u{8A9E}\u{306E}\u{30BF}\u{30A4} {i}"),
+                2 => format!("Beyonce\u{301} \u{b7} album {i}"),
+                _ => format!("an artist name far too long for any column this list gets {i}"),
+            })
+            .collect();
+        // the shape the padding actually depends on, and the one a
+        // corpus of short items never reaches: a cut cell with another
+        // column after it, so the gutter is measured from the cut.
+        let mut cut_beside_a_gutter = 0;
+        for avail in [1usize, 9, 18, 20, 40, 41, 80, 90, 200] {
+            for max_cols in 1..=3 {
+                let (cols, widths) = column_widths(&mixed, avail, max_cols);
+                let grid = columns(&mixed, avail, max_cols);
+                if cols > 1 && grid.iter().any(|l| l.contains('\u{2026}')) {
+                    cut_beside_a_gutter += 1;
+                }
+                assert_eq!(
+                    grid,
+                    super::bench::allocating_grid(&mixed, cols, &widths),
+                    "{avail} cells, {max_cols} columns"
+                );
+            }
+        }
+        assert!(
+            cut_beside_a_gutter > 0,
+            "no case cut a cell in a multi-column grid, so the padding is unguarded"
+        );
+    }
+
     /// One item cannot be laid out in three columns, and trying would
     /// leave two empty ones padded out to nothing.
     #[test]
@@ -799,16 +972,42 @@ pub mod eyeball {
     #[test]
     fn truncation() {
         println!("\n== truncation into 8 cells ==");
+        let mut into = String::new();
         for (name, s) in SAMPLES {
             let cut = truncate_to_width(s, 8);
             let ell = truncate_with_ellipsis(s, 8);
             let tail = tail_fit(s, 8);
+            // the in-place one writes the same thing and says how wide
+            // it is; the printed widths have to agree.
+            let cells = truncate_into(&mut into, s, 8);
             println!(
-                "{name:<15} to_width={:>2} ellipsis={:>2} tail={:>2}   {cut:?} {ell:?} {tail:?}",
+                "{name:<15} to_width={:>2} ellipsis={:>2} tail={:>2} into={cells:>2}   \
+                 {cut:?} {ell:?} {tail:?} {into:?}",
                 width(&cut),
                 width(&ell),
                 width(&tail),
             );
+        }
+    }
+
+    /// The one grid in this module, as it comes out of a kept buffer:
+    /// mixed ascii, cjk and nfd items at a width that packs them and
+    /// one that cuts every cell. `|` marks the right edge, so a cell
+    /// padded from the wrong count is visible rather than arithmetic.
+    #[test]
+    fn column_grid() {
+        let items: Vec<String> = (0..9)
+            .map(|i| match i % 3 {
+                0 => format!("artist {i}"),
+                1 => format!("\u{65E5}\u{672C}\u{8A9E}\u{306E}\u{30BF}\u{30A4} {i}"),
+                _ => format!("a long artist name to cut {i}"),
+            })
+            .collect();
+        for avail in [80usize, 44, 20] {
+            println!("\n== columns in {avail} cells, up to 3 ==");
+            for line in columns(&items, avail, 3) {
+                println!("|{line}|{} cells", width(&line));
+            }
         }
     }
 
@@ -929,12 +1128,15 @@ pub mod eyeball {
     /// not the claim.
     #[test]
     fn the_painted_width_never_exceeds_the_budget() {
+        let mut into = String::new();
         for (name, s) in SAMPLES {
             for budget in 0..=14usize {
+                truncate_into(&mut into, s, budget);
                 for (how, out) in [
                     ("truncate_to_width", truncate_to_width(s, budget)),
                     ("truncate_with_ellipsis", truncate_with_ellipsis(s, budget)),
                     ("tail_fit", tail_fit(s, budget)),
+                    ("truncate_into", into.clone()),
                 ] {
                     assert!(
                         width(&out) <= budget,
@@ -1108,6 +1310,148 @@ mod bench {
             corpus.len(),
             profile(),
         );
+    }
+
+    /// `truncate_with_ellipsis`' body before it delegated, so the
+    /// delegation is measured rather than assumed free: it built the
+    /// result with `String::with_capacity` where the shared one
+    /// reserves into a cleared buffer.
+    fn allocating_ellipsis(s: &str, max_width: usize) -> String {
+        if max_width == 0 {
+            return String::new();
+        }
+        if plain_ascii(s) {
+            if s.len() <= max_width {
+                return s.to_string();
+            }
+            return with_capacity_ellipsis(&s[..max_width - 1]);
+        }
+        if let Some(cells) = one_cell_count(s) {
+            if cells <= max_width {
+                return s.to_string();
+            }
+            if let Some(at) = char_cut(s, max_width - 1) {
+                return with_capacity_ellipsis(&s[..at]);
+            }
+        }
+        if clusters(s).map(cluster_cells).sum::<usize>() <= max_width {
+            return s.to_string();
+        }
+        let mut out = truncate_to_width(s, max_width - 1);
+        out.push('\u{2026}');
+        out
+    }
+
+    fn with_capacity_ellipsis(head: &str) -> String {
+        let mut out = String::with_capacity(head.len() + '\u{2026}'.len_utf8());
+        out.push_str(head);
+        out.push('\u{2026}');
+        out
+    }
+
+    /// A row drawn out of a kept buffer against one allocated per row,
+    /// at a budget where every row fits and one where none does. The
+    /// case that pays for `truncate_into`: the branch it replaces
+    /// (borrow the row when it fits, copy it when it does not) was
+    /// 1.96x where they fit and 0.82x where they did not, because the
+    /// second case paid a width walk the fit itself already does.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn into_cost() {
+        let corpus = corpus();
+        let mut kept = String::new();
+        for (case, budget) in [("every row fits", 60usize), ("none of them fits", 8)] {
+            let budget = std::hint::black_box(budget);
+            let [into, fresh, old] = best_each::<3>(12, 4000, |which| match which {
+                0 => {
+                    for s in &corpus {
+                        // the buffer escapes too, so none of the
+                        // writing into it can be elided where the
+                        // other two have a `String` to hand back.
+                        let cells = truncate_into(&mut kept, s, budget);
+                        std::hint::black_box((cells, kept.as_str()));
+                    }
+                }
+                1 => {
+                    for s in &corpus {
+                        std::hint::black_box(truncate_with_ellipsis(s, budget));
+                    }
+                }
+                _ => {
+                    for s in &corpus {
+                        std::hint::black_box(allocating_ellipsis(s, budget));
+                    }
+                }
+            });
+            println!(
+                "{} rows, {case} in {budget} cells ({}): one kept buffer {into:>10.3?}  \
+                 a String each {fresh:>10.3?} ({:.2}x)  before delegating {old:>10.3?}",
+                corpus.len(),
+                profile(),
+                fresh.as_secs_f64() / into.as_secs_f64(),
+            );
+        }
+    }
+
+    /// `columns` is the one caller in this file: a `String` per cell
+    /// and a `" ".repeat()` per gutter, against one buffer for the
+    /// whole grid. The geometry is identical on both sides and is
+    /// hoisted out of the clock, since walking every item's width
+    /// 1-3 times is most of `columns` and would just dilute this.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn columns_cost() {
+        let items: Vec<String> = (0..60)
+            .map(|i| match i % 3 {
+                0 => format!("artist number {i}"),
+                1 => format!("\u{65E5}\u{672C}\u{8A9E}\u{306E} {i}"),
+                _ => format!("a fairly long artist name to cut {i}"),
+            })
+            .collect();
+        for avail in [80usize, 40] {
+            let (cols, widths) = super::column_widths(&items, avail, 3);
+            let [kept, fresh] = best_each::<2>(12, 2000, |which| {
+                std::hint::black_box(match which {
+                    0 => super::column_grid(&items, cols, &widths),
+                    _ => allocating_grid(&items, cols, &widths),
+                });
+            });
+            println!(
+                "{} items, {cols} columns in {avail} cells ({}): one buffer {kept:>10.3?}  \
+                 a String per cell {fresh:>10.3?}  {:.2}x",
+                items.len(),
+                profile(),
+                fresh.as_secs_f64() / kept.as_secs_f64(),
+            );
+        }
+    }
+
+    /// `columns`' grid pass as it was: a `String` per cell and a
+    /// `" ".repeat()` per gutter, plus the width walk back over the
+    /// cut the fit already measured. Also the reference
+    /// `the_grid_is_the_grid_a_string_per_cell_built` holds the
+    /// kept-buffer version against.
+    pub(super) fn allocating_grid(items: &[String], cols: usize, widths: &[usize]) -> Vec<String> {
+        let rows = items.len().div_ceil(cols);
+        (0..rows)
+            .map(|row| {
+                let mut line = String::new();
+                for (col, col_w) in widths.iter().enumerate() {
+                    let Some(item) = items.get(col * rows + row) else {
+                        break;
+                    };
+                    let cell = truncate_with_ellipsis(item, *col_w);
+                    let more = items.get((col + 1) * rows + row).is_some();
+                    line.push_str(&cell);
+                    if more {
+                        line.push_str(
+                            &" ".repeat(col_w.saturating_sub(width(&cell)) + COLUMN_GUTTER),
+                        );
+                    }
+                }
+                line
+            })
+            .collect()
     }
 
     #[test]
