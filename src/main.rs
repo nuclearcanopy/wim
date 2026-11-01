@@ -415,12 +415,18 @@ fn open_wim_screen(
             let live = core.app.corpus.remote_clients();
             // the loader owns this view now, so its own generation bump
             // disowns anything still in flight; no separate invalidate.
-            let bv = open_starred(
+            let (bv, unreachable) = open_starred(
                 surf.browse_loader,
                 &core.cfg.navidrome_servers,
                 core.favorites,
                 &live,
             );
+            // a server missing from a starred list with no reason
+            // given is the whole point of carrying these up.
+            for why in unreachable {
+                core.notifications
+                    .push(Severity::Alert, format!("starred: {why}"));
+            }
             let count = bv.tracks.len();
             *surf.browse_view = Some(bv);
             // same as opening an album: the listing draws its own
@@ -4125,6 +4131,7 @@ fn main() -> anyhow::Result<()> {
                                     &mut favorites,
                                     &mut remote_starred,
                                     &star_tx,
+                                    wim::favorites::save,
                                 ) {
                                     notifications.push(Severity::Error, msg);
                                 }
@@ -4433,12 +4440,15 @@ fn main() -> anyhow::Result<()> {
                 if key.code == keymap.get(KeyAction::OpenStarredView) {
                     // the loader owns this view, so opening it bumps
                     // the generation and disowns anything in flight.
-                    let bv = open_starred(
+                    let (bv, unreachable) = open_starred(
                         &mut browse_loader,
                         &cfg.navidrome_servers,
                         &favorites,
                         &app.corpus.remote_clients(),
                     );
+                    for why in unreachable {
+                        notifications.push(Severity::Alert, format!("starred: {why}"));
+                    }
                     browse_view = Some(bv);
                     // same as opening an album: the starred list draws
                     // a selection cursor, so j/k have to move *it*
@@ -4542,7 +4552,13 @@ fn main() -> anyhow::Result<()> {
                     // own selected search result here.
                     if let Some(item) = app.selected_result().cloned() {
                         if let Err(msg) =
-                            toggle_star(&item, &mut favorites, &mut remote_starred, &star_tx)
+                            toggle_star(
+                                &item,
+                                &mut favorites,
+                                &mut remote_starred,
+                                &star_tx,
+                                wim::favorites::save,
+                            )
                         {
                             notifications.push(Severity::Error, msg);
                         }
