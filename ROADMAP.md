@@ -644,7 +644,7 @@ and `in-workspace (sub-rect) video` is still kitty-only via
       the video eating the frame or the chrome collapsing to unreadable
       slivers. this is a layout constraint, not a rendering one; the
       chrome should scale its own footprint, not vanish.
-- [ ] **frame budget.** measured, and the paint is not the problem.
+- [x] **frame budget.** measured, and the paint is not the problem.
       `framesource::frame_budget` (ignored by default, it is a
       measurement and a ceiling here would flake) at release opt:
 
@@ -702,9 +702,33 @@ and `in-workspace (sub-rect) video` is still kitty-only via
       this: they had been sitting above `FrameSource`, so the
       truncate-at-first-`#[cfg(test)]` rule every source guard here
       uses was cutting off the code it meant to search.
-      what is left is the tunable rate: decouple the ascii frame rate
-      from the display refresh with a config knob, degrading smoothness
-      and never blocking input.
+      **the tunable rate is in**, as `ascii_fps` in config.toml (and
+      `asciiFps` in the home-manager module), unset meaning the file's
+      own rate. `framesource::ascii_fps(container, capped)` is the
+      whole decision and a cap can only ever lower the rate: asking for
+      more frames than the file has makes mpv duplicate them, and a
+      duplicate costs a full paint to show the picture already on
+      screen. the display refresh was never the thing to match.
+      the rate now leads the **filter chain** (`fps=N,scale=...`),
+      which is the part that makes this correct rather than just
+      cheaper: mpv then scales only the frames that will be read, and
+      the stream becomes constant-rate, which is what `Schedule`'s
+      "frame n *is* media time `start + n/fps`" identity assumed all
+      along and vfr content quietly broke. the filter rate and the
+      schedule rate are one expression, guarded by a source test,
+      because if they ever disagree the picture drifts against
+      `time-pos` at exactly their ratio and reads as a sync mystery.
+      five mutations caught (a chain with no rate filter, a filter rate
+      that is not the schedule's, a cap that raises instead of lowers,
+      `clamp` where the floor can exceed the ceiling, and an unchecked
+      infinite container rate). a sixth was **not** caught and is
+      recorded in the test: dropping `is_finite` from the cap's filter
+      is semantically equivalent, since NaN fails `> 0.0` anyway and an
+      infinite cap is `min`'d away.
+      "never blocking input" needed nothing: the fifo is opened
+      non-blocking and `WouldBlock` is already an ordinary `Pending`.
+      what is left of this item is nothing, unless the maintainer wants
+      the cap exposed in the settings menu rather than only in config.
       the original note follows.
 - [ ] a few hundred cells across times a few hundred
       down, at video frame rate, is the real cost. the work is CPU
