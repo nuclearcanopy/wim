@@ -4029,6 +4029,13 @@ impl Console {
     /// one local corpus search, capped at `MAX_CANDIDATES`.
     fn refresh(&mut self, cand: &dyn Candidates) {
         let here = site(&self.input, self.cursor);
+        // a cycle is only valid for the token it opened on. the cursor
+        // keys and history recall left it open, so the next tab built a
+        // remainder against a token that had moved and the accept
+        // spliced it in mid-word, breaking `Cycle`'s own invariant.
+        if self.cycle.as_ref().is_some_and(|c| c.typed != here.token) {
+            self.cycle = None;
+        }
         let mut next = Suggestion {
             signature: here.signature.clone(),
             ..Suggestion::default()
@@ -7381,6 +7388,51 @@ mod tests {
         press(&mut c, &fake, KeyCode::Char('a'));
         assert!(c.cycle().is_none());
         assert_eq!(c.input, "queue(fla)");
+    }
+
+    /// `Cycle`'s own invariant is that every item extends `typed`, so
+    /// cycling cannot overwrite what was typed. That holds only while
+    /// `typed` is still the token under the cursor: the cursor keys and
+    /// history recall left the cycle open, so the next tab computed a
+    /// remainder against a token that had moved and the accept spliced
+    /// it in mid-word.
+    #[test]
+    fn moving_the_cursor_retires_an_open_cycle() {
+        let fake = Fake::new(&["flatline", "floor", "flowers"]);
+        let mut c = console_with(&fake, "queue(fl");
+        press(&mut c, &fake, KeyCode::Tab);
+        assert!(c.cycle().is_some(), "a cycle should be open to retire");
+        press(&mut c, &fake, KeyCode::Left);
+        assert!(c.cycle().is_none(), "the token under the cursor changed");
+        // and the end-to-end consequence: whatever tab then offers is
+        // an extension of the token it is actually sitting on.
+        press(&mut c, &fake, KeyCode::Tab);
+        let chosen = {
+            let cycle = c.cycle().expect("a fresh cycle for the new token");
+            cycle.items[cycle.at].clone()
+        };
+        ctrl(&mut c, &fake, 'f');
+        assert!(
+            c.input[..c.cursor].ends_with(&chosen),
+            "accepted {chosen} but the line reads {:?}",
+            c.input
+        );
+    }
+
+    /// Up and down replace the whole line, so the same reasoning holds
+    /// there: `recall_back` kept the cycle, and `Right` at the end of
+    /// the recalled line then accepted the previous line's remainder.
+    #[test]
+    fn recalling_a_line_retires_an_open_cycle() {
+        let fake = Fake::new(&["flatline", "floor", "flowers"]);
+        let mut c = Console::empty();
+        c.history = vec!["pause()".into(), "queue(gods)".into()];
+        type_in(&mut c, &fake, "queue(fl");
+        press(&mut c, &fake, KeyCode::Tab);
+        assert!(c.cycle().is_some());
+        press(&mut c, &fake, KeyCode::Up);
+        assert_eq!(c.input, "queue(gods)");
+        assert!(c.cycle().is_none(), "the recalled line is a new token");
     }
 
     #[test]
