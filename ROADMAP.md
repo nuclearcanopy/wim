@@ -767,10 +767,28 @@ alone, which found more than the feature work it was run beside.
 
 ## in flight
 
-**nothing. all ten branches are merged as of 2026-10-31**: the five
-perf ones, `feat/mouse`, `fix/async-open`, `feat/video`,
-`feat/art-modes`, and the mouse audit's follow-up commits. 874 tests,
-clippy `-D warnings` clean, fmt clean.
+**`wt/shellsong` merged 2026-11-01** (the audit above). `wt/draw`
+(per-frame draw path), `wt/suggest` (suggestion and hit scoring) and
+`wt/polish` (`ui/help.rs`, `ui/suggestions.rs`) are open with
+uncommitted work; none has pushed, and integration is the orchestrator's
+job, not theirs.
+
+before that: **all ten branches merged 2026-10-31**: the five perf ones,
+`feat/mouse`, `fix/async-open`, `feat/video`, `feat/art-modes`, and the
+mouse audit's follow-up commits.
+
+**1492 tests** (1458 lib, 27 bin, 6 shellswim, 1 alloc) and clippy
+`-D warnings` clean as of 2026-11-01.
+
+**not fmt clean, and that claim here was stale.** `cargo fmt --check`
+reports diffs in 20 files, `core.rs` and `main.rs` worst. not fixed in
+passing on purpose: running it over `framesource.rs` alone reflowed 843
+lines of code nobody is changing and broke a source guard that was
+matching an exact call expression, and three agents hold edits in four
+of those files right now. it wants its own commit on a quiet tree.
+the guard is fixed either way: it matches two tokens instead of a whole
+line, because a guard a formatter can break is a guard that fails for
+the wrong reason.
 
 `feat/art-modes` was the one hard merge: 12 conflicts, because it was
 based three merges back and both `fix/async-open` and `feat/video` had
