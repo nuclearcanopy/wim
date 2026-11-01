@@ -179,10 +179,16 @@ impl Widget for SuggestionsView<'_> {
             return;
         }
         let total = self.suggestions.len();
-        let title = if self.enriching {
-            format!("suggestions · {total} so far")
-        } else {
-            format!("suggestions · {total}")
+        // where the cursor is as well as how many there are. the `▌` on
+        // one of a handful of visible rows said which row was selected
+        // and nothing at all said which of thirty it was.
+        let title = match total {
+            0 => "suggestions".to_string(),
+            _ => {
+                let at = self.selected.min(total - 1) + 1;
+                let filling = if self.enriching { " so far" } else { "" };
+                format!("suggestions · {at}/{total}{filling}")
+            }
         };
         let body_top = draw_header(
             buf,
@@ -204,13 +210,27 @@ impl Widget for SuggestionsView<'_> {
         if self.suggestions.is_empty() {
             // a brand new library genuinely has nothing to go on, and
             // saying so beats an empty pane that looks broken.
-            draw::line(buf, area, body_top, "nothing to suggest yet", shade(MID));
+            //
+            // a row of air above it wherever there is one: flush under
+            // the header's rule the message read as a third line of the
+            // header rather than as the pane's own content. indented to
+            // the column a section heading sits in, and the headline a
+            // shade up from the reason, so the eye lands on the fact
+            // before the advice.
+            let y = body_top + u16::from(body_height >= 3);
             let why = if self.enriching {
                 "still reading your library"
             } else {
                 "play a few things and this fills in"
             };
-            draw::line(buf, area, body_top.saturating_add(1), why, shade(DIM));
+            let room = (area.width as usize).saturating_sub(1);
+            for (row, text, level) in [
+                (y, "nothing to suggest yet", BRIGHT),
+                (y.saturating_add(1), why, DIM),
+            ] {
+                let fitted = truncate_with_ellipsis(text, room);
+                draw::line(buf, area, row, &format!(" {fitted}"), shade(level));
+            }
             return;
         }
 
@@ -581,6 +601,102 @@ mod tests {
         assert!(out.contains("play a few things"), "{out}");
     }
 
+    /// A `shade` level back out of a painted cell, so a test can make
+    /// an ordering claim about brightness without restating the
+    /// constant the render used.
+    fn level_at(buf: &Buffer, x: u16, y: u16) -> f32 {
+        match buf.cell((x, y)).map(|c| c.fg) {
+            Some(ratatui::style::Color::Rgb(v, _, _)) => f32::from(v) / 255.0,
+            other => panic!("({x}, {y}) was not painted on the grey ramp: {other:?}"),
+        }
+    }
+
+    fn render_into(s: &Suggestions, selected: usize, w: u16, h: u16) -> Buffer {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = buffer(w, h);
+        SuggestionsView {
+            suggestions: s,
+            selected,
+            focused: true,
+            elapsed: Duration::ZERO,
+            enriching: false,
+        }
+        .render(area, &mut buf);
+        buf
+    }
+
+    /// Thirty suggestions two rows each in a pane that holds four: the
+    /// `▌` said which of the visible rows was selected and nothing at
+    /// all said which of thirty it was, so `j` felt like it moved
+    /// through an unmeasured list.
+    #[test]
+    fn the_title_says_where_the_cursor_is_as_well_as_how_many_there_are() {
+        let s = one_long_section();
+        for selected in [0usize, 14, 29] {
+            let g = grid(&render_into(&s, selected, 60, 10));
+            let head = g.lines().next().unwrap();
+            assert!(
+                head.contains(&format!("{}/{}", selected + 1, count(&s))),
+                "cursor {selected} is not in the title:\n{head}"
+            );
+        }
+        // an empty pane counts nothing: the body says what is going on
+        // and a "· 0" beside the word would only repeat it.
+        let empty = grid(&render_into(&Suggestions::default(), 0, 60, 10));
+        let head = empty.lines().next().unwrap();
+        assert!(head.contains("suggestions"), "{head}");
+        assert!(!head.contains('/'), "nothing to count:\n{head}");
+    }
+
+    /// The first thing a new library sees. It was two rows flush under
+    /// the header's rule at column zero, both middling, which read as a
+    /// third line of the header rather than as the pane's own content.
+    #[test]
+    fn an_empty_pane_has_air_above_it_and_leads_with_the_fact() {
+        let buf = render_into(&Suggestions::default(), 0, 50, 8);
+        let g = grid(&buf);
+        let rows: Vec<&str> = g.lines().collect();
+        let body = crate::ui::header::ROWS as usize;
+        assert!(
+            rows[body].chars().all(|c| c == '.'),
+            "the message is flush against the header rule:\n{g}"
+        );
+        // indented to the column a section heading sits in, not to the
+        // pane's own edge.
+        assert!(rows[body + 1].starts_with(" nothing to suggest yet"), "{g}");
+        assert!(
+            rows[body + 2].starts_with(" play a few things"),
+            "{g}"
+        );
+        // and the fact outranks the advice, so the eye lands on it
+        // first rather than reading two equal lines.
+        let fact = level_at(&buf, 1, body as u16 + 1);
+        let advice = level_at(&buf, 1, body as u16 + 2);
+        assert!(
+            fact > advice,
+            "the headline and the advice are one brightness: {fact} vs {advice}"
+        );
+    }
+
+    /// The empty message is the longest fixed string this pane paints,
+    /// and it used to stop dead wherever the pane's width ran out.
+    #[test]
+    fn an_empty_pane_too_narrow_for_its_message_ellipsises_it() {
+        for w in 6..=40u16 {
+            let g = grid(&render_into(&Suggestions::default(), 0, w, 8));
+            for line in g.lines().skip(crate::ui::header::ROWS as usize) {
+                let text = line.trim_end_matches('.');
+                if text.trim().is_empty() {
+                    continue;
+                }
+                assert!(
+                    text.ends_with('…') || text.ends_with("yet") || text.ends_with("in"),
+                    "{w} cols cut the message with no sign of it:\n{line}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_still_filling_list_says_so_in_the_title() {
         let s = two_sections();
@@ -939,6 +1055,72 @@ mod eyeball {
                 last == '.' || last == '▴' || last == '▾',
                 "the gutter column holds {last:?}:\n{g}"
             );
+        }
+    }
+
+    /// Every cell's brightness as one digit of `shade`'s level, 0 to 9,
+    /// blank where nothing was painted. On a strictly monochrome
+    /// surface the char grid shows none of the hierarchy, which is
+    /// exactly the half of this pane that wanted looking at: the
+    /// reason lines were painted at the level the *frame* is drawn at.
+    fn levels(buf: &Buffer) -> String {
+        let area = buf.area;
+        (area.y..area.y + area.height)
+            .map(|y| {
+                (area.x..area.x + area.width)
+                    .map(|x| match buf.cell((x, y)).map(|c| c.fg) {
+                        Some(ratatui::style::Color::Rgb(v, _, _)) => {
+                            char::from_digit(u32::from(v) * 10 / 256, 10).unwrap_or('?')
+                        }
+                        _ => ' ',
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The two states nothing ever printed: a pane with nothing in it
+    /// (the first thing a new library sees) and a pane holding exactly
+    /// one suggestion, where there is no list for the eye to compare
+    /// the one row against.
+    #[test]
+    fn print_the_empty_and_single_item_panes() {
+        for (w, h) in [(50u16, 8u16), (50, 3), (24, 6), (14, 5), (80, 12)] {
+            for enriching in [false, true] {
+                let area = Rect::new(0, 0, w, h);
+                let mut buf = buffer(w, h);
+                SuggestionsView {
+                    suggestions: &Suggestions::default(),
+                    selected: 0,
+                    focused: true,
+                    elapsed: Duration::ZERO,
+                    enriching,
+                }
+                .render(area, &mut buf);
+                assert_outside_untouched(&buf, area);
+                println!("--- empty {w}x{h} enriching={enriching}\n{}", grid(&buf));
+            }
+        }
+        let one = Suggestions {
+            sections: vec![crate::suggest::Section {
+                title: Reason::StarredUnplayed.title().to_string(),
+                reason: Reason::StarredUnplayed,
+                items: vec![crate::suggest::Suggestion {
+                    item: crate::search::SearchItem::LocalMusic {
+                        path: "/m/Obedient.flac".into(),
+                        title: "Obedient".to_string(),
+                        artist: Some("Bladee".to_string()),
+                        album: None,
+                    },
+                    reason_text: "starred in March, never opened".to_string(),
+                    score: 0.9,
+                }],
+            }],
+        };
+        for (w, h) in [(60u16, 10u16), (60, 5), (24, 8)] {
+            let buf = paint(&one, 0, w, h);
+            println!("--- one item {w}x{h}\n{}\n{}", grid(&buf), levels(&buf));
         }
     }
 
