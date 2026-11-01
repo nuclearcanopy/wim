@@ -414,10 +414,10 @@ impl PlayerView<'_> {
     fn elements(&self, detail: Detail) -> Vec<Element> {
         let speed_changed = (self.speed - 1.0).abs() >= 0.005;
         let onoff = |on: bool| if on { "on" } else { "off" };
-        // a glyph and the words the tier has room after it, pushed
-        // rather than `format!`ed: six of these are rebuilt on both of
-        // a frame's row passes, and the formatter measured 4.7x a push
-        // per label (`bench::label_cost`).
+        // a glyph, then whichever words the tier has room for after
+        // it, pushed rather than `format!`ed: six of these are rebuilt
+        // on both of a frame's row passes, and the formatter measured
+        // 4.7x a push per label (`bench::label_cost`).
         let words = |glyph: &str, rest: &[&str]| {
             let mut out = String::with_capacity(
                 glyph.len() + rest.iter().map(|w| w.len() + 1).sum::<usize>(),
@@ -572,8 +572,7 @@ impl PlayerView<'_> {
     fn hint(&self, avail: usize) -> String {
         // borrowed where the hint is a fixed sentence, which is most
         // of them: only the two that name a remappable key are built.
-        let minimize =
-            || Cow::Owned(format!("{}: minimize", self.key(KeyAction::ToggleMinimize)));
+        let minimize = || Cow::Owned(format!("{}: minimize", self.key(KeyAction::ToggleMinimize)));
         let parts: Vec<Cow<'static, str>> = if self.scrubbing {
             vec![
                 "arrows: seek".into(),
