@@ -137,9 +137,7 @@ impl Tiers {
     /// This is what mpv must be told, or it keeps drawing a video
     /// straight over the modal; `video::wanted` takes it as `overlay`.
     pub fn covers_screen(self) -> bool {
-        TIERS
-            .iter()
-            .any(|m| self.up(*m) && m.covers_screen())
+        TIERS.iter().any(|m| self.up(*m) && m.covers_screen())
     }
 
     /// Whether a tier that does *not* animate itself is covering the
@@ -1156,7 +1154,11 @@ mod tier_questions {
                 "{modal:?} alone is not the frontmost tier"
             );
         }
-        assert_eq!(front(Tiers::default()), None, "nothing up, nothing in front");
+        assert_eq!(
+            front(Tiers::default()),
+            None,
+            "nothing up, nothing in front"
+        );
     }
 
     /// The other direction: a tier painted over the panes must tell
@@ -1173,7 +1175,10 @@ mod tier_questions {
                 "{modal:?} disagrees with its own covers_screen"
             );
         }
-        assert!(up(Modal::Console).covers_screen(), "the console was missing");
+        assert!(
+            up(Modal::Console).covers_screen(),
+            "the console was missing"
+        );
         assert!(
             up(Modal::SubtitleMenu).covers_screen(),
             "the subtitle menu was missing, over video of all things"
@@ -1211,11 +1216,7 @@ mod tier_questions {
         // animate, or one of them is lying.
         for modal in TIERS {
             if !modal.animates() {
-                assert_eq!(
-                    up(modal).static_modal(),
-                    modal.covers_screen(),
-                    "{modal:?}"
-                );
+                assert_eq!(up(modal).static_modal(), modal.covers_screen(), "{modal:?}");
             }
         }
     }
