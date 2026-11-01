@@ -42,11 +42,12 @@ const ALBUM_PAGE_SIZE: usize = 500;
 const ALBUM_PAGE_CONCURRENCY: usize = 4;
 
 /// How long a cached navigation answer (a tracklist, an album's year,
-/// an artist's album list, a bio) may be served from memory. Pinned to
-/// the background catalog sync's own interval, so nothing a server
-/// changes is ever more than one sync cycle stale; see
-/// docs/startup-cache.md.
-const NAV_CACHE_TTL: Duration = Duration::from_secs(45);
+/// an artist's album list, a bio) may be served from memory. The sync
+/// interval itself rather than a literal equal to it: this is the
+/// backstop for what a catalog listing cannot see (a track added to an
+/// album that already existed), so docs/startup-cache.md's "worst
+/// case: 45 seconds" holds only while the two are one number.
+const NAV_CACHE_TTL: Duration = crate::catalog::AUTO_SYNC_INTERVAL;
 
 /// Cached navigation answers per server. 256 covers any plausible
 /// browsing session (an album tracklist each) and bounds what a day-
@@ -2289,6 +2290,15 @@ mod tests {
             cache.get(&key).is_none(),
             "nothing may be served for longer than one sync interval"
         );
+    }
+
+    /// And what that ttl has to be. The sync is the real invalidation
+    /// path; the ttl covers only what a catalog listing cannot see, so
+    /// a ttl longer than one sync cycle would serve a tracklist no
+    /// pass is going to drop.
+    #[test]
+    fn the_response_ttl_is_the_sync_interval_itself() {
+        assert_eq!(NAV_CACHE_TTL, crate::catalog::AUTO_SYNC_INTERVAL);
     }
 
     #[test]
