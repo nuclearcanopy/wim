@@ -118,16 +118,34 @@ in
     };
 
     videoOutput = mkOption {
-      type = types.enum [ "auto" "tct" "kitty" "off" ];
+      type = types.enum [ "auto" "tct" "kitty" "ascii" "off" ];
       default = "auto";
       description = ''
-        How 'v' draws a local video. mpv draws it itself, filling the
-        terminal, while wim stops drawing. "tct" is true-color
-        half-blocks and works in any terminal; "kitty" is the kitty
-        graphics protocol and needs a terminal that speaks it. "auto"
-        uses kitty only when the terminal answered the graphics probe
-        with it, "tct" otherwise. "off" disables the key. Music
-        playback is never affected.
+        How 'v' draws a local video. For "tct" and "kitty", mpv draws
+        it itself, filling the terminal, while wim stops drawing:
+        "tct" is true-color half-blocks and works in any terminal;
+        "kitty" is the kitty graphics protocol and needs a terminal
+        that speaks it. "auto" uses kitty only when the terminal
+        answered the graphics probe with it, "tct" otherwise.
+        "ascii" is different: wim decodes the video itself and paints
+        it as monochrome text cells, for a terminal with no image
+        protocol at all. "auto" never picks it, since a real protocol
+        beats a cell grid wherever one exists; shift-'v' switches to it
+        at runtime. "off" disables the key. Music playback is never
+        affected.
+      '';
+    };
+
+    asciiFps = mkOption {
+      type = types.nullOr types.number;
+      default = null;
+      description = ''
+        Caps the rate the "ascii" video output decodes and paints at.
+        null means the file's own rate. Only ever lowers it: asking for
+        more frames than the file has makes mpv duplicate them, and
+        each duplicate costs a full paint to show the same picture. For
+        a large cell grid on a slow machine, half the file's rate is
+        half the work and still watchable.
       '';
     };
 
@@ -404,6 +422,8 @@ in
       opensubtitles_api_key_file = toString cfg.opensubtitlesApiKeyFile;
     } // lib.optionalAttrs (cfg.listenbrainzUserTokenFile != null) {
       listenbrainz_user_token_file = toString cfg.listenbrainzUserTokenFile;
+    } // lib.optionalAttrs (cfg.asciiFps != null) {
+      ascii_fps = cfg.asciiFps;
     } // lib.optionalAttrs (cfg.logoStyle != null) {
       logo_style = cfg.logoStyle;
     } // lib.optionalAttrs (cfg.keybinds != { }) {
