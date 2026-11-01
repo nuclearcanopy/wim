@@ -231,6 +231,14 @@ pub struct Config {
     /// affected: only a `LocalVideo` item ever gets a drawing vo.
     #[serde(default)]
     pub video_output: VideoOutput,
+    /// Caps the rate `video_output = "ascii"` decodes and paints at.
+    /// Unset means the file's own rate. Only ever lowers it: asking
+    /// for more frames than the file has makes mpv duplicate them, and
+    /// each duplicate costs a full paint to show the same picture.
+    /// For a large cell grid on a slow box, half the file's rate is
+    /// half the work and still watchable.
+    #[serde(default)]
+    pub ascii_fps: Option<f64>,
 }
 
 fn default_mouse() -> bool {
@@ -518,6 +526,7 @@ impl Default for Config {
         Config {
             navidrome_servers: Vec::new(),
             album_art: AlbumArtMode::Auto,
+            ascii_fps: None,
             library_paths: Vec::new(),
             crossfade_enabled: false,
             crossfade_seconds: default_crossfade_seconds(),
@@ -650,6 +659,7 @@ fn fix_int<T: Ord + Copy + std::fmt::Display>(
 const KNOWN_KEYS: &[&str] = &[
     "navidrome_servers",
     "album_art",
+    "ascii_fps",
     "library_paths",
     "crossfade_enabled",
     "crossfade_seconds",
@@ -925,6 +935,7 @@ pasword = "x"
                 transcode_format: Some("opus".into()),
             }],
             album_art: AlbumArtMode::Auto,
+            ascii_fps: Some(12.0),
             library_paths: vec!["/music".into()],
             crossfade_enabled: true,
             crossfade_seconds: 3.0,
