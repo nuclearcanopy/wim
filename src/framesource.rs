@@ -35,7 +35,7 @@ use image::{DynamicImage, RgbImage};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use crate::ui::raster::{self, Fit, Style, Tone};
+use crate::ui::raster::{self, Fit, Sharpen, Style, Tone};
 
 /// Bytes per pixel. Packed rgb24: no padding and no stride, so a frame
 /// is exactly `w * h * 3` bytes and nothing has to interpret a layout.
@@ -342,109 +342,6 @@ pub fn plan(want_ascii: bool, media: Option<&Path>, grid: Grid, have: Have) -> P
     Plan::Keep
 }
 
-/// What a frame costs to paint at grids ascii video is actually
-/// watchable at, which is the measurable half of the frame budget.
-///
-/// A measurement, not an assertion: the numbers move with the box and
-/// a ceiling here would be a flake. Run it with
-/// `cargo test --lib frame_budget -- --ignored --nocapture`.
-#[cfg(test)]
-mod frame_budget {
-    use super::*;
-    use crate::ui::raster::Sharpen;
-    use std::time::{Duration, Instant};
-
-    /// Deterministic noise, because a flat frame is the one case the
-    /// quantizer is fast on and video frames are not flat.
-    fn noise(grid: Grid) -> DynamicImage {
-        let (w, h) = grid.pixels();
-        let mut img = RgbImage::new(w, h);
-        let mut x: u32 = 0x1234_5678;
-        for px in img.pixels_mut() {
-            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            let b = (x >> 16) as u8;
-            px.0 = [b, b.rotate_left(3), b.wrapping_add(71)];
-        }
-        DynamicImage::ImageRgb8(img)
-    }
-
-    /// Alternating batches in one process, best of each. Sequential
-    /// runs on this box differ 1.6-1.8x under load, so two separate
-    /// measurements are not comparable and this is the only shape that
-    /// is.
-    fn best_each(rounds: usize, iters: usize, a: &mut dyn FnMut(), b: &mut dyn FnMut()) -> (f64, f64) {
-        let mut best = (f64::MAX, f64::MAX);
-        let time = |f: &mut dyn FnMut()| {
-            let at = Instant::now();
-            for _ in 0..iters {
-                f();
-            }
-            at.elapsed().as_secs_f64() * 1e6 / iters as f64
-        };
-        for _ in 0..rounds {
-            best.0 = best.0.min(time(a));
-            best.1 = best.1.min(time(b));
-        }
-        best
-    }
-
-    #[test]
-    #[ignore = "a measurement; run it explicitly"]
-    fn what_a_painted_frame_costs() {
-        // 25fps is `FALLBACK_FPS` and the slowest thing it will be
-        // asked to keep up with.
-        let budget = Duration::from_secs_f64(1.0 / FALLBACK_FPS).as_secs_f64() * 1e6;
-        // the build is the first thing to say: the debug numbers are
-        // 8-11x the release ones, and a debug number quoted as the
-        // cost is how a non-problem becomes a blocker.
-        println!(
-            "--- paint cost per frame, budget {budget:.0}us at {FALLBACK_FPS}fps, {} build",
-            if cfg!(debug_assertions) {
-                "DEBUG (not the shipping cost; re-run with --release)"
-            } else {
-                "release"
-            }
-        );
-        for (cols, rows) in [(160u16, 50u16), (320, 100), (480, 140)] {
-            let grid = Grid::new(cols, rows, CELL_ASPECT);
-            let img = noise(grid);
-            let area = Rect::new(0, 0, cols, rows);
-            let style = |tone| Style {
-                fit: Fit::Stretch,
-                tone,
-            };
-            let mut buf = Buffer::empty(area);
-            let mut on = || {
-                raster::with_scratch(|r| {
-                    r.render_with(&img, area, grid.cell_aspect, style(Tone::Mono), Sharpen::On, &mut buf);
-                });
-            };
-            let mut buf_off = Buffer::empty(area);
-            let mut off = || {
-                raster::with_scratch(|r| {
-                    r.render_with(
-                        &img,
-                        area,
-                        grid.cell_aspect,
-                        style(Tone::Mono),
-                        Sharpen::Off,
-                        &mut buf_off,
-                    );
-                });
-            };
-            let (sharp, flat) = best_each(5, 20, &mut on, &mut off);
-            let (w, h) = grid.pixels();
-            println!(
-                "  {cols:>3}x{rows:<3} ({w:>4}x{h:<4}px, {:>7} bytes)  sharpen on {sharp:>8.1}us ({:>5.1}% of budget)   off {flat:>8.1}us ({:>5.1}%)   {:.2}x",
-                grid.frame_len(),
-                sharp / budget * 100.0,
-                flat / budget * 100.0,
-                sharp / flat,
-            );
-        }
-    }
-}
-
 /// The host's half: owns at most one instance and applies `plan` to it,
 /// so the draw loop gets one call and no lifecycle branches.
 ///
@@ -547,104 +444,6 @@ impl Ascii {
     }
 }
 
-/// The instance holder, whose reachable half is the no-op paths and
-/// the latch: a spawn is rejected for a degenerate grid before any
-/// process starts, which is what makes the failure path testable at
-/// all without a live mpv.
-#[cfg(test)]
-mod ascii_tests {
-    use super::*;
-
-    /// Grids `spawn` refuses outright, so no child is ever started.
-    fn no_cells() -> Grid {
-        Grid::new(0, 0, 2.0)
-    }
-
-    fn never_asked() -> f64 {
-        panic!("fps was read without a spawn to spend it on");
-    }
-
-    /// The fps closure is the assertion here: an ordinary frame must
-    /// not pay an ipc round trip, so reading it at all is the bug.
-    #[test]
-    fn an_idle_frame_costs_nothing() {
-        let mut ascii = Ascii::default();
-        ascii
-            .update(false, Some(Path::new("/v/a.mkv")), no_cells(), 0.0, never_asked)
-            .expect("ascii off is not an error");
-        ascii
-            .update(true, None, no_cells(), 0.0, never_asked)
-            .expect("a music track is not an error");
-        assert_eq!(ascii.attempts(), 0);
-        assert!(!ascii.active());
-    }
-
-    /// One error per file, not one per frame. The latch is the whole
-    /// point: `plan` says `Start` again on the very next frame, since
-    /// nothing is running and a video is still playing.
-    #[test]
-    fn a_file_that_cannot_be_decoded_is_only_attempted_once() {
-        let mut ascii = Ascii::default();
-        let a = Path::new("/v/a.mkv");
-        ascii
-            .update(true, Some(a), no_cells(), 0.0, || 25.0)
-            .expect_err("a grid with no cells has no frame to decode");
-        assert_eq!(ascii.attempts(), 1);
-        for _ in 0..5 {
-            ascii
-                .update(true, Some(a), no_cells(), 0.0, never_asked)
-                .expect("the latch answers without retrying");
-        }
-        assert_eq!(ascii.attempts(), 1, "it kept respawning the same file");
-        assert!(!ascii.active());
-    }
-
-    /// The latch is against the file, so the next track still gets its
-    /// turn; one undecodable video must not disable ascii for the
-    /// session.
-    #[test]
-    fn a_new_file_is_attempted_even_after_one_was_refused() {
-        let mut ascii = Ascii::default();
-        ascii
-            .update(true, Some(Path::new("/v/a.mkv")), no_cells(), 0.0, || 25.0)
-            .expect_err("still a grid with no cells");
-        ascii
-            .update(true, Some(Path::new("/v/b.mkv")), no_cells(), 0.0, || 25.0)
-            .expect_err("b fails the same way, which is not the point");
-        assert_eq!(ascii.attempts(), 2);
-    }
-
-    /// Turning ascii off clears the latch, so a user who hits the key
-    /// twice gets a real second attempt rather than silence.
-    #[test]
-    fn turning_it_off_clears_the_latch() {
-        let mut ascii = Ascii::default();
-        let a = Path::new("/v/a.mkv");
-        ascii
-            .update(true, Some(a), no_cells(), 0.0, || 25.0)
-            .expect_err("grid with no cells");
-        ascii
-            .update(false, Some(a), no_cells(), 0.0, never_asked)
-            .expect("stopping is not an error");
-        ascii
-            .update(true, Some(a), no_cells(), 0.0, || 25.0)
-            .expect_err("and it tried again");
-        assert_eq!(ascii.attempts(), 2);
-    }
-
-    /// Nothing running paints nothing, and in particular does not
-    /// panic or touch a cell: the host asks `active` first, and a
-    /// paint that leaked would be painted over its own ui.
-    #[test]
-    fn painting_with_no_instance_leaves_the_buffer_alone() {
-        let ascii = Ascii::default();
-        let mut buf = crate::ui::testbuf::buffer(12, 4);
-        let before = crate::ui::testbuf::grid(&buf);
-        ascii.paint(Rect::new(0, 0, 12, 4), Tone::Mono, &mut buf);
-        assert_eq!(crate::ui::testbuf::grid(&buf), before);
-    }
-}
-
 /// A second, headless mpv decoding to a fifo, plus the read loop that
 /// paces it.
 ///
@@ -671,6 +470,11 @@ pub struct FrameSource {
     filled: usize,
     sched: Schedule,
     ended: bool,
+    /// Bumped every time `front` becomes a different picture, and never
+    /// reset: it is the memo key, so a value that came round again
+    /// would hand back the wrong frame. A seek resets `Schedule`, which
+    /// is why `served()` cannot be the key.
+    stamp: u64,
 }
 
 impl FrameSource {
@@ -708,6 +512,7 @@ impl FrameSource {
             filled: 0,
             sched: Schedule::new(start, fps),
             ended: false,
+            stamp: 0,
         };
         // `src` is live by here, so a failure below still runs `Drop`
         // and takes the dir and any half-made fifo with it.
@@ -838,6 +643,7 @@ impl FrameSource {
                         self.filled = 0;
                         std::mem::swap(&mut self.front, &mut self.back);
                         self.sched.count();
+                        self.stamp += 1;
                         return Ok(Pull::Frame);
                     }
                 }
@@ -907,6 +713,10 @@ impl FrameSource {
         }
         let at = self.sched.next_time();
         self.grid = grid;
+        // the blank below is a new picture. the memo key covers the
+        // area and the cell aspect too, so this is belt and braces
+        // rather than load-bearing, and it costs an increment.
+        self.stamp += 1;
         // the one allocating operation in the module, and it is
         // per-resize rather than per-frame.
         self.front = blank(grid);
@@ -922,14 +732,18 @@ impl FrameSource {
     /// An `area` that no longer matches the grid (mid-resize, before
     /// `resize` has respawned) scales the last frame to the new pane,
     /// which is the least-wrong interim picture.
-    pub fn paint(&self, area: Rect, tone: Tone, buf: &mut Buffer) {
+    pub fn paint(&self, area: Rect, tone: Tone, buf: &mut Buffer) -> bool {
         let style = Style {
             fit: Fit::Stretch,
             tone,
         };
-        raster::with_scratch(|r| {
-            r.render(&self.front, area, self.grid.cell_aspect, style, buf);
-        });
+        raster::with_memo(|m| {
+            // explicit rather than inherited: the memo is shared with
+            // album art, which sets this for its own pane, and the
+            // setting is part of the key either way.
+            m.set_sharpen(Sharpen::On);
+            m.render_frame(self.stamp, &self.front, area, self.grid.cell_aspect, style, buf)
+        })
     }
 
     /// Whether mpv has exited. Reaps it in passing, so a finished
@@ -1018,126 +832,6 @@ fn mkfifo(path: &Path) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
-    }
-}
-
-/// The frame source's lifecycle, which is four decisions and no io.
-#[cfg(test)]
-mod plan_tests {
-    use super::*;
-
-    fn grid(cols: u16, rows: u16) -> Grid {
-        Grid::new(cols, rows, 2.0)
-    }
-
-    fn path(p: &str) -> &Path {
-        Path::new(p)
-    }
-
-    /// An idle frame has to be `Keep`, not `Stop`: a host that got
-    /// `Stop` every frame with nothing running would do pointless work
-    /// forever, and `Stop` would stop meaning anything.
-    #[test]
-    fn nothing_wanted_and_nothing_running_is_no_work_at_all() {
-        let g = grid(80, 24);
-        assert_eq!(plan(false, None, g, Have::default()), Plan::Keep);
-        assert_eq!(
-            plan(false, Some(path("/v/a.mkv")), g, Have::default()),
-            Plan::Keep,
-            "ascii is off, so a video playing changes nothing"
-        );
-        assert_eq!(
-            plan(true, None, g, Have::default()),
-            Plan::Keep,
-            "ascii is on but a music track is playing"
-        );
-    }
-
-    /// Turning it off, or playing something that is not a video, stops
-    /// the instance rather than leaving a child decoding into a pipe
-    /// nobody reads.
-    #[test]
-    fn a_running_source_is_stopped_when_it_is_no_longer_wanted() {
-        let g = grid(80, 24);
-        let running = Have {
-            media: Some(path("/v/a.mkv")),
-            grid: Some(g),
-        };
-        assert_eq!(plan(false, Some(path("/v/a.mkv")), g, running), Plan::Stop);
-        assert_eq!(
-            plan(true, None, g, running),
-            Plan::Stop,
-            "a music track has no frames to pull"
-        );
-    }
-
-    /// A different file is a new instance, not a seek: encode mode has
-    /// no socket to seek over, which is why `restart` takes a time and
-    /// not a path.
-    #[test]
-    fn a_new_file_starts_a_new_instance() {
-        let g = grid(80, 24);
-        assert_eq!(
-            plan(true, Some(path("/v/a.mkv")), g, Have::default()),
-            Plan::Start { grid: g },
-            "nothing running yet"
-        );
-        assert_eq!(
-            plan(
-                true,
-                Some(path("/v/b.mkv")),
-                g,
-                Have {
-                    media: Some(path("/v/a.mkv")),
-                    grid: Some(g),
-                }
-            ),
-            Plan::Start { grid: g },
-            "the track changed, so the instance has to be replaced"
-        );
-    }
-
-    /// A pane resize keeps the instance and re-sizes it, because the
-    /// filter chain is what has to change and the decode does not.
-    #[test]
-    fn a_resized_pane_keeps_the_instance() {
-        let a = grid(80, 24);
-        let b = grid(120, 40);
-        let running = Have {
-            media: Some(path("/v/a.mkv")),
-            grid: Some(a),
-        };
-        assert_eq!(
-            plan(true, Some(path("/v/a.mkv")), b, running),
-            Plan::Resize { grid: b }
-        );
-        assert_eq!(
-            plan(true, Some(path("/v/a.mkv")), a, running),
-            Plan::Keep,
-            "the same pane and the same file is no work"
-        );
-    }
-
-    /// The cell aspect is part of the size, so a font change resizes.
-    /// Getting it wrong is a 2x vertical stretch, not a rounding
-    /// error, which is why `Grid` carries it at all.
-    #[test]
-    fn a_changed_cell_aspect_is_a_resize() {
-        let square = Grid::new(80, 24, 1.0);
-        let tall = Grid::new(80, 24, 2.0);
-        assert_ne!(square, tall);
-        assert_eq!(
-            plan(
-                true,
-                Some(path("/v/a.mkv")),
-                tall,
-                Have {
-                    media: Some(path("/v/a.mkv")),
-                    grid: Some(square),
-                }
-            ),
-            Plan::Resize { grid: tall }
-        );
     }
 }
 
@@ -2097,6 +1791,455 @@ mod tests {
                     "{label} restart {cols:>3}x{rows:<3} {best:>9.3?} best  {worst:>9.3?} worst"
                 );
             }
+        }
+    }
+}
+
+/// The frame source's lifecycle, which is four decisions and no io.
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn grid(cols: u16, rows: u16) -> Grid {
+        Grid::new(cols, rows, 2.0)
+    }
+
+    fn path(p: &str) -> &Path {
+        Path::new(p)
+    }
+
+    /// An idle frame has to be `Keep`, not `Stop`: a host that got
+    /// `Stop` every frame with nothing running would do pointless work
+    /// forever, and `Stop` would stop meaning anything.
+    #[test]
+    fn nothing_wanted_and_nothing_running_is_no_work_at_all() {
+        let g = grid(80, 24);
+        assert_eq!(plan(false, None, g, Have::default()), Plan::Keep);
+        assert_eq!(
+            plan(false, Some(path("/v/a.mkv")), g, Have::default()),
+            Plan::Keep,
+            "ascii is off, so a video playing changes nothing"
+        );
+        assert_eq!(
+            plan(true, None, g, Have::default()),
+            Plan::Keep,
+            "ascii is on but a music track is playing"
+        );
+    }
+
+    /// Turning it off, or playing something that is not a video, stops
+    /// the instance rather than leaving a child decoding into a pipe
+    /// nobody reads.
+    #[test]
+    fn a_running_source_is_stopped_when_it_is_no_longer_wanted() {
+        let g = grid(80, 24);
+        let running = Have {
+            media: Some(path("/v/a.mkv")),
+            grid: Some(g),
+        };
+        assert_eq!(plan(false, Some(path("/v/a.mkv")), g, running), Plan::Stop);
+        assert_eq!(
+            plan(true, None, g, running),
+            Plan::Stop,
+            "a music track has no frames to pull"
+        );
+    }
+
+    /// A different file is a new instance, not a seek: encode mode has
+    /// no socket to seek over, which is why `restart` takes a time and
+    /// not a path.
+    #[test]
+    fn a_new_file_starts_a_new_instance() {
+        let g = grid(80, 24);
+        assert_eq!(
+            plan(true, Some(path("/v/a.mkv")), g, Have::default()),
+            Plan::Start { grid: g },
+            "nothing running yet"
+        );
+        assert_eq!(
+            plan(
+                true,
+                Some(path("/v/b.mkv")),
+                g,
+                Have {
+                    media: Some(path("/v/a.mkv")),
+                    grid: Some(g),
+                }
+            ),
+            Plan::Start { grid: g },
+            "the track changed, so the instance has to be replaced"
+        );
+    }
+
+    /// A pane resize keeps the instance and re-sizes it, because the
+    /// filter chain is what has to change and the decode does not.
+    #[test]
+    fn a_resized_pane_keeps_the_instance() {
+        let a = grid(80, 24);
+        let b = grid(120, 40);
+        let running = Have {
+            media: Some(path("/v/a.mkv")),
+            grid: Some(a),
+        };
+        assert_eq!(
+            plan(true, Some(path("/v/a.mkv")), b, running),
+            Plan::Resize { grid: b }
+        );
+        assert_eq!(
+            plan(true, Some(path("/v/a.mkv")), a, running),
+            Plan::Keep,
+            "the same pane and the same file is no work"
+        );
+    }
+
+    /// The cell aspect is part of the size, so a font change resizes.
+    /// Getting it wrong is a 2x vertical stretch, not a rounding
+    /// error, which is why `Grid` carries it at all.
+    #[test]
+    fn a_changed_cell_aspect_is_a_resize() {
+        let square = Grid::new(80, 24, 1.0);
+        let tall = Grid::new(80, 24, 2.0);
+        assert_ne!(square, tall);
+        assert_eq!(
+            plan(
+                true,
+                Some(path("/v/a.mkv")),
+                tall,
+                Have {
+                    media: Some(path("/v/a.mkv")),
+                    grid: Some(square),
+                }
+            ),
+            Plan::Resize { grid: tall }
+        );
+    }
+}
+
+/// Why a repeat paint is cheap, which is the half of the frame budget
+/// that is wim's own code: the sample is cached under the frame's
+/// stamp, so a ui that redraws faster than the video decodes pays for
+/// the paint and not the sampling.
+#[cfg(test)]
+mod repaint_tests {
+    use super::*;
+    use crate::ui::raster::Memo;
+
+    fn style() -> Style {
+        Style {
+            fit: Fit::Stretch,
+            tone: Tone::Mono,
+        }
+    }
+
+    /// The hazard the frame key exists to remove: that memo slot is
+    /// shared with album art, and a cover whose key spells the same
+    /// thing as a frame number would be handed the video's grid.
+    /// Separate variants make that unrepresentable, so this is a test
+    /// that the two kinds of key cannot alias, not that one formats
+    /// differently.
+    #[test]
+    fn a_frame_and_a_cover_with_the_same_name_are_different_pictures() {
+        let grid = Grid::new(8, 4, 2.0);
+        let img = blank(grid);
+        let area = Rect::new(0, 0, 8, 4);
+        let mut memo = Memo::default();
+        let mut buf = Buffer::empty(area);
+
+        assert!(memo.render_frame(7, &img, area, grid.cell_aspect, style(), &mut buf));
+        assert!(
+            memo.render("7", &img, area, grid.cell_aspect, style(), &mut buf),
+            "a cover keyed \"7\" was served the grid sampled for frame 7"
+        );
+        assert!(
+            memo.render_frame(7, &img, area, grid.cell_aspect, style(), &mut buf),
+            "and frame 7 was then served the cover's"
+        );
+    }
+
+    /// The mechanism above is worth nothing if `paint` does not use it
+    /// and the stamp does not move. Both need a live mpv to reach, so
+    /// this reads the source, anchored in the two functions rather than
+    /// file-wide.
+    #[test]
+    fn the_paint_path_keys_the_memo_on_a_stamp_that_moves() {
+        let src = include_str!("framesource.rs");
+        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
+
+        // the signature, not just the name: `Ascii::paint` is also
+        // `pub fn paint(` and it delegates, so the name alone anchors
+        // on the wrong function.
+        let at = code
+            .find("pub fn paint(&self, area: Rect, tone: Tone, buf: &mut Buffer) -> bool {")
+            .expect("nothing paints a frame, or it stopped reporting whether it resampled");
+        let paint = &code[at..(at + 700).min(code.len())];
+        assert!(
+            paint.contains("raster::with_memo"),
+            "painting goes through the unkeyed scratch, so every ui frame resamples:\n{paint}"
+        );
+        // two tokens rather than the whole call: `cargo fmt` reflows
+        // that line, and a guard that a formatter can break is a
+        // guard that fails for the wrong reason.
+        assert!(
+            paint.contains("render_frame(") && paint.contains("self.stamp"),
+            "the memo is keyed on something other than the frame:\n{paint}"
+        );
+
+        let at = code
+            .find("std::mem::swap(&mut self.front, &mut self.back);")
+            .expect("frames are no longer double buffered");
+        let landed = &code[at..(at + 200).min(code.len())];
+        assert!(
+            landed.contains("self.stamp += 1;"),
+            "a new frame does not move the stamp, so it is painted from the old sample:\n{landed}"
+        );
+    }
+
+    /// The mechanism itself: one sample per distinct frame, however
+    /// many times it is painted. `Memo::render` returns whether it had
+    /// to resample, which is the only observable here.
+    #[test]
+    fn the_same_frame_is_sampled_once_and_painted_as_often_as_asked() {
+        let grid = Grid::new(8, 4, 2.0);
+        let img = blank(grid);
+        let area = Rect::new(0, 0, 8, 4);
+        let mut memo = Memo::default();
+        let mut buf = Buffer::empty(area);
+        let paint = |memo: &mut Memo, buf: &mut Buffer, stamp: u64| {
+            memo.render_frame(stamp, &img, area, grid.cell_aspect, style(), buf)
+        };
+
+        assert!(paint(&mut memo, &mut buf, 1), "the first paint has to sample");
+        for _ in 0..5 {
+            assert!(
+                !paint(&mut memo, &mut buf, 1),
+                "the same frame was resampled, so the ui rate drives the cost"
+            );
+        }
+        assert!(
+            paint(&mut memo, &mut buf, 2),
+            "a new frame was served from the old sample"
+        );
+    }
+}
+
+/// The instance holder, whose reachable half is the no-op paths and
+/// the latch: a spawn is rejected for a degenerate grid before any
+/// process starts, which is what makes the failure path testable at
+/// all without a live mpv.
+#[cfg(test)]
+mod ascii_tests {
+    use super::*;
+
+    /// Grids `spawn` refuses outright, so no child is ever started.
+    fn no_cells() -> Grid {
+        Grid::new(0, 0, 2.0)
+    }
+
+    fn never_asked() -> f64 {
+        panic!("fps was read without a spawn to spend it on");
+    }
+
+    /// The fps closure is the assertion here: an ordinary frame must
+    /// not pay an ipc round trip, so reading it at all is the bug.
+    #[test]
+    fn an_idle_frame_costs_nothing() {
+        let mut ascii = Ascii::default();
+        ascii
+            .update(false, Some(Path::new("/v/a.mkv")), no_cells(), 0.0, never_asked)
+            .expect("ascii off is not an error");
+        ascii
+            .update(true, None, no_cells(), 0.0, never_asked)
+            .expect("a music track is not an error");
+        assert_eq!(ascii.attempts(), 0);
+        assert!(!ascii.active());
+    }
+
+    /// One error per file, not one per frame. The latch is the whole
+    /// point: `plan` says `Start` again on the very next frame, since
+    /// nothing is running and a video is still playing.
+    #[test]
+    fn a_file_that_cannot_be_decoded_is_only_attempted_once() {
+        let mut ascii = Ascii::default();
+        let a = Path::new("/v/a.mkv");
+        ascii
+            .update(true, Some(a), no_cells(), 0.0, || 25.0)
+            .expect_err("a grid with no cells has no frame to decode");
+        assert_eq!(ascii.attempts(), 1);
+        for _ in 0..5 {
+            ascii
+                .update(true, Some(a), no_cells(), 0.0, never_asked)
+                .expect("the latch answers without retrying");
+        }
+        assert_eq!(ascii.attempts(), 1, "it kept respawning the same file");
+        assert!(!ascii.active());
+    }
+
+    /// The latch is against the file, so the next track still gets its
+    /// turn; one undecodable video must not disable ascii for the
+    /// session.
+    #[test]
+    fn a_new_file_is_attempted_even_after_one_was_refused() {
+        let mut ascii = Ascii::default();
+        ascii
+            .update(true, Some(Path::new("/v/a.mkv")), no_cells(), 0.0, || 25.0)
+            .expect_err("still a grid with no cells");
+        ascii
+            .update(true, Some(Path::new("/v/b.mkv")), no_cells(), 0.0, || 25.0)
+            .expect_err("b fails the same way, which is not the point");
+        assert_eq!(ascii.attempts(), 2);
+    }
+
+    /// Turning ascii off clears the latch, so a user who hits the key
+    /// twice gets a real second attempt rather than silence.
+    #[test]
+    fn turning_it_off_clears_the_latch() {
+        let mut ascii = Ascii::default();
+        let a = Path::new("/v/a.mkv");
+        ascii
+            .update(true, Some(a), no_cells(), 0.0, || 25.0)
+            .expect_err("grid with no cells");
+        ascii
+            .update(false, Some(a), no_cells(), 0.0, never_asked)
+            .expect("stopping is not an error");
+        ascii
+            .update(true, Some(a), no_cells(), 0.0, || 25.0)
+            .expect_err("and it tried again");
+        assert_eq!(ascii.attempts(), 2);
+    }
+
+    /// Nothing running paints nothing, and in particular does not
+    /// panic or touch a cell: the host asks `active` first, and a
+    /// paint that leaked would be painted over its own ui.
+    #[test]
+    fn painting_with_no_instance_leaves_the_buffer_alone() {
+        let ascii = Ascii::default();
+        let mut buf = crate::ui::testbuf::buffer(12, 4);
+        let before = crate::ui::testbuf::grid(&buf);
+        ascii.paint(Rect::new(0, 0, 12, 4), Tone::Mono, &mut buf);
+        assert_eq!(crate::ui::testbuf::grid(&buf), before);
+    }
+}
+
+/// What a frame costs to paint at grids ascii video is actually
+/// watchable at, which is the measurable half of the frame budget.
+///
+/// A measurement, not an assertion: the numbers move with the box and
+/// a ceiling here would be a flake. Run it with
+/// `cargo test --lib frame_budget -- --ignored --nocapture`.
+#[cfg(test)]
+mod frame_budget {
+    use super::*;
+    use crate::ui::raster::Sharpen;
+    use std::time::{Duration, Instant};
+
+    /// Deterministic noise, because a flat frame is the one case the
+    /// quantizer is fast on and video frames are not flat.
+    fn noise(grid: Grid) -> DynamicImage {
+        let (w, h) = grid.pixels();
+        let mut img = RgbImage::new(w, h);
+        let mut x: u32 = 0x1234_5678;
+        for px in img.pixels_mut() {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let b = (x >> 16) as u8;
+            px.0 = [b, b.rotate_left(3), b.wrapping_add(71)];
+        }
+        DynamicImage::ImageRgb8(img)
+    }
+
+    /// Alternating batches in one process, best of each. Sequential
+    /// runs on this box differ 1.6-1.8x under load, so two separate
+    /// measurements are not comparable and this is the only shape that
+    /// is.
+    fn best_each(rounds: usize, iters: usize, a: &mut dyn FnMut(), b: &mut dyn FnMut()) -> (f64, f64) {
+        let mut best = (f64::MAX, f64::MAX);
+        let time = |f: &mut dyn FnMut()| {
+            let at = Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            at.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+        for _ in 0..rounds {
+            best.0 = best.0.min(time(a));
+            best.1 = best.1.min(time(b));
+        }
+        best
+    }
+
+    #[test]
+    #[ignore = "a measurement; run it explicitly"]
+    fn what_a_painted_frame_costs() {
+        // 25fps is `FALLBACK_FPS` and the slowest thing it will be
+        // asked to keep up with.
+        let budget = Duration::from_secs_f64(1.0 / FALLBACK_FPS).as_secs_f64() * 1e6;
+        // the build is the first thing to say: the debug numbers are
+        // 8-11x the release ones, and a debug number quoted as the
+        // cost is how a non-problem becomes a blocker.
+        println!(
+            "--- paint cost per frame, budget {budget:.0}us at {FALLBACK_FPS}fps, {} build",
+            if cfg!(debug_assertions) {
+                "DEBUG (not the shipping cost; re-run with --release)"
+            } else {
+                "release"
+            }
+        );
+        for (cols, rows) in [(160u16, 50u16), (320, 100), (480, 140)] {
+            let grid = Grid::new(cols, rows, CELL_ASPECT);
+            let img = noise(grid);
+            let area = Rect::new(0, 0, cols, rows);
+            let style = |tone| Style {
+                fit: Fit::Stretch,
+                tone,
+            };
+            let mut buf = Buffer::empty(area);
+            let mut on = || {
+                raster::with_scratch(|r| {
+                    r.render_with(&img, area, grid.cell_aspect, style(Tone::Mono), Sharpen::On, &mut buf);
+                });
+            };
+            let mut buf_off = Buffer::empty(area);
+            let mut off = || {
+                raster::with_scratch(|r| {
+                    r.render_with(
+                        &img,
+                        area,
+                        grid.cell_aspect,
+                        style(Tone::Mono),
+                        Sharpen::Off,
+                        &mut buf_off,
+                    );
+                });
+            };
+            let (sharp, flat) = best_each(5, 20, &mut on, &mut off);
+            // the repeat paint: what a ui redraw between two video
+            // frames costs, which is the common case at any display
+            // rate above the video's.
+            let mut memo = crate::ui::raster::Memo::default();
+            let mut buf_memo = Buffer::empty(area);
+            let mut stamp = 0u64;
+            let mut fresh = || {
+                stamp += 1;
+                memo.render_frame(stamp, &img, area, grid.cell_aspect, style(Tone::Mono), &mut buf_memo);
+            };
+            let mut memo_same = crate::ui::raster::Memo::default();
+            let mut buf_same = Buffer::empty(area);
+            let mut repeat = || {
+                memo_same.render_frame(1, &img, area, grid.cell_aspect, style(Tone::Mono), &mut buf_same);
+            };
+            let (new_frame, repaint) = best_each(5, 20, &mut fresh, &mut repeat);
+            let (w, h) = grid.pixels();
+            println!(
+                "  {cols:>3}x{rows:<3} ({w:>4}x{h:<4}px, {:>7} bytes)  sharpen on {sharp:>8.1}us ({:>5.1}% of budget)   off {flat:>8.1}us ({:>5.1}%)   {:.2}x",
+                grid.frame_len(),
+                sharp / budget * 100.0,
+                flat / budget * 100.0,
+                sharp / flat,
+            );
+            println!(
+                "            memo: new frame {new_frame:>8.1}us   repeat paint {repaint:>8.1}us ({:>5.1}% of budget)   {:.1}x cheaper",
+                repaint / budget * 100.0,
+                new_frame / repaint,
+            );
         }
     }
 }

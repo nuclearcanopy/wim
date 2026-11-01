@@ -648,28 +648,63 @@ and `in-workspace (sub-rect) video` is still kitty-only via
       `framesource::frame_budget` (ignored by default, it is a
       measurement and a ceiling here would flake) at release opt:
 
-      | grid | pixels | sharpen on | off | ratio |
+      | grid | pixels | new frame | repeat paint | sharpen off |
       | --- | --- | --- | --- | --- |
-      | 160x50 | 320x100 | 896us (2.2%) | 390us (1.0%) | 2.30x |
-      | 320x100 | 640x200 | 3540us (8.8%) | 1524us (3.8%) | 2.32x |
-      | 480x140 | 960x280 | 7555us (18.9%) | 3357us (8.4%) | 2.25x |
+      | 160x50 | 320x100 | 414us (1.0%) | 134us (0.3%) | 221us |
+      | 320x100 | 640x200 | 1683us (4.2%) | 551us (1.4%) | 892us |
+      | 480x140 | 960x280 | 3591us (9.0%) | 1179us (2.9%) | 1910us |
 
-      percentages are of a 40ms frame at `FALLBACK_FPS`. so at the grid
-      ascii is watchable at, painting costs 9% of the budget and the
-      held unsharp flip is worth 2.3x (2ms/frame) at that size, which
-      is the number that decision was missing.
+      percentages are of a 40ms frame at `FALLBACK_FPS`. **only the
+      ratios are stable**: the absolute numbers moved 2.1x between two
+      runs of the same code hours apart (a loaded box vs an idle one),
+      which is exactly why the harness alternates batches in one
+      process instead of comparing runs. the ratios held to within
+      0.05x across both.
+      so a repeat paint is **3.0x cheaper** than a new frame, and the
+      held unsharp flip is worth **1.9x** on a new frame.
       the same test in a debug build says 40.9ms at 320x100, i.e. 102%
       of budget: an 11.5x build artefact, and quoting it would have
       turned a non-problem into a blocker. the test prints which build
       it ran in for that reason.
-      three of the four hazards this item named are already absent:
-      mpv downscales once in `--vf` so nothing decodes at full
+      all four hazards this item named are now absent. three never
+      applied: mpv downscales once in `--vf` so nothing decodes at full
       resolution for wim, `raster` walks contiguously, and the frame
-      buffers are per-resize not per-frame. what is left is the fourth
-      (ratatui diffs the buffer, so unchanged cells are already not
-      repainted, but every cell is *sampled*) plus the real remaining
-      work: decouple the ascii frame rate from the display refresh and
-      make it tunable, degrading smoothness and never blocking input.
+      buffers are per-resize not per-frame. the fourth was real and is
+      fixed: every ui redraw resampled the frame, because `paint` used
+      the unkeyed scratch `Raster` whose doc said it was "for a source
+      that changes every frame anyway". that was true of the design
+      this came from and false of this one, where the video decodes at
+      25fps and the ui redraws on its own schedule.
+      so `FrameSource` carries a monotonic `stamp`, bumped where a
+      frame lands in `front`, and `paint` keys `raster::Memo` on it:
+      one sample per distinct frame, however often it is painted. the
+      stamp cannot be `Schedule::served()`, which a seek resets, and
+      cannot be a bare number, because that memo slot is shared with
+      album art and a collision there paints a cover in place of the
+      video; the key is `f#<stamp>`.
+      the first version keyed the memo on a formatted `f#<stamp>`
+      string, and `tests/framesource_alloc.rs` caught it: `Memo` does
+      `key.to_string()` on a miss, which is 25 allocations a second in
+      a steady frame rate, and that test exists to forbid exactly that.
+      so the memo key is a type now, `Keyed::{Name, Frame}` with a
+      borrowed `KeyRef` for the lookup: `Memo::render_frame(stamp, ..)`
+      never allocates, and a cover named `"7"` colliding with frame 7
+      is unrepresentable rather than merely unlikely. that is a
+      stronger guarantee than the prefix was, and the test says so.
+      six mutations caught: a key that ignores the stamp, a landed
+      frame that does not move it, a paint that goes back to the
+      scratch, a `same_as` that lets the two key kinds alias, a frame
+      key that allocates after all, and (before the refactor) a prefix
+      that no longer tells a frame from an art key. the source guard
+      needed two tries: `pub fn paint(` matched `Ascii::paint` first,
+      so it anchors on the full signature.
+      moving the new test modules to the end of the file was part of
+      this: they had been sitting above `FrameSource`, so the
+      truncate-at-first-`#[cfg(test)]` rule every source guard here
+      uses was cutting off the code it meant to search.
+      what is left is the tunable rate: decouple the ascii frame rate
+      from the display refresh with a config knob, degrading smoothness
+      and never blocking input.
       the original note follows.
 - [ ] a few hundred cells across times a few hundred
       down, at video frame rate, is the real cost. the work is CPU
