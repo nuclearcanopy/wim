@@ -1061,6 +1061,20 @@ impl Roll {
     }
 }
 
+/// One distinct genre, normalised: its rollup, the spelling it first
+/// arrived under (what the reason text shows), and the artist slots in
+/// it. A slot per genre rather than three maps keyed by the same
+/// string: the rollup loop runs once per genre per track over the
+/// whole library, and the three keyed maps cost three hashes of that
+/// key apiece.
+#[derive(Debug, Clone, Default)]
+struct GenreRoll {
+    key: String,
+    name: String,
+    roll: Roll,
+    artists: Vec<usize>,
+}
+
 /// Everything the generators read: the catalog plus its affinity
 /// rollups, computed once per `suggest` call.
 struct Model<'a> {
@@ -1071,10 +1085,64 @@ struct Model<'a> {
     tracks: Vec<TrackAffinity>,
     albums: Vec<Roll>,
     artists: Vec<Roll>,
-    genres: HashMap<String, Roll>,
-    genre_names: HashMap<String, String>,
-    genre_artists: HashMap<String, Vec<usize>>,
+    genres: Vec<GenreRoll>,
     total_plays: u32,
+}
+
+/// One `GenreRoll` per distinct normalised genre, in first-seen
+/// order. Hoisted out of `Model::build` because it is the half of the
+/// build that walks every track's genre list, so it is the half worth
+/// measuring on its own.
+fn genre_rolls(catalog: &Catalog, tracks: &[TrackAffinity]) -> Vec<GenreRoll> {
+    // this runs once per genre per track over the whole library,
+    // so the normalised key is built into one reused buffer, hashed
+    // once to reach a slot, and skipped outright while the raw
+    // spelling repeats: a whole album's tracks carry the same
+    // genre string, so most tracks never lowercase or hash at all.
+    let mut genres: Vec<GenreRoll> = Vec::new();
+    let mut slots: HashMap<String, usize> = HashMap::new();
+    let mut key = String::new();
+    let mut last: Option<(&str, usize)> = None;
+    for (index, track) in catalog.tracks.iter().enumerate() {
+        for genre in &track.genres {
+            let slot = match last {
+                Some((spelling, slot)) if spelling == genre.as_str() => slot,
+                _ => {
+                    key.clear();
+                    norm_into(genre, &mut key);
+                    if key.is_empty() {
+                        continue;
+                    }
+                    let slot = match slots.get(&key) {
+                        Some(&slot) => slot,
+                        None => {
+                            let slot = genres.len();
+                            genres.push(GenreRoll {
+                                key: key.clone(),
+                                name: genre.clone(),
+                                roll: Roll::default(),
+                                artists: Vec::new(),
+                            });
+                            slots.insert(key.clone(), slot);
+                            slot
+                        }
+                    };
+                    last = Some((genre.as_str(), slot));
+                    slot
+                }
+            };
+            let entry = &mut genres[slot];
+            entry.roll.add(&tracks[index]);
+            if let Some(artist) = catalog.track_artist[index] {
+                // consecutive tracks of one album share an artist,
+                // so the last one pushed answers before the scan.
+                if entry.artists.last() != Some(&artist) && !entry.artists.contains(&artist) {
+                    entry.artists.push(artist);
+                }
+            }
+        }
+    }
+    genres
 }
 
 impl<'a> Model<'a> {
@@ -1129,41 +1197,7 @@ impl<'a> Model<'a> {
             }
         }
 
-        // this runs once per genre per track over the whole library, so
-        // the key is normalised into one reused buffer and only cloned
-        // when a genre is seen for the first time; three
-        // `entry(key.clone())` calls was three fresh keys a track.
-        let mut genres: HashMap<String, Roll> = HashMap::new();
-        let mut genre_names: HashMap<String, String> = HashMap::new();
-        let mut genre_artists: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut key = String::new();
-        for (index, track) in catalog.tracks.iter().enumerate() {
-            for genre in &track.genres {
-                key.clear();
-                norm_into(genre, &mut key);
-                if key.is_empty() {
-                    continue;
-                }
-                match genres.get_mut(&key) {
-                    Some(roll) => roll.add(&tracks[index]),
-                    None => {
-                        // the two maps are only ever written together,
-                        // so one missing means both do.
-                        genres.entry(key.clone()).or_default().add(&tracks[index]);
-                        genre_names.insert(key.clone(), genre.clone());
-                    }
-                }
-                if let Some(artist) = catalog.track_artist[index] {
-                    if !genre_artists.contains_key(&key) {
-                        genre_artists.insert(key.clone(), Vec::new());
-                    }
-                    let owned = genre_artists.get_mut(&key).expect("just inserted");
-                    if !owned.contains(&artist) {
-                        owned.push(artist);
-                    }
-                }
-            }
-        }
+        let genres = genre_rolls(catalog, &tracks);
 
         Model {
             catalog,
@@ -1174,10 +1208,16 @@ impl<'a> Model<'a> {
             albums,
             artists,
             genres,
-            genre_names,
-            genre_artists,
             total_plays,
         }
+    }
+
+    /// The rollup for one normalised genre key. Linear, which is what
+    /// a slot layout costs an ad-hoc lookup; nothing in a pass asks
+    /// this, only the tests that assert a rollup landed.
+    #[cfg(test)]
+    fn genre(&self, key: &str) -> Option<&GenreRoll> {
+        self.genres.iter().find(|g| g.key == key)
     }
 
     fn artist_score(&self, slot: Option<usize>) -> f32 {
@@ -1777,18 +1817,20 @@ fn album_neighbours(model: &Model<'_>) -> Vec<Candidate> {
 /// The "least-played metal artist" case.
 fn genre_under_explored(model: &Model<'_>) -> Vec<Candidate> {
     let mut out = Vec::new();
-    let mut keys: Vec<&String> = model.genres.keys().collect();
-    keys.sort(); // deterministic: hashmap iteration order is not
-    for key in keys {
-        let roll = &model.genres[key];
+    // by key, not by slot: the slots are in first-seen order, which
+    // is ingest order, and the menu must not depend on that.
+    let mut order: Vec<usize> = (0..model.genres.len()).collect();
+    order.sort_by(|&a, &b| model.genres[a].key.cmp(&model.genres[b].key));
+    for genre in order.into_iter().map(|slot| &model.genres[slot]) {
+        let roll = &genre.roll;
         if roll.score < model.tuning.min_genre_affinity {
             continue;
         }
-        let Some(artists) = model.genre_artists.get(key) else {
-            continue;
-        };
+        let artists = &genre.artists;
         if artists.len() < 2 {
-            // one artist is not a genre you can under-explore.
+            // one artist is not a genre you can under-explore. an
+            // empty list is a genre no track resolved an artist for,
+            // which is the same non-answer.
             continue;
         }
         let top = artists
@@ -1817,13 +1859,9 @@ fn genre_under_explored(model: &Model<'_>) -> Vec<Candidate> {
         }
         let artist = &model.catalog.artists[slot];
         let item = artist.item.as_ref().expect("filtered on item above");
-        let genre = model
-            .genre_names
-            .get(key)
-            .map_or(key.as_str(), String::as_str);
         let text = format!(
-            "{genre} is one of your most played ({} plays across {} days); {} is the one you play least ({} plays)",
-            roll.plays, roll.days, artist.name, model.artists[slot].plays
+            "{} is one of your most played ({} plays across {} days); {} is the one you play least ({} plays)",
+            genre.name, roll.plays, roll.days, artist.name, model.artists[slot].plays
         );
         out.push(
             Candidate::new(
@@ -1832,7 +1870,7 @@ fn genre_under_explored(model: &Model<'_>) -> Vec<Candidate> {
                 roll.score * (1.0 - least_score / top),
                 text,
             )
-            .attributes(artist.key.clone(), None, Some(key.clone())),
+            .attributes(artist.key.clone(), None, Some(genre.key.clone())),
         );
     }
     out
@@ -2501,7 +2539,10 @@ mod tests {
         assert_eq!(model.albums[eversince].played_tracks, 2);
         assert_eq!(model.albums[eversince].known_tracks, 5);
         assert!((model.albums[eversince].coverage(5) - 0.4).abs() < 0.001);
-        assert_eq!(model.genres["cloud rap"].played_tracks, 2);
+        let genre = model.genre("cloud rap").expect("the genre rolled up");
+        assert_eq!(genre.roll.played_tracks, 2);
+        assert_eq!(genre.name, "Cloud Rap", "the spelling it arrived under");
+        assert_eq!(genre.artists, vec![artist]);
     }
 
     // ---------------- generators fire ----------------
@@ -4197,6 +4238,98 @@ mod cost {
         out.into_vec()
     }
 
+    /// The genre rollup as it was before genres became slots: three
+    /// maps keyed by the same normalised string, so three hashes of it
+    /// per track, and no shortcut for a repeated spelling.
+    #[allow(clippy::type_complexity)]
+    fn genre_maps(
+        catalog: &Catalog,
+        tracks: &[TrackAffinity],
+    ) -> (
+        HashMap<String, Roll>,
+        HashMap<String, String>,
+        HashMap<String, Vec<usize>>,
+    ) {
+        let mut genres: HashMap<String, Roll> = HashMap::new();
+        let mut genre_names: HashMap<String, String> = HashMap::new();
+        let mut genre_artists: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut key = String::new();
+        for (index, track) in catalog.tracks.iter().enumerate() {
+            for genre in &track.genres {
+                key.clear();
+                norm_into(genre, &mut key);
+                if key.is_empty() {
+                    continue;
+                }
+                match genres.get_mut(&key) {
+                    Some(roll) => roll.add(&tracks[index]),
+                    None => {
+                        genres.entry(key.clone()).or_default().add(&tracks[index]);
+                        genre_names.insert(key.clone(), genre.clone());
+                    }
+                }
+                if let Some(artist) = catalog.track_artist[index] {
+                    if !genre_artists.contains_key(&key) {
+                        genre_artists.insert(key.clone(), Vec::new());
+                    }
+                    let owned = genre_artists.get_mut(&key).expect("just inserted");
+                    if !owned.contains(&artist) {
+                        owned.push(artist);
+                    }
+                }
+            }
+        }
+        (genres, genre_names, genre_artists)
+    }
+
+    fn roll_shape(roll: &Roll) -> String {
+        format!(
+            "{:08x} {:08x} {} {} {} {}",
+            roll.score.to_bits(),
+            roll.raw.to_bits(),
+            roll.plays,
+            roll.days,
+            roll.played_tracks,
+            roll.known_tracks
+        )
+    }
+
+    /// Every genre slot has to carry what the three maps held for that
+    /// key: the same rollup to the bit, the same first-seen spelling,
+    /// and the same artist list in the same order. The artists are
+    /// scanned for a minimum with a key tiebreak, so their order is
+    /// not supposed to matter; asserting it anyway is what catches the
+    /// `last()` shortcut dropping one.
+    #[test]
+    fn genre_slots_hold_what_the_three_keyed_maps_held() {
+        let fixture = Fixture::new(300, 12);
+        let req = fixture.request();
+        let model = Model::build(&req);
+        let (rolls, names, artists) = genre_maps(&fixture.catalog, &model.tracks);
+        assert!(
+            model.genres.len() >= 8 && rolls.len() == model.genres.len(),
+            "{} slots against {} keys",
+            model.genres.len(),
+            rolls.len()
+        );
+        let empty = Vec::new();
+        for genre in &model.genres {
+            assert_eq!(
+                roll_shape(&genre.roll),
+                roll_shape(&rolls[&genre.key]),
+                "rollup for {}",
+                genre.key
+            );
+            assert_eq!(genre.name, names[&genre.key], "spelling for {}", genre.key);
+            assert_eq!(
+                &genre.artists,
+                artists.get(&genre.key).unwrap_or(&empty),
+                "artists in {}",
+                genre.key
+            );
+        }
+    }
+
     /// The neighbour pool is picked by score with ties going to the
     /// later position, which a map and a vec only agree on if both are
     /// walked the same way; this is over a few thousand tracks, where
@@ -4281,5 +4414,27 @@ mod cost {
             },
         );
         println!("  vec {fast:.1}us  hashmap {hashed:.1}us  {:.2}x", hashed / fast);
+    }
+
+    /// Genre slots against the three keyed maps they replaced,
+    /// alternating in one process.
+    #[test]
+    #[ignore = "a measurement; run it explicitly"]
+    fn what_the_genre_rollup_costs() {
+        let fixture = Fixture::new(2_200, 14);
+        let req = fixture.request();
+        let model = Model::build(&req);
+        println!("--- genre rollup, {}", fixture.describe());
+        let (slots, maps) = best_each(
+            5,
+            10,
+            &mut || {
+                let _ = genre_rolls(&fixture.catalog, &model.tracks);
+            },
+            &mut || {
+                let _ = genre_maps(&fixture.catalog, &model.tracks);
+            },
+        );
+        println!("  slots {slots:.1}us  maps {maps:.1}us  {:.2}x", maps / slots);
     }
 }
