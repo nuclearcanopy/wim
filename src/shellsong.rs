@@ -3936,6 +3936,7 @@ impl Console {
     pub fn paste(&mut self, text: &str, cand: &dyn Candidates) {
         let text: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
         self.cycle = None;
+        self.error = None;
         self.input.insert_str(self.cursor, &text);
         self.cursor += text.len();
         self.refresh(cand);
@@ -4009,6 +4010,9 @@ impl Console {
         };
         self.recall = Some(next);
         self.input = self.history[next].clone();
+        // the line the error was reported for is gone, so the error
+        // goes with it; same reasoning as `Delete`'s.
+        self.error = None;
         self.cursor = self.input.len();
     }
 
@@ -4021,6 +4025,7 @@ impl Console {
             self.recall = None;
             self.input = std::mem::take(&mut self.draft);
         }
+        self.error = None;
         self.cursor = self.input.len();
     }
 
@@ -7433,6 +7438,40 @@ mod tests {
         press(&mut c, &fake, KeyCode::Up);
         assert_eq!(c.input, "queue(gods)");
         assert!(c.cycle().is_none(), "the recalled line is a new token");
+    }
+
+    /// An error belongs to the line it was reported for, so anything
+    /// that replaces the line retires it. `Delete` was fixed for this
+    /// once; recall and paste replace *the whole line* and did not.
+    #[test]
+    fn replacing_the_line_retires_the_error_it_reported() {
+        let fake = Fake::new(&[]);
+        let mut c = Console::empty();
+        c.history = vec!["pause()".into()];
+        type_in(&mut c, &fake, "shufle()");
+        press(&mut c, &fake, KeyCode::Enter);
+        assert!(c.error.is_some(), "the bad line should have reported");
+        press(&mut c, &fake, KeyCode::Up);
+        assert_eq!(c.input, "pause()");
+        assert!(c.error.is_none(), "the error accused a line that is gone");
+        // down restores the parked draft, which is just as much a
+        // different line than the one that failed.
+        let mut c = Console::empty();
+        c.history = vec!["mute()".into()];
+        press(&mut c, &fake, KeyCode::Up);
+        type_in(&mut c, &fake, "x");
+        press(&mut c, &fake, KeyCode::Enter);
+        assert!(c.error.is_some(), "mute()x should not parse");
+        press(&mut c, &fake, KeyCode::Down);
+        assert_eq!(c.input, "", "the empty draft comes back");
+        assert!(c.error.is_none());
+
+        // and so does a paste, for the same reason.
+        let mut c = console_with(&fake, "shufle()");
+        press(&mut c, &fake, KeyCode::Enter);
+        assert!(c.error.is_some());
+        c.paste("x", &fake);
+        assert!(c.error.is_none());
     }
 
     #[test]
