@@ -48,63 +48,92 @@ pub fn spawn_background_sync(
     servers_rx: mpsc::Receiver<Vec<config::NavidromeConfig>>,
 ) {
     thread::spawn(move || {
-        let mut servers = initial_servers;
-        let mut first_pass = true;
-        // kept across passes: `Client::new` re-reads `password_file`
-        // off disk and starts with a cold connection pool, and this
-        // loop runs every 45 seconds for the life of the app, so
-        // rebuilding per pass is pure waste. the sync thread cannot see
-        // the corpus's clients (different thread), so it keeps its own.
-        let mut clients: Vec<Arc<subsonic::Client>> = Vec::new();
-        loop {
-            retain_live_clients(&mut clients, &servers);
-            // independent per-server requests, so run them
-            // concurrently rather than making every server wait for
-            // the one before it.
-            let results: Vec<BackgroundSyncResult> = thread::scope(|scope| {
-                servers
-                    .iter()
-                    .map(|nav| {
-                        (
-                            nav.url.clone(),
-                            scope.spawn(|| fetch_navidrome_everything(nav, &clients)),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .map(|(url, handle)| BackgroundSyncResult {
-                        url,
-                        result: handle
-                            .join()
-                            .unwrap_or_else(|_| Err("panicked while syncing".to_string())),
-                    })
-                    .collect()
-            });
-            // take delivery of any client this pass had to build, so
-            // the next one reuses it.
-            for r in &results {
-                if let Ok((catalog, _)) = &r.result {
-                    if !clients.iter().any(|c| Arc::ptr_eq(c, &catalog.client)) {
-                        clients.push(catalog.client.clone());
-                    }
+        sync_loop(
+            initial_servers,
+            &result_tx,
+            &servers_rx,
+            fetch_navidrome_everything,
+        )
+    });
+}
+
+/// The loop itself, with the fetch injected: a pass takes as long as
+/// the network does, and what happens to its answers when the server
+/// list changes underneath it needs no server to test.
+fn sync_loop(
+    initial_servers: Vec<config::NavidromeConfig>,
+    result_tx: &mpsc::Sender<BackgroundSyncResult>,
+    servers_rx: &mpsc::Receiver<Vec<config::NavidromeConfig>>,
+    fetch: impl Fn(&config::NavidromeConfig, &[Arc<subsonic::Client>]) -> NavidromeEverything + Sync,
+) {
+    let mut servers = initial_servers;
+    let mut first_pass = true;
+    // kept across passes: `Client::new` re-reads `password_file`
+    // off disk and starts with a cold connection pool, and this
+    // loop runs every 45 seconds for the life of the app, so
+    // rebuilding per pass is pure waste. the sync thread cannot see
+    // the corpus's clients (different thread), so it keeps its own.
+    let mut clients: Vec<Arc<subsonic::Client>> = Vec::new();
+    loop {
+        retain_live_clients(&mut clients, &servers);
+        // independent per-server requests, so run them
+        // concurrently rather than making every server wait for
+        // the one before it.
+        let results: Vec<BackgroundSyncResult> = thread::scope(|scope| {
+            servers
+                .iter()
+                .map(|nav| (nav.url.clone(), scope.spawn(|| fetch(nav, &clients))))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|(url, handle)| BackgroundSyncResult {
+                    url,
+                    result: handle
+                        .join()
+                        .unwrap_or_else(|_| Err("panicked while syncing".to_string())),
+                })
+                .collect()
+        });
+        // take delivery of any client this pass had to build, so
+        // the next one reuses it.
+        for r in &results {
+            if let Ok((catalog, _)) = &r.result {
+                if !clients.iter().any(|c| Arc::ptr_eq(c, &catalog.client)) {
+                    clients.push(catalog.client.clone());
                 }
-            }
-            if first_pass && !servers.is_empty() {
-                trace::mark("navidrome: first sync landed");
-                first_pass = false;
-            }
-            for result in results {
-                if result_tx.send(result).is_err() {
-                    return; // main thread is gone (shutting down)
-                }
-            }
-            match servers_rx.recv_timeout(AUTO_SYNC_INTERVAL) {
-                Ok(updated) => servers = updated,
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
             }
         }
-    });
+        if first_pass && !servers.is_empty() {
+            trace::mark("navidrome: first sync landed");
+            first_pass = false;
+        }
+        // the list is read *before* the answers go out, because a pass
+        // lasts as long as the network does and a profile deleted
+        // during one must not have its answer merged; see
+        // `stale_sync_reply_tests`.
+        let mut outran = false;
+        while let Ok(updated) = servers_rx.try_recv() {
+            servers = updated;
+            outran = true;
+        }
+        for result in results {
+            // by url, which is what identifies a reply on this channel
+            // (main.rs keys its offline/online map off it).
+            if !servers.iter().any(|nav| nav.url == result.url) {
+                continue;
+            }
+            if result_tx.send(result).is_err() {
+                return; // main thread is gone (shutting down)
+            }
+        }
+        if outran {
+            continue; // a changed list syncs at once, not in 45s
+        }
+        match servers_rx.recv_timeout(AUTO_SYNC_INTERVAL) {
+            Ok(updated) => servers = updated,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
 }
 
 /// Changes the configured server list **and** tells the sync thread,
@@ -524,6 +553,152 @@ mod server_list_tests {
         assert!(
             rx.try_recv().expect("something is pushed").is_empty(),
             "the last profile was removed, so the thread has nothing to poll"
+        );
+    }
+}
+
+/// What the sync thread does with an answer the server list outran.
+///
+/// A pass is in flight for as long as the network takes (a whole
+/// catalog fetch, or a connect timeout against a server that is
+/// down), so deleting a profile while one is running is ordinary.
+/// `BackgroundSyncResult` is tagged with the url precisely so whose
+/// answer it is can be told, and the tag went unconsulted: main.rs
+/// keys its offline/online map off it but never asks whether that
+/// server is still configured. Its own module rather than inside
+/// `server_list_tests`, which is about the main thread's half of the
+/// same seam (the edit reaching the thread at all).
+#[cfg(test)]
+mod stale_sync_reply_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    fn nav(url: &str) -> config::NavidromeConfig {
+        config::NavidromeConfig {
+            url: url.into(),
+            username: "ana".into(),
+            password: Some("pw".into()),
+            password_file: None,
+            max_bitrate_kbps: None,
+            transcode_format: None,
+        }
+    }
+
+    /// Deleting a profile mid-pass used to deliver its answer anyway,
+    /// which is `merge_catalog_into_app` re-adding its whole library
+    /// to the corpus (and holding its client, so the superseded
+    /// password is never zeroized), `remote_starred` re-extended from
+    /// it, and an offline/online toast for a profile that is gone.
+    #[test]
+    fn a_profile_deleted_mid_pass_has_its_answer_dropped() {
+        let (result_tx, result_rx) = mpsc::channel();
+        let (servers_tx, servers_rx) = mpsc::channel();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicBool::new(false));
+        let (fetch_entered, fetch_released) = (entered.clone(), released.clone());
+
+        thread::spawn(move || {
+            sync_loop(
+                vec![nav("https://a.invalid"), nav("https://b.invalid")],
+                &result_tx,
+                &servers_rx,
+                // held open so the delete lands while the pass is in
+                // flight. an error rather than a catalog because only
+                // this half can be built without a server; both halves
+                // reach the user, one as a merge and one as a toast.
+                move |nav, _live| {
+                    fetch_entered.fetch_add(1, Ordering::SeqCst);
+                    while !fetch_released.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(format!("{} is unreachable", nav.url))
+                },
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while entered.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            2,
+            "both servers' fetches have to be in flight for this to be the race"
+        );
+        servers_tx.send(vec![nav("https://a.invalid")]).unwrap();
+        released.store(true, Ordering::SeqCst);
+
+        let mut answered = Vec::new();
+        while let Ok(result) = result_rx.recv_timeout(Duration::from_millis(500)) {
+            answered.push(result.url);
+            if answered.len() > 4 {
+                break;
+            }
+        }
+        assert!(
+            answered.contains(&"https://a.invalid".to_string()),
+            "the profile that is still configured is still answered for: {answered:?}"
+        );
+        assert!(
+            !answered.contains(&"https://b.invalid".to_string()),
+            "a deleted profile's answer was delivered: {answered:?}"
+        );
+    }
+
+    /// The other side of reading the list before the answers go out:
+    /// an update consumed there is one `recv_timeout` no longer sees,
+    /// and a profile added at runtime must not wait out a whole
+    /// interval for its first sync.
+    #[test]
+    fn a_list_that_changed_mid_pass_is_resynced_at_once() {
+        let (result_tx, result_rx) = mpsc::channel();
+        let (servers_tx, servers_rx) = mpsc::channel();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicBool::new(false));
+        let (fetch_entered, fetch_released) = (entered.clone(), released.clone());
+
+        thread::spawn(move || {
+            sync_loop(
+                vec![nav("https://a.invalid")],
+                &result_tx,
+                &servers_rx,
+                move |nav, _live| {
+                    fetch_entered.fetch_add(1, Ordering::SeqCst);
+                    while !fetch_released.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(format!("{} is unreachable", nav.url))
+                },
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while entered.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        servers_tx
+            .send(vec![nav("https://a.invalid"), nav("https://b.invalid")])
+            .unwrap();
+        released.store(true, Ordering::SeqCst);
+
+        // the added profile was not part of the pass in flight, so its
+        // answer can only come from a new one, which is 45 seconds
+        // away if the update is left to the interval to notice.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_b = false;
+        while !saw_b && Instant::now() < deadline {
+            if let Ok(result) = result_rx.recv_timeout(Duration::from_millis(100)) {
+                saw_b = result.url == "https://b.invalid";
+            }
+        }
+        assert!(
+            saw_b,
+            "an added profile waits out the whole sync interval before its first pass"
+        );
+        assert!(
+            AUTO_SYNC_INTERVAL > Duration::from_secs(2),
+            "this only proves anything while the interval is longer than the wait"
         );
     }
 }
