@@ -82,21 +82,6 @@ pub fn logo_name(index: usize) -> Option<&'static str> {
     (index != 0).then(|| ALTERNATIVES[index - 1].0)
 }
 
-/// Every reachable logo's display width, measured once. The render
-/// centres the block and the two arrows off the widest line, and the
-/// art is static: `figlet: doh` is 50 rows of it, re-walked on every
-/// frame before this.
-static LOGO_WIDTHS: LazyLock<Vec<u16>> = LazyLock::new(|| {
-    (0..logo_count())
-        .map(|i| logo_lines(i).iter().map(|l| width(l)).max().unwrap_or(0) as u16)
-        .collect()
-});
-
-/// Display width of logo `index`' widest line.
-fn logo_width(index: usize) -> u16 {
-    LOGO_WIDTHS[index]
-}
-
 pub fn logo_index_for_name(name: Option<&str>) -> usize {
     match name {
         None => 0,
@@ -125,27 +110,36 @@ const MENU: &[(KeyAction, &str)] = &[
     (KeyAction::Quit, "quit"),
 ];
 
-/// The menu as it is drawn, and nothing that moves with the clock.
+/// Everything a banner frame derives from (logo index, keymap), and
+/// nothing that moves with the clock.
 ///
-/// LazyVim's own menu is a left-aligned column (key, two spaces,
-/// description) centred as one block; centring each row by its own
-/// length is what produced the staircase this fixed, since
+/// The menu half: LazyVim's own menu is a left-aligned column (key,
+/// two spaces, description) centred as one block; centring each row by
+/// its own length is what produced the staircase this fixed, since
 /// "n  navidrome profiles" and "q  quit" do not share a length.
-struct MenuLayout {
-    /// What it was built from: every `MENU` action's resolved key, so
-    /// a rebind rebuilds the rows and a frame reuses them.
+struct Layout {
+    /// What it was built from: the logo on screen and every `MENU`
+    /// action's resolved key. A rebind or a `<`/`>` press rebuilds it
+    /// and a frame reuses it.
+    logo: usize,
     keys: [KeyCode; MENU.len()],
+    /// Cells of the logo's widest line, which the art block and both
+    /// arrows are centred off. Kept rather than tabled for every logo:
+    /// measuring all 177 up front costs 185-220us on a first frame to
+    /// save the 1.2-2.3us only the one on screen is worth.
+    logo_width: u16,
     rows: Vec<String>,
-    /// Cells of the widest row. Display width, not char count: a key
-    /// bound to a wide char makes its row two cells wider than it
+    /// Cells of the widest menu row. Display width, not char count: a
+    /// key bound to a wide char makes its row two cells wider than it
     /// counts, which would centre the block left by that overhang.
-    width: u16,
+    menu_width: u16,
 }
 
-impl MenuLayout {
-    fn build(keys: [KeyCode; MENU.len()]) -> Self {
+impl Layout {
+    fn build(logo: usize, keys: [KeyCode; MENU.len()]) -> Self {
         #[cfg(test)]
         REBUILDS.with(|n| n.set(n.get() + 1));
+        let logo_width = logo_lines(logo).iter().map(|l| width(l)).max().unwrap_or(0) as u16;
         let labels: Vec<String> = keys.iter().copied().map(key_label).collect();
         // padded by display width, by hand: `{key:<n$}` counts chars
         // and `key.len()` counts bytes, and a key bound to a wide or
@@ -169,39 +163,42 @@ impl MenuLayout {
                 row
             })
             .collect();
-        let cells = rows.iter().map(|r| width(r)).max().unwrap_or(0) as u16;
-        MenuLayout {
+        let menu_width = rows.iter().map(|r| width(r)).max().unwrap_or(0) as u16;
+        Layout {
+            logo,
             keys,
+            logo_width,
             rows,
-            width: cells,
+            menu_width,
         }
     }
 }
 
 thread_local! {
-    /// The keymap-derived half of a banner frame, kept across frames.
-    /// ratatui draws on the thread that owns the terminal, so a
-    /// thread-local is exactly as shared as the draw call is; the call
-    /// `ui::raster::with_scratch` makes, for the same reason.
-    static MENU_CACHE: RefCell<Option<MenuLayout>> = const { RefCell::new(None) };
-    /// How many times `MenuLayout::build` has run on this thread, so
-    /// a test can pin that a second frame does not rebuild it. Per
+    /// The derived half of a banner frame, kept across frames. ratatui
+    /// draws on the thread that owns the terminal, so a thread-local
+    /// is exactly as shared as the draw call is; the call
+    /// `ui::raster::with_scratch` makes, for the same reason. One slot,
+    /// because one banner is on screen at a time.
+    static LAYOUT: RefCell<Option<Layout>> = const { RefCell::new(None) };
+    /// How many times `Layout::build` has run on this thread, so a
+    /// test can pin that a second frame does not rebuild it. Per
     /// thread because the cache is, and every `#[test]` gets its own.
     #[cfg(test)]
     static REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Runs `f` with this thread's menu layout for `keymap`, rebuilt only
-/// when one of the seven keys it shows has moved.
-fn with_menu<R>(keymap: &Keymap, f: impl FnOnce(&MenuLayout) -> R) -> R {
+/// Runs `f` with this thread's layout for `logo` and `keymap`, rebuilt
+/// only when the logo changed or one of the seven keys it shows moved.
+fn with_layout<R>(logo: usize, keymap: &Keymap, f: impl FnOnce(&Layout) -> R) -> R {
     let mut keys = [KeyCode::Null; MENU.len()];
     for (slot, (action, _)) in keys.iter_mut().zip(MENU) {
         *slot = keymap.get(*action);
     }
-    MENU_CACHE.with(|cache| {
+    LAYOUT.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if !matches!(&*cache, Some(menu) if menu.keys == keys) {
-            *cache = Some(MenuLayout::build(keys));
+        if !matches!(&*cache, Some(kept) if kept.logo == logo && kept.keys == keys) {
+            *cache = Some(Layout::build(logo, keys));
         }
         f(cache.as_ref().expect("built just above"))
     })
@@ -224,13 +221,23 @@ pub struct Banner<'a> {
 
 impl Widget for Banner<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // everything here but the two motions is derived from the logo
+        // index and the keymap, and is kept across frames (`Layout`).
+        with_layout(self.logo_index, self.keymap, |layout| {
+            self.paint(area, buf, layout);
+        });
+    }
+}
+
+impl Banner<'_> {
+    fn paint(&self, area: Rect, buf: &mut Buffer, layout: &Layout) {
         let lines = logo_lines(self.logo_index);
         let glyph_height = lines.len() as u16;
         // display width, like every other measurement on this screen,
         // measured once per logo rather than once per frame;
         // `is_line_art` keeps the two measures equal for the art the
         // picker can reach, and this does not depend on that holding.
-        let total_width = logo_width(self.logo_index);
+        let total_width = layout.logo_width;
         let start_x = area.x + area.width.saturating_sub(total_width) / 2;
 
         // logo, one gap row, the menu.
@@ -284,23 +291,18 @@ impl Widget for Banner<'_> {
             }
         }
 
-        // the rows and their block width are derived from the keymap
-        // and kept there; a frame that only moved the clock reuses
-        // them (see `MenuLayout`).
         let menu_start_y = logo_start_y + glyph_height + 2;
-        with_menu(self.keymap, |menu| {
-            let block_start_x = area.x + area.width.saturating_sub(menu.width) / 2;
-            for (i, row) in menu.rows.iter().enumerate() {
-                draw_left(
-                    buf,
-                    area,
-                    block_start_x,
-                    menu_start_y + i as u16,
-                    row,
-                    shade(DIM),
-                );
-            }
-        });
+        let block_start_x = area.x + area.width.saturating_sub(layout.menu_width) / 2;
+        for (i, row) in layout.rows.iter().enumerate() {
+            draw_left(
+                buf,
+                area,
+                block_start_x,
+                menu_start_y + i as u16,
+                row,
+                shade(DIM),
+            );
+        }
     }
 }
 
@@ -643,18 +645,26 @@ mod tests {
     fn the_cached_derivation_paints_exactly_what_rebuilding_it_did() {
         let elapsed = Duration::from_millis(1234);
         let rebound = rebound();
-        for logo in 0..logo_count() {
-            for (w, h) in [(44u16, 18u16), (90, 30), (60, 3), (12, 8), (26, 4)] {
-                for keymap in [&Keymap::default(), &rebound] {
+        // the keymap outermost on purpose: alternating it per logo
+        // re-keyed the slot on every single iteration, which hid
+        // whether the logo was part of that key at all.
+        for keymap in [&Keymap::default(), &rebound] {
+            for logo in 0..logo_count() {
+                for (w, h) in [(44u16, 18u16), (90, 30), (60, 3), (12, 8), (26, 4)] {
                     let area = Rect::new(0, 0, w, h);
                     let mut cached = buffer(w, h);
                     let mut rebuilt = buffer(w, h);
-                    Banner {
-                        elapsed,
-                        logo_index: logo,
-                        keymap,
+                    // twice: the second is the frame that hit the
+                    // slot, which is the one the cache can get wrong,
+                    // and the paint is idempotent either way.
+                    for _ in 0..2 {
+                        Banner {
+                            elapsed,
+                            logo_index: logo,
+                            keymap,
+                        }
+                        .render(area, &mut cached);
                     }
-                    .render(area, &mut cached);
                     rebuilding_render(elapsed, logo, keymap, area, &mut rebuilt);
                     assert!(
                         cached == rebuilt,
@@ -668,10 +678,11 @@ mod tests {
         }
     }
 
-    /// The width table stands in for a walk of the art, so it has to
-    /// be that walk's answer for every logo, not just the default.
+    /// The kept width stands in for a walk of the art, so it has to be
+    /// that walk's answer for every logo, not just the default.
     #[test]
     fn the_kept_logo_width_is_what_the_art_measures() {
+        let keymap = Keymap::default();
         for index in 0..logo_count() {
             let walked = logo_lines(index)
                 .iter()
@@ -679,7 +690,7 @@ mod tests {
                 .max()
                 .unwrap_or(0);
             assert_eq!(
-                usize::from(logo_width(index)),
+                with_layout(index, &keymap, |l| usize::from(l.logo_width)),
                 walked,
                 "{:?}",
                 logo_name(index).unwrap_or("default")
@@ -691,11 +702,12 @@ mod tests {
         REBUILDS.with(|n| n.get())
     }
 
-    /// The invariant the cache is: rebuilt when a key it shows moves,
-    /// and not otherwise. The rebind is the positive control, so
-    /// "it did not rebuild" cannot pass by never rebuilding at all.
+    /// The invariant the cache is: rebuilt when one of its two inputs
+    /// moves, and not otherwise. The rebind and the logo cycle are the
+    /// positive controls, so "it did not rebuild" cannot pass by never
+    /// rebuilding at all.
     #[test]
-    fn the_menu_is_rebuilt_only_when_a_key_it_shows_moves() {
+    fn the_layout_is_rebuilt_only_when_the_logo_or_a_key_it_shows_moves() {
         let mut keymap = Keymap::default();
         let before = rebuilds();
         render_to_string(&keymap);
@@ -714,6 +726,20 @@ mod tests {
         keymap.set(KeyAction::Enqueue, KeyCode::Char('Z'));
         render_to_string(&keymap);
         assert_eq!(rebuilds(), before + 2, "an unlisted action is not an input");
+
+        // and the other input: `<`/`>` moves the logo, whose width the
+        // same slot holds.
+        let mut buf = buffer(60, 24);
+        let doh = logo_index_for_name(Some("figlet: doh"));
+        for _ in 0..2 {
+            Banner {
+                elapsed: Duration::ZERO,
+                logo_index: doh,
+                keymap: &keymap,
+            }
+            .render(Rect::new(0, 0, 60, 24), &mut buf);
+        }
+        assert_eq!(rebuilds(), before + 3, "a logo cycle rebuilds it once");
     }
 
     /// And what it rebuilds is what the per-frame derivation produced,
@@ -723,9 +749,9 @@ mod tests {
     fn the_kept_rows_are_the_rows_the_old_derivation_built() {
         for keymap in [Keymap::default(), rebound()] {
             let (rows, block_width) = rebuilt_menu(&keymap);
-            with_menu(&keymap, |menu| {
-                assert_eq!(menu.rows, rows);
-                assert_eq!(menu.width, block_width);
+            with_layout(0, &keymap, |layout| {
+                assert_eq!(layout.rows, rows);
+                assert_eq!(layout.menu_width, block_width);
             });
         }
     }
@@ -950,37 +976,9 @@ mod frame_budget {
         println!("\n== banner derivation ({}) ==", profile());
         let keymap = Keymap::default();
 
-        #[inline(never)]
-        fn kept_menu(keymap: &Keymap) -> u16 {
-            with_menu(keymap, |menu| menu.width)
-        }
-        #[inline(never)]
-        fn built_menu(keymap: &Keymap) -> u16 {
-            rebuilt_menu(keymap).1
-        }
-        let [kept, built] = best_each::<2>(8, 20_000, |which| {
-            std::hint::black_box(match which {
-                0 => kept_menu(&keymap),
-                _ => built_menu(&keymap),
-            });
-        });
-        println!(
-            "7 menu rows:        kept {kept:>10.3?}  rebuilt {built:>10.3?}  {:.2}x",
-            built.as_secs_f64() / kept.as_secs_f64(),
-        );
-
-        #[inline(never)]
-        fn kept_width(index: usize) -> u16 {
-            logo_width(index)
-        }
-        #[inline(never)]
-        fn walked_width(index: usize) -> u16 {
-            logo_lines(index)
-                .iter()
-                .map(|l| width(l))
-                .max()
-                .unwrap_or(0) as u16
-        }
+        // one slot hit against rebuilding both halves, per logo: the
+        // slot's work is two comparisons either way, the derivation's
+        // is the art's width plus seven rows.
         for (label, index) in [
             ("default logo (6 rows)", 0),
             (
@@ -988,16 +986,42 @@ mod frame_budget {
                 logo_index_for_name(Some("figlet: doh")),
             ),
         ] {
-            let [kept, walked] = best_each::<2>(8, 20_000, |which| {
+            #[inline(never)]
+            fn kept(index: usize, keymap: &Keymap) -> u16 {
+                with_layout(index, keymap, |l| l.logo_width + l.menu_width)
+            }
+            #[inline(never)]
+            fn rebuilt(index: usize, keymap: &Keymap) -> u16 {
+                let logo = logo_lines(index)
+                    .iter()
+                    .map(|l| width(l))
+                    .max()
+                    .unwrap_or(0) as u16;
+                logo + rebuilt_menu(keymap).1
+            }
+            let [slot, derived] = best_each::<2>(8, 20_000, |which| {
                 std::hint::black_box(match which {
-                    0 => kept_width(index),
-                    _ => walked_width(index),
+                    0 => kept(index, &keymap),
+                    _ => rebuilt(index, &keymap),
                 });
             });
             println!(
-                "{label}: kept {kept:>10.3?}  walked {walked:>10.3?}  {:.2}x",
-                walked.as_secs_f64() / kept.as_secs_f64(),
+                "{label}: slot {slot:>10.3?}  derived {derived:>10.3?}  {:.2}x",
+                derived.as_secs_f64() / slot.as_secs_f64(),
             );
         }
+
+        // the trade this slot exists to avoid: measuring every logo's
+        // width up front instead of the one on screen. a first banner
+        // frame would pay all of it.
+        let at = Instant::now();
+        let table: Vec<u16> = (0..logo_count())
+            .map(|i| logo_lines(i).iter().map(|l| width(l)).max().unwrap_or(0) as u16)
+            .collect();
+        println!(
+            "rejected, a width per logo up front ({} of them): {:?} on a first frame",
+            table.len(),
+            at.elapsed(),
+        );
     }
 }
