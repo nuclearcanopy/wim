@@ -1475,6 +1475,23 @@ mod tests {
     /// `scan_into` overlaps with the walk, so whichever of the two is
     /// slower *is* the floor. Compares the json map on disk today
     /// against one row per line, serial and pooled.
+    ///
+    /// **Nothing shipped here, and the reason is the overlap, not the
+    /// parse.** One row per line with short keys and `Cow` fields is
+    /// 1.07-1.15x the json map's parse (cpu clock, four runs, both
+    /// sizes) and 15% fewer bytes to read, 6.39MB against 5.40MB at
+    /// 34000 files. But the walk it hides behind is 70.8-161.9ms wall
+    /// at that size even with its stats pooled, against 55-71ms for
+    /// the parse, so `max(walk, parse)` does not move and the format
+    /// change would buy a warm scan nothing while putting every index
+    /// already on disk through a migration. Worth revisiting only if
+    /// the walk's readdir pass is ever parallelised too, which is what
+    /// would make this the floor.
+    ///
+    /// **And the pool is worse than both:** 0.57-0.78x, because the
+    /// map insert that hashes every path stays serial and is most of
+    /// the work.
+    ///
     /// `cargo test --release -- --ignored --nocapture warm_index_parse`.
     #[test]
     #[ignore = "measurement, run explicitly"]
