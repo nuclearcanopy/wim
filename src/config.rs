@@ -1074,6 +1074,23 @@ pasword = "x"
         assert_eq!(cfg.eq_gains, None);
     }
 
+    /// Renaming a field must not hard-error someone's existing
+    /// config.toml: the old name is an alias of the new one, and both
+    /// defaults were 2, so the value carries straight over.
+    ///
+    /// Lived in `main.rs`'s `download_policy_tests` because the rename
+    /// happened while someone had that module open. It is about this
+    /// file's serde shape, which is what losing it would stop
+    /// covering; see docs/testing.md.
+    #[test]
+    fn a_config_with_the_old_play_count_field_still_loads() {
+        let cfg: Config =
+            toml::from_str("cache_listens_threshold = 4\n").expect("old field must still load");
+        assert_eq!(cfg.cache_days_threshold, 4);
+        let cfg: Config = toml::from_str("").expect("an empty config is all defaults");
+        assert_eq!(cfg.cache_days_threshold, 2);
+    }
+
     /// A config written before the four art modes existed names a
     /// protocol or `blocks`; every one of those has to keep parsing,
     /// into the mode that means the same thing. `blocks` asked for the
