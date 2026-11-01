@@ -157,6 +157,12 @@ struct WimSurface<'a> {
     /// (docs/undo.md).
     shellsong_queued: &'a mut Option<Box<shellsong::Program>>,
     bottombar_selected: Field,
+    /// What `video()` asked for, applied by the frame loop rather than
+    /// here: `CoreCtx` holds `&cfg` for the whole frame, so the op
+    /// cannot write it. Same deferral `shellsong_queued` uses, and the
+    /// loop clears the shift-`v` override with it, since the override
+    /// wins over config and would otherwise swallow the change.
+    video_request: &'a mut Option<config::VideoOutput>,
 }
 
 impl Surface for WimSurface<'_> {
@@ -239,6 +245,17 @@ impl Surface for WimSurface<'_> {
 
     fn minimize_player(&mut self, minimize: bool) {
         *self.player_minimized = minimize;
+    }
+
+    fn set_video_output(
+        &mut self,
+        mode: config::VideoOutput,
+        core: &mut CoreCtx,
+    ) -> (Dispatch, Report) {
+        *self.video_request = Some(mode);
+        let said = format!("video output: {}", mode.word());
+        core.notifications.push(Severity::Info, said.clone());
+        op_note(said)
     }
 
     fn queue_cursor(&mut self) -> Option<&mut usize> {
@@ -826,6 +843,8 @@ fn main() -> anyhow::Result<()> {
     // and the ascii key is the only thing that sets it, so a restart
     // goes back to whatever is configured.
     let mut video_over: Option<config::VideoOutput> = None;
+    // what `video()` asked for, drained below; see `WimSurface`.
+    let mut video_request: Option<config::VideoOutput> = None;
     // the ascii pane's instance, which is nothing until a video plays
     // with `video_output = "ascii"`. kept out here so it survives the
     // frame: dropping it would kill the child and respawn per frame.
@@ -1304,6 +1323,7 @@ fn main() -> anyhow::Result<()> {
                     eq_menu: &mut eq_menu,
                     undo_menu_open: &mut undo_menu_open,
                     shellsong_queued: &mut shellsong_queued,
+                    video_request: &mut video_request,
                     bottombar_selected,
                 }
             };
@@ -1409,6 +1429,15 @@ fn main() -> anyhow::Result<()> {
             keybinds_menu: keybinds_menu_open,
         };
         let overlay = tiers.covers_screen();
+        // `video()`'s request, applied before the decision it changes so
+        // it lands on this frame. the override goes with it: shift-`v`
+        // wins over config, so leaving it would make the command
+        // report a mode the screen does not show.
+        if let Some(mode) = video_request.take() {
+            cfg.video_output = mode;
+            video_over = None;
+            config::save_or_warn(&cfg, &mut notifications);
+        }
         // what should be on the screen right now; the whole decision is
         // `video::showing`, including the guard that keeps music on
         // `vo=null`. ascii and a drawing vo are the two halves of the
@@ -5503,6 +5532,55 @@ mod startup_tests {
             let msg = loading_message(scanning, syncing).unwrap();
             assert!(msg.len() <= 30, "{msg:?} would be truncated in the sidebar");
         }
+    }
+}
+
+/// `video()`'s host half, which needs a terminal and a console to
+/// reach any other way.
+#[cfg(test)]
+mod video_command_tests {
+    /// The command must clear the shift-`v` override with the mode it
+    /// sets. The override wins over config, so without this `video
+    /// (ascii)` would report a mode the screen does not show, which is
+    /// exactly the trap the settings menu's own row had to avoid.
+    #[test]
+    fn the_request_clears_the_runtime_override() {
+        let src = include_str!("main.rs");
+        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
+        let at = code
+            .find("video_request.take()")
+            .expect("nothing applies the video() request, so the command is inert");
+        let drain = &code[at..(at + 300).min(code.len())];
+        assert!(
+            drain.contains("video_over = None"),
+            "the override survives, so the command reports a mode the screen does not show:\n{drain}"
+        );
+        assert!(
+            drain.contains("cfg.video_output = mode"),
+            "the mode is not written:\n{drain}"
+        );
+        assert!(
+            drain.contains("save_or_warn"),
+            "the mode is set for this run only:\n{drain}"
+        );
+    }
+
+    /// Applied before the decision it changes, so the command lands on
+    /// the frame that answers it rather than the one after.
+    #[test]
+    fn the_request_is_applied_before_the_screen_decision() {
+        let src = include_str!("main.rs");
+        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
+        let drain = code
+            .find("video_request.take()")
+            .expect("nothing applies the request");
+        let decision = code
+            .find("let showing = video::showing(")
+            .expect("the screen decision moved");
+        assert!(
+            drain < decision,
+            "the request is applied after the frame that would have used it"
+        );
     }
 }
 
