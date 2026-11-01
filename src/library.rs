@@ -1149,7 +1149,9 @@ mod tests {
         let pooled = walk_root(&as_str);
         assert_eq!(pooled.len(), 30, "precondition: the tree was walked");
         assert!(
-            serial.iter().all(|(_, k, m)| *k == MediaKind::Video && m.is_some()),
+            serial
+                .iter()
+                .all(|(_, k, m)| *k == MediaKind::Video && m.is_some()),
             "precondition: the stat'ing walk did read every one of these"
         );
         assert!(
@@ -1178,7 +1180,10 @@ mod tests {
             want.insert(path, None);
         }
         for (path, mtime) in want.iter_mut() {
-            *mtime = fs::symlink_metadata(path).ok().as_ref().and_then(mtime_nanos);
+            *mtime = fs::symlink_metadata(path)
+                .ok()
+                .as_ref()
+                .and_then(mtime_nanos);
         }
         assert_eq!(want.len(), 300, "precondition: the tree was walked");
         assert_eq!(
@@ -1225,7 +1230,10 @@ mod tests {
     fn a_symlinked_track_is_cached_against_its_targets_mtime() {
         let root = media_tree("symlinked", 1, "flac");
         let target = root.join("real song.flac");
-        let link = root.join("artist 0").join("album 0").join("linked song.flac");
+        let link = root
+            .join("artist 0")
+            .join("album 0")
+            .join("linked song.flac");
         fs::write(&target, b"").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
         // the target's mtime is set outright rather than by touching
@@ -1233,8 +1241,14 @@ mod tests {
         // write right after the symlink lands on the same one.
         backdate(&target, 1_000_000);
         let target_mtime = fs::metadata(&target).ok().as_ref().and_then(mtime_nanos);
-        let link_mtime = fs::symlink_metadata(&link).ok().as_ref().and_then(mtime_nanos);
-        assert!(target_mtime.is_some() && target_mtime != link_mtime, "precondition");
+        let link_mtime = fs::symlink_metadata(&link)
+            .ok()
+            .as_ref()
+            .and_then(mtime_nanos);
+        assert!(
+            target_mtime.is_some() && target_mtime != link_mtime,
+            "precondition"
+        );
 
         let found = walk_root(&root.to_string_lossy());
         let (_, kind, mtime) = found
@@ -1461,6 +1475,23 @@ mod tests {
     /// `scan_into` overlaps with the walk, so whichever of the two is
     /// slower *is* the floor. Compares the json map on disk today
     /// against one row per line, serial and pooled.
+    ///
+    /// **Nothing shipped here, and the reason is the overlap, not the
+    /// parse.** One row per line with short keys and `Cow` fields is
+    /// 1.07-1.15x the json map's parse (cpu clock, four runs, both
+    /// sizes) and 15% fewer bytes to read, 6.39MB against 5.40MB at
+    /// 34000 files. But the walk it hides behind is 70.8-161.9ms wall
+    /// at that size even with its stats pooled, against 55-71ms for
+    /// the parse, so `max(walk, parse)` does not move and the format
+    /// change would buy a warm scan nothing while putting every index
+    /// already on disk through a migration. Worth revisiting only if
+    /// the walk's readdir pass is ever parallelised too, which is what
+    /// would make this the floor.
+    ///
+    /// **And the pool is worse than both:** 0.57-0.78x, because the
+    /// map insert that hashes every path stays serial and is most of
+    /// the work.
+    ///
     /// `cargo test --release -- --ignored --nocapture warm_index_parse`.
     #[test]
     #[ignore = "measurement, run explicitly"]
@@ -1470,7 +1501,12 @@ mod tests {
             let found: Vec<FoundMedia> = (0..files)
                 .map(|i| {
                     found(
-                        &format!("/home/u/Music/artist {}/album {}/{:02} - song.flac", i / 170, i / 17, i % 17),
+                        &format!(
+                            "/home/u/Music/artist {}/album {}/{:02} - song.flac",
+                            i / 170,
+                            i / 17,
+                            i % 17
+                        ),
                         MediaKind::Music,
                         Some(1_700_000_000_000_000_000 + i as u64),
                     )
@@ -1650,7 +1686,9 @@ mod restart_tests {
 
         // a batch already queued on the old channel, i.e. a scan that
         // has not finished signing off yet.
-        old_tx.send(Vec::new()).expect("the old receiver is still up");
+        old_tx
+            .send(Vec::new())
+            .expect("the old receiver is still up");
 
         // nothing to scan, so the new thread finishes immediately and
         // the test does not depend on the filesystem.
