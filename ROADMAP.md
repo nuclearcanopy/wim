@@ -2120,13 +2120,57 @@ needed, so the number is real and the work is scoped.
       problem**: its paths were `1, x, 2, 3`, already sorted, so
       sorting them changed nothing. `3, x, 1, 2` now, with the reason
       in the test.
-- [ ] **`banner.rs` is the real per-frame logo cost.** `logos.rs` is
+- [x] **`banner.rs` is the real per-frame logo cost.** A thread-local
+      one-slot `Layout`, keyed by `(logo_index, [KeyCode; 7])`, holds
+      the logo's display width, the seven menu rows and their block
+      width, so a frame walks no art and allocates nothing; `<`/`>` or
+      a rebind rebuilds it. **1.36x on a whole default frame**, 1.16x
+      on `figlet: doh` at 200x50, and **13.7-27.5x on the derivation
+      alone** (120ns against 1.6-3.3us).
+      identity is asserted cell-and-style-identical through `Buffer`'s
+      own `PartialEq` across **all 177 logos x 5 sizes x 2 keymaps**,
+      each rendered twice so the second frame is a slot hit.
+      **measured and rejected**: a `LazyLock<Vec<u16>>` tabling every
+      logo's width. A first frame then pays for all 177 logos, 62.9-
+      76.2us once (185-220us on a loaded box), to save the 1.2-2.3us
+      only the logo on screen is worth. The number is in
+      `derivation_cost` so it is not retried.
+      two of the seven mutations found holes in the agent's own tests
+      rather than in the code, which is the discipline earning its
+      keep: the grid corpus never produced a cut cell with a gutter
+      after it, and the flagship "not one cell moved" test alternated
+      the keymap per logo, re-keying the slot every iteration and
+      hiding whether the logo was in the key at all.
+- [ ] ~~**`banner.rs` is the real per-frame logo cost.**~~ `logos.rs` is
       compile-time data only, but the banner re-walks every line's
       width each frame (up to 50 rows for `figlet: doh`), plus a
       `Vec<(String, &str)>`, a `" ".repeat()` and a `format!` per menu
       row, then `width()` again over those: ~17 allocations a frame of
       static art, all derivable once per (logo index, keymap) change.
-- [ ] **`textfit::truncate_into(&mut String, ..)`.** Drawing an
+- [x] **`textfit::truncate_into(&mut String, ..)`.** Landed, and it
+      **wins both cases** where the reverted borrow-when-it-fits branch
+      could not (that was 1.96x fitting, 0.82x cutting): 1.09x when
+      every row fits and 1.13x when none does. `ellipsis_fit(s, max)`
+      holds the one copy of the unicode cut decision and returns the
+      display width written, which every branch already knew, so a
+      caller padding a column does not walk the result again.
+      `columns`, the one in-scope caller, is 1.30-1.36x on a
+      two-column grid.
+      **one honest cost, measured rather than waved away**: sharing the
+      cut decision makes `truncate_with_ellipsis` ~1% slower on the
+      fits path (~1.3ns a call). The agent ran an order-swap control
+      both loaded and quiet; the direction survives the swap, so the 1%
+      is real, where the 3-4% first measured under load was ordering
+      bias and flipped sign. Kept because the alternative is a second
+      copy of the cut decision, which is the thing
+      `docs/text-measurement.md` exists because of.
+      **it has no production caller yet.** The sites with the same
+      format-then-truncate double allocation, per the agent's sweep:
+      `header.rs:46,119` and `notify.rs:44,142` (both per frame),
+      `queue.rs:281`, `suggestions.rs:264,335`, `browse.rs:402,455`,
+      `undo_tree.rs:178,191,253`, `help.rs:286`, `eq_menu.rs:446`,
+      `nav_manager.rs:94`, `ui/shellsong.rs:117,132,163,186,199`.
+- [ ] ~~**`textfit::truncate_into(&mut String, ..)`.**~~ Drawing an
       already-fitting row straight out of its buffer is 1.96x where
       rows fit and 0.82x where they do not, because the second case
       pays an extra width walk; the version that wins both is an
