@@ -928,6 +928,7 @@ pub struct StarFailed {
     pub error: String,
 }
 
+#[derive(Debug, Clone)]
 pub struct SubtitleReady {
     pub path: String,
     pub release: String,
@@ -978,22 +979,57 @@ impl SubtitleReady {
 /// what tells two videos apart. It also answers the case a generation
 /// would miss, a video followed by music, since an audio track wants
 /// no subtitle at all.
-pub fn subtitle_belongs_to_playing(sub: &SubtitleReady, playing: Option<&SearchItem>) -> bool {
+/// What a subtitle fetch came back with.
+///
+/// A failure rides the same channel as a success on purpose: it
+/// carries the same video identity, so the same staleness guard
+/// applies. A failure for the video you have already moved on from is
+/// no more worth saying than a success for it.
+#[derive(Debug, Clone)]
+pub enum SubtitleOutcome {
+    Ready(SubtitleReady),
+    /// Nothing was written, and this says why.
+    ///
+    /// Four returns in the worker used to be silent, and only *one* of
+    /// them means "no subtitles exist": a refused key, a failed
+    /// download and an unwritable directory looked exactly like it. so
+    /// a typo'd `opensubtitles_api_key` was indistinguishable from a
+    /// film nobody has subtitled. the no-results case stays silent,
+    /// which is what makes silence mean that again.
+    Failed { for_video: String, why: String },
+}
+
+impl SubtitleOutcome {
+    pub fn for_video(&self) -> &str {
+        match self {
+            SubtitleOutcome::Ready(sub) => &sub.for_video,
+            SubtitleOutcome::Failed { for_video, .. } => for_video,
+        }
+    }
+}
+
+pub fn subtitle_belongs_to_playing(
+    sub: &SubtitleOutcome,
+    playing: Option<&SearchItem>,
+) -> bool {
     matches!(
         playing,
-        Some(SearchItem::LocalVideo { path, .. }) if *path.to_string_lossy() == *sub.for_video
+        Some(SearchItem::LocalVideo { path, .. }) if *path.to_string_lossy() == *sub.for_video()
     )
 }
 /// Starts an opensubtitles search + download on its own thread, same
 /// fire-and-forget contract as `fire_playing_now`: a no-op whenever
-/// `item` isn't a local video, no api key is configured, or the
-/// search/download fails for any reason (no matches, network error,
-/// quota exhausted). Two network round-trips, so it never runs inline;
-/// it used to, which on startup meant holding the first frame behind
-/// opensubtitles' response time.
+/// `item` isn't a local video or no api key is configured (the feature
+/// is simply off then). Two network round-trips, so it never runs
+/// inline; it used to, which on startup meant holding the first frame
+/// behind opensubtitles' response time.
+///
+/// Everything that goes wrong *after* that is reported, because only
+/// one of the four ways it can end means "no subtitles exist"; see
+/// `SubtitleOutcome::Failed`.
 pub fn fire_subtitle_fetch(
     cfg: &config::Config,
-    subtitle_tx: &mpsc::Sender<SubtitleReady>,
+    subtitle_tx: &mpsc::Sender<SubtitleOutcome>,
     item: &SearchItem,
 ) {
     let SearchItem::LocalVideo { path, title } = item else {
@@ -1010,24 +1046,46 @@ pub fn fire_subtitle_fetch(
     let video = path.clone();
     let subtitle_tx = subtitle_tx.clone();
     thread::spawn(move || {
-        let client = opensubtitles::Client::new(api_key);
-        let Ok(results) = client.search(&title, &language) else {
-            return;
+        let key = video.to_string_lossy().into_owned();
+        let failed = |why: String| SubtitleOutcome::Failed {
+            for_video: key.clone(),
+            why,
         };
+        let client = opensubtitles::Client::new(api_key);
+        let results = match client.search(&title, &language) {
+            Ok(results) => results,
+            // where a refused key lands, which is the case this
+            // whole enum exists for.
+            Err(e) => {
+                let _ = subtitle_tx.send(failed(format!("subtitle search failed: {e}")));
+                return;
+            }
+        };
+        // the one silent ending, and the only one that means what
+        // silence used to mean for all four.
         let Some(best) = results.first() else {
             return;
         };
-        let Ok(bytes) = client.download(best.file_id) else {
-            return;
+        let bytes = match client.download(best.file_id) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = subtitle_tx.send(failed(format!("subtitle download failed: {e}")));
+                return;
+            }
         };
-        if std::fs::write(SubtitleReady::sidecar(&video), bytes).is_err() {
+        let sidecar = SubtitleReady::sidecar(&video);
+        if let Err(e) = std::fs::write(&sidecar, bytes) {
+            let _ = subtitle_tx.send(failed(format!(
+                "couldn't write {}: {e}",
+                sidecar.display()
+            )));
             return;
         }
-        let _ = subtitle_tx.send(SubtitleReady::written_beside(
+        let _ = subtitle_tx.send(SubtitleOutcome::Ready(SubtitleReady::written_beside(
             &video,
             &best.release,
             &best.language,
-        ));
+        )));
     });
 }
 /// What a reply's text is, by the api's own `instrumental` flag rather
@@ -2020,7 +2078,7 @@ pub struct CoreCtx<'a> {
     pub download_tx: &'a mpsc::Sender<DownloadEvent>,
     pub downloading: &'a mut HashSet<String>,
     pub scrobble: &'a mut ScrobbleState,
-    pub subtitle_tx: &'a mpsc::Sender<SubtitleReady>,
+    pub subtitle_tx: &'a mpsc::Sender<SubtitleOutcome>,
     /// Where every op's one line lands (docs/shellsong.md R9).
     pub console: &'a mut Console,
     /// The same monotonic reading `Env::now` carries this frame, so a
@@ -3710,15 +3768,80 @@ mod late_subtitle_tests {
     /// Built through the real constructor, not a literal: the tag
     /// being filled in is half of what is under test, so a test that
     /// wrote it by hand would pass with the sender still untagged.
-    fn reply_for(path: &str) -> SubtitleReady {
-        SubtitleReady::written_beside(std::path::Path::new(path), "A.Film.1080p", "en")
+    fn reply_for(path: &str) -> SubtitleOutcome {
+        SubtitleOutcome::Ready(SubtitleReady::written_beside(
+            std::path::Path::new(path),
+            "A.Film.1080p",
+            "en",
+        ))
+    }
+
+    /// A failure rides the same channel, so the same staleness guard
+    /// applies to it.
+    ///
+    /// Reporting a failure for the video you have already moved on
+    /// from is no more wanted than loading a subtitle for it, and that
+    /// is why `Failed` carries `for_video` at all.
+    #[test]
+    fn a_failure_for_a_video_you_left_is_dropped_like_a_success_would_be() {
+        let failed = SubtitleOutcome::Failed {
+            for_video: "/v/a.mkv".to_string(),
+            why: "subtitle search failed: 401".to_string(),
+        };
+        assert_eq!(failed.for_video(), "/v/a.mkv");
+        assert!(subtitle_belongs_to_playing(&failed, Some(&video("/v/a.mkv"))));
+        assert!(
+            !subtitle_belongs_to_playing(&failed, Some(&video("/v/b.mkv"))),
+            "a failure for the previous video must not surface over this one"
+        );
+        assert!(!subtitle_belongs_to_playing(&failed, None));
+
+        // and the success variant answers the same question the same
+        // way, which is the point of one channel.
+        assert_eq!(reply_for("/v/a.mkv").for_video(), "/v/a.mkv");
+    }
+
+    /// Only one of the four endings is silent, and it is the one that
+    /// means what silence used to mean for all of them.
+    ///
+    /// A refused key, a failed download and an unwritable directory
+    /// looked exactly like "nobody has subtitled this film", so a
+    /// typo in `opensubtitles_api_key` was indistinguishable from a
+    /// film with no subtitles. Reads the source, since the three
+    /// failures are inside a spawned worker behind two network round
+    /// trips.
+    #[test]
+    fn every_ending_but_no_results_is_reported() {
+        let src = include_str!("core.rs");
+        let at = src
+            .find("pub fn fire_subtitle_fetch(")
+            .expect("fire_subtitle_fetch moved or was renamed");
+        let body = &src[at..];
+        let body = &body[..body.find("\n}\n").expect("an unterminated fn")];
+
+        for named in ["search failed", "download failed", "couldn't write"] {
+            assert!(
+                body.contains(named),
+                "{named:?} is not reported, so it looks like no subtitles \
+                 exist:\n{body}"
+            );
+        }
+        // the no-results arm is the one bare `return`, and it stays
+        // that way: saying "no subtitles" on every unsubtitled film is
+        // noise, and silence meaning exactly that is the whole fix.
+        assert!(
+            body.contains("let Some(best) = results.first() else"),
+            "the no-results arm moved:\n{body}"
+        );
     }
 
     /// The pairing the guard rests on: one path in, and both the file
     /// the worker wrote and the tag the drain compares come out of it.
     #[test]
     fn a_reply_is_tagged_with_the_video_it_was_written_beside() {
-        let reply = reply_for("/v/a.mkv");
+        let SubtitleOutcome::Ready(reply) = reply_for("/v/a.mkv") else {
+            panic!("the fixture is a success");
+        };
         assert_eq!(reply.for_video, "/v/a.mkv");
         assert_eq!(reply.path, "/v/a.wim-auto.srt");
         assert_eq!(reply.release, "A.Film.1080p");
@@ -3782,9 +3905,15 @@ mod late_subtitle_tests {
             body.contains("SubtitleReady::written_beside("),
             "a literal here can be sent with no video tag:\n{body}"
         );
+        // narrowed from "`for_video` appears nowhere" when the failure
+        // variant arrived, which sets its own tag and must: the
+        // invariant was always about the *success* reply, whose tag
+        // and written file have to come out of one call so they cannot
+        // disagree. a struct literal is what would break that.
         assert!(
-            !body.contains("for_video"),
-            "the tag is the constructor's to fill in, not this one's:\n{body}"
+            !body.contains("SubtitleReady {"),
+            "a hand-built success reply can carry a tag that does not \
+             match the file it wrote:\n{body}"
         );
     }
 }
@@ -4077,8 +4206,8 @@ mod seam_tests {
         _download_rx: mpsc::Receiver<DownloadEvent>,
         downloading: HashSet<String>,
         scrobble: ScrobbleState,
-        subtitle_tx: mpsc::Sender<SubtitleReady>,
-        _subtitle_rx: mpsc::Receiver<SubtitleReady>,
+        subtitle_tx: mpsc::Sender<SubtitleOutcome>,
+        _subtitle_rx: mpsc::Receiver<SubtitleOutcome>,
         console: Console,
         now_playing: Option<SearchItem>,
         favorites: favorites::Favorites,

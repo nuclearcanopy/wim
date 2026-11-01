@@ -2394,11 +2394,35 @@ stray paint.
       the channel cannot start crying wolf.
       two mutations caught: discarding the listen result again, and
       both halves reporting as the same kind.
-- [ ] **two of the nine are still open.** `core.rs` 784-797 (four
-      consecutive silent returns in subtitle auto-fetch, so a wrong
-      opensubtitles key looks identical to "no subtitles exist"), and
-      the sibling per-track statuses still dropped on paths other than
-      the first-frame queue refill.
+- [x] **a subtitle fetch says why it failed, so silence means one
+      thing again.** the worker had four endings and **all four were
+      silent**, while only one of them means "nobody has subtitled
+      this film": a refused api key, a failed download and an
+      unwritable directory looked exactly like it. so a typo in
+      `opensubtitles_api_key` was indistinguishable from a film with
+      no subtitles, which matters because setting that key is still an
+      open question in QUESTIONS.md.
+      the three real failures are reported and **the no-results arm
+      stays silent**, which is what makes silence mean that again;
+      saying "no subtitles" on every unsubtitled film is noise.
+      `SubtitleOutcome::{Ready, Failed}` rides the **same channel**
+      rather than a second one, because a failure carries the same
+      video identity and so wants the same staleness guard: reporting
+      a failure for the video you have already moved on from is no
+      more wanted than loading a subtitle for it. that is why `Failed`
+      has a `for_video` at all, and a test pins that the guard filters
+      both variants identically.
+      **an existing source guard had to be narrowed, not deleted.** it
+      asserted `for_video` appears nowhere in the function, which the
+      failure variant legitimately breaks; the invariant was always
+      about the *success* reply, whose tag and written file must come
+      out of one call. it forbids a `SubtitleReady {` literal now,
+      which is what would actually break it.
+      two mutations caught: a refused key going silent again, and a
+      failure carrying no video so the guard cannot filter it.
+- [ ] **one of the nine is still open:** the sibling per-track
+      statuses dropped on paths other than the first-frame queue
+      refill.
 - [x] ~~resolved by the overnight run~~ **two hardcoded keys in rendered text.** `ui/queue.rs` ~188
       hardcodes `'a'` for the remappable `Enqueue` ("enter on a song
       to start, 'a' to add"), the exact bug class

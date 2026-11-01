@@ -59,7 +59,7 @@ macro_rules! core_ctx {
 
 use wim::core::{
     self, drive, BetweenTracks, CoreCtx, Drive, Intent, RemoteSearchOutcome, ScrobbleState,
-    StarFailed, SubtitleReady, TrackResolver,
+    StarFailed, SubtitleOutcome, TrackResolver,
 };
 use wim::download::DownloadEvent;
 use wim::notify::Notifications;
@@ -92,8 +92,8 @@ pub struct Host {
     pub download_tx: Sender<DownloadEvent>,
     pub download_rx: Receiver<DownloadEvent>,
     pub downloading: HashSet<String>,
-    pub subtitle_tx: Sender<SubtitleReady>,
-    pub subtitle_rx: Receiver<SubtitleReady>,
+    pub subtitle_tx: Sender<SubtitleOutcome>,
+    pub subtitle_rx: Receiver<SubtitleOutcome>,
     pub remote_search_tx: Sender<core::RemoteSearchQuery>,
     pub remote_search_result_rx: Receiver<RemoteSearchOutcome>,
     pub scan_rx: Receiver<library::ScanBatch>,
@@ -491,8 +491,17 @@ impl Host {
             }
         }
         while let Ok(sub) = self.subtitle_rx.try_recv() {
-            if core::subtitle_belongs_to_playing(&sub, self.play_queue.current()) {
-                let _ = self.player.sub_add(&sub.path);
+            if !core::subtitle_belongs_to_playing(&sub, self.play_queue.current()) {
+                continue;
+            }
+            match sub {
+                core::SubtitleOutcome::Ready(ready) => {
+                    let _ = self.player.sub_add(&ready.path);
+                }
+                // said rather than swallowed: only "no subtitles for
+                // this film" is silent now, so a refused key does not
+                // look like one.
+                core::SubtitleOutcome::Failed { why, .. } => self.console.fail(why),
             }
         }
         // notifications are wim's toast channel; an overlay here would

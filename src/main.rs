@@ -31,7 +31,7 @@ use wim::core::{
     spawn_background_search, start_session, start_tracking_playback, suggestion_starred_keys,
     sweep_cache, toggle_star, track_started, BetweenTracks, CoreCtx, Dispatch, DownloadCtx,
     Drained, Drive, Intent, RemoteSearchOutcome, RemoteSearchQuery, Report, Resolution,
-    ScrobbleState, SelectStep, SessionStart, StarFailed, SubtitleReady, Surface, TrackResolver,
+    ScrobbleState, SelectStep, SessionStart, StarFailed, Surface, TrackResolver,
 };
 use wim::download::DownloadEvent;
 use wim::enrich::{
@@ -965,7 +965,7 @@ fn main() -> anyhow::Result<()> {
     // subtitles found by `fire_subtitle_fetch`'s thread, loaded into
     // mpv here (it owns the handle); polled every frame same as
     // `sync_rx`.
-    let (subtitle_tx, subtitle_rx) = mpsc::channel::<SubtitleReady>();
+    let (subtitle_tx, subtitle_rx) = mpsc::channel::<wim::core::SubtitleOutcome>();
 
     // live remote search (song titles especially; see
     // `spawn_background_search`'s own doc) debounced off query
@@ -2459,11 +2459,21 @@ fn main() -> anyhow::Result<()> {
             if !wim::core::subtitle_belongs_to_playing(&sub, now_playing.as_ref()) {
                 continue;
             }
-            if player.sub_add(&sub.path).is_ok() {
-                notifications.push(
-                    Severity::Info,
-                    format!("subtitle: {} ({})", sub.release, sub.language),
-                );
+            match sub {
+                wim::core::SubtitleOutcome::Ready(ready) => {
+                    if player.sub_add(&ready.path).is_ok() {
+                        notifications.push(
+                            Severity::Info,
+                            format!("subtitle: {} ({})", ready.release, ready.language),
+                        );
+                    }
+                }
+                // said rather than swallowed: only "no subtitles for
+                // this film" is silent now, so a refused key does not
+                // look like one.
+                wim::core::SubtitleOutcome::Failed { why, .. } => {
+                    notifications.push(Severity::Alert, why);
+                }
             }
         }
 
