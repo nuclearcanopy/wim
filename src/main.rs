@@ -560,9 +560,7 @@ fn suggestions_or_reason(
 fn empty_suggestions_reason(app: &app::App) -> String {
     if app.corpus.is_empty() {
         return loading_message(app.scanning_library, app.syncing_servers)
-            .unwrap_or(
-                "no library yet: check library_paths in config, or set up navidrome (n)",
-            )
+            .unwrap_or("no library yet: check library_paths in config, or set up navidrome (n)")
             .to_string();
     }
     // kept short on purpose: `ui::notify` sizes a box to its text and
@@ -1449,10 +1447,7 @@ fn main() -> anyhow::Result<()> {
         if let Err(e) = ascii.update(
             showing.is_ascii(),
             ascii_media,
-            framesource::Grid::for_area(
-                Rect::new(0, 0, size.0, size.1),
-                aspect,
-            ),
+            framesource::Grid::for_area(Rect::new(0, 0, size.0, size.1), aspect),
             // an unknown position is the start of the file, which is
             // what a just-loaded track is anyway.
             elapsed_secs.unwrap_or(0.0),
@@ -2060,10 +2055,10 @@ fn main() -> anyhow::Result<()> {
                         video_over,
                         art.protocol_type(),
                     ),
-                    SettingsField::AsciiFps => {
-                        ui::settings_menu::ascii_fps_value(cfg.ascii_fps)
+                    SettingsField::AsciiFps => ui::settings_menu::ascii_fps_value(cfg.ascii_fps),
+                    SettingsField::Crossfade => {
+                        if crossfade_enabled { "on" } else { "off" }.to_string()
                     }
-                    SettingsField::Crossfade => if crossfade_enabled { "on" } else { "off" }.to_string(),
                     SettingsField::CrossfadeSeconds => format!("{:.1}s", cfg.crossfade_seconds),
                     SettingsField::CacheDaysThreshold => {
                         format!("{} days played", cfg.cache_days_threshold)
@@ -3293,10 +3288,8 @@ fn main() -> anyhow::Result<()> {
                                 // dropped, or the navidrome catalog the
                                 // previous step just indexed goes with
                                 // it until the next 45s sync.
-                                scan_report = library::restart_scan(
-                                    cfg.library_paths.clone(),
-                                    &mut scan_rx,
-                                );
+                                scan_report =
+                                    library::restart_scan(cfg.library_paths.clone(), &mut scan_rx);
                                 app.corpus.drop_local();
                                 app.scanning_library = true;
                                 app.resync_results();
@@ -3677,49 +3670,73 @@ fn main() -> anyhow::Result<()> {
                             cfg.ascii_fps = config::step_ascii_fps(cfg.ascii_fps, 1);
                             config::save_or_warn(&cfg, &mut notifications);
                         }
-                        KeyCode::Char('h') | KeyCode::Left if settings_field() == SettingsField::Crossfade => {
+                        KeyCode::Char('h') | KeyCode::Left
+                            if settings_field() == SettingsField::Crossfade =>
+                        {
                             crossfade_enabled = false;
                             fade_in_started_at = None;
                             let _ = player.set_volume(base_volume);
                         }
-                        KeyCode::Char('l') | KeyCode::Right if settings_field() == SettingsField::Crossfade => {
+                        KeyCode::Char('l') | KeyCode::Right
+                            if settings_field() == SettingsField::Crossfade =>
+                        {
                             crossfade_enabled = true;
                         }
-                        KeyCode::Char('h') | KeyCode::Left if settings_field() == SettingsField::CrossfadeSeconds => {
+                        KeyCode::Char('h') | KeyCode::Left
+                            if settings_field() == SettingsField::CrossfadeSeconds =>
+                        {
                             cfg.crossfade_seconds =
                                 config::crossfade_seconds(cfg.crossfade_seconds - 0.5);
                         }
-                        KeyCode::Char('l') | KeyCode::Right if settings_field() == SettingsField::CrossfadeSeconds => {
+                        KeyCode::Char('l') | KeyCode::Right
+                            if settings_field() == SettingsField::CrossfadeSeconds =>
+                        {
                             cfg.crossfade_seconds =
                                 config::crossfade_seconds(cfg.crossfade_seconds + 0.5);
                         }
-                        KeyCode::Char('h') | KeyCode::Left if settings_field() == SettingsField::CacheDaysThreshold => {
+                        KeyCode::Char('h') | KeyCode::Left
+                            if settings_field() == SettingsField::CacheDaysThreshold =>
+                        {
                             cfg.cache_days_threshold =
                                 cfg.cache_days_threshold.saturating_sub(1).max(1);
                         }
-                        KeyCode::Char('l') | KeyCode::Right if settings_field() == SettingsField::CacheDaysThreshold => {
+                        KeyCode::Char('l') | KeyCode::Right
+                            if settings_field() == SettingsField::CacheDaysThreshold =>
+                        {
                             cfg.cache_days_threshold = (cfg.cache_days_threshold + 1).min(20);
                         }
-                        KeyCode::Char('h') | KeyCode::Left if settings_field() == SettingsField::CacheEvictionDays => {
+                        KeyCode::Char('h') | KeyCode::Left
+                            if settings_field() == SettingsField::CacheEvictionDays =>
+                        {
                             cfg.cache_eviction_days =
                                 cfg.cache_eviction_days.saturating_sub(1).max(1);
                         }
-                        KeyCode::Char('l') | KeyCode::Right if settings_field() == SettingsField::CacheEvictionDays => {
+                        KeyCode::Char('l') | KeyCode::Right
+                            if settings_field() == SettingsField::CacheEvictionDays =>
+                        {
                             cfg.cache_eviction_days = (cfg.cache_eviction_days + 1).min(90);
                         }
-                        KeyCode::Char('h') | KeyCode::Left if settings_field() == SettingsField::ScrobblePercent => {
+                        KeyCode::Char('h') | KeyCode::Left
+                            if settings_field() == SettingsField::ScrobblePercent =>
+                        {
                             cfg.scrobble.threshold_percent =
                                 (cfg.scrobble.threshold_percent - 5.0).clamp(5.0, 100.0);
                         }
-                        KeyCode::Char('l') | KeyCode::Right if settings_field() == SettingsField::ScrobblePercent => {
+                        KeyCode::Char('l') | KeyCode::Right
+                            if settings_field() == SettingsField::ScrobblePercent =>
+                        {
                             cfg.scrobble.threshold_percent =
                                 (cfg.scrobble.threshold_percent + 5.0).clamp(5.0, 100.0);
                         }
-                        KeyCode::Char('h') | KeyCode::Left if settings_field() == SettingsField::ScrobbleSeconds => {
+                        KeyCode::Char('h') | KeyCode::Left
+                            if settings_field() == SettingsField::ScrobbleSeconds =>
+                        {
                             cfg.scrobble.threshold_seconds =
                                 (cfg.scrobble.threshold_seconds - 15.0).clamp(15.0, 600.0);
                         }
-                        KeyCode::Char('l') | KeyCode::Right if settings_field() == SettingsField::ScrobbleSeconds => {
+                        KeyCode::Char('l') | KeyCode::Right
+                            if settings_field() == SettingsField::ScrobbleSeconds =>
+                        {
                             cfg.scrobble.threshold_seconds =
                                 (cfg.scrobble.threshold_seconds + 15.0).clamp(15.0, 600.0);
                         }
@@ -3980,8 +3997,7 @@ fn main() -> anyhow::Result<()> {
                 // moves a track up there, and this unconditional check
                 // ran first, so the queue's own `Char('J') | Char('K')`
                 // arm was dead for `K` and only `J` ever worked.
-                if key.code == KeyCode::Char('K')
-                    && !(queue_view_open && focus == Focus::Workspace)
+                if key.code == KeyCode::Char('K') && !(queue_view_open && focus == Focus::Workspace)
                 {
                     keybinds_menu_open = true;
                     keybinds_menu_selected = 0;
@@ -4750,9 +4766,7 @@ fn main() -> anyhow::Result<()> {
                         wim::core::Skipped::All | wim::core::Skipped::Short { .. } => {}
                         wim::core::Skipped::AtTheEnd => notifications
                             .push(Severity::Info, "nothing to skip to; this is the last track"),
-                        wim::core::Skipped::Failed(why) => {
-                            notifications.push(Severity::Error, why)
-                        }
+                        wim::core::Skipped::Failed(why) => notifications.push(Severity::Error, why),
                     }
                     continue;
                 }
@@ -4774,15 +4788,13 @@ fn main() -> anyhow::Result<()> {
                     // sidebar has focus, so it's always the sidebar's
                     // own selected search result here.
                     if let Some(item) = app.selected_result().cloned() {
-                        if let Err(msg) =
-                            toggle_star(
-                                &item,
-                                &mut favorites,
-                                &mut remote_starred,
-                                &star_tx,
-                                wim::favorites::save,
-                            )
-                        {
+                        if let Err(msg) = toggle_star(
+                            &item,
+                            &mut favorites,
+                            &mut remote_starred,
+                            &star_tx,
+                            wim::favorites::save,
+                        ) {
                             notifications.push(Severity::Error, msg);
                         }
                     }
@@ -4912,7 +4924,6 @@ mod download_policy_tests {
         assert!(!should_auto_download(5, 2, true, false));
         assert!(!should_auto_download(5, 2, false, true));
     }
-
 }
 
 #[cfg(test)]
@@ -5364,7 +5375,9 @@ mod startup_tests {
             .find("ViewTarget::Suggestions => {")
             .expect("the arm moved or was renamed");
         let arm = &code[at..];
-        let end = arm.find("\n        ViewTarget::").expect("an unterminated arm");
+        let end = arm
+            .find("\n        ViewTarget::")
+            .expect("an unterminated arm");
         let arm = &arm[..end];
         let refusal = arm
             .find("suggestions_or_reason(")
@@ -5510,65 +5523,65 @@ mod settings_video_tests {
 /// facts about how the draw and the vo handover agree with each other.
 #[cfg(test)]
 mod ascii_pane_tests {
-/// The ascii pane's three wiring facts, which need a terminal and a
-/// player to reach any other way. Reads the source above the test
-/// modules, for the reason the test above records.
-///
-/// What a behavioural test elsewhere cannot catch here is a
-/// *bypass*: the pane re-deriving its own answer instead of taking
-/// `showing`'s, or the draw falling through and painting the ui
-/// under the frames.
-#[test]
-fn the_loop_drives_the_ascii_pane_off_one_decision() {
-    let src = include_str!("main.rs");
-    let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
+    /// The ascii pane's three wiring facts, which need a terminal and a
+    /// player to reach any other way. Reads the source above the test
+    /// modules, for the reason the test above records.
+    ///
+    /// What a behavioural test elsewhere cannot catch here is a
+    /// *bypass*: the pane re-deriving its own answer instead of taking
+    /// `showing`'s, or the draw falling through and painting the ui
+    /// under the frames.
+    #[test]
+    fn the_loop_drives_the_ascii_pane_off_one_decision() {
+        let src = include_str!("main.rs");
+        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
 
-    assert!(
-        code.contains("let want_vo = showing.mpv_vo();"),
-        "the vo and the ascii pane are deciding separately, so they can disagree"
-    );
+        assert!(
+            code.contains("let want_vo = showing.mpv_vo();"),
+            "the vo and the ascii pane are deciding separately, so they can disagree"
+        );
 
-    let at = code
-        .find("ascii.update(")
-        .expect("nothing drives the frame source, so the pane is dead code");
-    let call = &code[at..(at + 300).min(code.len())];
-    assert!(
-        call.contains("showing.is_ascii()"),
-        "the pane re-derives whether ascii is wanted instead of taking it:\n{call}"
-    );
+        let at = code
+            .find("ascii.update(")
+            .expect("nothing drives the frame source, so the pane is dead code");
+        let call = &code[at..(at + 300).min(code.len())];
+        assert!(
+            call.contains("showing.is_ascii()"),
+            "the pane re-derives whether ascii is wanted instead of taking it:\n{call}"
+        );
 
-    // anchored at the decision, not file-wide: the key handler reads
-    // `effective` too, so a file-wide search here passes while the
-    // decision ignores the override entirely.
-    let at = code
-        .find("video::showing(")
-        .expect("nothing decides what is on the screen");
-    let decision = &code[at..(at + 400).min(code.len())];
-    assert!(
-        decision.contains("video::effective(cfg.video_output, video_over)"),
-        "the decision reads the config directly, so the ascii key does nothing:\n{decision}"
-    );
+        // anchored at the decision, not file-wide: the key handler reads
+        // `effective` too, so a file-wide search here passes while the
+        // decision ignores the override entirely.
+        let at = code
+            .find("video::showing(")
+            .expect("nothing decides what is on the screen");
+        let decision = &code[at..(at + 400).min(code.len())];
+        assert!(
+            decision.contains("video::effective(cfg.video_output, video_over)"),
+            "the decision reads the config directly, so the ascii key does nothing:\n{decision}"
+        );
 
-    let at = code
-        .find("video::toggle_ascii(cfg.video_output, video_over)")
-        .expect("nothing toggles the mode, so it is config-only again");
-    let press = &code[at..(at + 500).min(code.len())];
-    assert!(
-        press.contains("video_fullscreen = on || video_fullscreen"),
-        "turning it on leaves the pane hidden, so the press looks like a no-op:\n{press}"
-    );
+        let at = code
+            .find("video::toggle_ascii(cfg.video_output, video_over)")
+            .expect("nothing toggles the mode, so it is config-only again");
+        let press = &code[at..(at + 500).min(code.len())];
+        assert!(
+            press.contains("video_fullscreen = on || video_fullscreen"),
+            "turning it on leaves the pane hidden, so the press looks like a no-op:\n{press}"
+        );
 
-    let at = code
-        .find("if ascii.active() {")
-        .expect("the draw never checks for frames, so the ui is drawn over them");
-    let branch = &code[at..(at + 400).min(code.len())];
-    assert!(
-        branch.contains("ascii.paint("),
-        "it branches on frames and never paints them:\n{branch}"
-    );
-    assert!(
-        branch.contains("return;"),
-        "it paints frames and then falls through into the ui:\n{branch}"
-    );
-}
+        let at = code
+            .find("if ascii.active() {")
+            .expect("the draw never checks for frames, so the ui is drawn over them");
+        let branch = &code[at..(at + 400).min(code.len())];
+        assert!(
+            branch.contains("ascii.paint("),
+            "it branches on frames and never paints them:\n{branch}"
+        );
+        assert!(
+            branch.contains("return;"),
+            "it paints frames and then falls through into the ui:\n{branch}"
+        );
+    }
 }

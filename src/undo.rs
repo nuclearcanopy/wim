@@ -1344,8 +1344,6 @@ mod restore {
         item.identity().1.into_owned()
     }
 
-
-
     // ------------------------------------------------- the queue half
 
     /// The restore branch that restarts a track used to be the one of

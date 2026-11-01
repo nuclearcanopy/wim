@@ -158,12 +158,7 @@ pub enum Move {
 /// `want` is `showing(..).mpv_vo()`, `have` is the vo mpv is drawing
 /// with right now, and `armed` is the size it was given when it was
 /// armed.
-pub fn handover(
-    want: Option<Vo>,
-    have: Option<Vo>,
-    size: (u16, u16),
-    armed: (u16, u16),
-) -> Move {
+pub fn handover(want: Option<Vo>, have: Option<Vo>, size: (u16, u16), armed: (u16, u16)) -> Move {
     match want {
         // the vo changed (or there was none), so arming is the only
         // move: a bounce would re-init the one being replaced.

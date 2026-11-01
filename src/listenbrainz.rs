@@ -387,7 +387,10 @@ mod submission_wiring {
             let refuse = listen.track().contains("refuse me");
             seen.lock().unwrap().push(listen);
             let (status, reply) = if refuse {
-                ("401 Unauthorized", "{\"code\":401,\"error\":\"invalid token\"}")
+                (
+                    "401 Unauthorized",
+                    "{\"code\":401,\"error\":\"invalid token\"}",
+                )
             } else {
                 ("200 OK", "{\"status\":\"ok\"}")
             };
@@ -436,7 +439,10 @@ mod submission_wiring {
         let failed = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the refusal has to reach the host");
-        assert_eq!(failed.kind, "listen", "it says which submission: {failed:?}");
+        assert_eq!(
+            failed.kind, "listen",
+            "it says which submission: {failed:?}"
+        );
         assert!(
             failed.error.to_lowercase().contains("401")
                 || failed.error.to_lowercase().contains("unauthor"),

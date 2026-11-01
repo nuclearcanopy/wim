@@ -1237,8 +1237,7 @@ pasword = "x"
     /// pins the other half, that `Auto` will not pick it either.
     #[test]
     fn the_ascii_video_output_is_spelled_the_way_it_reads() {
-        let cfg: Config =
-            toml::from_str("video_output = \"ascii\"\n").expect("ascii has to parse");
+        let cfg: Config = toml::from_str("video_output = \"ascii\"\n").expect("ascii has to parse");
         assert_eq!(cfg.video_output, VideoOutput::Ascii);
 
         for (raw, want) in [
