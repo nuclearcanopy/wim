@@ -2126,6 +2126,11 @@ impl<'a> Lowering<'a> {
             parse_statement(input, offset, text, &world)?
         };
         self.track(&call);
+        // the latch is per statement, not per submission: it exists so
+        // one blown expansion reports once instead of 256 times, and
+        // leaving it set made the next statement's `repeat` lower to
+        // nothing at all with nothing said.
+        self.refused = false;
         self.lower(&call, false);
         Ok(())
     }
@@ -5685,6 +5690,38 @@ mod tests {
             .nodes
             .iter()
             .any(|n| matches!(n, Node::Note(text) if text.contains("expand"))));
+    }
+
+    /// The refusal is latched so one blown expansion reports once
+    /// rather than 256 times, but the latch is per `Lowering` and a
+    /// `Lowering` spans the whole submission: the next statement's
+    /// `repeat` saw the latch, returned without pushing anything, and
+    /// lowered to nothing at all with nothing said.
+    #[test]
+    fn a_statement_refused_for_expansion_says_so_rather_than_vanishing() {
+        let program =
+            Program::parse("repeat(256, repeat(256, skip())); repeat(2, pause()); mute()")
+                .expect("should parse");
+        let refusals = program
+            .nodes
+            .iter()
+            .filter(|n| matches!(n, Node::Fail(t) if t.contains("expand")))
+            .count();
+        assert_eq!(
+            refusals, 2,
+            "each refused statement reports once: not none, not 256 times"
+        );
+        // read off the nodes rather than stepped, like the nested-repeat
+        // bound is: the program is thousands of steps long.
+        let emitted = |op: Op| program.nodes.contains(&Node::Emit(op));
+        // positive control: the program is not simply dead after the
+        // first refusal, so "nothing ran" cannot be mistaken for "the
+        // budget stopped everything".
+        assert!(emitted(Op::Mute(true)), "a later plain statement still ran");
+        assert!(
+            !emitted(Op::TogglePause),
+            "the refused statement emitted nothing, which is the bound working"
+        );
     }
 
     #[test]
