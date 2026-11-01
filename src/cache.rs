@@ -786,6 +786,16 @@ impl CacheIndex {
         self.entries.get(id)
     }
 
+    /// Every tracked id with its entry, in no particular order. What
+    /// lets the suggestion engine walk the history instead of asking
+    /// of every track in the library whether it has any: a played
+    /// library is a fraction of a catalog, and this is one hash per
+    /// recorded track rather than one per catalog track. See
+    /// `suggest::cost::what_the_history_lookups_cost`.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &CacheEntry)> {
+        self.entries.iter().map(|(id, entry)| (id.as_str(), entry))
+    }
+
     // not read anywhere outside this module's own tests yet; kept as
     // part of the public read API for whatever UI surface later wants
     // to show "played N times" (same documented gap as
