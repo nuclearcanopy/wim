@@ -611,8 +611,23 @@ impl TrackResolver {
         }
     }
 
+    /// Hands a batch straight to `poll`, as a worker would.
+    ///
+    /// `pub(crate)` so `undo.rs` can state its rule directly. Its
+    /// resolver test used to fire two *real* off-thread requests at a
+    /// fixture host and wait up to 20s for a control to land, then 2s
+    /// to assert the second did not: slow, and the shape three other
+    /// tests in this repo already passed for the wrong reason in
+    /// (they raced DNS). An injected batch is the same assertion with
+    /// no clock in it.
     #[cfg(test)]
-    fn deliver(&self, epoch: u64, ticket: Option<u64>, into: Intent, tracks: Vec<SearchItem>) {
+    pub(crate) fn deliver(
+        &self,
+        epoch: u64,
+        ticket: Option<u64>,
+        into: Intent,
+        tracks: Vec<SearchItem>,
+    ) {
         let _ = self.tx.send(ResolvedBatch {
             epoch,
             ticket,
@@ -623,7 +638,7 @@ impl TrackResolver {
     }
 
     #[cfg(test)]
-    fn epoch(&self) -> u64 {
+    pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
     }
 
@@ -631,7 +646,7 @@ impl TrackResolver {
     /// for), so a test can state the lost-ticket rule in the
     /// resolver's own terms rather than guessing at numbers.
     #[cfg(test)]
-    fn tickets(&self) -> (u64, u64) {
+    pub(crate) fn tickets(&self) -> (u64, u64) {
         (self.next_ticket, self.next_delivery)
     }
 }

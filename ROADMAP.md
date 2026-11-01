@@ -1971,13 +1971,24 @@ do the wrong thing quietly, which is worse to diagnose.
       condition never firing, and comparing without saving). that is
       the assertion-that-cannot-fail shape this file records finding
       four times in other people's tests, and I wrote one.
-- [ ] **two seams the undo work hit are still open.**
-      `TrackResolver::deliver`/`epoch` are `#[cfg(test)]` **private**,
-      so undo.rs cannot inject a batch and its test works around it
-      with a real off-thread request plus a positive control;
-      `pub(crate)` would make it direct. (core.rs's `CoreCtx` harness
-      is no longer one of these: it is `pub(super)` now and shared.)
-- [x] ~~done in the overnight run~~ **`core.rs` ~1206: `go_to_previous` fires three of the five
+- [x] **the resolver's test seam is `pub(crate)`, and the test it
+      freed was racy.** `undo.rs` could not inject a batch, so its
+      resolver test fired two **real** off-thread requests at a
+      fixture host, waited up to 20s for a control to land and 2s to
+      assert the second did not. that is the shape three other tests
+      here already passed for the wrong reason in (they raced DNS).
+      `deliver`/`epoch`/`tickets` are `pub(crate)` now; the test
+      injects and runs in 0.17s instead of up to 22.
+      **and the first de-raced version lost its teeth, which is the
+      part worth recording.** it took a ticket from `tickets()` for
+      each delivery, but only `request` advances that counter, so both
+      batches reused one number and `poll` withheld the second for
+      *that* reason rather than the epoch's: deleting the invalidate
+      left it green. `ticket: None` (the download path's shape) makes
+      the epoch the only gate, which is the rule under test, and the
+      mutation fails again.
+      the second seam in this entry is closed too: core.rs's `CoreCtx`
+      harness is `pub(super)` and shared rather than copied.- [x] ~~done in the overnight run~~ **`core.rs` ~1206: `go_to_previous` fires three of the five
       track-start hooks by hand** instead of calling `track_started`,
       which is the exact parity bug `track_started` was created to
       close. enable crossfade, press skip-back during a fade-out: no
@@ -2478,16 +2489,23 @@ stray paint.
       which is what would actually break it.
       two mutations caught: a refused key going silent again, and a
       failure carrying no video so the guard cannot filter it.
-- [ ] **one of the nine is still open:** the sibling per-track
-      statuses dropped on paths other than the first-frame queue
-      refill.
-- [x] ~~resolved by the overnight run~~ **two hardcoded keys in rendered text.** `ui/queue.rs` ~188
+- [x] **all nine discarded results are closed.** the last one was
+      "sibling per-track statuses on paths other than the first-frame
+      refill", and re-checking found there are none: all four
+      production `enqueue_track` call sites handle their result now
+      (`append_resolved` counts, the silence arm matches, `enqueue_next`
+      returns, and the refill counts what it lost).- [x] ~~resolved by the overnight run~~ **two hardcoded keys in rendered text.** `ui/queue.rs` ~188
       hardcodes `'a'` for the remappable `Enqueue` ("enter on a song
       to start, 'a' to add"), the exact bug class
       `help::Key::Bound` exists to prevent and that the roadmap
-      records fixing in onboarding. **the keybinds menu's "k to close" is
-      fixed** (it reads "shift+k or esc: close"); `queue.rs`'s
-      hardcoded `'a'` is still open.
+      records fixing in onboarding. both are fixed: the keybinds menu
+      reads "shift+k or esc: close", and `queue.rs` resolves
+      `KeyAction::Enqueue` live, pinned by a test that rebinds it to
+      `f5` and asserts the drawn text follows.
+      (this entry carried "`queue.rs`'s hardcoded `'a'` is still open"
+      for several rounds **after it was fixed**, which is worse than an
+      unchecked entry: a live claim inside a checked one is where
+      nobody looks.)
 - [x] ~~done in the overnight run~~ **`main.rs` ~556: `wim` has no `--help`.** it handles only
       `--version` and silently ignores every other argument, so
       `wim --help` and `wim song.mp3` both just start the TUI with no
