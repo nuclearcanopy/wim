@@ -664,9 +664,32 @@ and `in-workspace (sub-rect) video` is still kitty-only via
         back past the narrow pane, a cycle that skips `ascii` (making
         it unselectable from the ui), a nudge off uncapped landing on
         10fps, and an indexing `field_at` that panics.
-      - [ ] **the crumbs.** `ui/help.rs`'s curated list does not mention
-        shift-`v` (the keybinds menu lists it automatically off
-        `ALL_ACTIONS`), and there is no shellsong command for the mode.
+      - [x] **the crumbs.** both done. `ui/help.rs` lists shift-`v` as
+        "video as text cells" (the polish agent added it, with a guard
+        that walks `ALL_ACTIONS` against the table so the next action
+        cannot reach a keymap without reaching the help), and
+        `video(mode)` is a shellsong command taking the same five words
+        config.toml takes.
+        the command writes `video_output` to config.toml where the key
+        only overrides it for the run: the key is the quick toggle, the
+        command is the setting. it clears the key's override as it
+        goes, since the override wins over config and would otherwise
+        swallow the change, which is the trap the settings menu's own
+        row already had to avoid. applied by the frame loop rather than
+        in the op, because `CoreCtx` holds `&cfg` for the whole frame;
+        same deferral `shellsong_queued` uses, and drained *before* the
+        `video::showing` call so it lands on the frame that answers it.
+        classified `Ignored` in the undo tree, like the settings row:
+        making a persisted display preference restorable would mean the
+        snapshot carrying config.toml and undo rewriting the file.
+        `VideoOutput::word()` is now shared by the command's report and
+        the settings row, so the two spellings cannot drift; a test
+        asserts each equals what config.toml accepts.
+        four mutations caught, and **three of the repo's own exhaustive
+        tests caught the addition before any of mine did**: the pinned
+        completion list (in three places), the parameter-class coverage
+        list, and `undo::classify`'s exhaustive match. that is the
+        table-driven design working.
 - [x] **usable at absurd zoom-out.** the stored sidebar width and bar
       height are absolute cell counts, which is right across the band
       people use and wrong at both ends. `PanelLayout::sidebar_for
@@ -2030,19 +2053,49 @@ same-process ratios are quoted.
 Each of these was measured by an agent that could not reach the file it
 needed, so the number is real and the work is scoped.
 
-- [ ] **`CacheIndex::entry` is 44% of a suggestions pass**, and 92% of
-      the affinity stage: 9412us per-track against 767us with the
-      lookup removed. The flip (walk the ~10k index entries instead of
-      30.8k tracks) is not a win while it pays both a `by_key` and an
-      `entry` lookup, so it needs `CacheIndex::entries()` in
-      `cache.rs`. That is now the largest single cost in the menu.
-- [ ] **`play_days` is where a big play index goes.** 20k tracks parse
-      in 36-41ms at 4 play days and **256-271ms at 64**, nine tenths of
-      it allocating `Vec<String>`s of `YYYY-MM-DD` on the main thread
-      before the first frame. Only `.len()` and `.first()` are read
-      outside `cache.rs` (`suggest.rs:1100,1103`), so a packed
-      representation takes it back; it changes a `pub` field, which is
-      why the agent stopped.
+- [x] **`CacheIndex::entry` is 44% of a suggestions pass.** Done, and
+      **the framing this entry carried was wrong, twice.**
+      It said the flip was held back by "paying both a `by_key` and an
+      `entry` lookup". It was not: flipping the join on the original
+      code measured **1.06x, 1.10x and 1.14x**, nowhere near the
+      predicted collapse. A per-leg breakdown found the real cost:
+      `day_number` re-parsing the first `YYYY-MM-DD` of every played
+      track was **2823us of a 5571us stage, 51%**.
+      And the "767us with the lookup removed" figure that sized this
+      item was **not a floor at all**: with `entry` statically `None`
+      the compiler constant-folds the loop body, so that number
+      measured dead code. A measurement of a variant that cannot run is
+      not a measurement of anything.
+      So the two items in this section were one fix: packing the days
+      takes that leg to 65us, and **only then** does the flip pay, at
+      1.31-1.93x on a stage that is 44% of a pass. The join keeps the
+      per-track version as an oracle and compares all seven fields of
+      all 30800 affinities to the bit, plus `total_plays`, including
+      starred cases and 64 ghost history keys the library lacks.
+      a third finding, measured and deliberately **not** landed as an
+      unassigned change: an FxHash-style hasher for `Catalog::by_key`
+      and the cache map is 1.37-2.39x on probes and 1.50x on
+      `cache.entry`, and `by_key` probes are now 1086-3028us of the
+      stage, i.e. the next bottleneck. Both maps are in those two files
+      and neither has a load-bearing iteration order. The trade is
+      SipHash's DoS resistance on keys that come from the user's own
+      navidrome server and local paths. Worth its own slice.
+- [x] **`play_days` is where a big play index goes.** Packed into day
+      numbers: **2.57-2.61x** at 20000 tracks x 64 days (220ms to 86ms,
+      cpu clock, labelled-vs-packed alternating in one process) and
+      1.35-1.46x at the smaller shapes, with the file 18.5MB down to
+      9.6MB. `day_number` moved to `cache.rs` beside `day_of`, whose
+      exact inverse it is.
+      on-disk compat is a hand-written visitor reading an integer *or*
+      a `YYYY-MM-DD` label per day, **not** `#[serde(untagged)]`, which
+      would buffer every day into a `Content` tree. An unreadable day
+      costs that day and not the track, because the legacy
+      `index.toml` is one document and one hand-edited date must not
+      reset a whole history; both of those are tested, and the two
+      older-format tests still pass.
+      seven mutations, each killed by its aimed test, including three
+      separate refusals of the label path and the int paths for toml
+      and ndjson.
 - [x] **the resume queue's cost is the stats, not the parse.** Fixed.
       `item_from_path` stats every saved path (`is_file`), and the loop
       ran before the first frame while the mpv appends it feeds were
@@ -2078,14 +2131,33 @@ needed, so the number is real and the work is scoped.
       rows fit and 0.82x where they do not, because the second case
       pays an extra width walk; the version that wins both is an
       in-place truncate, so the paint can hold one buffer end to end.
-- [ ] **`search::Ranking::group_boundaries_upto`.** `boundaries()` is
-      O(total matches) and is now the whole remaining geometry cost of
-      a results frame; `layout` only needs boundaries up to
-      `max(selected, visible_rows)`, which would make a 15k list with
-      the selection near the top walk ~40 items instead of 15000.
-- [ ] **main.rs computes the results geometry three times a frame**
-      (junction marks, click map, paint). Passing one `RowLayout` cuts
-      it to one: ~280us a frame down to ~93us at 15k matches.
+- [x] **the results frame's geometry is flat now, and `_upto` was the
+      wrong fix.** `rank_order` already builds the order one category
+      run at a time, so the boundaries are a by-product: `Ranking`
+      records `runs: Vec<(usize, Category)>` and `group_boundaries`
+      reads it, still behind the `addresses()` revision check so a
+      stale order still reports no headers.
+      **14.2x on a 15k-match frame** (349.8us to 24.5us) with the
+      selection on row 0 and 13.2x on the last row; one geometry call
+      is 0.4us flat against 85-90us walked. That was ~73% of this
+      list's frame work, now 0.02% of a 144hz budget.
+      the assigned `group_boundaries_upto` was built and benched first
+      and **rejected**: 17.8x with the selection on row 0 but **1.0x on
+      the last row**, since the headers above the selection must be
+      counted either way, and it narrows `RowLayout` to answering only
+      inside its own window, which is a hazard on a `pub` type. Both
+      numbers are recorded in `frame_budget` so it is not retried.
+      correctness is pinned by grid literals recorded off the
+      **pre-change** code, plus full `Buffer` equality (styles
+      included, so the selection plate counts) across three boundary
+      sources at n = 8/40/137/1000 and six selections.
+- [x] ~~**main.rs computes the results geometry three times a frame**
+      (junction marks, click map, paint).~~ **Dropped, not done.** The
+      recorded-runs change above made a geometry call 0.4us flat, so
+      the three calls together are now worth ~0.8us and threading a
+      `RowLayout` through the draw path would be churn for nothing.
+      Recorded rather than deleted because the arithmetic that made it
+      look worth ~190us a frame was correct when it was written.
 
 ### measured and rejected: a packed search prefilter (2026-11-01)
 
