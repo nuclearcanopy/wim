@@ -2170,7 +2170,13 @@ fn attributes_of(pool: &[Candidate]) -> (Vec<Attrs>, usize, usize, usize, usize)
             },
         })
         .collect();
-    (attrs, artists.len(), albums.len(), genres.len(), reasons.len())
+    (
+        attrs,
+        artists.len(),
+        albums.len(),
+        genres.len(),
+        reasons.len(),
+    )
 }
 
 /// Greedy MMR-ish selection: hard caps per artist and per album, plus a
@@ -4448,8 +4454,7 @@ mod cost {
                 if candidate.album_key.is_some() && album_count >= tuning.max_per_album {
                     continue;
                 }
-                if sections.get(&candidate.reason).copied().unwrap_or(0)
-                    >= tuning.section_max_items
+                if sections.get(&candidate.reason).copied().unwrap_or(0) >= tuning.section_max_items
                 {
                     continue;
                 }
@@ -4552,10 +4557,7 @@ mod cost {
             interned.len()
         );
         assert_eq!(
-            interned
-                .iter()
-                .filter(|c| c.artist_key.is_empty())
-                .count(),
+            interned.iter().filter(|c| c.artist_key.is_empty()).count(),
             4,
             "every untagged row has to be selectable; the empty key is not a key"
         );
@@ -4815,10 +4817,20 @@ mod cost {
             let new = affinities + genre_new + tail_new;
             let old = affinities + genre_old + tail_old;
             println!("  {:<26} {:>9} {:>9}", "", "new", "old");
-            println!("  {:<26} {affinities:>9.0} {affinities:>9.0}", "affinity + rollups");
+            println!(
+                "  {:<26} {affinities:>9.0} {affinities:>9.0}",
+                "affinity + rollups"
+            );
             println!("  {:<26} {genre_new:>9.0} {genre_old:>9.0}", "genre rollup");
-            println!("  {:<26} {tail_new:>9.0} {tail_old:>9.0}", "generation + selection");
-            println!("  {:<26} {new:>9.0} {old:>9.0}us  {:.2}x", "pass", old / new);
+            println!(
+                "  {:<26} {tail_new:>9.0} {tail_old:>9.0}",
+                "generation + selection"
+            );
+            println!(
+                "  {:<26} {new:>9.0} {old:>9.0}us  {:.2}x",
+                "pass",
+                old / new
+            );
         }
     }
 

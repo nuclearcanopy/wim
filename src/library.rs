@@ -1149,7 +1149,9 @@ mod tests {
         let pooled = walk_root(&as_str);
         assert_eq!(pooled.len(), 30, "precondition: the tree was walked");
         assert!(
-            serial.iter().all(|(_, k, m)| *k == MediaKind::Video && m.is_some()),
+            serial
+                .iter()
+                .all(|(_, k, m)| *k == MediaKind::Video && m.is_some()),
             "precondition: the stat'ing walk did read every one of these"
         );
         assert!(
@@ -1178,7 +1180,10 @@ mod tests {
             want.insert(path, None);
         }
         for (path, mtime) in want.iter_mut() {
-            *mtime = fs::symlink_metadata(path).ok().as_ref().and_then(mtime_nanos);
+            *mtime = fs::symlink_metadata(path)
+                .ok()
+                .as_ref()
+                .and_then(mtime_nanos);
         }
         assert_eq!(want.len(), 300, "precondition: the tree was walked");
         assert_eq!(
@@ -1225,7 +1230,10 @@ mod tests {
     fn a_symlinked_track_is_cached_against_its_targets_mtime() {
         let root = media_tree("symlinked", 1, "flac");
         let target = root.join("real song.flac");
-        let link = root.join("artist 0").join("album 0").join("linked song.flac");
+        let link = root
+            .join("artist 0")
+            .join("album 0")
+            .join("linked song.flac");
         fs::write(&target, b"").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
         // the target's mtime is set outright rather than by touching
@@ -1233,8 +1241,14 @@ mod tests {
         // write right after the symlink lands on the same one.
         backdate(&target, 1_000_000);
         let target_mtime = fs::metadata(&target).ok().as_ref().and_then(mtime_nanos);
-        let link_mtime = fs::symlink_metadata(&link).ok().as_ref().and_then(mtime_nanos);
-        assert!(target_mtime.is_some() && target_mtime != link_mtime, "precondition");
+        let link_mtime = fs::symlink_metadata(&link)
+            .ok()
+            .as_ref()
+            .and_then(mtime_nanos);
+        assert!(
+            target_mtime.is_some() && target_mtime != link_mtime,
+            "precondition"
+        );
 
         let found = walk_root(&root.to_string_lossy());
         let (_, kind, mtime) = found
