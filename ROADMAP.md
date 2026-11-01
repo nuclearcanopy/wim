@@ -2026,27 +2026,37 @@ do the wrong thing quietly, which is worse to diagnose.
       close. enable crossfade, press skip-back during a fade-out: no
       bound eq/volume/speed, and the volume is left wherever the ramp
       last wrote it for the whole track.
-- [ ] **the resolver's queue append has no undo hook, and the reason
-      is a timing one worth writing down before anyone starts.**
-      the site is `track_resolver.poll()`'s drain loop in main.rs (grep
-      `let _ = &mut surf;`, which is the tell: a `Surface` is built and
-      deliberately unused). queue an album, undo, redo: the tracks
-      vanish.
-      **the snapshot is not missing, it is early.** `queue(album)` is
-      recorded when it is typed, which is before the fan-out has
-      resolved a single track, so the snapshot redo restores is a state
-      that never saw them. so the fix is not "add a hook here" but
-      "record again once the tracks land", which raises a question the
-      audit did not: a second snapshot per async batch means an undo
-      tree with a node the user never typed. the alternative is
-      amending the existing node in place, which `undo::Tree` has no
-      operation for. **pick deliberately and say which in the entry**;
-      amending is probably right, since the user performed one action.
-      relatedly `core.rs` ~450: the resolver *reads* the epoch rather
-      than bumping it, which is right for `Intent::Back` but means two
-      `Intent::Front` batches fight for the same insert slot, so
-      queue-front album A then album B and the order is
-      nondeterministic run to run.
+- [x] **a queued album's tracks now land on the row that queued
+      them.** queue an album, undo, redo and the tracks vanished: the
+      fan-out is async, so `queued crest` was recorded *before* a
+      single track resolved, and the row held a state that never saw
+      them. undo worked; **redo lost them**.
+      `Tree::amend_row` re-snapshots the row rather than adding one.
+      the alternative (a second node for the arrival) would need **two
+      undos to get back past one keypress**, which is the wrong shape:
+      one user action is one row.
+      **the design note left here was under-specified and the reason
+      is worth keeping.** it suggested carrying a node id, which
+      cannot work: an op records *after* it dispatches, so the node
+      does not exist when the request is made. the targeting is the
+      row's label instead, which is exact rather than a guess, because
+      the row's and the resolver's both come from
+      `item.primary_name()`.
+      three refusals, each mutation-checked, each of which would
+      corrupt something: a **mismatched label**, which is what stops a
+      keypress made while the fan-out was in flight from collecting
+      someone else's tracks; a row with **children**, since amending
+      something walked past rewrites a state redo can reach (the rule
+      `coalesces` already applies, for the same reason); and the
+      **root**, which is the state the session started in and not an
+      op. wired in both drains, so shellswim gets it too.
+      the three synchronous `Resolution::Ready` paths need nothing:
+      their op records after the tracks are already in.
+- [ ] **the resolver still reads the epoch rather than ordering
+      `Intent::Front` batches**, so queue-front album A then album B
+      and the order is nondeterministic run to run. (a ticket scheme
+      landed for this; this entry survives only if the Front case is
+      still open, which wants re-checking against `core.rs` ~450.)
 - [ ] **`main.rs` ~2356 / `shellsong_host.rs` ~569: a settle can
       answer the wrong query.** `SearchSettle::answered` clears
       `pending_since` unconditionally and `RemoteSearchOutcome`

@@ -464,6 +464,41 @@ impl<S> Tree<S> {
         self.current = id;
     }
 
+    /// Re-snapshots the row named `label`, if it is still the current
+    /// one, leaving the row itself alone.
+    ///
+    /// For a state change that belongs to an op **already recorded**:
+    /// queueing an album spawns an async fan-out, so the tracks land
+    /// *after* the `queued crest` row was written, and the row holds a
+    /// state that never saw them. undo then works and **redo loses the
+    /// tracks**. One user action is one row, so this amends rather
+    /// than adding a row nobody typed (which would also need two
+    /// undos to get back past one keypress).
+    ///
+    /// `label` is the targeting, and it has to be: the node does not
+    /// exist when the request is made (the op records *after* it
+    /// dispatches), so there is no id to carry. The label is exact
+    /// rather than a guess, because the row's and the resolver's both
+    /// come from `item.primary_name()`.
+    ///
+    /// Refused at the root (a state, not an op), at a node with
+    /// children (walked past, so amending rewrites a state redo can
+    /// reach, the rule `coalesces` applies for the same reason), and
+    /// when the label does not match, which is what keeps a keypress
+    /// made while the fan-out was in flight from collecting someone
+    /// else's tracks.
+    pub fn amend_row(&mut self, label: &str, snapshot: S) -> bool {
+        if self.current == 0 {
+            return false;
+        }
+        let node = &mut self.nodes[self.current];
+        if !node.children.is_empty() || node.label != label {
+            return false;
+        }
+        node.snapshot = snapshot;
+        true
+    }
+
     /// Whether this op folds into the node already current.
     ///
     /// A barrier never coalesces: each irreversible effect is its own
@@ -630,6 +665,57 @@ mod tests {
 
     fn rec(t: &mut Tree<&'static str>, s: &'static str, now: Duration) {
         t.record(s, s.to_string(), None, None, now);
+    }
+
+    /// An async effect lands on the row that caused it.
+    ///
+    /// Queueing an album records its row immediately and the fan-out
+    /// arrives seconds later, so without this the row holds a state
+    /// with none of the tracks in it: undo works and **redo loses
+    /// them**.
+    #[test]
+    fn a_late_effect_amends_the_row_that_caused_it() {
+        let (mut t, t0) = tree();
+        rec(&mut t, "queued crest", at(t0, 10));
+        assert!(
+            t.amend_row("queued crest", "queued crest + 12 tracks"),
+            "the row is current and unvisited, so it takes the amend"
+        );
+        // and that is what redo gets back to.
+        assert_eq!(t.undo(), Moved::To(&"start"));
+        assert_eq!(t.redo(), Moved::To(&"queued crest + 12 tracks"));
+    }
+
+    /// The three refusals, each of which would corrupt something.
+    #[test]
+    fn an_amend_is_refused_wherever_it_could_rewrite_history() {
+        // a keypress while the fan-out was in flight: the current row
+        // is somebody else's, and amending it would hand them the
+        // album's tracks.
+        let (mut t, t0) = tree();
+        rec(&mut t, "queued crest", at(t0, 10));
+        rec(&mut t, "volume 50%", at(t0, 20));
+        assert!(
+            !t.amend_row("queued crest", "wrong row"),
+            "a mismatched label must not collect another row's effect"
+        );
+        assert_eq!(t.undo(), Moved::To(&"queued crest"), "and nothing moved");
+
+        // walked past: the row has a child, so a redo can reach the
+        // state being overwritten.
+        let (mut t, t0) = tree();
+        rec(&mut t, "queued crest", at(t0, 10));
+        rec(&mut t, "next", at(t0, 20));
+        assert_eq!(t.undo(), Moved::To(&"queued crest"));
+        assert!(
+            !t.amend_row("queued crest", "rewritten"),
+            "amending a visited row rewrites a state redo can reach"
+        );
+        assert_eq!(t.redo(), Moved::To(&"next"), "the child is still there");
+
+        // the root is the state the session started in, not an op.
+        let (mut t, _) = tree();
+        assert!(!t.amend_row("start", "not an op"));
     }
 
     #[test]
@@ -951,6 +1037,15 @@ impl Recorder {
         if let Some(tree) = &mut self.tree {
             tree.record(snapshot, label, kind, barrier, now);
         }
+    }
+
+    /// See `Tree::amend_row`. False when there is no tree yet, or the
+    /// row has been walked past, or something else was recorded while
+    /// the fan-out was in flight.
+    pub fn amend_row(&mut self, label: &str, snapshot: Snapshot) -> bool {
+        self.tree
+            .as_mut()
+            .is_some_and(|tree| tree.amend_row(label, snapshot))
     }
 
     pub fn undo(&mut self) -> Outcome {
