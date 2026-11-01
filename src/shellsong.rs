@@ -3358,7 +3358,12 @@ fn coerce(
             // zero is refused here rather than at apply time: a
             // silence of no length is a typo, not an instruction.
             Ok((None, Pos::Seconds(s))) if s > 0.0 => Ok(Arg::Span(s)),
-            Ok((None, Pos::Seconds(_))) => Err(bad("a silence needs a length".into())),
+            // named for the command that asked, since `pause` shares
+            // this type: "a silence needs a length" answered `pause(0)`
+            // with a command the user never typed.
+            Ok((None, Pos::Seconds(_))) => {
+                Err(bad(format!("{}: needs a length above 0", command.name)))
+            }
             Ok(_) => Err(expected()),
             Err(why) => Err(bad(format!("{}: {why}", command.name))),
         },
@@ -6699,6 +6704,19 @@ mod tests {
                 secs: DEFAULT_FADE_SECS
             }]
         );
+    }
+
+    /// `Ty::Span` is shared by `silence` and `pause`, and its
+    /// zero-length refusal was written for `silence` alone: asking to
+    /// `pause(0)` answered "a silence needs a length", which names a
+    /// command the user did not type.
+    #[test]
+    fn a_zero_span_names_the_command_that_asked_for_it() {
+        let e = error("pause(0)");
+        assert!(e.message.starts_with("pause:"), "{}", e.message);
+        assert!(e.message.contains("needs a length"), "{}", e.message);
+        let e = error("silence(0s)");
+        assert!(e.message.starts_with("silence:"), "{}", e.message);
     }
 
     /// `f64::parse` accepts `inf` and `nan`, and the host turns every
