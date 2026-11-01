@@ -1887,6 +1887,29 @@ a measurement.
       two mutations caught: clearing unconditionally again, and
       forgetting which query is outstanding.
 
+### measured and rejected: a packed search prefilter (2026-11-01)
+
+- [x] **`Entry` is 168 bytes and the prefilter reads 12 of them**, so
+      a keystroke's mask walk strides ~6.7mb through cache at 40k
+      items. A packed `{mask, word_lens}` copy is **4.0x faster** on
+      that walk (236us to 58us, cpu clock, alternating batches in one
+      process): `search::tests::bench_cpu_prefilter_layout`.
+      **Not landed.** The walk is ~236us of a 20ms pass for "bla", so
+      4x on it is **about 1%**: the real cost is nucleo scoring the
+      ~20k survivors plus `best_typo_score` on the rest, and even a
+      query matching nothing spends its 3.9ms there. A parallel `Vec`
+      would duplicate two fields `best_typo_score` reads off `Entry`
+      anyway, handing three mutation sites a desync-by-construction
+      hazard for one percent. The bench stays, with the arithmetic in
+      its doc, so the next reader does not re-derive the idea and land
+      it.
+      the loop's own earlier reasoning was wrong in a way worth
+      recording: "a query matching nothing still costs 3.9ms, so the
+      walk must be the floor" confused the *simplified* gate a bench
+      can express with the real one. `score_chunk`'s typo path has
+      three more conditions, so nearly everything reaches
+      `best_typo_score`, which is where that 3.9ms goes.
+
 ### the queue seam, audited 2026-11-01
 
 - [x] **deleting the playing track, when it was the last one,
