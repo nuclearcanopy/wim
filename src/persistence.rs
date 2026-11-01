@@ -266,24 +266,37 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// Alternating batches in one process, best of each, in
-    /// microseconds. Same helper and the same reason as
-    /// `framesource::frame_budget::best_each`: sequential runs on this
-    /// box differ 1.6-1.8x under load, so two numbers from two runs
-    /// are not comparable and this is the only shape that is.
-    fn best_each(
+    /// Alternating batches in one process, best of each, on the
+    /// process cpu clock: both sides here are single-threaded. Same
+    /// shape as `framesource::frame_budget::best_each`, different
+    /// clock. This box's
+    /// other cores are not idle during a bench run (load average 28
+    /// observed, wall 6x cpu on the same work), so wall clock moves
+    /// several-fold between batches while the work done does not. A
+    /// pooled candidate still has to be read on the wall clock, since
+    /// cpu time is exactly what it trades away.
+    fn best_each_cpu(
         rounds: usize,
         iters: usize,
         a: &mut dyn FnMut(),
         b: &mut dyn FnMut(),
     ) -> (f64, f64) {
+        let cpu_now = || {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: clock_gettime only writes the timespec we hand it.
+            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+            ts.tv_sec as f64 * 1e6 + ts.tv_nsec as f64 / 1e3
+        };
         let mut best = (f64::MAX, f64::MAX);
         let time = |f: &mut dyn FnMut()| {
-            let at = std::time::Instant::now();
+            let at = cpu_now();
             for _ in 0..iters {
                 f();
             }
-            at.elapsed().as_secs_f64() * 1e6 / iters as f64
+            (cpu_now() - at) / iters as f64
         };
         for _ in 0..rounds {
             best.0 = best.0.min(time(a));
@@ -339,8 +352,8 @@ mod tests {
                 serde_json::from_str::<PlaybackState>(&as_json).unwrap()
             );
 
-            let (from_toml, from_json) = best_each(
-                3,
+            let (from_toml, from_json) = best_each_cpu(
+                8,
                 5,
                 &mut || {
                     toml::from_str::<PlaybackState>(&as_toml).unwrap();
@@ -350,7 +363,7 @@ mod tests {
                 },
             );
             println!(
-                "{queued:>5} queued  toml {:>7}B {from_toml:>9.1}us  json {:>7}B \
+                "{queued:>5} queued  cpu: toml {:>7}B {from_toml:>9.1}us  json {:>7}B \
                  {from_json:>9.1}us  {:.2}x",
                 as_toml.len(),
                 as_json.len(),
