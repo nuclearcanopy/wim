@@ -39,13 +39,17 @@ const AWAIT_TIMEOUT: Duration = Duration::from_secs(8);
 /// actually expand to is bounded by `MAX_EXPANSION`.
 const MAX_REPEAT: u32 = 256;
 
-/// Upper bound on the nodes a program may expand to, checked inside
-/// `repeat` because nesting is the only way to reach it. `MAX_REPEAT`
+/// Upper bound on the nodes a program may expand to. `MAX_REPEAT`
 /// bounds each level, so nested levels multiply: 256 twice over is 65k
 /// nodes, three times is 16.7M (over a gigabyte) built synchronously in
 /// `submit` with the ui frozen, and four is an allocation failure there
 /// is no recovering from. 4096 is far past any real `repeat` (a flat
 /// `repeat(256, queue(x))` is 512) and small enough to build instantly.
+///
+/// Three paths expand, not one: `repeat` nesting, `run` fan-out (a
+/// script's lines times its depth) and a chain of `let`s composing one
+/// another. Each checks this, and the comment here said only `repeat`
+/// for as long as the other two were unbounded.
 ///
 /// Checked per iteration, so the guarantee is this plus whatever the
 /// iteration that crossed it was already building, not this exactly.
