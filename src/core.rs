@@ -1787,6 +1787,12 @@ pub struct RemoteSearchQuery {
 pub struct RemoteSearchOutcome {
     pub client: Arc<subsonic::Client>,
     pub result: subsonic::SearchResult,
+    /// Which query this answers.
+    ///
+    /// `SearchSettle` needs it: without it, an answer for `cre` could
+    /// clear the window opened for `crest`, so a shellsong program
+    /// gated on `search_settled` ran against the wrong result set.
+    pub query: String,
 }
 /// Runs forever on its own thread, debouncing query-changed events
 /// from the main thread and firing Subsonic's `search3` against every
@@ -1849,6 +1855,7 @@ pub fn spawn_background_search(
                     Some(RemoteSearchOutcome {
                         client,
                         result: result.ok()?,
+                        query: pending.query.clone(),
                     })
                 })
                 .collect()
@@ -2382,7 +2389,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
         Op::Search(query) => {
             core.app.set_query(&query);
             let fired = notify_query_changed(core.app, core.remote_search_tx);
-            core.settle.notified(fired, core.now);
+            core.settle.notified(&core.app.query, fired, core.now);
             surf.show_results();
             op_note(format!(
                 "search: {query} ({} results so far)",

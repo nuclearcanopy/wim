@@ -2459,7 +2459,7 @@ fn main() -> anyhow::Result<()> {
             warmup.poke();
             // an answer is in, so the results for whatever is typed are
             // as complete as a shellsong program should wait for.
-            settle.answered();
+            settle.answered(&outcome.query);
         }
 
         // drain whatever the background enrichment fetcher answered
@@ -2807,7 +2807,7 @@ fn main() -> anyhow::Result<()> {
                     app.paste_into_query(text);
                     if app.query != before {
                         let fired = notify_query_changed(&app, &remote_search_tx);
-                        settle.notified(fired, start.elapsed());
+                        settle.notified(&app.query, fired, start.elapsed());
                     }
                 }
             }
@@ -3308,7 +3308,7 @@ fn main() -> anyhow::Result<()> {
                     let action = app.handle_key(key.code, &keymap);
                     if app.query != before {
                         let fired = notify_query_changed(&app, &remote_search_tx);
-                        settle.notified(fired, start.elapsed());
+                        settle.notified(&app.query, fired, start.elapsed());
                     }
                     // enter while typing commits the selection, so the
                     // action has to run through the same dispatch the
