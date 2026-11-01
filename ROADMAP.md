@@ -1440,14 +1440,31 @@ a measurement.
       frame on every unbound track change, i.e. almost all of them).
       `Program`'s node count is private, so what the test asserts is
       that the ops reach somewhere the host can see at all.
-- [ ] **`quantize` is now 73% of a mono painted cell** (5.8 of 7.8 ns),
-      which is where the frame budget goes next: a midpoint, four
-      compares and two reciprocal averages per cell. left alone on
-      purpose, because it decides every glyph and both shades and is
-      the riskiest thing in the rasterizer. `ui/visualizer.rs` also
-      still writes its meter with `set_char`, where the 8.9 -> 1.4
-      ns/cell finding applies; one row per frame and no bench, so it
-      was not touched blind.
+- [x] **`quantize`: measured, and deliberately not changed.** it is
+      the largest remaining per-cell cost (5.8 of 7.8 ns in mono), and
+      the obvious fix is to go branchless, since `v >= mid` is a coin
+      flip along every edge.
+      **it is 1.50x faster on unpredictable quads and 0.85x on flat
+      ones**, and real covers are mostly flat: 72% of cells at 26x13
+      and 90% at 70x35 on a disc fixture, which is what large areas of
+      near-uniform colour look like (a pure gradient is 0-17%).
+      weighted by time that is ~8% *slower* at 90% flat. so the branch
+      stays, and the predictor is the reason.
+      two benches make it decidable rather than arguable:
+      `quantize_cost` alternates the two in one process, and
+      `flat_cell_fraction_of_real_covers` counts flat cells using the
+      fact that a full block is mask `0b1111`, which happens **only**
+      when a cell is flat (`mid` is the midpoint of the cell's own
+      range, so a non-flat cell always has a sample below it).
+      `branchless_quantize` stays in the test module with an
+      output-equality test over 200k quads, so the rejected option is
+      checkable instead of folklore; whoever revisits it should attack
+      the *content* assumption first, since that is the whole basis.
+      written up in docs/raster.md.
+      still open from the same group: `ui/visualizer.rs` writes its
+      meter with `set_char`, where the 8.9 -> 1.4 ns/cell finding
+      applies; one row per frame and no bench, so it was not touched
+      blind.
 - [ ] **`framesource` does not turn the unsharp pass off yet.** it is
       69% of a 1:1 resample and the video path is exactly 1:1, so
       `render_with(.., Sharpen::Off, ..)` is a 3.21x win sitting
