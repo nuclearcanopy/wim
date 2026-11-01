@@ -2481,6 +2481,27 @@ fn main() -> anyhow::Result<()> {
         // reverting rather than re-asking: the user saw it take, and a
         // retry loop against a server saying no is worse than one
         // honest line.
+        // the live curve is what gets saved, wherever it changed.
+        //
+        // `persist_eq` was reachable only from the eq menu's own key
+        // block, so `e` to cycle the eq and `: eq(rock)` were audible
+        // now and gone next launch, while the identical change made
+        // in the menu persisted. the three menu sites stay: they
+        // change the saved-preset *list*, which this cannot see.
+        //
+        // comparing rather than remembering covers a path nobody has
+        // written yet, and `persist_eq` writes `cfg` before saving, so
+        // a refused write leaves the two equal and does not retry
+        // every frame. skipped on a non-finite gain, which would never
+        // compare equal and so would retry forever.
+        let live = eq::persisted(app.eq_source, app.eq_gains, &cfg.eq_custom_presets);
+        let finite = live
+            .1
+            .is_none_or(|gains| gains.iter().all(|g| g.is_finite()));
+        if finite && (cfg.eq_preset.clone(), cfg.eq_gains) != live {
+            persist_eq(&mut cfg, &app, &mut notifications);
+        }
+
         while let Ok(failed) = scrobble_failed_rx.try_recv() {
             notifications.push(
                 Severity::Error,
@@ -5034,6 +5055,77 @@ mod cursor_tests {
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    /// The live curve is saved wherever it changed, not only from the
+    /// eq menu.
+    ///
+    /// `persist_eq` was reachable from three sites, all inside the eq
+    /// menu's own key block, so `e` to cycle the eq and `: eq(rock)`
+    /// were audible now and gone next launch while the identical
+    /// change made in the menu persisted. the detector is a
+    /// comparison rather than a flag each path sets, which is what
+    /// covers a route nobody has written yet.
+    #[test]
+    fn a_changed_live_curve_differs_from_what_config_holds() {
+        let mut cfg = config::Config::default();
+        let mut app = app::App::new(search::Corpus::new());
+        let saved = eq::CustomPresets::default();
+
+        // in step to begin with, so nothing is written on an idle
+        // frame; that is what keeps this off the per-frame budget.
+        persist_eq(&mut cfg, &app, &mut Notifications::default());
+        assert_eq!(
+            (cfg.eq_preset.clone(), cfg.eq_gains),
+            eq::persisted(app.eq_source, app.eq_gains, &saved),
+            "a frame that changed nothing must not look like a change"
+        );
+
+        // what `e` does: a different built-in curve.
+        app.eq_source = Some(eq::Source::Builtin(2));
+        app.eq_gains = eq::PRESETS[2].gains;
+        assert_ne!(
+            (cfg.eq_preset.clone(), cfg.eq_gains),
+            eq::persisted(app.eq_source, app.eq_gains, &saved),
+            "cycling the eq has to read as a change, or it is lost on restart"
+        );
+
+        // and once saved they agree again, so one write settles it
+        // rather than retrying every frame.
+        persist_eq(&mut cfg, &app, &mut Notifications::default());
+        assert_eq!(
+            (cfg.eq_preset.clone(), cfg.eq_gains),
+            eq::persisted(app.eq_source, app.eq_gains, &saved)
+        );
+    }
+
+    /// The loop has to actually compare *and* save, or the test above
+    /// pins a rule nothing applies. Reads the source: the frame needs
+    /// a terminal and a player.
+    ///
+    /// Searches only the code **above the test modules**. The first
+    /// version scanned the whole file for a literal that this test
+    /// also contains, so it could never fail: deleting the loop's
+    /// comparison outright left it green. That is the
+    /// assertion-that-cannot-fail shape recorded elsewhere in this
+    /// repo, and I wrote one.
+    #[test]
+    fn the_loop_persists_a_curve_that_drifted_from_config() {
+        let src = include_str!("main.rs");
+        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
+
+        let at = code
+            .find("eq::persisted(app.eq_source, app.eq_gains")
+            .expect("the per-frame comparison is gone, so only the eq menu saves");
+        let region = &code[at..(at + 500).min(code.len())];
+        assert!(
+            region.contains("!= live"),
+            "it computes the live curve and never compares it:\n{region}"
+        );
+        assert!(
+            region.contains("persist_eq(&mut cfg, &app, &mut notifications)"),
+            "it compares and never saves:\n{region}"
+        );
+    }
 
     /// Prints the three refusals as the notification area shows them,
     /// because the wording *is* the feature here. Run with

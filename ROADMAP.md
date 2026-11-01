@@ -1945,19 +1945,38 @@ do the wrong thing quietly, which is worse to diagnose.
       arm needs a live mpv and the whole host loop, and a bypass is
       exactly what a behavioural test in the wrong place misses, which
       is how this survived in the first place.
-- [ ] **two smaller ones from the same group are still open.**
-      `core.rs` ~1539 `persist_eq` is the only writer of
-      `cfg.eq_preset`/`eq_gains` and all three call sites are inside
-      the eq-menu key block, so `e` to cycle the eq (or `: eq(rock)`)
-      is lost on restart while the identical change made from the menu
-      persists.
-      and two seams the undo work hit: `TrackResolver::deliver`/`epoch`
-      are `#[cfg(test)]` **private**, so undo.rs cannot inject a batch
-      and its test works around it with a real off-thread request plus
-      a positive control; `pub(crate)` would make it direct. core.rs's
-      `CoreCtx` test harness is likewise private to its own test
-      module, so undo.rs carries a near-copy, and one shared `fixtures`
-      harness is the obvious cleanup.
+- [x] **cycling the eq was lost on restart.** `persist_eq` was
+      reachable from three sites, all inside the eq menu's own key
+      block, so `e` to cycle the eq and `: eq(rock)` were audible now
+      and gone next launch, while **the identical change made in the
+      menu persisted**. the structural reason it was stuck there:
+      `CoreCtx.cfg` is `&Config`, so core.rs cannot save at all, and
+      main.rs owns the mutable one.
+      so the loop **compares** rather than having each path remember:
+      `eq::persisted(..)` against what config holds, once per frame.
+      that covers a route nobody has written yet, which a flag per
+      call site does not, and `persist_eq` writes `cfg` before saving,
+      so a refused write leaves the two equal instead of retrying
+      every frame. skipped on a non-finite gain, which would never
+      compare equal and so would retry forever.
+      the three menu sites stay: they change the saved-preset *list*
+      (save, rename, delete), which the live-curve comparison cannot
+      see.
+      **and the source guard I wrote first could not fail**, which is
+      the part worth recording: it scanned the whole file for a
+      literal that the test itself contains, so deleting the loop's
+      comparison outright left it green. it searches only the code
+      above the test modules now, and asserts the comparison *and* the
+      save, so all three mutations fail (the block deleted, the
+      condition never firing, and comparing without saving). that is
+      the assertion-that-cannot-fail shape this file records finding
+      four times in other people's tests, and I wrote one.
+- [ ] **two seams the undo work hit are still open.**
+      `TrackResolver::deliver`/`epoch` are `#[cfg(test)]` **private**,
+      so undo.rs cannot inject a batch and its test works around it
+      with a real off-thread request plus a positive control;
+      `pub(crate)` would make it direct. (core.rs's `CoreCtx` harness
+      is no longer one of these: it is `pub(super)` now and shared.)
 - [x] ~~done in the overnight run~~ **`core.rs` ~1206: `go_to_previous` fires three of the five
       track-start hooks by hand** instead of calling `track_started`,
       which is the exact parity bug `track_started` was created to
