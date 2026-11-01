@@ -176,11 +176,19 @@ impl BetweenTracks {
     /// `gap(10s)` / `gap(off)`. Turning it off drops a hold being
     /// waited out rather than letting it expire: "off" should mean
     /// off, not "off after this one".
-    pub fn set_gap(&mut self, secs: f64) {
+    ///
+    /// Reports whether it actually dropped one, which is what earns
+    /// the caller's unpause: mpv pauses *itself* at a held end and
+    /// stays paused, so a dropped hold is the only pause this owns.
+    /// Unpausing whenever the gap came out zero resumed a track the
+    /// user had paused by hand.
+    pub fn set_gap(&mut self, secs: f64) -> bool {
         self.gap = Duration::from_secs_f64(secs.max(0.0));
-        if self.gap.is_zero() {
+        if self.gap.is_zero() && self.holding() {
             self.cancel();
+            return true;
         }
+        false
     }
 
     /// The whole per-frame step, which both front-ends had their own
@@ -2580,8 +2588,10 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             op_done()
         }
         Op::SetGap(secs) => {
-            core.between_tracks.set_gap(secs.unwrap_or(0.0));
-            if core.between_tracks.gap_secs() == 0.0 {
+            // only a dropped hold is unpaused: that pause is mpv's own
+            // at a held end, and sending it for every `gap(off)`
+            // resumed whatever the user had paused by hand.
+            if core.between_tracks.set_gap(secs.unwrap_or(0.0)) {
                 let _ = core.player.set_pause(false);
             }
             match secs {
@@ -5304,9 +5314,78 @@ mod seam_tests {
         let t0 = Instant::now();
         assert_eq!(g.tick(true, GAP, true, t0), Some(GapAction::Begin));
         assert!(g.holding());
-        g.set_gap(0.0);
+        assert!(g.set_gap(0.0), "it says it dropped one");
         assert!(!g.holding());
         assert_eq!(g.gap_secs(), 0.0);
+    }
+
+    /// And it says so only when it did, because that report is what
+    /// earns `Op::SetGap`'s unpause.
+    #[test]
+    fn turning_an_idle_gap_off_drops_nothing() {
+        let mut g = BetweenTracks::new(10.0);
+        assert!(!g.set_gap(0.0), "nothing was being waited out");
+        // and off while already off is not a drop either.
+        assert!(!g.set_gap(0.0));
+
+        // a length that is not zero never drops a hold, however long.
+        let mut g = BetweenTracks::new(10.0);
+        g.tick(true, GAP, true, Instant::now());
+        assert!(g.holding());
+        assert!(!g.set_gap(90.0), "a longer gap is not off");
+        assert!(g.holding());
+    }
+
+    /// The wiring: `gap(off)` must not start playback the user paused
+    /// by hand.
+    ///
+    /// The op unpaused whenever the resulting gap was zero, holding or
+    /// not, so pausing a track and then typing `gap(off)` (or
+    /// `gap(0)`, or `gap(off)` twice) resumed it. The unpause belongs
+    /// to the hold alone: mpv pauses itself at a held end and stays
+    /// paused, which is the only state that needs letting go of.
+    ///
+    /// `#[ignore]` for the usual reason: `CoreCtx` holds a live mpv.
+    #[test]
+    #[ignore]
+    fn turning_the_gap_off_does_not_unpause_a_paused_track() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let mut surf = Headless;
+
+        let paused = |player: &mpv::Mpv| {
+            player
+                .get_property(mpv::PROP_PAUSE)
+                .expect("mpv reports its own pause flag")
+                .as_bool()
+                .expect("a boolean")
+        };
+        player.set_pause(true).expect("mpv pauses while idle");
+        assert!(paused(&player), "the fixture has to start paused");
+
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::SetGap(None), &mut core, &mut surf);
+        }
+        assert!(
+            paused(&player),
+            "gap(off) with nothing being waited out resumed playback"
+        );
+
+        // the positive control, and the case the unpause is for: a
+        // hold *is* being waited out, so dropping it has to let mpv go.
+        h.between_tracks = BetweenTracks::new(10.0);
+        h.between_tracks.tick(true, GAP, true, Instant::now());
+        assert!(h.between_tracks.holding(), "staged a gap to drop");
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::SetGap(None), &mut core, &mut surf);
+        }
+        assert!(
+            !paused(&player),
+            "dropping a hold has to unpause, or the gap is also the end"
+        );
     }
 
     /// The gap length lives with the hold and the keep-open toggle
