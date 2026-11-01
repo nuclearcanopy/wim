@@ -172,11 +172,12 @@ pub struct FetchedCatalog {
     artists: Vec<subsonic::Artist>,
     albums: Vec<subsonic::Album>,
     playlists: Vec<subsonic::Playlist>,
-    /// Why this catalog couldn't be written to the startup cache, if
-    /// it couldn't. Carried rather than reported here because this
-    /// runs on a thread with no notification area; `cache_warning` is
-    /// what `merge_catalog_into_app` hands the caller.
-    cache_warning: Option<String>,
+    /// What this fetch could not do and did not fail over: a startup
+    /// cache that could not be written, a starred list that did not
+    /// answer. Carried rather than reported here because this runs on
+    /// a thread with no notification area; `merge_catalog_into_app` is
+    /// what hands them to the caller.
+    warnings: Vec<String>,
 }
 
 impl FetchedCatalog {
@@ -254,15 +255,17 @@ pub fn fetch_navidrome_catalog(
     // the next launch paints a library instead of "connecting...",
     // and a read-only or full cache dir used to lose it in silence.
     // same stance as `config::save_or_warn`.
-    let cache_warning = cache::save_catalog(&client, &artists, &albums, &playlists)
+    let warnings = cache::save_catalog(&client, &artists, &albums, &playlists)
         .err()
-        .map(|e| cache_warning_for(&nav.url, &e));
+        .map(|e| cache_warning_for(&nav.url, &e))
+        .into_iter()
+        .collect();
     Ok(FetchedCatalog {
         client,
         artists,
         albums,
         playlists,
-        cache_warning,
+        warnings,
     })
 }
 
@@ -281,17 +284,18 @@ fn cache_warning_for(url: &str, error: &impl std::fmt::Display) -> String {
 /// (startup, manual reconnect, add-profile, background auto-sync) gets
 /// it for free instead of having to remember it.
 ///
-/// Returns the warning the caller owes the user, same idiom as
+/// Returns whatever warning the caller owes the user, same idiom as
 /// `graphics::ArtProbe::poll`: this runs where there is an `App` but
 /// not always a notification area, and the fetch itself happened on a
-/// thread that had neither.
+/// thread that had neither. One string, since one fetch's warnings are
+/// one thing that went wrong with it.
 pub fn merge_catalog_into_app(app: &mut app::App, catalog: FetchedCatalog) -> Option<String> {
     let FetchedCatalog {
         client,
         artists,
         albums,
         playlists,
-        cache_warning,
+        warnings,
     } = catalog;
     app.corpus.reconcile_server(
         cache::ServerCatalog {
@@ -302,7 +306,7 @@ pub fn merge_catalog_into_app(app: &mut app::App, catalog: FetchedCatalog) -> Op
         &client,
     );
     app.resync_results();
-    cache_warning
+    (!warnings.is_empty()).then(|| warnings.join("; "))
 }
 
 type NavidromeEverything = Result<(FetchedCatalog, Vec<String>), String>;
@@ -315,13 +319,35 @@ pub fn fetch_navidrome_everything(
     nav: &config::NavidromeConfig,
     live: &[Arc<subsonic::Client>],
 ) -> NavidromeEverything {
-    let catalog = fetch_navidrome_catalog(nav, live)?;
-    let starred = catalog
-        .client
-        .get_starred_songs()
-        .map(|songs| songs.into_iter().map(|s| s.id).collect())
-        .unwrap_or_default();
+    let mut catalog = fetch_navidrome_catalog(nav, live)?;
+    let (starred, warning) = starred_or_warning(&nav.url, catalog.client.get_starred_songs());
+    catalog.warnings.extend(warning);
     Ok((catalog, starred))
+}
+
+/// The starred song ids, or the warning that stands in for them.
+///
+/// Not fatal: the catalog itself is good, and refusing it over the
+/// star markers would leave the library empty. Not swallowed either,
+/// which it was: an empty list is what "nothing on this server is
+/// starred" looks like, and that is exactly what the star marker on
+/// every row and the direction `core::toggle_star` flips both read, so
+/// a `getStarred2` that failed showed a library with no stars in it
+/// and said nothing.
+fn starred_or_warning(
+    url: &str,
+    fetched: anyhow::Result<Vec<subsonic::Song>>,
+) -> (Vec<String>, Option<String>) {
+    match fetched {
+        Ok(songs) => (songs.into_iter().map(|s| s.id).collect(), None),
+        Err(e) => (Vec::new(), Some(starred_warning_for(url, &e))),
+    }
+}
+
+/// One wording, same shape as `cache_warning_for`: names the server
+/// and what it costs, and leaves the detail to the error.
+fn starred_warning_for(url: &str, error: &impl std::fmt::Display) -> String {
+    format!("couldn't read {url}'s starred songs, so none of its tracks shows a star: {error}")
 }
 
 /// Shared by onboarding, the profile manager's add flow, and reconnect
@@ -422,13 +448,13 @@ mod fetch_outcome_tests {
                 }],
                 albums: Vec::new(),
                 playlists: Vec::new(),
-                cache_warning: Some("disk full".to_string()),
+                warnings: vec!["disk full".to_string(), "no starred songs".to_string()],
             },
         );
         assert_eq!(
             warning.as_deref(),
-            Some("disk full"),
-            "a failed cache write must reach the caller, not stop at the merge"
+            Some("disk full; no starred songs"),
+            "every warning a fetch carried must reach the caller, not stop at the merge"
         );
         app.query = "bladee".into();
         app.resync_results();
@@ -465,6 +491,90 @@ mod fetch_outcome_tests {
         );
         assert!(warning.contains("next start"), "what it costs: {warning}");
         assert!(warning.contains("os error 28"), "and the cause: {warning}");
+    }
+}
+
+/// What a starred-songs read's outcome may be read as. Its own module
+/// rather than joining `fetch_outcome_tests`: that one is about the
+/// three catalog listings, whose failure stops the whole fetch, and
+/// this one is about the half that deliberately does not.
+#[cfg(test)]
+mod starred_outcome_tests {
+    use super::*;
+
+    fn song(id: &str) -> subsonic::Song {
+        subsonic::Song {
+            id: id.into(),
+            title: "Icedancer".into(),
+            artist: "Bladee".into(),
+            album: "Icedancer".into(),
+            duration: None,
+            genres: Vec::new(),
+        }
+    }
+
+    /// The silent half of a sync: `getStarred2` failing returned an
+    /// empty list, which is indistinguishable from "nothing here is
+    /// starred" and is read as exactly that by every star marker.
+    #[test]
+    fn a_failed_starred_read_is_a_warning_not_an_empty_list() {
+        let (starred, warning) = starred_or_warning(
+            "https://music.example.invalid",
+            Err(anyhow::anyhow!("getStarred2: http 500")),
+        );
+        assert!(starred.is_empty(), "there is nothing to report as starred");
+        let warning = warning.expect("a failed starred read said nothing at all");
+        assert!(
+            warning.contains("https://music.example.invalid"),
+            "which server: {warning}"
+        );
+        assert!(warning.contains("star"), "what it costs: {warning}");
+        assert!(warning.contains("http 500"), "and the cause: {warning}");
+    }
+
+    /// The positive control the test above needs: a server where
+    /// nothing is starred is a legitimate empty answer and must stay
+    /// silent, or the warning fires on every sync for everyone.
+    #[test]
+    fn a_server_with_nothing_starred_warns_about_nothing() {
+        let (starred, warning) = starred_or_warning("https://a.invalid", Ok(Vec::new()));
+        assert!(starred.is_empty());
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn a_starred_read_that_answered_is_its_song_ids() {
+        let (starred, warning) =
+            starred_or_warning("https://a.invalid", Ok(vec![song("s1"), song("s2")]));
+        assert_eq!(starred, vec!["s1".to_string(), "s2".to_string()]);
+        assert_eq!(warning, None);
+    }
+
+    /// And the call site, which is what actually bypassed it: the
+    /// decision above is only reached if the fetch goes through it and
+    /// the warning is carried out on the catalog. Reaching this
+    /// behaviourally needs a server that answers the three catalog
+    /// endpoints and then fails `getStarred2`.
+    #[test]
+    fn the_sync_carries_the_starred_warning_rather_than_defaulting() {
+        let src = include_str!("catalog.rs");
+        let at = src
+            .find("pub fn fetch_navidrome_everything(")
+            .expect("fetch_navidrome_everything moved or was renamed");
+        assert!(
+            at < src.find("#[cfg(test)]").expect("no test module"),
+            "the anchor has to be the real function, not a test"
+        );
+        let body = &src[at..];
+        let body = &body[..body.find("\n}\n").expect("an unterminated fn")];
+        assert!(
+            body.contains("starred_or_warning("),
+            "the starred read decides its own outcome again:\n{body}"
+        );
+        assert!(
+            body.contains("warnings.extend("),
+            "a warning nothing carries out is a silent failure:\n{body}"
+        );
     }
 }
 
