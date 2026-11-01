@@ -586,12 +586,33 @@ and `in-workspace (sub-rect) video` is still kitty-only via
         track change keeping the old instance, a pane resize being
         ignored, and the opt-in being ignored so it pulls frames even
         with ascii off.
-      - [ ] **the host wiring, which is the rest of it.**
-        `FrameSource::paint` writes into a `Buffer`, so the draw path
-        can take it; what is missing is the host owning the source,
-        calling `plan` each frame and acting on it, and restarting on a
-        seek. a shellsong command and a key to toggle the mode want to
-        come with it.
+      - [x] **the host wiring.** `framesource::Ascii` owns at most one
+        instance and applies `plan` to it, so the loop is one
+        `ascii.update(showing.is_ascii(), media, grid, elapsed, fps)`
+        and the draw is `if ascii.active() { paint; return }` ahead of
+        every other branch. the vo and the pane now come out of one
+        `video::showing` call (`want_vo` is `showing.mpv_vo()`), so
+        they cannot disagree about who owns the screen.
+        the position is the same `elapsed_secs` every widget reads, so
+        the picture cannot drift from the scrubber, and since the fifo
+        is the clock a pause stops advancing it and mpv blocks in
+        `write`. `container-fps` is read through a closure, so it costs
+        one ipc round trip per spawn and none per frame.
+        a failed spawn latches against that file: one alert per video
+        rather than one per frame, and the latch drops the moment that
+        file stops being the one asked for, because a failure leaves
+        nothing running and turning ascii off is `Keep`, not `Stop`.
+        notifications still paint over the frames; an alert behind the
+        picture is an alert nobody sees.
+        nine tests, eight mutations (the pane re-deriving its own
+        answer, the draw falling through into the ui under the frames,
+        the vo deciding separately, a branch that never paints, no
+        latch, a latch that outlives the request, an unrecorded
+        failure, and a paint with no instance touching a cell).
+      - [ ] **a key and a shellsong command to toggle it.** the mode is
+        `config.video_output` only, so trying it means editing the
+        config and restarting; a runtime override wants to live beside
+        `video_fullscreen`.
 - [ ] **usable at absurd zoom-out.** ascii video is only watchable
       once the font is small enough to give a few hundred cells across,
       so the layout has to survive that: sidebar and bottom bar must
