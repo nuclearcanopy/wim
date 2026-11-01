@@ -4838,11 +4838,23 @@ mod seam_tests {
         // the lie, pinned. mpv reports ~1s whatever `d` says, at every
         // spelling tried, which is why anything drawing the length of
         // a silence must read `Silence { secs }` instead.
-        let reported = player
-            .get_property("duration")
-            .ok()
-            .and_then(|v| v.as_f64())
-            .expect("a duration is reported, it is just wrong");
+        //
+        // polled, not read once: the codec name arrives before the
+        // duration does, and this read came back empty once with a
+        // dozen other mpv instances on the machine, which is a flake
+        // and not a finding.
+        let mut reported = None;
+        for _ in 0..50 {
+            reported = player
+                .get_property("duration")
+                .ok()
+                .and_then(|v| v.as_f64());
+            if reported.is_some() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(40));
+        }
+        let reported = reported.expect("a duration is reported, it is just wrong");
         assert!(
             reported < 600.0 * 0.5,
             "mpv reported {reported}s for a 600s silence; if this now \
