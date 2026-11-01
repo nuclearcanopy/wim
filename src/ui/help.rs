@@ -134,6 +134,12 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
                 Key::Bound(KeyAction::ToggleFullscreenVideo),
                 "fullscreen video",
             ),
+            // next to the video row it modifies, not with the art
+            // modes: it is the same picture, drawn into cells.
+            (
+                Key::Bound(KeyAction::ToggleAsciiVideo),
+                "video as text cells",
+            ),
             (Key::Bound(KeyAction::CycleArtMode), "cycle album art"),
             (Key::Bound(KeyAction::ToggleResizeMode), "resize panes"),
         ],
@@ -701,6 +707,32 @@ mod tests {
                 scroll: 0,
             }
             .render(area, &mut buf);
+        }
+    }
+
+    /// Every remappable action is reachable from this table, which is
+    /// where a user finds out an action exists at all. `ToggleAsciiVideo`
+    /// landed in `ALL_ACTIONS`, got a default key and a label, and no
+    /// row here: the feature was findable only by pressing shift+v on
+    /// a hunch, or by opening the remap menu to look for it.
+    #[test]
+    fn every_remappable_action_has_a_row_in_the_table() {
+        let listed: Vec<KeyAction> = SECTIONS
+            .iter()
+            .flat_map(|(_, binds)| binds.iter())
+            .flat_map(|(key, _)| match key {
+                Key::Bound(a) => vec![*a],
+                Key::Pair(a, b) => vec![*a, *b],
+                Key::Fixed(_) => Vec::new(),
+            })
+            .collect();
+        for action in crate::keymap::ALL_ACTIONS {
+            assert!(
+                listed.contains(action),
+                "{:?} ({:?}) is remappable and no row names it",
+                action.name(),
+                action.label()
+            );
         }
     }
 
