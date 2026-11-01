@@ -2015,12 +2015,30 @@ needed, so the number is real and the work is scoped.
       outside `cache.rs` (`suggest.rs:1100,1103`), so a packed
       representation takes it back; it changes a `pub` field, which is
       why the agent stopped.
-- [ ] **the resume queue's cost is the stats, not the parse.**
-      `main.rs:1067-1072` calls `item_from_path` once per saved path,
-      a `stat` each, on the main thread before the frame, while the
-      matching mpv appends were already deferred past it. The toml
-      parse it sits next to is 144us, so the format is not the
-      problem; this is.
+- [x] **the resume queue's cost is the stats, not the parse.** Fixed.
+      `item_from_path` stats every saved path (`is_file`), and the loop
+      ran before the first frame while the mpv appends it feeds were
+      already deferred past it. Measured by
+      `persistence::tests::bench_cpu_queue_rebuild`, cpu clock,
+      release: **602.8us for 200 present paths (3.0us each)** and
+      427.4us for 200 missing ones, so it scales with the saved queue
+      and a 2000-entry one was ~6ms of time-to-first-frame for work
+      nothing on screen needed. The paths now go into `pending_paths`
+      unresolved and are rebuilt in the first-frame block beside the
+      appends.
+      `resolve_saved_paths(paths, resolve)` takes the resolver as a
+      function pointer, the `DownloadCtx::persist` idiom, because the
+      real one hits the filesystem: that is both why it is deferred and
+      why a test can cover it at all. A path that has gone since the
+      session was saved is **counted**, not dropped, and feeds the same
+      "n of the saved queue could not be restored" notice a refused
+      append does.
+      three mutations caught: dropping a gone file silently, moving the
+      stats back ahead of the frame, and reordering the survivors.
+      **the order mutation initially passed, and the test was the
+      problem**: its paths were `1, x, 2, 3`, already sorted, so
+      sorting them changed nothing. `3, x, 1, 2` now, with the reason
+      in the test.
 - [ ] **`banner.rs` is the real per-frame logo cost.** `logos.rs` is
       compile-time data only, but the banner re-walks every line's
       width each frame (up to 50 rows for `figlet: doh`), plus a

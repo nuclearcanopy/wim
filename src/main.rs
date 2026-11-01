@@ -540,6 +540,32 @@ fn loading_message(scanning_library: bool, syncing_servers: bool) -> Option<&'st
 /// is not set up"; and a full corpus with no suggestions is the only
 /// one that is actually about suggestions, since they are built from
 /// what has been played.
+/// Rebuilds saved queue paths into items, counting the ones that no
+/// longer resolve.
+///
+/// `resolve` is a parameter because the real one stats the filesystem
+/// (`is_file`), which is both the reason this is deferred past the
+/// first frame and the reason a test cannot use it. Same shape as
+/// `DownloadCtx::persist`.
+///
+/// A path that has gone since the session was saved is counted, not
+/// dropped: a queue that comes back short with no word is the bug
+/// `append_resolved` already had once.
+fn resolve_saved_paths(
+    paths: impl Iterator<Item = String>,
+    resolve: fn(&str) -> Option<SearchItem>,
+) -> (Vec<SearchItem>, usize) {
+    let mut items = Vec::new();
+    let mut lost = 0usize;
+    for path in paths {
+        match resolve(&path) {
+            Some(item) => items.push(item),
+            None => lost += 1,
+        }
+    }
+    (items, lost)
+}
+
 /// A built suggestion set, or why it is not worth opening.
 ///
 /// The rule is one function because the two entry points disagreed: the
@@ -1028,6 +1054,11 @@ fn main() -> anyhow::Result<()> {
     // is up (see the drain right after the first `draw`); `app.queue`
     // itself is filled here, since that's pure in-memory work.
     let mut pending_enqueue: Vec<SearchItem> = Vec::new();
+    // saved queue paths, still unresolved: `item_from_path` stats each
+    // one, and that belongs after the first frame with the appends it
+    // feeds, not ahead of it. 3us a path, so a 200-entry queue was
+    // 0.6ms of time-to-first-frame for work nothing on screen needed.
+    let mut pending_paths: Vec<String> = Vec::new();
 
     // resuming across restarts is standard in any serious media player;
     // a missing/corrupt state file just means nothing to resume, not an
@@ -1078,11 +1109,7 @@ fn main() -> anyhow::Result<()> {
         // drains after the first frame, so extra paths cost no ipc here.
         pending_enqueue.extend(from_cli.iter().skip(1).cloned());
         if let Some(saved) = &resume {
-            for queued_path in &saved.queue_paths {
-                if let Some(item) = persistence::item_from_path(queued_path) {
-                    pending_enqueue.push(item);
-                }
-            }
+            pending_paths.extend(saved.queue_paths.iter().cloned());
         }
         if let Some(vol) = saved_volume {
             let _ = player.set_volume(vol);
@@ -2275,7 +2302,11 @@ fn main() -> anyhow::Result<()> {
             // files mpv refuses would otherwise come back short with
             // no word, the same way `append_resolved` used to report
             // the requested count instead of the appended one.
-            let mut lost = 0usize;
+            // resolved here rather than before the frame: this is the
+            // stat per saved path, and nothing on screen needs it.
+            let (restored, mut lost) =
+                resolve_saved_paths(pending_paths.drain(..), persistence::item_from_path);
+            pending_enqueue.extend(restored);
             for item in pending_enqueue.drain(..) {
                 let done =
                     enqueue_track(&player, &item, &cache_index, &mut play_queue, app.shuffle);
@@ -5582,6 +5613,93 @@ mod ascii_pane_tests {
         assert!(
             branch.contains("return;"),
             "it paints frames and then falls through into the ui:\n{branch}"
+        );
+    }
+}
+
+/// Rebuilding a saved queue, which is deferred past the first frame
+/// because every path in it costs a stat.
+#[cfg(test)]
+mod saved_queue_tests {
+    use super::*;
+
+    fn music(path: &str) -> SearchItem {
+        SearchItem::LocalMusic {
+            path: std::path::PathBuf::from(path),
+            title: "t".into(),
+            artist: None,
+            album: None,
+        }
+    }
+
+    /// A file that has gone since the session was saved is counted,
+    /// not dropped: a queue that silently comes back short is the bug
+    /// `append_resolved` already had once, and the count is what the
+    /// user is told.
+    #[test]
+    fn a_path_that_no_longer_resolves_is_counted_not_dropped() {
+        let paths = ["/a.flac", "/gone.flac", "/b.flac"].map(String::from);
+        let (items, lost) =
+            resolve_saved_paths(paths.into_iter(), |p| (p != "/gone.flac").then(|| music(p)));
+        assert_eq!(lost, 1);
+        assert_eq!(items.len(), 2, "the survivors still queue");
+    }
+
+    /// Order is the queue: a saved queue that comes back reordered is
+    /// not the queue that was saved.
+    ///
+    /// The saved order here is deliberately **not** sorted. The first
+    /// version of this test used `1, x, 2, 3`, whose survivors are the
+    /// same either way, so sorting the paths passed it; the mutation
+    /// caught the test, not the code.
+    #[test]
+    fn the_survivors_keep_the_saved_order() {
+        let paths = ["/3.flac", "/x.flac", "/1.flac", "/2.flac"].map(String::from);
+        let (items, lost) =
+            resolve_saved_paths(paths.into_iter(), |p| (!p.contains('x')).then(|| music(p)));
+        assert_eq!(lost, 1);
+        let got: Vec<String> = items
+            .iter()
+            .map(|i| match i {
+                SearchItem::LocalMusic { path, .. } => path.to_string_lossy().into_owned(),
+                _ => unreachable!("the resolver only makes music here"),
+            })
+            .collect();
+        assert_eq!(got, vec!["/3.flac", "/1.flac", "/2.flac"]);
+    }
+
+    /// Nothing saved is no work and nothing reported.
+    #[test]
+    fn an_empty_saved_queue_loses_nothing() {
+        let (items, lost) = resolve_saved_paths(std::iter::empty(), |p| Some(music(p)));
+        assert!(items.is_empty());
+        assert_eq!(lost, 0);
+    }
+
+    /// The stats belong after the first frame. Reads the source: the
+    /// startup arm and the first-frame block both need a terminal and
+    /// a player to reach.
+    #[test]
+    fn the_saved_queue_is_resolved_after_the_first_frame_not_before() {
+        let src = include_str!("main.rs");
+        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
+
+        let at = code
+            .find("pending_paths.extend(")
+            .expect("the saved queue is no longer deferred at all");
+        let arm = &code[at..(at + 200).min(code.len())];
+        assert!(
+            !arm.contains("item_from_path"),
+            "the startup arm stats every saved path before the frame:\n{arm}"
+        );
+
+        let at = code
+            .find("first_frame_drawn = true;")
+            .expect("the first-frame block moved");
+        let block = &code[at..(at + 700).min(code.len())];
+        assert!(
+            block.contains("resolve_saved_paths(") && block.contains("item_from_path"),
+            "nothing resolves the saved paths after the frame, so the queue is lost:\n{block}"
         );
     }
 }
