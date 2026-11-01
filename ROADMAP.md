@@ -2249,16 +2249,32 @@ stray paint.
       green. and `PlaybackState`'s serde shape has no round-trip test
       at all while `load()` ends in `.ok()?`, so any field rename
       silently turns every saved queue into "nothing to resume".
-- [ ] **accreted test modules, the recorded pattern, again.**
-      `catalog.rs` ~273 `catalog_fetch_tests` holds 3 fetch tests plus
-      4 client-lifetime/zeroize tests; `main.rs` 4637/4665/4680 are
-      `is_starred`/`album_page` tests inside `shellsong_wiring_tests`;
-      `main.rs` ~4497 is a serde-alias test inside
-      `download_policy_tests`. third occurrence, so it is worth a
-      convention rather than another cleanup.
-
-**silent failures and undiscoverable keys.**
-
+- [x] **the accreted test modules are split, and the pattern is
+      written down.** this entry said it was the third occurrence and
+      "worth a convention rather than another cleanup", so it got
+      both: docs/testing.md now carries the rule, which is that **a
+      module is named for what losing it would stop covering**.
+      the two in main.rs: `shellsong_wiring_tests` held `is_starred`
+      and `album_page` tests, which are not shellsong wiring, and they
+      are `item_state_tests` now; `download_policy_tests` held a
+      serde-alias test about `Config`'s on-disk shape, which belongs
+      in config.rs beside the other alias test and is there.
+      the reason it matters beyond tidiness is in the doc: the name is
+      what a reader uses to decide whether an area is covered, so an
+      `is_starred` test filed under shellsong wiring reads as
+      "shellsong is well tested" *and* "`is_starred` is untested", and
+      both readings are wrong.
+      **no automated check, deliberately.** whether a test belongs is
+      a judgement about subject, which is what a lint cannot make, and
+      a fuzzy one would be worse than none. the doc says so rather
+      than leaving the absence to look like an oversight.
+      the doc also carries the two other things this file keeps
+      recording: that a test has to be able to fail (six instances
+      now, **two of them written by this loop while fixing the other
+      four**), and the limits that keep a source-reading guard honest.
+      one mistake in the split, caught by the test count going 27 to
+      26: the serde-alias test was deleted rather than moved. restored
+      in config.rs, where it reads better than it did in main.rs.
 - [x] ~~resolved by the overnight run~~ **`main.rs` ~3588: the interactive remap accepts a key it will
       then drop.** it never checks `reserved_key_purpose`, so a
       binding onto a reserved key is accepted, displayed, written to

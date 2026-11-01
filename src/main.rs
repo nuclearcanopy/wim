@@ -4763,23 +4763,12 @@ mod download_policy_tests {
         assert!(!should_auto_download(5, 2, false, true));
     }
 
-    #[test]
-    fn a_config_with_the_old_play_count_field_still_loads() {
-        // renaming the field must not hard-error someone's existing
-        // config.toml; the old name is an alias of the new one, and
-        // both defaults were 2, so the value carries straight over.
-        let cfg: config::Config =
-            toml::from_str("cache_listens_threshold = 4\n").expect("old field must still load");
-        assert_eq!(cfg.cache_days_threshold, 4);
-        let cfg: config::Config = toml::from_str("").expect("an empty config is all defaults");
-        assert_eq!(cfg.cache_days_threshold, 2);
-    }
 }
 
 #[cfg(test)]
 mod shellsong_wiring_tests {
     use super::*;
-    use wim::core::{album_page, is_starred, shellsong_env};
+    use wim::core::shellsong_env;
 
     /// Only the two readings `Env` takes from a front-end, so these
     /// tests do not need a `CoreCtx` (and so not a live mpv) to
@@ -4801,7 +4790,7 @@ mod shellsong_wiring_tests {
         }
     }
     use std::path::PathBuf;
-    use wim::browse::fixtures::{test_client, test_songs, test_view};
+    use wim::browse::fixtures::{test_songs, test_view};
     use wim::library::{LocalTrack, MediaKind};
 
     #[test]
@@ -4901,6 +4890,22 @@ mod shellsong_wiring_tests {
             shellsong::Focus::BottomBar
         );
     }
+}
+
+/// `is_starred` and `album_page`, which are not shellsong wiring.
+///
+/// These three lived in `shellsong_wiring_tests` because that is the
+/// module someone had open at the time. That is the accretion pattern
+/// this repo has now recorded three times: **a module named for the
+/// first thing tested in it collects whatever came next**, and the
+/// name then lies about what losing the module would stop covering.
+/// See docs/testing.md.
+#[cfg(test)]
+mod item_state_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use wim::browse::fixtures::{test_client, test_songs};
+    use wim::core::{album_page, is_starred};
 
     #[test]
     fn starred_state_is_read_from_whichever_store_owns_the_item() {
