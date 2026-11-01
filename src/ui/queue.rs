@@ -7,7 +7,7 @@ use ratatui::widgets::Widget;
 use crate::anim;
 use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::search::SearchItem;
-use crate::theme::{shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE};
+use crate::theme::{lerp, shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
 use crate::ui::results_list::{fill_row_bg, label};
 use crate::ui::scroll;
@@ -197,11 +197,18 @@ pub fn row_items(
         return Vec::new();
     }
     let rows = Layout::new(entries.len(), pos);
-    let offset = scroll::offset_for(rows.row_of(selected), body_height);
+    // the same split the paint makes, so the footer row is reported as
+    // nothing to click rather than as whatever entry would have been
+    // there without it.
+    let split = body_split(rows.total(), body_height);
+    let offset = scroll::offset_for(rows.row_of(selected), split.rows);
     (0..body_height)
-        .map(|row| match rows.get(offset + row) {
-            Some(Row::Entry(index)) => Some(index),
-            Some(Row::Section(_)) | None => None,
+        .map(|row| match row < split.rows {
+            false => None,
+            true => match rows.get(offset + row) {
+                Some(Row::Entry(index)) => Some(index),
+                Some(Row::Section(_)) | None => None,
+            },
         })
         .collect()
 }
@@ -261,61 +268,63 @@ impl Widget for QueueView<'_> {
             return;
         }
 
+        let mut text = String::new();
+        let mut fitted = String::new();
         if self.entries.is_empty() {
             // never a blank pane: say what to do, since an empty queue
-            // is the state a first-time user is actually in.
-            let mut fitted = String::new();
+            // is the state a first-time user is actually in. the
+            // message takes the row and the hint sits a row under it
+            // with a `›` lead-in, the same mark `ui::suggestions` puts
+            // on a row that is context rather than something a key
+            // acts on.
             draw_fitted(
                 buf,
                 area,
                 body_top,
-                "nothing queued",
+                " nothing queued",
                 shade(MID),
                 &mut fitted,
             );
-            let hint = format!(
-                "enter on a song to start, {} to add",
-                key_label(self.keymap.get(KeyAction::Enqueue))
-            );
-            let mut out = String::new();
+            text.clear();
+            text.push(' ');
+            text.push(INFO_MARK);
+            text.push_str(" enter on a song to start, ");
+            text.push_str(&key_label(self.keymap.get(KeyAction::Enqueue)));
+            text.push_str(" to add");
             draw_fitted(
                 buf,
                 area,
-                body_top.saturating_add(1),
-                &hint,
+                body_top.saturating_add(2),
+                &text,
                 shade(DIM),
-                &mut out,
+                &mut fitted,
             );
             return;
         }
 
         let rows = Layout::new(self.entries.len(), self.pos);
-        let offset = scroll::offset_for(rows.row_of(self.selected), body_height);
+        let total = rows.total();
+        // the footer takes the body's last row, and the cues take its
+        // last column, both only when the queue does not fit; one
+        // derivation, shared with `row_items`, so a click never lands
+        // on the footer.
+        let split = body_split(total, body_height);
+        let list = Rect {
+            width: area.width.saturating_sub(u16::from(split.footer)),
+            ..area
+        };
+        let offset = scroll::offset_for(rows.row_of(self.selected), split.rows);
         // the index gutter is sized to the widest number actually on
         // screen, so a 9-track queue doesn't pay for three digits.
         let gutter = digits(self.entries.len()).max(2);
-        // one pair of buffers for every row of the frame; both reach
-        // the widest row's length on the first screenful and stop
-        // reallocating, where a `format!` plus a `truncate` was two
-        // allocations per visible row every frame.
-        let mut text = String::new();
-        let mut fitted = String::new();
 
-        for row_i in 0..body_height {
+        for row_i in 0..split.rows {
             let Some(row) = rows.get(offset + row_i) else {
                 break;
             };
             let y = body_top + row_i as u16;
             match row {
-                Row::Section(name) => {
-                    // one blank column of indent so section labels sit
-                    // outside the rows they head, not in the same
-                    // column as the entry text.
-                    text.clear();
-                    text.push(' ');
-                    text.push_str(name);
-                    draw_fitted(buf, area, y, &text, shade(NEAR_BLACK), &mut fitted);
-                }
+                Row::Section(name) => draw_section(buf, list, y, name, &mut text),
                 Row::Entry(index) => {
                     let item = &self.entries[index];
                     let is_current = self.pos == Some(index);
@@ -333,16 +342,154 @@ impl Widget for QueueView<'_> {
                     let level = if is_current {
                         NEAR_WHITE
                     } else if is_played {
-                        NEAR_BLACK
+                        // `NEAR_BLACK` here was the level the header's
+                        // own rules are drawn at, so a queue scrolled
+                        // into its history was a pane of invisible
+                        // text; `ui::suggestions` records the same
+                        // mistake and the same fix.
+                        lerp(NEAR_BLACK, DIM, 0.75)
                     } else if is_selected {
                         BRIGHT
                     } else {
                         DIM
                     };
                     write_row_text(&mut text, item, index, marker, gutter);
-                    draw_fitted(buf, area, y, &text, shade(level), &mut fitted);
+                    draw_fitted(buf, list, y, &text, shade(level), &mut fitted);
                 }
             }
+        }
+        if !split.footer {
+            return;
+        }
+        // which way there is more, then how much: the same pair every
+        // windowed list in the ui carries (`help`, `suggestions`,
+        // `lyrics_view`).
+        let drawn = Rect {
+            y: body_top,
+            height: split.rows as u16,
+            ..area
+        };
+        crate::ui::results_list::scroll_cues(buf, drawn, offset, total);
+        draw_footer(
+            buf,
+            area,
+            body_top + split.rows as u16,
+            total.saturating_sub(offset + split.rows),
+            &mut text,
+            &mut fitted,
+        );
+    }
+}
+
+/// How the body splits: rows the queue itself gets, and whether the
+/// last one is the scroll footer.
+///
+/// The footer is only owed when the queue does not fit, so a short one
+/// loses no row to it (the rule `help`'s hint row follows). One
+/// direction only, so it cannot oscillate: taking a row away can only
+/// leave more hidden, never make it fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Body {
+    rows: usize,
+    footer: bool,
+}
+
+/// A body this short keeps every row for the queue: a footer saying
+/// how much is hidden, over one visible entry, is a pane that reports
+/// on itself instead of showing anything.
+const FOOTER_FLOOR: usize = 3;
+
+fn body_split(total: usize, body_height: usize) -> Body {
+    if body_height < FOOTER_FLOOR || total <= body_height {
+        return Body {
+            rows: body_height,
+            footer: false,
+        };
+    }
+    Body {
+        rows: body_height - 1,
+        footer: true,
+    }
+}
+
+/// Leads in a row that is context rather than something a keypress
+/// acts on; the same glyph `ui::suggestions` and `ui::shellsong` mark
+/// one with.
+const INFO_MARK: char = '›';
+
+/// A section label with a rule out to the pane's edge, rather than a
+/// bare line of text: the three runs are what gives this pane its
+/// structure, and the names were drawn at `NEAR_BLACK` too, i.e. at
+/// the brightness of the header's rules. Same shape as
+/// `suggestions::draw_section`: the name legible, the rule behind it
+/// at the frame's level so it reads as structure and not as noise.
+fn draw_section(buf: &mut Buffer, cols: Rect, y: u16, name: &str, text: &mut String) {
+    if y < cols.y || y >= cols.y + cols.height {
+        return;
+    }
+    let budget = cols.width as usize;
+    text.clear();
+    text.push(' ');
+    text.push_str(name);
+    text.push(' ');
+    // `draw::at` hands back the x it reached, so the rule starts where
+    // the name stopped; a recomputed offset would be a cell out for
+    // every wide glyph, and these names are the one thing here that
+    // never has one, which is exactly how such a bug survives.
+    let end = crate::ui::draw::at(buf, cols.x, y, text, shade(MID), budget);
+    let used = end.saturating_sub(cols.x) as usize;
+    let left = budget.saturating_sub(used);
+    text.clear();
+    for _ in 0..left {
+        text.push('─');
+    }
+    crate::ui::draw::at(buf, end, y, text, shade(NEAR_BLACK), left);
+}
+
+/// `21 more below · j/k, wheel`, right-aligned, which is the footer
+/// `ui::help` carries and the count the `▴`/`▾` cues cannot give. The
+/// short forms are for a pane too narrow for the long one rather than
+/// an ellipsis eating the number, which is the one part of it that
+/// matters.
+fn draw_footer(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    left: usize,
+    text: &mut String,
+    fitted: &mut String,
+) {
+    use std::fmt::Write;
+    if y < area.y || y >= area.y + area.height {
+        return;
+    }
+    let budget = area.width as usize;
+    for form in 0..3 {
+        text.clear();
+        let _ = match (left, form) {
+            // scrolled to the bottom: "0 more below" is a count where
+            // the answer is that there is no more, which is what the
+            // missing `▾` says and what this has to agree with.
+            (0, 0) => write!(text, "end of the queue · k, wheel up "),
+            (0, 1) => write!(text, "end of the queue "),
+            (0, _) => write!(text, "end "),
+            (_, 0) => write!(text, "{left} more below · j/k, wheel "),
+            (_, 1) => write!(text, "{left} more below "),
+            (_, _) => write!(text, "+{left} "),
+        };
+        let cells = crate::ui::textfit::width(text);
+        if cells <= budget || form == 2 {
+            truncate_into(fitted, text, budget);
+            let used = crate::ui::textfit::width(fitted);
+            crate::ui::draw::at(
+                buf,
+                area.x + (area.width - used as u16),
+                y,
+                fitted,
+                shade(DIM),
+                used,
+            );
+            return;
         }
     }
 }
@@ -985,8 +1132,13 @@ mod tests {
                     let section = ["now playing", "up next", "played"]
                         .iter()
                         .any(|s| text.contains(s));
+                    // the footer is the other row that is not an entry
+                    // and must not be reported as one.
+                    let footer = ["more below", "end of the queue", "wheel"]
+                        .iter()
+                        .any(|f| text.contains(f));
                     assert!(
-                        blank || section,
+                        blank || section || footer,
                         "body row {i} claims no entry but painted {text:?}"
                     );
                 }
@@ -1023,13 +1175,17 @@ mod tests {
         // a window this far down holds no label and no blank row, so
         // every answer has to be an entry and an offset of 0 would name
         // the wrong one.
+        // nine entry rows and then the scroll footer, which is not an
+        // entry and so must be reported as nothing to click.
         let map = row_items(&e, Some(0), 35, Rect::new(0, 0, 60, 12));
-        assert_eq!(map, (26..=35).map(Some).collect::<Vec<_>>());
+        let want: Vec<Option<usize>> = (27..=35).map(Some).chain([None]).collect();
+        assert_eq!(map, want);
         assert_agrees(&e, Some(0), 35, 60, 12);
 
         // and with the selection on the very last entry.
         let map = row_items(&e, Some(0), 39, Rect::new(0, 0, 60, 12));
-        assert_eq!(map, (30..=39).map(Some).collect::<Vec<_>>());
+        let want: Vec<Option<usize>> = (31..=39).map(Some).chain([None]).collect();
+        assert_eq!(map, want);
         assert_agrees(&e, Some(0), 39, 60, 12);
     }
 
@@ -1170,6 +1326,303 @@ mod tests {
     }
 }
 
+/// Both places this pane drew its own text at `NEAR_BLACK`, which is
+/// the level the header's own rules are drawn at: the section labels,
+/// and the whole already-played run. Not subtle, invisible; found by
+/// printing each cell's brightness as a digit and reading a surface
+/// that came out one flat level (`eyeball::print_the_shade_map`).
+#[cfg(test)]
+mod legibility_tests {
+    use super::tests::queue;
+    use super::*;
+    use crate::ui::testbuf::{buffer, grid};
+
+    fn painted(
+        entries: &[SearchItem],
+        pos: Option<usize>,
+        selected: usize,
+        w: u16,
+        h: u16,
+    ) -> Buffer {
+        let mut buf = buffer(w, h);
+        QueueView {
+            entries,
+            pos,
+            selected,
+            focused: true,
+            elapsed: Duration::ZERO,
+            keymap: &Keymap::default(),
+        }
+        .render(Rect::new(0, 0, w, h), &mut buf);
+        buf
+    }
+
+    /// A `theme::shade` level back out of a cell, which is what makes
+    /// "drawn at the frame's brightness" assertable at all.
+    fn level_at(buf: &Buffer, x: u16, y: u16) -> f32 {
+        match buf.cell((x, y)).unwrap().fg {
+            ratatui::style::Color::Rgb(r, _, _) => r as f32 / 255.0,
+            other => panic!("({x}, {y}) is not a shade: {other:?}"),
+        }
+    }
+
+    /// The first row `pick` accepts, and the x of its first glyph that
+    /// is neither blank nor the untouched fill.
+    ///
+    /// A predicate rather than a substring, because the header reads
+    /// "queue · 2 up next" and so contains the "up next" section label
+    /// too: matched loosely, the section test below reads the title
+    /// row's levels instead and passes on the wrong cells.
+    fn glyph_on(buf: &Buffer, what: &str, pick: impl Fn(&str) -> bool) -> (u16, u16) {
+        let y = grid(buf)
+            .lines()
+            .position(|l| pick(l))
+            .unwrap_or_else(|| panic!("no row is {what}:\n{}", grid(buf))) as u16;
+        let x = (0..buf.area.width)
+            .find(|x| !matches!(buf.cell((*x, y)).unwrap().symbol(), "." | " "))
+            .expect("a row that says something has a glyph");
+        (x, y)
+    }
+
+    /// A heading is its name over a rule: the name has to read, the
+    /// rule has to recede. Both were `NEAR_BLACK`.
+    #[test]
+    fn a_section_label_is_brighter_than_the_rule_it_carries() {
+        let e = queue(4);
+        let buf = painted(&e, Some(1), 1, 44, 12);
+        for name in [" now playing ", " up next ", " played "] {
+            // anchored at the row's start, which a section label is
+            // and the header is not.
+            let (x, y) = glyph_on(&buf, name, |l| l.starts_with(name));
+            let label = level_at(&buf, x, y);
+            let rule = (x..buf.area.width)
+                .find(|x| buf.cell((*x, y)).unwrap().symbol() == "\u{2500}")
+                .map(|x| level_at(&buf, x, y))
+                .unwrap_or_else(|| panic!("{name} carries no rule:\n{}", grid(&buf)));
+            assert_eq!(rule, shade_level(NEAR_BLACK), "{name}'s rule");
+            assert!(
+                label > rule,
+                "{name} is drawn at {label}, its rule at {rule}: a label at the \
+                 rule's level is invisible, not subtle"
+            );
+            assert!(label >= shade_level(MID), "{name} at {label}");
+        }
+    }
+
+    /// `shade` rounds a level to a byte, so a level read back out of a
+    /// cell is not bit-identical to the constant that produced it.
+    fn shade_level(level: f32) -> f32 {
+        match shade(level) {
+            ratatui::style::Color::Rgb(r, _, _) => r as f32 / 255.0,
+            other => panic!("not a shade: {other:?}"),
+        }
+    }
+
+    /// History is meant to recede, not disappear. At `NEAR_BLACK` a
+    /// queue scrolled into its played run was a pane of text drawn at
+    /// the brightness of the frame around it.
+    #[test]
+    fn an_already_played_row_recedes_without_going_invisible() {
+        let e = queue(10);
+        // playing the 6th, cursor on it: four played rows below the
+        // upcoming ones, all on screen at once.
+        let buf = painted(&e, Some(5), 5, 44, 16);
+        let (ux, uy) = glyph_on(&buf, "the 7th entry", |l| l.contains("7. t6"));
+        let (px, py) = glyph_on(&buf, "the 5th entry", |l| l.contains("5. t4"));
+        let upcoming = level_at(&buf, ux, uy);
+        let played = level_at(&buf, px, py);
+        assert!(played < upcoming, "played {played}, upcoming {upcoming}");
+        assert!(
+            played > shade_level(NEAR_BLACK),
+            "a played row at {played} is the level the rules are drawn at"
+        );
+    }
+}
+
+/// The feedback a windowed list owes: which way there is more, and how
+/// much. This pane had neither, so twelve rows of a 120-entry queue
+/// read as the whole queue.
+#[cfg(test)]
+mod scroll_feedback_tests {
+    use super::tests::queue;
+    use super::*;
+    use crate::ui::testbuf::{assert_outside_untouched, buffer, grid};
+
+    fn painted(
+        entries: &[SearchItem],
+        pos: Option<usize>,
+        selected: usize,
+        w: u16,
+        h: u16,
+    ) -> String {
+        let mut buf = buffer(w, h);
+        QueueView {
+            entries,
+            pos,
+            selected,
+            focused: true,
+            elapsed: Duration::ZERO,
+            keymap: &Keymap::default(),
+        }
+        .render(Rect::new(0, 0, w, h), &mut buf);
+        grid(&buf)
+    }
+
+    /// A queue that fits loses no row to a footer it has nothing to
+    /// say on; one that does not gets the row and the count.
+    #[test]
+    fn only_a_queue_that_does_not_fit_pays_for_a_footer() {
+        assert_eq!(
+            body_split(10, 10),
+            Body {
+                rows: 10,
+                footer: false
+            }
+        );
+        assert_eq!(
+            body_split(11, 10),
+            Body {
+                rows: 9,
+                footer: true
+            }
+        );
+        // and through the paint, which is what the user sees.
+        let fits = painted(&queue(8), Some(0), 0, 44, 14);
+        assert!(
+            !fits.contains("more below") && !fits.contains('\u{25be}'),
+            "a queue that fits says nothing about scrolling:\n{fits}"
+        );
+        assert!(fits.contains("8. t7"), "every entry is on screen:\n{fits}");
+    }
+
+    /// The `▴`/`▾` say which way, the footer says how much; both have
+    /// to agree with where the window actually is.
+    #[test]
+    fn the_cues_point_the_way_there_is_more_and_the_footer_counts_it() {
+        let e = queue(120);
+        // 121 display rows (120 entries plus one label), a 10-row body
+        // with the footer taking one: 9 on screen from the top.
+        let top = painted(&e, None, 0, 44, 12);
+        assert!(!top.contains('\u{25b4}'), "nothing is above row 0:\n{top}");
+        assert!(top.contains('\u{25be}'), "{top}");
+        assert!(top.contains("112 more below"), "{top}");
+
+        let middle = painted(&e, None, 60, 44, 12);
+        assert!(
+            middle.contains('\u{25b4}') && middle.contains('\u{25be}'),
+            "{middle}"
+        );
+        assert!(middle.contains("59 more below"), "{middle}");
+
+        let end = painted(&e, None, 119, 44, 12);
+        assert!(end.contains('\u{25b4}'), "{end}");
+        assert!(!end.contains('\u{25be}'), "that is the last entry:\n{end}");
+    }
+
+    /// At the bottom the count is zero, and "0 more below" is a number
+    /// where the answer is that there is no more; the missing `▾` says
+    /// so and the footer has to agree with it.
+    #[test]
+    fn the_bottom_of_the_queue_says_so_instead_of_counting_zero() {
+        let end = painted(&queue(120), None, 119, 44, 12);
+        assert!(
+            !end.contains("0 more below"),
+            "the footer counts nothing left as a count:\n{end}"
+        );
+        assert!(end.contains("end of the queue"), "{end}");
+    }
+
+    /// A footer over one visible entry is a pane reporting on itself
+    /// instead of showing anything, so a body this short keeps all of
+    /// its rows.
+    #[test]
+    fn a_body_too_short_for_a_footer_keeps_every_row_for_the_queue() {
+        for body_height in 0..FOOTER_FLOOR {
+            assert_eq!(
+                body_split(500, body_height),
+                Body {
+                    rows: body_height,
+                    footer: false
+                },
+                "body of {body_height}"
+            );
+        }
+        // 4 rows of pane is 2 of body, so nothing but entries.
+        let tiny = painted(&queue(120), None, 0, 44, 4);
+        assert!(!tiny.contains("more below"), "{tiny}");
+        assert!(tiny.contains("up next"), "{tiny}");
+    }
+
+    /// The count is the part of the footer that matters, so a pane too
+    /// narrow for the keys drops the keys rather than letting an
+    /// ellipsis eat the number.
+    #[test]
+    fn a_narrow_footer_keeps_the_count_and_drops_the_keys() {
+        let e = queue(120);
+        let wide = painted(&e, None, 0, 44, 12);
+        assert!(wide.contains("112 more below \u{b7} j/k, wheel"), "{wide}");
+        let narrow = painted(&e, None, 0, 20, 12);
+        assert!(narrow.contains("112 more below"), "{narrow}");
+        assert!(!narrow.contains("j/k, wheel"), "{narrow}");
+        let cramped = painted(&e, None, 0, 10, 12);
+        assert!(cramped.contains("+112"), "{cramped}");
+    }
+
+    /// Both of this pane's own painters write through `draw::at`,
+    /// which `Buffer` bounds-checks and the rect does not: a row
+    /// outside the rect is a row of some other pane, usually the
+    /// bottom bar's rule. Neither guard is reachable through `render`
+    /// (the arithmetic keeps both rows inside), so each is exercised
+    /// directly; same shape and same reason as
+    /// `results_list::a_section_rule_outside_its_rect_paints_nothing`.
+    #[test]
+    fn a_section_or_footer_outside_its_rect_paints_nothing() {
+        for (h, y) in [(0u16, 2u16), (0, 3), (1, 3), (2, 9), (3, 1), (3, 5)] {
+            let area = Rect::new(1, 2, 18, h);
+            let mut buf = buffer(22, 10);
+            let mut text = String::new();
+            let mut fitted = String::new();
+            draw_section(&mut buf, area, y, "up next", &mut text);
+            draw_footer(&mut buf, area, y, 12, &mut text, &mut fitted);
+            assert_outside_untouched(&buf, area);
+        }
+        // and the one row each of them must draw on, so this is not a
+        // test that passes because the painters do nothing at all.
+        let area = Rect::new(1, 2, 18, 2);
+        let mut buf = buffer(22, 10);
+        let mut text = String::new();
+        let mut fitted = String::new();
+        draw_section(&mut buf, area, 2, "up next", &mut text);
+        draw_footer(&mut buf, area, 3, 12, &mut text, &mut fitted);
+        let g = grid(&buf);
+        assert!(g.contains("up next") && g.contains("12 more"), "{g}");
+        assert_outside_untouched(&buf, area);
+    }
+
+    /// Both the cues and the footer write raw cells, and neither may
+    /// land in whatever pane sits past this one.
+    #[test]
+    fn the_cues_and_the_footer_stay_inside_the_rect() {
+        let e = queue(120);
+        for (w, h) in [(1u16, 1u16), (2, 3), (5, 4), (20, 6), (44, 12), (120, 40)] {
+            for pos in [None, Some(0), Some(60)] {
+                let area = Rect::new(2, 1, w, h);
+                let mut buf = buffer(w + 5, h + 3);
+                QueueView {
+                    entries: &e,
+                    pos,
+                    selected: 60,
+                    focused: true,
+                    elapsed: Duration::ZERO,
+                    keymap: &Keymap::default(),
+                }
+                .render(area, &mut buf);
+                assert_outside_untouched(&buf, area);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod eyeball {
     use super::*;
@@ -1262,5 +1715,116 @@ mod eyeball {
             println!("--- {w}x{h} {what}\n{text}");
             assert!(text.contains("queue"), "{what} lost its title:\n{text}");
         }
+    }
+
+    /// The states the chars above do not show: one entry, a queue
+    /// exactly as long as its pane, one far longer, and the two widths
+    /// the footer changes form at. Read it:
+    /// `cargo test --lib ui::queue::eyeball -- --nocapture`.
+    #[test]
+    fn print_the_queue_at_every_length_and_width() {
+        let km = Keymap::default();
+        let one = [song("only track")];
+        // 3 labels and 4 entries is 7 display rows, which is a 9-row
+        // pane exactly: the case either side of which a footer appears.
+        let fits: Vec<SearchItem> = (0..4).map(|i| song(&format!("track {i}"))).collect();
+        let long: Vec<SearchItem> = (0..120).map(|i| song(&format!("track {i}"))).collect();
+        let cases: [Case; 9] = [
+            ("one entry, nothing playing", &one, None, 0, &km, 60, 8),
+            ("one entry, playing", &one, Some(0), 0, &km, 60, 8),
+            ("exactly fills the pane", &fits, Some(1), 1, &km, 60, 9),
+            ("one row over", &fits, Some(1), 1, &km, 60, 8),
+            ("120 entries, at the top", &long, None, 0, &km, 60, 14),
+            ("120 entries, mid queue", &long, Some(60), 60, &km, 60, 14),
+            ("120 entries, at the end", &long, None, 119, &km, 60, 14),
+            ("cramped", &long, Some(60), 60, &km, 18, 8),
+            ("very wide", &long, Some(60), 60, &km, 110, 8),
+        ];
+        for (what, entries, pos, selected, keymap, w, h) in cases {
+            let mut buf = buffer(w, h);
+            QueueView {
+                entries,
+                pos,
+                selected,
+                focused: true,
+                elapsed: Duration::ZERO,
+                keymap,
+            }
+            .render(Rect::new(0, 0, w, h), &mut buf);
+            println!("--- {w}x{h} {what}\n{}", grid(&buf));
+        }
+        // the floor: the longest case says how much is hidden, which is
+        // the whole point of the footer.
+        let mut buf = buffer(60, 14);
+        QueueView {
+            entries: &long,
+            pos: None,
+            selected: 0,
+            focused: true,
+            elapsed: Duration::ZERO,
+            keymap: &km,
+        }
+        .render(Rect::new(0, 0, 60, 14), &mut buf);
+        assert!(grid(&buf).contains("more below"), "{}", grid(&buf));
+    }
+
+    /// Every cell's brightness as a digit, foreground over background.
+    ///
+    /// This is the printer that found both of this pane's legibility
+    /// bugs, and neither was visible in the chars: the section labels
+    /// and the whole played run came out at `1`, the same digit as the
+    /// header's own rules, i.e. the pane was drawing its own text at
+    /// the brightness of the frame around it. `legibility_tests` is
+    /// the regression; this is how to look.
+    /// `cargo test --lib ui::queue::eyeball -- --nocapture`.
+    #[test]
+    fn print_the_shade_map() {
+        let long: Vec<SearchItem> = (0..30).map(|i| song(&format!("track {i}"))).collect();
+        let mut buf = buffer(44, 14);
+        QueueView {
+            entries: &long,
+            pos: Some(4),
+            selected: 4,
+            focused: true,
+            elapsed: Duration::ZERO,
+            keymap: &Keymap::default(),
+        }
+        .render(Rect::new(0, 0, 44, 14), &mut buf);
+        let digit = |c: ratatui::style::Color| match c {
+            ratatui::style::Color::Rgb(r, _, _) => {
+                char::from_digit((r as u32 * 9 + 127) / 255, 10).unwrap_or('9')
+            }
+            // `Reset` is the terminal's own background, i.e. nothing
+            // was painted here at all.
+            _ => '.',
+        };
+        println!(
+            "--- 44x14 mid queue, chars then fg | bg shades\n{}",
+            grid(&buf)
+        );
+        for y in 0..buf.area.height {
+            let fg: String = (0..buf.area.width)
+                .map(|x| {
+                    let cell = buf.cell((x, y)).unwrap();
+                    match cell.symbol() {
+                        "." | " " => ' ',
+                        _ => digit(cell.fg),
+                    }
+                })
+                .collect();
+            let bg: String = (0..buf.area.width)
+                .map(|x| digit(buf.cell((x, y)).unwrap().bg))
+                .collect();
+            println!("{fg} | {bg}");
+        }
+        // the floor: the section labels are not drawn at the rules'
+        // own level, which is what this printer exists to catch.
+        let rule = digit(shade(NEAR_BLACK));
+        let label_row = grid(&buf)
+            .lines()
+            .position(|l| l.starts_with(" up next "))
+            .expect("a section label");
+        let label = digit(buf.cell((1, label_row as u16)).unwrap().fg);
+        assert_ne!(label, rule, "the label is drawn at the rules' level");
     }
 }
