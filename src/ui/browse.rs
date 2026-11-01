@@ -15,7 +15,7 @@ use crate::ui::header::draw_header;
 use crate::ui::results_list::{draw_header_row, fill_row_bg};
 use crate::ui::scroll;
 use crate::ui::searchbox::SearchBox;
-use crate::ui::textfit::truncate_with_ellipsis;
+use crate::ui::textfit::truncate_into;
 
 /// Track listing for an opened album/playlist, in `main_content`
 /// (not full-screen: the sidebar and bottom bar stay visible, this is
@@ -131,42 +131,103 @@ pub fn rows(area: Rect, view: &BrowseView, art_mode: ArtMode, cell_aspect: f32) 
         cell_aspect,
     );
     if !view.is_artist {
-        let all: Vec<usize> = (0..view.tracks.len()).collect();
+        // an album or playlist has no filter box, so the render shows
+        // every track and so does the map.
+        let shown = Shown::All(view.tracks.len());
         return BrowseRows {
             albums: None,
-            tracks: (list_area, track_rows(list_area, &all, view.selected)),
+            tracks: (list_area, track_rows(list_area, shown, view.selected)),
         };
     }
+    let filtered = filtered_tracks(view);
+    let shown = Shown::new(view, &filtered);
     let c = artist_columns(list_area);
-    let visible = view.visible_track_indices();
     BrowseRows {
         albums: Some((
             c.albums,
-            simple_rows(c.albums, view.albums.len(), view.albums_selected),
+            simple_rows(c.albums, view.albums.len(), view.albums_selected).collect(),
         )),
-        tracks: (c.songs, track_rows(c.songs, &visible, view.selected)),
+        tracks: (c.songs, track_rows(c.songs, shown, view.selected)),
     }
 }
 
-/// Which of `indices` each visible row of `area` shows, at the
+/// Which positions in `view.tracks` a list shows, in order: either
+/// every one of them or whatever the song filter narrowed them to.
+///
+/// `All` is both the album/playlist case and an artist page with an
+/// empty filter box, and it is the one that used to cost: a `Vec<usize>`
+/// as long as the whole listing, built twice a frame (the click map,
+/// then the paint), with a `position(|i| i == selected)` walk over it
+/// for the cursor's row. Both are arithmetic here; see `frame_budget`.
+#[derive(Debug, Clone, Copy)]
+enum Shown<'a> {
+    All(usize),
+    Filtered(&'a [usize]),
+}
+
+impl<'a> Shown<'a> {
+    fn new(view: &BrowseView, filtered: &'a Option<Vec<usize>>) -> Self {
+        match filtered {
+            Some(indices) => Shown::Filtered(indices),
+            None => Shown::All(view.tracks.len()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Shown::All(len) => *len,
+            Shown::Filtered(indices) => indices.len(),
+        }
+    }
+
+    /// The track at display row `row`, or `None` past the end.
+    fn get(&self, row: usize) -> Option<usize> {
+        match self {
+            Shown::All(len) => (row < *len).then_some(row),
+            Shown::Filtered(indices) => indices.get(row).copied(),
+        }
+    }
+
+    /// Which display row holds `selected`; row 0 when it shows none,
+    /// the same answer the `position(..).unwrap_or(0)` this replaced
+    /// gave by failing to find it.
+    fn row_of(&self, selected: usize) -> usize {
+        match self {
+            Shown::All(len) => match selected < *len {
+                true => selected,
+                false => 0,
+            },
+            Shown::Filtered(indices) => indices.iter().position(|&i| i == selected).unwrap_or(0),
+        }
+    }
+}
+
+/// The filter's answer, materialized only when there is a filter:
+/// `visible_track_indices`' own first branch is `(0..tracks.len())`
+/// collected, which is the `Vec` `Shown::All` exists to not build.
+fn filtered_tracks(view: &BrowseView) -> Option<Vec<usize>> {
+    (!view.filter_query.is_empty()).then(|| view.visible_track_indices())
+}
+
+/// Which track each visible row of `area` shows, at the
 /// clamp-to-selection offset `draw_track_list` draws from.
-fn track_rows(area: Rect, indices: &[usize], selected: usize) -> Vec<Option<usize>> {
-    let selected_row = indices.iter().position(|&i| i == selected).unwrap_or(0);
+fn track_rows(area: Rect, shown: Shown, selected: usize) -> Vec<Option<usize>> {
     let visible_rows = area.height as usize;
-    let offset = scroll::offset_for(selected_row, visible_rows);
+    let offset = scroll::offset_for(shown.row_of(selected), visible_rows);
     (0..visible_rows)
-        .map(|row| indices.get(offset + row).copied())
+        .map(|row| shown.get(offset + row))
         .collect()
 }
 
 /// Same for the albums column, whose rows are its indices outright (no
-/// filter sits between the two).
-fn simple_rows(area: Rect, len: usize, selected: usize) -> Vec<Option<usize>> {
+/// filter sits between the two); an iterator rather than a `Vec`, so
+/// the paint next door walks it without allocating a row map it then
+/// throws away. Still exactly `area.height` answers long, which is
+/// what the hit map it feeds indexes by row.
+fn simple_rows(area: Rect, len: usize, selected: usize) -> impl Iterator<Item = Option<usize>> {
     let visible_rows = area.height as usize;
     let offset = scroll::offset_for(selected, visible_rows);
-    (0..visible_rows)
-        .map(|row| (offset + row < len).then_some(offset + row))
-        .collect()
+    (0..visible_rows).map(move |row| (offset + row < len).then_some(offset + row))
 }
 
 fn is_starred(track: &SearchItem, favorites: &Favorites, remote_starred: &HashSet<String>) -> bool {
@@ -273,11 +334,13 @@ impl Widget for BrowseListView<'_> {
             draw_line(buf, list_area, y, &msg, shade(DIM));
             return;
         }
+        // an album or playlist has no filter box, so every track shows
+        // and `Shown::All` answers its rows without a row list.
         draw_track_list(
             buf,
             list_area,
             &self.view.tracks,
-            &(0..self.view.tracks.len()).collect::<Vec<_>>(),
+            Shown::All(self.view.tracks.len()),
             self.view.selected,
             true,
             self.focused,
@@ -327,8 +390,9 @@ impl BrowseListView<'_> {
         .render(c.filter, buf);
 
         let songs_rect = c.songs;
-        let visible = self.view.visible_track_indices();
-        if visible.is_empty() {
+        let filtered = filtered_tracks(self.view);
+        let shown = Shown::new(self.view, &filtered);
+        if shown.len() == 0 {
             let msg = crate::browse::pane_message(
                 self.view.loading,
                 !self.view.filter_query.is_empty(),
@@ -341,7 +405,7 @@ impl BrowseListView<'_> {
             buf,
             songs_rect,
             &self.view.tracks,
-            &visible,
+            shown,
             self.view.selected,
             !self.view.albums_focused,
             self.focused,
@@ -370,10 +434,11 @@ fn draw_simple_list(
     // same clamp-to-selection scroll as the track list beside it; it
     // had none at all, so past the pane height `j` moved a cursor
     // nothing on screen ever showed.
-    for (row, idx) in simple_rows(area, items.len(), selected)
-        .into_iter()
-        .enumerate()
-    {
+    // one pair of buffers for every row of the frame, where a
+    // `format!` plus a `truncate` was two allocations per visible row.
+    let mut text = String::new();
+    let mut fitted = String::new();
+    for (row, idx) in simple_rows(area, items.len(), selected).enumerate() {
         let Some(item) = idx.and_then(|i| items.get(i)) else {
             break;
         };
@@ -387,23 +452,27 @@ fn draw_simple_list(
                 anim::selection_bg(elapsed, focused && pane_focused),
             );
         }
-        let marker = if is_selected { "> " } else { "  " };
-        let name = match item {
-            SearchItem::Album { name, .. } => name.as_str(),
-            _ => "",
-        };
         let color = if is_selected && focused {
             shade(NEAR_WHITE)
         } else {
             shade(DIM)
         };
-        draw_line(
-            buf,
-            area,
-            y,
-            &truncate_with_ellipsis(&format!("{marker}{name}"), area.width as usize),
-            color,
-        );
+        write_album_text(&mut text, item, is_selected);
+        draw_fitted(buf, area, y, &text, color, &mut fitted);
+    }
+}
+
+/// `> an album` for one row of the albums column, written into `out`
+/// rather than returned: the paint hands the same buffer to every row.
+/// Clears `out` itself, so a caller cannot leak the previous row into
+/// this one.
+fn write_album_text(out: &mut String, item: &SearchItem, selected: bool) {
+    out.clear();
+    out.push_str(if selected { "> " } else { "  " });
+    // albums are the only thing this column ever holds; anything else
+    // is a row with no name to draw rather than a fallback label.
+    if let SearchItem::Album { name, .. } = item {
+        out.push_str(name);
     }
 }
 
@@ -417,7 +486,7 @@ fn draw_track_list(
     buf: &mut Buffer,
     area: Rect,
     tracks: &[SearchItem],
-    indices: &[usize],
+    shown: Shown,
     selected: usize,
     focused: bool,
     pane_focused: bool,
@@ -428,8 +497,14 @@ fn draw_track_list(
 ) {
     // same clamp-to-selection scroll as ResultsList: a long album
     // shouldn't be unreachable past the bottom of the pane.
-    for (row, idx) in track_rows(area, indices, selected).into_iter().enumerate() {
-        let Some(idx) = idx else {
+    let offset = scroll::offset_for(shown.row_of(selected), area.height as usize);
+    // one pair of buffers for every row of the frame, where a label,
+    // a `format!` and a `truncate` was three allocations per visible
+    // row.
+    let mut text = String::new();
+    let mut fitted = String::new();
+    for row in 0..area.height as usize {
+        let Some(idx) = shown.get(offset + row) else {
             break;
         };
         let track = &tracks[idx];
@@ -438,34 +513,314 @@ fn draw_track_list(
             let level = anim::selection_bg(elapsed, focused && pane_focused);
             fill_row_bg(buf, area, area.y + row as u16, level);
         }
-        let marker = if is_selected { "> " } else { "  " };
-        let label = match track {
-            SearchItem::Song { title, artist, .. } if show_artist => format!("{title} · {artist}"),
-            SearchItem::Song { title, .. } => title.clone(),
-            _ => String::new(),
-        };
-        let star = if is_starred(track, favorites, remote_starred) {
-            "* "
-        } else {
-            ""
-        };
-        let line = format!("{marker}{:>2}. {star}{label}", idx + 1);
-        draw_line(
+        write_track_text(
+            &mut text,
+            track,
+            idx,
+            is_selected,
+            show_artist,
+            is_starred(track, favorites, remote_starred),
+        );
+        draw_fitted(
             buf,
             area,
             area.y + row as u16,
-            &truncate_with_ellipsis(&line, area.width as usize),
+            &text,
             if is_selected && focused {
                 shade(BRIGHT)
             } else {
                 shade(DIM)
             },
+            &mut fitted,
         );
+    }
+}
+
+/// `>  7. * a title · an artist` for one track row, written into `out`
+/// rather than returned, same reason as `write_album_text`: the label
+/// used to be a `String` of its own on top of the row's `format!`.
+fn write_track_text(
+    out: &mut String,
+    track: &SearchItem,
+    idx: usize,
+    selected: bool,
+    show_artist: bool,
+    starred: bool,
+) {
+    use std::fmt::Write;
+    out.clear();
+    out.push_str(if selected { "> " } else { "  " });
+    // right-aligned in two columns by hand, which is what `{:>2}` did.
+    let number = idx + 1;
+    if number < 10 {
+        out.push(' ');
+    }
+    // writing into a `String` cannot fail.
+    let _ = write!(out, "{number}. ");
+    if starred {
+        out.push_str("* ");
+    }
+    // a track's artist only shows where the listing is not already one
+    // artist's (`show_track_artist`); anything but a remote song is a
+    // row with no label to draw rather than a fallback.
+    if let SearchItem::Song { title, artist, .. } = track {
+        out.push_str(title);
+        if show_artist {
+            out.push_str(" · ");
+            out.push_str(artist);
+        }
     }
 }
 
 fn draw_line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
     crate::ui::draw::line(buf, area, y, text, color);
+}
+
+/// One row of `area`, clipped to its width with an ellipsis where
+/// anything was cut. `fitted` is the caller's reused buffer.
+fn draw_fitted(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    text: &str,
+    color: ratatui::style::Color,
+    fitted: &mut String,
+) {
+    truncate_into(fitted, text, area.width as usize);
+    crate::ui::draw::line(buf, area, y, fitted, color);
+}
+
+/// What a frame of this pane costs, and whether it costs it per
+/// *visible row* or per track in the whole listing. main.rs asks for
+/// this pane's row map once a frame and then paints it, so anything in
+/// here that scales with the track count is paid for twice at the
+/// display's rate.
+///
+/// A measurement, not an assertion: the numbers move with the box and
+/// a ceiling here would be a flake. Run it with
+/// `cargo test --release --lib ui::browse::frame_budget -- --ignored --nocapture`;
+/// the dev profile is `opt-level = 0` and reads about 10x the shipping
+/// cost, which is why the build is the first thing printed.
+#[cfg(test)]
+mod frame_budget {
+    use super::tests::{eager_album_text, eager_track_text, long_album};
+    use super::*;
+    use crate::ui::testbuf::buffer;
+    use std::time::Instant;
+
+    /// Alternating batches in one process, best of each. Sequential
+    /// runs on this box differ 1.6-2.1x under load, so two separate
+    /// measurements are not comparable and this is the only shape that
+    /// is; same harness as `results_list::frame_budget`.
+    fn best_each(
+        rounds: usize,
+        iters: usize,
+        a: &mut dyn FnMut(),
+        b: &mut dyn FnMut(),
+    ) -> (f64, f64) {
+        let mut best = (f64::MAX, f64::MAX);
+        let time = |f: &mut dyn FnMut()| {
+            let at = Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            at.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+        for _ in 0..rounds {
+            best.0 = best.0.min(time(a));
+            best.1 = best.1.min(time(b));
+        }
+        best
+    }
+
+    /// The workspace pane on a tall terminal.
+    const PANE: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 70,
+        height: 40,
+    };
+
+    fn frame(view: &BrowseView, buf: &mut Buffer) {
+        let _ = rows(PANE, view, ArtMode::Off, 2.0);
+        BrowseListView {
+            view,
+            favorites: &Favorites::default(),
+            remote_starred: &HashSet::new(),
+            art_mode: ArtMode::Off,
+            cell_aspect: 2.0,
+            cursor_visible: false,
+            focused: true,
+            elapsed: Duration::ZERO,
+        }
+        .render(PANE, buf);
+    }
+
+    /// One screenful of row geometry, which is what each of a frame's
+    /// two derivations does: place the cursor, then ask for every row
+    /// in the window.
+    ///
+    /// A function, and `screenful_materialized` below is another one,
+    /// because an "old" shape written as a branch inside the timing
+    /// loop gets inlined and specialized while the real path stays an
+    /// ordinary call, and the A/B then lies.
+    fn screenful(len: usize, selected: usize) {
+        let shown = Shown::All(len);
+        let offset = scroll::offset_for(shown.row_of(selected), PANE.height as usize);
+        for row in 0..PANE.height as usize {
+            std::hint::black_box(shown.get(offset + row));
+        }
+    }
+
+    /// The same screenful off the `(0..len).collect()` index list that
+    /// `Shown::All` replaced, plus the linear `position` scan for the
+    /// cursor that went with it.
+    fn screenful_materialized(len: usize, selected: usize) {
+        let indices: Vec<usize> = (0..len).collect();
+        let selected_row = indices.iter().position(|&i| i == selected).unwrap_or(0);
+        let offset = scroll::offset_for(selected_row, PANE.height as usize);
+        for row in 0..PANE.height as usize {
+            std::hint::black_box(indices.get(offset + row).copied());
+        }
+    }
+
+    #[test]
+    #[ignore = "a measurement; run it explicitly"]
+    fn what_a_frame_of_the_browse_pane_costs() {
+        // 144hz is `anim::MAX_HZ`, the fastest the poll loop will ever
+        // redraw at, so it is the tightest deadline this path has.
+        let budget = 1e6 / crate::anim::MAX_HZ as f64;
+        println!(
+            "--- browse pane {}x{}, budget {budget:.0}us at {}hz, {} build",
+            PANE.width,
+            PANE.height,
+            crate::anim::MAX_HZ,
+            if cfg!(debug_assertions) {
+                "DEBUG (not the shipping cost; re-run with --release)"
+            } else {
+                "release"
+            }
+        );
+        // the short listing is the control: a pane's worth of tracks
+        // and nothing more. Any gap between the two is work the frame
+        // did on tracks that are not on screen.
+        let small = long_album(PANE.height as usize, 0);
+        let mut buf_a = buffer(PANE.width, PANE.height);
+        let mut buf_b = buffer(PANE.width, PANE.height);
+        for n in [2_000usize, 8_000, 15_000] {
+            for (what, selected) in [("row 0", 0usize), ("the last row", n - 1)] {
+                let long = long_album(n, selected);
+                let (big, ctrl) = {
+                    let mut on_long = || frame(&long, &mut buf_a);
+                    let mut on_small = || frame(&small, &mut buf_b);
+                    best_each(5, 20, &mut on_long, &mut on_small)
+                };
+                let (closed, materialized) =
+                    best_each(5, 20, &mut || screenful(n, selected), &mut || {
+                        screenful_materialized(n, selected)
+                    });
+                // and the whole frame either way. `frame` already does
+                // the two closed-form derivations, so stacking the two
+                // materialized ones on top is the old frame plus one
+                // closed screenful of noise.
+                let (was, now) = best_each(
+                    5,
+                    20,
+                    &mut || {
+                        screenful_materialized(n, selected);
+                        screenful_materialized(n, selected);
+                        frame(&long, &mut buf_a);
+                    },
+                    &mut || frame(&long, &mut buf_b),
+                );
+                println!(
+                    "  {n:>6} tracks, cursor on {what:<12}: frame {big:>8.1}us ({:>5.1}% of budget)   {} on screen {ctrl:>7.1}us   {:>5.1}x\n{:24}one screenful of geometry: closed form {closed:>8.2}us   a Vec<usize> {materialized:>8.1}us   {:>6.1}x\n{:24}the whole frame {now:>8.1}us   with both derivations materialized {was:>8.1}us   {:>5.1}x",
+                    big / budget * 100.0,
+                    PANE.height,
+                    big / ctrl,
+                    "",
+                    materialized / closed,
+                    "",
+                    was / now,
+                );
+            }
+        }
+
+        // the row text, which the paint builds once per visible row:
+        // one reused buffer plus `truncate_into` against the label,
+        // `format!` and `truncate_with_ellipsis` triple it replaced.
+        let view = long_album(PANE.height as usize, 0);
+        let mut text = String::new();
+        let mut fitted = String::new();
+        for (case, show_artist) in [("title only", false), ("title and artist", true)] {
+            let mut reused = || {
+                for (i, t) in view.tracks.iter().enumerate() {
+                    write_track_text(&mut text, t, i, i == 0, show_artist, false);
+                    truncate_into(&mut fitted, &text, PANE.width as usize);
+                    std::hint::black_box(&fitted);
+                }
+            };
+            let mut formatted = || {
+                for (i, t) in view.tracks.iter().enumerate() {
+                    let line = eager_track_text(t, i, i == 0, show_artist, false);
+                    std::hint::black_box(crate::ui::textfit::truncate_with_ellipsis(
+                        &line,
+                        PANE.width as usize,
+                    ));
+                }
+            };
+            let (one_buffer, per_row) = best_each(5, 200, &mut reused, &mut formatted);
+            println!(
+                "  {} track rows, {case:<16}: two buffers {one_buffer:>7.2}us   a String per row {per_row:>7.2}us   {:.1}x",
+                PANE.height,
+                per_row / one_buffer,
+            );
+        }
+        let albums = tests::test_albums(PANE.height as usize);
+        let mut reused = || {
+            for (i, a) in albums.iter().enumerate() {
+                write_album_text(&mut text, a, i == 0);
+                truncate_into(&mut fitted, &text, PANE.width as usize);
+                std::hint::black_box(&fitted);
+            }
+        };
+        let mut formatted = || {
+            for (i, a) in albums.iter().enumerate() {
+                let line = eager_album_text(a, i == 0);
+                std::hint::black_box(crate::ui::textfit::truncate_with_ellipsis(
+                    &line,
+                    PANE.width as usize,
+                ));
+            }
+        };
+        let (one_buffer, per_row) = best_each(5, 200, &mut reused, &mut formatted);
+        println!(
+            "  {} album rows{:21}: two buffers {one_buffer:>7.2}us   a String per row {per_row:>7.2}us   {:.1}x",
+            PANE.height,
+            "",
+            per_row / one_buffer,
+        );
+
+        // and the whole paint, which is what that sits inside.
+        let mut pane = buffer(PANE.width, PANE.height);
+        let mut paint = || frame(&view, &mut pane);
+        let mut geometry = || {
+            std::hint::black_box(rows(PANE, &view, ArtMode::Off, 2.0));
+        };
+        let (painted, geo) = best_each(5, 200, &mut paint, &mut geometry);
+        println!(
+            "  a whole frame {painted:>7.2}us ({:>4.1}% of budget)   the row map alone {geo:>7.2}us",
+            painted / budget * 100.0,
+        );
+        // the floor, so this is a test and not just a printer: a
+        // render that drew nothing would measure beautifully.
+        let grid = crate::ui::testbuf::grid(&pane);
+        assert!(grid.contains(">  1. song 0"), "nothing painted:\n{grid}");
+        assert!(
+            grid.lines().last().is_some_and(|r| r.contains(". song")),
+            "the pane is not full to its last row:\n{grid}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -689,7 +1044,7 @@ mod tests {
         }
     }
 
-    fn test_albums(n: usize) -> Vec<SearchItem> {
+    pub(super) fn test_albums(n: usize) -> Vec<SearchItem> {
         let client = test_client();
         (0..n)
             .map(|i| SearchItem::Album {
@@ -699,6 +1054,163 @@ mod tests {
                 client: client.clone(),
             })
             .collect()
+    }
+
+    /// An album listing of `n` tracks with the cursor on `selected`,
+    /// which is the one view in here whose cost scales with the whole
+    /// listing. Shared with `frame_budget`.
+    pub(super) fn long_album(n: usize, selected: usize) -> BrowseView {
+        let mut v = test_view(test_songs(n));
+        v.selected = selected;
+        v
+    }
+
+    /// What a track row's text used to cost: a `String` for the label
+    /// and a `format!` for the row, per visible row per frame. Kept as
+    /// the definition `write_track_text` has to agree with, and as the
+    /// benchmark's other half.
+    pub(super) fn eager_track_text(
+        track: &SearchItem,
+        idx: usize,
+        selected: bool,
+        show_artist: bool,
+        starred: bool,
+    ) -> String {
+        let marker = if selected { "> " } else { "  " };
+        let label = match track {
+            SearchItem::Song { title, artist, .. } if show_artist => format!("{title} · {artist}"),
+            SearchItem::Song { title, .. } => title.clone(),
+            _ => String::new(),
+        };
+        let star = if starred { "* " } else { "" };
+        format!("{marker}{:>2}. {star}{label}", idx + 1)
+    }
+
+    /// Same for the albums column's rows.
+    pub(super) fn eager_album_text(item: &SearchItem, selected: bool) -> String {
+        let marker = if selected { "> " } else { "  " };
+        let name = match item {
+            SearchItem::Album { name, .. } => name.as_str(),
+            _ => "",
+        };
+        format!("{marker}{name}")
+    }
+
+    /// Both one-buffer row writers have to spell the same row as the
+    /// `format!`s they replaced, for every item variant and every
+    /// combination of the flags; the track number is right-aligned by
+    /// hand where `{:>2}` did it, so a number wider than two columns
+    /// has to overflow the same way rather than be clipped.
+    #[test]
+    fn the_row_text_says_what_a_formatted_one_said() {
+        let client = test_client();
+        let items = [
+            SearchItem::Song {
+                id: "1".into(),
+                title: "a title".into(),
+                artist: "an artist".into(),
+                album: "an album".into(),
+                client: client.clone(),
+            },
+            SearchItem::Album {
+                id: "2".into(),
+                name: "an album".into(),
+                artist: "an artist".into(),
+                client: client.clone(),
+            },
+            // the variants neither list draws a label for, which both
+            // writers have to leave blank rather than fall back on.
+            SearchItem::Artist {
+                id: "3".into(),
+                name: "an artist".into(),
+                client,
+            },
+            SearchItem::LocalVideo {
+                path: "/v/c.mkv".into(),
+                title: "a clip".into(),
+            },
+            SearchItem::Silence { secs: 930 },
+        ];
+        let mut out = String::new();
+        for item in &items {
+            for idx in [0usize, 8, 9, 98, 99, 100] {
+                for selected in [false, true] {
+                    for show_artist in [false, true] {
+                        for starred in [false, true] {
+                            // the same buffer across every case, so a
+                            // missing `clear` shows up as the previous
+                            // row's text still being in front.
+                            write_track_text(&mut out, item, idx, selected, show_artist, starred);
+                            assert_eq!(
+                                out,
+                                eager_track_text(item, idx, selected, show_artist, starred),
+                                "{item:?} idx {idx} selected {selected} artist {show_artist} starred {starred}"
+                            );
+                        }
+                    }
+                    write_album_text(&mut out, item, selected);
+                    assert_eq!(
+                        out,
+                        eager_album_text(item, selected),
+                        "album row for {item:?} selected {selected}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `Shown::All` answers rows and the cursor's row arithmetically
+    /// where a `(0..len).collect()` plus a `position` scan did, so it
+    /// has to agree with that list at every row, at a `selected` past
+    /// the end (which falls back to row 0), and with what
+    /// `visible_track_indices` hands back for an unfiltered view,
+    /// which is the call `filtered_tracks` skips.
+    #[test]
+    fn the_unfiltered_row_source_answers_what_the_index_list_would() {
+        for n in [0usize, 1, 3, 40, 137] {
+            let view = long_album(n, 0);
+            assert!(
+                filtered_tracks(&view).is_none(),
+                "an empty filter query materializes no index list"
+            );
+            let indices = view.visible_track_indices();
+            assert_eq!(indices, (0..n).collect::<Vec<_>>(), "precondition, n {n}");
+            let shown = Shown::new(&view, &None);
+            assert_eq!(shown.len(), indices.len(), "n {n}");
+            for row in 0..n + 3 {
+                assert_eq!(
+                    shown.get(row),
+                    indices.get(row).copied(),
+                    "row {row}, n {n}"
+                );
+            }
+            for selected in [0usize, 1, n / 2, n.saturating_sub(1), n, n + 9] {
+                assert_eq!(
+                    shown.row_of(selected),
+                    indices.iter().position(|&i| i == selected).unwrap_or(0),
+                    "cursor row for selected {selected}, n {n}"
+                );
+            }
+        }
+    }
+
+    /// And the filtered half, which still carries a real index list:
+    /// `filtered_tracks` has to produce it and `Shown` has to read
+    /// through it rather than treating the rows as their own indices.
+    #[test]
+    fn a_filter_query_still_materializes_the_tracks_it_matched() {
+        let mut view = long_album(20, 0);
+        view.is_artist = true;
+        view.filter_query = "7".to_string();
+        let filtered = filtered_tracks(&view).expect("a query materializes its matches");
+        assert_eq!(filtered, view.visible_track_indices());
+        assert!(filtered.len() > 1 && filtered.len() < 20, "{filtered:?}");
+        let held = Some(filtered.clone());
+        let shown = Shown::new(&view, &held);
+        assert_eq!(shown.len(), filtered.len());
+        assert_eq!(shown.get(0), Some(filtered[0]));
+        assert_ne!(shown.get(1), Some(1), "row 1 is not track 1 under a filter");
+        assert_eq!(shown.row_of(filtered[1]), 1);
     }
 
     /// The row map a click resolves against has to name the rows the
