@@ -1086,46 +1086,63 @@ struct Model<'a> {
 }
 
 /// One `TrackAffinity` per catalog track, plus the library's total
-/// play count. Hoisted out of `Model::build` because it is the half
-/// of the build that asks the play history about every track, which
-/// is the single most expensive thing a pass does; see
+/// play count. Hoisted out of `Model::build` because it is the half of
+/// the build that joins the library to the play history, which is the
+/// single most expensive thing a pass does.
+///
+/// Both joins run the small side first and index into the per-track
+/// vec: the starred set is the user's own and the play history is
+/// whatever they have actually listened to, both orders of magnitude
+/// smaller than a library, and `by_key` is keyed on exactly what both
+/// hold. Asking `CacheIndex::entry` of every catalog track instead was
+/// 44% of a whole pass and 92% of this stage at 30800 tracks; see
 /// `cost::what_the_history_lookups_cost`.
 fn track_affinities(req: &Request<'_>) -> (Vec<TrackAffinity>, u32) {
     let catalog = req.catalog;
     let tuning = req.tuning;
-    // the starred set is the user's own, orders of magnitude smaller
-    // than the library, and `by_key` is keyed on exactly what it
-    // holds: look its members up here rather than asking of every
-    // track in the library whether it is one of them.
-    let mut is_starred = vec![false; catalog.tracks.len()];
+    let unplayed = {
+        let raw = frequency(0, 0, false, tuning);
+        TrackAffinity {
+            raw,
+            score: raw * decay(None, req.now_secs, tuning.half_life_days),
+            ..TrackAffinity::default()
+        }
+    };
+    let mut tracks = vec![unplayed; catalog.tracks.len()];
+
+    // starred first, so a track that is both starred and played reads
+    // its own flag below rather than needing a second lookup.
     for key in req.starred {
         if let Some(&index) = catalog.by_key.get(key) {
-            is_starred[index] = true;
+            let raw = frequency(0, 0, true, tuning);
+            tracks[index] = TrackAffinity {
+                raw,
+                score: raw * decay(None, req.now_secs, tuning.half_life_days),
+                starred: true,
+                ..TrackAffinity::default()
+            };
         }
     }
 
-    let mut tracks = Vec::with_capacity(catalog.tracks.len());
     let mut total_plays = 0u32;
-    for (index, track) in catalog.tracks.iter().enumerate() {
-        let entry = req.cache.entry(&track.key);
-        let plays = entry.map_or(0, |e| e.play_count);
-        let days = entry.map_or(0, |e| e.play_days.len() as u32);
-        let last_played_secs = entry.and_then(|e| e.last_played_secs);
-        let first_day = entry
-            .and_then(|e| e.play_days.first())
-            .map(|&d| i64::from(d));
-        let starred = is_starred[index];
-        let raw = frequency(days, plays, starred, tuning);
+    for (key, entry) in req.cache.entries() {
+        // history for a track this library no longer has (deleted, or
+        // another server's) rolls up to nothing, exactly as it did
+        // when the walk was the other way round.
+        let Some(&index) = catalog.by_key.get(key) else {
+            continue;
+        };
+        let affinity = &mut tracks[index];
+        let plays = entry.play_count;
+        let days = entry.play_days.len() as u32;
+        let raw = frequency(days, plays, affinity.starred, tuning);
         total_plays += plays;
-        tracks.push(TrackAffinity {
-            raw,
-            score: raw * decay(last_played_secs, req.now_secs, tuning.half_life_days),
-            plays,
-            days,
-            last_played_secs,
-            first_day,
-            starred,
-        });
+        affinity.raw = raw;
+        affinity.score = raw * decay(entry.last_played_secs, req.now_secs, tuning.half_life_days);
+        affinity.plays = plays;
+        affinity.days = days;
+        affinity.last_played_secs = entry.last_played_secs;
+        affinity.first_day = entry.play_days.first().map(|&d| i64::from(d));
     }
     (tracks, total_plays)
 }
@@ -4176,6 +4193,51 @@ mod cost {
         out
     }
 
+    /// Process cpu time in microseconds, same clock and the same
+    /// reason as `cache::tests::best_each_cpu`: this box's other cores
+    /// are not idle during a bench run (load average 19 observed), so
+    /// the wall clock moves several-fold between batches while the
+    /// work done does not.
+    fn cpu_now() -> f64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime only writes the timespec we hand it.
+        unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+        ts.tv_sec as f64 * 1e6 + ts.tv_nsec as f64 / 1e3
+    }
+
+    /// `best`, on the cpu clock. For single-threaded candidates only;
+    /// anything pooled has to be read on the wall clock, since cpu
+    /// time is exactly what it trades away.
+    fn best_cpu(rounds: usize, iters: usize, f: &mut dyn FnMut()) -> f64 {
+        let mut best = f64::MAX;
+        for _ in 0..rounds {
+            let at = cpu_now();
+            for _ in 0..iters {
+                f();
+            }
+            best = best.min((cpu_now() - at) / iters as f64);
+        }
+        best
+    }
+
+    /// `best_each`, on the cpu clock.
+    fn best_each_cpu(
+        rounds: usize,
+        iters: usize,
+        a: &mut dyn FnMut(),
+        b: &mut dyn FnMut(),
+    ) -> (f64, f64) {
+        let mut out = (f64::MAX, f64::MAX);
+        for _ in 0..rounds {
+            out.0 = out.0.min(best_cpu(1, iters, a));
+            out.1 = out.1.min(best_cpu(1, iters, b));
+        }
+        out
+    }
+
     /// A whole request's worth of owned inputs, since `Request`
     /// borrows all of them.
     struct Fixture {
@@ -4916,18 +4978,29 @@ mod cost {
                     let _ = suggest_reference(&model, &req);
                 },
             );
-            // the model minus its genre stage: the same work on both
-            // sides, so it is measured once and added to both.
+            let (join_new, join_old) = best_each(
+                5,
+                10,
+                &mut || {
+                    let _ = track_affinities(&req);
+                },
+                &mut || {
+                    let _ = track_affinities_per_track(&req);
+                },
+            );
+            // the model minus its two measured stages: the same work
+            // on both sides, so it is measured once and added to both.
             let model_total = best(5, 10, &mut || {
                 let _ = Model::build(&req);
             });
-            let affinities = model_total - genre_new;
-            let new = affinities + genre_new + tail_new;
-            let old = affinities + genre_old + tail_old;
+            let rollups = model_total - genre_new - join_new;
+            let new = rollups + join_new + genre_new + tail_new;
+            let old = rollups + join_old + genre_old + tail_old;
             println!("  {:<26} {:>9} {:>9}", "", "new", "old");
+            println!("  {:<26} {join_new:>9.0} {join_old:>9.0}", "history join");
             println!(
-                "  {:<26} {affinities:>9.0} {affinities:>9.0}",
-                "affinity + rollups"
+                "  {:<26} {rollups:>9.0} {rollups:>9.0}",
+                "album/artist rollups"
             );
             println!("  {:<26} {genre_new:>9.0} {genre_old:>9.0}", "genre rollup");
             println!(
@@ -4969,87 +5042,201 @@ mod cost {
         );
     }
 
-    /// What is left: the play-history lookup per track, which is the
-    /// largest single cost in a pass and is not fixable from this
-    /// module. Three shapes, alternating in one process:
+    /// `track_affinities` as it was before the join was flipped: one
+    /// `CacheIndex::entry` per catalog track, which was 92% of the
+    /// stage. The baseline both for the ratio and for "same scores".
+    fn track_affinities_per_track(req: &Request<'_>) -> (Vec<TrackAffinity>, u32) {
+        let catalog = req.catalog;
+        let tuning = req.tuning;
+        let mut is_starred = vec![false; catalog.tracks.len()];
+        for key in req.starred {
+            if let Some(&index) = catalog.by_key.get(key) {
+                is_starred[index] = true;
+            }
+        }
+        let mut tracks = Vec::with_capacity(catalog.tracks.len());
+        let mut total_plays = 0u32;
+        for (index, track) in catalog.tracks.iter().enumerate() {
+            let entry = req.cache.entry(&track.key);
+            let plays = entry.map_or(0, |e| e.play_count);
+            let days = entry.map_or(0, |e| e.play_days.len() as u32);
+            let last_played_secs = entry.and_then(|e| e.last_played_secs);
+            let first_day = entry
+                .and_then(|e| e.play_days.first())
+                .map(|&d| i64::from(d));
+            let starred = is_starred[index];
+            let raw = frequency(days, plays, starred, tuning);
+            total_plays += plays;
+            tracks.push(TrackAffinity {
+                raw,
+                score: raw * decay(last_played_secs, req.now_secs, tuning.half_life_days),
+                plays,
+                days,
+                last_played_secs,
+                first_day,
+                starred,
+            });
+        }
+        (tracks, total_plays)
+    }
+
+    /// Every field of one track's affinity, scores to the bit. The
+    /// whole input to every later stage: albums, artists, genres and
+    /// all nine generators are derived from this vec and nothing else,
+    /// so two identical vecs are two identical menus.
+    fn affinity_shape(tracks: &[TrackAffinity]) -> Vec<String> {
+        tracks
+            .iter()
+            .map(|t| {
+                format!(
+                    "{:08x} {:08x} {} {} {:?} {:?} {}",
+                    t.raw.to_bits(),
+                    t.score.to_bits(),
+                    t.plays,
+                    t.days,
+                    t.last_played_secs,
+                    t.first_day,
+                    t.starred
+                )
+            })
+            .collect()
+    }
+
+    /// Walking the history and indexing into the per-track vec has to
+    /// land exactly what asking the history about every track landed:
+    /// same scores to the bit, same day counts, same first days, same
+    /// starred flags, same library total. Over a corpus where history
+    /// covers half the library, some rows are both starred and played,
+    /// and some are starred and never played.
+    #[test]
+    fn the_flipped_affinity_join_scores_exactly_what_the_per_track_one_scored() {
+        let fixture = Fixture::new(300, 12);
+        let req = fixture.request();
+        let (flipped, flipped_plays) = track_affinities(&req);
+        let (per_track, per_track_plays) = track_affinities_per_track(&req);
+        assert!(
+            flipped.iter().filter(|t| t.plays > 0).count() > 500,
+            "only {} played rows, so the join is barely exercised",
+            flipped.iter().filter(|t| t.plays > 0).count()
+        );
+        assert!(
+            flipped.iter().any(|t| t.starred && t.plays > 0)
+                && flipped.iter().any(|t| t.starred && t.plays == 0),
+            "both starred cases have to be in the corpus"
+        );
+        assert_eq!(flipped_plays, per_track_plays);
+        assert_eq!(affinity_shape(&flipped), affinity_shape(&per_track));
+
+        // and history for a key the library does not have must roll up
+        // to nothing rather than to some other track.
+        let mut cache = fixture.cache.clone();
+        for i in 0..64 {
+            cache.record_play(&format!("ghost-{i}"), "2026-01-01");
+        }
+        let mut req = fixture.request();
+        req.cache = &cache;
+        let (with_ghosts, ghost_plays) = track_affinities(&req);
+        assert_eq!(ghost_plays, per_track_plays, "a ghost adds no plays");
+        assert_eq!(affinity_shape(&with_ghosts), affinity_shape(&per_track));
+    }
+
+    /// The largest single cost in a pass, measured on the cpu clock
+    /// since both sides are single-threaded.
     ///
-    /// - the loop as it stands, one `CacheIndex::entry` per track;
-    /// - the same loop with the lookup removed and nothing else
-    ///   changed, which is what the lookups cost;
-    /// - the flip: one `Catalog::by_key` lookup per *history* entry
-    ///   instead, which is a third as many on a library you have
-    ///   played half of. A proxy, since it is handed the keys rather
-    ///   than walking the index: `CacheIndex` has no way to be
-    ///   iterated, so the real flip needs an `entries()` on it, which
-    ///   is cache.rs and not this module.
+    /// **What shipped:** walking the history and indexing into the
+    /// per-track vec instead of asking `CacheIndex::entry` of every
+    /// catalog track, 1.3-1.9x of the stage, which is 44% of a pass.
+    /// Four runs at load average 11-25; the absolute numbers move 2x
+    /// with the load even on the cpu clock, the ratio does not.
+    ///
+    /// The ratio only appeared once `cache::CacheEntry::play_days` was
+    /// packed into day numbers. Before that, re-parsing the first
+    /// `YYYY-MM-DD` of every played track was 2823us of a 5571us
+    /// stage, swamping the join entirely and holding the flip to
+    /// 1.06-1.14x (three runs); with the days packed that leg is 65us.
+    /// The legs printed below are why: what is left is the `by_key`
+    /// probe and the scattered write, and `frequency`, `decay` and the
+    /// first-day read together are under 300us.
     #[test]
     #[ignore = "a measurement; run it explicitly"]
     fn what_the_history_lookups_cost() {
-        let (albums, per_album) = (2_200usize, 14usize);
+        for (albums, per_album) in [(700usize, 14usize), (2_200, 14)] {
+            history_lookup_legs(albums, per_album);
+        }
+    }
+
+    fn history_lookup_legs(albums: usize, per_album: usize) {
         let fixture = Fixture::new(albums, per_album);
         let req = fixture.request();
         let catalog = &fixture.catalog;
         let tuning = &fixture.tuning;
-        let keys = fixture.played_keys(albums, per_album);
         println!(
             "--- history lookups, {} of {} tracks played, {}",
-            keys.len(),
+            fixture.played_keys(albums, per_album).len(),
             catalog.track_count(),
             fixture.describe()
         );
-        let (whole, blind) = best_each(
-            5,
+        let (flipped, whole) = best_each_cpu(
+            12,
             10,
             &mut || {
                 let _ = track_affinities(&req);
             },
             &mut || {
-                // the same walk, same writes, no lookup.
-                let mut tracks = Vec::with_capacity(catalog.tracks.len());
-                for track in catalog.tracks.iter() {
-                    let entry: Option<&cache::CacheEntry> = None;
-                    let plays = entry.map_or(0, |e| e.play_count);
-                    let days = entry.map_or(0, |e| e.play_days.len() as u32);
-                    let raw = frequency(days, plays, false, tuning);
-                    tracks.push(TrackAffinity {
-                        raw,
-                        score: raw * decay(None, req.now_secs, tuning.half_life_days),
-                        plays,
-                        days,
-                        last_played_secs: None,
-                        first_day: None,
-                        starred: !track.key.is_empty(),
-                    });
-                }
-                std::hint::black_box(tracks);
+                let _ = track_affinities_per_track(&req);
             },
         );
-        let flipped = best(5, 10, &mut || {
-            let mut tracks = vec![TrackAffinity::default(); catalog.tracks.len()];
-            let mut total_plays = 0u32;
-            for key in &keys {
-                let Some(&index) = catalog.by_key.get(key) else {
-                    continue;
-                };
-                let entry = req.cache.entry(key).expect("a recorded key");
-                let plays = entry.play_count;
-                let days = entry.play_days.len() as u32;
+        let fill = best_cpu(5, 10, &mut || {
+            std::hint::black_box(vec![TrackAffinity::default(); catalog.tracks.len()]);
+        });
+        let probes = best_cpu(5, 10, &mut || {
+            let mut hit = 0usize;
+            for (key, _) in req.cache.entries() {
+                hit += catalog.by_key.get(key).copied().unwrap_or(0);
+            }
+            std::hint::black_box(hit);
+        });
+        let lookups = best_cpu(5, 10, &mut || {
+            let mut hit = 0usize;
+            for track in &catalog.tracks {
+                hit += req.cache.entry(&track.key).map_or(0, |e| e.play_count) as usize;
+            }
+            std::hint::black_box(hit);
+        });
+        let blind = best_cpu(5, 10, &mut || {
+            // the per-track walk, same writes, no lookup.
+            let mut tracks = Vec::with_capacity(catalog.tracks.len());
+            for track in catalog.tracks.iter() {
+                let entry: Option<&cache::CacheEntry> = None;
+                let plays = entry.map_or(0, |e| e.play_count);
+                let days = entry.map_or(0, |e| e.play_days.len() as u32);
                 let raw = frequency(days, plays, false, tuning);
-                total_plays += plays;
-                tracks[index] = TrackAffinity {
+                tracks.push(TrackAffinity {
                     raw,
-                    score: raw * decay(entry.last_played_secs, req.now_secs, tuning.half_life_days),
+                    score: raw * decay(None, req.now_secs, tuning.half_life_days),
                     plays,
                     days,
-                    last_played_secs: entry.last_played_secs,
-                    first_day: entry.play_days.first().map(|&d| i64::from(d)),
-                    starred: false,
-                };
+                    last_played_secs: None,
+                    first_day: None,
+                    starred: !track.key.is_empty(),
+                });
             }
-            std::hint::black_box((tracks, total_plays));
+            std::hint::black_box(tracks);
+        });
+        let days = best_cpu(5, 10, &mut || {
+            let mut acc = 0i64;
+            for (_, entry) in req.cache.entries() {
+                acc += i64::from(entry.play_days.len() as u32)
+                    + i64::from(entry.play_days.first().copied().unwrap_or(0));
+            }
+            std::hint::black_box(acc);
         });
         println!(
-            "  per track {whole:.0}us  without the lookup {blind:.0}us  per history entry {flipped:.0}us"
+            "  per history entry {flipped:.0}us  per track {whole:.0}us  {:.2}x\n  \
+             legs: vec fill {fill:.0}us  by_key probes {probes:.0}us  cache.entry \
+             {lookups:.0}us  day count + first day {days:.0}us  per-track walk with \
+             no lookup {blind:.0}us",
+            whole / flipped
         );
     }
 
