@@ -265,7 +265,14 @@ impl Host {
                     .console
                     .note(format!("nothing to {} in {label}", into.verb())),
                 Ok(tracks) => match into {
-                    Intent::Back => core::append_resolved(&tracks, &mut core),
+                    Intent::Back => {
+                        core::append_resolved(&tracks, &mut core);
+                        // the row for this queue op was written before the
+                        // fan-out landed, so it holds a state with none of
+                        // these tracks in it and redo would lose them.
+                        let after = wim::undo::Snapshot::capture(&core);
+                        core.undo.amend_row(&format!("queued {label}"), after);
+                    }
                     Intent::Front => match core::front_resolved(&tracks, &mut core) {
                         Ok(n) => core.console.note(format!("queued {n} tracks next")),
                         Err(why) => core.console.note(why),
