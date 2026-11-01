@@ -266,6 +266,99 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// Alternating batches in one process, best of each, in
+    /// microseconds. Same helper and the same reason as
+    /// `framesource::frame_budget::best_each`: sequential runs on this
+    /// box differ 1.6-1.8x under load, so two numbers from two runs
+    /// are not comparable and this is the only shape that is.
+    fn best_each(
+        rounds: usize,
+        iters: usize,
+        a: &mut dyn FnMut(),
+        b: &mut dyn FnMut(),
+    ) -> (f64, f64) {
+        let mut best = (f64::MAX, f64::MAX);
+        let time = |f: &mut dyn FnMut()| {
+            let at = std::time::Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            at.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+        for _ in 0..rounds {
+            best.0 = best.0.min(time(a));
+            best.1 = best.1.min(time(b));
+        }
+        best
+    }
+
+    fn profile() -> &'static str {
+        if cfg!(debug_assertions) {
+            "DEBUG (not the shipping cost; re-run with --release)"
+        } else {
+            "release"
+        }
+    }
+
+    /// A saved queue the size a real one reaches: `main.rs` notes ~200
+    /// on a real session, and queueing an artist's discography makes
+    /// it thousands.
+    fn long_state(queued: usize) -> PlaybackState {
+        PlaybackState {
+            now_playing_path: Some("/home/u/Music/Bladee/Crest/01 - Wiking.flac".to_string()),
+            queue_paths: (0..queued)
+                .map(|i| {
+                    format!(
+                        "/home/u/Music/artist {}/album {}/{:02} - some song title.flac",
+                        i / 170,
+                        i / 17,
+                        i % 17
+                    )
+                })
+                .collect(),
+            position_secs: Some(91.5),
+            volume: Some(73.0),
+        }
+    }
+
+    /// The resume state is read on the main thread before the first
+    /// frame, so its parse is first-frame time. Is toml costing
+    /// anything worth a format change at the sizes a real queue
+    /// reaches? `cargo test --release -- --ignored --nocapture
+    /// resume_state_parse`.
+    #[test]
+    #[ignore = "measurement, run explicitly"]
+    fn resume_state_parse() {
+        println!("--- resume state parse, {} build", profile());
+        for queued in [200usize, 2_000] {
+            let state = long_state(queued);
+            let as_toml = toml::to_string_pretty(&state).unwrap();
+            let as_json = serde_json::to_string(&state).unwrap();
+            assert_eq!(
+                toml::from_str::<PlaybackState>(&as_toml).unwrap(),
+                serde_json::from_str::<PlaybackState>(&as_json).unwrap()
+            );
+
+            let (from_toml, from_json) = best_each(
+                3,
+                5,
+                &mut || {
+                    toml::from_str::<PlaybackState>(&as_toml).unwrap();
+                },
+                &mut || {
+                    serde_json::from_str::<PlaybackState>(&as_json).unwrap();
+                },
+            );
+            println!(
+                "{queued:>5} queued  toml {:>7}B {from_toml:>9.1}us  json {:>7}B \
+                 {from_json:>9.1}us  {:.2}x",
+                as_toml.len(),
+                as_json.len(),
+                from_toml / from_json,
+            );
+        }
+    }
+
     /// The case `.ok()?` hid: the file is there, it does not parse, and
     /// the user's queue is gone. That has to be said, not silently
     /// read as a first launch.

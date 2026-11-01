@@ -873,6 +873,44 @@ mod tests {
         (best, last)
     }
 
+    /// Alternating batches in one process, best of each, in
+    /// microseconds. Same helper and the same reason as
+    /// `framesource::frame_budget::best_each`: sequential runs on this
+    /// box differ 1.6-1.8x under load, so two numbers from two runs are
+    /// not comparable and this is the only shape that is.
+    fn best_each(
+        rounds: usize,
+        iters: usize,
+        a: &mut dyn FnMut(),
+        b: &mut dyn FnMut(),
+    ) -> (f64, f64) {
+        let mut best = (f64::MAX, f64::MAX);
+        let time = |f: &mut dyn FnMut()| {
+            let at = std::time::Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            at.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+        for _ in 0..rounds {
+            best.0 = best.0.min(time(a));
+            best.1 = best.1.min(time(b));
+        }
+        best
+    }
+
+    /// Which profile a measurement ran in. `cargo test` defaults to
+    /// `opt-level = 0`, where one of these paths measured 11x its
+    /// release cost, and a debug number quoted as the cost is how a
+    /// non-problem becomes a blocker.
+    fn profile() -> &'static str {
+        if cfg!(debug_assertions) {
+            "DEBUG (not the shipping cost; re-run with --release)"
+        } else {
+            "release"
+        }
+    }
+
     /// A real on-disk library tree of `files` music files in an
     /// artist/album/track layout, so the walk measures a real stat
     /// storm rather than one flat directory. Its own temp dir; nothing
@@ -924,6 +962,338 @@ mod tests {
             );
         }
         index
+    }
+
+    /// The walk with no `stat` at all, to price its two legs apart:
+    /// the serial readdir pass against the per-file mtime read, which
+    /// is what decides whether fanning the stats out is worth it.
+    fn walk_root_no_stat(root: &str) -> usize {
+        WalkDir::new(root)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .and_then(classify)
+                    .is_some()
+            })
+            .count()
+    }
+
+    /// Candidate: walkdir still discovers the files in one serial pass
+    /// (its symlink-loop detection is why it stays), then the mtimes
+    /// are read across a pool. `path_is_symlink` is exactly what
+    /// walkdir's own `metadata()` branches on, so the mtime a file
+    /// reached through a symlink gets is unchanged.
+    fn walk_root_parallel_stat(root: &str) -> Vec<FoundMedia> {
+        let mut found: Vec<FoundMedia> = Vec::new();
+        let mut follows: Vec<bool> = Vec::new();
+        for entry in WalkDir::new(root)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let Some(kind) = entry
+                .path()
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(classify)
+            else {
+                continue;
+            };
+            follows.push(entry.path_is_symlink());
+            found.push((entry.into_path(), kind, None));
+        }
+        fill_mtimes(&mut found, &follows);
+        found
+    }
+
+    fn mtime_of(path: &Path, follow: bool) -> Option<u64> {
+        let meta = if follow {
+            fs::metadata(path)
+        } else {
+            fs::symlink_metadata(path)
+        };
+        meta.ok().as_ref().and_then(mtime_nanos)
+    }
+
+    /// Chunked by index over both slices at once, so a worker can only
+    /// ever write the mtime of the path it stat'd.
+    fn fill_mtimes(found: &mut [FoundMedia], follows: &[bool]) {
+        let workers = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(found.len());
+        if workers <= 1 {
+            for (slot, follow) in found.iter_mut().zip(follows) {
+                slot.2 = mtime_of(&slot.0, *follow);
+            }
+            return;
+        }
+        let chunk = found.len().div_ceil(workers);
+        thread::scope(|scope| {
+            for (part, part_follows) in found.chunks_mut(chunk).zip(follows.chunks(chunk)) {
+                scope.spawn(move || {
+                    for (slot, follow) in part.iter_mut().zip(part_follows) {
+                        slot.2 = mtime_of(&slot.0, *follow);
+                    }
+                });
+            }
+        });
+    }
+
+    /// The candidate has to find the same files, in the same order,
+    /// with the same mtimes: the order is what keeps a scan's batches
+    /// reproducible and the mtime is what the whole tag cache hangs on.
+    #[test]
+    fn a_pooled_stat_walk_finds_exactly_what_the_serial_one_did() {
+        let root = media_tree("statparity", 40);
+        let as_str = root.to_string_lossy().into_owned();
+        let serial = walk_root(&as_str);
+        let pooled = walk_root_parallel_stat(&as_str);
+        assert_eq!(serial.len(), 40, "precondition: the tree was walked");
+        assert_eq!(pooled, serial);
+        assert!(
+            serial.iter().all(|(_, _, m)| m.is_some()),
+            "precondition: these files can be stat'd, so the mtimes are compared"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Which leg of the walk is worth attacking, and whether fanning
+    /// the stats out pays for its own `thread::scope`. The walk is the
+    /// leg `warm_scan_phases` says leads a warm scan, so this is the
+    /// floor's critical path. `cargo test --release -- --ignored
+    /// --nocapture warm_walk_legs`.
+    #[test]
+    #[ignore = "measurement, run explicitly"]
+    fn warm_walk_legs() {
+        println!("--- walk legs, {} build", profile());
+        for files in [5_000usize, 34_000] {
+            let root = media_tree("walklegs", files);
+            let at = root.to_string_lossy().into_owned();
+            assert_eq!(walk_root_no_stat(&at), files);
+
+            let (serial, pooled) = best_each(
+                3,
+                1,
+                &mut || {
+                    walk_root(&at);
+                },
+                &mut || {
+                    walk_root_parallel_stat(&at);
+                },
+            );
+            let (serial_again, readdir) = best_each(
+                3,
+                1,
+                &mut || {
+                    walk_root(&at);
+                },
+                &mut || {
+                    walk_root_no_stat(&at);
+                },
+            );
+            println!(
+                "{files:>6} files  readdir only {readdir:>9.0}us  serial {serial:>9.0}us \
+                 (re-measured {serial_again:>9.0}us)  pooled stat {pooled:>9.0}us  \
+                 {:.2}x",
+                serial / pooled
+            );
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// Candidate row shape for the tag index: one json object per
+    /// line, short keys (the file is one row per file in the library,
+    /// so the key names are a real share of its bytes) and `Cow`
+    /// fields so a row with no escapes borrows out of the line. Same
+    /// reasoning and the same keys-as-bytes argument as
+    /// `cache::PlayRow`.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct TagRow<'a> {
+        #[serde(borrow)]
+        p: std::borrow::Cow<'a, str>,
+        m: u64,
+        #[serde(borrow)]
+        t: std::borrow::Cow<'a, str>,
+        #[serde(default, borrow, skip_serializing_if = "Option::is_none")]
+        ar: Option<std::borrow::Cow<'a, str>>,
+        #[serde(default, borrow, skip_serializing_if = "Option::is_none")]
+        al: Option<std::borrow::Cow<'a, str>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        d: Option<u32>,
+    }
+
+    fn index_rows(index: &TagIndex) -> String {
+        use std::borrow::Cow;
+        let mut body = String::new();
+        for (path, tags) in &index.entries {
+            let row = TagRow {
+                p: Cow::Borrowed(path),
+                m: tags.mtime_nanos,
+                t: Cow::Borrowed(&tags.title),
+                ar: tags.artist.as_deref().map(Cow::Borrowed),
+                al: tags.album.as_deref().map(Cow::Borrowed),
+                d: tags.duration_secs,
+            };
+            if let Ok(line) = serde_json::to_string(&row) {
+                body.push_str(&line);
+                body.push('\n');
+            }
+        }
+        body
+    }
+
+    fn parse_index_rows(raw: &str) -> TagIndex {
+        let mut entries = HashMap::with_capacity(raw.lines().count());
+        for row in raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<TagRow>(line).ok())
+        {
+            entries.insert(
+                row.p.into_owned(),
+                IndexedTags {
+                    mtime_nanos: row.m,
+                    title: row.t.into_owned(),
+                    artist: row.ar.map(|s| s.into_owned()),
+                    album: row.al.map(|s| s.into_owned()),
+                    duration_secs: row.d,
+                },
+            );
+        }
+        TagIndex { entries }
+    }
+
+    /// The same parse with the serde half chunked over a pool; the
+    /// map insert stays serial, since hashing every path once is the
+    /// irreducible part.
+    fn parse_index_rows_parallel(raw: &str) -> TagIndex {
+        let lines: Vec<&str> = raw.lines().collect();
+        let workers = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(lines.len().max(1));
+        let chunk = lines.len().div_ceil(workers.max(1));
+        let parts: Vec<Vec<(String, IndexedTags)>> = thread::scope(|scope| {
+            lines
+                .chunks(chunk.max(1))
+                .map(|part| {
+                    scope.spawn(move || {
+                        part.iter()
+                            .filter_map(|line| serde_json::from_str::<TagRow>(line).ok())
+                            .map(|row| {
+                                (
+                                    row.p.into_owned(),
+                                    IndexedTags {
+                                        mtime_nanos: row.m,
+                                        title: row.t.into_owned(),
+                                        artist: row.ar.map(|s| s.into_owned()),
+                                        album: row.al.map(|s| s.into_owned()),
+                                        duration_secs: row.d,
+                                    },
+                                )
+                            })
+                            .collect()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+        let mut entries = HashMap::with_capacity(lines.len());
+        entries.extend(parts.into_iter().flatten());
+        TagIndex { entries }
+    }
+
+    /// The row shape has to read back exactly what the json map held,
+    /// field for field, or the format changed under every index
+    /// already on disk. Same oracle as
+    /// `cache::tests::the_row_shape_reads_exactly_what_the_toml_shape_did`.
+    #[test]
+    fn the_tag_row_reads_exactly_what_the_json_map_did() {
+        let mut index = TagIndex::default();
+        index.record(&track("/music/a.flac"), 11);
+        index.record(
+            &LocalTrack {
+                artist: None,
+                album: None,
+                duration_secs: None,
+                ..track("/music/b with \"quotes\".flac")
+            },
+            12,
+        );
+
+        let via_rows = parse_index_rows(&index_rows(&index));
+        assert_eq!(via_rows.entries, index.entries);
+        let pooled = parse_index_rows_parallel(&index_rows(&index));
+        assert_eq!(pooled.entries, index.entries);
+    }
+
+    /// The other half of a warm scan's floor: the index parse, which
+    /// `scan_into` overlaps with the walk, so whichever of the two is
+    /// slower *is* the floor. Compares the json map on disk today
+    /// against one row per line, serial and pooled.
+    /// `cargo test --release -- --ignored --nocapture warm_index_parse`.
+    #[test]
+    #[ignore = "measurement, run explicitly"]
+    fn warm_index_parse() {
+        println!("--- tag index parse, {} build", profile());
+        for files in [5_000usize, 34_000] {
+            let found: Vec<FoundMedia> = (0..files)
+                .map(|i| {
+                    found(
+                        &format!("/home/u/Music/artist {}/album {}/{:02} - song.flac", i / 170, i / 17, i % 17),
+                        MediaKind::Music,
+                        Some(1_700_000_000_000_000_000 + i as u64),
+                    )
+                })
+                .collect();
+            let index = index_covering(&found);
+            assert_eq!(index.entries.len(), files);
+            let json = serde_json::to_vec(&index).unwrap();
+            let rows = index_rows(&index);
+            assert_eq!(
+                serde_json::from_slice::<TagIndex>(&json).unwrap().entries,
+                parse_index_rows(&rows).entries
+            );
+
+            let (as_json, as_rows) = best_each(
+                3,
+                3,
+                &mut || {
+                    serde_json::from_slice::<TagIndex>(&json).unwrap_or_default();
+                },
+                &mut || {
+                    parse_index_rows(&rows);
+                },
+            );
+            let (as_rows_again, pooled) = best_each(
+                3,
+                3,
+                &mut || {
+                    parse_index_rows(&rows);
+                },
+                &mut || {
+                    parse_index_rows_parallel(&rows);
+                },
+            );
+            println!(
+                "{files:>6} files  json {:>8}B {as_json:>9.0}us  ndjson {:>8}B {as_rows:>9.0}us \
+                 (re-measured {as_rows_again:>9.0}us) {:.2}x  pooled {pooled:>9.0}us {:.2}x",
+                json.len(),
+                rows.len(),
+                as_json / as_rows,
+                as_json / pooled,
+            );
+        }
     }
 
     /// What `resolve_known` used to be, kept only as the baseline the
