@@ -2491,11 +2491,17 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             // cache: this runs once per command, not per frame, and a
             // percent target must resolve against the duration as of
             // now rather than whatever the last pushed change said.
-            let duration = core
+            let reported = core
                 .player
                 .get_property(mpv::PROP_DURATION)
                 .ok()
                 .and_then(|v| v.as_f64());
+            // through `playing_duration`, the same reading the
+            // scrubber's target comes from: mpv reports ~1s for a
+            // generated silence, so asking it directly put
+            // `moveto(50%)` in a 15m gap at half a second and refused
+            // `moveto(5m)` as past the end.
+            let duration = playing_duration(core.now_playing.as_ref(), reported);
             match shellsong_host::seek_target(pos, duration) {
                 Ok(secs) => match core.player.seek(secs, false) {
                     Ok(()) => op_note(format!("moved to {secs:.0}s")),
@@ -4317,7 +4323,7 @@ mod seam_tests {
         subtitle_tx: mpsc::Sender<SubtitleOutcome>,
         _subtitle_rx: mpsc::Receiver<SubtitleOutcome>,
         pub(super) console: Console,
-        now_playing: Option<SearchItem>,
+        pub(super) now_playing: Option<SearchItem>,
         favorites: favorites::Favorites,
         remote_starred: HashSet<String>,
         lyrics_client: lyrics::Client,
@@ -6097,6 +6103,110 @@ mod index_map_tests {
         }
         assert_eq!(queue.entries().len(), 7);
         assert_eq!(queue.pos(), Some(0), "shuffling in never moves what plays");
+    }
+}
+
+/// Which length a `moveto(...)` resolves against, which is the one
+/// the scrubber already uses.
+#[cfg(test)]
+mod seek_length_tests {
+    use super::seam_tests::Harness;
+    use super::*;
+    use crate::shellsong::Pos;
+
+    fn silence() -> SearchItem {
+        SearchItem::Silence { secs: 600 }
+    }
+
+    /// mpv reports ~1s for a generated silence whatever length was
+    /// asked for (measured; see `silence_url`), so resolving a
+    /// position against its reading puts the seek in the wrong place
+    /// and refuses legal ones outright.
+    #[test]
+    fn mpvs_reading_of_a_silence_resolves_a_seek_to_the_wrong_place() {
+        let entry = silence();
+        let lie = Some(1.0);
+        let real = playing_duration(Some(&entry), lie);
+        assert_eq!(real, Some(600.0), "the entry knows its own length");
+
+        assert_eq!(shellsong_host::seek_target(Pos::Percent(50.0), lie), Ok(0.5));
+        assert_eq!(
+            shellsong_host::seek_target(Pos::Percent(50.0), real),
+            Ok(300.0),
+            "half of ten minutes is five, not half a second"
+        );
+
+        assert!(
+            shellsong_host::seek_target(Pos::Seconds(300.0), lie).is_err(),
+            "five minutes into a ten minute gap was refused as past the end"
+        );
+        assert_eq!(shellsong_host::seek_target(Pos::Seconds(300.0), real), Ok(300.0));
+    }
+
+    /// And the wiring, which is where the two paths disagreed: the
+    /// scrubber hands `activate_transport` a `playing_duration`
+    /// (main.rs), while this arm asked mpv. so dragging the bar to the
+    /// middle of a `silence(10m)` moved to 5:00 and `moveto(50%)`
+    /// moved to half a second.
+    ///
+    /// mpv honours either seek, which is what makes this a wrong
+    /// position rather than a refusal: measured, `--start=300` into a
+    /// 600s `anullsrc` plays from 00:05:00.
+    ///
+    /// `#[ignore]` for the usual reason: `CoreCtx` holds a live mpv.
+    #[test]
+    #[ignore]
+    fn a_seek_in_a_silence_resolves_against_the_entrys_own_length() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let _ = player.set_property("vo", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let mut surf = Headless;
+        h.now_playing = Some(silence());
+        {
+            let core = h.ctx(&player);
+            let (status, played) = load_playlist(
+                core.player,
+                core.cache,
+                core.queue,
+                vec![silence()],
+                SessionStart::New,
+            );
+            assert!(played, "{status}");
+        }
+        // the seek needs the file actually open, or it fails for a
+        // reason that has nothing to do with the duration.
+        let mut loaded = false;
+        for _ in 0..50 {
+            if player.get_property("audio-codec-name").is_ok() {
+                loaded = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(40));
+        }
+        assert!(loaded, "the silence never became the playing file");
+
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::SeekAbsolute(Pos::Percent(50.0)), &mut core, &mut surf);
+        }
+        assert_eq!(
+            h.console.lines.last().expect("one line per op").text,
+            "moved to 300s",
+            "a percent resolved against mpv's ~1s reading: {:?}",
+            h.console.lines
+        );
+
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::SeekAbsolute(Pos::Seconds(300.0)), &mut core, &mut surf);
+        }
+        let last = h.console.lines.last().expect("one line per op").clone();
+        assert_eq!(
+            last.kind,
+            crate::shellsong::LineKind::Note,
+            "a position inside the gap was refused as past its end: {last:?}"
+        );
     }
 }
 
