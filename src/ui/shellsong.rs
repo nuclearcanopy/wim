@@ -313,14 +313,31 @@ fn split_at_cursor(input: &str, cursor: usize, budget: usize) -> (String, usize)
     (format!("{left}{right}"), used)
 }
 
+/// The interior, filled by row rather than cell by cell.
+///
+/// It is one blank cell repeated, and `put` costs a bounds check and a
+/// coordinate-to-index multiply per cell; the box is ~63% of a console
+/// frame and its interior is ~85% of the box (884 cells against 160 of
+/// border at 68x13). `Rect::intersection` does the clipping once, so
+/// the fill itself needs no per-cell check.
+fn blank_interior(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, color: Color) {
+    if w < 3 || h < 3 {
+        return;
+    }
+    let mut cell = ratatui::buffer::Cell::EMPTY;
+    cell.set_char(' ');
+    cell.set_fg(color);
+    let inner = Rect::new(x + 1, y + 1, w - 2, h - 2).intersection(buf.area);
+    for row in inner.y..inner.y + inner.height {
+        let start = buf.index_of(inner.x, row);
+        buf.content[start..start + inner.width as usize].fill(cell.clone());
+    }
+}
+
 /// Hand-drawn border with the label set into the top edge, and the
 /// interior blanked so the box actually occludes what it sits over.
 fn frame(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, color: Color) {
-    for row in 1..h.saturating_sub(1) {
-        for col in 1..w.saturating_sub(1) {
-            put(buf, x + col, y + row, ' ', color);
-        }
-    }
+    blank_interior(buf, x, y, w, h, color);
     put(buf, x, y, '┌', color);
     put(buf, x + w - 1, y, '┐', color);
     put(buf, x, y + h - 1, '└', color);
@@ -909,5 +926,241 @@ mod scrollback {
         println!("--- as far back as it goes\n{}", render(&c, 56, 18));
         let g = render(&c, 56, 18);
         assert!(g.contains("line 0"), "the oldest line is reachable:\n{g}");
+    }
+}
+/// What a console frame costs, and specifically the row loop: one
+/// allocation per visible row per frame, which is the shape
+/// `results_list` found was 44% of its paint.
+///
+/// `cargo test --release --lib ui::shellsong::frame_budget -- --ignored --nocapture`
+#[cfg(test)]
+mod frame_budget {
+    use super::*;
+    use crate::shellsong::{Console, NoCandidates};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::buffer::Buffer;
+    use ratatui::widgets::Widget;
+    use std::time::{Duration, Instant};
+
+    /// A console with `lines` of scrollback, built through the real
+    /// editor so the rows are what the widget really gets.
+    fn filled(lines: usize) -> Console {
+        let mut c = Console::empty();
+        for i in 0..lines {
+            for ch in format!("play(a very long track title number {i} that will be cut)").chars() {
+                c.handle_key(
+                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                    &NoCandidates,
+                );
+            }
+            c.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &NoCandidates,
+            );
+        }
+        c
+    }
+
+    /// Alternating batches in one process, best of each: this box moves
+    /// 1.6-2.1x between runs, so two separate measurements are not
+    /// comparable.
+    fn best_each(
+        rounds: usize,
+        iters: usize,
+        a: &mut dyn FnMut(),
+        b: &mut dyn FnMut(),
+    ) -> (f64, f64) {
+        let mut best = (f64::MAX, f64::MAX);
+        let time = |f: &mut dyn FnMut()| {
+            let at = Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            at.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+        for _ in 0..rounds {
+            best.0 = best.0.min(time(a));
+            best.1 = best.1.min(time(b));
+        }
+        best
+    }
+
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn what_a_console_frame_costs() {
+        println!(
+            "--- console frame, {} build",
+            if cfg!(debug_assertions) {
+                "DEBUG (not the shipping cost)"
+            } else {
+                "release"
+            }
+        );
+        for (w, h) in [(60u16, 14u16), (76, 24), (76, 40)] {
+            let console = filled(60);
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            let mut frame = || {
+                ShellsongConsole {
+                    console: &console,
+                    cursor_visible: true,
+                }
+                .render(area, &mut buf);
+            };
+            let mut best = Duration::MAX;
+            for _ in 0..6 {
+                let at = Instant::now();
+                for _ in 0..200 {
+                    frame();
+                }
+                best = best.min(at.elapsed() / 200);
+            }
+            println!("  {w}x{h:<3} whole frame {best:>10.3?}");
+        }
+    }
+
+    /// The pre-change interior fill, kept verbatim as the oracle: the
+    /// row fill has to produce the same cells, styles included.
+    fn put_interior(
+        buf: &mut Buffer,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        color: ratatui::style::Color,
+    ) {
+        for row in 1..h.saturating_sub(1) {
+            for col in 1..w.saturating_sub(1) {
+                put(buf, x + col, y + row, ' ', color);
+            }
+        }
+    }
+
+    /// Cell for cell and style for style, against the loop it
+    /// replaced, including the sizes where the box hangs off the
+    /// buffer and the clip is what has to agree.
+    #[test]
+    fn the_row_fill_blanks_exactly_what_the_cell_loop_did() {
+        for (bw, bh) in [(20u16, 10u16), (76, 40), (3, 3), (2, 2)] {
+            let area = Rect::new(0, 0, bw, bh);
+            for (x, y, w, h) in [
+                (0u16, 0u16, bw, bh),
+                (1, 1, 10, 5),
+                (0, 0, 3, 3),
+                (0, 0, 2, 2),
+                // a box narrower than its own border: `w - 2` would
+                // underflow, which is the whole job of the size guard
+                // and is why these three are here. the first draft
+                // stopped at 2x2, so removing the guard passed.
+                (0, 0, 1, 1),
+                (0, 0, 0, 0),
+                (0, 0, 1, 9),
+                // hanging off the right and bottom edges, so the
+                // intersection is doing real work.
+                (bw.saturating_sub(4), bh.saturating_sub(2), 12, 8),
+            ] {
+                let mut want = Buffer::empty(area);
+                let mut got = Buffer::empty(area);
+                put_interior(&mut want, x, y, w, h, shade(MID));
+                blank_interior(&mut got, x, y, w, h, shade(MID));
+                assert_eq!(want, got, "box {w}x{h} at ({x},{y}) in a {bw}x{bh} buffer");
+            }
+        }
+    }
+
+    /// The box as it ships, printed so the fill is looked at and not
+    /// only asserted. `cargo test --lib ui::shellsong::frame_budget::eyeball -- --nocapture`
+    #[test]
+    fn eyeball_the_filled_box_over_a_dirty_screen() {
+        use crate::ui::testbuf::{buffer, grid};
+        let console = filled(6);
+        for (w, h) in [(46u16, 12u16), (30, 9)] {
+            // `buffer` prefills with `.`, so anything the box fails to
+            // own shows through as dots inside its border.
+            let mut buf = buffer(w, h);
+            ShellsongConsole {
+                console: &console,
+                cursor_visible: true,
+            }
+            .render(Rect::new(0, 0, w, h), &mut buf);
+            println!(
+                "--- console at {w}x{h} over a prefilled screen\n{}",
+                grid(&buf)
+            );
+        }
+    }
+
+    /// Which leg of a frame the time is in. The row loop turned out
+    /// not to be it, so this splits the rest: the box, and the whole
+    /// render minus the box.
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn what_the_frame_legs_cost() {
+        let console = filled(60);
+        for (w, h) in [(60u16, 14u16), (76, 40)] {
+            let area = Rect::new(0, 0, w, h);
+            // a buffer each, so neither closure borrows the other's.
+            let mut box_buf = Buffer::empty(area);
+            let mut frame_buf = Buffer::empty(area);
+            // the box alone, at the size `render` would pick.
+            let bw = w.saturating_sub(8).clamp(MIN_WIDTH, MAX_WIDTH).min(w);
+            let mut box_only = || {
+                frame(&mut box_buf, 0, 0, bw, h.min(13), shade(MID));
+            };
+            let mut whole = || {
+                ShellsongConsole {
+                    console: &console,
+                    cursor_visible: true,
+                }
+                .render(area, &mut frame_buf);
+            };
+            let (b, f) = best_each(6, 200, &mut box_only, &mut whole);
+            println!(
+                "  {w}x{h:<3} box {b:>9.3}us  whole frame {f:>9.3}us  box is {:>5.1}% of it",
+                b / f * 100.0
+            );
+            // the fill against the cell loop it replaced, which is the
+            // only part this slice changed.
+            let bh = h.min(13);
+            let mut fill_buf = Buffer::empty(area);
+            let mut put_buf = Buffer::empty(area);
+            let mut filled_rows = || blank_interior(&mut fill_buf, 0, 0, bw, bh, shade(MID));
+            let mut per_cell = || put_interior(&mut put_buf, 0, 0, bw, bh, shade(MID));
+            let (fill, cells) = best_each(6, 400, &mut filled_rows, &mut per_cell);
+            println!(
+                "         interior: row fill {fill:>8.3}us  cell loop {cells:>8.3}us  {:.2}x",
+                cells / fill
+            );
+        }
+    }
+
+    /// The row loop on its own, allocating per row against one kept
+    /// buffer, which is the only part this slice changes.
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn what_the_row_loop_costs() {
+        use crate::ui::textfit::{truncate_into, truncate_with_ellipsis};
+        let console = filled(60);
+        let rows: Vec<&str> = console.lines.iter().map(|l| l.text.as_str()).collect();
+        for inner in [20usize, 40, 72] {
+            let mut allocating = || {
+                for r in &rows {
+                    std::hint::black_box(truncate_with_ellipsis(r, inner).len());
+                }
+            };
+            let mut kept = String::new();
+            let mut reused = || {
+                for r in &rows {
+                    truncate_into(&mut kept, r, inner);
+                    std::hint::black_box(kept.len());
+                }
+            };
+            let (a, b) = best_each(6, 400, &mut allocating, &mut reused);
+            println!(
+                "  {} rows at {inner:>2} cells  allocating {a:>8.3}us  kept {b:>8.3}us  {:.2}x",
+                rows.len(),
+                a / b,
+            );
+        }
     }
 }
