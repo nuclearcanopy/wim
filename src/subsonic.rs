@@ -451,7 +451,11 @@ impl Client {
         ]
     }
 
-    fn get(&self, endpoint: &str, extra: &[(&str, &str)]) -> anyhow::Result<serde_json::Value> {
+    /// The authenticated request itself, unsent. Shared so nothing can
+    /// reach an endpoint with different auth than `get` does; its url
+    /// carries `u=`, the token and the salt, so it must not be
+    /// formatted into anything (see `request_failed`).
+    fn request(&self, endpoint: &str, extra: &[(&str, &str)]) -> ureq::Request {
         let url = format!("{}/rest/{endpoint}", self.base_url);
         let mut req = self.agent.get(&url);
         for (k, v) in self.auth_params() {
@@ -460,7 +464,14 @@ impl Client {
         for (k, v) in extra {
             req = req.query(k, v);
         }
-        let response = req.call().map_err(|e| request_failed(endpoint, e))?;
+        req
+    }
+
+    fn get(&self, endpoint: &str, extra: &[(&str, &str)]) -> anyhow::Result<serde_json::Value> {
+        let response = self
+            .request(endpoint, extra)
+            .call()
+            .map_err(|e| request_failed(endpoint, e))?;
         let body: SubsonicEnvelope = crate::safenet::json_capped(response, 256 << 20)?;
         if body.subsonic_response.status != "ok" {
             let msg = body
@@ -606,6 +617,29 @@ impl Client {
     pub fn ping(&self) -> anyhow::Result<()> {
         self.get("ping", &[])?;
         Ok(())
+    }
+
+    /// `ping`, classified instead of flattened. `ping` stays for the
+    /// callers that only need pass/fail; the profile manager needs the
+    /// difference, because "fix your password" and "your server is
+    /// down" are different things to go do.
+    pub fn reachability(&self) -> Reachability {
+        let response = match self.request("ping", &[]).call() {
+            Ok(response) => response,
+            Err(ureq::Error::Status(status, _)) => return Reachability::HttpError { status },
+            Err(ureq::Error::Transport(t)) => {
+                return Reachability::Unreachable {
+                    why: transport_why(&t),
+                }
+            }
+        };
+        match crate::safenet::json_capped::<SubsonicEnvelope>(response, 256 << 20) {
+            Ok(env) if env.subsonic_response.status == "ok" => Reachability::Online,
+            Ok(env) => Reachability::refused(env.subsonic_response.error.and_then(|e| e.code)),
+            // 200 and not a subsonic envelope at all: a captive portal
+            // or something else answering on that port.
+            Err(_) => Reachability::NotSubsonic,
+        }
     }
 
     /// Every track on an album, in album order, plus the album's own
@@ -1067,9 +1101,101 @@ struct SubsonicResponse {
 
 #[derive(Debug, Deserialize)]
 struct SubsonicError {
+    /// The subsonic error code, which is the only thing that separates
+    /// a refused password (40, 41, 50) from any other failure: all of
+    /// them arrive as `status: "failed"` inside an http 200. Optional
+    /// because a server is free to send the envelope without one.
     #[serde(default)]
     code: Option<u32>,
     message: String,
+}
+
+/// What a connectivity check found. Three failures a `bool` had one
+/// slot for: a server that refused the credentials, a server that
+/// answered and is broken, and a host that is not there. The first
+/// read as the third, so a typo'd password sent you to check your
+/// network.
+///
+/// No variant carries a url, a token, a salt, or any text the *server*
+/// chose. `why` comes from `transport_why`, the summaries below are
+/// our own words, and the codes are numbers; see `request_failed` for
+/// why that matters here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reachability {
+    /// Answered `ping` with `status: "ok"`: reachable, and these
+    /// credentials work.
+    Online,
+    /// Answered, and refused the credentials. Subsonic reports this
+    /// inside an http 200 as an error envelope, never as a status.
+    CredentialsRefused { code: u32 },
+    /// Answered `failed` for some other reason: api version, trial
+    /// over, a server fault. `None` when it sent no code.
+    ApiRefused { code: Option<u32> },
+    /// Answered with an http error status: it is there and broken, or
+    /// something in front of it is.
+    HttpError { status: u16 },
+    /// Answered 200 with something that is not a subsonic envelope.
+    /// Carries nothing on purpose: the body is the server's own text,
+    /// and a proxy's error page quotes the url it was asked for.
+    NotSubsonic,
+    /// Never answered: dns, connect, tls, timeout.
+    Unreachable { why: String },
+    /// Never asked, because no client could be built for the profile
+    /// (an unreadable `password_file`, no password at all). Not the
+    /// network's fault and must not read as the network's fault; see
+    /// `core::client_for`.
+    Unusable { why: String },
+}
+
+impl Reachability {
+    /// Which refusal a `failed` envelope is. 40 wrong username or
+    /// password, 41 token auth refused for an ldap user, 50 user not
+    /// authorized: all three mean "fix the account", which is what
+    /// separates them from the rest.
+    fn refused(code: Option<u32>) -> Reachability {
+        match code {
+            Some(code @ (40 | 41 | 50)) => Reachability::CredentialsRefused { code },
+            other => Reachability::ApiRefused { code: other },
+        }
+    }
+
+    /// Whether the server answered at all. The distinction the bool
+    /// lost: a refused password is not an offline server.
+    pub fn answered(&self) -> bool {
+        !matches!(
+            self,
+            Reachability::Unreachable { .. } | Reachability::Unusable { .. }
+        )
+    }
+
+    pub fn is_online(&self) -> bool {
+        matches!(self, Reachability::Online)
+    }
+
+    /// One lowercase line, meaning first so it survives truncation at
+    /// a narrow width. Lives here rather than in the ui so the profile
+    /// manager's status line and the toast cannot word one outcome two
+    /// ways.
+    pub fn summary(&self) -> String {
+        match self {
+            Reachability::Online => "connected".into(),
+            Reachability::CredentialsRefused { code } => match code {
+                40 => "wrong username or password".into(),
+                41 => "password auth refused for this user (ldap)".into(),
+                50 => "this user is not authorized".into(),
+                code => format!("credentials refused (code {code})"),
+            },
+            Reachability::ApiRefused { code: Some(code) } => {
+                format!("server refused the request (code {code})")
+            }
+            Reachability::ApiRefused { code: None } => "server refused the request".into(),
+            Reachability::HttpError { status } => format!("server error (http {status})"),
+            Reachability::NotSubsonic => "answered, but not as a subsonic server".into(),
+            Reachability::Unreachable { why } if why.is_empty() => "unreachable".into(),
+            Reachability::Unreachable { why } => format!("unreachable: {why}"),
+            Reachability::Unusable { why } => format!("unusable profile: {why}"),
+        }
+    }
 }
 
 /// Why a request failed, without the url it failed on. ureq's error
@@ -1082,18 +1208,7 @@ struct SubsonicError {
 pub(crate) fn request_failed(endpoint: &str, e: ureq::Error) -> anyhow::Error {
     match e {
         ureq::Error::Status(code, _) => anyhow::anyhow!("{endpoint}: http {code}"),
-        ureq::Error::Transport(t) => {
-            let mut why = format!("{endpoint}: {}", t.kind());
-            if let Some(message) = t.message() {
-                why.push_str(": ");
-                why.push_str(message);
-            }
-            if let Some(source) = std::error::Error::source(&t) {
-                why.push_str(": ");
-                why.push_str(&source.to_string());
-            }
-            anyhow::anyhow!(why)
-        }
+        ureq::Error::Transport(t) => anyhow::anyhow!("{endpoint}: {}", transport_why(&t)),
     }
 }
 
@@ -1125,6 +1240,23 @@ pub fn insecure_transport_warning(url: &str) -> Option<String> {
             safe_server_identity(url)
         )
     })
+}
+
+/// A transport failure's kind, message and source, which is everything
+/// ureq's own `Display` says *except* the url it leads with. Shared
+/// with `Reachability::Unreachable`, so both paths are redacted by the
+/// same code rather than by two that have to agree.
+fn transport_why(t: &ureq::Transport) -> String {
+    let mut why = t.kind().to_string();
+    if let Some(message) = t.message() {
+        why.push_str(": ");
+        why.push_str(message);
+    }
+    if let Some(source) = std::error::Error::source(t) {
+        why.push_str(": ");
+        why.push_str(&source.to_string());
+    }
+    why
 }
 
 /// So typing a bare `myserver.com` (no scheme) in the login prompt
@@ -1354,14 +1486,11 @@ fn parse_search3_response(v: &serde_json::Value) -> SearchResult {
     }
 }
 
-/// What a failed request is allowed to say. ureq's own error text
-/// begins with the whole request url, and a subsonic request url
-/// carries `u=`, the per-request auth token and its salt; these errors
-/// are shown (`catalog::fetched` wraps them and the event loop pushes
-/// them as notifications), so the url cannot be in them. The status
-/// code or the transport cause is the part worth keeping.
+/// Telling a server that refused the credentials from one that never
+/// answered. Both used to be `Some(false)`, i.e. "offline", which
+/// sends you to check the network over a typo'd password.
 #[cfg(test)]
-mod request_error_tests {
+mod reachability_tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
@@ -1377,9 +1506,14 @@ mod request_error_tests {
         }
     }
 
-    /// Answers one canned status line to every request, which
-    /// `MockServer` cannot: that one is always 200.
-    fn start_failing_server(status_line: &'static str) -> String {
+    /// Subsonic reports a bad password *inside* a 200 as an error
+    /// envelope with a code; there is no http status to read it off.
+    const AUTH_FAILED: &str = r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":40,"message":"Wrong username or password"}}}"#;
+
+    /// Answers one canned status line and body to every request.
+    /// `MockServer` in `tests` below is always a 200 with a real
+    /// catalog behind it, so neither failure shape is reachable there.
+    pub(super) fn start_canned_server(status_line: &'static str, body: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         // detached: the test binary exits without waiting on it
@@ -1396,8 +1530,11 @@ mod request_error_tests {
                         if !line.trim().is_empty() {
                             continue;
                         }
-                        let body = format!("{status_line}\r\nContent-Length: 0\r\n\r\n");
-                        if writer.write_all(body.as_bytes()).is_err() {
+                        let response = format!(
+                            "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if writer.write_all(response.as_bytes()).is_err() {
                             return;
                         }
                         let _ = writer.flush();
@@ -1406,6 +1543,173 @@ mod request_error_tests {
             }
         });
         url
+    }
+
+    /// A port nothing is listening on, so connecting is refused
+    /// without needing a network.
+    fn dead_url() -> String {
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", dead.local_addr().unwrap());
+        drop(dead);
+        url
+    }
+
+    fn reachability_of(url: &str) -> Reachability {
+        Client::new(&cfg(url)).unwrap().reachability()
+    }
+
+    /// The bug itself: with a bool these were both `Some(false)`.
+    #[test]
+    fn a_refused_password_is_not_an_unreachable_server() {
+        let refused = reachability_of(&start_canned_server("HTTP/1.1 200 OK", AUTH_FAILED));
+        let absent = reachability_of(&dead_url());
+        assert_eq!(refused, Reachability::CredentialsRefused { code: 40 });
+        assert!(
+            refused.answered(),
+            "the server answered; only the credentials were refused"
+        );
+        assert!(!absent.answered(), "nothing answered on a dead port");
+        assert_ne!(
+            refused, absent,
+            "a wrong password and a host that is not there read the same"
+        );
+    }
+
+    /// The positive control: the same code path has to be able to say
+    /// yes, or "not online" cannot be told from "never asked".
+    #[test]
+    fn a_server_that_answers_ok_is_online() {
+        const OK: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#;
+        let online = reachability_of(&start_canned_server("HTTP/1.1 200 OK", OK));
+        assert_eq!(online, Reachability::Online);
+        assert!(online.is_online() && online.answered());
+    }
+
+    /// A broken server is a third thing again: it answered, and not
+    /// with an envelope to read a code off.
+    #[test]
+    fn an_http_error_is_the_server_failing_not_the_credentials() {
+        let broken = reachability_of(&start_canned_server(
+            "HTTP/1.1 500 Internal Server Error",
+            "",
+        ));
+        assert_eq!(broken, Reachability::HttpError { status: 500 });
+        assert!(broken.answered());
+    }
+
+    #[test]
+    fn a_dead_port_keeps_the_transport_cause() {
+        let absent = reachability_of(&dead_url());
+        let Reachability::Unreachable { why } = &absent else {
+            panic!("expected a transport failure, got {absent:?}");
+        };
+        assert!(
+            why.to_lowercase().contains("connection"),
+            "the cause has to survive: {why}"
+        );
+    }
+
+    /// A `failed` envelope that is not about auth: the user has
+    /// nothing to fix about their password, so it must not say they do.
+    #[test]
+    fn a_non_auth_envelope_error_is_not_a_credentials_problem() {
+        const INCOMPATIBLE: &str = r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":30,"message":"Incompatible version"}}}"#;
+        let refused = reachability_of(&start_canned_server("HTTP/1.1 200 OK", INCOMPATIBLE));
+        assert_eq!(refused, Reachability::ApiRefused { code: Some(30) });
+        assert!(!refused.summary().contains("password"), "{refused:?}");
+    }
+
+    /// Hitting the wrong port: a 200 that is not subsonic json at all.
+    #[test]
+    fn a_200_that_is_not_a_subsonic_envelope_is_its_own_answer() {
+        let portal = reachability_of(&start_canned_server(
+            "HTTP/1.1 200 OK",
+            "<html>sign in to the wifi</html>",
+        ));
+        assert_eq!(portal, Reachability::NotSubsonic);
+    }
+
+    /// Every outcome's `summary` reaches the profile manager's status
+    /// line, so none of them may carry the query string: it is `u=`,
+    /// `md5(password + salt)` and that salt.
+    #[test]
+    fn no_outcome_puts_the_credentials_on_screen() {
+        let auth = start_canned_server("HTTP/1.1 200 OK", AUTH_FAILED);
+        let dead = dead_url();
+        let broken = start_canned_server("HTTP/1.1 503 Service Unavailable", "");
+        for url in [&auth, &dead, &broken] {
+            let outcome = reachability_of(url);
+            let shown = format!("{} {:?}", outcome.summary(), outcome);
+            assert!(!shown.contains('?'), "a query string got through: {shown}");
+            assert!(!shown.contains("ana"), "the username got through: {shown}");
+            assert!(!shown.contains("pw"), "the password got through: {shown}");
+            assert!(
+                !shown.contains(url.trim_start_matches("http://")),
+                "the host got through: {shown}"
+            );
+        }
+    }
+
+    /// The whole point of the type is that the summary differs; one
+    /// wording for two causes is the bug in a different coat.
+    #[test]
+    fn each_outcome_words_itself_differently() {
+        let summaries = [
+            Reachability::Online,
+            Reachability::CredentialsRefused { code: 40 },
+            Reachability::CredentialsRefused { code: 41 },
+            Reachability::CredentialsRefused { code: 50 },
+            Reachability::CredentialsRefused { code: 44 },
+            Reachability::ApiRefused { code: Some(30) },
+            Reachability::ApiRefused { code: None },
+            Reachability::HttpError { status: 500 },
+            Reachability::NotSubsonic,
+            Reachability::Unreachable {
+                why: "io: connection refused".into(),
+            },
+            Reachability::Unusable {
+                why: "reading password_file at /nope".into(),
+            },
+        ]
+        .map(|r| r.summary());
+        let mut seen = summaries.to_vec();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            summaries.len(),
+            "two outcomes read alike: {summaries:?}"
+        );
+        assert!(summaries.iter().all(|s| !s.is_empty()));
+    }
+}
+
+/// What a failed request is allowed to say. ureq's own error text
+/// begins with the whole request url, and a subsonic request url
+/// carries `u=`, the per-request auth token and its salt; these errors
+/// are shown (`catalog::fetched` wraps them and the event loop pushes
+/// them as notifications), so the url cannot be in them. The status
+/// code or the transport cause is the part worth keeping.
+#[cfg(test)]
+mod request_error_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    fn cfg(url: &str) -> NavidromeConfig {
+        NavidromeConfig {
+            url: url.into(),
+            username: "ana".into(),
+            password: Some("pw".into()),
+            password_file: None,
+            max_bitrate_kbps: None,
+            transcode_format: None,
+        }
+    }
+
+    /// Answers one canned status line to every request, which
+    /// `MockServer` cannot: that one is always 200.
+    fn start_failing_server(status_line: &'static str) -> String {
+        super::reachability_tests::start_canned_server(status_line, "")
     }
 
     /// A 500 from the server used to put `md5(password + salt)` and
