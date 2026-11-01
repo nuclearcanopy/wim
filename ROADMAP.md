@@ -821,18 +821,18 @@ alone, which found more than the feature work it was run beside.
 
 ## in flight
 
-**`wt/shellsong` merged 2026-11-01** (the audit above). `wt/draw`
-(per-frame draw path), `wt/suggest` (suggestion and hit scoring) and
-`wt/polish` (`ui/help.rs`, `ui/suggestions.rs`) are open with
-uncommitted work; none has pushed, and integration is the orchestrator's
-job, not theirs.
+**nothing. all seven of 2026-11-01's branches are merged**:
+`wt/shellsong` (the audit above), `wt/core`, `wt/draw`, `wt/frame`,
+`wt/polish`, `wt/boot` and `wt/suggest`.
 
 before that: **all ten branches merged 2026-10-31**: the five perf ones,
 `feat/mouse`, `fix/async-open`, `feat/video`, `feat/art-modes`, and the
 mouse audit's follow-up commits.
 
-**1492 tests** (1458 lib, 27 bin, 6 shellswim, 1 alloc) and clippy
-`-D warnings` clean as of 2026-11-01.
+**1562 tests** (1526 lib, 29 bin, 6 shellswim, 1 alloc) plus 92 ignored,
+clippy `-D warnings` clean, fmt clean, and **ci green**: all four steps,
+`nix build` included, as of 2026-11-01. the ci entry below is why that
+last clause is worth writing down.
 
 ### ci was red for every commit of 2026-11-01, and the loop never looked
 
@@ -1925,6 +1925,77 @@ a measurement.
       wim never did that; the two front-ends agree now.
       two mutations caught: clearing unconditionally again, and
       forgetting which query is outstanding.
+
+### the six-agent run (2026-11-01, afternoon)
+
+Six agents on strictly disjoint files while the maintainer was out.
+Everything below was measured with alternating batches in one process
+at `--release`, because this box moves 1.6-2.1x between runs; only
+same-process ratios are quoted.
+
+- [x] **the suggestions cold start was 7.11x off**, and nobody had
+      looked: a new library's first open cloned every album row and
+      every track in the library to choose six rows. 30483us to 4286us
+      at 30.8k tracks. the whole pass is 1.40x (32.1ms to 22.9ms) off
+      three more: the genre rollup into slots rather than three keyed
+      maps (2.12x), album positions by vec not `HashMap` (2.02x), and
+      interning the diversification keys once per pool (4.59x on
+      `diversify`).
+      the agent kept each pre-change implementation as an oracle and
+      compares the **whole menu** old-vs-new over two corpus sizes:
+      same sections, same order, same rows, same reason sentences, same
+      scores to the bit. that is the right shape for a ranking change.
+      **the largest remaining cost is now `CacheIndex::entry`, 92% of
+      the affinity stage and 44% of a pass**, and the fix needs
+      `cache.rs`, which was another agent's file. recorded rather than
+      reached for.
+      three rejections recorded with numbers: gating the `first_day`
+      parse (1.06x, not worth a field only valid under a gate),
+      flipping the history lookups (not a win while it pays two
+      lookups), and deferring candidate construction (the premise was
+      wrong: only 458 candidates are built to keep 64, and the
+      neighbour walk is most of the stage).
+- [x] **the results list stopped materializing its geometry.**
+      `layout` built a `Vec` as long as the whole match set and
+      linear-scanned it, three times a frame; the sequence is a
+      function of the category boundaries alone, so `RowLayout` keeps
+      the handful of boundaries and places any row with one
+      `partition_point`. 1.6x on a screenful at 15k matches, and row
+      text now builds in one reused buffer instead of two allocations
+      per visible row (12.5x on that step, ~44% of the paint).
+      the strongest guard there recorded its expected grid against the
+      **old** code first, so it proves the rewrite is byte-identical
+      rather than merely plausible.
+- [x] **the bottom bar was building and measuring the scrubber twice a
+      frame to size a rect.** at 200 cells the row text *is* the
+      scrubber (166 chars), and `place` built and measured it on both
+      passes main.rs makes, the first of which uses none of the text.
+      arithmetic instead: 2.6x at 60 cells, 5.1x at 120, 8.9x at 200.
+      player labels are pushed rather than `format!`ed (4.4x) and each
+      element carries its width instead of being measured four times a
+      pass (31x, 18 of 24 calls a frame gone).
+      **the trap worth remembering**: the first A/B said the new path
+      was 19% *slower*, because the "old" shape was a branch inside the
+      timing loop and got inlined and specialized on a literal while
+      the real function was an ordinary call. Both sides have to be
+      functions. Written into that bench's doc.
+- [x] **a video library walk is 2.46x faster**: it was `stat`ing every
+      video for an mtime nothing reads (a video is never tagged, so
+      `resolve_known`'s `Video` arm drops it). 186.9ms to 75.9ms at
+      34000 files, cpu clock, with identical paths and kinds out, which
+      is what makes it a skipped stat rather than a skipped file.
+      two startup rejections recorded with their arithmetic: ndjson for
+      the warm index (1.07-1.15x on a parse that `max(walk, parse)`
+      hides, and every index on disk would need migrating) and json for
+      the resume state (3.85-4.53x on a 144us parse, i.e. 0.2% of a
+      first frame, on the one file whose loss is a user's queue).
+- [x] **the continuously-animating visualizer was audited and left
+      alone**, with the number in `frame_budget` so it is not audited
+      from scratch again: 1.05us at a realistic 24 columns, 0.015% of
+      budget. `logos.rs` turned out to be compile-time data only; the
+      real per-frame logo cost is in `banner.rs` (~17 allocations and
+      several width walks of static art per frame), which was out of
+      scope and is the obvious next slice.
 
 ### measured and rejected: a packed search prefilter (2026-11-01)
 
