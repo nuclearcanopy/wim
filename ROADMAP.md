@@ -1887,6 +1887,30 @@ a measurement.
       two mutations caught: clearing unconditionally again, and
       forgetting which query is outstanding.
 
+### the queue seam, audited 2026-11-01
+
+- [x] **deleting the playing track, when it was the last one,
+      swallowed the next track's hooks.** `PlayQueue::remove` kept
+      `pos` where it was on purpose (mpv moves to the next file and
+      that file has shifted into the slot), but with nothing after it
+      there is no such file, so `pos` sat one past the end. Not merely
+      cosmetic, which is why it survived: the next track mpv loaded
+      landed on exactly that index, `set_pos` saw the number it already
+      held and answered `Unchanged`, and the caller skips its
+      track-change hooks on `Unchanged`. So the new track played with
+      **no scrobble, no art, no title update**. An `append` in between
+      claimed the appended track was already playing, for the same
+      reason. Reachable from ordinary use: delete the track you are
+      listening to while it is last in the queue, then queue another.
+      the fix is one line (`pos` is only a position while it is in
+      range) and it subsumes the old `entries.is_empty()` special case.
+      three mutations: the old behaviour, a `pos` that stops shifting
+      when an earlier entry goes, and one that shifts on the playing
+      entry too.
+      **`move_entry`'s four-way shift was audited in the same pass and
+      is correct**, including both `to == p` edges; recorded because an
+      unverified "looks fine" is what lets the next reader skip it.
+
 ### the untracked-defect audit (2026-10-31)
 
 Ran once the roadmap was down to 8 unchecked items, 5 of them blocked,
