@@ -3097,15 +3097,24 @@ fn check_remember(
 /// over no time is not one, and `simple_op` only ever matched
 /// `Some(secs)`, so `fade(out, off)` silently faded over the default 5s
 /// instead of saying that `off` means nothing here.
+/// `0` is the same instruction as `off` in a different spelling, and
+/// the host's ramp short-circuits a zero length to "already finished",
+/// so `fade(out, 0)` slammed the volume down on the first frame and
+/// called it a fade.
 fn check_fade(input: &str, args: &[Arg], positional: &[(usize, &str)]) -> Result<(), ParseError> {
-    let Some(at) = args.iter().position(|a| matches!(a, Arg::Duration(None))) else {
+    let nothing = |a: &Arg| match a {
+        Arg::Duration(None) => true,
+        Arg::Duration(Some(secs)) => *secs <= 0.0,
+        _ => false,
+    };
+    let Some(at) = args.iter().position(nothing) else {
         return Ok(());
     };
     Err(err(
         input,
         positional.get(at).map(|(o, _)| *o).unwrap_or(0),
         positional.get(at).map(|(_, t)| *t).unwrap_or("off"),
-        "fade has no off; write fade(out, 2s), or fade(out) for the default",
+        "fade has no off and no zero; write fade(out, 2s), or fade(out) for the default",
     ))
 }
 
@@ -6658,6 +6667,38 @@ mod tests {
         let e = error("fade(out, off)");
         assert!(e.message.contains("fade has no off"), "{}", e.message);
         assert!(e.message.contains("fade(out, 2s)"), "{}", e.message);
+    }
+
+    /// `0` is the same mistake as `off` in a different spelling, and
+    /// `check_fade` only looked for `off`: a ramp of no length is a cut,
+    /// which the host's `Ramp` short-circuits to "already finished", so
+    /// `fade(out, 0)` slammed the volume to zero on the first frame and
+    /// called it a fade.
+    #[test]
+    fn fade_refuses_a_ramp_of_no_length() {
+        for input in ["fade(out, 0)", "fade(in, 0s)", "fade(out, 0:00)"] {
+            let e = error(input);
+            assert!(
+                e.message.contains("fade(out, 2s)"),
+                "{input} said '{}'",
+                e.message
+            );
+        }
+        // a real ramp is untouched, and so is the default.
+        assert_eq!(
+            ops("fade(out, 0.5s)"),
+            vec![Op::Fade {
+                into: false,
+                secs: 0.5
+            }]
+        );
+        assert_eq!(
+            ops("fade(out)"),
+            vec![Op::Fade {
+                into: false,
+                secs: DEFAULT_FADE_SECS
+            }]
+        );
     }
 
     /// `f64::parse` accepts `inf` and `nan`, and the host turns every
