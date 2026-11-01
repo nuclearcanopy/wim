@@ -1682,6 +1682,172 @@ mod tests {
     }
 }
 
+/// Per-frame cost of the bottom bar. Not pass/fail gates: absolute
+/// numbers are machine-dependent, so these print and the report
+/// compares runs.
+///
+/// `cargo test --release --lib -- --ignored --nocapture
+/// --test-threads=1 ui::controlsbar::bench`
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::ui::testbuf::buffer;
+    use std::time::{Duration, Instant};
+
+    /// Which profile the numbers below came out of, printed because
+    /// `cargo test` defaults to the dev one: `opt-level = 0` measured
+    /// one path in this crate 11.5x slower than release, which is an
+    /// artefact and not a result.
+    fn profile() -> &'static str {
+        if cfg!(debug_assertions) {
+            "debug, opt-level 0: an artefact, re-run with --release"
+        } else {
+            "release"
+        }
+    }
+
+    /// Variants timed with their batches alternating, minimum each.
+    /// Measuring them one after another is not a comparison on this
+    /// machine: back-to-back runs of the same binary came out 1.6x
+    /// apart with other builds running, and the same code 2.1x apart
+    /// hours apart. Alternating makes every variant see the same
+    /// machine, so the ratio is a measurement even when the absolute
+    /// numbers are not.
+    fn best_each<const N: usize>(
+        batches: u32,
+        n: u32,
+        mut f: impl FnMut(usize),
+    ) -> [Duration; N] {
+        let mut best = [Duration::MAX; N];
+        for _ in 0..batches {
+            for (i, slot) in best.iter_mut().enumerate() {
+                let t = Instant::now();
+                for _ in 0..n {
+                    f(i);
+                }
+                *slot = (*slot).min(t.elapsed() / n);
+            }
+        }
+        best
+    }
+
+    /// The busiest realistic bar: every control in a non-default state
+    /// (so no body is the short one), a cursor on the row, a flash
+    /// decaying, and a scrubber with room to stretch.
+    fn busy() -> ControlsBar<'static> {
+        ControlsBar {
+            move_mode: false,
+            focus_label: "bottom bar",
+            focused: true,
+            queue_len: 17,
+            loop_mode: LoopMode::One,
+            shuffle_on: true,
+            speed: 1.25,
+            eq_active: true,
+            crossfade_on: true,
+            paused: false,
+            muted: true,
+            gap_remaining: None,
+            elapsed_secs: Some(187.0),
+            duration_secs: Some(382.0),
+            flash: Some((Field::Shuffle, 0.4)),
+            selected: Some(Field::Progress),
+            scrubbing: false,
+            resize_hint: None,
+        }
+    }
+
+    const WIDTHS: [u16; 3] = [60, 120, 200];
+
+    /// What main.rs pays per frame: `layout` for the hit map, then
+    /// `render`, both of which run the whole fit pass.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn frame_cost() {
+        println!("\n== controlsbar frame cost ({}) ==", profile());
+        for w in WIDTHS {
+            let area = Rect::new(0, 0, w, 2);
+            let mut buf = buffer(w, 2);
+            let [render, layout, both] = best_each::<3>(6, 2000, |which| match which {
+                0 => busy().render(area, &mut buf),
+                1 => {
+                    std::hint::black_box(busy().layout(area));
+                }
+                _ => {
+                    std::hint::black_box(busy().layout(area));
+                    busy().render(area, &mut buf);
+                }
+            });
+            println!(
+                "{w}x2: frame {both:>9.3?}  (render {render:>9.3?}  layout {layout:>9.3?})"
+            );
+        }
+    }
+
+    /// Where the frame goes: the element list, the fit-and-place pass
+    /// over it, and the paint. Each piece is timed with its inputs
+    /// outside the clock, so they are reported beside the whole rather
+    /// than summed to it.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn frame_phases() {
+        println!("\n== controlsbar phases ({}) ==", profile());
+        for w in WIDTHS {
+            let area = Rect::new(0, 0, w, 2);
+            let mut buf = buffer(w, 2);
+            let bar = busy();
+            let segs = bar.segments(None);
+            let placed = place(&segs, area, 1);
+            let [segments, placing, painting, mode] = best_each::<4>(6, 2000, |which| match which {
+                0 => {
+                    std::hint::black_box(bar.segments(None));
+                }
+                1 => {
+                    std::hint::black_box(place(&segs, area, 1));
+                }
+                2 => {
+                    for p in &placed {
+                        draw_placed(&mut buf, area, p, bar.flash, bar.selected, bar.scrubbing);
+                    }
+                }
+                _ => {
+                    std::hint::black_box(bar.mode_label());
+                    std::hint::black_box(console_hint());
+                }
+            });
+            println!(
+                "{w}x2: segments {segments:>9.3?}  place {placing:>9.3?}  \
+                 paint {painting:>9.3?}  mode line {mode:>9.3?}"
+            );
+        }
+    }
+
+    /// The scrubber's track, against the `collect`-from-chars shape it
+    /// was built with: one `String` grown from the iterator's lower
+    /// bound (one byte a cell, where every glyph here is three) rather
+    /// than reserved once.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn track_cost() {
+        println!("\n== controlsbar track ({}) ==", profile());
+        for cells in [20usize, 56, 180] {
+            let [reserved, grown] = best_each::<2>(8, 5000, |which| {
+                std::hint::black_box(match which {
+                    0 => track(0.47, cells, false),
+                    _ => (0..cells)
+                        .map(|i| match i.cmp(&(cells / 2)) {
+                            Ordering::Less => TRACK_DONE,
+                            Ordering::Equal => TRACK_HEAD,
+                            Ordering::Greater => TRACK_LEFT,
+                        })
+                        .collect::<String>(),
+                });
+            });
+            println!("{cells} cells: reserved {reserved:>9.3?}  grown {grown:>9.3?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod eyeball {
     use super::*;
