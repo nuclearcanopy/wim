@@ -601,6 +601,16 @@ pub fn spawn_warm_from_cache(servers: &[NavidromeConfig]) -> WarmingCorpus {
 pub struct Ranking {
     rev: u64,
     order: Vec<u32>,
+    /// `(index, category)` per category change in `order`, i.e. where
+    /// the results list draws a section header.
+    ///
+    /// Stored rather than derived on demand because `rank_order`
+    /// *builds* the order one category run at a time, so these are a
+    /// by-product of ranking it, while deriving them means resolving
+    /// an item per match: a draw path that only wants a screenful paid
+    /// that three times a frame. `rank_order` returns the two together
+    /// so neither can be built without the other.
+    runs: Vec<(usize, Category)>,
 }
 
 impl Ranking {
@@ -631,12 +641,26 @@ impl Ranking {
 
     /// Where a section header lands, without materializing a row.
     ///
-    /// The draw path's one real need for the whole list was this, and
-    /// it only ever depended on the *categories*: cloning a row to
-    /// ask `item.category()` is precisely the cost the index list
-    /// exists to avoid. Empty for a corpus this ranking does not
-    /// address, matching `rows`.
+    /// Read off the runs `rank_order` already walked rather than
+    /// walked again: it concatenates the order one category at a time,
+    /// so the boundaries are a by-product of ranking, and a results
+    /// frame asks for them three times (see
+    /// `ui::results_list::frame_budget`) where every ask used to
+    /// resolve an item per match. Empty for a corpus this ranking does
+    /// not address, matching `rows`.
     pub fn group_boundaries(&self, corpus: &Corpus) -> Vec<(usize, Category)> {
+        if !self.addresses(corpus) {
+            return Vec::new();
+        }
+        self.runs.clone()
+    }
+
+    /// What `group_boundaries` was: the categories walked off the
+    /// order, an item resolved per match. Kept as the definition the
+    /// stored runs have to agree with, and as the benchmark's other
+    /// half (`ui::results_list::frame_budget`).
+    #[cfg(test)]
+    pub(crate) fn walked_group_boundaries(&self, corpus: &Corpus) -> Vec<(usize, Category)> {
         if !self.addresses(corpus) {
             return Vec::new();
         }
@@ -1048,9 +1072,11 @@ impl Corpus {
     /// screenful needs none of those clones. `search` is now this plus
     /// the clone, so the two cannot order differently.
     pub fn rank(&self, query: &str) -> Ranking {
+        let (order, runs) = rank_order(&self.items, self.score_all(query));
         Ranking {
             rev: self.rev,
-            order: rank_order(&self.items, self.score_all(query)),
+            order,
+            runs,
         }
     }
 
@@ -1155,10 +1181,15 @@ struct Scored {
     at: u32,
 }
 
-/// The ranking proper, as corpus indices. `scored` carries indices
-/// rather than references so the result can outlive the borrow and be
-/// held across an event loop; `Corpus::rank_indices` is the caller.
-fn rank_order(items: &[Entry], mut scored: Vec<Scored>) -> Vec<u32> {
+/// The ranking proper, as corpus indices, plus where its category runs
+/// begin. `scored` carries indices rather than references so the
+/// result can outlive the borrow and be held across an event loop;
+/// `Corpus::rank_indices` is the caller.
+///
+/// The runs come out of here rather than off a second walk because the
+/// order is *built* a category at a time below, and returning the pair
+/// is what keeps `Ranking`'s two halves from being built apart.
+fn rank_order(items: &[Entry], mut scored: Vec<Scored>) -> (Vec<u32>, Vec<(usize, Category)>) {
     // relative score cutoff: nucleo's own subsequence matcher will
     // happily return *some* nonzero score for almost any haystack
     // against a short query (e.g. "crest" is a valid, if scattered,
@@ -1183,7 +1214,7 @@ fn rank_order(items: &[Entry], mut scored: Vec<Scored>) -> Vec<u32> {
     // corpus order, which the stable sort below needs for ties, so
     // this is the same list in the same order either way.
     let Some(top_score) = scored.iter().map(|c| c.score).max() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let category = |at: u32| items[at as usize].item.category();
     let threshold = (top_score as f64 * WEAK_MATCH_CUTOFF_FRACTION).round() as u32;
@@ -1207,7 +1238,11 @@ fn rank_order(items: &[Entry], mut scored: Vec<Scored>) -> Vec<u32> {
         }
     }
     let mut out = Vec::with_capacity(scored.len());
+    let mut runs = Vec::with_capacity(group_order.len());
     for cat in group_order {
+        // every category in `group_order` was seen on an item, so the
+        // run below is never empty and this is a real boundary.
+        runs.push((out.len(), cat));
         out.extend(
             scored
                 .iter()
@@ -1215,7 +1250,7 @@ fn rank_order(items: &[Entry], mut scored: Vec<Scored>) -> Vec<u32> {
                 .map(|c| c.at),
         );
     }
-    out
+    (out, runs)
 }
 
 /// `rank_order` resolved back to references, for the one caller that
@@ -1224,6 +1259,7 @@ fn rank_order(items: &[Entry], mut scored: Vec<Scored>) -> Vec<u32> {
 /// differently.
 fn rank_borrowed(items: &[Entry], scored: Vec<Scored>) -> Vec<&SearchItem> {
     rank_order(items, scored)
+        .0
         .into_iter()
         .map(|at| &items[at as usize].item)
         .collect()
@@ -2214,6 +2250,7 @@ mod tests {
     /// testing the real ranking rather than a second copy of it.
     fn ranked_items(c: &Corpus, scored: Vec<Scored>) -> Vec<SearchItem> {
         rank_order(&c.items, scored)
+            .0
             .into_iter()
             .map(|at| c.items[at as usize].item.clone())
             .collect()
@@ -2536,6 +2573,43 @@ mod tests {
                 "{query:?}: headers land on different rows"
             );
         }
+    }
+
+    /// The runs `rank_order` records have to be exactly the boundaries
+    /// a walk of the finished order finds, for every query: the stored
+    /// pair is the hazard of storing it at all, and a run recorded one
+    /// index off is a section header against the wrong row.
+    ///
+    /// `ranked_group_boundaries_match_the_materialized_ones` above is
+    /// the third leg, against `group_boundaries` over owned items.
+    #[test]
+    fn the_recorded_category_runs_are_what_a_walk_of_the_order_finds() {
+        for size in [1usize, 200, 2_000] {
+            let c = varied_corpus(size);
+            for query in GUARD_QUERIES {
+                let ranking = c.rank(query);
+                assert_eq!(
+                    ranking.group_boundaries(&c),
+                    ranking.walked_group_boundaries(&c),
+                    "{query:?} over {size} items: recorded runs are not the order's own"
+                );
+            }
+        }
+    }
+
+    /// Runs recorded at rank time do not make a stale order readable:
+    /// they are indices into one corpus state like the order itself,
+    /// so a corpus that moved on still reports no headers at all.
+    #[test]
+    fn the_recorded_category_runs_still_refuse_the_wrong_corpus() {
+        let mut c = varied_corpus(200);
+        let ranking = c.rank("a");
+        assert!(
+            !ranking.group_boundaries(&c).is_empty(),
+            "need headers for this to mean anything"
+        );
+        c.drop_local();
+        assert!(ranking.group_boundaries(&c).is_empty());
     }
 
     /// The per-chunk base arithmetic, stated directly.
