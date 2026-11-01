@@ -1027,6 +1027,100 @@ mod tests {
         );
     }
 
+    /// The list painted into a pane with a row of untouched buffer
+    /// around it, so a recorded grid pins where the rows stop as well
+    /// as what they say. `pub(super)` for the `eyeball` module, which
+    /// prints the same grids.
+    pub(super) fn painted(rows: &dyn Rows, selected: usize) -> String {
+        let area = Rect::new(1, 1, 26, 8);
+        let mut buf = buffer(28, 10);
+        ResultsList {
+            items: rows,
+            selected,
+            empty_message: "nothing here",
+            favorites: &Favorites::default(),
+            remote_starred: &HashSet::new(),
+            focused: true,
+            elapsed: Duration::ZERO,
+        }
+        .render(area, &mut buf);
+        assert_outside_untouched(&buf, area);
+        crate::ui::testbuf::grid(&buf)
+    }
+
+    /// The four selections worth pinning: a list shorter than the
+    /// pane, then the selection on row 0, mid-list and on the last row
+    /// (the scrolled case) of a list far longer than it.
+    pub(super) const RECORDED: [(usize, usize); 4] = [(5, 0), (137, 0), (137, 68), (137, 136)];
+
+    /// Every cell of the painted pane at the four `RECORDED`
+    /// selections, as the full-boundary walk drew them: literals taken
+    /// off the old code, so a change to how the geometry is computed
+    /// has to reproduce the rows rather than merely stay
+    /// self-consistent. `eyeball::print_the_recorded_grids` prints the
+    /// same four.
+    #[test]
+    fn the_painted_grid_is_what_the_full_boundary_walk_drew() {
+        let expected = [
+            [
+                "............................",
+                ".───────── SONGS ──────────.",
+                ".> [fs] track 0.............",
+                ".  [fs] track 1.............",
+                ".  [fs] track 2.............",
+                ".  [fs] track 3.............",
+                ".  [fs] track 4.............",
+                "............................",
+                "............................",
+                "............................",
+            ],
+            [
+                "............................",
+                ".───────── SONGS ──────────.",
+                ".> [fs] track 0.............",
+                ".  [fs] track 1.............",
+                ".  [fs] track 2.............",
+                ".  [fs] track 3.............",
+                ".  [fs] track 4.............",
+                ".  [fs] track 5.............",
+                ".  [fs] track 6.............",
+                "............................",
+            ],
+            [
+                "............................",
+                ".  [fs] track 62............",
+                ".───────── VIDEOS ─────────.",
+                ".  [fv] clip 63.............",
+                ".  [fv] clip 64.............",
+                ".  [fv] clip 65.............",
+                ".  [fv] clip 66.............",
+                ".  [fv] clip 67.............",
+                ".> [fv] clip 68.............",
+                "............................",
+            ],
+            [
+                "............................",
+                ".  [fs] track 130...........",
+                ".  [fs] track 131...........",
+                ".  [fs] track 132...........",
+                ".───────── VIDEOS ─────────.",
+                ".  [fv] clip 133............",
+                ".  [fv] clip 134............",
+                ".  [fv] clip 135............",
+                ".> [fv] clip 136............",
+                "............................",
+            ],
+        ];
+        for (&(n, selected), want) in RECORDED.iter().zip(expected) {
+            let rows = mixed(n);
+            assert_eq!(
+                painted(&rows, selected),
+                want.join("\n"),
+                "{n} rows, selected {selected}"
+            );
+        }
+    }
+
     fn render(selected: usize, focused: bool, elapsed: Duration) -> Buffer {
         let area = Rect::new(0, 0, 20, 5);
         let mut buf = buffer(20, 5);
@@ -1277,6 +1371,21 @@ mod eyeball {
         let mut buf = buffer(20, 6);
         draw_header_row(&mut buf, Rect::new(0, 2, 20, 1), 2, "ALBUMS");
         assert!(grid(&buf).contains("ALBUMS"), "{}", grid(&buf));
+    }
+
+    /// The grids `the_painted_grid_is_what_the_full_boundary_walk_drew`
+    /// pins, printed so they can be read rather than diffed out of an
+    /// assert failure:
+    /// `cargo test --lib ui::results_list::eyeball -- --nocapture`.
+    #[test]
+    fn print_the_recorded_grids() {
+        for (n, selected) in super::tests::RECORDED {
+            let rows = super::tests::mixed(n);
+            println!(
+                "--- {n} rows in a 26x8 pane at (1,1), selected {selected}\n{}",
+                super::tests::painted(&rows, selected)
+            );
+        }
     }
 
     /// The whole list, printed at three heights against a 6-row pane:
