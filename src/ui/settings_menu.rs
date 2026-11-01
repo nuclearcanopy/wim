@@ -2,22 +2,131 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
+use crate::config::VideoOutput;
+use ratatui_image::picker::ProtocolType;
 use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
 use crate::ui::results_list::scroll_cues;
 
-pub const FIELD_COUNT: usize = 8;
-pub const FIELD_LABELS: [&str; FIELD_COUNT] = [
-    "album art",
-    "crossfade",
-    "crossfade seconds",
-    "cache after days played",
-    "cache eviction days",
-    "scrobble % threshold",
-    "scrobble seconds threshold",
-    "listenbrainz token",
+/// A row, named rather than numbered.
+///
+/// The adjust keys used to match on the selected *index*, so inserting
+/// a row anywhere but the end silently moved every adjuster below it
+/// onto the wrong setting. Naming them means `FIELDS` is the only
+/// place order lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    AlbumArt,
+    VideoOutput,
+    AsciiFps,
+    Crossfade,
+    CrossfadeSeconds,
+    CacheDaysThreshold,
+    CacheEvictionDays,
+    ScrobblePercent,
+    ScrobbleSeconds,
+    ListenbrainzToken,
+}
+
+/// Every row, in the order they are drawn. The two display settings
+/// sit together at the top, and the token stays last because it is the
+/// only one that opens an editor and the footer hint names it.
+pub const FIELDS: [Field; 10] = [
+    Field::AlbumArt,
+    Field::VideoOutput,
+    Field::AsciiFps,
+    Field::Crossfade,
+    Field::CrossfadeSeconds,
+    Field::CacheDaysThreshold,
+    Field::CacheEvictionDays,
+    Field::ScrobblePercent,
+    Field::ScrobbleSeconds,
+    Field::ListenbrainzToken,
 ];
+
+pub const FIELD_COUNT: usize = FIELDS.len();
+
+impl Field {
+    pub fn label(self) -> &'static str {
+        match self {
+            Field::AlbumArt => "album art",
+            Field::VideoOutput => "video output",
+            Field::AsciiFps => "text-cell video rate",
+            Field::Crossfade => "crossfade",
+            Field::CrossfadeSeconds => "crossfade seconds",
+            Field::CacheDaysThreshold => "cache after days played",
+            Field::CacheEvictionDays => "cache eviction days",
+            Field::ScrobblePercent => "scrobble % threshold",
+            Field::ScrobbleSeconds => "scrobble seconds threshold",
+            Field::ListenbrainzToken => "listenbrainz token",
+        }
+    }
+}
+
+/// What the "video output" row reads, which is the mode actually in
+/// force and not simply the config's.
+///
+/// Three things the plain config value would hide: that shift-`v` has
+/// overridden it (so the row would contradict the screen), that `auto`
+/// resolved to a particular vo (the user cannot otherwise tell whether
+/// their terminal answered the graphics probe), and that `ascii` is
+/// wim painting rather than mpv.
+pub fn video_output_value(
+    configured: VideoOutput,
+    over: Option<VideoOutput>,
+    probed: Option<ProtocolType>,
+) -> String {
+    let live = crate::video::effective(configured, over);
+    let mut said = match live {
+        // what `auto` resolved to, which is the only way to see
+        // whether the terminal answered the graphics probe.
+        VideoOutput::Auto => match crate::video::drawing_vo(VideoOutput::Auto, probed) {
+            Some(vo) => format!("auto ({})", vo.mpv_name()),
+            None => "auto (no protocol yet)".to_string(),
+        },
+        other => config_word(other).to_string(),
+    };
+    if over.is_some() {
+        // naming the config value is the point: this row is the only
+        // place the override is visible, and a restart undoes it.
+        //
+        // kept short deliberately. the first version read `ascii (wim
+        // paints it) [shift+v; config: auto]`, which is 44 cells and
+        // truncated to `... [shift` on a 62-wide pane, cutting the one
+        // fact the note exists for.
+        said.push_str(&format!(" (config: {})", config_word(configured)));
+    }
+    said
+}
+
+/// The bare config word, for the override note. Not `Debug`: that
+/// would print `Tct` where config.toml says `tct`.
+fn config_word(mode: VideoOutput) -> &'static str {
+    match mode {
+        VideoOutput::Auto => "auto",
+        VideoOutput::Tct => "tct",
+        VideoOutput::Kitty => "kitty",
+        VideoOutput::Ascii => "ascii",
+        VideoOutput::Off => "off",
+    }
+}
+
+/// What the rate row reads. Unset is the common case and says what it
+/// means rather than "none".
+pub fn ascii_fps_value(cap: Option<f64>) -> String {
+    match cap {
+        Some(fps) => format!("at most {fps:.0} fps"),
+        None => "the file's own rate".to_string(),
+    }
+}
+
+/// The row the cursor is on. Out of range cannot happen (the cursor
+/// wraps on `FIELD_COUNT`), and the fallback is the first row rather
+/// than a panic: a settings menu is not worth crashing over.
+pub fn field_at(selected: usize) -> Field {
+    FIELDS.get(selected).copied().unwrap_or(Field::AlbumArt)
+}
 
 /// Takes over the whole workspace (sidebar included, never the
 /// bottom bar) the same way the help overlay takes over the whole
@@ -25,7 +134,10 @@ pub const FIELD_LABELS: [&str; FIELD_COUNT] = [
 /// thing that should be easy to find rather than a small popup, which
 /// is what the centered subtitle menu is for instead.
 pub struct SettingsMenu<'a> {
-    pub values: [&'a str; FIELD_COUNT],
+    /// One per `FIELDS` entry, in that order. A slice rather than an
+    /// array so the caller can build it by mapping `FIELDS`, which is
+    /// what keeps the two in step.
+    pub values: &'a [&'a str],
     pub selected: usize,
     pub keymap: &'a Keymap,
 }
@@ -53,7 +165,7 @@ impl Widget for SettingsMenu<'_> {
         );
         y += 1;
 
-        let key_width = FIELD_LABELS.iter().map(|l| l.len()).max().unwrap_or(0);
+        let key_width = FIELDS.iter().map(|f| f.label().len()).max().unwrap_or(0);
         // the hint naming the key that opens the token editor claims
         // its row before the list does, then the list scrolls inside
         // what is left: it had no offset at all, so on a short pane
@@ -71,8 +183,9 @@ impl Widget for SettingsMenu<'_> {
             width: area.width.saturating_sub(u16::from(scrolls)),
             ..area
         };
-        for (row, (i, (label, value))) in FIELD_LABELS
+        for (row, (i, (label, value))) in FIELDS
             .iter()
+            .map(|f| f.label())
             .zip(self.values.iter())
             .enumerate()
             .skip(offset)
@@ -141,7 +254,7 @@ mod tests {
 
     fn render(area: Rect, buf: &mut Buffer, values: [&str; FIELD_COUNT]) {
         SettingsMenu {
-            values,
+            values: &values,
             selected: 0,
             keymap: &Keymap::default(),
         }
@@ -155,17 +268,22 @@ mod tests {
         render(
             area,
             &mut buf,
-            ["on", "off", "3", "7", "30", "50", "240", "set"],
+            ["on", "auto (tct)", "the file's own rate", "off", "3", "7", "30", "50", "240", "set"],
         );
         assert_eq!(grid(&buf), SNAPSHOT.join("\n"));
     }
 
+    /// Two more rows than there is room for the secondary hint, so
+    /// it clips: `footer` reserves the primary hint only, which is the
+    /// rule this file already had and this snapshot now exercises.
     const SNAPSHOT: [&str; 17] = [
         "┌──────────────────────────────────────────────────────────────────────────────┐",
         "│ settings │ u or esc to close                                                 │",
         "│ ─────────┴────────────────────────────────────────────────────────────────── │",
         "│                                                                              │",
         "│ > album art                   on                                             │",
+        "│   video output                auto (tct)                                     │",
+        "│   text-cell video rate        the file's own rate                            │",
         "│   crossfade                   off                                            │",
         "│   crossfade seconds           3                                              │",
         "│   cache after days played     7                                              │",
@@ -175,8 +293,6 @@ mod tests {
         "│   listenbrainz token          set                                            │",
         "│                                                                              │",
         "│ j/k select, h/l adjust, enter on 'listenbrainz token' to set/change it       │",
-        "│ other settings: '?' keybinds, 't' subtitles, left/right on the home screen l │",
-        "│                                                                              │",
         "└──────────────────────────────────────────────────────────────────────────────┘",
     ];
 
@@ -186,7 +302,7 @@ mod tests {
     fn a_wide_value_does_not_shift_the_glyphs_after_it() {
         let area = Rect::new(0, 0, 60, 17);
         let mut buf = buffer(60, 17);
-        render(area, &mut buf, ["日本x", "", "", "", "", "", "", ""]);
+        render(area, &mut buf, ["日本x", "", "", "", "", "", "", "", "", ""]);
         let g = grid(&buf);
         let row: Vec<char> = g
             .lines()
@@ -251,7 +367,7 @@ mod tests {
 
     fn render_at(area: Rect, buf: &mut Buffer, selected: usize) {
         SettingsMenu {
-            values: ["on"; FIELD_COUNT],
+            values: &["on"; FIELD_COUNT],
             selected,
             keymap: &Keymap::default(),
         }
@@ -264,7 +380,7 @@ mod tests {
     #[test]
     fn the_selected_field_is_on_screen_at_every_selection() {
         for h in [8u16, 10, 12, 17] {
-            for (selected, label) in FIELD_LABELS.iter().enumerate() {
+            for (selected, label) in FIELDS.iter().map(|f| f.label()).enumerate() {
                 let mut buf = buffer(80, h);
                 render_at(Rect::new(0, 0, 80, h), &mut buf, selected);
                 let g = grid(&buf);
@@ -314,7 +430,7 @@ mod tests {
         let area = Rect::new(0, 0, 100, 20);
         let mut buf = Buffer::empty(area);
         SettingsMenu {
-            values: ["", "", "", "", "", "", "", ""],
+            values: &["", "", "", "", "", "", "", "", "", ""],
             selected: 0,
             keymap: &keymap,
         }
@@ -346,13 +462,15 @@ mod eyeball {
 
     /// The menu at the rows `main_content` actually gets: a 14-row
     /// terminal with the default 4-row bottom bar leaves 10, and the
-    /// listenbrainz token is the last of the eight fields:
+    /// listenbrainz token is the last field:
     /// `cargo test --lib ui::settings_menu::eyeball -- --nocapture`.
     /// Asserts the floor too, so it is a test and not just a printer.
     #[test]
     fn print_the_menu_with_the_token_row_selected() {
         let values = [
             "balanced ('i' also cycles this)",
+            "auto (tct)",
+            "the file's own rate",
             "off",
             "3.0s",
             "7 days played",
@@ -361,15 +479,16 @@ mod eyeball {
             "240s",
             "not set (enter to add)",
         ];
+        let last = FIELD_COUNT - 1;
         for (w, h, selected) in [
-            (80u16, 10u16, 7usize),
+            (80u16, 10u16, last),
             (80, 10, 0),
-            (80, 12, 7),
-            (80, 17, 7),
+            (80, 12, last),
+            (80, 17, last),
         ] {
             let mut buf = buffer(w, h);
             SettingsMenu {
-                values,
+                values: &values,
                 selected,
                 keymap: &Keymap::default(),
             }
@@ -381,5 +500,152 @@ mod eyeball {
                 "{w}x{h} drew nothing at all"
             );
         }
+    }
+}
+/// The two video rows' text, and the row-naming that replaced index
+/// literals. Losing this would stop covering what the menu *says*
+/// about a mode, which is the only place an override is visible.
+#[cfg(test)]
+mod video_row_tests {
+    use super::*;
+
+    /// Every word here has to be the one config.toml uses, because the
+    /// row doubles as documentation for what to type in the file.
+    #[test]
+    fn each_mode_reads_as_its_config_word() {
+        for (mode, word) in [
+            (VideoOutput::Tct, "tct"),
+            (VideoOutput::Kitty, "kitty"),
+            (VideoOutput::Ascii, "ascii"),
+            (VideoOutput::Off, "off"),
+        ] {
+            assert_eq!(video_output_value(mode, None, None), word);
+        }
+    }
+
+    /// `auto` names what it resolved to: a user on a terminal that
+    /// failed the graphics probe otherwise has no way to tell that
+    /// from one that passed.
+    #[test]
+    fn auto_says_what_it_resolved_to() {
+        assert_eq!(
+            video_output_value(VideoOutput::Auto, None, Some(ProtocolType::Kitty)),
+            "auto (kitty)"
+        );
+        assert_eq!(
+            video_output_value(VideoOutput::Auto, None, None),
+            "auto (tct)",
+            "no protocol still gets a drawing vo, since tct needs nothing"
+        );
+    }
+
+    /// The row has to contradict neither the screen nor the file: it
+    /// shows what is in force and names what config says.
+    #[test]
+    fn an_override_names_the_config_it_is_covering() {
+        let said = video_output_value(VideoOutput::Auto, Some(VideoOutput::Ascii), None);
+        assert_eq!(said, "ascii (config: auto)");
+        // and with no override there is no note at all, so the common
+        // case stays short.
+        assert_eq!(video_output_value(VideoOutput::Ascii, None, None), "ascii");
+    }
+
+    /// Short enough to survive the narrow pane that cut the first
+    /// version: at 62 cells the value column is 25 wide, and
+    /// `ascii (wim paints it) [shift+v; config: auto]` truncated to
+    /// `[shift`, losing the one fact the note exists for.
+    #[test]
+    fn the_override_note_fits_a_narrow_pane() {
+        let longest = video_output_value(
+            VideoOutput::Kitty,
+            Some(VideoOutput::Ascii),
+            Some(ProtocolType::Kitty),
+        );
+        assert!(longest.len() <= 25, "{longest} is {} cells", longest.len());
+    }
+
+    #[test]
+    fn the_rate_row_says_what_unset_means() {
+        assert_eq!(ascii_fps_value(None), "the file's own rate");
+        assert_eq!(ascii_fps_value(Some(15.0)), "at most 15 fps");
+    }
+
+    /// `values` is indexed by `FIELDS`, so a row with no value (or one
+    /// too many) is a silent misalignment of every row after it.
+    #[test]
+    fn every_field_has_exactly_one_value() {
+        assert_eq!(FIELDS.len(), FIELD_COUNT);
+        let values: Vec<String> = FIELDS.iter().map(|f| f.label().to_string()).collect();
+        assert_eq!(values.len(), FIELD_COUNT);
+        // and no two rows share a label, which would make the menu
+        // unreadable and a selection ambiguous.
+        let mut seen: Vec<&str> = FIELDS.iter().map(|f| f.label()).collect();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), before);
+    }
+
+    /// Out of range cannot happen (the cursor wraps on `FIELD_COUNT`),
+    /// and the answer is the first row rather than a panic.
+    #[test]
+    fn the_cursor_always_names_a_row() {
+        assert_eq!(field_at(0), Field::AlbumArt);
+        assert_eq!(field_at(FIELD_COUNT - 1), Field::ListenbrainzToken);
+        assert_eq!(field_at(FIELD_COUNT), Field::AlbumArt);
+        assert_eq!(field_at(usize::MAX), Field::AlbumArt);
+    }
+}
+
+/// Prints the menu as it ships, with the two video rows in it. Run
+/// with `cargo test --lib eyeball_settings -- --nocapture`.
+#[cfg(test)]
+mod eyeball_video {
+    use super::*;
+    use crate::ui::testbuf::{buffer, grid};
+    use ratatui::widgets::Widget;
+
+    fn show(label: &str, values: &[&str], width: u16) {
+        let area = Rect::new(0, 0, width, 19);
+        let mut buf = buffer(width, 19);
+        SettingsMenu {
+            values,
+            selected: 1,
+            keymap: &Keymap::default(),
+        }
+        .render(area, &mut buf);
+        println!("--- {label} ({width} wide, 'video output' selected)");
+        println!("{}", grid(&buf));
+    }
+
+    #[test]
+    fn eyeball_settings_with_the_video_rows() {
+        let probed = Some(ProtocolType::Kitty);
+        let rows: Vec<String> = FIELDS
+            .iter()
+            .map(|f| match f {
+                Field::AlbumArt => "ascii-bw ('i' also cycles this)".to_string(),
+                Field::VideoOutput => video_output_value(VideoOutput::Auto, None, probed),
+                Field::AsciiFps => ascii_fps_value(None),
+                Field::Crossfade => "off".to_string(),
+                Field::CrossfadeSeconds => "3.0s".to_string(),
+                Field::CacheDaysThreshold => "2 days played".to_string(),
+                Field::CacheEvictionDays => "30 days".to_string(),
+                Field::ScrobblePercent => "50%".to_string(),
+                Field::ScrobbleSeconds => "240s".to_string(),
+                Field::ListenbrainzToken => "set (enter to change)".to_string(),
+            })
+            .collect();
+        let borrowed: Vec<&str> = rows.iter().map(String::as_str).collect();
+        show("the default, kitty terminal", &borrowed, 80);
+
+        // and the override case, which is the row that has to explain
+        // itself: the screen disagrees with config.toml.
+        let mut over = rows.clone();
+        over[1] = video_output_value(VideoOutput::Auto, Some(VideoOutput::Ascii), probed);
+        over[2] = ascii_fps_value(Some(15.0));
+        let borrowed: Vec<&str> = over.iter().map(String::as_str).collect();
+        show("shift+v override active, rate capped", &borrowed, 80);
+        show("the same at 62 wide, where the value column has to fit", &borrowed, 62);
     }
 }

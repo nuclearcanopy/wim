@@ -634,6 +634,36 @@ and `in-workspace (sub-rect) video` is still kitty-only via
         passed file-wide because the key handler calls it too, so it is
         anchored at the `video::showing(` call instead. that is the
         anchor rule in `docs/testing.md`, and I broke it again.
+      - [x] **the settings menu shows the mode and its rate.** two
+        rows at the top beside album art, since those three are the
+        display settings. the output row reads the mode **actually in
+        force**, which the plain config value would hide three ways: an
+        active shift-`v` override (the row would contradict the
+        screen), what `auto` resolved to (`auto (kitty)` vs
+        `auto (tct)`, the only way to tell whether the terminal
+        answered the graphics probe), and that a change in the menu
+        needs the override cleared or it does nothing.
+        **the first draft was looked at and shortened.** it read
+        `ascii (wim paints it) [shift+v; config: auto]`, 44 cells,
+        which on a 62-wide pane truncated to `... [shift`: it cut the
+        one fact the note exists for. `ascii (config: auto)` is 20 and
+        survives, and a test pins the 25-cell ceiling with the reason.
+        the rate row steps 10/15/20/24/30 and "the file's own rate",
+        coarse because this is a "make it keep up" knob; uncapped sits
+        at the **fast** end, so one nudge down from it gives 30 rather
+        than dropping a user to 10. a hand-edited value joins at the
+        nearest step at or above itself.
+        the slice that made this safe came first: the adjust keys
+        matched on the selected **index**, so inserting a row moved
+        every adjuster below it onto the wrong setting with nothing to
+        catch it. `settings_menu::Field` plus `FIELDS` names them, the
+        values are built by mapping `FIELDS` so the compiler holds the
+        two in step, and a guard asserts no `settings_menu_selected ==`
+        literal comes back.
+        five mutations caught: a surviving override, the note growing
+        back past the narrow pane, a cycle that skips `ascii` (making
+        it unselectable from the ui), a nudge off uncapped landing on
+        10fps, and an indexing `field_at` that panics.
       - [ ] **the crumbs.** `ui/help.rs`'s curated list does not mention
         shift-`v` (the keybinds menu lists it automatically off
         `ALL_ACTIONS`), and there is no shellsong command for the mode.
@@ -727,8 +757,8 @@ and `in-workspace (sub-rect) video` is still kitty-only via
       infinite cap is `min`'d away.
       "never blocking input" needed nothing: the fifo is opened
       non-blocking and `WouldBlock` is already an ordinary `Pending`.
-      what is left of this item is nothing, unless the maintainer wants
-      the cap exposed in the settings menu rather than only in config.
+      the cap is in the settings menu too, as of the ascii-renderer
+      item's own settings slice, so this item is closed.
       the original note, kept for the reasoning:
       > a few hundred cells across times a few hundred
       down, at video frame rate, is the real cost. the work is CPU

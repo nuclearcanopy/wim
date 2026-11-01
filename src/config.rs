@@ -780,9 +780,127 @@ fn restrict_to_owner(_path: &Path) -> Result<()> {
 /// Persists config, surfacing a failure instead of swallowing it: a
 /// read-only config dir or a full disk used to mean every setting
 /// silently reverted on the next launch with nothing said about it.
+/// The settings menu's video-output cycle. `ascii` is in it: `Auto`
+/// never *picks* it, because a real protocol beats a cell grid, but a
+/// user on a terminal with neither protocol has to be able to choose
+/// it, and the menu is where they would look.
+pub fn next_video_output(mode: VideoOutput) -> VideoOutput {
+    match mode {
+        VideoOutput::Auto => VideoOutput::Tct,
+        VideoOutput::Tct => VideoOutput::Kitty,
+        VideoOutput::Kitty => VideoOutput::Ascii,
+        VideoOutput::Ascii => VideoOutput::Off,
+        VideoOutput::Off => VideoOutput::Auto,
+    }
+}
+
+/// The settings menu's rate steps for `ascii_fps`, coarse on purpose:
+/// this is a "make it keep up" knob, not a precise one, and one fps at
+/// a time would be forty presses.
+pub const ASCII_FPS_STEPS: [f64; 5] = [10.0, 15.0, 20.0, 24.0, 30.0];
+
+/// Steps the cap one notch. `None` (the file's own rate) sits at the
+/// top end, so stepping down from it enters the list at the fastest
+/// cap rather than the slowest.
+pub fn step_ascii_fps(cap: Option<f64>, dir: i32) -> Option<f64> {
+    let steps = ASCII_FPS_STEPS;
+    let at = cap.and_then(|c| {
+        steps
+            .iter()
+            .position(|s| (s - c).abs() < 0.5)
+            // an out-of-list value from a hand-edited config enters at
+            // the nearest step rather than being snapped away.
+            .or_else(|| steps.iter().position(|s| *s >= c))
+    });
+    match (at, dir) {
+        (None, d) if d < 0 => Some(steps[steps.len() - 1]),
+        (None, _) => None,
+        (Some(i), d) if d < 0 => Some(steps[i.saturating_sub(1)]),
+        (Some(i), _) if i + 1 < steps.len() => Some(steps[i + 1]),
+        // off the fast end is "the file's own rate", which is the
+        // honest name for no cap at all.
+        (Some(_), _) => None,
+    }
+}
+
 pub fn save_or_warn(cfg: &Config, notifications: &mut Notifications) {
     if let Err(e) = save(cfg) {
         notifications.push(Severity::Error, format!("couldn't save settings: {e}"));
+    }
+}
+
+/// The settings menu's two video steppers, which are cycles with one
+/// end that is not a number.
+#[cfg(test)]
+mod video_setting_tests {
+    use super::*;
+
+    /// Every mode reachable, and back to where it started: a cycle
+    /// that skipped one would make that mode unselectable from the ui.
+    #[test]
+    fn the_output_cycle_reaches_every_mode_and_returns() {
+        let mut seen = vec![VideoOutput::Auto];
+        let mut at = VideoOutput::Auto;
+        for _ in 0..5 {
+            at = next_video_output(at);
+            if at == VideoOutput::Auto {
+                break;
+            }
+            seen.push(at);
+        }
+        assert_eq!(at, VideoOutput::Auto, "the cycle does not close");
+        seen.sort_unstable_by_key(|m| format!("{m:?}"));
+        assert_eq!(
+            seen,
+            vec![
+                VideoOutput::Ascii,
+                VideoOutput::Auto,
+                VideoOutput::Kitty,
+                VideoOutput::Off,
+                VideoOutput::Tct,
+            ]
+        );
+    }
+
+    /// `None` is the fast end, so stepping down from it enters at the
+    /// fastest cap. Entering at the slowest instead would drop a user
+    /// who nudged the knob once from 25fps to 10.
+    #[test]
+    fn stepping_down_from_uncapped_enters_at_the_fastest_cap() {
+        assert_eq!(step_ascii_fps(None, -1), Some(30.0));
+        assert_eq!(step_ascii_fps(None, 1), None, "already uncapped");
+    }
+
+    /// Up off the fast end is "no cap", which is the honest name for
+    /// it; it must not stop at 30 and look stuck.
+    #[test]
+    fn stepping_up_past_the_fastest_cap_removes_it() {
+        assert_eq!(step_ascii_fps(Some(30.0), 1), None);
+        assert_eq!(step_ascii_fps(Some(24.0), 1), Some(30.0));
+    }
+
+    /// Down at the slow end stays, rather than wrapping to uncapped:
+    /// a wrap there turns "as slow as it goes" into "as fast as the
+    /// file", which is the opposite of what the press asked for.
+    #[test]
+    fn stepping_down_at_the_slowest_cap_stays() {
+        assert_eq!(step_ascii_fps(Some(10.0), -1), Some(10.0));
+        assert_eq!(step_ascii_fps(Some(15.0), -1), Some(10.0));
+    }
+
+    /// A hand-edited config can hold any number. It enters at the
+    /// nearest step at or above it rather than being snapped away, so
+    /// one press from 13 goes to 20, not to 10.
+    #[test]
+    fn a_value_from_outside_the_steps_joins_the_list() {
+        assert_eq!(step_ascii_fps(Some(13.0), 1), Some(20.0));
+        assert_eq!(step_ascii_fps(Some(13.0), -1), Some(10.0));
+        assert_eq!(
+            step_ascii_fps(Some(200.0), -1),
+            Some(30.0),
+            "above every step, so it comes in at the top"
+        );
+        assert_eq!(step_ascii_fps(Some(200.0), 1), None);
     }
 }
 
