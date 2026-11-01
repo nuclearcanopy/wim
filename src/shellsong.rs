@@ -2180,7 +2180,9 @@ impl<'a> Lowering<'a> {
                     // allocates. checked before the iteration, so
                     // nothing oversized is ever built.
                     if self.refused || self.nodes.len() >= MAX_EXPANSION {
-                        self.refuse_expansion();
+                        self.refuse_expansion(format!(
+                            "repeat would expand past {MAX_EXPANSION} steps; nest fewer repeats"
+                        ));
                         return;
                     }
                     self.lower(inner, false);
@@ -2209,17 +2211,16 @@ impl<'a> Lowering<'a> {
     }
 
     /// One message however deep the nesting went, and every enclosing
-    /// `repeat` stops rather than reporting the same refusal 256 more
-    /// times. A `Fail` node, like `MAX_SCRIPT_DEPTH`'s: the rest of the
-    /// program still runs, with this in the scrollback.
-    fn refuse_expansion(&mut self) {
+    /// `repeat` or script frame stops rather than reporting the same
+    /// refusal again per iteration. A `Fail` node, like
+    /// `MAX_SCRIPT_DEPTH`'s: the rest of the program still runs, with
+    /// this in the scrollback. Reset per statement in `absorb`.
+    fn refuse_expansion(&mut self, why: String) {
         if self.refused {
             return;
         }
         self.refused = true;
-        self.nodes.push(Node::Fail(format!(
-            "repeat would expand past {MAX_EXPANSION} steps; nest fewer repeats"
-        )));
+        self.nodes.push(Node::Fail(why));
     }
 
     /// Inlines a `.shg` file: every line is parsed on its own and
@@ -2236,6 +2237,15 @@ impl<'a> Lowering<'a> {
             self.nodes.push(Node::Fail(format!(
                 "{label}: scripts nest more than {MAX_SCRIPT_DEPTH} deep; stopped here"
             )));
+            return;
+        }
+        // depth is not the whole bound: a file holding `b` `run` lines
+        // inlines `b^depth` frames, so a handful of lines is millions
+        // of nodes. the total is what has to be held, same as `repeat`.
+        if self.refused || self.nodes.len() >= MAX_EXPANSION {
+            self.refuse_expansion(format!(
+                "{label}: scripts would expand past {MAX_EXPANSION} steps; stopped here"
+            ));
             return;
         }
         self.depth += 1;
@@ -7971,6 +7981,44 @@ queue(morning)
             ops_of(&program).len(),
             MAX_SCRIPT_DEPTH,
             "one pause() per frame, then the bound"
+        );
+    }
+
+    /// `MAX_SCRIPT_DEPTH` bounds how deep the frames go, not how many
+    /// there are: a file that runs itself *twice* per frame expands
+    /// breadth-to-the-depth, so a handful of lines is millions of nodes
+    /// and a wedged ui. Only a bound on the total holds that, so this
+    /// pins the total the way the nested-`repeat` test does.
+    #[test]
+    fn script_breadth_is_bounded_by_the_total_it_expands_to() {
+        let slack = 128;
+        for lines in ["run(loop)\nrun(loop)\n", &"run(loop)\n".repeat(4)] {
+            let program = run_script("run(loop)", &[("loop", lines)]);
+            assert!(
+                program.nodes.len() <= MAX_EXPANSION + slack,
+                "{lines:?} lowered to {} nodes",
+                program.nodes.len()
+            );
+        }
+        // and the refusal is said out loud, not just stopped at.
+        let program = run_script("run(loop)", &[("loop", &"run(loop)\n".repeat(4))]);
+        assert!(
+            program
+                .nodes
+                .iter()
+                .any(|n| matches!(n, Node::Fail(text) if text.contains("expand"))),
+            "expanded past the budget without saying so"
+        );
+        // a script well inside the budget is untouched: four frames of
+        // one `pause()` each, plus the depth refusal, is not a refusal
+        // to expand.
+        let small = run_script("run(s)", &[("s", "pause()\nrun(s)\n")]);
+        assert!(
+            !small
+                .nodes
+                .iter()
+                .any(|n| matches!(n, Node::Fail(text) if text.contains("expand"))),
+            "a small script must not be refused"
         );
     }
 
