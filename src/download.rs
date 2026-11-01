@@ -143,6 +143,30 @@ fn ext_for_content_type(ct: Option<&str>) -> &'static str {
     }
 }
 
+/// Why a transfer failed, without the url it failed on. ureq's text for
+/// both error variants starts with the whole request url, and a stream
+/// url carries `u=`, `t=md5(password + salt)` and that salt; main.rs
+/// toasts this string, so the url is dropped and the status or the
+/// transport cause kept. Twin of `subsonic::request_failed`, which the
+/// json path already goes through.
+fn transfer_failed(e: ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, _) => format!("http {code}"),
+        ureq::Error::Transport(t) => {
+            let mut why = t.kind().to_string();
+            if let Some(message) = t.message() {
+                why.push_str(": ");
+                why.push_str(message);
+            }
+            if let Some(source) = std::error::Error::source(&t) {
+                why.push_str(": ");
+                why.push_str(&source.to_string());
+            }
+            why
+        }
+    }
+}
+
 /// One agent for a whole batch: stall timeouts, and a pool big enough
 /// that the workers reuse connections instead of each track paying a
 /// fresh tcp+tls handshake (`ureq::get` builds a throwaway agent per
@@ -169,7 +193,7 @@ fn download_one(
     dest_for: DestFor,
     tx: &mpsc::Sender<DownloadEvent>,
 ) -> Result<PathBuf, String> {
-    let resp = agent.get(url).call().map_err(|e| e.to_string())?;
+    let resp = agent.get(url).call().map_err(transfer_failed)?;
     let total = resp
         .header("Content-Length")
         .and_then(|v| v.parse::<u64>().ok());
@@ -537,6 +561,17 @@ mod tests {
             .collect()
     }
 
+    /// One track whose url is shaped like `Client::stream_url`'s: the
+    /// real one carries `u=`, `t=md5(password + salt)` and that salt,
+    /// so these stand in for them and nothing real is ever in play.
+    fn credentialed_track(base: &str) -> Vec<(String, String, String)> {
+        vec![(
+            "t0".to_string(),
+            "track 0".to_string(),
+            format!("{base}/rest/stream?id=t0&u=zzuser&t=zztoken&s=zzsalt&v=1.16.1&c=wim"),
+        )]
+    }
+
     /// `batch_agent` with a read timeout short enough to wait out. The
     /// only agent here that is not the app's own: every other test
     /// drives `batch_agent()` itself, so its pool and its timeouts are
@@ -756,6 +791,59 @@ mod tests {
             })
             .collect();
         assert_eq!(ids.len(), 30);
+    }
+
+    /// ureq's text for both of its error variants starts with the whole
+    /// request url, and a stream url carries `u=`, `t=md5(password +
+    /// salt)` and that salt; main.rs toasts this string as "download
+    /// failed: <track>: <error>", so a 500 from the server put a
+    /// crackable hash of the password and its own salt on screen. Twin
+    /// of `subsonic::request_failed`, which the json path already has.
+    #[test]
+    fn a_server_error_keeps_the_stream_url_out_of_the_failure() {
+        let server = ByteServer::start(Mode::Failing);
+        let dir = TempDir::new("redact-status");
+        let tracks = credentialed_track(&server.url);
+        let events = run(&tracks, &dir);
+        let (_, failed) = outcomes(&events);
+        assert_eq!(failed.len(), 1);
+        let error = failed[0].1;
+        // never interpolated into a failure message: this string is
+        // exactly the one that reaches a toast.
+        assert!(
+            !error.contains('?'),
+            "the request url is in the error, and it carries u=, t= and s="
+        );
+        assert!(!error.contains("zztoken"), "the auth token is in the error");
+        assert!(!error.contains("zzsalt"), "its salt is in the error");
+        assert!(!error.contains("zzuser"), "the username is in the error");
+        assert!(error.contains("500"), "the status still has to survive");
+    }
+
+    /// The other variant: a server that is not there fails in transport,
+    /// which puts the url in its text the same way.
+    #[test]
+    fn an_unreachable_server_keeps_the_stream_url_out_of_the_failure() {
+        // bound to claim a port, then dropped, so nothing answers on it
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", dead.local_addr().unwrap());
+        drop(dead);
+        let dir = TempDir::new("redact-transport");
+        let tracks = credentialed_track(&base);
+        let events = run(&tracks, &dir);
+        let (_, failed) = outcomes(&events);
+        assert_eq!(failed.len(), 1);
+        let error = failed[0].1;
+        assert!(
+            !error.contains('?'),
+            "the request url is in the error, and it carries u=, t= and s="
+        );
+        assert!(!error.contains("zztoken"), "the auth token is in the error");
+        assert!(!error.contains("zzsalt"), "its salt is in the error");
+        assert!(
+            error.to_lowercase().contains("connection"),
+            "the cause still has to survive"
+        );
     }
 
     /// Successes collapse the same way, so downloading a 30-track
