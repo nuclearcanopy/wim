@@ -3439,10 +3439,31 @@ pub fn enqueue_next(item: &SearchItem, core: &mut CoreCtx) -> Result<(), String>
     }
     let from = core.queue.entries().len().saturating_sub(1);
     let to = core.queue.pos().map_or(0, |p| p + 1);
-    if to < from && core.queue.move_entry(from, to) {
-        if let Err(e) = core.player.playlist_move(from, to) {
-            return Err(format!("error moving: {e}"));
-        }
+    move_in_step(core.queue, from, to, |f, t| core.player.playlist_move(f, t))
+}
+
+/// Moves one entry on both sides, or on neither.
+///
+/// `entries` *is* mpv's playlist by index, so a local move mpv refused
+/// leaves every later operation addressing the wrong track: the kind of
+/// drift `enqueue_track` puts back for a refused shuffle slot and this
+/// pairing did not.
+///
+/// Takes the mpv call as a closure because the only path that matters
+/// is the one mpv declines, and that is unreachable with a live socket.
+fn move_in_step(
+    queue: &mut PlayQueue,
+    from: usize,
+    to: usize,
+    ask_mpv: impl FnOnce(usize, usize) -> anyhow::Result<()>,
+) -> Result<(), String> {
+    // already where it belongs, or nothing moved.
+    if to >= from || !queue.move_entry(from, to) {
+        return Ok(());
+    }
+    if let Err(e) = ask_mpv(from, to) {
+        queue.move_entry(to, from);
+        return Err(format!("error moving: {e}"));
     }
     Ok(())
 }
@@ -6048,6 +6069,108 @@ mod index_map_tests {
         }
         assert_eq!(queue.entries().len(), 7);
         assert_eq!(queue.pos(), Some(0), "shuffling in never moves what plays");
+    }
+}
+
+/// What a move mpv refused leaves behind, which is the half of the
+/// index-map invariant `index_map_tests` cannot reach: with a live
+/// socket a valid `playlist-move` does not fail.
+#[cfg(test)]
+mod refused_move_tests {
+    use super::*;
+
+    fn silence(secs: u64) -> SearchItem {
+        SearchItem::Silence { secs }
+    }
+
+    fn lengths(queue: &PlayQueue) -> Vec<u64> {
+        queue
+            .entries()
+            .iter()
+            .map(|item| match item {
+                SearchItem::Silence { secs } => *secs,
+                other => panic!("the fixture is silences only: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// A local move mpv will not follow is not a failed move, it is a
+    /// *drifted* one: `entries` is mpv's playlist by index, so every
+    /// later remove, reorder or `playlist-pos` addresses the wrong
+    /// track from then on, and the only sign is a wrong title on the
+    /// bar. `enqueue_track` puts its refused shuffle move back for
+    /// exactly this reason; this pairing kept it and reported an
+    /// error.
+    #[test]
+    fn a_move_mpv_refuses_leaves_the_index_map_alone() {
+        let mut queue = PlayQueue::default();
+        queue.reset(vec![silence(1), silence(2), silence(3)]);
+        // what `enqueue_next` has in hand after its append: the new
+        // entry is last and wants to sit behind what is playing.
+        queue.append(silence(4), false);
+        let before = lengths(&queue);
+
+        let why = move_in_step(&mut queue, 3, 1, |_, _| Err(anyhow::anyhow!("mpv said no")))
+            .expect_err("a refused move is a refusal");
+        assert!(why.contains("mpv said no"), "it has to say why: {why}");
+        assert_eq!(
+            lengths(&queue),
+            before,
+            "the index map moved and mpv's playlist did not"
+        );
+        assert_eq!(queue.pos(), Some(0), "and what is playing is still index 0");
+
+        // the positive control, in the same run: a move mpv takes does
+        // move both sides.
+        move_in_step(&mut queue, 3, 1, |_, _| Ok(())).expect("mpv took it");
+        assert_eq!(lengths(&queue), vec![1, 4, 2, 3]);
+    }
+
+    /// Nothing to move must not ask mpv anything: `playlist-move` of
+    /// an entry onto its own index is an error reply, which would be
+    /// reported as a failed enqueue.
+    #[test]
+    fn an_entry_already_behind_what_plays_is_not_moved() {
+        let mut queue = PlayQueue::default();
+        queue.reset(vec![silence(1)]);
+        queue.append(silence(2), false);
+        let mut asked = false;
+        move_in_step(&mut queue, 1, 1, |_, _| {
+            asked = true;
+            Ok(())
+        })
+        .expect("nothing to do is not a failure");
+        assert!(!asked, "mpv was asked to move an entry onto itself");
+        assert_eq!(lengths(&queue), vec![1, 2]);
+    }
+
+    /// And the wiring, because a pure helper covers nothing about its
+    /// caller: the local move must happen only inside the pairing,
+    /// which is where the revert is. Reads the source, since
+    /// `enqueue_next` takes a `CoreCtx` and so a live mpv.
+    #[test]
+    fn the_front_enqueue_goes_through_the_paired_move() {
+        let src = include_str!("core.rs");
+        let at = src
+            .find("pub fn enqueue_next(")
+            .expect("enqueue_next moved or was renamed");
+        // anchored in real code: ahead of the first test module, not
+        // merely somewhere in the file (docs/testing.md).
+        assert!(
+            at < src.find("#[cfg(test)]\nmod ").unwrap_or(src.len()),
+            "the anchor is in test code, so this guards nothing"
+        );
+        let body = &src[at..];
+        let body = &body[..body.find("\n}\n").expect("an unterminated fn")];
+        assert!(
+            body.contains("move_in_step("),
+            "the front enqueue moves the two sides apart again:\n{body}"
+        );
+        assert!(
+            !body.contains("move_entry("),
+            "a local move inline here is one with no revert, which is \
+             the drift itself:\n{body}"
+        );
     }
 }
 
