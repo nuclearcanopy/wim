@@ -644,7 +644,34 @@ and `in-workspace (sub-rect) video` is still kitty-only via
       the video eating the frame or the chrome collapsing to unreadable
       slivers. this is a layout constraint, not a rendering one; the
       chrome should scale its own footprint, not vanish.
-- [ ] **frame budget.** a few hundred cells across times a few hundred
+- [ ] **frame budget.** measured, and the paint is not the problem.
+      `framesource::frame_budget` (ignored by default, it is a
+      measurement and a ceiling here would flake) at release opt:
+
+      | grid | pixels | sharpen on | off | ratio |
+      | --- | --- | --- | --- | --- |
+      | 160x50 | 320x100 | 896us (2.2%) | 390us (1.0%) | 2.30x |
+      | 320x100 | 640x200 | 3540us (8.8%) | 1524us (3.8%) | 2.32x |
+      | 480x140 | 960x280 | 7555us (18.9%) | 3357us (8.4%) | 2.25x |
+
+      percentages are of a 40ms frame at `FALLBACK_FPS`. so at the grid
+      ascii is watchable at, painting costs 9% of the budget and the
+      held unsharp flip is worth 2.3x (2ms/frame) at that size, which
+      is the number that decision was missing.
+      the same test in a debug build says 40.9ms at 320x100, i.e. 102%
+      of budget: an 11.5x build artefact, and quoting it would have
+      turned a non-problem into a blocker. the test prints which build
+      it ran in for that reason.
+      three of the four hazards this item named are already absent:
+      mpv downscales once in `--vf` so nothing decodes at full
+      resolution for wim, `raster` walks contiguously, and the frame
+      buffers are per-resize not per-frame. what is left is the fourth
+      (ratatui diffs the buffer, so unchanged cells are already not
+      repainted, but every cell is *sampled*) plus the real remaining
+      work: decouple the ascii frame rate from the display refresh and
+      make it tunable, degrading smoothness and never blocking input.
+      the original note follows.
+- [ ] a few hundred cells across times a few hundred
       down, at video frame rate, is the real cost. the work is CPU
       (decode, downscale, per-cell sampling, diffing the buffer), not
       gpu: the terminal emulator rasterizes glyphs on the gpu and that
