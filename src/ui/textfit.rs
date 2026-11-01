@@ -67,7 +67,23 @@ pub fn plain_ascii(s: &str) -> bool {
 /// still matches what `draw::at` advances by; cutting between them
 /// would not, which is why the fits use `plain_ascii` instead.
 pub fn one_cell_chars(s: &str) -> bool {
-    s.chars().all(|c| char_cells(c) == 1)
+    one_cell_count(s).is_some()
+}
+
+/// How many chars `s` has, when every one of them is exactly one cell;
+/// `None` as soon as one is not. The count is the width in that case,
+/// so returning it keeps the one-cell string to a single walk where
+/// measuring and then counting it walked twice. Every non-ascii glyph
+/// in a frame's chrome takes this path.
+fn one_cell_count(s: &str) -> Option<usize> {
+    let mut cells = 0;
+    for c in s.chars() {
+        if char_cells(c) != 1 {
+            return None;
+        }
+        cells += 1;
+    }
+    Some(cells)
 }
 
 /// Display width of `s` in terminal cells: the sum of its clusters,
@@ -77,8 +93,8 @@ pub fn width(s: &str) -> usize {
     if plain_ascii(s) {
         return s.len();
     }
-    if one_cell_chars(s) {
-        return s.chars().count();
+    if let Some(cells) = one_cell_count(s) {
+        return cells;
     }
     clusters(s).map(cluster_cells).sum()
 }
@@ -188,16 +204,46 @@ pub fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
     }
-    if width(s) <= max_width {
-        return s.to_string();
+    // measuring and then cutting ran the same two gates twice over the
+    // same str, and built the result at the cut's size before pushing
+    // the ellipsis past it. one gate, one walk, one allocation at its
+    // final size; the title and every hint in a frame come through
+    // here. a budget of 1 needs no case of its own: nothing fits in
+    // front of the ellipsis, so the cut is at zero.
+    if plain_ascii(s) {
+        if s.len() <= max_width {
+            return s.to_string();
+        }
+        return with_ellipsis(&s[..max_width - 1]);
     }
-    if max_width == 1 {
-        return "…".to_string();
+    if let Some(cells) = one_cell_count(s) {
+        if cells <= max_width {
+            return s.to_string();
+        }
+        // `None` means the cut lands inside a cluster, where a cell
+        // count is not a byte index; the grapheme walk below answers.
+        if let Some(at) = char_cut(s, max_width - 1) {
+            return with_ellipsis(&s[..at]);
+        }
+    }
+    if clusters(s).map(cluster_cells).sum::<usize>() <= max_width {
+        return s.to_string();
     }
     let mut out = truncate_to_width(s, max_width - 1);
     out.push('…');
     out
 }
+
+/// `head` plus the ellipsis, in one allocation sized for both.
+fn with_ellipsis(head: &str) -> String {
+    let mut out = String::with_capacity(head.len() + ELLIPSIS.len_utf8());
+    out.push_str(head);
+    out.push(ELLIPSIS);
+    out
+}
+
+/// The cut marker: one cell, three bytes.
+const ELLIPSIS: char = '…';
 
 #[cfg(test)]
 mod tests {
@@ -380,6 +426,21 @@ mod tests {
         kept.concat()
     }
 
+    fn slow_ellipsis(s: &str, max: usize) -> String {
+        if max == 0 {
+            return String::new();
+        }
+        if slow_width(s) <= max {
+            return s.to_string();
+        }
+        if max == 1 {
+            return "…".to_string();
+        }
+        let mut out = slow_truncate(s, max - 1);
+        out.push('…');
+        out
+    }
+
     /// `width` is called many times per frame by the layout decisions,
     /// so printable ascii skips the grapheme walk. That is only sound
     /// while the two agree exactly, including on the strings the fast
@@ -421,6 +482,15 @@ mod tests {
                     "truncate_to_width {s:?}/{max}"
                 );
                 assert_eq!(tail_fit(s, max), slow_tail(s, max), "tail_fit {s:?}/{max}");
+                // its own branch per gate, rather than a measure and
+                // then a cut that re-gate themselves: three paths to
+                // the same cut, and the walk is the reference for all
+                // three.
+                assert_eq!(
+                    truncate_with_ellipsis(s, max),
+                    slow_ellipsis(s, max),
+                    "truncate_with_ellipsis {s:?}/{max}"
+                );
             }
         }
     }
@@ -948,23 +1018,99 @@ mod bench {
         clusters(s).map(cluster_cells).sum()
     }
 
+    /// Which profile these came out of: `cargo test` defaults to the
+    /// dev one, where `opt-level = 0` measured a path in this crate
+    /// 11.5x slow, and that is an artefact rather than a result.
+    fn profile() -> &'static str {
+        if cfg!(debug_assertions) {
+            "debug, opt-level 0: an artefact, re-run with --release"
+        } else {
+            "release"
+        }
+    }
+
+    /// The shape `width` replaced: the one-cell gate measured the
+    /// whole str, and then a second walk counted it. A function for
+    /// the same reason `gated_twice` is one.
+    fn two_pass_width(s: &str) -> usize {
+        if plain_ascii(s) {
+            s.len()
+        } else if one_cell_chars(s) {
+            s.chars().count()
+        } else {
+            grapheme_width(s)
+        }
+    }
+
     #[test]
     #[ignore = "timing, run explicitly"]
     fn width_cost() {
         let corpus = corpus();
-        let [fast, graphemes, head] = best_each::<3>(8, 2000, |which| {
+        let [fast, two_pass, graphemes, head] = best_each::<4>(8, 2000, |which| {
             for s in &corpus {
                 std::hint::black_box(match which {
                     0 => width(s),
-                    1 => grapheme_width(s),
+                    1 => two_pass_width(s),
+                    2 => grapheme_width(s),
                     _ => UnicodeWidthStr::width(s.as_str()),
                 });
             }
         });
         println!(
-            "width over {} strings: fast {fast:>10.3?}  graphemes {graphemes:>10.3?}  \
-             head's UnicodeWidthStr {head:>10.3?}",
-            corpus.len()
+            "width over {} strings ({}): fused {fast:>10.3?}  two-pass {two_pass:>10.3?}  \
+             graphemes {graphemes:>10.3?}  head's UnicodeWidthStr {head:>10.3?}",
+            corpus.len(),
+            profile(),
+        );
+    }
+
+    /// The measure-then-cut shape `truncate_with_ellipsis` replaced,
+    /// written in this module's own public fns: `width` and
+    /// `truncate_to_width` each ran the same two gates over the same
+    /// str, and the result was built at the cut's size and then
+    /// regrown for the ellipsis.
+    ///
+    /// A function, not a branch inside the timing loop: inlined there
+    /// it gets specialized on a literal budget where the real one is
+    /// an ordinary call, which measures inlining rather than the
+    /// algorithm (that way round it reported the fused path 19%
+    /// *slower*).
+    fn gated_twice(s: &str, max: usize) -> String {
+        if max == 0 {
+            return String::new();
+        }
+        if width(s) <= max {
+            return s.to_string();
+        }
+        if max == 1 {
+            return "\u{2026}".to_string();
+        }
+        let mut out = truncate_to_width(s, max - 1);
+        out.push('\u{2026}');
+        out
+    }
+
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn ellipsis_cost() {
+        let corpus = corpus();
+        // 20 cells cuts the long titles and leaves the labels alone,
+        // which is the mix a frame actually fits. opaque to the
+        // optimizer, so neither side folds the budget into its gates.
+        let budget = std::hint::black_box(20usize);
+        let [fused, gated] = best_each::<2>(8, 2000, |which| {
+            for s in &corpus {
+                std::hint::black_box(match which {
+                    0 => truncate_with_ellipsis(s, budget),
+                    _ => gated_twice(s, budget),
+                });
+            }
+        });
+        println!(
+            "truncate_with_ellipsis over {} strings ({}): fused {fused:>10.3?}  \
+             gated twice {gated:>10.3?}",
+            corpus.len(),
+            profile(),
         );
     }
 
