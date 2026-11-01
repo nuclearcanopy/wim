@@ -7042,6 +7042,116 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------ generated corpus
+
+    /// A 64-bit LCG, seeded by a constant on purpose: a generated
+    /// corpus is only useful in-tree if a failure reproduces, and a
+    /// clock- or entropy-seeded one gives a different corpus per run,
+    /// so the run that found something is not the run anyone debugs.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 16
+        }
+
+        fn pick<'a, T>(&mut self, from: &'a [T]) -> &'a T {
+            &from[(self.next() % from.len() as u64) as usize]
+        }
+    }
+
+    /// Fragments chosen for the hazards rather than for realism: the
+    /// delimiters the byte scanners key on, multibyte and combining and
+    /// zwj text to slice across, a NUL, and the literals that `f64`
+    /// accepts but nothing downstream survives.
+    const FRAGMENTS: &[&str] = &[
+        "queue(", "play(", "volume(", "moveto(", "repeat(", "dry(", "run(", "silence(", "fade(",
+        "let", "kind=", "=", "(", ")", "[", "]", ",", ";", "#", "\"", " ", "\n", "\t", "a", "2",
+        "+", "-", "%", "s", "m", "h", ":", ".", "nan", "inf", "1e30", "off", "é", "\u{301}",
+        "👩\u{200d}👧", "日本", "\0", "ı", "İ",
+    ];
+    /// Enough to cover the delimiters in combination without making the
+    /// suite slow; the seed is fixed, so this is a corpus, not a dice
+    /// roll that happened to pass.
+    const FUZZ_ROUNDS: usize = 400;
+
+    /// The panic classes this file has actually hit are all about an
+    /// index: a byte offset used to slice a `&str` somewhere it is not
+    /// a char boundary. Every one of them is reachable by typing, so
+    /// the guard is a generated corpus pushed through the real
+    /// keystroke path rather than through the helpers one at a time.
+    #[test]
+    fn no_generated_line_can_panic_the_parser_or_the_editor() {
+        let fake = Fake::new(&["flatline", "floor"]);
+        let mut rng = Lcg(0x5eed_1337);
+        let mut parsed = 0usize;
+        for _ in 0..FUZZ_ROUNDS {
+            let pieces = 1 + (rng.next() % 12) as usize;
+            let mut line = String::new();
+            for _ in 0..pieces {
+                line.push_str(rng.pick(FRAGMENTS));
+            }
+            if Program::parse(&line).is_ok() {
+                parsed += 1;
+            }
+            // `site` runs on every keystroke, at whatever offset the
+            // cursor happens to be.
+            for cursor in (0..=line.len()).filter(|c| line.is_char_boundary(*c)) {
+                let _ = site(&line, cursor);
+            }
+            // and the editor has to survive the same text arriving one
+            // key at a time, then being taken back out again.
+            let mut console = Console::empty();
+            for ch in line.chars() {
+                press(&mut console, &fake, KeyCode::Char(ch));
+            }
+            assert!(
+                console.input.is_char_boundary(console.cursor),
+                "cursor {} is mid-character in {:?}",
+                console.cursor,
+                console.input
+            );
+            // taken back out from the end, which is the backward
+            // boundary walk; autopairing means the typed line is not the
+            // generated one, so this has to run on what is actually
+            // there.
+            press(&mut console, &fake, KeyCode::End);
+            while !console.input.is_empty() {
+                let was = console.input.len();
+                press(&mut console, &fake, KeyCode::Backspace);
+                assert!(
+                    console.input.len() < was,
+                    "backspace made no progress on {:?}",
+                    console.input
+                );
+            }
+            // and forwards from the start, which is the other walk and
+            // reaches `Delete` and `paste` with the text verbatim.
+            console.paste(&line, &fake);
+            press(&mut console, &fake, KeyCode::Home);
+            while !console.input.is_empty() {
+                let was = console.input.len();
+                press(&mut console, &fake, KeyCode::Delete);
+                assert!(
+                    console.input.len() < was,
+                    "delete made no progress on {:?}",
+                    console.input
+                );
+            }
+        }
+        // positive control: the generator has to be producing real
+        // programs, or "nothing panicked" would only mean "nothing
+        // reached the parser".
+        assert!(
+            parsed > FUZZ_ROUNDS / 100,
+            "only {parsed} of {FUZZ_ROUNDS} lines parsed; the corpus is all noise"
+        );
+    }
+
     // ------------------------------------------------------- the site
 
     /// Every parameter type is covered by exactly one of the two
