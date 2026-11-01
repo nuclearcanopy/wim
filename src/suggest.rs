@@ -2110,13 +2110,62 @@ fn dedup(merged: &mut Vec<Candidate>) {
 /// multiplicative penalty for every already-selected row sharing an
 /// artist, album, or genre. Ten rows from one artist is a failure even
 /// when every one of them scores well.
+/// One candidate's diversification attributes as slot numbers into
+/// the pool's own key sets, with `None` where it has no key of that
+/// kind. The selection is quadratic, so the keys are interned once
+/// here rather than hashed again for every candidate in every round.
+struct Attrs {
+    artist: Option<usize>,
+    album: Option<usize>,
+    genre: Option<usize>,
+    reason: usize,
+}
+
+/// Interns one attribute's keys in first-seen order. Three separate
+/// sets, one per kind: an artist key and an album key that happen to
+/// be the same string are different things and are capped separately.
+fn intern<'a>(seen: &mut HashMap<&'a str, usize>, key: &'a str) -> usize {
+    let next = seen.len();
+    *seen.entry(key).or_insert(next)
+}
+
+fn attributes_of(pool: &[Candidate]) -> (Vec<Attrs>, usize, usize, usize, usize) {
+    let mut artists: HashMap<&str, usize> = HashMap::new();
+    let mut albums: HashMap<&str, usize> = HashMap::new();
+    let mut genres: HashMap<&str, usize> = HashMap::new();
+    let mut reasons: Vec<Reason> = Vec::new();
+    let attrs = pool
+        .iter()
+        .map(|c| Attrs {
+            // an empty artist key is no key: it is never counted and
+            // never capped, the way an absent album key is not.
+            artist: (!c.artist_key.is_empty()).then(|| intern(&mut artists, &c.artist_key)),
+            album: c.album_key.as_deref().map(|k| intern(&mut albums, k)),
+            genre: c.genre_key.as_deref().map(|k| intern(&mut genres, k)),
+            reason: match reasons.iter().position(|r| *r == c.reason) {
+                Some(slot) => slot,
+                None => {
+                    reasons.push(c.reason);
+                    reasons.len() - 1
+                }
+            },
+        })
+        .collect();
+    (attrs, artists.len(), albums.len(), genres.len(), reasons.len())
+}
+
+/// Greedy MMR-ish selection: hard caps per artist and per album, plus a
+/// multiplicative penalty for every already-selected row sharing an
+/// artist, album, or genre. Ten rows from one artist is a failure even
+/// when every one of them scores well.
 fn diversify(pool: Vec<Candidate>, tuning: &Tuning) -> Vec<Candidate> {
+    let (attrs, artist_keys, album_keys, genre_keys, reason_keys) = attributes_of(&pool);
     let mut remaining: Vec<Option<Candidate>> = pool.into_iter().map(Some).collect();
     let mut picked: Vec<Candidate> = Vec::new();
-    let mut artists: HashMap<String, usize> = HashMap::new();
-    let mut albums: HashMap<String, usize> = HashMap::new();
-    let mut genres: HashMap<String, usize> = HashMap::new();
-    let mut sections: HashMap<Reason, usize> = HashMap::new();
+    let mut artists = vec![0usize; artist_keys];
+    let mut albums = vec![0usize; album_keys];
+    let mut genres = vec![0usize; genre_keys];
+    let mut sections = vec![0usize; reason_keys];
 
     while picked.len() < tuning.max_items {
         let mut best: Option<(usize, f32)> = None;
@@ -2124,25 +2173,19 @@ fn diversify(pool: Vec<Candidate>, tuning: &Tuning) -> Vec<Candidate> {
             let Some(candidate) = slot else {
                 continue;
             };
-            let artist_count = count(&artists, &candidate.artist_key);
-            if !candidate.artist_key.is_empty() && artist_count >= tuning.max_per_artist {
+            let attr = &attrs[index];
+            let artist_count = attr.artist.map_or(0, |k| artists[k]);
+            if attr.artist.is_some() && artist_count >= tuning.max_per_artist {
                 continue;
             }
-            let album_count = candidate
-                .album_key
-                .as_ref()
-                .map_or(0, |k| count(&albums, k));
-            if candidate.album_key.is_some() && album_count >= tuning.max_per_album {
+            let album_count = attr.album.map_or(0, |k| albums[k]);
+            if attr.album.is_some() && album_count >= tuning.max_per_album {
                 continue;
             }
-            if sections.get(&candidate.reason).copied().unwrap_or(0) >= tuning.section_max_items {
+            if sections[attr.reason] >= tuning.section_max_items {
                 continue;
             }
-            let genre_count = candidate
-                .genre_key
-                .as_ref()
-                .map_or(0, |k| count(&genres, k))
-                .min(4);
+            let genre_count = attr.genre.map_or(0, |k| genres[k]).min(4);
             let adjusted = candidate.score
                 * tuning.repeat_artist_penalty.powi(artist_count as i32)
                 * tuning.repeat_album_penalty.powi(album_count as i32)
@@ -2157,23 +2200,20 @@ fn diversify(pool: Vec<Candidate>, tuning: &Tuning) -> Vec<Candidate> {
             break;
         };
         let candidate = remaining[index].take().expect("just selected");
-        if !candidate.artist_key.is_empty() {
-            *artists.entry(candidate.artist_key.clone()).or_default() += 1;
+        let attr = &attrs[index];
+        if let Some(key) = attr.artist {
+            artists[key] += 1;
         }
-        if let Some(key) = &candidate.album_key {
-            *albums.entry(key.clone()).or_default() += 1;
+        if let Some(key) = attr.album {
+            albums[key] += 1;
         }
-        if let Some(key) = &candidate.genre_key {
-            *genres.entry(key.clone()).or_default() += 1;
+        if let Some(key) = attr.genre {
+            genres[key] += 1;
         }
-        *sections.entry(candidate.reason).or_default() += 1;
+        sections[attr.reason] += 1;
         picked.push(candidate);
     }
     picked
-}
-
-fn count(counts: &HashMap<String, usize>, key: &str) -> usize {
-    counts.get(key).copied().unwrap_or(0)
 }
 
 /// Buckets the selected rows by reason, keeping both the row order and
@@ -4177,10 +4217,11 @@ mod cost {
             .iter()
             .map(|c| {
                 format!(
-                    "{:?} {:?} {:08x} {:?} {:?} {:?} {}",
+                    "{:?} {:?} {:08x} {:08x} {:?} {:?} {:?} {}",
                     c.reason,
                     c.identity,
                     c.raw.to_bits(),
+                    c.score.to_bits(),
                     c.artist_key,
                     c.album_key,
                     c.genre_key,
@@ -4330,6 +4371,154 @@ mod cost {
         }
     }
 
+    /// `diversify` as it was before the keys were interned: three
+    /// maps keyed by the candidate's own strings, asked again for
+    /// every candidate in every round.
+    fn diversify_keyed(pool: Vec<Candidate>, tuning: &Tuning) -> Vec<Candidate> {
+        fn count(counts: &HashMap<String, usize>, key: &str) -> usize {
+            counts.get(key).copied().unwrap_or(0)
+        }
+        let mut remaining: Vec<Option<Candidate>> = pool.into_iter().map(Some).collect();
+        let mut picked: Vec<Candidate> = Vec::new();
+        let mut artists: HashMap<String, usize> = HashMap::new();
+        let mut albums: HashMap<String, usize> = HashMap::new();
+        let mut genres: HashMap<String, usize> = HashMap::new();
+        let mut sections: HashMap<Reason, usize> = HashMap::new();
+
+        while picked.len() < tuning.max_items {
+            let mut best: Option<(usize, f32)> = None;
+            for (index, slot) in remaining.iter().enumerate() {
+                let Some(candidate) = slot else {
+                    continue;
+                };
+                let artist_count = count(&artists, &candidate.artist_key);
+                if !candidate.artist_key.is_empty() && artist_count >= tuning.max_per_artist {
+                    continue;
+                }
+                let album_count = candidate
+                    .album_key
+                    .as_ref()
+                    .map_or(0, |k| count(&albums, k));
+                if candidate.album_key.is_some() && album_count >= tuning.max_per_album {
+                    continue;
+                }
+                if sections.get(&candidate.reason).copied().unwrap_or(0)
+                    >= tuning.section_max_items
+                {
+                    continue;
+                }
+                let genre_count = candidate
+                    .genre_key
+                    .as_ref()
+                    .map_or(0, |k| count(&genres, k))
+                    .min(4);
+                let adjusted = candidate.score
+                    * tuning.repeat_artist_penalty.powi(artist_count as i32)
+                    * tuning.repeat_album_penalty.powi(album_count as i32)
+                    * tuning.repeat_genre_penalty.powi(genre_count as i32);
+                if best.is_none_or(|(_, b)| adjusted > b) {
+                    best = Some((index, adjusted));
+                }
+            }
+            let Some((index, _)) = best else {
+                break;
+            };
+            let candidate = remaining[index].take().expect("just selected");
+            if !candidate.artist_key.is_empty() {
+                *artists.entry(candidate.artist_key.clone()).or_default() += 1;
+            }
+            if let Some(key) = &candidate.album_key {
+                *albums.entry(key.clone()).or_default() += 1;
+            }
+            if let Some(key) = &candidate.genre_key {
+                *genres.entry(key.clone()).or_default() += 1;
+            }
+            *sections.entry(candidate.reason).or_default() += 1;
+            picked.push(candidate);
+        }
+        picked
+    }
+
+    /// Every pool the generators produce, normalised, truncated,
+    /// merged and deduped: what `suggest_with` hands to `diversify`.
+    fn merged_pool(model: &Model<'_>, req: &Request<'_>) -> Vec<Candidate> {
+        let mut merged: Vec<Candidate> = Vec::new();
+        for mut pool in [
+            daily_rotation(model),
+            album_gap(model),
+            track_gap(model),
+            album_neighbours(model),
+            genre_under_explored(model),
+            rediscovery(model),
+            starred_unplayed(model),
+            similar_artists(model, req.enrichment),
+            popular_unplayed(model, req.enrichment),
+        ] {
+            normalise(&mut pool, req.tuning);
+            pool.truncate(req.tuning.per_generator_candidates);
+            merged.extend(pool);
+        }
+        dedup(&mut merged);
+        merged
+    }
+
+    /// The caps and the repeat penalties both count by key, so a pool
+    /// whose keys were interned has to select the same rows in the
+    /// same order as one that looked them up by string. Over a real
+    /// merged pool, where the artist cap and the album cap both bite.
+    #[test]
+    fn interned_keys_select_what_the_keyed_maps_selected() {
+        let fixture = Fixture::new(300, 12);
+        let req = fixture.request();
+        let model = Model::build(&req);
+        let mut merged = merged_pool(&model, &req);
+        assert!(
+            merged.len() > req.tuning.max_items * 4,
+            "{} candidates is not a crowded pool",
+            merged.len()
+        );
+        // an untagged row (a starred local file with no artist tag)
+        // carries an empty artist key, which is no key at all: never
+        // counted, never capped. The generated corpus has no such
+        // row, so four of them are added at the pool's top score,
+        // where more of them than `max_per_artist` get picked and an
+        // implementation that treated "" as a key would stop at three.
+        let top = merged[0].score;
+        for i in 0..4 {
+            let mut untagged = Candidate::new(
+                Reason::StarredUnplayed,
+                &SearchItem::LocalMusic {
+                    path: format!("/music/untagged-{i}.flac").into(),
+                    title: format!("untagged {i}"),
+                    artist: None,
+                    album: None,
+                },
+                top,
+                "starred and never played, not once".to_string(),
+            );
+            untagged.score = top;
+            merged.push(untagged);
+        }
+        let interned = diversify(merged.clone(), req.tuning);
+        assert!(
+            interned.len() > req.tuning.max_items / 2,
+            "only {} rows selected, so the caps are not being exercised",
+            interned.len()
+        );
+        assert_eq!(
+            interned
+                .iter()
+                .filter(|c| c.artist_key.is_empty())
+                .count(),
+            4,
+            "every untagged row has to be selectable; the empty key is not a key"
+        );
+        assert_eq!(
+            shape(&interned),
+            shape(&diversify_keyed(merged, req.tuning))
+        );
+    }
+
     /// The neighbour pool is picked by score with ties going to the
     /// later position, which a map and a vec only agree on if both are
     /// walked the same way; this is over a few thousand tracks, where
@@ -4436,5 +4625,42 @@ mod cost {
             },
         );
         println!("  slots {slots:.1}us  maps {maps:.1}us  {:.2}x", maps / slots);
+    }
+
+    /// Interned keys against the keyed maps they replaced,
+    /// alternating in one process. `diversify` consumes its pool, so
+    /// both sides clone one; the clone is timed on its own and
+    /// subtracted, since at this size it is not small.
+    #[test]
+    #[ignore = "a measurement; run it explicitly"]
+    fn what_diversification_costs() {
+        let fixture = Fixture::new(2_200, 14);
+        let req = fixture.request();
+        let model = Model::build(&req);
+        let merged = merged_pool(&model, &req);
+        println!(
+            "--- diversify over {} candidates, {}",
+            merged.len(),
+            fixture.describe()
+        );
+        let clone = best(5, 20, &mut || {
+            let _ = merged.clone();
+        });
+        let (interned, keyed) = best_each(
+            5,
+            20,
+            &mut || {
+                let _ = diversify(merged.clone(), req.tuning);
+            },
+            &mut || {
+                let _ = diversify_keyed(merged.clone(), req.tuning);
+            },
+        );
+        println!(
+            "  interned {:.1}us  keyed {:.1}us  {:.2}x  (clone {clone:.1}us, subtracted)",
+            interned - clone,
+            keyed - clone,
+            (keyed - clone) / (interned - clone)
+        );
     }
 }
