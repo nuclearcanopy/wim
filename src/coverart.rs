@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use image::DynamicImage;
 use md5::{Digest, Md5};
@@ -292,21 +292,39 @@ fn fetch(
     art_id: &str,
     key: &Key,
     store: Option<&Path>,
-) -> Option<DynamicImage> {
+) -> Outcome {
     if let Some(dir) = store {
         if let Some(bytes) = store::read(dir, key) {
             match decode_cover(&bytes) {
-                Some(img) => return Some(img),
+                Some(img) => return Outcome::Cover(img),
                 None => store::remove(dir, key),
             }
         }
     }
-    let bytes = client.get_cover_art_bytes(art_id).ok()?;
-    let img = decode_cover(&bytes)?;
+    // the split that matters: a request that did not complete is
+    // `Failed` and will be asked again, where bytes that arrived and
+    // did not decode are the server saying it has no cover. a subsonic
+    // error envelope comes back at http 200, so it lands in the second
+    // case, which is the right answer for an album without art.
+    let Ok(bytes) = client.get_cover_art_bytes(art_id) else {
+        return Outcome::Failed;
+    };
+    let Some(img) = decode_cover(&bytes) else {
+        return Outcome::Nothing;
+    };
     if let Some(dir) = store {
         store::write(dir, key, &bytes);
     }
-    Some(img)
+    Outcome::Cover(img)
+}
+
+/// Stamps a failure with when it arrived; the other two need no clock.
+fn answer_of(outcome: Outcome, now: Instant) -> Answer {
+    match outcome {
+        Outcome::Cover(img) => Answer::Cover(img),
+        Outcome::Nothing => Answer::Nothing,
+        Outcome::Failed => Answer::Failed(now),
+    }
 }
 
 /// One cover, store first and store after, for a caller outside
@@ -321,12 +339,79 @@ pub fn fetch_stored(
     key: &Key,
     art_id: &str,
 ) -> Option<DynamicImage> {
-    fetch(client, art_id, key, store::dir().as_deref())
+    // the caller holds the image itself and has no cache to retry
+    // from, so the two no-answer cases collapse here. that is the
+    // honest shape for a synchronous one-shot: it returns what it got.
+    match fetch(client, art_id, key, store::dir().as_deref()) {
+        Outcome::Cover(img) => Some(img),
+        Outcome::Nothing | Outcome::Failed => None,
+    }
 }
 
 struct Fetched {
     key: Key,
-    image: Option<DynamicImage>,
+    outcome: Outcome,
+}
+
+/// What one fetch attempt established.
+///
+/// The distinction is the whole point: both halves used to arrive as
+/// `None`, so a request that *failed* was cached as "this album has no
+/// cover" and never asked again. A flaky network at the moment you
+/// first looked at an album blanked its art for the rest of the
+/// session, with nothing to retry it and nothing said.
+#[derive(Debug)]
+enum Outcome {
+    /// Decoded, and ready to draw.
+    Cover(DynamicImage),
+    /// The server answered and has no cover for this. Negative for the
+    /// session, which is correct: asking again gets the same no.
+    /// A subsonic error envelope arrives at http 200 and does not
+    /// decode, which is this case and not a failure.
+    Nothing,
+    /// The request itself did not complete (transport error, an http
+    /// status, a timeout). Asked again, after `RETRY_AFTER`.
+    Failed,
+}
+
+/// How long a failed cover fetch is left alone before another attempt.
+///
+/// `request` is called every frame for whatever is on screen, so a
+/// failure that retried immediately would be a thread per frame; that
+/// is what the negative cache was protecting against when it swallowed
+/// this case. Long enough to be no load, short enough that a server
+/// coming back fills the art in while you are still looking at it.
+const RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Whether a failure recorded at `failed_at` is due another attempt.
+fn retry_due(failed_at: Instant, now: Instant) -> bool {
+    now.duration_since(failed_at) >= RETRY_AFTER
+}
+
+/// A map entry: an answer, or a failure stamped with when it happened.
+#[derive(Debug)]
+enum Answer {
+    Cover(DynamicImage),
+    Nothing,
+    Failed(Instant),
+}
+
+impl Answer {
+    fn cover(&self) -> Option<&DynamicImage> {
+        match self {
+            Answer::Cover(img) => Some(img),
+            Answer::Nothing | Answer::Failed(_) => None,
+        }
+    }
+
+    /// Whether `request` should ask again. A held cover and a known
+    /// no are both settled; only a failure expires.
+    fn wants_fetch(&self, now: Instant) -> bool {
+        match self {
+            Answer::Cover(_) | Answer::Nothing => false,
+            Answer::Failed(at) => retry_due(*at, now),
+        }
+    }
 }
 
 /// Background cover fetches plus their results, including the failures.
@@ -334,7 +419,7 @@ pub struct Cache {
     /// `None` means "asked, and the answer was no". Kept so a cover
     /// the server does not have is not re-requested on every frame
     /// for as long as the track plays.
-    entries: HashMap<Key, Option<DynamicImage>>,
+    entries: HashMap<Key, Answer>,
     /// Insertion order, for evicting at `MAX_ENTRIES`.
     order: Vec<Key>,
     in_flight: Vec<Key>,
@@ -404,9 +489,11 @@ impl Cache {
     /// frame that gained art from one that did not.
     pub fn poll(&mut self) -> bool {
         let mut got = false;
-        while let Ok(Fetched { key, image }) = self.rx.try_recv() {
+        while let Ok(Fetched { key, outcome }) = self.rx.try_recv() {
             self.in_flight.retain(|k| *k != key);
-            self.insert(key, image);
+            // the arrival stamps the failure, so the fetch thread
+            // needs no clock of its own.
+            self.insert(key, answer_of(outcome, Instant::now()));
             got = true;
         }
         got
@@ -419,7 +506,11 @@ impl Cache {
         let Some((key, art_id)) = fetch_plan(item) else {
             return;
         };
-        if self.entries.contains_key(&key) || self.in_flight.contains(&key) {
+        let settled = self
+            .entries
+            .get(&key)
+            .is_some_and(|a| !a.wants_fetch(Instant::now()));
+        if settled || self.in_flight.contains(&key) {
             return;
         }
         let SearchItem::Song { client, .. } = item else {
@@ -430,9 +521,9 @@ impl Cache {
         let tx = self.tx.clone();
         let store = self.store.clone();
         thread::spawn(move || {
-            let image = fetch(&client, &art_id, &key, store.as_deref());
+            let outcome = fetch(&client, &art_id, &key, store.as_deref());
             // a dead receiver just means the app is shutting down.
-            let _ = tx.send(Fetched { key, image });
+            let _ = tx.send(Fetched { key, outcome });
         });
     }
 
@@ -441,14 +532,14 @@ impl Cache {
     /// which the caller treats identically: draw no art.
     pub fn get(&self, item: &SearchItem) -> Option<&DynamicImage> {
         let (key, _) = fetch_plan(item)?;
-        self.entries.get(&key)?.as_ref()
+        self.entries.get(&key)?.cover()
     }
 
-    fn insert(&mut self, key: Key, image: Option<DynamicImage>) {
+    fn insert(&mut self, key: Key, answer: Answer) {
         if !self.entries.contains_key(&key) {
             self.order.push(key.clone());
         }
-        self.entries.insert(key, image);
+        self.entries.insert(key, answer);
         while self.order.len() > MAX_ENTRIES {
             let oldest = self.order.remove(0);
             self.entries.remove(&oldest);
@@ -457,8 +548,17 @@ impl Cache {
 
     #[cfg(test)]
     fn deliver(&mut self, key: Key, image: Option<DynamicImage>) {
+        let outcome = match image {
+            Some(img) => Outcome::Cover(img),
+            None => Outcome::Nothing,
+        };
+        self.deliver_outcome(key, outcome);
+    }
+
+    #[cfg(test)]
+    fn deliver_outcome(&mut self, key: Key, outcome: Outcome) {
         self.in_flight.retain(|k| *k != key);
-        self.insert(key, image);
+        self.insert(key, answer_of(outcome, Instant::now()));
     }
 }
 
@@ -580,12 +680,138 @@ mod tests {
         );
     }
 
+    /// A client pointed at a local listener, so `fetch`'s own
+    /// classification can be exercised with no network.
+    fn client_at(addr: std::net::SocketAddr) -> std::sync::Arc<crate::subsonic::Client> {
+        std::sync::Arc::new(
+            crate::subsonic::Client::new(&crate::config::NavidromeConfig {
+                url: format!("http://{addr}"),
+                username: "test".into(),
+                password: Some("pw".into()),
+                password_file: None,
+                max_bitrate_kbps: None,
+                transcode_format: None,
+            })
+            .unwrap(),
+        )
+    }
+
+    /// `fetch` is where the split actually happens, and no `Cache`
+    /// test reaches it: a mutation turning its failure arm into
+    /// `Nothing` left the whole suite green, which is the
+    /// pinned-the-function-not-the-wiring shape `docs/testing.md`
+    /// records. These two drive it against a real socket.
+    #[test]
+    fn fetch_calls_a_dead_server_a_failure_and_undecodable_bytes_a_no() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // a listener that answers 200 with a subsonic error envelope,
+        // which is what a server without that cover really sends: http
+        // 200, not an http error.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut scratch = [0u8; 1024];
+                let _ = sock.read(&mut scratch);
+                let body = br#"{"subsonic-response":{"status":"failed"}}"#;
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = sock.write_all(body);
+            }
+        });
+        let client = client_at(addr);
+        let (key, art) = fetch_plan(&song_on(&client, "1", "Bladee", "Crest")).unwrap();
+        assert!(
+            matches!(fetch(&client, &art, &key, None), Outcome::Nothing),
+            "bytes that arrived and did not decode are the server saying no"
+        );
+        server.join().unwrap();
+
+        // and a port with nothing on it: the request never completes,
+        // which must be retryable rather than cached as a no.
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let client = client_at(dead_addr);
+        assert!(
+            matches!(fetch(&client, &art, &key, None), Outcome::Failed),
+            "a request that did not complete is not a missing cover"
+        );
+    }
+
+    /// A failed request is not a missing cover.
+    ///
+    /// Both used to arrive as `None`, so a flaky network at the moment
+    /// you first looked at an album blanked its art for the rest of
+    /// the session: nothing retried, and nothing said why.
+    #[test]
+    fn a_failed_fetch_is_retried_where_a_missing_cover_is_not() {
+        let mut cache = Cache::default();
+        let item = song("1", "Bladee", "Crest");
+        let (key, _) = fetch_plan(&item).unwrap();
+
+        // a fresh failure is left alone: `request` runs every frame,
+        // so retrying at once would be a thread per frame, which is
+        // what the negative cache was protecting against when it
+        // swallowed this case.
+        cache.deliver_outcome(key.clone(), Outcome::Failed);
+        assert!(cache.get(&item).is_none(), "nothing to draw either way");
+        cache.request(&item);
+        assert!(
+            cache.in_flight.is_empty(),
+            "a failure retried on the next frame is a thread per frame"
+        );
+
+        // and once it has aged out, it is asked again, where a known
+        // missing cover never would be.
+        cache
+            .entries
+            .insert(key.clone(), Answer::Failed(Instant::now() - RETRY_AFTER));
+        cache.request(&item);
+        assert_eq!(
+            cache.in_flight.len(),
+            1,
+            "a failed fetch was remembered as a permanent no"
+        );
+
+        // the contrast, on the same key: a real no stays a no.
+        cache.in_flight.clear();
+        cache.deliver_outcome(key, Outcome::Nothing);
+        cache.request(&item);
+        assert!(
+            cache.in_flight.is_empty(),
+            "a cover the server does not have was re-requested"
+        );
+    }
+
+    /// And the retry is not every frame, which is what the negative
+    /// cache exists to prevent: `request` is called per frame, so an
+    /// unreachable server would be a thread per frame.
+    #[test]
+    fn a_failure_is_not_retried_on_the_very_next_frame() {
+        assert!(
+            !retry_due(Instant::now(), Instant::now()),
+            "a failure retried immediately is a thread per frame"
+        );
+        assert!(
+            retry_due(Instant::now() - RETRY_AFTER, Instant::now()),
+            "and it has to be retried eventually, or it is still permanent"
+        );
+    }
+
     #[test]
     fn a_server_with_no_cover_is_remembered_as_a_no() {
         let mut cache = Cache::default();
         let item = song("1", "Bladee", "Crest");
         let (key, _) = fetch_plan(&item).unwrap();
-        cache.deliver(key.clone(), None);
+        cache.deliver_outcome(key.clone(), Outcome::Nothing);
         assert!(cache.get(&item).is_none());
         // the point of caching the negative: request must now be a
         // no-op rather than spawning a thread every frame.
@@ -628,7 +854,7 @@ mod tests {
             .tx
             .send(Fetched {
                 key,
-                image: Some(img()),
+                outcome: Outcome::Cover(img()),
             })
             .unwrap();
         assert!(cache.poll());
