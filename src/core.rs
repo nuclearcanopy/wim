@@ -1104,32 +1104,74 @@ pub fn scrobble_metadata(item: &SearchItem) -> Option<listenbrainz::TrackMetadat
         | SearchItem::Playlist { .. } => None,
     }
 }
+/// A listen ListenBrainz refused, so the host can say so once.
+///
+/// Modelled on `StarFailed`: the submit runs on a spawned thread, so
+/// reporting needs a channel the caller owns. Both results used to be
+/// `let _ =`, which made **a revoked token indistinguishable from
+/// working**, forever: nothing scrobbles and nothing is said.
+#[derive(Debug, Clone)]
+pub struct ScrobbleFailed {
+    /// `playing now` or `listen`, so the message says which.
+    pub kind: &'static str,
+    pub error: String,
+}
+
 /// Fires a "playing_now" listen on a background thread; fire-and-
 /// forget, a slow/failed ListenBrainz request must never block
 /// playback or the ui. A no-op if listenbrainz isn't configured (no
 /// token) or `item` has no scrobbleable metadata.
-pub fn fire_playing_now(cfg: &config::Config, item: &SearchItem) {
+///
+/// `failed_tx` is how a refusal gets out; see `ScrobbleFailed`.
+pub fn fire_playing_now(
+    cfg: &config::Config,
+    item: &SearchItem,
+    failed_tx: Option<&mpsc::Sender<ScrobbleFailed>>,
+) {
     let Some(meta) = scrobble_metadata(item) else {
         return;
     };
     let Some(client) = listenbrainz::Client::from_config(cfg) else {
         return;
     };
+    let tx = failed_tx.cloned();
     thread::spawn(move || {
-        let _ = client.submit_playing_now(&meta);
+        if let Err(e) = client.submit_playing_now(&meta) {
+            // a dead receiver only means the app is shutting down.
+            if let Some(tx) = &tx {
+                let _ = tx.send(ScrobbleFailed {
+                    kind: "playing now",
+                    error: e.to_string(),
+                });
+            }
+        }
     });
 }
 /// Fires a "single" (scrobble) listen on a background thread; same
-/// fire-and-forget contract as `fire_playing_now`.
-pub fn fire_scrobble(cfg: &config::Config, item: &SearchItem, listened_at: i64) {
+/// fire-and-forget contract as `fire_playing_now`, including how a
+/// refusal gets out.
+pub fn fire_scrobble(
+    cfg: &config::Config,
+    item: &SearchItem,
+    listened_at: i64,
+    failed_tx: Option<&mpsc::Sender<ScrobbleFailed>>,
+) {
     let Some(meta) = scrobble_metadata(item) else {
         return;
     };
     let Some(client) = listenbrainz::Client::from_config(cfg) else {
         return;
     };
+    let tx = failed_tx.cloned();
     thread::spawn(move || {
-        let _ = client.submit_single(&meta, listened_at);
+        if let Err(e) = client.submit_single(&meta, listened_at) {
+            if let Some(tx) = &tx {
+                let _ = tx.send(ScrobbleFailed {
+                    kind: "listen",
+                    error: e.to_string(),
+                });
+            }
+        }
     });
 }
 /// Per-track scrobble bookkeeping, bundled into one struct (rather than
@@ -1147,6 +1189,15 @@ pub struct ScrobbleState {
     /// happens to fire; used as the `single` submission's
     /// `listened_at`.
     pub started_unix: Option<i64>,
+    /// Where a refused submission goes, if the host wired one.
+    ///
+    /// It lives here rather than as a fourth argument because
+    /// `ScrobbleState` is already threaded to every site that fires a
+    /// listen, so this is one construction point instead of three
+    /// signatures and a `CoreCtx` field. `None` means nobody is
+    /// listening, which is what the tests want (they assert against a
+    /// local collector, not a channel).
+    pub failed_tx: Option<mpsc::Sender<ScrobbleFailed>>,
 }
 /// Called from every site that sets `now_playing` to a new `Some(..)`:
 /// resets the per-track scrobble bookkeeping and fires "playing_now".
@@ -1159,7 +1210,7 @@ pub fn start_tracking_playback(
 ) {
     scrobble.scrobbled = false;
     scrobble.started_unix = Some(listenbrainz::now_unix());
-    fire_playing_now(cfg, item);
+    fire_playing_now(cfg, item, scrobble.failed_tx.as_ref());
 }
 /// Replaces mpv's whole playlist and plays `item` immediately. Returns
 /// the status line and whether it actually started playing, so the
