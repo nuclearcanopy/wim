@@ -3525,16 +3525,32 @@ fn seconds(text: &str, secs: f64) -> Result<Pos, String> {
     Ok(Pos::Seconds(secs))
 }
 
+/// `50%`, a bare `50` meaning the same, or a signed `+10%` nudge.
+///
+/// Deliberately not routed through `parse_time`: that grammar also
+/// accepts `30s`, `1m` and `1:30`, so a level built on it read
+/// `volume(1m)` as 60% and answered `volume(2h)` with "7200% is
+/// outside 0-100". A duration is not a quieter spelling of a percent.
 fn parse_level(text: &str) -> Result<Level, String> {
-    let (sign, pos) = parse_time(text)?;
-    let value = match pos {
-        Pos::Percent(p) => p,
-        // a bare number is a percent here, since that is the only
-        // thing a volume could mean, so it is held to the same range
-        // the `%` spelling is rather than to `parse_time`'s.
-        Pos::Seconds(s) if (0.0..=100.0).contains(&s) => s,
-        Pos::Seconds(s) => return Err(format!("{s}% is outside 0-100")),
+    let (sign, rest) = match text.strip_prefix('+') {
+        Some(r) => (Some('+'), r),
+        None => match text.strip_prefix('-') {
+            Some(r) => (Some('-'), r),
+            None => (None, text),
+        },
     };
+    let number = rest.strip_suffix('%').unwrap_or(rest);
+    let value: f64 = number
+        .parse()
+        .map_err(|_| format!("'{text}' is not a percent"))?;
+    // `f64::parse` takes "nan" and "inf", and a level reaches mpv's
+    // volume property, so neither may get past here.
+    if !value.is_finite() {
+        return Err(format!("'{text}' is not a percent"));
+    }
+    if !(0.0..=100.0).contains(&value) {
+        return Err(format!("'{text}' is outside 0-100"));
+    }
     Ok(match sign {
         Some('-') => Level::Delta(-value),
         Some(_) => Level::Delta(value),
@@ -6527,6 +6543,43 @@ mod tests {
         );
     }
 
+    /// A level is a percent, and `Ty::Level` used to reach it through
+    /// `parse_time`, which accepts the unit and colon forms too: so
+    /// `volume(1m)` set the volume to 60 and said "volume: 60%", and
+    /// `volume(2h)` reported "7200% is outside 0-100". A duration is
+    /// not a quieter spelling of a percent.
+    #[test]
+    fn a_level_is_a_percent_and_never_a_duration() {
+        for input in [
+            "volume(30s)",
+            "volume(1m)",
+            "volume(1:30)",
+            "volume(0:50)",
+            "volume(+1m)",
+            "volume(2h)",
+        ] {
+            let e = error(input);
+            assert!(
+                e.message.contains("not a percent"),
+                "{input} said '{}'",
+                e.message
+            );
+        }
+        // the spellings that are percents still are, sign and all.
+        assert_eq!(
+            ops("volume(50)"),
+            vec![Op::SetVolume(Level::Absolute(50.0))]
+        );
+        assert_eq!(
+            ops("volume(12.5%)"),
+            vec![Op::SetVolume(Level::Absolute(12.5))]
+        );
+        assert_eq!(
+            ops("volume(-10%)"),
+            vec![Op::SetVolume(Level::Delta(-10.0))]
+        );
+    }
+
     #[test]
     fn sleep_takes_a_duration_or_cancels() {
         assert_eq!(ops("sleep(30m)"), vec![Op::Sleep(Some(1800.0))]);
@@ -6679,8 +6732,11 @@ mod tests {
             ("moveto(inf:0)", "not a time"),
             ("moveto(99999h)", "longer than"),
             ("seek(+inf)", "not a time"),
-            ("volume(nan)", "not a time"),
-            ("volume(1e30)", "longer than"),
+            // a level has its own parser, so these are refused as
+            // percents rather than as times; routing them through the
+            // time grammar is what let `volume(1m)` mean 60%.
+            ("volume(nan)", "not a percent"),
+            ("volume(1e30)", "outside 0-100"),
             // a bare number is a percent for volume, so it is held to
             // the same 0-100 the `%` spelling always was.
             ("volume(101)", "outside 0-100"),
