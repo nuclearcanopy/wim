@@ -1388,10 +1388,12 @@ fn main() -> anyhow::Result<()> {
             .size()
             .map(|s| (s.width, s.height))
             .unwrap_or(video_geometry);
-        if want_vo != video_vo {
-            // the handover. nothing is seeked or reloaded: `vo` is
-            // settable live and mpv keeps playing straight through it.
-            if let Some(vo) = want_vo {
+        // which move, if any, is `video::handover`; this is only the
+        // ipc for it. nothing is seeked or reloaded either way: `vo` is
+        // settable live and mpv plays straight through the switch.
+        match video::handover(want_vo, video_vo, size, video_geometry) {
+            video::Move::Nothing => {}
+            video::Move::Arm { vo, size } => {
                 let armed = player
                     .set_video_geometry(size.0, size.1)
                     .and_then(|()| player.set_video_output(vo.mpv_name()));
@@ -1407,16 +1409,13 @@ fn main() -> anyhow::Result<()> {
                         notifications.push(Severity::Alert, "video: mpv refused the video output");
                     }
                 }
-            } else {
+            }
+            video::Move::Disarm => {
                 let _ = player.set_video_output(video::Vo::Null.mpv_name());
                 video_vo = None;
                 let _ = guard.reclaim();
             }
-        } else if video_vo.is_some() && size != video_geometry {
-            // mpv reads the vo's size once, at init, so a resize has to
-            // bounce it; wim is not drawing, so the screen it flickers
-            // through belongs to nobody in between.
-            if let Some(vo) = want_vo {
+            video::Move::Rebounce { vo, size } => {
                 let _ = player.set_video_output(video::Vo::Null.mpv_name());
                 let _ = player.set_video_geometry(size.0, size.1);
                 let _ = player.set_video_output(vo.mpv_name());

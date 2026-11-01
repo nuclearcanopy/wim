@@ -132,6 +132,51 @@ pub fn showing(screen: Screen, want: VideoOutput, probed: Option<ProtocolType>) 
     }
 }
 
+/// What the loop should do about mpv's video output this frame.
+///
+/// The handover was four nested conditions doing ipc inline, so the one
+/// rule that is easy to get wrong could not be tested at all: a *vo
+/// change* has to re-arm (bouncing would keep the old one) while a
+/// *size change* on the same vo has to bounce (re-arming would be the
+/// same work plus a reclaim). Same split as `framesource::plan`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Move {
+    /// Nothing to do, which is every frame once the screen has settled.
+    Nothing,
+    /// Hand mpv the screen, at this size. Also the answer when the vo
+    /// itself changes, since the new one has to be armed from scratch.
+    Arm { vo: Vo, size: (u16, u16) },
+    /// Take the screen back and put mpv on `vo=null`.
+    Disarm,
+    /// Same vo, new size. mpv reads the vo's size once, at init, so
+    /// this is a null-geometry-vo bounce rather than a resize; wim is
+    /// not drawing, so the screen it flickers through belongs to
+    /// nobody in between.
+    Rebounce { vo: Vo, size: (u16, u16) },
+}
+
+/// `want` is `showing(..).mpv_vo()`, `have` is the vo mpv is drawing
+/// with right now, and `armed` is the size it was given when it was
+/// armed.
+pub fn handover(
+    want: Option<Vo>,
+    have: Option<Vo>,
+    size: (u16, u16),
+    armed: (u16, u16),
+) -> Move {
+    match want {
+        // the vo changed (or there was none), so arming is the only
+        // move: a bounce would re-init the one being replaced.
+        Some(vo) if have != Some(vo) => Move::Arm { vo, size },
+        Some(vo) if size != armed => Move::Rebounce { vo, size },
+        Some(_) => Move::Nothing,
+        // only when there is something to take back, so an ordinary
+        // frame with no video is no work and no ipc.
+        None if have.is_some() => Move::Disarm,
+        None => Move::Nothing,
+    }
+}
+
 /// The mode actually in force: a runtime override if the user set one,
 /// the config otherwise.
 pub fn effective(configured: VideoOutput, over: Option<VideoOutput>) -> VideoOutput {
@@ -214,6 +259,91 @@ impl Hole {
 /// The ascii toggle's two directions, which are not symmetric: off
 /// means "whatever the config says now", and that cannot be expressed
 /// when the config itself says ascii.
+/// The vo handover, whose two non-obvious cases are that a vo change
+/// re-arms and a size change on the same vo bounces. Neither was
+/// reachable by a test while this lived inline in the frame loop.
+#[cfg(test)]
+mod handover_tests {
+    use super::*;
+
+    const SMALL: (u16, u16) = (80, 24);
+    const BIG: (u16, u16) = (200, 60);
+
+    /// Both idle cases. `Disarm` only when there is something to take
+    /// back: otherwise every music frame would set `vo=null` and
+    /// reclaim the terminal it already owns.
+    #[test]
+    fn a_settled_screen_is_no_work() {
+        assert_eq!(handover(None, None, SMALL, SMALL), Move::Nothing);
+        assert_eq!(
+            handover(Some(Vo::Kitty), Some(Vo::Kitty), SMALL, SMALL),
+            Move::Nothing
+        );
+        assert_eq!(
+            handover(None, Some(Vo::Kitty), SMALL, SMALL),
+            Move::Disarm,
+            "mpv is drawing and should not be"
+        );
+    }
+
+    /// Arming carries the size, so the first arm at a new size does not
+    /// need a bounce behind it.
+    #[test]
+    fn taking_the_screen_arms_at_the_current_size() {
+        assert_eq!(
+            handover(Some(Vo::Tct), None, BIG, SMALL),
+            Move::Arm {
+                vo: Vo::Tct,
+                size: BIG
+            }
+        );
+    }
+
+    /// A different vo has to be armed, not bounced: a bounce re-inits
+    /// the vo mpv already has, which is the one being replaced.
+    #[test]
+    fn a_changed_vo_is_armed_rather_than_bounced() {
+        assert_eq!(
+            handover(Some(Vo::Tct), Some(Vo::Kitty), SMALL, SMALL),
+            Move::Arm {
+                vo: Vo::Tct,
+                size: SMALL
+            }
+        );
+        // and the size being stale at the same time changes nothing:
+        // arming sets both, so there is no second move owed.
+        assert_eq!(
+            handover(Some(Vo::Tct), Some(Vo::Kitty), BIG, SMALL),
+            Move::Arm {
+                vo: Vo::Tct,
+                size: BIG
+            }
+        );
+    }
+
+    /// Same vo, new size. The size that matters is the one mpv was
+    /// armed with, not the one it was asked for, because the vo reads
+    /// it once at init.
+    #[test]
+    fn a_resize_under_the_same_vo_is_a_bounce() {
+        assert_eq!(
+            handover(Some(Vo::Kitty), Some(Vo::Kitty), BIG, SMALL),
+            Move::Rebounce {
+                vo: Vo::Kitty,
+                size: BIG
+            }
+        );
+    }
+
+    /// A resize with nothing armed is nothing: there is no vo holding
+    /// a stale size, and bouncing one that does not exist would hand
+    /// mpv a drawing vo the screen state never asked for.
+    #[test]
+    fn a_resize_while_nothing_is_armed_does_nothing() {
+        assert_eq!(handover(None, None, BIG, SMALL), Move::Nothing);
+    }
+}
+
 #[cfg(test)]
 mod toggle_tests {
     use super::*;

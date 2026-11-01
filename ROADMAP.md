@@ -729,8 +729,8 @@ and `in-workspace (sub-rect) video` is still kitty-only via
       non-blocking and `WouldBlock` is already an ordinary `Pending`.
       what is left of this item is nothing, unless the maintainer wants
       the cap exposed in the settings menu rather than only in config.
-      the original note follows.
-- [ ] a few hundred cells across times a few hundred
+      the original note, kept for the reasoning:
+      > a few hundred cells across times a few hundred
       down, at video frame rate, is the real cost. the work is CPU
       (decode, downscale, per-cell sampling, diffing the buffer), not
       gpu: the terminal emulator rasterizes glyphs on the gpu and that
@@ -3998,9 +3998,30 @@ the order below is not a preference, it is a dependency.
       locals, then the draw closure, and only then the input tiers
       (their ordering is load-bearing and heavily commented).
       **the "~3.9k lines" in this entry was stale: it was 6.2k when
-      the decomposition started.** down to 4.9k over six slices.
-      worth re-measuring rather than trusting, since every feature
-      slice adds to it.
+      the decomposition started.** 4.9k over six slices, and **5442
+      now**: the video work since (the ascii pane, its key, its rate)
+      put 600 lines back. worth re-measuring rather than trusting,
+      exactly as this entry says, and the measurement says the loop is
+      growing faster than it is being decomposed.
+      - [x] **the vo handover -> `video::handover`.** the loop held
+        four nested conditions doing ipc inline, so the one rule that
+        is easy to get wrong was not reachable by a test at all: a *vo
+        change* must re-arm (a bounce re-inits the vo being replaced)
+        while a *size change under the same vo* must bounce (arming is
+        the same work plus a reclaim). `Move::{Nothing, Arm, Disarm,
+        Rebounce}` is the decision and main.rs is now only the ipc for
+        it. same split as `framesource::plan`, for the same reason.
+        `Disarm` only fires when something is armed, so an ordinary
+        music frame costs no ipc rather than setting `vo=null` and
+        reclaiming a terminal wim already owns.
+        the old shape also had one branch that could not be taken: the
+        resize arm re-tested `if let Some(vo) = want_vo` inside a
+        condition that already implied it.
+        four mutations caught, and one of them is the reason this was
+        worth extracting: swapping the two arms so the bounce is tried
+        first makes a *first* arm at a stale size return `Rebounce`,
+        which hands mpv a drawing vo that was never armed. that is a
+        black screen, and it was unreachable by any test before.
       - [x] **the eq menu's three locals -> `ui::eq_menu::EqMenuPane`.**
         `eq_menu_open`, `eq_menu_selected` and the `EqMenuState`
         editor, behind `open`/`close`/`selected`/`state_mut`. named
