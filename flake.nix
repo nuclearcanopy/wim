@@ -60,6 +60,16 @@
 
           shellHook = ''
             export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"
+            # sccache cannot cache incremental compilation, and
+            # Cargo.toml sets incremental = true on both profiles, so
+            # every call was marked non-cacheable: measured 0 hits
+            # against 2137 misses while the incremental dirs across 16
+            # worktrees reached 22G. the env var takes precedence over
+            # the manifest. the trade is slower repeated edits inside
+            # one worktree, which is the right way round here:
+            # incremental state is per-target-dir and cannot be shared,
+            # where the sccache store is shared by all of them.
+            export CARGO_INCREMENTAL=0
             export SCCACHE_DIR="$HOME/.cache/sccache"
           '';
         };
