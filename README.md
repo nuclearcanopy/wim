@@ -103,6 +103,11 @@ picks it (a real protocol beats a cell grid wherever one exists), so it
 is either `video_output = "ascii"` in config.toml or shift-`v` at
 runtime, which also switches to fullscreen.
 
+`ascii_fps` caps the rate ascii video decodes and paints at; unset
+means the file's own rate. it only ever lowers it, since asking for
+more frames than the file has just makes mpv duplicate them. a large
+cell grid on a slow machine is the case for halving it.
+
 ## keybindings
 
 press `?` in the app for the full list. it resolves every key from the
