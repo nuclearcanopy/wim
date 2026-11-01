@@ -95,6 +95,25 @@ the two files get relinked the next time they are played); or have me
 relink just the two `cached_path` entries and leave the counts empty,
 which stops them being re-downloaded without inventing a history.
 
+### two shellsong behaviours the audit found and left alone
+
+Both are deliberate-looking and pinned by tests, so changing either is
+a design call rather than a fix.
+
+`paste` joins a multi-line paste with no separator, so pasting
+`play(a)` and `next()` together gives `play(a)next()`. The doc comment
+says the text goes in literally and a test pins exactly that. Inserting
+`;` would make a paste do something the user did not type, which is why
+it was not done unasked.
+
+`Ty::Count` shares `MAX_REPEAT` between `repeat` and `skip`, so
+`skip(300)` is refused with "a count above 256 is refused". The range
+is documented as the type's in `docs/shellsong.md`, so this reads as a
+shared limit rather than a wrong message; a separate skip ceiling is
+yours to name if you want one.
+
+---
+
 ## defaults taken, recorded so they are not re-litigated
 
 ### a completion matched by folding types the ascii, not the diacritics
