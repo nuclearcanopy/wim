@@ -151,6 +151,29 @@ pass with no tag parsing. invalidated per file by mtime in
 nanoseconds, so there is no staleness window: a touched file is
 re-read. see `library.rs`.
 
+## the play index's on-disk shape
+
+`index.ndjson` is the third cache and the one the main thread reads
+before the first frame, so its parse is on the critical path. one row
+per track, which is what keeps a corrupt row costing one entry instead
+of the file.
+
+`play_days` holds **day numbers**, not `YYYY-MM-DD` labels. the labels
+were nine tenths of the parse at a large history: 20000 tracks at 64
+play days took 220ms, and re-parsing the first label of every played
+track was separately 51% of the suggestions affinity stage. packed, the
+parse is 86ms (2.57-2.61x, cpu clock) and the file is 9.6MB instead of
+18.5MB. `cache::day_number` and `cache::day_of` are the two directions
+and live next to each other.
+
+reading still accepts **either**: a hand-written visitor takes an
+integer or a label per day. not `#[serde(untagged)]`, which buffers
+every day into a `Content` tree to try the alternatives. an unreadable
+day costs that day and not the track, because the legacy `index.toml`
+is a single document and one hand-edited date must not reset a whole
+play history. writing is always day numbers, so a file converts itself
+the first time wim saves it.
+
 ## bounded fan-out
 
 every multi-request path runs concurrently through a bounded pool, not
