@@ -57,6 +57,51 @@ pub fn playable_path(item: &SearchItem) -> Option<String> {
 /// gap handling above, while the other two came through
 /// `Op::TogglePause`. All three go through here now, which
 /// `the_pause_keybind_goes_through_the_shared_toggle` pins.
+/// What a skip forward did, so the keybind and the op report the same
+/// thing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Skipped {
+    /// Moved the full `n`.
+    All,
+    /// Hit the end first; `steps` is how far it actually went.
+    Short { steps: usize },
+    /// Nothing upcoming at all.
+    AtTheEnd,
+    Failed(String),
+}
+
+/// Skip forward `n`, asking the queue before mpv.
+///
+/// Shared for the same reason `toggle_pause` is, and it was the same
+/// kind of gap: the keybind did a bare `let _ = player.playlist_next()`
+/// and so had **none** of this, while `Op::SkipNext` had all of it.
+/// `playlist-next weak` on the last entry replies with an error
+/// (measured; see `Mpv::playlist_next`), and the keybind discarded it,
+/// so pressing skip on the last track did nothing and said nothing.
+///
+/// The queue is the right authority: `entries` *is* mpv's playlist by
+/// invariant, so if nothing is upcoming here there is nothing for mpv
+/// to skip to either. A skip past the end lands on the last track
+/// rather than refusing outright, since asking to go forward four with
+/// two left plainly means "the end".
+pub fn skip_next(player: &mpv::Mpv, queue: &PlayQueue, n: usize) -> Skipped {
+    let upcoming = queue.upcoming_len();
+    if upcoming == 0 {
+        return Skipped::AtTheEnd;
+    }
+    let steps = n.min(upcoming);
+    for _ in 0..steps {
+        if let Err(e) = player.playlist_next() {
+            return Skipped::Failed(format!("error skipping: {e}"));
+        }
+    }
+    if steps < n {
+        Skipped::Short { steps }
+    } else {
+        Skipped::All
+    }
+}
+
 pub fn toggle_pause(player: &mpv::Mpv, between: &mut BetweenTracks) -> anyhow::Result<()> {
     if between.holding() {
         between.cancel();
@@ -2244,33 +2289,16 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             if core.now_playing.is_none() {
                 return op_fail("nothing is playing");
             }
-            // asked here rather than left to mpv: `playlist-next
-            // weak` on the last entry replies with an error (measured;
-            // see `Mpv::playlist_next`), so without this, skipping the
-            // only track in the queue reported "error running
-            // command" at the user for doing something reasonable.
-            //
-            // the queue is the right authority: `entries` *is* mpv's
-            // playlist by invariant, so if nothing is upcoming here,
-            // there is nothing for mpv to skip to either.
-            let upcoming = core.queue.upcoming_len();
-            if upcoming == 0 {
-                return op_fail("nothing to skip to; this is the last track");
-            }
-            // a skip past the end lands on the last track rather than
-            // refusing the whole thing: asking to go forward four with
-            // two left plainly means "the end", and mpv would error on
-            // the overshoot.
-            let steps = n.min(upcoming);
-            for _ in 0..steps {
-                if let Err(e) = core.player.playlist_next() {
-                    return op_fail(format!("error skipping: {e}"));
+            // every guard lives in `skip_next`, shared with the
+            // keybind, which used to have none of them.
+            match skip_next(core.player, core.queue, n) {
+                Skipped::All => op_done(),
+                Skipped::Short { steps } => {
+                    op_note(format!("skipped {steps}, which is all there was"))
                 }
+                Skipped::AtTheEnd => op_fail("nothing to skip to; this is the last track"),
+                Skipped::Failed(why) => op_fail(why),
             }
-            if steps < n {
-                return op_note(format!("skipped {steps}, which is all there was"));
-            }
-            op_done()
         }
         Op::PauseFor(secs) => {
             if core.now_playing.is_none() {
@@ -5723,6 +5751,96 @@ mod index_map_tests {
 ///
 /// `#[ignore]`: the function takes an mpv handle even on the path that
 /// refuses before touching it.
+/// `skip_next`, and the keybind that used to have none of its guards.
+#[cfg(test)]
+mod skip_next_tests {
+    use super::*;
+
+    fn silence(secs: u64) -> SearchItem {
+        SearchItem::Silence { secs }
+    }
+
+    /// The end of the queue is an answer, not an error and not
+    /// silence. `playlist-next weak` replies with an error there
+    /// (measured), which the keybind discarded, so skip on the last
+    /// track did nothing and said nothing.
+    #[test]
+    #[ignore]
+    fn skipping_at_the_end_reports_the_end() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let cache = Arc::new(Mutex::new(CacheIndex::default()));
+        let mut queue = PlayQueue::default();
+        let (_, played) = load_playlist(
+            &player,
+            &cache,
+            &mut queue,
+            vec![silence(1)],
+            SessionStart::New,
+        );
+        assert!(played, "one track loaded");
+
+        assert_eq!(
+            skip_next(&player, &queue, 1),
+            Skipped::AtTheEnd,
+            "nothing is upcoming, so there is nothing for mpv to skip to"
+        );
+    }
+
+    /// A skip past the end lands on the last track rather than
+    /// refusing the whole thing, and says how far it got.
+    #[test]
+    #[ignore]
+    fn skipping_past_the_end_goes_as_far_as_it_can() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let cache = Arc::new(Mutex::new(CacheIndex::default()));
+        let mut queue = PlayQueue::default();
+        let (_, played) = load_playlist(
+            &player,
+            &cache,
+            &mut queue,
+            vec![silence(1), silence(2), silence(3)],
+            SessionStart::New,
+        );
+        assert!(played);
+
+        assert_eq!(
+            skip_next(&player, &queue, 9),
+            Skipped::Short { steps: 2 },
+            "two upcoming, so two steps and an honest count"
+        );
+    }
+
+    /// Both callers share the guards, which is the whole point: the
+    /// keybind had a bare `playlist_next` and so had none of them.
+    /// Reads the source, like the pause pair, because the arm needs a
+    /// live mpv and the whole host loop.
+    #[test]
+    fn both_skip_paths_go_through_the_shared_guard() {
+        let host = include_str!("main.rs");
+        let at = host
+            .find("key.code == keymap.get(KeyAction::SkipNext)")
+            .expect("the skip keybind moved or was renamed");
+        let arm = &host[at..at + 900];
+        let end = arm.find("\n                if ").unwrap_or(arm.len());
+        let arm = &arm[..end];
+        assert!(
+            arm.contains("skip_next(&player, &play_queue"),
+            "the keybind skips mpv directly again, so it has no \
+             last-track guard and no message:\n{arm}"
+        );
+
+        let src = include_str!("core.rs");
+        let at = src.find("Op::SkipNext(n) => {").expect("the op moved");
+        let op = &src[at..at + 600];
+        assert!(
+            op.contains("skip_next(core.player, core.queue, n)"),
+            "the op stopped sharing it:\n{op}"
+        );
+    }
+}
+
 /// The three paths that pause, which `toggle_pause`'s doc says cannot
 /// disagree.
 #[cfg(test)]
