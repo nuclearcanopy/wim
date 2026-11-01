@@ -132,6 +132,7 @@ messages come from, and (r12) what completion offers.
 | `level` | a percent, absolute or signed | nothing; hint only |
 | `count` | a whole number, 1 to 256 | nothing; hint only |
 | | `repeat` also refuses when the *total* expansion would pass 4096 steps, so nesting counts multiply rather than each being bounded on its own | |
+| | and calls themselves may not nest past 32 deep, which is a *parse* bound rather than an expansion one: the parser recurses once per level, so a deep nest used to overflow the stack before the expansion bound could see it | |
 | `index` | a 1-based queue position | nothing; hint only |
 | `indices` | one or more queue positions | nothing; hint only |
 | `speed` | a multiplier 0.25-3, or `up` / `down` / `reset` | nothing; hint only |

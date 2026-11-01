@@ -2060,6 +2060,18 @@ fn best_match(results: &[Kind], prefs: &[Kind], pick: Pick) -> Option<usize> {
 /// difference without a visited set.
 const MAX_SCRIPT_DEPTH: usize = 8;
 
+/// How deep calls may nest inside one another.
+///
+/// `parse_call` recurses once per level through `bind` and `coerce`,
+/// *at parse time*, so a balanced nest pasted into the console
+/// (`dry(dry(dry(...)))`) overflowed the stack before `MAX_EXPANSION`
+/// could see it; that bound is on what a program expands to, which is
+/// a later phase entirely. 32 is far past anything real
+/// (`dry(repeat(3, queue([a])))` is three) and far short of the
+/// thousands of frames a stack holds, so the refusal is a message and
+/// never an abort.
+const MAX_CALL_DEPTH: usize = 32;
+
 struct Lowering<'a> {
     nodes: Vec<Node>,
     groups: usize,
@@ -2786,7 +2798,7 @@ fn parse_statement(
         .filter(|rest| rest.starts_with(char::is_whitespace))
     {
         Some(rest) => parse_let(input, offset + LET.len(), rest, world),
-        None => parse_call(input, offset, text, world),
+        None => parse_call(input, offset, text, world, 0),
     }
 }
 
@@ -2830,7 +2842,7 @@ fn parse_let(input: &str, offset: usize, text: &str, world: &World) -> Result<Ca
         ));
     }
     let args = vec![
-        coerce(input, command, &command.params[0], offset, name, world)?,
+        coerce(input, command, &command.params[0], offset, name, world, 0)?,
         coerce(
             input,
             command,
@@ -2838,6 +2850,7 @@ fn parse_let(input: &str, offset: usize, text: &str, world: &World) -> Result<Ca
             value_offset,
             value,
             world,
+            0,
         )?,
     ];
     Ok(Call {
@@ -2849,7 +2862,22 @@ fn parse_let(input: &str, offset: usize, text: &str, world: &World) -> Result<Ca
 
 /// `name(args...)`. `input`/`offset` are only carried for error
 /// columns; `text` is the already-trimmed statement or nested call.
-fn parse_call(input: &str, offset: usize, text: &str, world: &World) -> Result<Call, ParseError> {
+fn parse_call(
+    input: &str,
+    offset: usize,
+    text: &str,
+    world: &World,
+    depth: usize,
+) -> Result<Call, ParseError> {
+    if depth > MAX_CALL_DEPTH {
+        let name = text.split('(').next().unwrap_or(text).trim();
+        return Err(err(
+            input,
+            offset,
+            name,
+            format!("calls nest more than {MAX_CALL_DEPTH} deep; split this over lines"),
+        ));
+    }
     let Some(lp) = text.find('(') else {
         let name = text.split_whitespace().next().unwrap_or(text);
         let message = if lookup(name).is_some() {
@@ -2983,7 +3011,7 @@ fn parse_call(input: &str, offset: usize, text: &str, world: &World) -> Result<C
         }
     }
 
-    let args = bind(input, command, &positional, world)?;
+    let args = bind(input, command, &positional, world, depth)?;
     if command.name == "view" {
         check_view(input, &args, &positional)?;
     }
@@ -3118,6 +3146,7 @@ fn bind(
     command: &'static Command,
     given: &[(usize, &str)],
     world: &World,
+    depth: usize,
 ) -> Result<Vec<Arg>, ParseError> {
     let strict = given.len() == command.params.len();
     let mut args = Vec::new();
@@ -3134,7 +3163,7 @@ fn bind(
             }
             continue;
         };
-        match coerce(input, command, param, *off, text, world) {
+        match coerce(input, command, param, *off, text, world, depth) {
             Ok(arg) => {
                 args.push(arg);
                 next += 1;
@@ -3172,6 +3201,7 @@ fn bind(
     Ok(args)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn coerce(
     input: &str,
     command: &'static Command,
@@ -3179,6 +3209,7 @@ fn coerce(
     off: usize,
     text: &str,
     world: &World,
+    depth: usize,
 ) -> Result<Arg, ParseError> {
     let bad = |what: String| err(input, off, text, what);
     let expected = || {
@@ -3327,7 +3358,7 @@ fn coerce(
             if !text.contains('(') {
                 return Err(expected());
             }
-            parse_call(input, off, text, world).map(|c| Arg::Call(Box::new(c)))
+            parse_call(input, off, text, world, depth + 1).map(|c| Arg::Call(Box::new(c)))
         }
     }
 }
@@ -6682,6 +6713,47 @@ mod tests {
         let mut cursor = cursor;
         edit_backspace(&mut buf, &mut cursor);
         assert_eq!(buf, "queue([日])");
+    }
+
+    /// A deep nest is refused at parse time, with a message.
+    ///
+    /// `parse_call` recurses once per level through `bind` and
+    /// `coerce`, so a balanced nest pasted into the console
+    /// overflowed the stack **before** `MAX_EXPANSION` could see it;
+    /// that bound is on what a program expands to, a later phase
+    /// entirely. the roadmap recorded this as hard to verify because
+    /// an overflow aborts the harness, and that is the point of a
+    /// bound well below the stack: the refusal is reachable without
+    /// ever going near it.
+    #[test]
+    fn calls_cannot_nest_past_the_depth_limit() {
+        // `dry(...)` takes a call, which is what makes it nestable.
+        let nest = |levels: usize| {
+            let mut line = String::from("skip()");
+            for _ in 0..levels {
+                line = format!("dry({line})");
+            }
+            line
+        };
+
+        let ok = nest(MAX_CALL_DEPTH);
+        assert!(
+            Program::parse(&ok).is_ok(),
+            "the limit itself has to parse, or it is off by one"
+        );
+
+        let too_deep = nest(MAX_CALL_DEPTH + 1);
+        let why = Program::parse(&too_deep).expect_err("one past the limit is refused");
+        let said = why.to_string();
+        assert!(said.contains("nest"), "it has to name the problem: {said}");
+        assert!(
+            said.contains("lines"),
+            "and say what to do instead: {said}"
+        );
+
+        // and far past it is the same message, not a crash: this is
+        // the shape someone actually pastes.
+        assert!(Program::parse(&nest(400)).is_err());
     }
 
     /// Editing steps by what the terminal draws as one glyph.

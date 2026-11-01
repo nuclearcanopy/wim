@@ -1799,12 +1799,22 @@ writing (two agents, one per file).
       billion; a flat `repeat(256, skip())` is untouched; and
       `MAX_REPEAT`'s doc now says what it actually bounds and points at
       the constant that bounds the total.
-- [ ] **`parse_call` recursion is still unbounded**, independently of
-      lowering: a balanced deep nest (`dry(dry(dry(...)))`, pasted or
-      in a `.shg` line) recurses once per level at *parse* time, before
-      `MAX_EXPANSION` can see it. unverified, because a stack overflow
-      aborts the test harness; flagged rather than expanded into scope.
-      a depth counter in `parse_call` would close it.
+- [x] **calls cannot nest past 32 deep, and that is a *parse* bound.**
+      `parse_call` recurses once per level through `bind` and `coerce`,
+      so a balanced nest pasted into the console
+      (`dry(dry(dry(...)))`) overflowed the stack **before**
+      `MAX_EXPANSION` could see it: that bound is on what a program
+      expands to, which is a later phase entirely. this was the last of
+      the three parse-level aborts (the multibyte call-name slice and
+      `inf` as a duration were the others).
+      32 is far past anything real (`dry(repeat(3, queue([a])))` is
+      three) and far short of the thousands of frames a stack holds,
+      **which is what makes it testable at all**: this entry recorded
+      the overflow as unverifiable because it aborts the harness, and a
+      bound well below the stack means the refusal is reachable without
+      going anywhere near it. `nest(400)` is a message, not a crash.
+      three mutations caught: no bound, a counter that never
+      increments, and `>=` instead of `>` at the limit itself.
 
 **silent desync and stale replies.** none of these crash; all of them
 do the wrong thing quietly, which is worse to diagnose.
