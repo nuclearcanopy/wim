@@ -42,13 +42,23 @@ const MAX_TRACKED_DAYS: usize = 64;
 pub struct CacheEntry {
     #[serde(default)]
     pub play_count: u32,
-    /// Distinct calendar days (`YYYY-MM-DD`, see `day_of`) this track
-    /// was played on, oldest first. What the auto-download threshold
-    /// actually counts: playing the same song twice in one sitting
-    /// says nothing about wanting it cached, coming back to it on
-    /// another day does.
-    #[serde(default)]
-    pub play_days: Vec<String>,
+    /// Distinct calendar days this track was played on, in the order
+    /// they were recorded, as day numbers (days since the unix epoch;
+    /// `day_of` renders one, `day_number` reads one back). What the
+    /// auto-download threshold actually counts: playing the same song
+    /// twice in one sitting says nothing about wanting it cached,
+    /// coming back to it on another day does.
+    ///
+    /// Packed integers rather than the `Vec<String>` of `YYYY-MM-DD`
+    /// this used to be, because both ends of it were measured: at
+    /// 20000 tracks x 64 days the day strings were nine tenths of the
+    /// whole index parse, on the main thread before the first frame
+    /// (`play_index_parse_legs`), and re-parsing the first one per
+    /// track was over half the suggestion engine's affinity stage
+    /// (`suggest::cost::what_the_history_lookups_cost`). Either shape
+    /// still loads off disk; see `play_days_from_disk`.
+    #[serde(default, deserialize_with = "play_days_from_disk")]
+    pub play_days: Vec<i32>,
     /// Unix seconds; `None` if never played this session or across a
     /// restart before this field existed.
     #[serde(default)]
@@ -100,11 +110,99 @@ pub fn day_of(unix_secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// `YYYY-MM-DD` back to a day number, the exact inverse of `day_of`.
+/// Same March-based-year trick, which is what removes every month
+/// special case. `None` for anything unparseable, so a hand-edited
+/// index cannot panic anything that reads it.
+pub fn day_number(ymd: &str) -> Option<i64> {
+    let mut parts = ymd.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+/// The day number a timestamp falls on, i.e. `day_number(&day_of(s))`
+/// without the string in the middle; `day_of` is a pure render of
+/// this, which is what makes the two agree by construction.
+fn day_number_of(unix_secs: u64) -> i32 {
+    (unix_secs / 86_400) as i32
+}
+
 /// Today's `day_of`. The one wall-clock read in the day-threshold
 /// path; everything that decides anything takes the day as an
 /// argument instead, so the policy stays testable against fixed days.
 pub fn today() -> String {
     day_of(now_secs())
+}
+
+/// One recorded play day as it may sit on disk: an integer day number
+/// (what is written now) or a `YYYY-MM-DD` label (what every index
+/// written before the packing holds, including the legacy
+/// `index.toml`). An unreadable label is dropped rather than failing
+/// the row: the ndjson index costs one track per bad line, but the
+/// legacy toml is read as one document, and a single hand-edited date
+/// must not reset someone's whole play history.
+///
+/// Hand-written rather than `#[serde(untagged)]`, which cannot
+/// deserialize in one pass and would buffer every day into its own
+/// `Content` tree; that is the cost `CatalogRow` exists to avoid, and
+/// this field is the one that was measured as the parse.
+fn play_days_from_disk<'de, D>(deserializer: D) -> Result<Vec<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct Day(Option<i32>);
+
+    impl<'de> Deserialize<'de> for Day {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Day, D::Error> {
+            struct V;
+            impl Visitor<'_> for V {
+                type Value = Day;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a day number or a YYYY-MM-DD date")
+                }
+                fn visit_i64<E: Error>(self, v: i64) -> Result<Day, E> {
+                    Ok(Day(i32::try_from(v).ok()))
+                }
+                fn visit_u64<E: Error>(self, v: u64) -> Result<Day, E> {
+                    Ok(Day(i32::try_from(v).ok()))
+                }
+                fn visit_str<E: Error>(self, v: &str) -> Result<Day, E> {
+                    Ok(Day(day_number(v).and_then(|d| i32::try_from(d).ok())))
+                }
+            }
+            d.deserialize_any(V)
+        }
+    }
+
+    struct Days;
+    impl<'de> Visitor<'de> for Days {
+        type Value = Vec<i32>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a list of day numbers or YYYY-MM-DD dates")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<i32>, A::Error> {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_TRACKED_DAYS));
+            while let Some(Day(day)) = seq.next_element::<Day>()? {
+                out.extend(day);
+            }
+            Ok(out)
+        }
+    }
+    deserializer.deserialize_seq(Days)
 }
 
 /// `~/.cache/wim`; the actual downloaded audio lives under its own
@@ -169,8 +267,9 @@ struct PlayRow<'a> {
     id: Cow<'a, str>,
     #[serde(default)]
     play_count: u32,
-    #[serde(default, borrow)]
-    play_days: Vec<Cow<'a, str>>,
+    /// Day numbers out, either shape in; see `play_days_from_disk`.
+    #[serde(default, deserialize_with = "play_days_from_disk")]
+    play_days: Vec<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_played_secs: Option<u64>,
     #[serde(default, borrow, skip_serializing_if = "Option::is_none")]
@@ -185,11 +284,7 @@ fn index_body(index: &CacheIndex) -> String {
         let row = PlayRow {
             id: Cow::Borrowed(id),
             play_count: entry.play_count,
-            play_days: entry
-                .play_days
-                .iter()
-                .map(|d| Cow::Borrowed(d.as_str()))
-                .collect(),
+            play_days: entry.play_days.clone(),
             last_played_secs: entry.last_played_secs,
             cached_path: entry.cached_path.as_deref().map(Cow::Borrowed),
             cached_at_secs: entry.cached_at_secs,
@@ -210,7 +305,7 @@ fn play_entry(line: &str) -> Option<(String, CacheEntry)> {
         row.id.into_owned(),
         CacheEntry {
             play_count: row.play_count,
-            play_days: row.play_days.into_iter().map(Cow::into_owned).collect(),
+            play_days: row.play_days,
             last_played_secs: row.last_played_secs,
             cached_path: row.cached_path.map(Cow::into_owned),
             cached_at_secs: row.cached_at_secs,
@@ -643,23 +738,28 @@ impl CacheIndex {
     pub fn record_play(&mut self, id: &str, today: &str) -> u32 {
         let entry = self.entries.entry(id.to_string()).or_default();
         entry.play_count += 1;
-        // migration for an index written before play days existed: the
-        // one earlier day we can still recover is whatever
-        // `last_played_secs` points at, so a track played yesterday
-        // and played again now counts as the two days it really was,
-        // instead of silently restarting from zero.
-        if entry.play_days.is_empty() {
-            if let Some(prev) = entry.last_played_secs {
-                entry.play_days.push(day_of(prev));
+        // a day label that will not parse records the play but no day:
+        // every caller passes `today()`, so this is the hand-edited
+        // case, and inventing a day for it would inflate the threshold.
+        if let Some(today) = day_number(today).and_then(|d| i32::try_from(d).ok()) {
+            // migration for an index written before play days existed:
+            // the one earlier day we can still recover is whatever
+            // `last_played_secs` points at, so a track played
+            // yesterday and played again now counts as the two days it
+            // really was, instead of silently restarting from zero.
+            if entry.play_days.is_empty() {
+                if let Some(prev) = entry.last_played_secs {
+                    entry.play_days.push(day_number_of(prev));
+                }
             }
-        }
-        if entry.play_days.last().map(String::as_str) != Some(today) {
-            entry.play_days.retain(|d| d != today);
-            entry.play_days.push(today.to_string());
-        }
-        if entry.play_days.len() > MAX_TRACKED_DAYS {
-            let excess = entry.play_days.len() - MAX_TRACKED_DAYS;
-            entry.play_days.drain(..excess);
+            if entry.play_days.last() != Some(&today) {
+                entry.play_days.retain(|&d| d != today);
+                entry.play_days.push(today);
+            }
+            if entry.play_days.len() > MAX_TRACKED_DAYS {
+                let excess = entry.play_days.len() - MAX_TRACKED_DAYS;
+                entry.play_days.drain(..excess);
+            }
         }
         entry.last_played_secs = Some(now_secs());
         entry.play_days.len() as u32
@@ -853,8 +953,9 @@ mod tests {
         assert_eq!(back.days_played("t1"), 2);
         assert_eq!(
             back.entry("t1").unwrap().play_days,
-            ["2026-01-01", "2026-01-03"],
-            "the day list is what the download threshold counts, and it is ordered"
+            [20_454, 20_456],
+            "the day list is what the download threshold counts, and it is ordered \
+             (2026-01-01 and 2026-01-03 as day numbers)"
         );
         assert_eq!(
             back.entry("t1").unwrap().cached_path.as_deref(),
@@ -1547,6 +1648,115 @@ mod tests {
         CacheIndex { entries }
     }
 
+    /// `index_body` as it was before the days were packed: the day
+    /// list written as `YYYY-MM-DD` labels, which is what every index
+    /// already on disk holds until its first save after this change.
+    /// The baseline both for the format's cost and for "reads the same
+    /// history".
+    fn index_body_labelled(index: &CacheIndex) -> String {
+        #[derive(Serialize)]
+        struct LabelledRow<'a> {
+            id: &'a str,
+            play_count: u32,
+            play_days: Vec<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            last_played_secs: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cached_path: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cached_at_secs: Option<u64>,
+        }
+        let mut body = String::new();
+        for (id, entry) in &index.entries {
+            let row = LabelledRow {
+                id,
+                play_count: entry.play_count,
+                play_days: entry
+                    .play_days
+                    .iter()
+                    .map(|&d| day_of(d as u64 * 86_400))
+                    .collect(),
+                last_played_secs: entry.last_played_secs,
+                cached_path: entry.cached_path.as_deref(),
+                cached_at_secs: entry.cached_at_secs,
+            };
+            if let Ok(line) = serde_json::to_string(&row) {
+                body.push_str(&line);
+                body.push('\n');
+            }
+        }
+        body
+    }
+
+    /// Every index already on disk holds `YYYY-MM-DD` day labels, and
+    /// the day count is exactly what the auto-download threshold is
+    /// measured against: a packed reader that could not read them
+    /// would silently reset everyone's history to one day. Same oracle
+    /// shape as `the_row_shape_reads_exactly_what_the_toml_shape_did`.
+    #[test]
+    fn an_index_written_with_day_labels_reads_the_same_days_as_a_packed_one() {
+        let mut idx = play_index(200, 5);
+        idx.record_play("t-odd", "2026-01-09");
+        idx.mark_cached("t-odd", PathBuf::from("/c/wim/tracks/t-odd.mp3"));
+        let labelled = index_body_labelled(&idx);
+        assert!(
+            labelled.contains("\"play_days\":[\"2023-11-14\""),
+            "the baseline has to be the label shape: {}",
+            &labelled[..labelled.len().min(160)]
+        );
+        let from_labels = parse_index_body(&labelled);
+        assert_eq!(
+            from_labels.entries, idx.entries,
+            "an index written with day labels has to load as the same history"
+        );
+        assert_eq!(
+            from_labels.entries,
+            parse_index_body(&index_body(&idx)).entries
+        );
+    }
+
+    /// Both shapes in one list, plus one that is neither. The row
+    /// still loads and keeps every day it could read: the ndjson index
+    /// costs one track per bad line, but the legacy `index.toml` is
+    /// read as one document, so a single hand-edited date must not
+    /// reset a whole install's history.
+    #[test]
+    fn an_unreadable_day_costs_that_day_and_not_the_track() {
+        let raw = concat!(
+            r#"{"id":"t1","play_count":4,"#,
+            r#""play_days":["2026-01-01","nonsense",20456,"2026-13-99"],"#,
+            r#""last_played_secs":1}"#,
+            "\n"
+        );
+        let idx = parse_index_body(raw);
+        assert_eq!(
+            idx.entry("t1").expect("the row still loads").play_days,
+            [20_454, 20_456],
+            "2026-01-01 read from a label, 20456 read as itself"
+        );
+        assert_eq!(idx.play_count("t1"), 4);
+
+        let legacy_raw =
+            "[entries.t1]\nplay_count = 7\nplay_days = [\"2026-01-01\", \"2026-13-99\"]\n";
+        let legacy: CacheIndex = toml::from_str(legacy_raw).expect("the document must still parse");
+        assert_eq!(legacy.days_played("t1"), 1);
+        assert_eq!(legacy.play_count("t1"), 7);
+    }
+
+    #[test]
+    fn day_number_is_the_exact_inverse_of_day_of() {
+        for secs in [0u64, 86_399, 86_400, 1_709_164_800, 1_767_225_600] {
+            assert_eq!(
+                day_number(&day_of(secs)),
+                Some((secs / 86_400) as i64),
+                "round trip failed for {secs}"
+            );
+            assert_eq!(day_number_of(secs), (secs / 86_400) as i32);
+        }
+        assert_eq!(day_number("garbage"), None);
+        assert_eq!(day_number("2026-13-01"), None);
+    }
+
     /// `parse_index_body` as it was before the map was pre-sized:
     /// kept as the baseline `play_index_parse_legs` measures against.
     fn parse_index_body_growing(raw: &str) -> CacheIndex {
@@ -1559,7 +1769,7 @@ mod tests {
                 row.id.into_owned(),
                 CacheEntry {
                     play_count: row.play_count,
-                    play_days: row.play_days.into_iter().map(Cow::into_owned).collect(),
+                    play_days: row.play_days,
                     last_played_secs: row.last_played_secs,
                     cached_path: row.cached_path.map(Cow::into_owned),
                     cached_at_secs: row.cached_at_secs,
@@ -1591,13 +1801,12 @@ mod tests {
     /// docs call a long-running install, for a thread pool on the
     /// startup path.
     ///
-    /// **Where the parse really goes** is `play_days`: 20000 tracks
-    /// cost 36-41ms at 4 days each and 256-271ms at 64, so nine tenths
-    /// of a big index's parse is allocating `Vec<String>`s of
-    /// `YYYY-MM-DD`. Nothing outside this module reads more than
-    /// `.len()` and `.first()` of them (`suggest.rs`), so a packed
-    /// representation would take that back; it changes a `pub` field,
-    /// so it is not done here.
+    /// **What also shipped: packed `play_days`.** The parse used to go
+    /// almost entirely into `play_days`: 20000 tracks cost 36-41ms at
+    /// 4 days each and 256-271ms at 64, nine tenths of it allocating
+    /// a `Vec<String>` of `YYYY-MM-DD` per track. Day numbers instead
+    /// (`index_body_labelled` is the label shape, kept as the
+    /// baseline) take that back; the ratio is the last column.
     ///
     /// `cargo test --release -- --ignored --nocapture
     /// play_index_parse_legs`.
@@ -1613,7 +1822,19 @@ mod tests {
             (20_000, 4),
             (20_000, 64),
         ] {
-            let raw = index_body(&play_index(tracks, days));
+            let index = play_index(tracks, days);
+            let raw = index_body(&index);
+            let labelled = index_body_labelled(&index);
+            let (labels, packed) = best_each_cpu(
+                8,
+                2,
+                &mut || {
+                    parse_index_body(&labelled);
+                },
+                &mut || {
+                    parse_index_body(&raw);
+                },
+            );
             let (growing, sized) = best_each_cpu(
                 8,
                 2,
@@ -1635,17 +1856,15 @@ mod tests {
                 },
             );
             println!(
-                "{tracks:>6} tracks x {days:>2} days ({:>9}B)  cpu: growing map \
+                "{tracks:>6} tracks x {days:>2} days  cpu: growing map \
                  {growing:>9.0}us pre-sized {sized:>9.0}us {:.2}x   wall: serial \
-                 {serial:>9.0}us pooled {pooled:>9.0}us {:.2}x{}",
-                raw.len(),
+                 {serial:>9.0}us pooled {pooled:>9.0}us {:.2}x   cpu: day labels \
+                 ({:>9}B) {labels:>9.0}us packed ({:>9}B) {packed:>9.0}us {:.2}x",
                 growing / sized,
                 serial / pooled,
-                if days > 4 {
-                    "  <- play_days dominates"
-                } else {
-                    ""
-                },
+                labelled.len(),
+                raw.len(),
+                labels / packed,
             );
         }
     }
@@ -1753,7 +1972,7 @@ mod tests {
                 CacheEntry {
                     play_count: days as u32,
                     play_days: (0..days)
-                        .map(|d| day_of(1_700_000_000 + d as u64 * 86_400))
+                        .map(|d| day_number_of(1_700_000_000 + d as u64 * 86_400))
                         .collect(),
                     last_played_secs: Some(1_700_000_000),
                     // only a minority of played tracks are ever

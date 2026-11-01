@@ -980,27 +980,6 @@ fn song_item(song: &Song, client: &Arc<Client>) -> SearchItem {
 // affinity
 // ---------------------------------------------------------------------
 
-/// `YYYY-MM-DD` back to a day number (days since the unix epoch), the
-/// inverse of `cache::day_of`. Same March-based-year trick, which is
-/// what removes every month special case. `None` for anything
-/// unparseable, so a hand-edited index can't panic the menu.
-fn day_number(ymd: &str) -> Option<i64> {
-    let mut parts = ymd.split('-');
-    let year: i64 = parts.next()?.parse().ok()?;
-    let month: i64 = parts.next()?.parse().ok()?;
-    let day: i64 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let yoe = year - era * 400;
-    let mp = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146_097 + doe - 719_468)
-}
-
 /// Exponential recency decay, `0.5 ^ (age / half_life)`. Never played
 /// (or no timestamp recorded) decays by nothing: there is no evidence
 /// of staleness to apply, and the frequency term is already 0 or just
@@ -1134,7 +1113,7 @@ fn track_affinities(req: &Request<'_>) -> (Vec<TrackAffinity>, u32) {
         let last_played_secs = entry.and_then(|e| e.last_played_secs);
         let first_day = entry
             .and_then(|e| e.play_days.first())
-            .and_then(|d| day_number(d));
+            .map(|&d| i64::from(d));
         let starred = is_starred[index];
         let raw = frequency(days, plays, starred, tuning);
         total_plays += plays;
@@ -2555,19 +2534,6 @@ mod tests {
     }
 
     // ---------------- affinity model ----------------
-
-    #[test]
-    fn day_number_is_the_exact_inverse_of_day_of() {
-        for secs in [0u64, 86_399, 86_400, 1_709_164_800, NOW, NOW + 77 * DAY] {
-            assert_eq!(
-                day_number(&day_of(secs)),
-                Some((secs / DAY) as i64),
-                "round trip failed for {secs}"
-            );
-        }
-        assert_eq!(day_number("garbage"), None);
-        assert_eq!(day_number("2026-13-01"), None);
-    }
 
     #[test]
     fn decay_puts_a_recent_play_above_an_identical_old_one() {
@@ -5076,7 +5042,7 @@ mod cost {
                     plays,
                     days,
                     last_played_secs: entry.last_played_secs,
-                    first_day: entry.play_days.first().and_then(|d| day_number(d)),
+                    first_day: entry.play_days.first().map(|&d| i64::from(d)),
                     starred: false,
                 };
             }
