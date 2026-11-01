@@ -1464,6 +1464,43 @@ mod tests {
         best
     }
 
+    /// `best_each` on the process cpu clock instead of the wall clock,
+    /// for the pairs where both sides are single-threaded. This box's
+    /// other cores are not idle during a bench run (load average 28
+    /// observed, wall 6x cpu on the same work), so wall clock moves
+    /// several-fold between batches while the work done does not. A
+    /// pooled candidate still has to be read on the wall clock, since
+    /// cpu time is exactly what it trades away.
+    fn best_each_cpu(
+        rounds: usize,
+        iters: usize,
+        a: &mut dyn FnMut(),
+        b: &mut dyn FnMut(),
+    ) -> (f64, f64) {
+        let cpu_now = || {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: clock_gettime only writes the timespec we hand it.
+            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+            ts.tv_sec as f64 * 1e6 + ts.tv_nsec as f64 / 1e3
+        };
+        let mut best = (f64::MAX, f64::MAX);
+        let time = |f: &mut dyn FnMut()| {
+            let at = cpu_now();
+            for _ in 0..iters {
+                f();
+            }
+            (cpu_now() - at) / iters as f64
+        };
+        for _ in 0..rounds {
+            best.0 = best.0.min(time(a));
+            best.1 = best.1.min(time(b));
+        }
+        best
+    }
+
     /// Which profile a measurement ran in. `cargo test` defaults to
     /// `opt-level = 0`, where one of these paths measured 11x its
     /// release cost, and a debug number quoted as the cost is how a
@@ -1567,9 +1604,9 @@ mod tests {
                 "nor may chunking it"
             );
 
-            let (growing, sized) = best_each(
-                3,
-                3,
+            let (growing, sized) = best_each_cpu(
+                8,
+                2,
                 &mut || {
                     parse_index_body_growing(&raw);
                 },
@@ -1578,8 +1615,8 @@ mod tests {
                 },
             );
             let (sized_again, pooled) = best_each(
-                3,
-                3,
+                8,
+                2,
                 &mut || {
                     parse_index_body(&raw);
                 },
@@ -1588,12 +1625,12 @@ mod tests {
                 },
             );
             println!(
-                "{tracks:>6} tracks x {days:>2} days ({:>9}B)  growing map {growing:>9.0}us  \
-                 pre-sized {sized:>9.0}us (re-measured {sized_again:>9.0}us) {:.2}x  \
-                 pooled {pooled:>9.0}us {:.2}x",
+                "{tracks:>6} tracks x {days:>2} days ({:>9}B)  cpu: growing map \
+                 {growing:>9.0}us pre-sized {sized:>9.0}us {:.2}x   wall: pre-sized \
+                 {sized_again:>9.0}us pooled {pooled:>9.0}us {:.2}x",
                 raw.len(),
                 growing / sized,
-                growing / pooled,
+                sized_again / pooled,
             );
         }
     }
