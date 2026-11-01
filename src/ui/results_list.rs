@@ -426,6 +426,153 @@ pub(crate) fn draw_header_row(buf: &mut Buffer, area: Rect, y: u16, label: &str)
     crate::ui::draw::centered(buf, row, y, &text, shade(DIM));
 }
 
+/// What a frame of this list costs, and whether it costs it per
+/// *visible row* or per row in the whole result set. main.rs asks for
+/// the row geometry three times a frame (the sidebar divider's
+/// junction marks, then the click map, then the paint), so anything in
+/// here that scales with the match count is paid for three times at
+/// the display's rate.
+///
+/// A measurement, not an assertion: the numbers move with the box and
+/// a ceiling here would be a flake. Run it with
+/// `cargo test --release --lib ui::results_list::frame_budget -- --ignored --nocapture`;
+/// the dev profile is `opt-level = 0` and reads about 10x the shipping
+/// cost, which is why the build is the first thing printed.
+#[cfg(test)]
+mod frame_budget {
+    use super::*;
+    use crate::library::{LocalTrack, MediaKind};
+    use crate::search::Ranking;
+    use crate::ui::testbuf::buffer;
+    use std::time::Instant;
+
+    /// Alternating batches in one process, best of each. Sequential
+    /// runs on this box differ 1.6-1.8x under load, so two separate
+    /// measurements are not comparable and this is the only shape that
+    /// is; same harness as `framesource::frame_budget`.
+    fn best_each(rounds: usize, iters: usize, a: &mut dyn FnMut(), b: &mut dyn FnMut()) -> (f64, f64) {
+        let mut best = (f64::MAX, f64::MAX);
+        let time = |f: &mut dyn FnMut()| {
+            let at = Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            at.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+        for _ in 0..rounds {
+            best.0 = best.0.min(time(a));
+            best.1 = best.1.min(time(b));
+        }
+        best
+    }
+
+    /// `n` tracks ranked the way `App` holds them, alternating music
+    /// and video so the order has two category runs and the layout has
+    /// headers to place (`rank_order` groups by category, so the run
+    /// count is bounded by `Category`'s variants however long the list
+    /// gets).
+    fn ranked(n: usize) -> (Corpus, Ranking) {
+        let mut corpus = Corpus::new();
+        corpus.add_local_tracks((0..n).map(|i| LocalTrack {
+            path: format!("/m/{i}.flac").into(),
+            title: format!("track {i}"),
+            artist: Some(format!("artist {}", i % 97)),
+            album: None,
+            duration_secs: None,
+            kind: if i % 2 == 0 {
+                MediaKind::Music
+            } else {
+                MediaKind::Video
+            },
+        }));
+        let ranking = corpus.rank("track");
+        (corpus, ranking)
+    }
+
+    /// A sidebar's worth: the real pane is about this wide and this is
+    /// a tall terminal's row count.
+    const PANE: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 28,
+        height: 40,
+    };
+
+    /// One frame's work on this list: the two geometry calls main.rs
+    /// makes outside the widget, plus the paint (which lays the
+    /// geometry out a third time itself).
+    fn frame(rows: &dyn Rows, selected: usize, buf: &mut Buffer) {
+        let _ = header_rows(rows, selected, PANE);
+        let _ = row_items(rows, selected, PANE);
+        ResultsList {
+            items: rows,
+            selected,
+            empty_message: "",
+            favorites: &Favorites::default(),
+            remote_starred: &HashSet::new(),
+            focused: true,
+            elapsed: Duration::ZERO,
+        }
+        .render(PANE, buf);
+    }
+
+    #[test]
+    #[ignore = "a measurement; run it explicitly"]
+    fn what_a_frame_of_the_results_list_costs() {
+        // 144hz is `anim::MAX_HZ`, the fastest the poll loop will ever
+        // redraw at, so it is the tightest deadline this path has.
+        let budget = 1e6 / crate::anim::MAX_HZ as f64;
+        println!(
+            "--- results list, {} rows visible, budget {budget:.0}us at {}hz, {} build",
+            PANE.height,
+            crate::anim::MAX_HZ,
+            if cfg!(debug_assertions) {
+                "DEBUG (not the shipping cost; re-run with --release)"
+            } else {
+                "release"
+            }
+        );
+        // the short list is the control: a pane's worth of rows and
+        // nothing more. Any gap between the two is work the frame did
+        // on rows that are not on screen.
+        let (small_corpus, small_ranking) = ranked(PANE.height as usize);
+        let small = Ranked {
+            ranking: &small_ranking,
+            corpus: &small_corpus,
+        };
+        for n in [2_000usize, 8_000, 15_000] {
+            let (corpus, ranking) = ranked(n);
+            let long = Ranked {
+                ranking: &ranking,
+                corpus: &corpus,
+            };
+            let count = long.count();
+            let runs = long.boundaries().len();
+            let mut long_buf = buffer(PANE.width, PANE.height);
+            let mut small_buf = buffer(PANE.width, PANE.height);
+            let mut on_long = || frame(&long, 0, &mut long_buf);
+            let mut on_small = || frame(&small, 0, &mut small_buf);
+            let (big, ctrl) = best_each(5, 20, &mut on_long, &mut on_small);
+            println!(
+                "  {n:>6} tracks -> {count:>6} matches in {runs} category runs: frame {big:>8.1}us ({:>5.1}% of budget)   {} on screen {ctrl:>7.1}us   {:.1}x",
+                big / budget * 100.0,
+                PANE.height,
+                big / ctrl,
+            );
+            // and the geometry alone, which is two thirds of that
+            // frame and the half that has no business scaling.
+            let mut geo_long = || {
+                let _ = header_rows(&long, 0, PANE);
+            };
+            let mut geo_small = || {
+                let _ = header_rows(&small, 0, PANE);
+            };
+            let (gl, gs) = best_each(5, 20, &mut geo_long, &mut geo_small);
+            println!("            header_rows alone: {gl:>8.1}us vs {gs:>7.1}us   {:.1}x", gl / gs);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
