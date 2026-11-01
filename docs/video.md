@@ -503,6 +503,18 @@ the position is the `elapsed_secs` every widget already reads, so the
 picture cannot drift from the scrubber, and since the fifo is the clock
 a pause stops advancing it and mpv blocks in `write(2)` on its own.
 
+the rate is `framesource::ascii_fps(container, config.ascii_fps)` and
+it goes into **two** places: the filter chain (`fps=N` leading it) and
+`Schedule`. that they are one expression is guarded by a test, because
+if they ever disagree the picture drifts against `time-pos` at exactly
+their ratio, which presents as a sync mystery rather than as a wrong
+number. putting `fps` in the chain also fixed something that was never
+written down as a bug: `Schedule`'s identity (frame `n` *is* media time
+`start + n/fps`) assumes a constant rate, and vfr content does not have
+one. the filter gives it one. a cap can only lower the rate, since
+asking for more frames than the file has makes mpv duplicate them, and
+a duplicate costs a full paint to show the picture already on screen.
+
 shift-`v` is the runtime toggle. `video::effective(configured,
 override)` is what the decision reads, so the override is a `None`
 beside `video_fullscreen` and a restart goes back to config.toml;
