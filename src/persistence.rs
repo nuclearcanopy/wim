@@ -337,7 +337,21 @@ mod tests {
     /// The resume state is read on the main thread before the first
     /// frame, so its parse is first-frame time. Is toml costing
     /// anything worth a format change at the sizes a real queue
-    /// reaches? `cargo test --release -- --ignored --nocapture
+    /// reaches?
+    ///
+    /// **Measured and declined.** json parses the same four fields
+    /// 3.85-4.53x faster (cpu clock, one process), but the whole toml
+    /// parse is 144us at the ~200 queued paths `main.rs` calls a real
+    /// saved queue and 1.41ms at 2000, against a first frame of 82ms
+    /// warm. That is 0.2% of a first frame for a format migration of
+    /// the one file whose loss is a user's queue, and `save` is the
+    /// only writer of it. The queue's real startup cost is not the
+    /// parse: `main.rs` then calls `item_from_path` once per saved
+    /// path, which is a `stat` each, on the main thread before the
+    /// frame, while the matching mpv appends were already deferred
+    /// past it.
+    ///
+    /// `cargo test --release -- --ignored --nocapture
     /// resume_state_parse`.
     #[test]
     #[ignore = "measurement, run explicitly"]
