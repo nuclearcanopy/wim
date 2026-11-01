@@ -2284,12 +2284,12 @@ mod tests {
     use crate::config::NavidromeConfig;
     use std::time::Instant;
 
-    const DAY: u64 = 86_400;
+    pub(super) const DAY: u64 = 86_400;
     /// Fixed "now" for every test: 2026-01-01, so decay ages and day
     /// labels are both exact and nothing reads a clock.
-    const NOW: u64 = 1_767_225_600;
+    pub(super) const NOW: u64 = 1_767_225_600;
 
-    fn client() -> Arc<Client> {
+    pub(super) fn client() -> Arc<Client> {
         Arc::new(
             Client::new(&NavidromeConfig {
                 url: "https://example.invalid".into(),
@@ -2303,7 +2303,7 @@ mod tests {
         )
     }
 
-    fn song(id: &str, title: &str, artist: &str, album: &str, genres: &[&str]) -> Song {
+    pub(super) fn song(id: &str, title: &str, artist: &str, album: &str, genres: &[&str]) -> Song {
         Song {
             id: id.into(),
             title: title.into(),
@@ -2314,7 +2314,7 @@ mod tests {
         }
     }
 
-    fn album_item(id: &str, name: &str, artist: &str) -> SearchItem {
+    pub(super) fn album_item(id: &str, name: &str, artist: &str) -> SearchItem {
         SearchItem::Album {
             id: id.into(),
             name: name.into(),
@@ -2323,7 +2323,7 @@ mod tests {
         }
     }
 
-    fn artist_item(id: &str, name: &str) -> SearchItem {
+    pub(super) fn artist_item(id: &str, name: &str) -> SearchItem {
         SearchItem::Artist {
             id: id.into(),
             name: name.into(),
@@ -2334,16 +2334,16 @@ mod tests {
     /// Play history built as an `index.toml` would be loaded, which is
     /// the only way to get backdated timestamps: `record_play` stamps
     /// `last_played_secs` off the wall clock.
-    struct History(String);
+    pub(super) struct History(String);
 
     impl History {
-        fn new() -> History {
+        pub(super) fn new() -> History {
             History(String::new())
         }
 
         /// `days_ago` is when it was last played; `days` distinct days
         /// ending there, one per day.
-        fn played(mut self, id: &str, plays: u32, days: u32, days_ago: u64) -> History {
+        pub(super) fn played(mut self, id: &str, plays: u32, days: u32, days_ago: u64) -> History {
             let last = NOW - days_ago * DAY;
             let labels: Vec<String> = (0..days)
                 .rev()
@@ -2356,12 +2356,12 @@ mod tests {
             self
         }
 
-        fn build(self) -> CacheIndex {
+        pub(super) fn build(self) -> CacheIndex {
             toml::from_str(&self.0).expect("fixture index must parse")
         }
     }
 
-    fn starred(ids: &[&str]) -> HashSet<String> {
+    pub(super) fn starred(ids: &[&str]) -> HashSet<String> {
         ids.iter().map(|i| i.to_string()).collect()
     }
 
@@ -3814,6 +3814,328 @@ mod tests {
                 "{tracks:>6} tracks {albums:>5} albums  pass {pass:>10.3?}  of which model {model:>10.3?}  ({} rows)",
                 rows / iters as usize
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// cost
+// ---------------------------------------------------------------------
+
+/// What a suggestion pass costs and where the time goes, on a
+/// library-shaped catalog with real-looking names. Measurements only;
+/// absolute numbers are machine-dependent and a debug number is not
+/// the shipping one, so every test here prints its profile.
+#[cfg(test)]
+mod cost {
+    use super::tests::{album_item, artist_item, client, song, starred, History, NOW};
+    use super::*;
+    use std::time::Instant;
+
+    /// splitmix64, so a corpus is the same every run without pulling a
+    /// generator in.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[(self.next() % xs.len() as u64) as usize]
+        }
+
+        fn upto(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    const ARTISTS: [&str; 24] = [
+        "Bladee",
+        "Ecco2k",
+        "Thaiboy Digital",
+        "Sigur Rós",
+        "Björk",
+        "坂本龍一",
+        "Boards of Canada",
+        "Burial",
+        "Aphex Twin",
+        "Godspeed You! Black Emperor",
+        "My Bloody Valentine",
+        "Slowdive",
+        "Tim Hecker",
+        "Oneohtrix Point Never",
+        "Mount Eerie",
+        "Grouper",
+        "Yves Tumor",
+        "Death Grips",
+        "Jean-Michel Jarre",
+        "Café Tacvba",
+        "Mazzy Star",
+        "The Caretaker",
+        "Vladislav Delay",
+        "Fennesz",
+    ];
+
+    const NOUNS: [&str; 16] = [
+        "Mirror", "Drain", "Static", "Ember", "Cathedral", "Window", "Spiral", "Hollow", "Signal",
+        "Vapour", "Garden", "Machine", "Threnody", "Halo", "Pulse", "Lantern",
+    ];
+
+    const ADJECTIVES: [&str; 12] = [
+        "Quiet", "Endless", "Silver", "Broken", "Distant", "Pale", "Late", "Hidden", "Soft",
+        "Burning", "Frozen", "Golden",
+    ];
+
+    const ALBUMS: [&str; 16] = [
+        "Eversince",
+        "Icedancer",
+        "Ágætis byrjun",
+        "Untrue",
+        "Selected Ambient Works 85-92",
+        "Loveless",
+        "Souvlaki",
+        "Ravedeath, 1972",
+        "R Plus Seven",
+        "Dragon New Warm Mountain I Believe In You",
+        "Geogaddi",
+        "Dead Magic",
+        "A Crow Looked At Me",
+        "Hvarf/Heim",
+        "The Disintegration Loops",
+        "Blonde",
+    ];
+
+    const TITLES: [&str; 20] = [
+        "Be Nice 2 Me",
+        "Obedient",
+        "Who Goes There",
+        "Untitled #3",
+        "Svefn-g-englar",
+        "Archangel",
+        "Xtal",
+        "Sometimes",
+        "When the Sun Hits",
+        "Avril 14th",
+        "In a Beautiful Place Out in the Country",
+        "Real Love",
+        "Lilac",
+        "Weird Fishes / Arpeggi",
+        "Fade Into You",
+        "Nausea",
+        "Zonked Out",
+        "半分",
+        "It's Nothing",
+        "Last Chance to Breathe (Reprise)",
+    ];
+
+    const GENRES: [&str; 12] = [
+        "Cloud Rap",
+        "Ambient",
+        "Dubstep",
+        "Shoegaze",
+        "Drone",
+        "IDM",
+        "Post-Rock",
+        "Trance",
+        "Dream Pop",
+        "Experimental Hip Hop",
+        "Modern Classical",
+        "Noise",
+    ];
+
+    /// Navidrome-shaped: a 32-char hex id, which is what the per-track
+    /// history lookups actually hash.
+    fn song_id(album: usize, track: usize) -> String {
+        let mut rng = Rng(((album as u64) << 20) ^ track as u64);
+        format!("{:016x}{:016x}", rng.next(), rng.next())
+    }
+
+    fn artist_name(index: usize, rng: &mut Rng) -> String {
+        if index < ARTISTS.len() {
+            return ARTISTS[index].to_string();
+        }
+        match index % 3 {
+            0 => format!("{} {}", rng.pick(&ADJECTIVES), rng.pick(&NOUNS)),
+            1 => format!("{}s of {}", rng.pick(&NOUNS), rng.pick(&NOUNS)),
+            _ => format!("{} {}", rng.pick(&NOUNS), index),
+        }
+    }
+
+    /// `albums` albums of `per_album` tracks over `albums / 6` artists,
+    /// each album ingested whole so positions and track totals exist
+    /// and every generator can fire. Names come off the word lists, so
+    /// the lowercasing and the key hashing see realistic lengths and
+    /// non-ascii rather than `Artist 7`.
+    fn library(albums: usize, per_album: usize) -> Catalog {
+        let client = client();
+        let mut rng = Rng(0x5eed_1234);
+        let mut catalog = Catalog::new();
+        let artist_count = (albums / 6).max(1);
+        let names: Vec<String> = (0..artist_count)
+            .map(|i| artist_name(i, &mut rng))
+            .collect();
+        for (i, name) in names.iter().enumerate() {
+            catalog.ingest_item(&artist_item(&format!("ar-{i}"), name));
+        }
+        for al in 0..albums {
+            let artist = &names[al % artist_count];
+            let album = match al % 4 {
+                0 => rng.pick(&ALBUMS).to_string(),
+                1 => format!("{} {}", rng.pick(&ADJECTIVES), rng.pick(&NOUNS)),
+                2 => format!("{} ({} Edition)", rng.pick(&ALBUMS), rng.pick(&ADJECTIVES)),
+                _ => format!("{} {}", rng.pick(&NOUNS), 1960 + rng.upto(66)),
+            };
+            catalog.ingest_item(&album_item(&format!("al-{al}"), &album, artist));
+            let genres = [GENRES[al % GENRES.len()]];
+            let songs: Vec<Song> = (0..per_album)
+                .map(|t| {
+                    let title = match t % 5 {
+                        0 => rng.pick(&TITLES).to_string(),
+                        1 => format!("{} {}", rng.pick(&ADJECTIVES), rng.pick(&NOUNS)),
+                        2 => format!(
+                            "{} (feat. {})",
+                            rng.pick(&TITLES),
+                            rng.pick(&ARTISTS)
+                        ),
+                        3 => format!("{} - Remastered {}", rng.pick(&TITLES), 2004 + rng.upto(20)),
+                        _ => format!("{} {}", rng.pick(&NOUNS), rng.pick(&NOUNS)),
+                    };
+                    song(&song_id(al, t), &title, artist, &album, &genres)
+                })
+                .collect();
+            catalog.ingest_album(artist, &album, &songs, &client);
+        }
+        catalog
+    }
+
+    /// A listen history over the first `played` albums: fresh, stale
+    /// and long-dead plays mixed, so decay, rediscovery and the daily
+    /// rotation all have something real to rank.
+    fn history(played: usize, per_album: usize) -> CacheIndex {
+        let mut out = History::new();
+        for al in 0..played {
+            for t in 0..per_album {
+                if (al * per_album + t).is_multiple_of(3) {
+                    continue;
+                }
+                let days_ago = ((al * 7 + t * 13) % 400) as u64;
+                let plays = 1 + ((al + t) % 9) as u32;
+                let days = 1 + ((al + t) % 5) as u32;
+                out = out.played(&song_id(al, t), plays, days, days_ago);
+            }
+        }
+        out.build()
+    }
+
+    fn profile() -> &'static str {
+        if cfg!(debug_assertions) {
+            "DEBUG (not the shipping cost; re-run with --release)"
+        } else {
+            "release"
+        }
+    }
+
+    /// Microseconds per call, best of `rounds` batches of `iters`.
+    fn best(rounds: usize, iters: usize, f: &mut dyn FnMut()) -> f64 {
+        let mut best = f64::MAX;
+        for _ in 0..rounds {
+            let at = Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            best = best.min(at.elapsed().as_secs_f64() * 1e6 / iters as f64);
+        }
+        best
+    }
+
+    /// Alternating batches in one process, best of each. Sequential
+    /// runs on this box differ 1.6-1.8x under load, so two separate
+    /// measurements are not comparable and this is the only shape that
+    /// is.
+    #[allow(dead_code)]
+    fn best_each(
+        rounds: usize,
+        iters: usize,
+        a: &mut dyn FnMut(),
+        b: &mut dyn FnMut(),
+    ) -> (f64, f64) {
+        let mut out = (f64::MAX, f64::MAX);
+        for _ in 0..rounds {
+            out.0 = out.0.min(best(1, iters, a));
+            out.1 = out.1.min(best(1, iters, b));
+        }
+        out
+    }
+
+    /// Where one pass spends its time, stage by stage. Not an
+    /// assertion: this is the map that says what is worth optimizing,
+    /// and the `tail` line is everything after candidate generation
+    /// (normalise, dedup, diversify, group).
+    #[test]
+    #[ignore = "a measurement; run it explicitly"]
+    fn where_a_suggestion_pass_spends_its_time() {
+        for (albums, per_album) in [(700usize, 14usize), (2_200, 14)] {
+            let catalog = library(albums, per_album);
+            let cache = history(albums / 2, per_album);
+            let starred = starred(&[
+                &song_id(1, 1),
+                &song_id(2, 2),
+                &song_id(900, 3),
+                &song_id(901, 4),
+            ]);
+            let enrichment = EnrichmentCache::new();
+            let tuning = Tuning::default();
+            let req = Request {
+                catalog: &catalog,
+                cache: &cache,
+                starred: &starred,
+                now_secs: NOW,
+                seed: 7,
+                enrichment: &enrichment,
+                tuning: &tuning,
+            };
+            println!(
+                "--- {} tracks / {albums} albums / {} artists, {} build",
+                catalog.track_count(),
+                catalog.artist_count(),
+                profile()
+            );
+            let rounds = 5;
+            let iters = 10;
+            let total = best(rounds, iters, &mut || {
+                let _ = suggest(&req);
+            });
+            let model = best(rounds, iters, &mut || {
+                let _ = Model::build(&req);
+            });
+            let built = Model::build(&req);
+            let mut stages = vec![("model", model)];
+            let mut gens = 0.0;
+            for (name, run) in [
+                ("daily_rotation", &daily_rotation as &dyn Fn(&Model) -> Vec<Candidate>),
+                ("album_gap", &album_gap),
+                ("track_gap", &track_gap),
+                ("album_neighbours", &album_neighbours),
+                ("genre_under_explored", &genre_under_explored),
+                ("rediscovery", &rediscovery),
+                ("starred_unplayed", &starred_unplayed),
+            ] {
+                let us = best(rounds, iters, &mut || {
+                    let _ = run(&built);
+                });
+                gens += us;
+                stages.push((name, us));
+            }
+            stages.push(("tail (+generation overhead)", total - model - gens));
+            for (name, us) in stages {
+                println!("  {name:<28} {us:>10.1}us  {:>5.1}%", 100.0 * us / total);
+            }
+            println!("  {:<28} {total:>10.1}us", "total");
         }
     }
 }
