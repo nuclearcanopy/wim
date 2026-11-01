@@ -56,6 +56,11 @@ pub const CELL_ASPECT: f32 = 2.0;
 /// and a zero here would divide every frame time by it.
 pub const FALLBACK_FPS: f64 = 25.0;
 
+/// The floor on a user-set rate. Below this the picture is a slideshow
+/// and the catch-up arithmetic gets coarse enough to be visible; a
+/// stream that is genuinely slower than this keeps its own rate.
+pub const MIN_FPS: f64 = 1.0;
+
 /// How far behind the picture may fall before respawning beats reading
 /// through the gap.
 ///
@@ -155,11 +160,17 @@ impl Grid {
     /// letterbox for square pixels and come out stretched on screen.
     /// `pad` is what keeps every frame the same size whatever the
     /// source aspect is, so the reader never renegotiates.
-    fn vf(self) -> String {
+    /// `fps` leads the chain, and it is not only a rate cap: it makes
+    /// the stream constant-rate, which is what lets `Schedule` say
+    /// "frame n *is* media time start + n/fps" at all. It also means
+    /// mpv scales only the frames that will be read, so a capped rate
+    /// is cheaper on its side too, not just on wim's.
+    fn vf(self, fps: f64) -> String {
         let (w, h) = self.pixels();
         let (bw, bh) = self.fit_box();
         format!(
-            "scale={bw}:{bh}:force_original_aspect_ratio=decrease,\
+            "fps={fps},\
+             scale={bw}:{bh}:force_original_aspect_ratio=decrease,\
              pad={bw}:{bh}:-1:-1:color=black,\
              scale={w}:{h},format=rgb24"
         )
@@ -340,6 +351,25 @@ pub fn plan(want_ascii: bool, media: Option<&Path>, grid: Grid, have: Have) -> P
         return Plan::Resize { grid };
     }
     Plan::Keep
+}
+
+/// The rate the ascii pane runs at: the stream's own, unless the user
+/// capped it.
+///
+/// A cap can only lower it. Asking for more frames than the file has
+/// would make mpv duplicate them, which costs a full paint each to
+/// show the same picture; the display refresh is not the thing being
+/// matched here.
+pub fn ascii_fps(container: Option<f64>, capped: Option<f64>) -> f64 {
+    let stream = container
+        .filter(|f| f.is_finite() && *f > 0.0)
+        .unwrap_or(FALLBACK_FPS);
+    let want = capped
+        .filter(|f| f.is_finite() && *f > 0.0)
+        .map_or(stream, |c| c.min(stream));
+    // not `clamp`: that panics when the floor is above the ceiling,
+    // which is any stream slower than `MIN_FPS`.
+    want.max(MIN_FPS.min(stream))
 }
 
 /// The host's half: owns at most one instance and applies `plan` to it,
@@ -531,7 +561,10 @@ impl FrameSource {
         let mut cmd = Command::new("mpv");
         cmd.arg("--no-config")
             .arg("--no-terminal")
-            .arg(format!("--vf={}", self.grid.vf()))
+            // the schedule's own rate, not the container's: these two
+            // numbers are the same number or the picture drifts
+            // against `time-pos` at exactly their ratio.
+            .arg(format!("--vf={}", self.grid.vf(self.sched.fps())))
             // a frame source and nothing else: no audio device to fight
             // the audible instance over, no subtitles.
             .arg("--audio=no")
@@ -856,8 +889,8 @@ mod tests {
         // the fit box is the sample grid's real-world shape.
         assert_eq!(grid.fit_box(), (320, 192));
         assert_eq!(
-            grid.vf(),
-            "scale=320:192:force_original_aspect_ratio=decrease,\
+            grid.vf(25.0),
+            "fps=25,scale=320:192:force_original_aspect_ratio=decrease,\
              pad=320:192:-1:-1:color=black,scale=320:96,format=rgb24"
         );
         // a square cell needs no squash, and the same chain degenerates
@@ -2241,5 +2274,100 @@ mod frame_budget {
                 new_frame / repaint,
             );
         }
+    }
+}
+
+/// The rate the pane runs at, which is one number in two places: the
+/// filter chain mpv is spawned with, and the `Schedule` that decides
+/// which frame is due. They cannot be allowed to disagree.
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+
+    /// Unset means the file's own rate, and a missing or nonsense
+    /// `container-fps` (0 for some containers) falls back rather than
+    /// dividing every frame time by it.
+    #[test]
+    fn an_uncapped_rate_is_the_streams_own() {
+        assert_eq!(ascii_fps(Some(30.0), None), 30.0);
+        assert_eq!(ascii_fps(Some(23.976), None), 23.976);
+        assert_eq!(ascii_fps(None, None), FALLBACK_FPS);
+        assert_eq!(ascii_fps(Some(0.0), None), FALLBACK_FPS);
+        assert_eq!(ascii_fps(Some(-5.0), None), FALLBACK_FPS);
+        assert_eq!(ascii_fps(Some(f64::NAN), None), FALLBACK_FPS);
+        assert_eq!(ascii_fps(Some(f64::INFINITY), None), FALLBACK_FPS);
+    }
+
+    /// A cap only ever lowers the rate. Raising it would make mpv
+    /// duplicate frames, and a duplicate costs a full paint to show
+    /// the picture that is already on screen.
+    #[test]
+    fn a_cap_only_lowers_the_rate() {
+        assert_eq!(ascii_fps(Some(30.0), Some(12.0)), 12.0);
+        assert_eq!(ascii_fps(Some(24.0), Some(60.0)), 24.0, "the cap is not a target");
+        assert_eq!(ascii_fps(None, Some(10.0)), 10.0, "capped below the fallback");
+        assert_eq!(ascii_fps(None, Some(99.0)), FALLBACK_FPS);
+    }
+
+    /// A nonsense cap is ignored rather than refused: this value comes
+    /// from a hand-edited config.toml, and a zero would divide every
+    /// frame time by it.
+    ///
+    /// Recorded because mutating it taught me something: dropping
+    /// `is_finite` from the *cap*'s filter changes nothing, since NaN
+    /// already fails `> 0.0` and an infinite cap is `min`'d away by
+    /// the stream. It is belt and braces there. On the *container*'s
+    /// filter it is load-bearing, and the mutation does fail: an
+    /// infinite rate would otherwise become the stream rate, and go
+    /// into both the filter chain and `Schedule`.
+    #[test]
+    fn a_nonsense_cap_leaves_the_rate_alone() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(ascii_fps(Some(30.0), Some(bad)), 30.0, "{bad}");
+        }
+    }
+
+    /// The floor is a floor on the *cap*, not on the file: a 0.5fps
+    /// timelapse keeps its own rate, because `MIN_FPS.min(stream)` is
+    /// the floor and `clamp` would panic here instead.
+    #[test]
+    fn a_stream_slower_than_the_floor_keeps_its_rate() {
+        assert_eq!(ascii_fps(Some(0.5), None), 0.5);
+        assert_eq!(ascii_fps(Some(0.5), Some(0.25)), 0.5);
+        assert_eq!(
+            ascii_fps(Some(30.0), Some(0.25)),
+            MIN_FPS,
+            "a cap under the floor is raised to it"
+        );
+    }
+
+    /// `fps` has to lead the chain: after the scales it would scale
+    /// frames that are about to be dropped, and `Schedule`'s whole
+    /// "frame n is media time start + n/fps" identity needs the stream
+    /// to be constant-rate, which is what this filter makes it.
+    #[test]
+    fn the_rate_leads_the_filter_chain() {
+        let vf = Grid::new(80, 24, 2.0).vf(12.0);
+        assert!(vf.starts_with("fps=12,"), "{vf}");
+        assert!(vf.ends_with("format=rgb24"), "{vf}");
+    }
+
+    /// The invariant that cannot be reached without spawning mpv: the
+    /// rate in the filter chain and the rate `Schedule` counts with
+    /// are the same expression. If they ever differ the picture drifts
+    /// against `time-pos` at exactly their ratio, which is the kind of
+    /// bug that looks like a sync mystery.
+    #[test]
+    fn the_filter_and_the_schedule_are_given_one_number() {
+        let src = include_str!("framesource.rs");
+        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
+        let at = code
+            .find("--vf=")
+            .expect("mpv is spawned without a filter chain");
+        let spawn = &code[at..(at + 120).min(code.len())];
+        assert!(
+            spawn.contains("self.grid.vf(self.sched.fps())"),
+            "the filter rate is not the schedule's rate:\n{spawn}"
+        );
     }
 }
