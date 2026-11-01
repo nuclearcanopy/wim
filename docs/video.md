@@ -458,6 +458,60 @@ still not it: every frame is a blocking ipc round trip competing with
 wim's own property traffic, plus a png encode, a file write and a file
 read for data wim already had in raw form a step earlier.
 
+## the host half, and what is pure in it
+
+the frame source is the hard part; the lifecycle around it is four
+decisions, and they are separated out for the same reason `Schedule` is:
+every one of them is testable with no child process anywhere.
+
+`framesource::plan(want_ascii, media, grid, have)` answers `Keep`,
+`Stop`, `Start { grid }` or `Resize { grid }`. two of those are not
+obvious:
+
+- **`Start` also covers a changed file.** encode mode has no socket to
+  seek over, which is why `restart` takes a time and not a path, so a
+  new file is a new child. a seek *within* one file is `advance_to`'s
+  own restart and never reaches `plan`.
+- **`Stop` only fires when something is running.** an idle frame is
+  `Keep`, so a wim with ascii off does no work at all, and `Stop` keeps
+  meaning something.
+
+`framesource::Ascii` is the holder: one `update(want_ascii, media,
+grid, now, fps)` per ui frame, and the draw path asks `active()`.
+three things it does that the decision table cannot:
+
+- **the fps closure.** `container-fps` is an ipc round trip on the
+  audible instance, and only a spawn needs it, so it is a `FnOnce` and
+  an ordinary frame never pays for it.
+- **the refusal latch.** a spawn that fails is latched against the file
+  that failed, so a video mpv cannot decode costs one alert instead of
+  one per frame. the latch is dropped the moment that file stops being
+  the one asked for, and it cannot be cleared on `Stop` instead: a
+  failed spawn leaves nothing running, so turning ascii off is `Keep`.
+  that was found by a test, not by reading.
+- **one decision for two outputs.** the loop calls `video::showing`
+  once; `want_vo` is `showing.mpv_vo()` and the pane takes
+  `showing.is_ascii()`. ascii and a drawing vo cannot both think they
+  own the screen, because there is only one answer.
+
+in the draw closure the ascii branch comes before every other one and
+returns, so the ui is never painted under the frames. notifications are
+the exception, drawn on top: an alert behind the picture is an alert
+nobody sees.
+
+the position is the `elapsed_secs` every widget already reads, so the
+picture cannot drift from the scrubber, and since the fifo is the clock
+a pause stops advancing it and mpv blocks in `write(2)` on its own.
+
+shift-`v` is the runtime toggle. `video::effective(configured,
+override)` is what the decision reads, so the override is a `None`
+beside `video_fullscreen` and a restart goes back to config.toml;
+`toggle_ascii` clears the override rather than naming a mode, except
+when ascii is itself configured, where `Auto` is the honest other half.
+the press turns fullscreen on in the same stroke, because the pane only
+draws fullscreen and the first press would otherwise look like nothing
+happened.
+
 ## what mpv can do instead
 
 mpv has video outputs that draw into a terminal directly. on this build

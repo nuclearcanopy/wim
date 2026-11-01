@@ -96,6 +96,13 @@ it. `auto` uses kitty only when the terminal actually answered the
 graphics probe with it, `tct` otherwise. `off` disables the key. music
 playback is never affected.
 
+`ascii` is the fallback for a terminal with no image protocol at all:
+wim decodes the video itself and paints it as monochrome text cells, so
+it works over ssh and in any terminal that can show text. `auto` never
+picks it (a real protocol beats a cell grid wherever one exists), so it
+is either `video_output = "ascii"` in config.toml or shift-`v` at
+runtime, which also switches to fullscreen.
+
 ## keybindings
 
 press `?` in the app for the full list. it resolves every key from the
