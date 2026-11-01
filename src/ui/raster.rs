@@ -595,6 +595,16 @@ fn quantize(q: [u8; 4]) -> (usize, u8, u8) {
     let mid = midpoint(q);
     // one pass for the mask and both sums: splitting it cost a second
     // walk over the four samples and bought nothing.
+    //
+    // **the branch stays, measured.** a branchless version (multiply
+    // by the predicate, take the background sum off the total) is
+    // 1.48x faster on unpredictable quads and **0.86x on flat ones**,
+    // and real covers are mostly flat: 72-90% of cells on a
+    // disc-shaped fixture, which is what large areas of near-uniform
+    // colour look like. weighted by time that is ~8% slower at 90%
+    // flat and only wins on a pure gradient. `quantize_cost` and
+    // `flat_cell_fraction_of_real_covers` are the two benches that
+    // make that decidable; see docs/raster.md.
     let mut mask = 0usize;
     let mut fg_sum = 0u32;
     let mut fg_n = 0u32;
@@ -2347,6 +2357,148 @@ mod tests {
             }
         }
         best
+    }
+
+    /// The branchless `quantize` that was measured and **not**
+    /// shipped, kept so the decision stays checkable rather than
+    /// becoming folklore. Output-identical to `quantize`; only the
+    /// timing differs, and which way depends on the content.
+    fn branchless_quantize(q: [u8; 4]) -> (usize, u8, u8) {
+        let mid = midpoint(q);
+        let mut mask = 0usize;
+        let mut fg_sum = 0u32;
+        let mut fg_n = 0u32;
+        let mut total = 0u32;
+        for (i, &v) in q.iter().enumerate() {
+            let v = v as u32;
+            let fg = u32::from(v >= mid as u32);
+            mask |= (fg as usize) << i;
+            fg_sum += v * fg;
+            fg_n += fg;
+            total += v;
+        }
+        let bg_sum = total - fg_sum;
+        let fg = div_small(fg_sum, fg_n) as u8;
+        let bg = if fg_n >= 4 {
+            fg
+        } else {
+            div_small(bg_sum, 4 - fg_n) as u8
+        };
+        (mask, fg, bg)
+    }
+
+    /// The two are the same function, which is what makes the timing
+    /// comparison meaningful rather than a comparison of two answers.
+    #[test]
+    fn the_rejected_branchless_quantize_gives_the_same_answer() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..200_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let q = [
+                seed as u8,
+                (seed >> 8) as u8,
+                (seed >> 16) as u8,
+                (seed >> 24) as u8,
+            ];
+            assert_eq!(quantize(q), branchless_quantize(q), "{q:?}");
+        }
+        for v in 0..=255u8 {
+            assert_eq!(quantize([v; 4]), branchless_quantize([v; 4]));
+        }
+    }
+
+    /// `quantize` alone, branchless against branching, on quads whose
+    /// split is a coin flip (which is what an edge in the image is)
+    /// and on flat ones (which predict perfectly).
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn quantize_cost() {
+        // deterministic, and deliberately not sorted: a predictable
+        // pattern would let the branch predictor win and hide the
+        // whole point.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let edges: Vec<[u8; 4]> = (0..4096)
+            .map(|_| {
+                let r = next();
+                [r as u8, (r >> 8) as u8, (r >> 16) as u8, (r >> 24) as u8]
+            })
+            .collect();
+        let flats: Vec<[u8; 4]> = (0..4096).map(|i| [(i % 256) as u8; 4]).collect();
+
+        for (label, quads) in [("edges", &edges), ("flat", &flats)] {
+            let [old, new] = best_each::<2>(5, 50, |which| {
+                let f = if which == 0 {
+                    quantize
+                } else {
+                    branchless_quantize
+                };
+                let mut acc = 0usize;
+                for q in quads.iter() {
+                    let (m, fg, bg) = f(std::hint::black_box(*q));
+                    acc = acc.wrapping_add(m + fg as usize + bg as usize);
+                }
+                std::hint::black_box(acc);
+            });
+            let per = |d: std::time::Duration| d.as_nanos() as f64 / quads.len() as f64;
+            println!(
+                "{label:<6} shipped {:>6.2} ns/cell   branchless {:>6.2}   {:.2}x",
+                per(old),
+                per(new),
+                per(old) / per(new)
+            );
+        }
+    }
+
+    /// What fraction of a real cover's cells are flat, which is the
+    /// number that decides whether branchless `quantize` is a win.
+    ///
+    /// A full block is mask `0b1111`, and that happens *only* for a
+    /// flat cell: `mid` is the midpoint of the cell's own range, so a
+    /// non-flat cell always has at least one sample below it. So
+    /// counting full blocks in a painted grid counts flat cells.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn flat_cell_fraction_of_real_covers() {
+        let disc = {
+            let (w, h) = (640u32, 640u32);
+            DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
+                let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+                let d = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
+                let v = if d < cx * 0.75 { 235 } else { 25 };
+                Rgb([v, v, v])
+            }))
+        };
+        for (label, img) in [("ramp", ramp(640, 640)), ("disc", disc)] {
+            for (w, h) in [(26u16, 13u16), (70, 35)] {
+                let rect = Rect::new(0, 0, w, h);
+                let mut buf = Buffer::empty(rect);
+                let mut r = Raster::new();
+                let style = Style {
+                    fit: Fit::Contain,
+                    tone: Tone::Mono,
+                };
+                r.sample(&img, rect, 2.0, style);
+                r.paint(rect, &mut buf);
+                let total = buf.content.len();
+                let flat = buf
+                    .content
+                    .iter()
+                    .filter(|c| c.symbol() == "\u{2588}")
+                    .count();
+                println!(
+                    "{label:<5} {w:>3}x{h:<3} flat {flat:>5} of {total:<5} = {:>5.1}%",
+                    100.0 * flat as f64 / total as f64
+                );
+            }
+        }
     }
 
     /// Numbers for the report, not a pass/fail gate; `cargo test
