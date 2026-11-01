@@ -379,10 +379,20 @@ mod submission_wiring {
                 return;
             }
             let body = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-            seen.lock().unwrap().push(Listen { auth, body });
-            let reply = "{\"status\":\"ok\"}";
+            let listen = Listen { auth, body };
+            // a track named for it gets refused, so the failure path
+            // is reachable through the real client without a second
+            // collector: the redirect is process-wide, so there can
+            // only be one.
+            let refuse = listen.track().contains("refuse me");
+            seen.lock().unwrap().push(listen);
+            let (status, reply) = if refuse {
+                ("401 Unauthorized", "{\"code\":401,\"error\":\"invalid token\"}")
+            } else {
+                ("200 OK", "{\"status\":\"ok\"}")
+            };
             let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
                 reply.len()
             );
             if writer.write_all(head.as_bytes()).is_err() {
@@ -410,6 +420,44 @@ mod submission_wiring {
         }
     }
 
+    /// A refusal reaches the host, instead of vanishing.
+    ///
+    /// Both submits were `let _ =`, which made **a revoked token
+    /// indistinguishable from working**: nothing scrobbles and nothing
+    /// is said, for as long as you do not go and check the website.
+    /// Driven through the real `fire_*` against the collector, which
+    /// answers 401 for a track named for it.
+    #[test]
+    fn a_refused_submission_reports_itself() {
+        let c = collector();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        crate::core::fire_scrobble(&configured(), &song("refuse me, listen"), 1, Some(&tx));
+        let failed = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the refusal has to reach the host");
+        assert_eq!(failed.kind, "listen", "it says which submission: {failed:?}");
+        assert!(
+            failed.error.to_lowercase().contains("401")
+                || failed.error.to_lowercase().contains("unauthor"),
+            "and carries the cause: {failed:?}"
+        );
+
+        crate::core::fire_playing_now(&configured(), &song("refuse me, playing"), Some(&tx));
+        let failed = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the playing-now half reports too");
+        assert_eq!(failed.kind, "playing now");
+
+        // and an accepted one says nothing at all.
+        crate::core::fire_playing_now(&configured(), &song("accept me"), Some(&tx));
+        c.wait_for("accept me");
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a submission that worked must not report a failure"
+        );
+    }
+
     fn song(title: &str) -> SearchItem {
         SearchItem::Song {
             id: "song-1".into(),
@@ -433,9 +481,9 @@ mod submission_wiring {
         let cfg = configured();
         let fifteen_minutes = SearchItem::Silence { secs: 900 };
 
-        crate::core::fire_playing_now(&cfg, &fifteen_minutes);
-        crate::core::fire_scrobble(&cfg, &fifteen_minutes, 1_443_521_965);
-        crate::core::fire_playing_now(&cfg, &song("the silence control"));
+        crate::core::fire_playing_now(&cfg, &fifteen_minutes, None);
+        crate::core::fire_scrobble(&cfg, &fifteen_minutes, 1_443_521_965, None);
+        crate::core::fire_playing_now(&cfg, &song("the silence control"), None);
 
         server.wait_for("the silence control");
         thread::sleep(Duration::from_millis(100));
@@ -457,7 +505,7 @@ mod submission_wiring {
     #[test]
     fn a_remote_song_is_submitted_with_its_own_metadata() {
         let server = collector();
-        crate::core::fire_scrobble(&configured(), &song("Icedancer"), 1_443_521_965);
+        crate::core::fire_scrobble(&configured(), &song("Icedancer"), 1_443_521_965, None);
 
         let listen = server.wait_for("Icedancer");
         assert_eq!(listen.auth, "Token a-test-token");
@@ -474,7 +522,7 @@ mod submission_wiring {
     #[test]
     fn a_track_start_is_submitted_as_playing_now_with_no_timestamp() {
         let server = collector();
-        crate::core::fire_playing_now(&configured(), &song("Be Nice 2 Me"));
+        crate::core::fire_playing_now(&configured(), &song("Be Nice 2 Me"), None);
 
         let listen = server.wait_for("Be Nice 2 Me");
         assert_eq!(listen.body["listen_type"], "playing_now");
@@ -493,8 +541,8 @@ mod submission_wiring {
     fn nothing_is_submitted_when_no_token_is_configured() {
         let server = collector();
         let untitled = "Girls Just Want to Have Fun";
-        crate::core::fire_scrobble(&Config::default(), &song(untitled), 1);
-        crate::core::fire_playing_now(&configured(), &song("the token control"));
+        crate::core::fire_scrobble(&Config::default(), &song(untitled), 1, None);
+        crate::core::fire_playing_now(&configured(), &song("the token control"), None);
 
         server.wait_for("the token control");
         thread::sleep(Duration::from_millis(100));
@@ -517,8 +565,8 @@ mod submission_wiring {
             artist: None,
             album: None,
         };
-        crate::core::fire_scrobble(&configured(), &untagged, 1);
-        crate::core::fire_playing_now(&configured(), &song("the artist control"));
+        crate::core::fire_scrobble(&configured(), &untagged, 1, None);
+        crate::core::fire_playing_now(&configured(), &song("the artist control"), None);
 
         server.wait_for("the artist control");
         thread::sleep(Duration::from_millis(100));

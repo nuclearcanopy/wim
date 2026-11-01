@@ -753,7 +753,15 @@ fn main() -> anyhow::Result<()> {
     // whatever was playing right before `now_playing` last changed;
     // purely for the player view's "previous: ..." line.
     let mut previous_track: Option<SearchItem> = None;
-    let mut scrobble = ScrobbleState::default();
+    // a refused submission has nowhere to go otherwise, which made a
+    // revoked token indistinguishable from working: nothing scrobbles
+    // and nothing is said. `notify::push` coalesces repeats, so a dead
+    // token is one counted box rather than one per track.
+    let (scrobble_failed_tx, scrobble_failed_rx) = mpsc::channel::<wim::core::ScrobbleFailed>();
+    let mut scrobble = ScrobbleState {
+        failed_tx: Some(scrobble_failed_tx),
+        ..ScrobbleState::default()
+    };
     // false (full player) by default for a standalone play; starting
     // playback from an open album/playlist sets this true instead, so
     // the track listing stays visible rather than getting replaced.
@@ -2347,7 +2355,7 @@ fn main() -> anyhow::Result<()> {
                     if listenbrainz::should_scrobble(&cfg.scrobble, elapsed, duration) {
                         let listened_at =
                             scrobble.started_unix.unwrap_or_else(listenbrainz::now_unix);
-                        fire_scrobble(&cfg, item, listened_at);
+                        fire_scrobble(&cfg, item, listened_at, scrobble.failed_tx.as_ref());
                         scrobble.scrobbled = true;
                     }
                 }
@@ -2463,6 +2471,13 @@ fn main() -> anyhow::Result<()> {
         // reverting rather than re-asking: the user saw it take, and a
         // retry loop against a server saying no is worse than one
         // honest line.
+        while let Ok(failed) = scrobble_failed_rx.try_recv() {
+            notifications.push(
+                Severity::Error,
+                format!("listenbrainz refused the {}: {}", failed.kind, failed.error),
+            );
+        }
+
         while let Ok(failed) = star_rx.try_recv() {
             if failed.wanted {
                 remote_starred.remove(&failed.id);

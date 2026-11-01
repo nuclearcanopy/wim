@@ -2371,14 +2371,34 @@ stray paint.
       work turned up). what the discarded result actually hid is a
       refill coming back short with no word, so it is counted and
       reported now, the discipline `append_resolved` already uses.
-- [ ] **three of the nine are still open.** `core.rs` 887/900 (every
-      scrobble failure forever, so a revoked token is
-      indistinguishable from working; the shape is written up under the
-      scrobble-metadata item), 784-797 (four consecutive silent returns
-      in subtitle auto-fetch, so a wrong key looks identical to "no
-      subtitles exist"), and `main.rs` ~2062's sibling cases where a
-      per-track status is still dropped on a path other than the
-      first-frame refill.
+- [x] **a refused scrobble reports itself.** both submits were
+      `let _ =`, which made **a revoked token indistinguishable from
+      working**: nothing scrobbles and nothing is said, for as long as
+      you do not go and check the website. this is the one of the nine
+      with the longest silent failure window, which is why it went
+      next.
+      `ScrobbleFailed` mirrors `StarFailed`, since the submit runs on a
+      spawned thread and reporting needs a channel the caller owns. the
+      sender lives **on `ScrobbleState`** rather than as a fourth
+      argument: that struct is already threaded to every site that
+      fires a listen, so it is one construction point instead of three
+      signatures and a `CoreCtx` field. `Option`, so the module's own
+      tests stay on their collector rather than a channel.
+      `notify::push` coalesces repeats, so a dead token is one counted
+      box and not one per track.
+      **the collector learned to refuse**, keyed by track name: the
+      redirect is process-wide so there can only be one collector, and
+      a name it recognises answers 401. that makes the failure path
+      reachable through the real client instead of mocked around. the
+      test also asserts an *accepted* submission reports nothing, so
+      the channel cannot start crying wolf.
+      two mutations caught: discarding the listen result again, and
+      both halves reporting as the same kind.
+- [ ] **two of the nine are still open.** `core.rs` 784-797 (four
+      consecutive silent returns in subtitle auto-fetch, so a wrong
+      opensubtitles key looks identical to "no subtitles exist"), and
+      the sibling per-track statuses still dropped on paths other than
+      the first-frame queue refill.
 - [x] ~~resolved by the overnight run~~ **two hardcoded keys in rendered text.** `ui/queue.rs` ~188
       hardcodes `'a'` for the remappable `Enqueue` ("enter on a song
       to start, 'a' to add"), the exact bug class
