@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
@@ -8,8 +10,8 @@ use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::theme::{shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE, WHITE};
 use crate::ui::albumart::CachedArt;
 use crate::ui::controlsbar::{
-    fill_bg, segments_that_fit, track, Field, GLYPH_CROSSFADE, GLYPH_EQ, GLYPH_LOOP, GLYPH_PAUSE,
-    GLYPH_PLAY, GLYPH_SHUFFLE, GLYPH_SPEED, SCRUB_BG, SELECT_BG, TRACK_MIN,
+    fill_bg, segments_that_fit, track_into, Field, GLYPH_CROSSFADE, GLYPH_EQ, GLYPH_LOOP,
+    GLYPH_PAUSE, GLYPH_PLAY, GLYPH_SHUFFLE, GLYPH_SPEED, SCRUB_BG, SELECT_BG, TRACK_MIN,
 };
 use crate::ui::draw;
 use crate::ui::gap::{Gap, GapPanel};
@@ -50,6 +52,17 @@ const SEP_GLYPHS: usize = 2;
 /// Between hints on the bottom row; a dot, since those are sentences
 /// about keys and two spaces alone did not read as a list.
 const HINT_SEP: &str = "  ·  ";
+
+/// `HINT_SEP`'s width: five columns in six bytes, so neither a byte
+/// count nor a walk per frame. `the_hint_separator_is_five_cells_wide`
+/// holds the two together.
+const HINT_SEP_CELLS: usize = 5;
+
+/// Most hints a row ever lists, as the stack the fit is tried on.
+const HINTS: usize = 4;
+
+/// Controls the transport row carries, likewise.
+const CONTROLS: usize = 6;
 
 /// Where every piece of the now-playing screen goes. Returned by
 /// `layout` rather than decided inside `render` so the host can put a
@@ -295,11 +308,42 @@ enum Detail {
 struct Element {
     field: Field,
     text: String,
+    /// `text`'s display width. Measured once, where the text is built:
+    /// the fit pass, the row's centring, the rect and the plate all
+    /// want it, and asking four times was most of what a row cost.
+    cells: usize,
     lit: bool,
     /// Scrubber only: the track's offset into `text` and its length,
     /// both in cells, so a click lands on a position on the track
     /// rather than on one of the readouts either side of it.
     track: Option<(usize, usize)>,
+}
+
+impl Element {
+    fn new(field: Field, lit: bool, text: String) -> Self {
+        Element {
+            field,
+            cells: width(&text),
+            lit,
+            text,
+            track: None,
+        }
+    }
+
+    /// An element whose width is known without measuring it, which is
+    /// the scrubber: its text is as long as the row, and walking it to
+    /// count cells it was built from showed up on the frame.
+    /// `the_cells_an_element_claims_are_the_cells_it_draws` holds the
+    /// count against the text.
+    fn sized(field: Field, lit: bool, text: String, cells: usize) -> Self {
+        Element {
+            field,
+            cells,
+            lit,
+            text,
+            track: None,
+        }
+    }
 }
 
 impl PlayerView<'_> {
@@ -311,14 +355,23 @@ impl PlayerView<'_> {
     /// goes there: on a screen whose complaint was "i can't tell how to
     /// control it", the two labels are also the two hints.
     fn context_line(&self) -> String {
-        let mut parts = Vec::new();
+        // pushed, not formatted and joined, for the reason `elements`
+        // states: this is on the frame and none of it is a number.
+        let mut out = String::new();
         if let Some(prev) = self.previous {
-            parts.push(format!("{} ◂ {prev}", self.key(KeyAction::SkipBack)));
+            out.push_str(&self.key(KeyAction::SkipBack));
+            out.push_str(" ◂ ");
+            out.push_str(prev);
         }
         if let Some(next) = self.next {
-            parts.push(format!("{next} ▸ {}", self.key(KeyAction::SkipNext)));
+            if !out.is_empty() {
+                out.push_str("     ");
+            }
+            out.push_str(next);
+            out.push_str(" ▸ ");
+            out.push_str(&self.key(KeyAction::SkipNext));
         }
-        parts.join("     ")
+        out
     }
 
     /// The six toggles, and the separator the row ended up using.
@@ -336,8 +389,13 @@ impl PlayerView<'_> {
             (Detail::Glyph, SEP_GLYPHS),
         ] {
             let items = self.elements(detail);
-            let lengths: Vec<usize> = items.iter().map(|e| width(&e.text)).collect();
-            let fits = segments_that_fit(&lengths, avail, sep);
+            // on the stack and already measured: the fit is tried up
+            // to three times a row and the row twice a frame.
+            let mut lengths = [0usize; CONTROLS];
+            for (slot, e) in lengths.iter_mut().zip(&items) {
+                *slot = e.cells;
+            }
+            let fits = segments_that_fit(&lengths[..items.len()], avail, sep);
             if fits == items.len() {
                 return (items, sep);
             }
@@ -356,22 +414,40 @@ impl PlayerView<'_> {
     fn elements(&self, detail: Detail) -> Vec<Element> {
         let speed_changed = (self.speed - 1.0).abs() >= 0.005;
         let onoff = |on: bool| if on { "on" } else { "off" };
+        // a glyph, then whichever words the tier has room for after
+        // it, pushed rather than `format!`ed: six of these are rebuilt
+        // on both of a frame's row passes, and the formatter measured
+        // 4.7x a push per label (`bench::label_cost`).
+        let words = |glyph: &str, rest: &[&str]| {
+            let mut out = String::with_capacity(
+                glyph.len() + rest.iter().map(|w| w.len() + 1).sum::<usize>(),
+            );
+            out.push_str(glyph);
+            for word in rest {
+                out.push(' ');
+                out.push_str(word);
+            }
+            out
+        };
+        let glyph_words = |glyph: char, rest: &[&str]| {
+            let mut buf = [0u8; 4];
+            words(glyph.encode_utf8(&mut buf), rest)
+        };
         // name without value: the glyph's brightness already carries
         // on/off, so the middle tier spends its cells on which control
         // this is, which is the part a glyph can't teach you.
-        let named = |g: char, name: &str, value: String| match detail {
-            Detail::Full => format!("{g} {name} {value}"),
-            Detail::Named => format!("{g} {name}"),
-            Detail::Glyph => g.to_string(),
+        let named = |g: char, name: &str, value: &str| match detail {
+            Detail::Full => glyph_words(g, &[name, value]),
+            Detail::Named => glyph_words(g, &[name]),
+            Detail::Glyph => glyph_words(g, &[]),
         };
         vec![
-            Element {
-                field: Field::Pause,
-                track: None,
+            Element::new(
+                Field::Pause,
                 // lit means "audio is moving", same as the bar: the
                 // play triangle is the bright state.
-                lit: !self.paused && self.gap_remaining.is_none(),
-                text: match (detail, self.gap_remaining, self.paused) {
+                !self.paused && self.gap_remaining.is_none(),
+                match (detail, self.gap_remaining, self.paused) {
                     // the gap wins the segment: "paused" is true but
                     // it is not why, and it is not what happens next.
                     (Detail::Glyph, Some(left), _) => {
@@ -380,69 +456,66 @@ impl PlayerView<'_> {
                     (_, Some(left), _) => {
                         format!("{GLYPH_PAUSE} gap {}s", left.max(0.0).ceil() as u64)
                     }
-                    (Detail::Glyph, None, true) => GLYPH_PAUSE.to_string(),
-                    (Detail::Glyph, None, false) => GLYPH_PLAY.to_string(),
-                    (_, None, true) => format!("{GLYPH_PAUSE} paused"),
-                    (_, None, false) => format!("{GLYPH_PLAY} playing"),
+                    (Detail::Glyph, None, true) => glyph_words(GLYPH_PAUSE, &[]),
+                    (Detail::Glyph, None, false) => glyph_words(GLYPH_PLAY, &[]),
+                    (_, None, true) => glyph_words(GLYPH_PAUSE, &["paused"]),
+                    (_, None, false) => glyph_words(GLYPH_PLAY, &["playing"]),
                 },
-            },
-            Element {
-                field: Field::Loop,
-                track: None,
-                lit: self.loop_mode != LoopMode::Off,
-                text: match detail {
+            ),
+            Element::new(
+                Field::Loop,
+                self.loop_mode != LoopMode::Off,
+                match detail {
                     Detail::Glyph if self.loop_mode == LoopMode::One => {
                         format!("{GLYPH_LOOP}1")
                     }
-                    Detail::Glyph => GLYPH_LOOP.to_string(),
-                    _ => named(GLYPH_LOOP, "loop", self.loop_mode.label().to_string()),
+                    Detail::Glyph => glyph_words(GLYPH_LOOP, &[]),
+                    _ => named(GLYPH_LOOP, "loop", self.loop_mode.label()),
                 },
-            },
-            Element {
-                field: Field::Shuffle,
-                track: None,
-                lit: self.shuffle_on,
-                text: named(GLYPH_SHUFFLE, "shuffle", onoff(self.shuffle_on).to_string()),
-            },
-            Element {
-                field: Field::Speed,
-                track: None,
-                lit: speed_changed,
+            ),
+            Element::new(
+                Field::Shuffle,
+                self.shuffle_on,
+                named(GLYPH_SHUFFLE, "shuffle", onoff(self.shuffle_on)),
+            ),
+            Element::new(
+                Field::Speed,
+                speed_changed,
                 // the rate stays even at 1.00x on the two word tiers:
                 // the bar drops it to save cells, this screen has them
                 // and "what speed am i playing at" is a thing it should
                 // answer without being asked.
-                text: match detail {
+                match detail {
+                    // the rate is a number, so these go through the
+                    // formatter where the fixed labels do not.
                     Detail::Full => format!("{GLYPH_SPEED} speed {:.2}x", self.speed),
                     Detail::Named => format!("{GLYPH_SPEED} {:.2}x", self.speed),
                     Detail::Glyph if speed_changed => {
                         format!("{GLYPH_SPEED}{:.2}", self.speed)
                     }
-                    Detail::Glyph => GLYPH_SPEED.to_string(),
+                    Detail::Glyph => glyph_words(GLYPH_SPEED, &[]),
                 },
-            },
-            Element {
-                field: Field::Eq,
-                track: None,
-                lit: self.eq_preset != "flat",
-                text: match detail {
-                    Detail::Full => format!("{GLYPH_EQ} eq {}", self.eq_preset),
-                    Detail::Named => format!("{GLYPH_EQ} eq"),
-                    Detail::Glyph => GLYPH_EQ.to_string(),
+            ),
+            Element::new(
+                Field::Eq,
+                self.eq_preset != "flat",
+                match detail {
+                    Detail::Full => words(GLYPH_EQ, &["eq", self.eq_preset]),
+                    Detail::Named => words(GLYPH_EQ, &["eq"]),
+                    Detail::Glyph => words(GLYPH_EQ, &[]),
                 },
-            },
-            Element {
-                field: Field::Crossfade,
-                track: None,
-                lit: self.crossfade_on,
-                text: match detail {
+            ),
+            Element::new(
+                Field::Crossfade,
+                self.crossfade_on,
+                match detail {
                     Detail::Full => {
-                        format!("{GLYPH_CROSSFADE} crossfade {}", onoff(self.crossfade_on))
+                        words(GLYPH_CROSSFADE, &["crossfade", onoff(self.crossfade_on)])
                     }
-                    Detail::Named => format!("{GLYPH_CROSSFADE} crossfade"),
-                    Detail::Glyph => GLYPH_CROSSFADE.to_string(),
+                    Detail::Named => words(GLYPH_CROSSFADE, &["crossfade"]),
+                    Detail::Glyph => words(GLYPH_CROSSFADE, &[]),
                 },
-            },
+            ),
         ]
     }
 
@@ -456,25 +529,38 @@ impl PlayerView<'_> {
             _ => 0.0,
         };
         let dragging = self.scrubbing && self.selected == Some(Field::Progress);
+        let (elapsed_cells, total_cells) = (width(&elapsed), width(&total));
         // two spaces around the track, two cells for the plate.
-        let fixed = width(&elapsed) + width(&total) + 4;
-        let (text, cells) = match avail.checked_sub(fixed + TRACK_MIN) {
+        let fixed = elapsed_cells + total_cells + 4;
+        match avail.checked_sub(fixed + TRACK_MIN) {
             Some(slack) => {
                 let cells = TRACK_MIN + slack.min(TRACK_MAX - TRACK_MIN);
-                (
-                    format!("{elapsed} {} {total}", track(frac, cells, dragging)),
-                    Some(cells),
-                )
+                // one allocation at its final size, and a width that
+                // is arithmetic: a readout either side of a track of
+                // one-cell glyphs.
+                let mut text = String::with_capacity(elapsed.len() + total.len() + 2 + cells * 3);
+                text.push_str(&elapsed);
+                text.push(' ');
+                track_into(&mut text, frac, cells, dragging);
+                text.push(' ');
+                text.push_str(&total);
+                let mut element = Element::sized(
+                    Field::Progress,
+                    self.elapsed_secs.is_some(),
+                    text,
+                    elapsed_cells + 1 + cells + 1 + total_cells,
+                );
+                element.track = Some((elapsed_cells + 1, cells));
+                element
             }
             // too narrow for a track anyone could read a position off,
             // so the position goes as text rather than as a stub bar.
-            None => (format!("{elapsed} / {total}"), None),
-        };
-        Element {
-            field: Field::Progress,
-            lit: self.elapsed_secs.is_some(),
-            track: cells.map(|cells| (width(&elapsed) + 1, cells)),
-            text,
+            None => Element::sized(
+                Field::Progress,
+                self.elapsed_secs.is_some(),
+                format!("{elapsed} / {total}"),
+                elapsed_cells + 3 + total_cells,
+            ),
         }
     }
 
@@ -484,8 +570,10 @@ impl PlayerView<'_> {
     /// hints at a time, so a narrow pane loses "minimize" rather than
     /// half of "move focus".
     fn hint(&self, avail: usize) -> String {
-        let minimize = format!("{}: minimize", self.key(KeyAction::ToggleMinimize));
-        let parts = if self.scrubbing {
+        // borrowed where the hint is a fixed sentence, which is most
+        // of them: only the two that name a remappable key are built.
+        let minimize = || Cow::Owned(format!("{}: minimize", self.key(KeyAction::ToggleMinimize)));
+        let parts: Vec<Cow<'static, str>> = if self.scrubbing {
             vec![
                 "arrows: seek".into(),
                 "shift: coarse".into(),
@@ -493,19 +581,22 @@ impl PlayerView<'_> {
             ]
         } else if let Some(field) = self.selected {
             vec![
-                self.activate_hint(field),
+                self.activate_hint(field).into(),
                 "arrows: pick".into(),
                 "tab: move focus".into(),
-                minimize,
+                minimize(),
             ]
         } else {
-            vec!["tab: move focus".into(), minimize]
+            vec!["tab: move focus".into(), minimize()]
         };
-        let lengths: Vec<usize> = parts.iter().map(|p| width(p)).collect();
+        let mut lengths = [0usize; HINTS];
+        for (slot, p) in lengths.iter_mut().zip(&parts) {
+            *slot = width(p);
+        }
         // cells, not bytes: the separator is 5 columns and 6 bytes
         // (the middle dot is two), so `len()` over-charged a cell per
         // gap and dropped a hint earlier than it needed to.
-        let fits = segments_that_fit(&lengths, avail, width(HINT_SEP)).max(1);
+        let fits = segments_that_fit(&lengths[..parts.len()], avail, HINT_SEP_CELLS).max(1);
         parts[..fits].join(HINT_SEP)
     }
 
@@ -554,7 +645,7 @@ impl PlayerView<'_> {
             // one cell of padding each side, so a one-glyph element's
             // plate reads as a plate and not as a stray lit cell.
             if let Some(bg) = bg {
-                let end = x.saturating_add(width(&item.text) as u16 + 1);
+                let end = x.saturating_add(item.cells as u16 + 1);
                 fill_bg(buf, x.saturating_sub(1).max(area.x), end.min(limit), y, bg);
             }
             draw::at_styled(
@@ -626,8 +717,7 @@ fn row_rects(items: &[Element], area: Rect, y: u16, sep: usize) -> Vec<Placed> {
     if items.is_empty() || y >= area.y + area.height {
         return Vec::new();
     }
-    let total: usize =
-        items.iter().map(|e| width(&e.text)).sum::<usize>() + sep * (items.len() - 1);
+    let total: usize = items.iter().map(|e| e.cells).sum::<usize>() + sep * (items.len() - 1);
     let limit = area.x + area.width;
     let mut out = Vec::with_capacity(items.len());
     let mut x = area.x + ((area.width as usize).saturating_sub(total) / 2) as u16;
@@ -638,7 +728,7 @@ fn row_rects(items: &[Element], area: Rect, y: u16, sep: usize) -> Vec<Placed> {
         if x >= limit {
             break;
         }
-        let drawn = (width(&item.text) as u16).min(limit - x);
+        let drawn = (item.cells as u16).min(limit - x);
         out.push(Placed {
             field: item.field,
             rect: Rect {
@@ -663,10 +753,25 @@ fn row_rects(items: &[Element], area: Rect, y: u16, sep: usize) -> Vec<Placed> {
 }
 
 fn draw_centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
+    if y < area.y || y >= area.y + area.height {
+        return;
+    }
     // centred on display width, not char count: a wide-char title
     // used to drift right by its own overhang.
-    let text = truncate_with_ellipsis(text, area.width as usize);
-    draw::centered(buf, area, y, &text, color);
+    //
+    // the pad is worked out here rather than by `draw::centered`,
+    // which would fit the text a second time (it cannot know this one
+    // already fits) and measure it a third.
+    let fitted = truncate_with_ellipsis(text, area.width as usize);
+    let pad = (area.width as usize).saturating_sub(width(&fitted)) / 2;
+    draw::at(
+        buf,
+        area.x + pad as u16,
+        y,
+        &fitted,
+        color,
+        area.width as usize - pad,
+    );
 }
 
 #[cfg(test)]
@@ -878,6 +983,82 @@ mod tests {
                 assert_eq!(buf.cell((track.x - 1, track.y)).unwrap().symbol(), " ");
             }
         }
+    }
+
+    /// An `Element` carries its own width, because the fit pass, the
+    /// row's centring, the rect and the plate each used to measure the
+    /// same text again. The count has to be the width of the text it
+    /// sits beside, or the row is laid out for a string it never
+    /// draws; the scrubber's is arithmetic, which is the one that can
+    /// drift.
+    #[test]
+    fn the_cells_an_element_claims_are_the_cells_it_draws() {
+        let keymap = Keymap::default();
+        let cover = art();
+        let mut v = view(&keymap, Some(&cover));
+        v.speed = 1.25;
+        v.loop_mode = LoopMode::One;
+        v.eq_preset = "bass";
+        v.selected = Some(Field::Progress);
+        for gap in [None, Some(6.2)] {
+            v.gap_remaining = gap;
+            for detail in [Detail::Full, Detail::Named, Detail::Glyph] {
+                for e in v.elements(detail) {
+                    assert_eq!(
+                        e.cells,
+                        width(&e.text),
+                        "{detail:?} {:?}: {:?}",
+                        e.field,
+                        e.text
+                    );
+                }
+            }
+            // either side of the width a readable track stops fitting
+            // at, where the element swaps to plain text.
+            for avail in 0..64usize {
+                for scrubbing in [false, true] {
+                    v.scrubbing = scrubbing;
+                    let e = v.scrubber(avail);
+                    assert_eq!(
+                        e.cells,
+                        width(&e.text),
+                        "scrubber at {avail} cells, scrubbing={scrubbing}: {:?}",
+                        e.text
+                    );
+                }
+            }
+        }
+    }
+
+    /// The pad `draw_centered` works out itself, by cells: a wide-char
+    /// title centred on a char count drifts right by its own overhang.
+    #[test]
+    fn a_centred_row_is_padded_by_cells_and_stays_inside_its_rect() {
+        let area = Rect::new(0, 0, 20, 1);
+        for (text, cells) in [
+            ("abc", 3u16),
+            ("\u{65E5}\u{672C}\u{8A9E}", 6),
+            ("Beyonce\u{301}", 7),
+        ] {
+            let mut buf = buffer(20, 1);
+            draw_centered(&mut buf, area, 0, text, shade(NEAR_WHITE));
+            let first = (0..20u16)
+                .find(|x| buf.cell((*x, 0)).unwrap().symbol() != ".")
+                .unwrap_or_else(|| panic!("{text:?} drew nothing:\n{}", grid(&buf)));
+            assert_eq!(first, (20 - cells) / 2, "{text:?}:\n{}", grid(&buf));
+        }
+        // and a row below its own rect draws nothing, which is the
+        // guard `draw::centered` was carrying for this.
+        let mut buf = buffer(20, 2);
+        draw_centered(&mut buf, area, 1, "nope", shade(NEAR_WHITE));
+        assert!(!grid(&buf).contains("nope"), "{}", grid(&buf));
+    }
+
+    #[test]
+    fn the_hint_separator_is_five_cells_wide() {
+        // six bytes, five columns: the fit counts columns, and the
+        // constant saves it the walk.
+        assert_eq!(width(HINT_SEP), HINT_SEP_CELLS);
     }
 
     #[test]
@@ -1415,6 +1596,67 @@ mod bench {
     }
 
     const SIZES: [(u16, u16); 3] = [(80, 24), (120, 40), (200, 60)];
+
+    /// Which profile the numbers came out of: `cargo test` defaults to
+    /// the dev one, where `opt-level = 0` measured a path in this crate
+    /// 11.5x slow, and that is an artefact rather than a result.
+    fn profile() -> &'static str {
+        if cfg!(debug_assertions) {
+            "debug, opt-level 0: an artefact, re-run with --release"
+        } else {
+            "release"
+        }
+    }
+
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn label_cost() {
+        let g = std::hint::black_box('\u{21C4}');
+        let name = std::hint::black_box("shuffle");
+        let value = std::hint::black_box("off");
+        let [pushed, formatted] = best_each::<2>(8, 20_000, |which| {
+            std::hint::black_box(match which {
+                0 => {
+                    let mut out = String::with_capacity(name.len() + value.len() + 6);
+                    out.push(g);
+                    out.push(' ');
+                    out.push_str(name);
+                    out.push(' ');
+                    out.push_str(value);
+                    out
+                }
+                _ => format!("{g} {name} {value}"),
+            });
+        });
+        println!(
+            "one control label ({}): pushed {pushed:>9.3?}  formatted {formatted:>9.3?}",
+            profile()
+        );
+    }
+
+    /// What an `Element` carrying its own width buys. The row asked
+    /// four times a pass (the fit, the centring total, the rect, the
+    /// plate) and it lays out twice a frame, over text with a glyph in
+    /// front of it: non-ascii, so `textfit::width` has to walk it.
+    #[test]
+    #[ignore = "timing, run explicitly"]
+    fn element_width_cost() {
+        let keymap = Keymap::default();
+        let art = cover();
+        let items = busy(&keymap, &art).elements(Detail::Full);
+        let [carried, measured] = best_each::<2>(8, 5000, |which| {
+            let total: usize = match which {
+                0 => items.iter().map(|e| e.cells).sum(),
+                _ => items.iter().map(|e| width(&e.text)).sum(),
+            };
+            std::hint::black_box(total);
+        });
+        println!(
+            "{} element widths ({}): carried {carried:>9.3?}  measured {measured:>9.3?}",
+            items.len(),
+            profile(),
+        );
+    }
 
     /// Variants timed with their batches alternating, minimum each.
     /// Measuring them one after another is not a comparison on this
