@@ -1150,7 +1150,6 @@ mod restore {
     use std::collections::HashSet;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
-    use std::thread;
     use std::time::Instant;
 
     use crate::cache::{self, CacheIndex};
@@ -1345,33 +1344,7 @@ mod restore {
         item.identity().1.into_owned()
     }
 
-    /// An album, which is the one `SearchItem` kind whose resolution
-    /// fans out off-thread; its client answers nothing, so the
-    /// fan-out fails fast and the test only cares that a batch lands
-    /// at all.
-    fn album() -> SearchItem {
-        SearchItem::Album {
-            id: "al1".to_string(),
-            name: "a discography".to_string(),
-            artist: "a prolific artist".to_string(),
-            client: browse::fixtures::test_client(),
-        }
-    }
 
-    /// Blocks until the resolver hands back a batch, or `within`
-    /// elapses with nothing.
-    fn landed(resolver: &mut TrackResolver, within: Duration) -> bool {
-        let deadline = Instant::now() + within;
-        loop {
-            if resolver.poll().is_some() {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
 
     // ------------------------------------------------- the queue half
 
@@ -1397,13 +1370,35 @@ mod restore {
         // reloads mpv's playlist.
         h.play(&player, vec![songs[1].clone()]);
 
-        h.track_resolver.request(&album(), Intent::Back);
+        // injected rather than fetched. this used to fire two real
+        // off-thread requests at a fixture host, wait up to 20s for a
+        // control to land and 2s to assert the second did not: slow,
+        // and the shape three other tests here already passed for the
+        // wrong reason in. `deliver` is `pub(crate)` for this.
+        //
+        // `ticket: None`, which is the download path's shape, on
+        // purpose: only `request` advances the ticket counter, so two
+        // injected batches would reuse one number and `poll` would
+        // withhold the second for *that* reason rather than the
+        // epoch's. a first attempt did exactly that and passed with
+        // the invalidate deleted. with no ticket the epoch is the only
+        // gate, which is the rule under test.
+        //
+        // the control first, so "nothing landed" below cannot mean
+        // "nothing had landed yet".
+        let epoch = h.track_resolver.epoch();
+        h.track_resolver
+            .deliver(epoch, None, Intent::Back, vec![songs[0].clone()]);
         assert!(
-            landed(&mut h.track_resolver, Duration::from_secs(20)),
+            h.track_resolver.poll().is_some(),
             "the control has to land or the assertion below proves nothing"
         );
 
-        h.track_resolver.request(&album(), Intent::Back);
+        // and now one that the restore is about to disown.
+        let epoch = h.track_resolver.epoch();
+        h.track_resolver
+            .deliver(epoch, None, Intent::Back, vec![songs[0].clone()]);
+
         h.restore(&player, &snapshot);
         assert_eq!(
             h.queue.current().map(id),
@@ -1411,7 +1406,7 @@ mod restore {
             "the restore has to have taken the restart branch"
         );
         assert!(
-            !landed(&mut h.track_resolver, Duration::from_secs(2)),
+            h.track_resolver.poll().is_none(),
             "the fan-out was resolved against the queue this restore \
              replaced; letting it land appends a whole discography on \
              top of a finished undo"
