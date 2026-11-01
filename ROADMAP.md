@@ -667,13 +667,41 @@ and `in-workspace (sub-rect) video` is still kitty-only via
       - [ ] **the crumbs.** `ui/help.rs`'s curated list does not mention
         shift-`v` (the keybinds menu lists it automatically off
         `ALL_ACTIONS`), and there is no shellsong command for the mode.
-- [ ] **usable at absurd zoom-out.** ascii video is only watchable
-      once the font is small enough to give a few hundred cells across,
-      so the layout has to survive that: sidebar and bottom bar must
-      stay visible and operable at very small cell sizes, rather than
-      the video eating the frame or the chrome collapsing to unreadable
-      slivers. this is a layout constraint, not a rendering one; the
-      chrome should scale its own footprint, not vanish.
+- [x] **usable at absurd zoom-out.** the stored sidebar width and bar
+      height are absolute cell counts, which is right across the band
+      people use and wrong at both ends. `PanelLayout::sidebar_for
+      (width)` and `bottom_bar_for(height)` bound them by a share of
+      the terminal: at most 2/5 and 1/3, at least 1/10 and 1/16.
+      the narrow end was a **real bug, not just thin chrome**:
+      `Constraint::Length` hands the whole width to the first
+      constraint and zero to the rest, so a stored 32 on a 24-cell
+      terminal left the sidebar holding everything and the content pane
+      holding *nothing*. a property test now walks every width from 2
+      to 400 at three stored widths and asserts a content pane exists.
+      the wide end is the one this item asked for: a fixed 32 cells is
+      a physical sliver at the font ascii video needs, so past ~320
+      columns it scales (48 at 480, 80 at 800). a user who narrowed it
+      still gets it widened, since the choice was made in cells at some
+      other font size.
+      **the band is untouched**: a test asserts the stored width is
+      returned unchanged for every width from 80 to 320 and every
+      height from 12 to 48, because moving the familiar sidebar would
+      be a regression dressed as a fix.
+      drawn to scale and read, which is what set the floors: at 1/8 the
+      sidebar grew to 40 cells at 320 columns, overriding a narrow
+      choice inside the ordinary band. 1/10 lets the stored 32 survive
+      to exactly 320.
+      **a correction worth recording.** the first version carried a
+      `.min(ceiling)` on the floor with a comment claiming `clamp`
+      would otherwise panic on a one-cell terminal. that was wrong: at
+      one cell both shares floor to zero, and 1/10 cannot exceed 2/5 at
+      any width, so the guard was dead code. mutating it away broke no
+      test, which is how it surfaced. the invariant is two `const`
+      assertions now, so inverting the shares fails to **compile**,
+      which is stronger than the test I would otherwise have written.
+      the eyeball test had its own lie, too: it scaled the one-cell
+      divider like a pane, so the 1x1 row drew as a full bar of
+      dividers.
 - [x] **frame budget.** measured, and the paint is not the problem.
       `framesource::frame_budget` (ignored by default, it is a
       measurement and a ceiling here would flake) at release opt:

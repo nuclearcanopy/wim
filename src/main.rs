@@ -1641,7 +1641,7 @@ fn main() -> anyhow::Result<()> {
             let rows = Layout::vertical([
                 Constraint::Min(0),
                 Constraint::Length(mini_bar_height),
-                Constraint::Length(panels.bottom_bar_height),
+                Constraint::Length(panels.bottom_bar_for(area.height)),
             ])
             .split(area);
             let top = rows[0];
@@ -1649,7 +1649,7 @@ fn main() -> anyhow::Result<()> {
             let bottom = rows[2];
 
             let cols = Layout::horizontal([
-                Constraint::Length(panels.sidebar_width),
+                Constraint::Length(panels.sidebar_for(area.width)),
                 Constraint::Length(1),
                 Constraint::Min(0),
             ])
