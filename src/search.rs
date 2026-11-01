@@ -2727,6 +2727,96 @@ mod tests {
         }
     }
 
+    /// What the prefilter walk costs by layout, kept for the **answer
+    /// it gave, which was no**.
+    ///
+    /// `Entry` is 168 bytes (a `SearchItem` plus two `String`s), so
+    /// reading 12 bytes of bitmask per item strides over all of it and
+    /// 40k items drag ~6.7mb through cache. A packed `{mask,
+    /// word_lens}` copy is **4.0x faster** on that walk, measured
+    /// here, which looked like the floor every keystroke pays.
+    ///
+    /// It is not the floor. The walk is ~236us of a pass that
+    /// `bench_phases` measures at 20ms for "bla", i.e. **about 1%**,
+    /// because the cost is nucleo scoring the ~20k items that survive
+    /// and `best_typo_score` on the rest; a query matching nothing
+    /// still spends its 3.9ms there and not here. So the parallel
+    /// `Vec` was not added: it would duplicate two fields that
+    /// `best_typo_score` reads off `Entry` anyway, giving three
+    /// mutation sites a desync-by-construction hazard for one percent.
+    ///
+    /// Alternating batches in one process, cpu clock, since the
+    /// question is memory traffic and a loaded box moves wall time 2x
+    /// on its own.
+    #[test]
+    #[ignore = "timing benchmark, run manually"]
+    fn bench_cpu_prefilter_layout() {
+        #[derive(Clone, Copy)]
+        struct Packed {
+            mask: u64,
+            word_lens: u32,
+        }
+        for (label, c) in [
+            ("narrow-vocab 40k", synthetic_corpus(40_000)),
+            ("varied 40k", varied_corpus(40_000)),
+        ] {
+            let packed: Vec<Packed> = c
+                .items
+                .iter()
+                .map(|e| Packed {
+                    mask: e.mask,
+                    word_lens: e.word_lens,
+                })
+                .collect();
+            println!(
+                "--- {label}: {} entries, {}B each vs {}B packed",
+                c.items.len(),
+                std::mem::size_of::<Entry>(),
+                std::mem::size_of::<Packed>(),
+            );
+            for query in BENCH_QUERIES {
+                let needle = Needle::new(query);
+                // the reject half of `score_chunk`, both ways: count
+                // what survives so neither can be optimized away.
+                let over_entries = || {
+                    c.items
+                        .iter()
+                        .filter(|e| {
+                            needle.fuzzy_mask & !e.mask == 0
+                                || e.word_lens & needle.length_window != 0
+                        })
+                        .count()
+                };
+                let over_packed = || {
+                    packed
+                        .iter()
+                        .filter(|p| {
+                            needle.fuzzy_mask & !p.mask == 0
+                                || p.word_lens & needle.length_window != 0
+                        })
+                        .count()
+                };
+                let mut best = (std::time::Duration::MAX, std::time::Duration::MAX);
+                let (mut a_out, mut b_out) = (0, 0);
+                for _ in 0..8 {
+                    let at = cpu_now();
+                    a_out = over_entries();
+                    best.0 = best.0.min(cpu_now().saturating_sub(at));
+                    let at = cpu_now();
+                    b_out = over_packed();
+                    best.1 = best.1.min(cpu_now().saturating_sub(at));
+                }
+                assert_eq!(a_out, b_out, "the two layouts disagree");
+                println!(
+                    "  {query:<14} entries {:>10.3?}  packed {:>10.3?}  {:.2}x   survive {a_out:>6}",
+                    best.0,
+                    best.1,
+                    best.0.as_secs_f64() / best.1.as_secs_f64().max(1e-12),
+                );
+            }
+        }
+    }
+
     const BENCH_QUERIES: [&str; 7] = [
         "b",
         "bla",
