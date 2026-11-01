@@ -342,6 +342,109 @@ pub fn plan(want_ascii: bool, media: Option<&Path>, grid: Grid, have: Have) -> P
     Plan::Keep
 }
 
+/// What a frame costs to paint at grids ascii video is actually
+/// watchable at, which is the measurable half of the frame budget.
+///
+/// A measurement, not an assertion: the numbers move with the box and
+/// a ceiling here would be a flake. Run it with
+/// `cargo test --lib frame_budget -- --ignored --nocapture`.
+#[cfg(test)]
+mod frame_budget {
+    use super::*;
+    use crate::ui::raster::Sharpen;
+    use std::time::{Duration, Instant};
+
+    /// Deterministic noise, because a flat frame is the one case the
+    /// quantizer is fast on and video frames are not flat.
+    fn noise(grid: Grid) -> DynamicImage {
+        let (w, h) = grid.pixels();
+        let mut img = RgbImage::new(w, h);
+        let mut x: u32 = 0x1234_5678;
+        for px in img.pixels_mut() {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let b = (x >> 16) as u8;
+            px.0 = [b, b.rotate_left(3), b.wrapping_add(71)];
+        }
+        DynamicImage::ImageRgb8(img)
+    }
+
+    /// Alternating batches in one process, best of each. Sequential
+    /// runs on this box differ 1.6-1.8x under load, so two separate
+    /// measurements are not comparable and this is the only shape that
+    /// is.
+    fn best_each(rounds: usize, iters: usize, a: &mut dyn FnMut(), b: &mut dyn FnMut()) -> (f64, f64) {
+        let mut best = (f64::MAX, f64::MAX);
+        let time = |f: &mut dyn FnMut()| {
+            let at = Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            at.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+        for _ in 0..rounds {
+            best.0 = best.0.min(time(a));
+            best.1 = best.1.min(time(b));
+        }
+        best
+    }
+
+    #[test]
+    #[ignore = "a measurement; run it explicitly"]
+    fn what_a_painted_frame_costs() {
+        // 25fps is `FALLBACK_FPS` and the slowest thing it will be
+        // asked to keep up with.
+        let budget = Duration::from_secs_f64(1.0 / FALLBACK_FPS).as_secs_f64() * 1e6;
+        // the build is the first thing to say: the debug numbers are
+        // 8-11x the release ones, and a debug number quoted as the
+        // cost is how a non-problem becomes a blocker.
+        println!(
+            "--- paint cost per frame, budget {budget:.0}us at {FALLBACK_FPS}fps, {} build",
+            if cfg!(debug_assertions) {
+                "DEBUG (not the shipping cost; re-run with --release)"
+            } else {
+                "release"
+            }
+        );
+        for (cols, rows) in [(160u16, 50u16), (320, 100), (480, 140)] {
+            let grid = Grid::new(cols, rows, CELL_ASPECT);
+            let img = noise(grid);
+            let area = Rect::new(0, 0, cols, rows);
+            let style = |tone| Style {
+                fit: Fit::Stretch,
+                tone,
+            };
+            let mut buf = Buffer::empty(area);
+            let mut on = || {
+                raster::with_scratch(|r| {
+                    r.render_with(&img, area, grid.cell_aspect, style(Tone::Mono), Sharpen::On, &mut buf);
+                });
+            };
+            let mut buf_off = Buffer::empty(area);
+            let mut off = || {
+                raster::with_scratch(|r| {
+                    r.render_with(
+                        &img,
+                        area,
+                        grid.cell_aspect,
+                        style(Tone::Mono),
+                        Sharpen::Off,
+                        &mut buf_off,
+                    );
+                });
+            };
+            let (sharp, flat) = best_each(5, 20, &mut on, &mut off);
+            let (w, h) = grid.pixels();
+            println!(
+                "  {cols:>3}x{rows:<3} ({w:>4}x{h:<4}px, {:>7} bytes)  sharpen on {sharp:>8.1}us ({:>5.1}% of budget)   off {flat:>8.1}us ({:>5.1}%)   {:.2}x",
+                grid.frame_len(),
+                sharp / budget * 100.0,
+                flat / budget * 100.0,
+                sharp / flat,
+            );
+        }
+    }
+}
+
 /// The host's half: owns at most one instance and applies `plan` to it,
 /// so the draw loop gets one call and no lifecycle branches.
 ///
