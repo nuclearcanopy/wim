@@ -1443,12 +1443,13 @@ fn main() -> anyhow::Result<()> {
             elapsed_secs.unwrap_or(0.0),
             // one ipc round trip per spawn, never per frame.
             || {
-                player
-                    .get_property("container-fps")
-                    .ok()
-                    .and_then(|v| v.as_f64())
-                    .filter(|fps| fps.is_finite() && *fps > 0.0)
-                    .unwrap_or(framesource::FALLBACK_FPS)
+                framesource::ascii_fps(
+                    player
+                        .get_property("container-fps")
+                        .ok()
+                        .and_then(|v| v.as_f64()),
+                    cfg.ascii_fps,
+                )
             },
         ) {
             // `Ascii` latches the file it failed on, so this is once per
