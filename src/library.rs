@@ -370,8 +370,20 @@ fn walk_media(paths: &[String]) -> Vec<FoundMedia> {
     }
 }
 
+/// Two passes, because they cost very differently: walkdir discovers
+/// the files in one serial pass, then the `lstat`s go across a pool.
+/// Measured by `warm_walk_legs` (release, cpu clock, 34k files): the
+/// readdir pass is 59-61ms of a 171-176ms walk, so two thirds of the
+/// walk is per-file `stat` and nothing in it is ordered.
+///
+/// walkdir still owns the traversal: with `follow_links` it is what
+/// detects a symlink loop, and reproducing that is not worth owning.
 fn walk_root(root: &str) -> Vec<FoundMedia> {
-    let mut found = Vec::new();
+    let mut found: Vec<FoundMedia> = Vec::new();
+    // walkdir's `metadata()` follows the link for an entry it reached
+    // through one and not otherwise, so the flag has to be kept per
+    // file or a symlinked track gets its link's mtime.
+    let mut follows: Vec<bool> = Vec::new();
     for entry in WalkDir::new(root)
         .follow_links(true)
         .into_iter()
@@ -388,15 +400,52 @@ fn walk_root(root: &str) -> Vec<FoundMedia> {
         else {
             continue;
         };
-        // one `lstat` per media file and no more: walkdir's own
-        // `file_type` comes from the directory read, and a file whose
-        // extension is not media is never stat'd (or tagged) at all.
-        let mtime = entry.metadata().ok().as_ref().and_then(mtime_nanos);
+        follows.push(entry.path_is_symlink());
         // `into_path` moves walkdir's own `PathBuf` rather than
         // copying the bytes into a second one.
-        found.push((entry.into_path(), kind, mtime));
+        found.push((entry.into_path(), kind, None));
     }
+    fill_mtimes(&mut found, &follows);
     found
+}
+
+/// One `lstat` per media file and no more: walkdir's own `file_type`
+/// comes from the directory read, and a file whose extension is not
+/// media is never stat'd (or tagged) at all.
+fn mtime_of(path: &Path, follow: bool) -> Option<u64> {
+    let meta = if follow {
+        fs::metadata(path)
+    } else {
+        fs::symlink_metadata(path)
+    };
+    meta.ok().as_ref().and_then(mtime_nanos)
+}
+
+/// Fills in every entry's mtime across a pool sized to the machine.
+/// Chunked by index over both slices at once, so a worker can only
+/// ever write the mtime of the path it stat'd; a misalignment here
+/// would serve one file's tags for another's.
+fn fill_mtimes(found: &mut [FoundMedia], follows: &[bool]) {
+    let workers = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(found.len());
+    if workers <= 1 {
+        for (slot, follow) in found.iter_mut().zip(follows) {
+            slot.2 = mtime_of(&slot.0, *follow);
+        }
+        return;
+    }
+    let chunk = found.len().div_ceil(workers);
+    thread::scope(|scope| {
+        for (part, part_follows) in found.chunks_mut(chunk).zip(follows.chunks(chunk)) {
+            scope.spawn(move || {
+                for (slot, follow) in part.iter_mut().zip(part_follows) {
+                    slot.2 = mtime_of(&slot.0, *follow);
+                }
+            });
+        }
+    });
 }
 
 /// The one real scan path, shared by `scan` and `spawn_scan`: walk,
@@ -1001,33 +1050,12 @@ mod tests {
         index
     }
 
-    /// The walk with no `stat` at all, to price its two legs apart:
-    /// the serial readdir pass against the per-file mtime read, which
-    /// is what decides whether fanning the stats out is worth it.
-    fn walk_root_no_stat(root: &str) -> usize {
-        WalkDir::new(root)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .and_then(classify)
-                    .is_some()
-            })
-            .count()
-    }
-
-    /// Candidate: walkdir still discovers the files in one serial pass
-    /// (its symlink-loop detection is why it stays), then the mtimes
-    /// are read across a pool. `path_is_symlink` is exactly what
-    /// walkdir's own `metadata()` branches on, so the mtime a file
-    /// reached through a symlink gets is unchanged.
-    fn walk_root_parallel_stat(root: &str) -> Vec<FoundMedia> {
-        let mut found: Vec<FoundMedia> = Vec::new();
-        let mut follows: Vec<bool> = Vec::new();
+    /// The same walk with no `stat` at all, building the same `Vec`,
+    /// to price its two legs apart: the readdir pass against the
+    /// per-file mtime read. What decides whether fanning the stats out
+    /// is worth owning a second pass for.
+    fn walk_root_no_stat(root: &str) -> Vec<FoundMedia> {
+        let mut found = Vec::new();
         for entry in WalkDir::new(root)
             .follow_links(true)
             .into_iter()
@@ -1044,61 +1072,142 @@ mod tests {
             else {
                 continue;
             };
-            follows.push(entry.path_is_symlink());
             found.push((entry.into_path(), kind, None));
         }
-        fill_mtimes(&mut found, &follows);
         found
     }
 
-    fn mtime_of(path: &Path, follow: bool) -> Option<u64> {
-        let meta = if follow {
-            fs::metadata(path)
-        } else {
-            fs::symlink_metadata(path)
-        };
-        meta.ok().as_ref().and_then(mtime_nanos)
-    }
-
-    /// Chunked by index over both slices at once, so a worker can only
-    /// ever write the mtime of the path it stat'd.
-    fn fill_mtimes(found: &mut [FoundMedia], follows: &[bool]) {
-        let workers = thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(found.len());
-        if workers <= 1 {
-            for (slot, follow) in found.iter_mut().zip(follows) {
-                slot.2 = mtime_of(&slot.0, *follow);
+    /// What `walk_root` was before the stats were pooled, kept only as
+    /// the baseline `warm_walk_legs` measures against: one
+    /// `entry.metadata()` inline in the traversal.
+    fn walk_root_serial_stat(root: &str) -> Vec<FoundMedia> {
+        let mut found = Vec::new();
+        for entry in WalkDir::new(root)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
             }
-            return;
+            let Some(kind) = entry
+                .path()
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(classify)
+            else {
+                continue;
+            };
+            let mtime = entry.metadata().ok().as_ref().and_then(mtime_nanos);
+            found.push((entry.into_path(), kind, mtime));
         }
-        let chunk = found.len().div_ceil(workers);
-        thread::scope(|scope| {
-            for (part, part_follows) in found.chunks_mut(chunk).zip(follows.chunks(chunk)) {
-                scope.spawn(move || {
-                    for (slot, follow) in part.iter_mut().zip(part_follows) {
-                        slot.2 = mtime_of(&slot.0, *follow);
-                    }
-                });
-            }
-        });
+        found
     }
 
-    /// The candidate has to find the same files, in the same order,
-    /// with the same mtimes: the order is what keeps a scan's batches
-    /// reproducible and the mtime is what the whole tag cache hangs on.
+    /// The pooled walk has to find the same files, in the same order,
+    /// with the same mtimes as the inline-`metadata()` walk it
+    /// replaced: the order is what keeps a scan's batches
+    /// reproducible, and the mtime is what the whole tag cache hangs
+    /// on, so a chunk that drifted by one would serve one file's tags
+    /// for another's.
     #[test]
-    fn a_pooled_stat_walk_finds_exactly_what_the_serial_one_did() {
+    fn the_pooled_walk_finds_exactly_what_the_inline_stat_did() {
         let root = media_tree("statparity", 40);
         let as_str = root.to_string_lossy().into_owned();
-        let serial = walk_root(&as_str);
-        let pooled = walk_root_parallel_stat(&as_str);
+        let serial = walk_root_serial_stat(&as_str);
+        let pooled = walk_root(&as_str);
         assert_eq!(serial.len(), 40, "precondition: the tree was walked");
-        assert_eq!(pooled, serial);
         assert!(
             serial.iter().all(|(_, _, m)| m.is_some()),
             "precondition: these files can be stat'd, so the mtimes are compared"
+        );
+        assert_eq!(pooled, serial);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The mtime a pooled chunk writes has to be the one belonging to
+    /// its own path, and a tree written in one go is no test of that:
+    /// the kernel's file timestamps move in ~ms ticks, so every file
+    /// would share one mtime and any shuffle would pass. Each file is
+    /// given its own, so a chunk that drifted by one is visible.
+    #[cfg(unix)]
+    #[test]
+    fn pooled_mtimes_land_on_the_path_they_were_read_for() {
+        let root = media_tree("mtimealign", 300);
+        let at = root.to_string_lossy().into_owned();
+        let mut want: HashMap<PathBuf, Option<u64>> = HashMap::new();
+        for (i, (path, _, _)) in walk_root(&at).into_iter().enumerate() {
+            backdate(&path, 1_000_000 + i as i64);
+            want.insert(path, None);
+        }
+        for (path, mtime) in want.iter_mut() {
+            *mtime = fs::symlink_metadata(path).ok().as_ref().and_then(mtime_nanos);
+        }
+        assert_eq!(want.len(), 300, "precondition: the tree was walked");
+        assert_eq!(
+            want.values().flatten().collect::<HashSet<_>>().len(),
+            300,
+            "precondition: every file has its own mtime, so a shuffle shows"
+        );
+
+        let found = walk_root(&at);
+        assert_eq!(found.len(), 300);
+        for (path, _, mtime) in &found {
+            assert_eq!(
+                mtime,
+                want.get(path).expect("same walk, same paths"),
+                "{} got another file's mtime",
+                path.display()
+            );
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Pins a file's mtime to a given instant well in the past.
+    #[cfg(unix)]
+    fn backdate(path: &Path, secs: i64) {
+        use std::os::unix::ffi::OsStrExt;
+        let when = libc::timespec {
+            tv_sec: secs,
+            tv_nsec: 123_000,
+        };
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: utimensat reads the path and the two timespecs it is
+        // handed and writes nothing back.
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), [when; 2].as_ptr(), 0) };
+        assert_eq!(rc, 0, "could not set an mtime");
+    }
+
+    /// A track reached through a symlink has to be cached against the
+    /// *target's* mtime, which is what walkdir's own `metadata()`
+    /// answers for an entry it followed. Deferring the stat means
+    /// carrying that per file, and getting it wrong caches a symlink's
+    /// own timestamp, so the track is never re-read after a tag edit.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_track_is_cached_against_its_targets_mtime() {
+        let root = media_tree("symlinked", 1);
+        let target = root.join("real song.flac");
+        let link = root.join("artist 0").join("album 0").join("linked song.flac");
+        fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // the target's mtime is set outright rather than by touching
+        // it: the kernel's file timestamps move in ~ms ticks, so a
+        // write right after the symlink lands on the same one.
+        backdate(&target, 1_000_000);
+        let target_mtime = fs::metadata(&target).ok().as_ref().and_then(mtime_nanos);
+        let link_mtime = fs::symlink_metadata(&link).ok().as_ref().and_then(mtime_nanos);
+        assert!(target_mtime.is_some() && target_mtime != link_mtime, "precondition");
+
+        let found = walk_root(&root.to_string_lossy());
+        let (_, kind, mtime) = found
+            .iter()
+            .find(|(p, _, _)| p == &link)
+            .expect("the symlinked track must be walked");
+        assert_eq!(*kind, MediaKind::Music);
+        assert_eq!(
+            *mtime, target_mtime,
+            "a followed symlink must be cached against the file it points at"
         );
         fs::remove_dir_all(&root).ok();
     }
@@ -1115,33 +1224,50 @@ mod tests {
         for files in [5_000usize, 34_000] {
             let root = media_tree("walklegs", files);
             let at = root.to_string_lossy().into_owned();
-            assert_eq!(walk_root_no_stat(&at), files);
+            assert_eq!(walk_root_no_stat(&at).len(), files);
 
             let (serial, pooled) = best_each(
-                3,
+                6,
                 1,
                 &mut || {
-                    walk_root(&at);
+                    walk_root_serial_stat(&at);
                 },
                 &mut || {
-                    walk_root_parallel_stat(&at);
+                    walk_root(&at);
                 },
             );
-            let (serial_again, readdir) = best_each_cpu(
-                3,
+            let (serial_cpu, readdir_cpu) = best_each_cpu(
+                6,
                 1,
                 &mut || {
-                    walk_root(&at);
+                    walk_root_serial_stat(&at);
                 },
                 &mut || {
                     walk_root_no_stat(&at);
                 },
             );
+            // the pool's own cost, read where the load cannot reach
+            // it: the stat leg is the same work either way, so cpu
+            // time apart is the price of the second pass and the
+            // `thread::scope`, and tells the wall numbers below from
+            // a box with no spare core to give.
+            let (serial_cpu_again, pooled_cpu) = best_each_cpu(
+                6,
+                1,
+                &mut || {
+                    walk_root_serial_stat(&at);
+                },
+                &mut || {
+                    walk_root(&at);
+                },
+            );
             println!(
-                "{files:>6} files  cpu: readdir only {readdir:>9.0}us serial \
-                 {serial_again:>9.0}us   wall: serial {serial:>9.0}us pooled stat \
+                "{files:>6} files  cpu: readdir only {readdir_cpu:>9.0}us  serial \
+                 {serial_cpu:>9.0}us/{serial_cpu_again:>9.0}us  pooled {pooled_cpu:>9.0}us \
+                 ({:+.0}%)\n              wall: serial {serial:>9.0}us  pooled \
                  {pooled:>9.0}us  {:.2}x",
-                serial / pooled
+                (pooled_cpu / serial_cpu_again - 1.0) * 100.0,
+                serial / pooled,
             );
             fs::remove_dir_all(&root).ok();
         }
