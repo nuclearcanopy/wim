@@ -159,10 +159,11 @@ impl PlayQueue {
 
     /// Drops the entry at `index`, keeping `pos` pointing at the same
     /// *track* rather than the same number. Removing the playing entry
-    /// leaves `pos` where it is, which is correct: mpv moves on to the
-    /// next file, and that file has just shifted into this slot. The
-    /// observed `playlist-pos` corrects anything this gets wrong on
-    /// the next notification either way.
+    /// leaves `pos` where it is, which is correct while something has
+    /// shifted into that slot: mpv moves on to the next file. When it
+    /// was the last entry there is no such file, so `pos` is cleared;
+    /// leaving it past the end made the next `set_pos` to that index
+    /// read as `Unchanged` and swallow the next track's hooks.
     pub fn remove(&mut self, index: usize) -> bool {
         if index >= self.entries.len() {
             return false;
@@ -173,11 +174,18 @@ impl PlayQueue {
         self.forget(&gone);
         self.entries.remove(index);
         if let Some(p) = self.pos {
-            if index < p {
-                self.pos = Some(p - 1);
-            } else if self.entries.is_empty() {
-                self.pos = None;
-            }
+            // the same *track*, not the same number, so an entry
+            // removed ahead of the playing one shifts it down.
+            let moved = if index < p { p - 1 } else { p };
+            // and a position past the end is not a position. removing
+            // the playing entry while it was the last one left `pos`
+            // there, which was not merely cosmetic: the next track mpv
+            // loaded landed on that index, `set_pos` saw the number it
+            // already had and said `Unchanged`, and the caller skipped
+            // every track-change hook for a track that really started.
+            // an `append` in between claimed the new entry was already
+            // playing for the same reason.
+            self.pos = (moved < self.entries.len()).then_some(moved);
         }
         true
     }
@@ -286,6 +294,54 @@ impl PlayQueue {
 
 #[cfg(test)]
 mod tests {
+
+    /// Deleting the playing track when it is the last entry used to
+    /// leave `pos` one past the end, which is not merely odd: the next
+    /// track mpv loads lands on that index, `set_pos` sees the number
+    /// it already has, and reports `Unchanged`. The caller then skips
+    /// every track-change hook for a track that really did start.
+    #[test]
+    fn deleting_the_playing_last_track_does_not_swallow_the_next_one() {
+        let mut q = PlayQueue::default();
+        q.reset(vec![song("a"), song("b")]);
+        assert_eq!(q.set_pos(1), PosChange::Advanced(1));
+
+        assert!(q.remove(1));
+        assert_eq!(
+            title_of(q.current()),
+            None,
+            "nothing is playing out of a one-item list"
+        );
+        assert_eq!(q.pos(), None, "a position past the end is not a position");
+
+        // mpv is handed another track, loads it at index 1, and says
+        // so. that has to read as a track change.
+        q.append(song("c"), false);
+        assert_eq!(
+            q.set_pos(1),
+            PosChange::Advanced(1),
+            "the hooks for the new track were skipped: no scrobble, no art, no title"
+        );
+        assert_eq!(title_of(q.current()), Some("c".to_string()));
+    }
+
+    /// The same shape one step earlier: an append must not change what
+    /// is playing, and with a stale out-of-range `pos` it did.
+    #[test]
+    fn appending_to_a_queue_with_nothing_playing_plays_nothing() {
+        let mut q = PlayQueue::default();
+        q.reset(vec![song("a"), song("b")]);
+        assert_eq!(q.set_pos(1), PosChange::Advanced(1));
+        assert!(q.remove(1));
+
+        q.append(song("c"), false);
+        assert_eq!(
+            title_of(q.current()),
+            None,
+            "an append claimed the appended track was already playing"
+        );
+    }
+
     use super::*;
 
     fn song(title: &str) -> SearchItem {
