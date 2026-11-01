@@ -720,7 +720,7 @@ is reported with the file and the line number, and the rest runs:
 ```
 : run(mix)
 mix:2: col 1: unknown command 'xyzzy' (at 'xyzzy')
-mix:4: col 8: volume: 'nonsense' is not a time
+mix:4: col 8: volume: 'nonsense' is not a percent
 ```
 
 that is the same stance a term that matches nothing already takes (one

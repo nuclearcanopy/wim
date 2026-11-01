@@ -719,6 +719,52 @@ and `in-workspace (sub-rect) video` is still kitty-only via
       rate and make it tunable; dropping to a lower rate must degrade
       smoothness, never block the input path.
 
+## the shellsong audit (2026-11-01)
+
+ten commits, merged. an outside-contributor pass over `src/shellsong.rs`
+alone, which found more than the feature work it was run beside.
+
+- **three unbounded expansions**, each a real denial of service on the
+  user's own machine, all of which the existing bounds were assumed to
+  cover and did not. `lower_script` never checked `MAX_EXPANSION`
+  (`MAX_SCRIPT_DEPTH` bounds depth, not breadth, so a file with eight
+  `run` lines inlines `b^8`: a measured **65536 nodes**, and 10^8
+  synchronously inside `submit` at ten lines). `Scope::expand` is eager
+  and cycle-free but unbounded in *width*, so eight chained ten-item
+  `let`s reach 10^8 terms. and the `refused` latch was per `Lowering`
+  rather than per statement, so a legal `repeat` after a refused one
+  silently pushed nothing.
+- **`volume(1m)` set the volume to 60% and said "60%".** `Ty::Level`
+  reached its value through `parse_time`, which accepts units and
+  colons; `volume(1:30)` was 90% and `volume(2h)` said "7200% is
+  outside 0-100". now parsed as a percent in its own right.
+- **`fade(out, 0)`** passed the `off` check and reached the host's
+  `Ramp`, which short-circuits zero and slams the volume.
+- **two stale-state bugs in the editor**, both the same shape as bugs
+  already fixed once here: a tab cycle survived the cursor leaving its
+  token (`queue(fl` Tab Left Tab gives `queue(foorl)`, breaking
+  `Cycle`'s documented invariant), and `self.error` survived whole-line
+  replacement, so a recalled line was accused of the previous line's
+  typo.
+- a constant-seeded LCG corpus through `parse`, `site` and both
+  keystroke directions, **with its own miss recorded**: it does not
+  catch removing `list_items`' `!text.ends_with(']')` check, because a
+  specific ordered four-fragment subsequence is ~1e-4 per round over
+  400 rounds. written down so the fuzzer is not read as proof.
+- nineteen candidates investigated and found **not** to be bugs, with
+  the reasoning kept: every raw `&str` slice in the parser is anchored
+  on an ascii delimiter found by `find` or a byte scan (utf-8 lead and
+  continuation bytes map to U+0080-U+00F4, which equals no delimiter,
+  so multibyte text cannot mis-split); `MAX_CALL_DEPTH` is checked
+  before recursion; nested `repeat` shares one counter so the product
+  is bounded; `Duration::from_secs_f64` cannot abort because all four
+  reachable sites clamp and `seconds()` refuses non-finite; `spin`'s
+  `as i32` has `2 <= n <= 60`.
+- found and deliberately **not** fixed, as design calls: `paste` joins
+  multi-line pastes with no separator (a test pins exactly that), and
+  `Ty::Count` shares `MAX_REPEAT` between `repeat` and `skip`, so
+  `skip(300)` says "a count above 256 is refused".
+
 ## in flight
 
 **nothing. all ten branches are merged as of 2026-10-31**: the five
