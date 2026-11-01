@@ -2114,12 +2114,28 @@ same-process ratios are quoted.
       `Some(false)`**, so a typo'd password and an unreachable host are
       indistinguishable in the profile manager. The consumer and the
       signature change are in main.rs.
-- [ ] **`coverart::Cache` remembers "no cover" for a whole session**
-      even when the failure was transient. Noticed while confirming
-      that a subsonic error envelope returned at HTTP 200 is *not* a
-      bug (`decode_cover` refuses it and nothing undecodable reaches
-      the store, which is the right outcome), so this is the adjacent
-      real one.
+- [x] **`coverart::Cache` remembered "no cover" for a whole session.**
+      `fetch` returned `Option`, so "the server has no cover" and "the
+      request did not complete" arrived as the same `None` and were
+      both cached as a permanent no. One flaky moment while you were
+      first looking at an album blanked its art for the rest of the
+      session, with nothing to retry it and nothing said.
+      `Outcome::{Cover, Nothing, Failed}` splits them, and a failure is
+      stamped so it is retried after `RETRY_AFTER` (30s) while a real
+      missing cover stays negative forever. The backoff is the point:
+      `request` runs every frame for whatever is on screen, so an
+      immediate retry would be a thread per frame, which is what the
+      negative cache was protecting against when it swallowed this.
+      **the first mutation round exposed a vacuous test.** Four
+      mutations of `Cache` all got caught, but flipping `fetch`'s own
+      failure arm to `Nothing`, the exact line this item is about, left
+      the whole suite green: nothing tested `fetch`, only `Cache`'s
+      handling of what it returns. That is the
+      pinned-the-function-not-the-wiring shape `docs/testing.md`
+      records. There is now a test driving `fetch` against a real local
+      `TcpListener` (200 plus a subsonic error envelope, which is what
+      a server with no cover actually sends) and a dead port, and it
+      kills that mutation plus its inverse.
 
 ### the console box, and a measurement artefact worth knowing about
 
