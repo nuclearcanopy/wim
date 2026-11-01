@@ -3929,8 +3929,22 @@ mod cost {
     ];
 
     const NOUNS: [&str; 16] = [
-        "Mirror", "Drain", "Static", "Ember", "Cathedral", "Window", "Spiral", "Hollow", "Signal",
-        "Vapour", "Garden", "Machine", "Threnody", "Halo", "Pulse", "Lantern",
+        "Mirror",
+        "Drain",
+        "Static",
+        "Ember",
+        "Cathedral",
+        "Window",
+        "Spiral",
+        "Hollow",
+        "Signal",
+        "Vapour",
+        "Garden",
+        "Machine",
+        "Threnody",
+        "Halo",
+        "Pulse",
+        "Lantern",
     ];
 
     const ADJECTIVES: [&str; 12] = [
@@ -4044,11 +4058,7 @@ mod cost {
                     let title = match t % 5 {
                         0 => rng.pick(&TITLES).to_string(),
                         1 => format!("{} {}", rng.pick(&ADJECTIVES), rng.pick(&NOUNS)),
-                        2 => format!(
-                            "{} (feat. {})",
-                            rng.pick(&TITLES),
-                            rng.pick(&ARTISTS)
-                        ),
+                        2 => format!("{} (feat. {})", rng.pick(&TITLES), rng.pick(&ARTISTS)),
                         3 => format!("{} - Remastered {}", rng.pick(&TITLES), 2004 + rng.upto(20)),
                         _ => format!("{} {}", rng.pick(&NOUNS), rng.pick(&NOUNS)),
                     };
@@ -4372,7 +4382,10 @@ mod cost {
             let mut stages = vec![("model", model)];
             let mut gens = 0.0;
             for (name, run) in [
-                ("daily_rotation", &daily_rotation as &dyn Fn(&Model) -> Vec<Candidate>),
+                (
+                    "daily_rotation",
+                    &daily_rotation as &dyn Fn(&Model) -> Vec<Candidate>,
+                ),
                 ("album_gap", &album_gap),
                 ("track_gap", &track_gap),
                 ("album_neighbours", &album_neighbours),
@@ -4413,7 +4426,10 @@ mod cost {
                 let _ = album_neighbours_hashed(&model);
             },
         );
-        println!("  vec {fast:.1}us  hashmap {hashed:.1}us  {:.2}x", hashed / fast);
+        println!(
+            "  vec {fast:.1}us  hashmap {hashed:.1}us  {:.2}x",
+            hashed / fast
+        );
     }
 
     /// Genre slots against the three keyed maps they replaced,
@@ -4435,6 +4451,9 @@ mod cost {
                 let _ = genre_maps(&fixture.catalog, &model.tracks);
             },
         );
-        println!("  slots {slots:.1}us  maps {maps:.1}us  {:.2}x", maps / slots);
+        println!(
+            "  slots {slots:.1}us  maps {maps:.1}us  {:.2}x",
+            maps / slots
+        );
     }
 }

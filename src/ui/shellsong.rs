@@ -835,7 +835,10 @@ mod scrollback {
 
     fn page_up(c: &mut Console, times: usize) {
         for _ in 0..times {
-            c.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &NoCandidates);
+            c.handle_key(
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+                &NoCandidates,
+            );
         }
     }
 
@@ -848,7 +851,10 @@ mod scrollback {
     fn paging_back_shows_older_lines() {
         let mut c = loaded(40);
         let tail = render(&c, 60, 24);
-        assert!(tail.contains("line 39"), "the newest line is on screen:\n{tail}");
+        assert!(
+            tail.contains("line 39"),
+            "the newest line is on screen:\n{tail}"
+        );
 
         page_up(&mut c, 1);
         let back = render(&c, 60, 24);

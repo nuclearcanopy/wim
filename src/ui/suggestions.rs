@@ -557,7 +557,10 @@ mod tests {
         // is no row to follow.
         assert_eq!(reconcile(&s, None, 9), 0);
         assert!(anchor(&Suggestions::default(), 0).is_none());
-        assert!(anchor(&s, 99).is_none(), "a cursor past the end anchors on nothing");
+        assert!(
+            anchor(&s, 99).is_none(),
+            "a cursor past the end anchors on nothing"
+        );
         // and a rebuild that came back empty has no row to land on.
         assert_eq!(reconcile(&Suggestions::default(), anchor(&s, 1), 1), 0);
     }
@@ -703,10 +706,7 @@ mod tests {
         // indented to the column a section heading sits in, not to the
         // pane's own edge.
         assert!(rows[body + 1].starts_with(" nothing to suggest yet"), "{g}");
-        assert!(
-            rows[body + 2].starts_with(" play a few things"),
-            "{g}"
-        );
+        assert!(rows[body + 2].starts_with(" play a few things"), "{g}");
         // and the fact outranks the advice, so the eye lands on it
         // first rather than reading two equal lines.
         let fact = level_at(&buf, 1, body as u16 + 1);
@@ -805,7 +805,8 @@ mod tests {
             // and it stops short of the pane, so the `▴`/`▾` gutter is
             // never butted straight onto the end of it.
             assert_eq!(
-                line[w as usize - 1], '.',
+                line[w as usize - 1],
+                '.',
                 "{w}x{h}: the rule ran into the cue column:\n{g}"
             );
         }
@@ -900,7 +901,9 @@ mod tests {
                 None => {
                     // the scroll cue lives in the gutter column, so a
                     // row holding only that is still a blank row.
-                    let blank = text.chars().all(|c| c == '.' || c == '\u{25B4}' || c == '\u{25BE}');
+                    let blank = text
+                        .chars()
+                        .all(|c| c == '.' || c == '\u{25B4}' || c == '\u{25BE}');
                     let heading = s
                         .sections
                         .iter()
@@ -1112,7 +1115,10 @@ mod eyeball {
         let at = 4usize;
         for (w, h) in [(60u16, 14u16), (60, 8), (34, 9), (60, 24)] {
             println!("=== {w}x{h}");
-            println!("--- before, cursor {at}\n{}", grid(&paint(&before, at, w, h)));
+            println!(
+                "--- before, cursor {at}\n{}",
+                grid(&paint(&before, at, w, h))
+            );
             println!(
                 "--- after the reply, same index {at}\n{}",
                 grid(&paint(&after, at, w, h))
@@ -1288,7 +1294,10 @@ mod eyeball {
                         "\u{1f469}\u{200d}\u{1f469}\u{200d}\u{1f467} \u{306e}\u{305f}\u{3081}",
                     ),
                     wide("Beyonce\u{301}", "\u{2764}\u{fe0f} 28 plays"),
-                    wide("\u{1f3b5}\u{1f3b5}\u{1f3b5}", "\u{1100}\u{1161}\u{11a8} song"),
+                    wide(
+                        "\u{1f3b5}\u{1f3b5}\u{1f3b5}",
+                        "\u{1100}\u{1161}\u{11a8} song",
+                    ),
                 ],
             }],
         };

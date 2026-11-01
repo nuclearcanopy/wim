@@ -981,11 +981,7 @@ mod tests {
                 let g = grid(&buf);
                 let inner = crate::ui::draw::framed_inner(Rect::new(0, 0, w, h));
                 let body = (inner.y + HEADER_ROWS) as usize;
-                for line in g
-                    .lines()
-                    .take((inner.y + inner.height) as usize)
-                    .skip(body)
-                {
+                for line in g.lines().take((inner.y + inner.height) as usize).skip(body) {
                     let cells: Vec<char> = line.chars().collect();
                     let mut runs = 0;
                     for (i, c) in cells.iter().enumerate() {

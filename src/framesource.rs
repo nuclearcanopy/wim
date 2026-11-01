@@ -775,7 +775,14 @@ impl FrameSource {
             // album art, which sets this for its own pane, and the
             // setting is part of the key either way.
             m.set_sharpen(Sharpen::On);
-            m.render_frame(self.stamp, &self.front, area, self.grid.cell_aspect, style, buf)
+            m.render_frame(
+                self.stamp,
+                &self.front,
+                area,
+                self.grid.cell_aspect,
+                style,
+                buf,
+            )
         })
     }
 
@@ -2041,7 +2048,10 @@ mod repaint_tests {
             memo.render_frame(stamp, &img, area, grid.cell_aspect, style(), buf)
         };
 
-        assert!(paint(&mut memo, &mut buf, 1), "the first paint has to sample");
+        assert!(
+            paint(&mut memo, &mut buf, 1),
+            "the first paint has to sample"
+        );
         for _ in 0..5 {
             assert!(
                 !paint(&mut memo, &mut buf, 1),
@@ -2078,7 +2088,13 @@ mod ascii_tests {
     fn an_idle_frame_costs_nothing() {
         let mut ascii = Ascii::default();
         ascii
-            .update(false, Some(Path::new("/v/a.mkv")), no_cells(), 0.0, never_asked)
+            .update(
+                false,
+                Some(Path::new("/v/a.mkv")),
+                no_cells(),
+                0.0,
+                never_asked,
+            )
             .expect("ascii off is not an error");
         ascii
             .update(true, None, no_cells(), 0.0, never_asked)
@@ -2183,7 +2199,12 @@ mod frame_budget {
     /// runs on this box differ 1.6-1.8x under load, so two separate
     /// measurements are not comparable and this is the only shape that
     /// is.
-    fn best_each(rounds: usize, iters: usize, a: &mut dyn FnMut(), b: &mut dyn FnMut()) -> (f64, f64) {
+    fn best_each(
+        rounds: usize,
+        iters: usize,
+        a: &mut dyn FnMut(),
+        b: &mut dyn FnMut(),
+    ) -> (f64, f64) {
         let mut best = (f64::MAX, f64::MAX);
         let time = |f: &mut dyn FnMut()| {
             let at = Instant::now();
@@ -2227,7 +2248,14 @@ mod frame_budget {
             let mut buf = Buffer::empty(area);
             let mut on = || {
                 raster::with_scratch(|r| {
-                    r.render_with(&img, area, grid.cell_aspect, style(Tone::Mono), Sharpen::On, &mut buf);
+                    r.render_with(
+                        &img,
+                        area,
+                        grid.cell_aspect,
+                        style(Tone::Mono),
+                        Sharpen::On,
+                        &mut buf,
+                    );
                 });
             };
             let mut buf_off = Buffer::empty(area);
@@ -2252,12 +2280,26 @@ mod frame_budget {
             let mut stamp = 0u64;
             let mut fresh = || {
                 stamp += 1;
-                memo.render_frame(stamp, &img, area, grid.cell_aspect, style(Tone::Mono), &mut buf_memo);
+                memo.render_frame(
+                    stamp,
+                    &img,
+                    area,
+                    grid.cell_aspect,
+                    style(Tone::Mono),
+                    &mut buf_memo,
+                );
             };
             let mut memo_same = crate::ui::raster::Memo::default();
             let mut buf_same = Buffer::empty(area);
             let mut repeat = || {
-                memo_same.render_frame(1, &img, area, grid.cell_aspect, style(Tone::Mono), &mut buf_same);
+                memo_same.render_frame(
+                    1,
+                    &img,
+                    area,
+                    grid.cell_aspect,
+                    style(Tone::Mono),
+                    &mut buf_same,
+                );
             };
             let (new_frame, repaint) = best_each(5, 20, &mut fresh, &mut repeat);
             let (w, h) = grid.pixels();
@@ -2304,8 +2346,16 @@ mod rate_tests {
     #[test]
     fn a_cap_only_lowers_the_rate() {
         assert_eq!(ascii_fps(Some(30.0), Some(12.0)), 12.0);
-        assert_eq!(ascii_fps(Some(24.0), Some(60.0)), 24.0, "the cap is not a target");
-        assert_eq!(ascii_fps(None, Some(10.0)), 10.0, "capped below the fallback");
+        assert_eq!(
+            ascii_fps(Some(24.0), Some(60.0)),
+            24.0,
+            "the cap is not a target"
+        );
+        assert_eq!(
+            ascii_fps(None, Some(10.0)),
+            10.0,
+            "capped below the fallback"
+        );
         assert_eq!(ascii_fps(None, Some(99.0)), FALLBACK_FPS);
     }
 

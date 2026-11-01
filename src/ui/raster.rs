@@ -1513,7 +1513,10 @@ mod tests {
                             got.luma, want.luma,
                             "{tone:?} {fit:?} {w}x{h} luma grid differs"
                         );
-                        assert_eq!(got.rgb, want.rgb, "{tone:?} {fit:?} {w}x{h} rgb grid differs");
+                        assert_eq!(
+                            got.rgb, want.rgb,
+                            "{tone:?} {fit:?} {w}x{h} rgb grid differs"
+                        );
                     }
                 }
             }
@@ -1565,7 +1568,10 @@ mod tests {
                             got.luma, want.luma,
                             "{tone:?} {fit:?} {w}x{h} luma grid differs"
                         );
-                        assert_eq!(got.rgb, want.rgb, "{tone:?} {fit:?} {w}x{h} rgb grid differs");
+                        assert_eq!(
+                            got.rgb, want.rgb,
+                            "{tone:?} {fit:?} {w}x{h} rgb grid differs"
+                        );
                     }
                 }
             }
@@ -2786,10 +2792,11 @@ mod tests {
         // exactly `2cols x 2rows` pixels, so `Fit::Stretch` is a 1:1
         // copy, one tap per sample and no box average to compensate
         // for. The unsharp pass is then most of a frame's resample.
-        let frame = DynamicImage::ImageRgb8(RgbImage::from_fn(w as u32 * 2, h as u32 * 2, |x, y| {
-            let v = ((x * 7 + y * 11) % 256) as u8;
-            Rgb([v, v.wrapping_add(40), 255 - v])
-        }));
+        let frame =
+            DynamicImage::ImageRgb8(RgbImage::from_fn(w as u32 * 2, h as u32 * 2, |x, y| {
+                let v = ((x * 7 + y * 11) % 256) as u8;
+                Rgb([v, v.wrapping_add(40), 255 - v])
+            }));
         let style = Style {
             fit: Fit::Stretch,
             tone: Tone::Mono,

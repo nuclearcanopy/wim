@@ -64,7 +64,9 @@ pub enum Skipped {
     /// Moved the full `n`.
     All,
     /// Hit the end first; `steps` is how far it actually went.
-    Short { steps: usize },
+    Short {
+        steps: usize,
+    },
     /// Nothing upcoming at all.
     AtTheEnd,
     Failed(String),
@@ -683,8 +685,10 @@ pub fn append_resolved(tracks: &[SearchItem], core: &mut CoreCtx) {
         // nothing went in, so "queued 0 tracks" would be the wrong
         // shape of message entirely.
         if skipped > 0 {
-            core.notifications
-                .push(Severity::Error, format!("queued nothing{}", lost_note(skipped)));
+            core.notifications.push(
+                Severity::Error,
+                format!("queued nothing{}", lost_note(skipped)),
+            );
         }
         return;
     }
@@ -1019,7 +1023,10 @@ pub enum SubtitleOutcome {
     /// a typo'd `opensubtitles_api_key` was indistinguishable from a
     /// film nobody has subtitled. the no-results case stays silent,
     /// which is what makes silence mean that again.
-    Failed { for_video: String, why: String },
+    Failed {
+        for_video: String,
+        why: String,
+    },
 }
 
 impl SubtitleOutcome {
@@ -1031,10 +1038,7 @@ impl SubtitleOutcome {
     }
 }
 
-pub fn subtitle_belongs_to_playing(
-    sub: &SubtitleOutcome,
-    playing: Option<&SearchItem>,
-) -> bool {
+pub fn subtitle_belongs_to_playing(sub: &SubtitleOutcome, playing: Option<&SearchItem>) -> bool {
     matches!(
         playing,
         Some(SearchItem::LocalVideo { path, .. }) if *path.to_string_lossy() == *sub.for_video()
@@ -1098,10 +1102,7 @@ pub fn fire_subtitle_fetch(
         };
         let sidecar = SubtitleReady::sidecar(&video);
         if let Err(e) = std::fs::write(&sidecar, bytes) {
-            let _ = subtitle_tx.send(failed(format!(
-                "couldn't write {}: {e}",
-                sidecar.display()
-            )));
+            let _ = subtitle_tx.send(failed(format!("couldn't write {}: {e}", sidecar.display())));
             return;
         }
         let _ = subtitle_tx.send(SubtitleOutcome::Ready(SubtitleReady::written_beside(
@@ -1793,7 +1794,10 @@ pub fn note_playback_started(
     // so a read-only cache dir is one counted box and not one per
     // track.
     if let Err(why) = saved {
-        notifications.push(Severity::Error, format!("couldn't save the play index: {why}"));
+        notifications.push(
+            Severity::Error,
+            format!("couldn't save the play index: {why}"),
+        );
     }
     if !should_auto_download(
         days,
@@ -2852,9 +2856,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                     // arm is a bug rather than a user mistake; say so
                     // instead of reporting a queued gap that is not
                     // there.
-                    Enqueued::NotPlayable => {
-                        op_fail("a silence did not resolve to a playable url")
-                    }
+                    Enqueued::NotPlayable => op_fail("a silence did not resolve to a playable url"),
                     Enqueued::Failed(why) => op_fail(why),
                 }
             }
@@ -3903,7 +3905,10 @@ mod late_subtitle_tests {
             why: "subtitle search failed: 401".to_string(),
         };
         assert_eq!(failed.for_video(), "/v/a.mkv");
-        assert!(subtitle_belongs_to_playing(&failed, Some(&video("/v/a.mkv"))));
+        assert!(subtitle_belongs_to_playing(
+            &failed,
+            Some(&video("/v/a.mkv"))
+        ));
         assert!(
             !subtitle_belongs_to_playing(&failed, Some(&video("/v/b.mkv"))),
             "a failure for the previous video must not surface over this one"
@@ -4545,8 +4550,8 @@ mod seam_tests {
         assert!(now, "it reports the new state at once");
         assert!(starred.contains(&id), "and the set already holds it");
 
-        let now =
-            toggle_star(&item, &mut favorites, &mut starred, &star_tx, star_nowhere).expect("and unstarred");
+        let now = toggle_star(&item, &mut favorites, &mut starred, &star_tx, star_nowhere)
+            .expect("and unstarred");
         assert!(!now);
         assert!(!starred.contains(&id));
     }
@@ -6141,7 +6146,10 @@ mod seek_length_tests {
         let real = playing_duration(Some(&entry), lie);
         assert_eq!(real, Some(600.0), "the entry knows its own length");
 
-        assert_eq!(shellsong_host::seek_target(Pos::Percent(50.0), lie), Ok(0.5));
+        assert_eq!(
+            shellsong_host::seek_target(Pos::Percent(50.0), lie),
+            Ok(0.5)
+        );
         assert_eq!(
             shellsong_host::seek_target(Pos::Percent(50.0), real),
             Ok(300.0),
@@ -6152,7 +6160,10 @@ mod seek_length_tests {
             shellsong_host::seek_target(Pos::Seconds(300.0), lie).is_err(),
             "five minutes into a ten minute gap was refused as past the end"
         );
-        assert_eq!(shellsong_host::seek_target(Pos::Seconds(300.0), real), Ok(300.0));
+        assert_eq!(
+            shellsong_host::seek_target(Pos::Seconds(300.0), real),
+            Ok(300.0)
+        );
     }
 
     /// And the wiring, which is where the two paths disagreed: the
@@ -6237,7 +6248,10 @@ mod rememberable_setting_tests {
         let cfg = config::Config::default();
         let why = setting_refusal(&Setting::Eq("nope".into()), &cfg)
             .expect("there is no preset called nope");
-        assert!(why.contains("eq preset"), "it has to say what is wrong: {why}");
+        assert!(
+            why.contains("eq preset"),
+            "it has to say what is wrong: {why}"
+        );
 
         // a built-in resolves, and so does a saved curve, which is the
         // half a parse-time check could not see.
@@ -6597,10 +6611,7 @@ mod undo_hook_tests {
         // every op the tree calls a barrier has to say why, or the
         // refusal reads as a bug.
         let mut barriers = 0;
-        for op in [
-            Op::Download(shellsong::Target::Selection),
-            Op::Quit,
-        ] {
+        for op in [Op::Download(shellsong::Target::Selection), Op::Quit] {
             let hook = UndoHook::of(&op);
             if let undo::Reversibility::Barrier(why) = undo::classify(&op) {
                 barriers += 1;
