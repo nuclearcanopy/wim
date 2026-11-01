@@ -479,9 +479,6 @@ pub struct Track {
     /// Empty unless the track came in through `ingest_songs`/
     /// `ingest_album`; `SearchItem` does not carry genre.
     pub genres: Vec<String>,
-    /// Slot on its album, only known for `ingest_album` tracks; what
-    /// the album-neighbour generator needs.
-    pub position: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -534,6 +531,12 @@ pub struct Catalog {
     tracks: Vec<Track>,
     track_album: Vec<Option<usize>>,
     track_artist: Vec<Option<usize>>,
+    /// Slot on its album, only known for `ingest_album` tracks; what
+    /// the album-neighbour generator needs. Parallel to `tracks`
+    /// rather than a field on `Track` because that generator asks it
+    /// of every track in the library, and a `Track` is ten times the
+    /// width of this answer.
+    track_position: Vec<Option<usize>>,
     by_key: HashMap<String, usize>,
     albums: Vec<AlbumEntry>,
     /// Name index, `(normalised artist, normalised album)`. Kept
@@ -739,7 +742,7 @@ impl Catalog {
                     track.genres = genres.to_vec();
                 }
                 if position.is_some() {
-                    track.position = position;
+                    self.track_position[index] = position;
                 }
                 index
             }
@@ -752,10 +755,10 @@ impl Catalog {
                     artist: artist.to_string(),
                     album: album.to_string(),
                     genres: genres.to_vec(),
-                    position,
                 });
                 self.track_album.push(None);
                 self.track_artist.push(None);
+                self.track_position.push(position);
                 self.by_key.insert(key.to_string(), index);
                 index
             }
@@ -1089,6 +1092,51 @@ struct Model<'a> {
     total_plays: u32,
 }
 
+/// One `TrackAffinity` per catalog track, plus the library's total
+/// play count. Hoisted out of `Model::build` because it is the half
+/// of the build that asks the play history about every track, which
+/// is the single most expensive thing a pass does; see
+/// `cost::what_the_history_lookups_cost`.
+fn track_affinities(req: &Request<'_>) -> (Vec<TrackAffinity>, u32) {
+    let catalog = req.catalog;
+    let tuning = req.tuning;
+    // the starred set is the user's own, orders of magnitude smaller
+    // than the library, and `by_key` is keyed on exactly what it
+    // holds: look its members up here rather than asking of every
+    // track in the library whether it is one of them.
+    let mut is_starred = vec![false; catalog.tracks.len()];
+    for key in req.starred {
+        if let Some(&index) = catalog.by_key.get(key) {
+            is_starred[index] = true;
+        }
+    }
+
+    let mut tracks = Vec::with_capacity(catalog.tracks.len());
+    let mut total_plays = 0u32;
+    for (index, track) in catalog.tracks.iter().enumerate() {
+        let entry = req.cache.entry(&track.key);
+        let plays = entry.map_or(0, |e| e.play_count);
+        let days = entry.map_or(0, |e| e.play_days.len() as u32);
+        let last_played_secs = entry.and_then(|e| e.last_played_secs);
+        let first_day = entry
+            .and_then(|e| e.play_days.first())
+            .and_then(|d| day_number(d));
+        let starred = is_starred[index];
+        let raw = frequency(days, plays, starred, tuning);
+        total_plays += plays;
+        tracks.push(TrackAffinity {
+            raw,
+            score: raw * decay(last_played_secs, req.now_secs, tuning.half_life_days),
+            plays,
+            days,
+            last_played_secs,
+            first_day,
+            starred,
+        });
+    }
+    (tracks, total_plays)
+}
+
 /// One `GenreRoll` per distinct normalised genre, in first-seen
 /// order. Hoisted out of `Model::build` because it is the half of the
 /// build that walks every track's genre list, so it is the half worth
@@ -1153,36 +1201,7 @@ impl<'a> Model<'a> {
         // than the library, and `by_key` is keyed on exactly what it
         // holds: look its members up here rather than asking of every
         // track in the library whether it is one of them.
-        let mut is_starred = vec![false; catalog.tracks.len()];
-        for key in req.starred {
-            if let Some(&index) = catalog.by_key.get(key) {
-                is_starred[index] = true;
-            }
-        }
-
-        let mut tracks = Vec::with_capacity(catalog.tracks.len());
-        let mut total_plays = 0u32;
-        for (index, track) in catalog.tracks.iter().enumerate() {
-            let entry = req.cache.entry(&track.key);
-            let plays = entry.map_or(0, |e| e.play_count);
-            let days = entry.map_or(0, |e| e.play_days.len() as u32);
-            let last_played_secs = entry.and_then(|e| e.last_played_secs);
-            let first_day = entry
-                .and_then(|e| e.play_days.first())
-                .and_then(|d| day_number(d));
-            let starred = is_starred[index];
-            let raw = frequency(days, plays, starred, tuning);
-            total_plays += plays;
-            tracks.push(TrackAffinity {
-                raw,
-                score: raw * decay(last_played_secs, req.now_secs, tuning.half_life_days),
-                plays,
-                days,
-                last_played_secs,
-                first_day,
-                starred,
-            });
-        }
+        let (tracks, total_plays) = track_affinities(req);
 
         let mut albums = vec![Roll::default(); catalog.albums.len()];
         for (slot, album) in catalog.albums.iter().enumerate() {
@@ -1770,7 +1789,7 @@ fn album_neighbours(model: &Model<'_>) -> Vec<Candidate> {
     for album in &model.catalog.albums {
         by_position.clear();
         for &index in &album.tracks {
-            if let Some(position) = model.catalog.tracks[index].position {
+            if let Some(position) = model.catalog.track_position[index] {
                 if position >= by_position.len() {
                     by_position.resize(position + 1, None);
                 }
@@ -1781,7 +1800,7 @@ fn album_neighbours(model: &Model<'_>) -> Vec<Candidate> {
             if model.tracks[index].plays > 0 {
                 continue;
             }
-            let Some(position) = model.catalog.tracks[index].position else {
+            let Some(position) = model.catalog.track_position[index] else {
                 continue;
             };
             let best = [position.checked_sub(1), Some(position + 1)]
@@ -3428,7 +3447,7 @@ mod tests {
         );
         assert_eq!(catalog.track_count(), 1, "the same id is one track");
         assert_eq!(catalog.tracks[0].genres, vec!["Cloud Rap"]);
-        assert_eq!(catalog.tracks[0].position, Some(0));
+        assert_eq!(catalog.track_position[0], Some(0));
     }
 
     /// A client of this test's own, since the id index is shared per
@@ -4198,6 +4217,21 @@ mod cost {
             }
         }
 
+        /// The history keys this fixture recorded, which is what a
+        /// `CacheIndex` would hand back if it could be walked.
+        fn played_keys(&self, albums: usize, per_album: usize) -> Vec<String> {
+            let mut out = Vec::new();
+            for al in 0..albums / 2 {
+                for t in 0..per_album {
+                    if (al * per_album + t).is_multiple_of(3) {
+                        continue;
+                    }
+                    out.push(song_id(al, t));
+                }
+            }
+            out
+        }
+
         fn describe(&self) -> String {
             format!(
                 "{} tracks / {} albums / {} artists, {} build",
@@ -4233,13 +4267,15 @@ mod cost {
 
     /// `album_neighbours` as it was before the position map became a
     /// vec: the baseline both for the ratio and for "same answer".
+    /// It reads the positions where they live now, so the ratio it
+    /// gives is the map change alone.
     fn album_neighbours_hashed(model: &Model<'_>) -> Vec<Candidate> {
         let mut out = Pool::new(model.tuning.per_generator_candidates);
         let mut by_position: HashMap<usize, usize> = HashMap::new();
         for album in &model.catalog.albums {
             by_position.clear();
             for &index in &album.tracks {
-                if let Some(position) = model.catalog.tracks[index].position {
+                if let Some(position) = model.catalog.track_position[index] {
                     by_position.insert(position, index);
                 }
             }
@@ -4247,7 +4283,7 @@ mod cost {
                 if model.tracks[index].plays > 0 {
                     continue;
                 }
-                let Some(position) = model.catalog.tracks[index].position else {
+                let Some(position) = model.catalog.track_position[index] else {
                     continue;
                 };
                 let best = [position.checked_sub(1), Some(position + 1)]
@@ -4538,6 +4574,96 @@ mod cost {
         assert_eq!(shape(&fast), shape(&album_neighbours_hashed(&model)));
     }
 
+    /// A model whose genre rollups came from the three keyed maps
+    /// rather than from the slot pass, for the old-against-new
+    /// ranking comparison. The slots are in first-seen order and the
+    /// map's are in hash order, which nothing downstream can see:
+    /// `genre_under_explored` sorts them by key before reading any.
+    fn model_with_mapped_genres<'a>(req: &Request<'a>) -> Model<'a> {
+        let mut model = Model::build(req);
+        let (rolls, names, artists) = genre_maps(req.catalog, &model.tracks);
+        model.genres = rolls
+            .into_iter()
+            .map(|(key, roll)| GenreRoll {
+                name: names[&key].clone(),
+                artists: artists.get(&key).cloned().unwrap_or_default(),
+                key,
+                roll,
+            })
+            .collect();
+        model
+    }
+
+    /// The pass as it was before any of this: the hashed neighbour
+    /// map and the string-keyed diversification. `suggest_with`'s own
+    /// shape, including both routes to the cold start, so the
+    /// comparison is of the whole answer and not of one stage.
+    fn suggest_reference(model: &Model, req: &Request<'_>) -> Suggestions {
+        if model.total_plays == 0 {
+            return cold_start(model, req);
+        }
+        let pools = vec![
+            daily_rotation(model),
+            album_gap(model),
+            track_gap(model),
+            album_neighbours_hashed(model),
+            genre_under_explored(model),
+            rediscovery(model),
+            starred_unplayed(model),
+            similar_artists(model, req.enrichment),
+            popular_unplayed(model, req.enrichment),
+        ];
+        let mut merged: Vec<Candidate> = Vec::new();
+        for mut pool in pools {
+            normalise(&mut pool, req.tuning);
+            pool.truncate(req.tuning.per_generator_candidates);
+            merged.extend(pool);
+        }
+        dedup(&mut merged);
+        let sections = group(diversify_keyed(merged, req.tuning), req.tuning);
+        if sections.is_empty() {
+            return cold_start(model, req);
+        }
+        Suggestions { sections }
+    }
+
+    /// Every row of the menu in display order, with the score to the
+    /// bit: the whole documented output shape.
+    fn rows(suggestions: &Suggestions) -> Vec<String> {
+        suggestions
+            .flat()
+            .map(|(reason, s)| {
+                format!(
+                    "{reason:?} {:?} {:08x} {}",
+                    s.item.identity(),
+                    s.score.to_bits(),
+                    s.reason_text
+                )
+            })
+            .collect()
+    }
+
+    /// The whole menu, old against new, over a library-shaped corpus:
+    /// same sections in the same order, same rows in the same order,
+    /// same reason sentences, same scores to the bit. This is the one
+    /// assertion that covers all three optimizations at once, since
+    /// every stage they touched is on the reference side.
+    #[test]
+    fn the_optimized_pass_ranks_exactly_what_the_old_one_ranked() {
+        for (albums, per_album) in [(300usize, 12usize), (700, 14)] {
+            let fixture = Fixture::new(albums, per_album);
+            let req = fixture.request();
+            let new = rows(&suggest(&req));
+            let old = rows(&suggest_reference(&model_with_mapped_genres(&req), &req));
+            assert!(
+                new.len() > 20,
+                "{} rows is not a menu worth comparing",
+                new.len()
+            );
+            assert_eq!(new, old, "{albums} albums of {per_album}");
+        }
+    }
+
     /// Where one pass spends its time, stage by stage. Not an
     /// assertion: this is the map that says what is worth optimizing,
     /// and the `tail` line is everything after candidate generation
@@ -4625,6 +4751,140 @@ mod cost {
             },
         );
         println!("  slots {slots:.1}us  maps {maps:.1}us  {:.2}x", maps / slots);
+    }
+
+    /// What a whole pass costs, old against new. Composed from parts
+    /// each measured by alternating batches in this one process: the
+    /// stages the optimizations touched are measured against the code
+    /// they replaced, and the rest of the model (the per-track
+    /// affinities and the album/artist rollups) is identical on both
+    /// sides and so is measured once.
+    #[test]
+    #[ignore = "a measurement; run it explicitly"]
+    fn what_a_suggestion_pass_costs() {
+        for (albums, per_album) in [(700usize, 14usize), (2_200, 14)] {
+            let fixture = Fixture::new(albums, per_album);
+            let req = fixture.request();
+            let model = Model::build(&req);
+            println!("--- {}", fixture.describe());
+            let (genre_new, genre_old) = best_each(
+                5,
+                10,
+                &mut || {
+                    let _ = genre_rolls(&fixture.catalog, &model.tracks);
+                },
+                &mut || {
+                    let _ = genre_maps(&fixture.catalog, &model.tracks);
+                },
+            );
+            let (tail_new, tail_old) = best_each(
+                5,
+                10,
+                &mut || {
+                    let _ = suggest_with(&model, &req);
+                },
+                &mut || {
+                    let _ = suggest_reference(&model, &req);
+                },
+            );
+            // the model minus its genre stage: the same work on both
+            // sides, so it is measured once and added to both.
+            let model_total = best(5, 10, &mut || {
+                let _ = Model::build(&req);
+            });
+            let affinities = model_total - genre_new;
+            let new = affinities + genre_new + tail_new;
+            let old = affinities + genre_old + tail_old;
+            println!("  {:<26} {:>9} {:>9}", "", "new", "old");
+            println!("  {:<26} {affinities:>9.0} {affinities:>9.0}", "affinity + rollups");
+            println!("  {:<26} {genre_new:>9.0} {genre_old:>9.0}", "genre rollup");
+            println!("  {:<26} {tail_new:>9.0} {tail_old:>9.0}", "generation + selection");
+            println!("  {:<26} {new:>9.0} {old:>9.0}us  {:.2}x", "pass", old / new);
+        }
+    }
+
+    /// What is left: the play-history lookup per track, which is the
+    /// largest single cost in a pass and is not fixable from this
+    /// module. Three shapes, alternating in one process:
+    ///
+    /// - the loop as it stands, one `CacheIndex::entry` per track;
+    /// - the same loop with the lookup removed and nothing else
+    ///   changed, which is what the lookups cost;
+    /// - the flip: one `Catalog::by_key` lookup per *history* entry
+    ///   instead, which is a third as many on a library you have
+    ///   played half of. A proxy, since it is handed the keys rather
+    ///   than walking the index: `CacheIndex` has no way to be
+    ///   iterated, so the real flip needs an `entries()` on it, which
+    ///   is cache.rs and not this module.
+    #[test]
+    #[ignore = "a measurement; run it explicitly"]
+    fn what_the_history_lookups_cost() {
+        let (albums, per_album) = (2_200usize, 14usize);
+        let fixture = Fixture::new(albums, per_album);
+        let req = fixture.request();
+        let catalog = &fixture.catalog;
+        let tuning = &fixture.tuning;
+        let keys = fixture.played_keys(albums, per_album);
+        println!(
+            "--- history lookups, {} of {} tracks played, {}",
+            keys.len(),
+            catalog.track_count(),
+            fixture.describe()
+        );
+        let (whole, blind) = best_each(
+            5,
+            10,
+            &mut || {
+                let _ = track_affinities(&req);
+            },
+            &mut || {
+                // the same walk, same writes, no lookup.
+                let mut tracks = Vec::with_capacity(catalog.tracks.len());
+                for track in catalog.tracks.iter() {
+                    let entry: Option<&cache::CacheEntry> = None;
+                    let plays = entry.map_or(0, |e| e.play_count);
+                    let days = entry.map_or(0, |e| e.play_days.len() as u32);
+                    let raw = frequency(days, plays, false, tuning);
+                    tracks.push(TrackAffinity {
+                        raw,
+                        score: raw * decay(None, req.now_secs, tuning.half_life_days),
+                        plays,
+                        days,
+                        last_played_secs: None,
+                        first_day: None,
+                        starred: !track.key.is_empty(),
+                    });
+                }
+                std::hint::black_box(tracks);
+            },
+        );
+        let flipped = best(5, 10, &mut || {
+            let mut tracks = vec![TrackAffinity::default(); catalog.tracks.len()];
+            let mut total_plays = 0u32;
+            for key in &keys {
+                let Some(&index) = catalog.by_key.get(key) else {
+                    continue;
+                };
+                let entry = req.cache.entry(key).expect("a recorded key");
+                let plays = entry.play_count;
+                let days = entry.play_days.len() as u32;
+                let raw = frequency(days, plays, false, tuning);
+                total_plays += plays;
+                tracks[index] = TrackAffinity {
+                    raw,
+                    score: raw * decay(entry.last_played_secs, req.now_secs, tuning.half_life_days),
+                    plays,
+                    days,
+                    last_played_secs: entry.last_played_secs,
+                    first_day: entry.play_days.first().and_then(|d| day_number(d)),
+                    starred: false,
+                };
+            }
+            std::hint::black_box((tracks, total_plays));
+        });
+        println!(
+            "  per track {whole:.0}us  without the lookup {blind:.0}us  per history entry {flipped:.0}us"
+        );
     }
 
     /// Interned keys against the keyed maps they replaced,
