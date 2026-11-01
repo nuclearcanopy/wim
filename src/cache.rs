@@ -1641,7 +1641,11 @@ mod tests {
                 raw.len(),
                 growing / sized,
                 serial / pooled,
-                if days > 4 { "  <- play_days dominates" } else { "" },
+                if days > 4 {
+                    "  <- play_days dominates"
+                } else {
+                    ""
+                },
             );
         }
     }
