@@ -202,30 +202,36 @@ fn index_body(index: &CacheIndex) -> String {
     body
 }
 
-/// Pre-sized off the line count (one memchr pass over the file, next
-/// to nothing) rather than grown: this runs on the main thread before
-/// the first frame, and a map grown from empty rehashes every id it
-/// already holds a dozen times on the way up.
+/// One row as an entry, or `None` for a line that will not parse,
+/// which costs that track and nothing else.
+fn play_entry(line: &str) -> Option<(String, CacheEntry)> {
+    let row: PlayRow = serde_json::from_str(line).ok()?;
+    Some((
+        row.id.into_owned(),
+        CacheEntry {
+            play_count: row.play_count,
+            play_days: row.play_days.into_iter().map(Cow::into_owned).collect(),
+            last_played_secs: row.last_played_secs,
+            cached_path: row.cached_path.map(Cow::into_owned),
+            cached_at_secs: row.cached_at_secs,
+        },
+    ))
+}
+
+/// The map is pre-sized off the line count rather than grown: a map
+/// grown from empty rehashes every id it already holds a dozen times
+/// on the way up, and this is the one startup read still on the main
+/// thread, with nothing overlapping it, so it is first-frame time.
+/// Worth 1.07-1.16x of the parse, measured by `play_index_parse_legs`.
+///
+/// Serial on purpose. Chunking the rows over a pool was measured and
+/// rejected; `play_index_parse_legs` holds the candidate and the
+/// numbers.
 fn parse_index_body(raw: &str) -> CacheIndex {
-    let mut index = CacheIndex {
-        entries: HashMap::with_capacity(raw.lines().count()),
-    };
-    for row in raw
-        .lines()
-        .filter_map(|line| serde_json::from_str::<PlayRow>(line).ok())
-    {
-        index.entries.insert(
-            row.id.into_owned(),
-            CacheEntry {
-                play_count: row.play_count,
-                play_days: row.play_days.into_iter().map(Cow::into_owned).collect(),
-                last_played_secs: row.last_played_secs,
-                cached_path: row.cached_path.map(Cow::into_owned),
-                cached_at_secs: row.cached_at_secs,
-            },
-        );
-    }
-    index
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut entries = HashMap::with_capacity(lines.len());
+    entries.extend(lines.into_iter().filter_map(play_entry));
+    CacheIndex { entries }
 }
 
 /// Where a given track id would land on disk once downloaded, with the
@@ -1513,6 +1519,34 @@ mod tests {
         }
     }
 
+    /// The candidate pooled row parse, kept here rather than in the
+    /// module because the numbers rejected it; see
+    /// `play_index_parse_legs`. The map insert stays serial, since
+    /// hashing every id once is the irreducible part, which is most of
+    /// why it scales so poorly.
+    fn parse_index_body_pooled(raw: &str) -> CacheIndex {
+        let lines: Vec<&str> = raw.lines().collect();
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(lines.len().max(1));
+        let chunk = lines.len().div_ceil(workers.max(1)).max(1);
+        let parts: Vec<Vec<(String, CacheEntry)>> = std::thread::scope(|scope| {
+            lines
+                .chunks(chunk)
+                .map(|part| {
+                    scope.spawn(move || part.iter().copied().filter_map(play_entry).collect())
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+        let mut entries = HashMap::with_capacity(lines.len());
+        entries.extend(parts.into_iter().flatten());
+        CacheIndex { entries }
+    }
+
     /// `parse_index_body` as it was before the map was pre-sized:
     /// kept as the baseline `play_index_parse_legs` measures against.
     fn parse_index_body_growing(raw: &str) -> CacheIndex {
@@ -1535,75 +1569,51 @@ mod tests {
         index
     }
 
-    /// The same parse with the serde half chunked over a pool; the map
-    /// insert stays serial, since hashing every id once is the
-    /// irreducible part.
-    fn parse_index_body_parallel(raw: &str) -> CacheIndex {
-        let lines: Vec<&str> = raw.lines().collect();
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(lines.len().max(1));
-        let chunk = lines.len().div_ceil(workers.max(1)).max(1);
-        let parts: Vec<Vec<(String, CacheEntry)>> = std::thread::scope(|scope| {
-            lines
-                .chunks(chunk)
-                .map(|part| {
-                    scope.spawn(move || {
-                        part.iter()
-                            .filter_map(|line| serde_json::from_str::<PlayRow>(line).ok())
-                            .map(|row| {
-                                (
-                                    row.id.into_owned(),
-                                    CacheEntry {
-                                        play_count: row.play_count,
-                                        play_days: row
-                                            .play_days
-                                            .into_iter()
-                                            .map(Cow::into_owned)
-                                            .collect(),
-                                        last_played_secs: row.last_played_secs,
-                                        cached_path: row.cached_path.map(Cow::into_owned),
-                                        cached_at_secs: row.cached_at_secs,
-                                    },
-                                )
-                            })
-                            .collect()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|h| h.join().unwrap_or_default())
-                .collect()
-        });
-        let mut entries = HashMap::with_capacity(lines.len());
-        entries.extend(parts.into_iter().flatten());
-        CacheIndex { entries }
-    }
-
     /// `CacheIndex::load` is the one startup read still on the **main
     /// thread**, before the first frame and with nothing overlapping
     /// it, so every microsecond here is a microsecond of first frame.
-    /// Prices the growing map against the pre-sized one and against a
-    /// pooled parse. `cargo test --release -- --ignored --nocapture
+    /// Three things at once: the growing map against the pre-sized one
+    /// (cpu clock, both single-threaded), the pooled candidate against
+    /// the serial parse (wall clock, which is what a pool trades cpu
+    /// for), and what `play_days` costs, which the 4-day and 64-day
+    /// rows at the same track count price apart.
+    ///
+    /// **What shipped:** the pre-sized map, 1.07-1.16x of the parse,
+    /// the same at every size but 64 days (where allocating the day
+    /// strings is ~90% of the parse and swamps it).
+    ///
+    /// **What did not: the pool.** Measured 1.09-1.47x on a box at
+    /// load average 14-18 and 0.36-1.90x on the same box at load 25-31
+    /// (same sizes, same harness, one process), so there is no floor
+    /// this machine can set honestly, which is the same thing
+    /// `docs/startup-cache.md` records about fanning the catalog parse
+    /// out. It would be buying 1-2ms at 5000 tracks, the size the
+    /// docs call a long-running install, for a thread pool on the
+    /// startup path.
+    ///
+    /// **Where the parse really goes** is `play_days`: 20000 tracks
+    /// cost 36-41ms at 4 days each and 256-271ms at 64, so nine tenths
+    /// of a big index's parse is allocating `Vec<String>`s of
+    /// `YYYY-MM-DD`. Nothing outside this module reads more than
+    /// `.len()` and `.first()` of them (`suggest.rs`), so a packed
+    /// representation would take that back; it changes a `pub` field,
+    /// so it is not done here.
+    ///
+    /// `cargo test --release -- --ignored --nocapture
     /// play_index_parse_legs`.
     #[test]
     #[ignore = "measurement, run explicitly"]
     fn play_index_parse_legs() {
         println!("--- play index parse, {} build", profile());
-        for (tracks, days) in [(2_000usize, 3usize), (5_000, 4), (20_000, 64)] {
+        for (tracks, days) in [
+            (1_000usize, 3usize),
+            (2_000, 3),
+            (4_000, 4),
+            (5_000, 4),
+            (20_000, 4),
+            (20_000, 64),
+        ] {
             let raw = index_body(&play_index(tracks, days));
-            assert_eq!(
-                parse_index_body_growing(&raw).entries,
-                parse_index_body(&raw).entries,
-                "pre-sizing the map must not change what it holds"
-            );
-            assert_eq!(
-                parse_index_body_parallel(&raw).entries,
-                parse_index_body(&raw).entries,
-                "nor may chunking it"
-            );
-
             let (growing, sized) = best_each_cpu(
                 8,
                 2,
@@ -1614,25 +1624,45 @@ mod tests {
                     parse_index_body(&raw);
                 },
             );
-            let (sized_again, pooled) = best_each(
+            let (serial, pooled) = best_each(
                 8,
                 2,
                 &mut || {
                     parse_index_body(&raw);
                 },
                 &mut || {
-                    parse_index_body_parallel(&raw);
+                    parse_index_body_pooled(&raw);
                 },
             );
             println!(
                 "{tracks:>6} tracks x {days:>2} days ({:>9}B)  cpu: growing map \
-                 {growing:>9.0}us pre-sized {sized:>9.0}us {:.2}x   wall: pre-sized \
-                 {sized_again:>9.0}us pooled {pooled:>9.0}us {:.2}x",
+                 {growing:>9.0}us pre-sized {sized:>9.0}us {:.2}x   wall: serial \
+                 {serial:>9.0}us pooled {pooled:>9.0}us {:.2}x{}",
                 raw.len(),
                 growing / sized,
-                sized_again / pooled,
+                serial / pooled,
+                if days > 4 { "  <- play_days dominates" } else { "" },
             );
         }
+    }
+
+    /// Pre-sizing the map is a capacity, not a format: it must not
+    /// change, drop or merge a row. Pinned against a body with a row
+    /// the generated ones do not have, and against the rejected pooled
+    /// candidate, which is only evidence while it still reads the same
+    /// index.
+    #[test]
+    fn pre_sizing_the_map_reads_exactly_what_growing_it_did() {
+        let mut idx = play_index(300, 5);
+        idx.record_play("t-odd", "2026-01-09");
+        idx.mark_cached("t-odd", PathBuf::from("/c/wim/tracks/t-odd.mp3"));
+        let raw = index_body(&idx);
+        assert_eq!(raw.lines().count(), 301, "precondition");
+
+        let sized = parse_index_body(&raw);
+        assert_eq!(sized.entries, idx.entries, "the parse round-trips");
+        assert_eq!(parse_index_body_growing(&raw).entries, sized.entries);
+        assert_eq!(parse_index_body_pooled(&raw).entries, sized.entries);
     }
 
     /// Does the row parse need parallelising? It is on the startup
