@@ -13,8 +13,8 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use unicode_segmentation::UnicodeSegmentation;
 use serde::{Deserialize, Serialize};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::LoopMode;
 use crate::eq;
@@ -4638,7 +4638,24 @@ fn next_boundary(buf: &str, cursor: usize) -> Option<usize> {
 /// and read back in order, and nothing else needs to parse it.
 pub(crate) fn state_path(file: &str) -> Option<PathBuf> {
     let dir = dirs::state_dir().or_else(dirs::data_dir)?;
-    Some(dir.join("wim").join(file))
+    let dir = dir.join("wim");
+    // under test there is no state dir unless it is a temp one.
+    //
+    // the same hazard `cache::cache_dir` guards, and it was live: a
+    // bare `cargo test` appended to the maintainer's real
+    // `shellsong_history`, and `Op::Remember` reaches here too, so an
+    // `--ignored` run rewrote their real bindings. a sibling incident
+    // destroyed their play index this way.
+    //
+    // `None` rather than a panic, because that is already this
+    // module's contract for "no state dir" and every caller handles
+    // it: a test that wants real history points `XDG_STATE_HOME` at a
+    // temp dir and gets a path.
+    #[cfg(test)]
+    if !dir.starts_with(std::env::temp_dir()) {
+        return None;
+    }
+    Some(dir.join(file))
 }
 
 fn load_history() -> Vec<String> {
@@ -5165,7 +5182,11 @@ mod tests {
         let cols: Vec<usize> = stops.iter().map(|(_, c)| *c).collect();
         let mut sorted = cols.clone();
         sorted.dedup();
-        assert_eq!(cols.len(), sorted.len(), "two stops on one column: {stops:?}");
+        assert_eq!(
+            cols.len(),
+            sorted.len(),
+            "two stops on one column: {stops:?}"
+        );
         assert_eq!(cursor, 0, "it has to walk all the way out");
     }
 
@@ -6962,10 +6983,7 @@ mod tests {
         let why = Program::parse(&too_deep).expect_err("one past the limit is refused");
         let said = why.to_string();
         assert!(said.contains("nest"), "it has to name the problem: {said}");
-        assert!(
-            said.contains("lines"),
-            "and say what to do instead: {said}"
-        );
+        assert!(said.contains("lines"), "and say what to do instead: {said}");
 
         // and far past it is the same message, not a crash: this is
         // the shape someone actually pastes.
@@ -7073,10 +7091,50 @@ mod tests {
     /// zwj text to slice across, a NUL, and the literals that `f64`
     /// accepts but nothing downstream survives.
     const FRAGMENTS: &[&str] = &[
-        "queue(", "play(", "volume(", "moveto(", "repeat(", "dry(", "run(", "silence(", "fade(",
-        "let", "kind=", "=", "(", ")", "[", "]", ",", ";", "#", "\"", " ", "\n", "\t", "a", "2",
-        "+", "-", "%", "s", "m", "h", ":", ".", "nan", "inf", "1e30", "off", "é", "\u{301}",
-        "👩\u{200d}👧", "日本", "\0", "ı", "İ",
+        "queue(",
+        "play(",
+        "volume(",
+        "moveto(",
+        "repeat(",
+        "dry(",
+        "run(",
+        "silence(",
+        "fade(",
+        "let",
+        "kind=",
+        "=",
+        "(",
+        ")",
+        "[",
+        "]",
+        ",",
+        ";",
+        "#",
+        "\"",
+        " ",
+        "\n",
+        "\t",
+        "a",
+        "2",
+        "+",
+        "-",
+        "%",
+        "s",
+        "m",
+        "h",
+        ":",
+        ".",
+        "nan",
+        "inf",
+        "1e30",
+        "off",
+        "é",
+        "\u{301}",
+        "👩\u{200d}👧",
+        "日本",
+        "\0",
+        "ı",
+        "İ",
     ];
     /// Enough to cover the delimiters in combination without making the
     /// suite slow; the seed is fixed, so this is a corpus, not a dice
