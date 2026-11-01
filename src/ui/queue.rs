@@ -11,7 +11,7 @@ use crate::theme::{shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
 use crate::ui::results_list::{fill_row_bg, label};
 use crate::ui::scroll;
-use crate::ui::textfit::truncate_with_ellipsis;
+use crate::ui::textfit::truncate_into;
 
 /// The queue, finally visible. It was previously a bare count on the
 /// bottom bar, which for an app whose central design choice is an
@@ -52,46 +52,120 @@ enum Row {
     Entry(usize),
 }
 
-/// Flattens the playlist into the display order: current, then
-/// upcoming, then already-played newest-first. History reads better
-/// backwards (the thing you just heard is the thing you're most likely
-/// looking for) and it keeps the two interesting sections adjacent.
-fn rows(entries: &[SearchItem], pos: Option<usize>) -> Vec<Row> {
-    let mut out = Vec::new();
-    let played_end = match pos {
-        Some(p) if p < entries.len() => {
-            out.push(Row::Section("now playing"));
-            out.push(Row::Entry(p));
-            p
-        }
-        _ => 0,
-    };
-    let upcoming_start = match pos {
-        Some(p) if p < entries.len() => p + 1,
-        _ => 0,
-    };
-    if upcoming_start < entries.len() {
-        out.push(Row::Section("up next"));
-        for offset in 0..entries.len() - upcoming_start {
-            out.push(Row::Entry(upcoming_start + offset));
-        }
-    }
-    if played_end > 0 {
-        out.push(Row::Section("played"));
-        for index in (0..played_end).rev() {
-            out.push(Row::Entry(index));
-        }
-    }
-    out
+/// Where every display row of the queue lands, as an answer per row
+/// rather than as a sequence.
+///
+/// The display order is current, then upcoming, then already-played
+/// newest-first. History reads better backwards (the thing you just
+/// heard is the thing you're most likely looking for) and it keeps the
+/// two interesting sections adjacent.
+///
+/// That whole sequence is a function of the queue's length and play
+/// position alone: three labelled runs whose lengths both of those
+/// fix, so a couple of comparisons place any row and the cursor's own
+/// row is arithmetic rather than a scan. The `Vec<Row>` this replaces
+/// was one entry per queue entry, built twice a frame (`row_items` for
+/// the click map, then the paint) and scanned linearly for the cursor
+/// each time; see `frame_budget`.
+#[derive(Debug, Clone, Copy)]
+struct Layout {
+    len: usize,
+    /// `pos` once it is known to name an entry, which is the only form
+    /// the arithmetic below uses: a position past the end has no "now
+    /// playing" row and reads as a queue that has not started.
+    playing: Option<usize>,
 }
 
-/// Which display row holds `selected`, so the scroll offset can follow
-/// the cursor through the section labels without the labels ever being
-/// what's "selected".
-fn row_of(rows: &[Row], selected: usize) -> usize {
-    rows.iter()
-        .position(|r| matches!(r, Row::Entry(i) if *i == selected))
-        .unwrap_or(0)
+impl Layout {
+    fn new(len: usize, pos: Option<usize>) -> Self {
+        Layout {
+            len,
+            playing: pos.filter(|p| *p < len),
+        }
+    }
+
+    /// Display row the "played" label sits on, i.e. how many rows the
+    /// now-playing and up-next runs take: the label and the current
+    /// entry, plus the up-next label and its entries when any remain.
+    /// Unconditional, so the row is named even when `p` is 0 and there
+    /// is no played run; the callers check that.
+    fn played_label(&self, p: usize) -> usize {
+        match self.len - p - 1 {
+            0 => 2,
+            upcoming => 3 + upcoming,
+        }
+    }
+
+    /// Display rows in total: one per entry plus one per section label.
+    fn total(&self) -> usize {
+        match self.playing {
+            None if self.len == 0 => 0,
+            None => self.len + 1,
+            Some(0) => self.played_label(0),
+            Some(p) => self.played_label(p) + 1 + p,
+        }
+    }
+
+    /// The display row at `at`, or `None` past the end.
+    fn get(&self, at: usize) -> Option<Row> {
+        if at >= self.total() {
+            return None;
+        }
+        let Some(p) = self.playing else {
+            // nothing playing yet: one label, then the whole queue.
+            return Some(match at {
+                0 => Row::Section("up next"),
+                _ => Row::Entry(at - 1),
+            });
+        };
+        match at {
+            0 => Some(Row::Section("now playing")),
+            1 => Some(Row::Entry(p)),
+            _ => {
+                let upcoming = self.len - p - 1;
+                if upcoming > 0 {
+                    if at == 2 {
+                        return Some(Row::Section("up next"));
+                    }
+                    if at < 3 + upcoming {
+                        return Some(Row::Entry(p + 1 + (at - 3)));
+                    }
+                }
+                // `total` already refused everything past the played
+                // run, so `p` is non-zero here and this label exists.
+                let label = self.played_label(p);
+                match at == label {
+                    true => Some(Row::Section("played")),
+                    false => Some(Row::Entry(p - 1 - (at - label - 1))),
+                }
+            }
+        }
+    }
+
+    /// Which display row holds `selected`, so the scroll offset can
+    /// follow the cursor through the section labels without the labels
+    /// ever being what's "selected". A `selected` naming no entry
+    /// scrolls to the top, the same answer the position scan this
+    /// replaced gave by failing to find it.
+    fn row_of(&self, selected: usize) -> usize {
+        let Some(p) = self.playing else {
+            return match selected < self.len {
+                true => selected + 1,
+                false => 0,
+            };
+        };
+        if selected >= self.len {
+            return 0;
+        }
+        use std::cmp::Ordering;
+        match selected.cmp(&p) {
+            Ordering::Equal => 1,
+            Ordering::Greater => 3 + (selected - p - 1),
+            // `selected < p` makes `p` non-zero, so the played run is
+            // there and its label is the row above it.
+            Ordering::Less => self.played_label(p) + 1 + (p - 1 - selected),
+        }
+    }
 }
 
 /// The rect the entry rows are drawn into, so a hit map knows which
@@ -122,11 +196,11 @@ pub fn row_items(
     if body_height == 0 {
         return Vec::new();
     }
-    let rows = rows(entries, pos);
-    let offset = scroll::offset_for(row_of(&rows, selected), body_height);
+    let rows = Layout::new(entries.len(), pos);
+    let offset = scroll::offset_for(rows.row_of(selected), body_height);
     (0..body_height)
         .map(|row| match rows.get(offset + row) {
-            Some(Row::Entry(index)) => Some(*index),
+            Some(Row::Entry(index)) => Some(index),
             Some(Row::Section(_)) | None => None,
         })
         .collect()
@@ -136,13 +210,15 @@ pub fn row_items(
 /// the caller needs this to move the cursor past a section label in
 /// one keypress rather than landing on it.
 pub fn selectable(entries: &[SearchItem], pos: Option<usize>) -> Vec<usize> {
-    rows(entries, pos)
-        .into_iter()
-        .filter_map(|r| match r {
-            Row::Entry(index) => Some(index),
-            Row::Section(_) => None,
-        })
-        .collect()
+    let rows = Layout::new(entries.len(), pos);
+    let Some(p) = rows.playing else {
+        return (0..rows.len).collect();
+    };
+    let mut out = Vec::with_capacity(rows.len);
+    out.push(p);
+    out.extend(p + 1..rows.len);
+    out.extend((0..p).rev());
+    out
 }
 
 /// The header's key hint.
@@ -188,55 +264,63 @@ impl Widget for QueueView<'_> {
         if self.entries.is_empty() {
             // never a blank pane: say what to do, since an empty queue
             // is the state a first-time user is actually in.
-            draw_line(
+            let mut fitted = String::new();
+            draw_fitted(
                 buf,
                 area,
                 body_top,
                 "nothing queued",
                 shade(MID),
-                area.width as usize,
+                &mut fitted,
             );
-            draw_line(
+            let hint = format!(
+                "enter on a song to start, {} to add",
+                key_label(self.keymap.get(KeyAction::Enqueue))
+            );
+            let mut out = String::new();
+            draw_fitted(
                 buf,
                 area,
                 body_top.saturating_add(1),
-                &format!(
-                    "enter on a song to start, {} to add",
-                    key_label(self.keymap.get(KeyAction::Enqueue))
-                ),
+                &hint,
                 shade(DIM),
-                area.width as usize,
+                &mut out,
             );
             return;
         }
 
-        let rows = rows(self.entries, self.pos);
-        let offset = scroll::offset_for(row_of(&rows, self.selected), body_height);
+        let rows = Layout::new(self.entries.len(), self.pos);
+        let offset = scroll::offset_for(rows.row_of(self.selected), body_height);
         // the index gutter is sized to the widest number actually on
         // screen, so a 9-track queue doesn't pay for three digits.
-        let gutter = self.entries.len().to_string().len().max(2);
+        let gutter = digits(self.entries.len()).max(2);
+        // one pair of buffers for every row of the frame; both reach
+        // the widest row's length on the first screenful and stop
+        // reallocating, where a `format!` plus a `truncate` was two
+        // allocations per visible row every frame.
+        let mut text = String::new();
+        let mut fitted = String::new();
 
-        for (row_i, row) in rows.iter().skip(offset).take(body_height).enumerate() {
+        for row_i in 0..body_height {
+            let Some(row) = rows.get(offset + row_i) else {
+                break;
+            };
             let y = body_top + row_i as u16;
             match row {
                 Row::Section(name) => {
                     // one blank column of indent so section labels sit
                     // outside the rows they head, not in the same
                     // column as the entry text.
-                    draw_line(
-                        buf,
-                        area,
-                        y,
-                        &format!(" {name}"),
-                        shade(NEAR_BLACK),
-                        area.width as usize,
-                    );
+                    text.clear();
+                    text.push(' ');
+                    text.push_str(name);
+                    draw_fitted(buf, area, y, &text, shade(NEAR_BLACK), &mut fitted);
                 }
                 Row::Entry(index) => {
-                    let item = &self.entries[*index];
-                    let is_current = self.pos == Some(*index);
-                    let is_selected = *index == self.selected;
-                    let is_played = self.pos.is_some_and(|p| *index < p);
+                    let item = &self.entries[index];
+                    let is_current = self.pos == Some(index);
+                    let is_selected = index == self.selected;
+                    let is_played = self.pos.is_some_and(|p| index < p);
 
                     if is_selected {
                         fill_row_bg(buf, area, y, anim::selection_bg(self.elapsed, self.focused));
@@ -255,31 +339,282 @@ impl Widget for QueueView<'_> {
                     } else {
                         DIM
                     };
-                    let text = format!(
-                        "{marker}{:>gutter$}. {}",
-                        index + 1,
-                        label(item),
-                        gutter = gutter
-                    );
-                    draw_line(buf, area, y, &text, shade(level), area.width as usize);
+                    write_row_text(&mut text, item, index, marker, gutter);
+                    draw_fitted(buf, area, y, &text, shade(level), &mut fitted);
                 }
             }
         }
     }
 }
 
-fn draw_line(
+/// `▌ 12. title · artist` for one row, written into `out` rather than
+/// returned: the paint hands the same buffer to every row, where a
+/// `format!` per row was an allocation per visible row every frame.
+/// Clears `out` itself, so a caller cannot leak the previous row into
+/// this one.
+fn write_row_text(out: &mut String, item: &SearchItem, index: usize, marker: char, gutter: usize) {
+    use std::fmt::Write;
+    out.clear();
+    out.push(marker);
+    // right-aligned by hand: `{:>gutter$}` would do it, but only
+    // through a second `format!`.
+    let number = index + 1;
+    for _ in digits(number)..gutter {
+        out.push(' ');
+    }
+    // writing into a `String` cannot fail.
+    let _ = write!(out, "{number}. ");
+    out.push_str(&label(item));
+}
+
+/// Decimal digits in a positive number, which is the index gutter's
+/// width; `to_string().len()` was the same answer and an allocation.
+fn digits(n: usize) -> usize {
+    n.max(1).ilog10() as usize + 1
+}
+
+/// One row of `area`, clipped to its width with an ellipsis where
+/// anything was cut. `fitted` is the caller's reused buffer: the
+/// ellipsis goes on first (it is what signals "there is more"), then
+/// the width-correct writer does the clipping and cell advance.
+fn draw_fitted(
     buf: &mut Buffer,
     area: Rect,
     y: u16,
     text: &str,
     color: ratatui::style::Color,
-    max_width: usize,
+    fitted: &mut String,
 ) {
-    // ellipsis first (it is what signals "there is more"), then the
-    // width-correct writer does the clipping and cell advance.
-    let fitted = truncate_with_ellipsis(text, max_width);
-    crate::ui::draw::line(buf, area, y, &fitted, color);
+    truncate_into(fitted, text, area.width as usize);
+    crate::ui::draw::line(buf, area, y, fitted, color);
+}
+
+/// What a frame of the queue pane costs, and whether it costs it per
+/// *visible row* or per entry in the whole queue. main.rs derives this
+/// pane's geometry twice a frame (the click map, then the paint), so
+/// anything in here that scales with the queue length is paid for
+/// twice at the display's rate.
+///
+/// A measurement, not an assertion: the numbers move with the box and
+/// a ceiling here would be a flake. Run it with
+/// `cargo test --release --lib ui::queue::frame_budget -- --ignored --nocapture`;
+/// the dev profile is `opt-level = 0` and reads about 10x the shipping
+/// cost, which is why the build is the first thing printed.
+#[cfg(test)]
+mod frame_budget {
+    use super::tests::{eager_row_of, eager_row_text, eager_rows, queue};
+    use super::*;
+    use crate::ui::testbuf::buffer;
+    use std::time::Instant;
+
+    /// Alternating batches in one process, best of each. Sequential
+    /// runs on this box differ 1.6-2.1x under load, so two separate
+    /// measurements are not comparable and this is the only shape that
+    /// is; same harness as `results_list::frame_budget`.
+    fn best_each(
+        rounds: usize,
+        iters: usize,
+        a: &mut dyn FnMut(),
+        b: &mut dyn FnMut(),
+    ) -> (f64, f64) {
+        let mut best = (f64::MAX, f64::MAX);
+        let time = |f: &mut dyn FnMut()| {
+            let at = Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            at.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+        for _ in 0..rounds {
+            best.0 = best.0.min(time(a));
+            best.1 = best.1.min(time(b));
+        }
+        best
+    }
+
+    /// The pane the workspace hands this view, at a tall terminal's
+    /// row count.
+    const PANE: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 60,
+        height: 40,
+    };
+
+    /// One frame's work on this pane: the click map main.rs builds
+    /// outside the widget, plus the paint (which lays the geometry out
+    /// a second time itself).
+    fn frame(entries: &[SearchItem], pos: Option<usize>, selected: usize, buf: &mut Buffer) {
+        let _ = row_items(entries, pos, selected, PANE);
+        QueueView {
+            entries,
+            pos,
+            selected,
+            focused: true,
+            elapsed: Duration::ZERO,
+            keymap: &Keymap::default(),
+        }
+        .render(PANE, buf);
+    }
+
+    /// One screenful of geometry, which is what each of a frame's two
+    /// geometry derivations does: place the cursor, then ask for every
+    /// row in the window.
+    ///
+    /// A function, and `screenful_materialized` below is another one,
+    /// because an "old" shape written as a branch inside the timing
+    /// loop gets inlined and specialized while the real path stays an
+    /// ordinary call, and the A/B then lies.
+    fn screenful(entries: &[SearchItem], pos: Option<usize>, selected: usize) {
+        let l = Layout::new(entries.len(), pos);
+        let offset = scroll::offset_for(l.row_of(selected), PANE.height as usize);
+        for row in 0..PANE.height as usize {
+            std::hint::black_box(l.get(offset + row));
+        }
+    }
+
+    /// The same screenful out of the `Vec<Row>` that `Layout`
+    /// replaced, i.e. one entry per entry in the whole queue, plus the
+    /// linear scan for the cursor that went with it.
+    fn screenful_materialized(entries: &[SearchItem], pos: Option<usize>, selected: usize) {
+        let seq = eager_rows(entries, pos);
+        let offset = scroll::offset_for(eager_row_of(&seq, selected), PANE.height as usize);
+        for row in 0..PANE.height as usize {
+            std::hint::black_box(seq.get(offset + row));
+        }
+    }
+
+    #[test]
+    #[ignore = "a measurement; run it explicitly"]
+    fn what_a_frame_of_the_queue_costs() {
+        // 144hz is `anim::MAX_HZ`, the fastest the poll loop will ever
+        // redraw at, so it is the tightest deadline this path has.
+        let budget = 1e6 / crate::anim::MAX_HZ as f64;
+        println!(
+            "--- queue pane {}x{}, budget {budget:.0}us at {}hz, {} build",
+            PANE.width,
+            PANE.height,
+            crate::anim::MAX_HZ,
+            if cfg!(debug_assertions) {
+                "DEBUG (not the shipping cost; re-run with --release)"
+            } else {
+                "release"
+            }
+        );
+        // the short queue is the control: a pane's worth of entries and
+        // nothing more. Any gap between the two is work the frame did
+        // on entries that are not on screen.
+        let small = queue(PANE.height as usize);
+        let mut buf_a = buffer(PANE.width, PANE.height);
+        let mut buf_b = buffer(PANE.width, PANE.height);
+        for n in [2_000usize, 8_000, 15_000] {
+            let long = queue(n);
+            // mid-queue, so all three sections are on and the played
+            // run is as long as the upcoming one.
+            let pos = Some(n / 2);
+            for (what, selected) in [("the current track", n / 2), ("the last played", 0usize)] {
+                let (big, ctrl) = {
+                    let mut on_long = || frame(&long, pos, selected, &mut buf_a);
+                    let mut on_small =
+                        || frame(&small, Some(PANE.height as usize / 2), 0, &mut buf_b);
+                    best_each(5, 20, &mut on_long, &mut on_small)
+                };
+                let (closed, materialized) =
+                    best_each(5, 20, &mut || screenful(&long, pos, selected), &mut || {
+                        screenful_materialized(&long, pos, selected)
+                    });
+                // and the whole frame either way. `frame` already does
+                // the two closed-form derivations, so stacking the two
+                // materialized ones on top is the old frame plus one
+                // closed screenful of noise (0.2us of a 100us frame).
+                let (was, now) = best_each(
+                    5,
+                    20,
+                    &mut || {
+                        screenful_materialized(&long, pos, selected);
+                        screenful_materialized(&long, pos, selected);
+                        frame(&long, pos, selected, &mut buf_a);
+                    },
+                    &mut || frame(&long, pos, selected, &mut buf_b),
+                );
+                println!(
+                    "  {n:>6} entries, cursor on {what:<18}: frame {big:>8.1}us ({:>5.1}% of budget)   {} on screen {ctrl:>7.1}us   {:>5.1}x\n{:30}one screenful of geometry: closed form {closed:>8.2}us   a Vec<Row> {materialized:>8.1}us   {:>6.1}x\n{:30}the whole frame {now:>8.1}us   with both derivations materialized {was:>8.1}us   {:>5.1}x",
+                    big / budget * 100.0,
+                    PANE.height,
+                    big / ctrl,
+                    "",
+                    materialized / closed,
+                    "",
+                    was / now,
+                );
+            }
+        }
+
+        // the row text, which the paint builds once per visible row:
+        // one reused buffer plus `truncate_into` against the
+        // `format!` + `truncate_with_ellipsis` pair it replaced. The
+        // label itself still allocates (`results_list::label` returns
+        // a `String`), so this is two of the three allocations a row
+        // used to cost, not all three.
+        let rows = queue(PANE.height as usize);
+        let mut text = String::new();
+        let mut fitted = String::new();
+        let mut reused = || {
+            for (i, item) in rows.iter().enumerate() {
+                write_row_text(&mut text, item, i, ' ', 2);
+                truncate_into(&mut fitted, &text, PANE.width as usize);
+                std::hint::black_box(&fitted);
+            }
+        };
+        let mut formatted = || {
+            for (i, item) in rows.iter().enumerate() {
+                let t = eager_row_text(item, i, ' ', 2);
+                std::hint::black_box(crate::ui::textfit::truncate_with_ellipsis(
+                    &t,
+                    PANE.width as usize,
+                ));
+            }
+        };
+        let (one_buffer, per_row) = best_each(5, 200, &mut reused, &mut formatted);
+        println!(
+            "  {} rows of row text: two buffers {one_buffer:>7.2}us   a String per row {per_row:>7.2}us   {:.1}x",
+            PANE.height,
+            per_row / one_buffer,
+        );
+
+        // and the whole paint, which is what that sits inside: the
+        // geometry is a rounding error at a pane's worth of entries,
+        // so this is where the rest of a frame goes.
+        let mut pane = buffer(PANE.width, PANE.height);
+        let mut paint = || {
+            QueueView {
+                entries: &rows,
+                pos: Some(0),
+                selected: 0,
+                focused: true,
+                elapsed: Duration::ZERO,
+                keymap: &Keymap::default(),
+            }
+            .render(PANE, &mut pane);
+        };
+        let mut geometry = || {
+            std::hint::black_box(row_items(&rows, Some(0), 0, PANE));
+        };
+        let (painted, geo) = best_each(5, 200, &mut paint, &mut geometry);
+        println!(
+            "  {} rows painted {painted:>7.2}us ({:>4.1}% of budget)   the click map alone {geo:>7.2}us",
+            PANE.height,
+            painted / budget * 100.0,
+        );
+        // the floor, so this is a test and not just a printer: a
+        // render that drew nothing would measure beautifully.
+        let grid = crate::ui::testbuf::grid(&pane);
+        assert!(grid.contains("▌ 1. t0"), "nothing painted:\n{grid}");
+        assert!(
+            grid.lines().last().is_some_and(|r| r.contains(". t")),
+            "the pane is not full to its last row:\n{grid}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +628,91 @@ mod tests {
             title: title.to_string(),
             artist: Some("Artist".to_string()),
             album: None,
+        }
+    }
+
+    /// `n` entries with an artist each, so every row's label is the
+    /// two-part form the pane actually shows. Shared with
+    /// `frame_budget`.
+    pub(super) fn queue(n: usize) -> Vec<SearchItem> {
+        (0..n).map(|i| song(&format!("t{i}"))).collect()
+    }
+
+    /// What the row text used to cost: a `String` for the label and a
+    /// `format!` for the row, per visible row per frame. Kept as the
+    /// definition `write_row_text` has to agree with, and as the
+    /// benchmark's other half.
+    pub(super) fn eager_row_text(
+        item: &SearchItem,
+        index: usize,
+        marker: char,
+        gutter: usize,
+    ) -> String {
+        format!(
+            "{marker}{:>gutter$}. {}",
+            index + 1,
+            label(item),
+            gutter = gutter
+        )
+    }
+
+    /// The one-buffer row text has to spell the same row as the
+    /// `format!` it replaced, for every item variant and at every
+    /// gutter width the index can cross: `digits` right-aligns by hand
+    /// where `{:>gutter$}` did it, so a number wider than the gutter
+    /// (which a queue shortened under the cursor produces) has to
+    /// overflow the column the same way rather than be clipped.
+    #[test]
+    fn the_row_text_says_what_a_formatted_one_said() {
+        let client = crate::browse::fixtures::test_client();
+        let items = [
+            song("a title"),
+            SearchItem::LocalMusic {
+                path: "/m/b.flac".into(),
+                title: "no artist".into(),
+                artist: None,
+                album: None,
+            },
+            SearchItem::LocalVideo {
+                path: "/v/c.mkv".into(),
+                title: "a clip".into(),
+            },
+            SearchItem::Silence { secs: 930 },
+            SearchItem::Song {
+                id: "3".into(),
+                title: "a song".into(),
+                artist: "an artist".into(),
+                album: "an album".into(),
+                client,
+            },
+        ];
+        let mut out = String::new();
+        for item in &items {
+            for index in [0usize, 8, 9, 98, 99, 100, 998] {
+                for gutter in [1usize, 2, 3, 4] {
+                    for marker in [' ', '▌'] {
+                        // the same buffer across every case, so a
+                        // missing `clear` shows up as the previous
+                        // row's text still being in front.
+                        write_row_text(&mut out, item, index, marker, gutter);
+                        assert_eq!(
+                            out,
+                            eager_row_text(item, index, marker, gutter),
+                            "{item:?} index {index} gutter {gutter} marker {marker:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The gutter is sized off this, where a `to_string().len()` did
+    /// it before; an empty queue never reaches the render, but the
+    /// helper still has to answer rather than panic on 0.
+    #[test]
+    fn the_gutter_width_is_the_decimal_length_of_the_count() {
+        for n in [0usize, 1, 9, 10, 99, 100, 101, 999, 1000, 15_000] {
+            assert_eq!(digits(n), n.max(1).to_string().len(), "{n}");
         }
     }
 
@@ -311,10 +731,120 @@ mod tests {
         grid(&buf)
     }
 
+    /// What `Layout` used to be: the display-row sequence as a `Vec`
+    /// the length of the whole queue, plus a linear scan for the
+    /// selected row. Kept as the definition the closed form has to
+    /// agree with at every index; `frame_budget` next door times the
+    /// two against each other, which is the only reason the old shape
+    /// is worth keeping around.
+    pub(super) fn eager_rows(entries: &[SearchItem], pos: Option<usize>) -> Vec<Row> {
+        let mut out = Vec::new();
+        let played_end = match pos {
+            Some(p) if p < entries.len() => {
+                out.push(Row::Section("now playing"));
+                out.push(Row::Entry(p));
+                p
+            }
+            _ => 0,
+        };
+        let upcoming_start = match pos {
+            Some(p) if p < entries.len() => p + 1,
+            _ => 0,
+        };
+        if upcoming_start < entries.len() {
+            out.push(Row::Section("up next"));
+            for offset in 0..entries.len() - upcoming_start {
+                out.push(Row::Entry(upcoming_start + offset));
+            }
+        }
+        if played_end > 0 {
+            out.push(Row::Section("played"));
+            for index in (0..played_end).rev() {
+                out.push(Row::Entry(index));
+            }
+        }
+        out
+    }
+
+    /// The same scan `eager_rows` paired with, so the two halves of
+    /// the old geometry are both here to compare against.
+    pub(super) fn eager_row_of(rows: &[Row], selected: usize) -> usize {
+        rows.iter()
+            .position(|r| matches!(r, Row::Entry(i) if *i == selected))
+            .unwrap_or(0)
+    }
+
+    /// The live layout materialized, so the shape tests below read the
+    /// production geometry rather than a second copy of it.
+    fn sequence(entries: &[SearchItem], pos: Option<usize>) -> Vec<Row> {
+        let l = Layout::new(entries.len(), pos);
+        (0..l.total()).map(|at| l.get(at).unwrap()).collect()
+    }
+
+    /// `Layout` answers one display row at a time out of the queue's
+    /// length and play position instead of out of a `Vec` as long as
+    /// the queue. It has to give the same answer at every index, the
+    /// same total, and the same cursor row, including at a `selected`
+    /// that names no entry at all (which scrolls to the top) and a
+    /// `pos` past the end of the queue.
+    #[test]
+    fn the_row_geometry_answers_what_a_materialized_one_would() {
+        for n in [0usize, 1, 2, 3, 7, 40, 137] {
+            let e: Vec<_> = (0..n).map(|i| song(&format!("t{i}"))).collect();
+            let positions = [
+                None,
+                Some(0),
+                Some(1),
+                Some(n / 2),
+                Some(n.saturating_sub(1)),
+                Some(n),
+                Some(n + 5),
+            ];
+            for pos in positions {
+                let eager = eager_rows(&e, pos);
+                let lazy = Layout::new(n, pos);
+                let at = format!("n {n}, pos {pos:?}");
+                assert_eq!(lazy.total(), eager.len(), "total: {at}");
+                // three past the end, so "past the end" is pinned as
+                // `None` on both sides rather than left unasked.
+                for row in 0..eager.len() + 3 {
+                    assert_eq!(lazy.get(row), eager.get(row).copied(), "row {row} of {at}");
+                }
+                for selected in [0usize, 1, n / 2, n.saturating_sub(1), n, n + 9] {
+                    assert_eq!(
+                        lazy.row_of(selected),
+                        eager_row_of(&eager, selected),
+                        "cursor row for selected {selected} of {at}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// And the one thing the row-by-row agreement does not cover: the
+    /// order j/k steps through, which is built straight from the
+    /// layout rather than read out of it.
+    #[test]
+    fn selectable_is_the_entries_of_the_materialized_sequence() {
+        for n in [0usize, 1, 2, 7, 40] {
+            let e: Vec<_> = (0..n).map(|i| song(&format!("t{i}"))).collect();
+            for pos in [None, Some(0), Some(1), Some(n / 2), Some(n), Some(n + 5)] {
+                let want: Vec<usize> = eager_rows(&e, pos)
+                    .into_iter()
+                    .filter_map(|r| match r {
+                        Row::Entry(i) => Some(i),
+                        Row::Section(_) => None,
+                    })
+                    .collect();
+                assert_eq!(selectable(&e, pos), want, "n {n}, pos {pos:?}");
+            }
+        }
+    }
+
     #[test]
     fn sections_run_current_then_upcoming_then_played_backwards() {
         let e: Vec<_> = ["a", "b", "c", "d"].iter().map(|t| song(t)).collect();
-        let r = rows(&e, Some(1));
+        let r = sequence(&e, Some(1));
         assert_eq!(
             r,
             vec![
@@ -332,7 +862,7 @@ mod tests {
     #[test]
     fn nothing_playing_yet_is_all_upcoming_with_no_empty_sections() {
         let e: Vec<_> = ["a", "b"].iter().map(|t| song(t)).collect();
-        let r = rows(&e, None);
+        let r = sequence(&e, None);
         assert_eq!(r.len(), 3, "one label plus two entries: {r:?}");
         assert_eq!(r[0], Row::Section("up next"));
     }
@@ -340,7 +870,7 @@ mod tests {
     #[test]
     fn the_last_track_playing_has_no_up_next_section() {
         let e: Vec<_> = ["a", "b"].iter().map(|t| song(t)).collect();
-        let r = rows(&e, Some(1));
+        let r = sequence(&e, Some(1));
         assert!(
             !r.contains(&Row::Section("up next")),
             "an empty section must not be labelled: {r:?}"
