@@ -3389,6 +3389,17 @@ fn main() -> anyhow::Result<()> {
                                             s.remove(nm.selected);
                                         });
                                         nm.forget_status_at(nm.selected);
+                                        // a sync pass in flight for the
+                                        // deleted profile is now
+                                        // discarded rather than
+                                        // delivered, so it no longer
+                                        // clears this flag on the way
+                                        // past; without this, deleting
+                                        // the only profile mid-pass
+                                        // leaves the sidebar on
+                                        // "connecting to navidrome..."
+                                        // forever.
+                                        app.syncing_servers = !cfg.navidrome_servers.is_empty();
                                         config::save_or_warn(&cfg, &mut notifications);
                                         nm.selected = nm.selected.min(cfg.navidrome_servers.len());
                                         nm.pending_delete = None;
@@ -5532,6 +5543,43 @@ mod startup_tests {
             let msg = loading_message(scanning, syncing).unwrap();
             assert!(msg.len() <= 30, "{msg:?} would be truncated in the sidebar");
         }
+    }
+}
+
+/// The profile manager's delete, whose one flag needs a terminal and a
+/// key press to reach any other way.
+#[cfg(test)]
+mod profile_delete_tests {
+    /// Deleting a profile has to settle `syncing_servers` itself.
+    ///
+    /// It used to be cleared as a side effect of the in-flight sync
+    /// answer arriving; `catalog::sync_loop` now discards an answer for
+    /// a profile that was deleted mid-pass, which is the right fix and
+    /// takes that side effect with it. Deleting the only profile while
+    /// its first pass is in flight, with an empty local corpus, then
+    /// left the sidebar on "connecting to navidrome..." with nothing
+    /// ever coming.
+    #[test]
+    fn deleting_a_profile_settles_the_syncing_flag() {
+        let src = include_str!("main.rs");
+        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
+        // bounded by two unique markers rather than a character
+        // count: a fixed window large enough to clear the eleven-line
+        // comment also reached the arm below, which has its own
+        // `is_empty()`, so removing the assignment left the guard
+        // green. this span holds the assignment and nothing else.
+        let start = code
+            .find("nm.forget_status_at(nm.selected);")
+            .expect("the profile delete moved or was renamed");
+        let rest = &code[start..];
+        let end = rest
+            .find("config::save_or_warn")
+            .expect("the delete no longer saves the config");
+        let between = &rest[..end];
+        assert!(
+            between.contains("app.syncing_servers"),
+            "the delete leaves the sidebar waiting on a sync that was discarded:\n{between}"
+        );
     }
 }
 

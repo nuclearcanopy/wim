@@ -2048,6 +2048,79 @@ same-process ratios are quoted.
       several width walks of static art per frame), which was out of
       scope and is the obvious next slice.
 
+### the network seam, audited 2026-11-01
+
+- [x] **the auth token was in every request error, on screen.** The
+      worst find of the day. ureq 2.12's `Display` begins with the
+      request url for **both** `Error::Status` and `Error::Transport`,
+      and every url `subsonic::Client::get` builds carries
+      `u=<username>&t=md5(password+salt)&s=<salt>`. A 500 or an
+      unreachable server therefore flowed through `catalog::fetched`
+      into `"artists failed: {e}"` and onto the notification area,
+      putting the username, a **crackable md5 of the password, and the
+      very salt that made it** on the screen; the profile manager
+      showed the same string verbatim. `request_failed(endpoint, e)`
+      keeps the status code, or the transport kind and message, and
+      names the endpoint instead. `get_cover_art_bytes` bypasses `get`
+      and is redacted the same way. The agent checked ureq's own
+      message constructions: none embed the url, so only the variant
+      prefix had to go. Three tests watched failing first, two
+      mutations.
+- [x] **a sync answer for a profile deleted mid-pass was delivered.**
+      `BackgroundSyncResult.url` was stored and never consulted as a
+      guard, and the server list was read only *after* the answers went
+      out. A pass lasts as long as the network, so deleting a profile
+      during one merged its catalog back into the corpus, re-extended
+      `remote_starred`, toasted "is back online" for a profile that is
+      gone, and kept an `Arc<Client>` holding the superseded password
+      unzeroized. These are the symptoms `edit_servers`' own doc claims
+      were fixed: that fix closed the steady state and left this
+      one-pass window. The list is drained with `try_recv` before the
+      answers go out and each answer matched against it.
+      the fix took a side effect with it, which needed a line in
+      main.rs the agent could not touch: the sidebar's
+      `syncing_servers` flag used to be cleared by that answer
+      arriving, so deleting the only profile mid-pass with an empty
+      local corpus now left "connecting to navidrome..." forever. The
+      delete settles the flag itself.
+      **that guard took three tries**, each failure instructive: a
+      700-char window stopped short of the assignment (the comment
+      above it is eleven lines at that indentation); widening it
+      reached the arm below, which has its own `is_empty()`, so the
+      guard passed with the assignment deleted; and the first mutation
+      removed the *startup* assignment of the same name rather than the
+      delete's. It is bounded by two unique markers now.
+- [x] **a failed `getStarred2` read as "nothing is starred".** It was
+      `.unwrap_or_default()`, and an empty list is exactly what a
+      server with no stars looks like, which is what the star marker on
+      every row and the direction `core::toggle_star` flips both read.
+      No message, and no offline toast either, because the catalog half
+      of the same sync succeeded. `FetchedCatalog` carries
+      `warnings: Vec<String>` now, so the fetch still lands (a library
+      must not be refused over star markers) and both warnings go out
+      on the existing channel. Four tests, including a
+      genuinely-empty server as the positive control.
+- [x] a doc describing a ping round trip `fetch_navidrome_catalog`
+      deliberately removed, and `NAV_CACHE_TTL` as a 45s literal whose
+      comment claimed it was pinned to `AUTO_SYNC_INTERVAL`, coupling
+      neither constant: the exact shape `docs/testing.md` records. It
+      is that constant now, with an equality test.
+- [ ] **`stream_url` hand-builds its query without percent-encoding**,
+      unlike `get`, which goes through ureq's `query`. A username or
+      `transcode_format` containing `&`, `+` or a space produces a url
+      that 401s while the catalog works. Flagged rather than guessed
+      at: there is no encoder in the dependency tree.
+- [ ] **`test_navidrome_connectivity` collapses every failure to
+      `Some(false)`**, so a typo'd password and an unreachable host are
+      indistinguishable in the profile manager. The consumer and the
+      signature change are in main.rs.
+- [ ] **`coverart::Cache` remembers "no cover" for a whole session**
+      even when the failure was transient. Noticed while confirming
+      that a subsonic error envelope returned at HTTP 200 is *not* a
+      bug (`decode_cover` refuses it and nothing undecodable reaches
+      the store, which is the right outcome), so this is the adjacent
+      real one.
+
 ### the console box, and a measurement artefact worth knowing about
 
 - [x] **the console's interior fill is 3.4x faster**, which takes the
