@@ -48,63 +48,92 @@ pub fn spawn_background_sync(
     servers_rx: mpsc::Receiver<Vec<config::NavidromeConfig>>,
 ) {
     thread::spawn(move || {
-        let mut servers = initial_servers;
-        let mut first_pass = true;
-        // kept across passes: `Client::new` re-reads `password_file`
-        // off disk and starts with a cold connection pool, and this
-        // loop runs every 45 seconds for the life of the app, so
-        // rebuilding per pass is pure waste. the sync thread cannot see
-        // the corpus's clients (different thread), so it keeps its own.
-        let mut clients: Vec<Arc<subsonic::Client>> = Vec::new();
-        loop {
-            retain_live_clients(&mut clients, &servers);
-            // independent per-server requests, so run them
-            // concurrently rather than making every server wait for
-            // the one before it.
-            let results: Vec<BackgroundSyncResult> = thread::scope(|scope| {
-                servers
-                    .iter()
-                    .map(|nav| {
-                        (
-                            nav.url.clone(),
-                            scope.spawn(|| fetch_navidrome_everything(nav, &clients)),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .map(|(url, handle)| BackgroundSyncResult {
-                        url,
-                        result: handle
-                            .join()
-                            .unwrap_or_else(|_| Err("panicked while syncing".to_string())),
-                    })
-                    .collect()
-            });
-            // take delivery of any client this pass had to build, so
-            // the next one reuses it.
-            for r in &results {
-                if let Ok((catalog, _)) = &r.result {
-                    if !clients.iter().any(|c| Arc::ptr_eq(c, &catalog.client)) {
-                        clients.push(catalog.client.clone());
-                    }
+        sync_loop(
+            initial_servers,
+            &result_tx,
+            &servers_rx,
+            fetch_navidrome_everything,
+        )
+    });
+}
+
+/// The loop itself, with the fetch injected: a pass takes as long as
+/// the network does, and what happens to its answers when the server
+/// list changes underneath it needs no server to test.
+fn sync_loop(
+    initial_servers: Vec<config::NavidromeConfig>,
+    result_tx: &mpsc::Sender<BackgroundSyncResult>,
+    servers_rx: &mpsc::Receiver<Vec<config::NavidromeConfig>>,
+    fetch: impl Fn(&config::NavidromeConfig, &[Arc<subsonic::Client>]) -> NavidromeEverything + Sync,
+) {
+    let mut servers = initial_servers;
+    let mut first_pass = true;
+    // kept across passes: `Client::new` re-reads `password_file`
+    // off disk and starts with a cold connection pool, and this
+    // loop runs every 45 seconds for the life of the app, so
+    // rebuilding per pass is pure waste. the sync thread cannot see
+    // the corpus's clients (different thread), so it keeps its own.
+    let mut clients: Vec<Arc<subsonic::Client>> = Vec::new();
+    loop {
+        retain_live_clients(&mut clients, &servers);
+        // independent per-server requests, so run them
+        // concurrently rather than making every server wait for
+        // the one before it.
+        let results: Vec<BackgroundSyncResult> = thread::scope(|scope| {
+            servers
+                .iter()
+                .map(|nav| (nav.url.clone(), scope.spawn(|| fetch(nav, &clients))))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|(url, handle)| BackgroundSyncResult {
+                    url,
+                    result: handle
+                        .join()
+                        .unwrap_or_else(|_| Err("panicked while syncing".to_string())),
+                })
+                .collect()
+        });
+        // take delivery of any client this pass had to build, so
+        // the next one reuses it.
+        for r in &results {
+            if let Ok((catalog, _)) = &r.result {
+                if !clients.iter().any(|c| Arc::ptr_eq(c, &catalog.client)) {
+                    clients.push(catalog.client.clone());
                 }
-            }
-            if first_pass && !servers.is_empty() {
-                trace::mark("navidrome: first sync landed");
-                first_pass = false;
-            }
-            for result in results {
-                if result_tx.send(result).is_err() {
-                    return; // main thread is gone (shutting down)
-                }
-            }
-            match servers_rx.recv_timeout(AUTO_SYNC_INTERVAL) {
-                Ok(updated) => servers = updated,
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
             }
         }
-    });
+        if first_pass && !servers.is_empty() {
+            trace::mark("navidrome: first sync landed");
+            first_pass = false;
+        }
+        // the list is read *before* the answers go out, because a pass
+        // lasts as long as the network does and a profile deleted
+        // during one must not have its answer merged; see
+        // `stale_sync_reply_tests`.
+        let mut outran = false;
+        while let Ok(updated) = servers_rx.try_recv() {
+            servers = updated;
+            outran = true;
+        }
+        for result in results {
+            // by url, which is what identifies a reply on this channel
+            // (main.rs keys its offline/online map off it).
+            if !servers.iter().any(|nav| nav.url == result.url) {
+                continue;
+            }
+            if result_tx.send(result).is_err() {
+                return; // main thread is gone (shutting down)
+            }
+        }
+        if outran {
+            continue; // a changed list syncs at once, not in 45s
+        }
+        match servers_rx.recv_timeout(AUTO_SYNC_INTERVAL) {
+            Ok(updated) => servers = updated,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
 }
 
 /// Changes the configured server list **and** tells the sync thread,
@@ -143,11 +172,12 @@ pub struct FetchedCatalog {
     artists: Vec<subsonic::Artist>,
     albums: Vec<subsonic::Album>,
     playlists: Vec<subsonic::Playlist>,
-    /// Why this catalog couldn't be written to the startup cache, if
-    /// it couldn't. Carried rather than reported here because this
-    /// runs on a thread with no notification area; `cache_warning` is
-    /// what `merge_catalog_into_app` hands the caller.
-    cache_warning: Option<String>,
+    /// What this fetch could not do and did not fail over: a startup
+    /// cache that could not be written, a starred list that did not
+    /// answer. Carried rather than reported here because this runs on
+    /// a thread with no notification area; `merge_catalog_into_app` is
+    /// what hands them to the caller.
+    warnings: Vec<String>,
 }
 
 impl FetchedCatalog {
@@ -161,9 +191,6 @@ impl FetchedCatalog {
     }
 }
 
-/// Pings before fetching; a typo'd url/password surfaces as an error
-/// rather than silently returning an empty catalog. Pure network I/O,
-/// safe to call from any thread.
 /// One catalog fetch's outcome. A panicked thread and a failed request
 /// are the same thing to the caller: we do not know what this server
 /// has, so nothing may be reconciled against it.
@@ -178,6 +205,10 @@ pub fn fetched<T>(
     }
 }
 
+/// The three catalog listings for one server, plus the startup cache
+/// write they feed. A typo'd url or password surfaces as an error
+/// rather than as an empty catalog, which would be a claim that the
+/// server has nothing. Pure network I/O, safe to call from any thread.
 pub fn fetch_navidrome_catalog(
     nav: &config::NavidromeConfig,
     live: &[Arc<subsonic::Client>],
@@ -225,15 +256,17 @@ pub fn fetch_navidrome_catalog(
     // the next launch paints a library instead of "connecting...",
     // and a read-only or full cache dir used to lose it in silence.
     // same stance as `config::save_or_warn`.
-    let cache_warning = cache::save_catalog(&client, &artists, &albums, &playlists)
+    let warnings = cache::save_catalog(&client, &artists, &albums, &playlists)
         .err()
-        .map(|e| cache_warning_for(&nav.url, &e));
+        .map(|e| cache_warning_for(&nav.url, &e))
+        .into_iter()
+        .collect();
     Ok(FetchedCatalog {
         client,
         artists,
         albums,
         playlists,
-        cache_warning,
+        warnings,
     })
 }
 
@@ -252,17 +285,18 @@ fn cache_warning_for(url: &str, error: &impl std::fmt::Display) -> String {
 /// (startup, manual reconnect, add-profile, background auto-sync) gets
 /// it for free instead of having to remember it.
 ///
-/// Returns the warning the caller owes the user, same idiom as
+/// Returns whatever warning the caller owes the user, same idiom as
 /// `graphics::ArtProbe::poll`: this runs where there is an `App` but
 /// not always a notification area, and the fetch itself happened on a
-/// thread that had neither.
+/// thread that had neither. One string, since one fetch's warnings are
+/// one thing that went wrong with it.
 pub fn merge_catalog_into_app(app: &mut app::App, catalog: FetchedCatalog) -> Option<String> {
     let FetchedCatalog {
         client,
         artists,
         albums,
         playlists,
-        cache_warning,
+        warnings,
     } = catalog;
     app.corpus.reconcile_server(
         cache::ServerCatalog {
@@ -273,7 +307,7 @@ pub fn merge_catalog_into_app(app: &mut app::App, catalog: FetchedCatalog) -> Op
         &client,
     );
     app.resync_results();
-    cache_warning
+    (!warnings.is_empty()).then(|| warnings.join("; "))
 }
 
 type NavidromeEverything = Result<(FetchedCatalog, Vec<String>), String>;
@@ -286,13 +320,35 @@ pub fn fetch_navidrome_everything(
     nav: &config::NavidromeConfig,
     live: &[Arc<subsonic::Client>],
 ) -> NavidromeEverything {
-    let catalog = fetch_navidrome_catalog(nav, live)?;
-    let starred = catalog
-        .client
-        .get_starred_songs()
-        .map(|songs| songs.into_iter().map(|s| s.id).collect())
-        .unwrap_or_default();
+    let mut catalog = fetch_navidrome_catalog(nav, live)?;
+    let (starred, warning) = starred_or_warning(&nav.url, catalog.client.get_starred_songs());
+    catalog.warnings.extend(warning);
     Ok((catalog, starred))
+}
+
+/// The starred song ids, or the warning that stands in for them.
+///
+/// Not fatal: the catalog itself is good, and refusing it over the
+/// star markers would leave the library empty. Not swallowed either,
+/// which it was: an empty list is what "nothing on this server is
+/// starred" looks like, and that is exactly what the star marker on
+/// every row and the direction `core::toggle_star` flips both read, so
+/// a `getStarred2` that failed showed a library with no stars in it
+/// and said nothing.
+fn starred_or_warning(
+    url: &str,
+    fetched: anyhow::Result<Vec<subsonic::Song>>,
+) -> (Vec<String>, Option<String>) {
+    match fetched {
+        Ok(songs) => (songs.into_iter().map(|s| s.id).collect(), None),
+        Err(e) => (Vec::new(), Some(starred_warning_for(url, &e))),
+    }
+}
+
+/// One wording, same shape as `cache_warning_for`: names the server
+/// and what it costs, and leaves the detail to the error.
+fn starred_warning_for(url: &str, error: &impl std::fmt::Display) -> String {
+    format!("couldn't read {url}'s starred songs, so none of its tracks shows a star: {error}")
 }
 
 /// Shared by onboarding, the profile manager's add flow, and reconnect
@@ -393,13 +449,13 @@ mod fetch_outcome_tests {
                 }],
                 albums: Vec::new(),
                 playlists: Vec::new(),
-                cache_warning: Some("disk full".to_string()),
+                warnings: vec!["disk full".to_string(), "no starred songs".to_string()],
             },
         );
         assert_eq!(
             warning.as_deref(),
-            Some("disk full"),
-            "a failed cache write must reach the caller, not stop at the merge"
+            Some("disk full; no starred songs"),
+            "every warning a fetch carried must reach the caller, not stop at the merge"
         );
         app.query = "bladee".into();
         app.resync_results();
@@ -436,6 +492,90 @@ mod fetch_outcome_tests {
         );
         assert!(warning.contains("next start"), "what it costs: {warning}");
         assert!(warning.contains("os error 28"), "and the cause: {warning}");
+    }
+}
+
+/// What a starred-songs read's outcome may be read as. Its own module
+/// rather than joining `fetch_outcome_tests`: that one is about the
+/// three catalog listings, whose failure stops the whole fetch, and
+/// this one is about the half that deliberately does not.
+#[cfg(test)]
+mod starred_outcome_tests {
+    use super::*;
+
+    fn song(id: &str) -> subsonic::Song {
+        subsonic::Song {
+            id: id.into(),
+            title: "Icedancer".into(),
+            artist: "Bladee".into(),
+            album: "Icedancer".into(),
+            duration: None,
+            genres: Vec::new(),
+        }
+    }
+
+    /// The silent half of a sync: `getStarred2` failing returned an
+    /// empty list, which is indistinguishable from "nothing here is
+    /// starred" and is read as exactly that by every star marker.
+    #[test]
+    fn a_failed_starred_read_is_a_warning_not_an_empty_list() {
+        let (starred, warning) = starred_or_warning(
+            "https://music.example.invalid",
+            Err(anyhow::anyhow!("getStarred2: http 500")),
+        );
+        assert!(starred.is_empty(), "there is nothing to report as starred");
+        let warning = warning.expect("a failed starred read said nothing at all");
+        assert!(
+            warning.contains("https://music.example.invalid"),
+            "which server: {warning}"
+        );
+        assert!(warning.contains("star"), "what it costs: {warning}");
+        assert!(warning.contains("http 500"), "and the cause: {warning}");
+    }
+
+    /// The positive control the test above needs: a server where
+    /// nothing is starred is a legitimate empty answer and must stay
+    /// silent, or the warning fires on every sync for everyone.
+    #[test]
+    fn a_server_with_nothing_starred_warns_about_nothing() {
+        let (starred, warning) = starred_or_warning("https://a.invalid", Ok(Vec::new()));
+        assert!(starred.is_empty());
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn a_starred_read_that_answered_is_its_song_ids() {
+        let (starred, warning) =
+            starred_or_warning("https://a.invalid", Ok(vec![song("s1"), song("s2")]));
+        assert_eq!(starred, vec!["s1".to_string(), "s2".to_string()]);
+        assert_eq!(warning, None);
+    }
+
+    /// And the call site, which is what actually bypassed it: the
+    /// decision above is only reached if the fetch goes through it and
+    /// the warning is carried out on the catalog. Reaching this
+    /// behaviourally needs a server that answers the three catalog
+    /// endpoints and then fails `getStarred2`.
+    #[test]
+    fn the_sync_carries_the_starred_warning_rather_than_defaulting() {
+        let src = include_str!("catalog.rs");
+        let at = src
+            .find("pub fn fetch_navidrome_everything(")
+            .expect("fetch_navidrome_everything moved or was renamed");
+        assert!(
+            at < src.find("#[cfg(test)]").expect("no test module"),
+            "the anchor has to be the real function, not a test"
+        );
+        let body = &src[at..];
+        let body = &body[..body.find("\n}\n").expect("an unterminated fn")];
+        assert!(
+            body.contains("starred_or_warning("),
+            "the starred read decides its own outcome again:\n{body}"
+        );
+        assert!(
+            body.contains("warnings.extend("),
+            "a warning nothing carries out is a silent failure:\n{body}"
+        );
     }
 }
 
@@ -524,6 +664,152 @@ mod server_list_tests {
         assert!(
             rx.try_recv().expect("something is pushed").is_empty(),
             "the last profile was removed, so the thread has nothing to poll"
+        );
+    }
+}
+
+/// What the sync thread does with an answer the server list outran.
+///
+/// A pass is in flight for as long as the network takes (a whole
+/// catalog fetch, or a connect timeout against a server that is
+/// down), so deleting a profile while one is running is ordinary.
+/// `BackgroundSyncResult` is tagged with the url precisely so whose
+/// answer it is can be told, and the tag went unconsulted: main.rs
+/// keys its offline/online map off it but never asks whether that
+/// server is still configured. Its own module rather than inside
+/// `server_list_tests`, which is about the main thread's half of the
+/// same seam (the edit reaching the thread at all).
+#[cfg(test)]
+mod stale_sync_reply_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    fn nav(url: &str) -> config::NavidromeConfig {
+        config::NavidromeConfig {
+            url: url.into(),
+            username: "ana".into(),
+            password: Some("pw".into()),
+            password_file: None,
+            max_bitrate_kbps: None,
+            transcode_format: None,
+        }
+    }
+
+    /// Deleting a profile mid-pass used to deliver its answer anyway,
+    /// which is `merge_catalog_into_app` re-adding its whole library
+    /// to the corpus (and holding its client, so the superseded
+    /// password is never zeroized), `remote_starred` re-extended from
+    /// it, and an offline/online toast for a profile that is gone.
+    #[test]
+    fn a_profile_deleted_mid_pass_has_its_answer_dropped() {
+        let (result_tx, result_rx) = mpsc::channel();
+        let (servers_tx, servers_rx) = mpsc::channel();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicBool::new(false));
+        let (fetch_entered, fetch_released) = (entered.clone(), released.clone());
+
+        thread::spawn(move || {
+            sync_loop(
+                vec![nav("https://a.invalid"), nav("https://b.invalid")],
+                &result_tx,
+                &servers_rx,
+                // held open so the delete lands while the pass is in
+                // flight. an error rather than a catalog because only
+                // this half can be built without a server; both halves
+                // reach the user, one as a merge and one as a toast.
+                move |nav, _live| {
+                    fetch_entered.fetch_add(1, Ordering::SeqCst);
+                    while !fetch_released.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(format!("{} is unreachable", nav.url))
+                },
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while entered.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            2,
+            "both servers' fetches have to be in flight for this to be the race"
+        );
+        servers_tx.send(vec![nav("https://a.invalid")]).unwrap();
+        released.store(true, Ordering::SeqCst);
+
+        let mut answered = Vec::new();
+        while let Ok(result) = result_rx.recv_timeout(Duration::from_millis(500)) {
+            answered.push(result.url);
+            if answered.len() > 4 {
+                break;
+            }
+        }
+        assert!(
+            answered.contains(&"https://a.invalid".to_string()),
+            "the profile that is still configured is still answered for: {answered:?}"
+        );
+        assert!(
+            !answered.contains(&"https://b.invalid".to_string()),
+            "a deleted profile's answer was delivered: {answered:?}"
+        );
+    }
+
+    /// The other side of reading the list before the answers go out:
+    /// an update consumed there is one `recv_timeout` no longer sees,
+    /// and a profile added at runtime must not wait out a whole
+    /// interval for its first sync.
+    #[test]
+    fn a_list_that_changed_mid_pass_is_resynced_at_once() {
+        let (result_tx, result_rx) = mpsc::channel();
+        let (servers_tx, servers_rx) = mpsc::channel();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicBool::new(false));
+        let (fetch_entered, fetch_released) = (entered.clone(), released.clone());
+
+        thread::spawn(move || {
+            sync_loop(
+                vec![nav("https://a.invalid")],
+                &result_tx,
+                &servers_rx,
+                move |nav, _live| {
+                    fetch_entered.fetch_add(1, Ordering::SeqCst);
+                    while !fetch_released.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(format!("{} is unreachable", nav.url))
+                },
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while entered.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        servers_tx
+            .send(vec![nav("https://a.invalid"), nav("https://b.invalid")])
+            .unwrap();
+        released.store(true, Ordering::SeqCst);
+
+        // the added profile was not part of the pass in flight, so its
+        // answer can only come from a new one, which is 45 seconds
+        // away if the update is left to the interval to notice.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_b = false;
+        while !saw_b && Instant::now() < deadline {
+            if let Ok(result) = result_rx.recv_timeout(Duration::from_millis(100)) {
+                saw_b = result.url == "https://b.invalid";
+            }
+        }
+        assert!(
+            saw_b,
+            "an added profile waits out the whole sync interval before its first pass"
+        );
+        assert!(
+            AUTO_SYNC_INTERVAL > Duration::from_secs(2),
+            "this only proves anything while the interval is longer than the wait"
         );
     }
 }

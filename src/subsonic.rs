@@ -42,11 +42,12 @@ const ALBUM_PAGE_SIZE: usize = 500;
 const ALBUM_PAGE_CONCURRENCY: usize = 4;
 
 /// How long a cached navigation answer (a tracklist, an album's year,
-/// an artist's album list, a bio) may be served from memory. Pinned to
-/// the background catalog sync's own interval, so nothing a server
-/// changes is ever more than one sync cycle stale; see
-/// docs/startup-cache.md.
-const NAV_CACHE_TTL: Duration = Duration::from_secs(45);
+/// an artist's album list, a bio) may be served from memory. The sync
+/// interval itself rather than a literal equal to it: this is the
+/// backstop for what a catalog listing cannot see (a track added to an
+/// album that already existed), so docs/startup-cache.md's "worst
+/// case: 45 seconds" holds only while the two are one number.
+const NAV_CACHE_TTL: Duration = crate::catalog::AUTO_SYNC_INTERVAL;
 
 /// Cached navigation answers per server. 256 covers any plausible
 /// browsing session (an album tracklist each) and bounds what a day-
@@ -447,7 +448,10 @@ impl Client {
         for (k, v) in extra {
             req = req.query(k, v);
         }
-        let body: SubsonicEnvelope = req.call()?.into_json()?;
+        let body: SubsonicEnvelope = req
+            .call()
+            .map_err(|e| request_failed(endpoint, e))?
+            .into_json()?;
         if body.subsonic_response.status != "ok" {
             let msg = body
                 .subsonic_response
@@ -842,7 +846,10 @@ impl Client {
         }
         req = req.query("id", cover_art_id);
         let mut bytes = Vec::new();
-        req.call()?.into_reader().read_to_end(&mut bytes)?;
+        req.call()
+            .map_err(|e| request_failed("getCoverArt", e))?
+            .into_reader()
+            .read_to_end(&mut bytes)?;
         Ok(bytes)
     }
 }
@@ -1010,6 +1017,31 @@ struct SubsonicResponse {
 #[derive(Debug, Deserialize)]
 struct SubsonicError {
     message: String,
+}
+
+/// Why a request failed, without the url it failed on. ureq's error
+/// text starts with the whole request url, and every url in here
+/// carries `u=`, the per-request auth token and its salt, which is
+/// `md5(password + salt)` next to the salt that made it; these errors
+/// are user-visible (`catalog::fetched` wraps them and the event loop
+/// toasts them), so the url is dropped and the status or transport
+/// cause kept. Mirrors ureq's own kind/message/source wording.
+fn request_failed(endpoint: &str, e: ureq::Error) -> anyhow::Error {
+    match e {
+        ureq::Error::Status(code, _) => anyhow::anyhow!("{endpoint}: http {code}"),
+        ureq::Error::Transport(t) => {
+            let mut why = format!("{endpoint}: {}", t.kind());
+            if let Some(message) = t.message() {
+                why.push_str(": ");
+                why.push_str(message);
+            }
+            if let Some(source) = std::error::Error::source(&t) {
+                why.push_str(": ");
+                why.push_str(&source.to_string());
+            }
+            anyhow::anyhow!(why)
+        }
+    }
 }
 
 /// So typing a bare `myserver.com` (no scheme) in the login prompt
@@ -1221,6 +1253,115 @@ fn parse_search3_response(v: &serde_json::Value) -> SearchResult {
         artists: parse_artist_array(r.and_then(|r| r.get("artist"))),
         albums: parse_album_array(r.and_then(|r| r.get("album"))),
         songs: parse_song_array(r.and_then(|r| r.get("song"))),
+    }
+}
+
+/// What a failed request is allowed to say. ureq's own error text
+/// begins with the whole request url, and a subsonic request url
+/// carries `u=`, the per-request auth token and its salt; these errors
+/// are shown (`catalog::fetched` wraps them and the event loop pushes
+/// them as notifications), so the url cannot be in them. The status
+/// code or the transport cause is the part worth keeping.
+#[cfg(test)]
+mod request_error_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    fn cfg(url: &str) -> NavidromeConfig {
+        NavidromeConfig {
+            url: url.into(),
+            username: "ana".into(),
+            password: Some("pw".into()),
+            password_file: None,
+            max_bitrate_kbps: None,
+            transcode_format: None,
+        }
+    }
+
+    /// Answers one canned status line to every request, which
+    /// `MockServer` cannot: that one is always 200.
+    fn start_failing_server(status_line: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        // detached: the test binary exits without waiting on it
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut writer = stream;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if !line.trim().is_empty() {
+                            continue;
+                        }
+                        let body = format!("{status_line}\r\nContent-Length: 0\r\n\r\n");
+                        if writer.write_all(body.as_bytes()).is_err() {
+                            return;
+                        }
+                        let _ = writer.flush();
+                    }
+                });
+            }
+        });
+        url
+    }
+
+    /// A 500 from the server used to put `md5(password + salt)` and
+    /// that salt on screen, which is an offline crack of the password
+    /// from a toast.
+    #[test]
+    fn a_server_error_names_the_request_without_its_url() {
+        let url = start_failing_server("HTTP/1.1 500 Internal Server Error");
+        let client = Client::new(&cfg(&url)).unwrap();
+        let err = client.ping().unwrap_err().to_string();
+        assert!(
+            !err.contains('?'),
+            "the request url is in the error, and it carries u=, t= and s="
+        );
+        assert!(!err.contains("ana"), "nor may the username be");
+        assert!(err.contains("500"), "the status still has to survive");
+        assert!(err.contains("ping"), "and which request it was");
+    }
+
+    /// The other variant: a server that is not there fails in
+    /// transport, which puts the url in its text the same way.
+    #[test]
+    fn an_unreachable_server_names_the_request_without_its_url() {
+        // bound to claim a port, then dropped, so nothing answers on it
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", dead.local_addr().unwrap());
+        drop(dead);
+        let client = Client::new(&cfg(&url)).unwrap();
+        let err = client.all_artists().unwrap_err().to_string();
+        assert!(
+            !err.contains('?'),
+            "the request url is in the error, and it carries u=, t= and s="
+        );
+        assert!(!err.contains("ana"), "nor may the username be");
+        assert!(
+            err.to_lowercase().contains("connection"),
+            "the cause still has to survive"
+        );
+        assert!(err.contains("getArtists"), "and which request it was");
+    }
+
+    /// Cover art bypasses `get` (it is not json) and so needs the
+    /// same redaction of its own.
+    #[test]
+    fn a_failed_cover_art_fetch_names_the_request_without_its_url() {
+        let url = start_failing_server("HTTP/1.1 404 Not Found");
+        let client = Client::new(&cfg(&url)).unwrap();
+        let err = client.get_cover_art_bytes("al-1").unwrap_err().to_string();
+        assert!(
+            !err.contains('?'),
+            "the request url is in the error, and it carries u=, t= and s="
+        );
+        assert!(err.contains("404"), "the status still has to survive");
+        assert!(err.contains("getCoverArt"), "and which request it was");
     }
 }
 
@@ -2149,6 +2290,15 @@ mod tests {
             cache.get(&key).is_none(),
             "nothing may be served for longer than one sync interval"
         );
+    }
+
+    /// And what that ttl has to be. The sync is the real invalidation
+    /// path; the ttl covers only what a catalog listing cannot see, so
+    /// a ttl longer than one sync cycle would serve a tracklist no
+    /// pass is going to drop.
+    #[test]
+    fn the_response_ttl_is_the_sync_interval_itself() {
+        assert_eq!(NAV_CACHE_TTL, crate::catalog::AUTO_SYNC_INTERVAL);
     }
 
     #[test]
