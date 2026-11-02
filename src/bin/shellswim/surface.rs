@@ -184,14 +184,37 @@ fn print_lyrics(core: &mut CoreCtx) -> (Dispatch, Report) {
         return op_fail("no lyrics for this item");
     };
     let name = label(&item);
-    core.lyrics_loader.request(
-        core.lyrics_client,
-        name.clone(),
-        &artist,
-        &title,
-        &album,
-        None,
-    );
+    if let Some((server, id)) = core::lyrics_remote(&item) {
+        core.lyrics_loader.request_subsonic(
+            core.lyrics_client,
+            server,
+            id,
+            name.clone(),
+            &artist,
+            &title,
+            &album,
+            None,
+        );
+    } else if let Some(path) = core::lyrics_path(&item) {
+        core.lyrics_loader.request_local(
+            core.lyrics_client,
+            name.clone(),
+            &artist,
+            &title,
+            &album,
+            None,
+            path,
+        );
+    } else {
+        core.lyrics_loader.request(
+            core.lyrics_client,
+            name.clone(),
+            &artist,
+            &title,
+            &album,
+            None,
+        );
+    }
     op_note(format!("fetching lyrics for {name}"))
 }
 
