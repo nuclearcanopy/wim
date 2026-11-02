@@ -1218,6 +1218,7 @@ fn main() -> anyhow::Result<()> {
     // spawned here because the query saves and restores whatever
     // termios state it finds, so raw mode has to be on first.
     let mut art = ArtProbe::spawn(cfg.album_art);
+    let mut last_drawn_art_mode = art.mode();
     trace::mark("terminal ready");
     // rebuilt (not re-encoded every frame) whenever the open view's
     // art or the art mode changes; `ratatui-image` owns the actual
@@ -1360,6 +1361,13 @@ fn main() -> anyhow::Result<()> {
         // landing, 'i', the settings menu's art row) happens after the
         // draw, so one snapshot is what this frame renders with.
         let art_mode = art.mode();
+        // A protocol image can change while ratatui's cell buffer stays
+        // identical (the art rectangle is blank in full-art mode). Clear
+        // its diff state so the new inline image is sent immediately.
+        if video_vo.is_none() && art_mode != last_drawn_art_mode {
+            guard.clear()?;
+            last_drawn_art_mode = art_mode;
+        }
         // rebuild either image protocol only when its cover or the art
         // mode changes; every frame would throw away the resize state a
         // protocol exists to hold. the mode is in the key because
