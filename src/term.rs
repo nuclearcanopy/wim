@@ -78,6 +78,14 @@ impl TerminalGuard {
         self.terminal.draw(render).map(|_| ())
     }
 
+    /// Invalidates ratatui's previous frame and clears the screen.
+    /// Needed when an inline graphics protocol changes without changing
+    /// the underlying cell buffer: otherwise its image escape may not be
+    /// emitted until a resize forces a full redraw.
+    pub fn clear(&mut self) -> io::Result<()> {
+        self.terminal.clear()
+    }
+
     /// Takes the screen back after mpv's video output has been turned
     /// off again.
     ///
