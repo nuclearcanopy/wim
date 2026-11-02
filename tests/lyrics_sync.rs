@@ -63,6 +63,22 @@ fn synced_pane_follows_and_resumes_after_three_seconds_of_manual_scroll() {
 }
 
 #[test]
+fn shellswim_style_scroll_is_clamped_and_pauses_follow() {
+    let lyrics = Lyrics {
+        plain: Some("one\ntwo\nthree".into()),
+        ..Lyrics::default()
+    };
+    let mut pane = LyricsPane::default();
+    pane.open_lyrics(&lyrics, "song".into());
+    pane.saw_size(40, 3);
+    pane.scroll_by(100);
+    assert_eq!(pane.scroll(), 2);
+    assert!(!pane.following());
+    pane.scroll_by(-100);
+    assert_eq!(pane.scroll(), 0);
+}
+
+#[test]
 fn local_lyrics_are_cached_across_requests() {
     let root = std::env::temp_dir().join(format!("wim-lyrics-cache-{}", std::process::id()));
     fs::remove_dir_all(&root).ok();

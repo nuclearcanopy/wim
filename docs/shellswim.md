@@ -39,22 +39,32 @@ shellswim has no equaliser pane; wim's 'e' has it
 
 ## what it will not do, and how it says so
 
-shellswim has no panes, so five `view(...)` targets have nowhere to
-go. it declines them, by name, pointing at the key in wim that opens
-them. it does not no-op and it does not pretend: `view(eq)` doing
+shellswim has no general pane system, so most `view(...)` targets have
+nowhere to go. it declines them, by name, pointing at the key in wim that opens
+them. It has dedicated live views for lyrics and now-playing. It does not no-op and it does not pretend: `view(eq)` doing
 nothing and `view(eq)` saying where the eq lives are different
 answers, and only one of them is true.
 
 | | |
 | --- | --- |
 | printed in the core, identically in both | `view(queue)`, `view(index)`, `view(history)`, `view(playlists)`, `view(help)` |
-| printed by shellswim instead of a pane | `view(now)`, `view(lyrics)` |
+| dedicated interactive view / printed by one-shot | `view(lyrics)` |
+| printed by shellswim | `view(now)` |
 | declined, naming wim | `view(eq)`, `view(settings)`, `view(keybinds)`, `view(starred)`, `view(suggestions)` |
 | declined, naming a command that works | `up()`/`down()`/`top()`/`bottom()`, `go()` on a browse row, opening an album's page |
 
 the first row is not a shellswim decision: `ViewTarget::is_screen()`
 already partitioned the language exactly that way, and the seam just
 started honouring it.
+
+In the interactive prompt, `view(lyrics)` opens a live lyrics split view
+beside the command console.
+Synchronized lyrics follow playback; `j`/`k` or arrows pause following
+for three seconds before it resumes. `esc` closes the lyrics side and
+returns the console to full width.
+First launch offers the same provider choices and optional Musixmatch
+key-file path as wim's setup. `shellswim -c 'view(lyrics)'` remains a
+plain-text, non-interactive command suitable for scripts.
 
 `dry(...)` still describes **every** op here, including the ones
 shellswim would refuse, because `dry` lowers to notes and never
