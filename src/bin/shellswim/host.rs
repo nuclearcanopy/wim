@@ -192,7 +192,10 @@ impl Host {
             scrobble: ScrobbleState::default(),
             favorites: favorites::load(),
             remote_starred: HashSet::new(),
-            lyrics_client: lyrics::Client::new(),
+            lyrics_client: lyrics::Client::with_providers(
+                cfg.lyrics.providers.clone(),
+                cfg.resolve_lyrics_api_keys(),
+            ),
             lyrics_loader: lyrics::Loader::new(),
             track_resolver: TrackResolver::new(),
             star_tx,

@@ -81,6 +81,19 @@ in
       description = "wim package to install.";
     };
 
+    lyrics = {
+      providers = mkOption {
+        type = types.listOf types.str;
+        default = [ "local" "opensubsonic" "lrclib" "musixmatch" "lyrics-ovh" ];
+        description = "Ordered lyrics providers; choose from local, opensubsonic, lrclib, musixmatch, and lyrics-ovh.";
+      };
+      apiKeyFiles = mkOption {
+        type = types.attrsOf types.path;
+        default = { };
+        description = "Provider name to secret-file path (for example musixmatch = config.age.secrets.musixmatch.path). Never put API keys in Nix values.";
+      };
+    };
+
     # a list, not a single server: wim merges every configured server
     # into one unified search corpus rather than picking an "active"
     # one; see ROADMAP.md. the in-app 'n' profile manager can add more
@@ -387,6 +400,10 @@ in
     home.packages = [ cfg.package ];
 
     xdg.configFile."wim/config.toml".source = tomlFormat.generate "wim-config.toml" ({
+      lyrics = {
+        inherit (cfg.lyrics) providers;
+        api_key_files = lib.mapAttrs (_: toString) cfg.lyrics.apiKeyFiles;
+      };
       album_art = cfg.albumArt;
       video_output = cfg.videoOutput;
       library_paths = cfg.libraryPaths;

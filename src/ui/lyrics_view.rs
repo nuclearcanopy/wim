@@ -14,8 +14,13 @@ use crate::ui::textfit;
 pub struct LyricsView<'a> {
     pub lines: &'a [&'a str],
     pub scroll: usize,
+    pub active_line: Option<usize>,
     /// "title · artist" of the track these lyrics are for.
     pub track: &'a str,
+    pub source: &'a str,
+    pub synced: bool,
+    pub following: bool,
+    pub attribution: Option<&'a str>,
 }
 
 impl Widget for LyricsView<'_> {
@@ -23,12 +28,22 @@ impl Widget for LyricsView<'_> {
         if area.height == 0 || area.width == 0 {
             return;
         }
+        let hint = match (self.synced, self.following) {
+            (true, true) => "synced · j/k pause follow · esc close",
+            (true, false) => "synced · follow resumes in 3s · esc close",
+            (false, _) => "j/k: scroll · esc: close",
+        };
+        let title = if self.source.is_empty() {
+            self.track.to_string()
+        } else {
+            format!("{} · {}", self.track, self.source)
+        };
         let body_top = draw_header(
             buf,
             area,
             area.y,
-            self.track,
-            "j/k: scroll, esc: close",
+            &title,
+            hint,
             shade(DIM),
             shade(NEAR_BLACK),
         );
@@ -38,21 +53,37 @@ impl Widget for LyricsView<'_> {
         }
 
         let (inset, cells) = column(area.width);
-        let wrapped = wrap(self.lines, cells);
+        let wrapped: Vec<(String, usize)> = self
+            .lines
+            .iter()
+            .enumerate()
+            .flat_map(|(index, line)| wrap(&[*line], cells).into_iter().map(move |s| (s, index)))
+            .collect();
         let text_rect = Rect {
             x: area.x + inset,
             width: cells as u16,
             ..area
         };
-        let shown = wrapped.len().saturating_sub(self.scroll).min(body_height) as u16;
-        for (row, line) in wrapped
+        let attribution_lines = self
+            .attribution
+            .map(|text| wrap(&[text], area.width as usize))
+            .unwrap_or_default();
+        let footer_height = attribution_lines.len().min(body_height);
+        let text_height = body_height.saturating_sub(footer_height);
+        let shown = wrapped.len().saturating_sub(self.scroll).min(text_height) as u16;
+        for (row, (line, line_index)) in wrapped
             .iter()
             .skip(self.scroll)
-            .take(body_height)
+            .take(text_height)
             .enumerate()
         {
             let y = body_top + row as u16;
-            crate::ui::draw::line(buf, text_rect, y, line, shade(NEAR_WHITE));
+            let color = if self.active_line == Some(*line_index) {
+                shade(NEAR_WHITE)
+            } else {
+                shade(DIM)
+            };
+            crate::ui::draw::line(buf, text_rect, y, line, color);
         }
 
         // scroll cues in the right gutter, which the words no longer
@@ -68,6 +99,14 @@ impl Widget for LyricsView<'_> {
             if self.scroll + (shown as usize) < wrapped.len() {
                 crate::ui::draw::put(buf, cue_x, body_top + shown - 1, '▾', shade(DIM));
             }
+        }
+        for (row, attribution) in attribution_lines
+            .iter()
+            .skip(attribution_lines.len().saturating_sub(footer_height))
+            .enumerate()
+        {
+            let y = body_top + text_height as u16 + row as u16;
+            crate::ui::draw::line(buf, area, y, attribution, shade(DIM));
         }
     }
 }
@@ -96,6 +135,17 @@ fn column(pane_width: u16) -> (u16, usize) {
 /// scroll range before.
 pub fn wrapped_len(lines: &[&str], width: usize) -> usize {
     wrap(lines, column(width as u16).1).len()
+}
+
+/// First rendered row occupied by a source lyric line after wrapping.
+pub fn wrapped_row_for_line(lines: &[String], width: usize, line: usize) -> usize {
+    let end = line.min(lines.len());
+    let borrowed: Vec<&str> = lines[..end].iter().map(String::as_str).collect();
+    wrap(&borrowed, column(width as u16).1).len()
+}
+
+pub fn attribution_rows(attribution: Option<&str>, width: usize) -> usize {
+    attribution.map_or(0, |text| wrap(&[text], width).len())
 }
 
 /// Word-wraps at `width`, keeping blank lines (verse breaks) and
@@ -245,7 +295,12 @@ mod tests {
             LyricsView {
                 lines: &lines,
                 scroll: 0,
+                active_line: None,
                 track: "Song · Artist",
+                source: "",
+                synced: false,
+                following: true,
+                attribution: None,
             }
             .render(area, &mut buf);
             for line in grid(&buf).lines().skip(crate::ui::header::ROWS as usize) {
@@ -271,7 +326,12 @@ mod tests {
             LyricsView {
                 lines: &lines,
                 scroll,
+                active_line: None,
                 track: "Song · Artist",
+                source: "",
+                synced: false,
+                following: true,
+                attribution: None,
             }
             .render(area, &mut buf);
             grid(&buf)
@@ -302,7 +362,12 @@ mod tests {
             LyricsView {
                 lines: &["some words here", "", "more words"],
                 scroll: 0,
+                active_line: None,
                 track: "Song · Artist",
+                source: "",
+                synced: false,
+                following: true,
+                attribution: None,
             }
             .render(area, &mut buf);
         }
@@ -315,7 +380,12 @@ mod tests {
         LyricsView {
             lines: &["a", "b"],
             scroll: 999,
+            active_line: None,
             track: "Song · Artist",
+            source: "",
+            synced: false,
+            following: true,
+            attribution: None,
         }
         .render(area, &mut buf);
     }
@@ -327,7 +397,12 @@ mod tests {
         LyricsView {
             lines: &["words"],
             scroll: 0,
+            active_line: None,
             track: "Crest · Bladee",
+            source: "",
+            synced: false,
+            following: true,
+            attribution: None,
         }
         .render(area, &mut buf);
         let top: String = (0..60)
@@ -369,7 +444,12 @@ mod eyeball {
             LyricsView {
                 lines: &lines,
                 scroll,
+                active_line: None,
                 track: "Crest \u{b7} Bladee",
+                source: "",
+                synced: false,
+                following: true,
+                attribution: None,
             }
             .render(area, &mut buf);
             let text = grid(&buf);

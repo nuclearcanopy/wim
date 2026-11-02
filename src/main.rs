@@ -27,13 +27,13 @@ use wim::catalog::{
 use wim::core::{
     append_resolved, apply_eq_row, apply_op, browse_session, dispatch_action, download_resolved,
     download_tracks, drained, drive, enqueue_track, eq_preset_names, fire_scrobble,
-    fire_subtitle_fetch, front_resolved, go_to_previous, load_playlist, lyrics_query,
-    note_playback_started, notify_query_changed, op_done, op_fail, op_note, open_starred,
-    playing_duration, print_listing, save_playback_state, set_vid_for_item, shellsong_focus,
-    spawn_background_search, start_session, start_tracking_playback, suggestion_starred_keys,
-    sweep_cache, toggle_star, track_started, BetweenTracks, CoreCtx, Dispatch, DownloadCtx,
-    Drained, Drive, Intent, RemoteSearchOutcome, RemoteSearchQuery, Report, Resolution,
-    ScrobbleState, SelectStep, SessionStart, StarFailed, Surface, TrackResolver,
+    fire_subtitle_fetch, front_resolved, go_to_previous, load_playlist, lyrics_path, lyrics_query,
+    lyrics_remote, note_playback_started, notify_query_changed, op_done, op_fail, op_note,
+    open_starred, playing_duration, print_listing, save_playback_state, set_vid_for_item,
+    shellsong_focus, spawn_background_search, start_session, start_tracking_playback,
+    suggestion_starred_keys, sweep_cache, toggle_star, track_started, BetweenTracks, CoreCtx,
+    Dispatch, DownloadCtx, Drained, Drive, Intent, RemoteSearchOutcome, RemoteSearchQuery, Report,
+    Resolution, ScrobbleState, SelectStep, SessionStart, StarFailed, Surface, TrackResolver,
 };
 use wim::download::DownloadEvent;
 use wim::enrich::{
@@ -466,14 +466,37 @@ fn open_wim_lyrics(core: &mut CoreCtx) -> (Dispatch, Report) {
         return op_fail("no lyrics for this item");
     };
     let name = label(&item);
-    core.lyrics_loader.request(
-        core.lyrics_client,
-        name.clone(),
-        &artist,
-        &title,
-        &album,
-        None,
-    );
+    if let Some((server, id)) = lyrics_remote(&item) {
+        core.lyrics_loader.request_subsonic(
+            core.lyrics_client,
+            server,
+            id,
+            name.clone(),
+            &artist,
+            &title,
+            &album,
+            None,
+        );
+    } else if let Some(path) = lyrics_path(&item) {
+        core.lyrics_loader.request_local(
+            core.lyrics_client,
+            name.clone(),
+            &artist,
+            &title,
+            &album,
+            None,
+            path,
+        );
+    } else {
+        core.lyrics_loader.request(
+            core.lyrics_client,
+            name.clone(),
+            &artist,
+            &title,
+            &album,
+            None,
+        );
+    }
     op_note(format!("fetching lyrics for {name}"))
 }
 
@@ -911,7 +934,8 @@ fn main() -> anyhow::Result<()> {
     // crossing the threshold (or a second manual download press)
     // doesn't kick off a duplicate transfer of the same file.
     let mut downloading: HashSet<String> = HashSet::new();
-    let lyrics_client = lyrics::Client::new();
+    let lyrics_client =
+        lyrics::Client::with_providers(cfg.lyrics.providers.clone(), cfg.resolve_lyrics_api_keys());
     // the fetch runs off-thread; the key handler only asks.
     let mut lyrics_loader = lyrics::Loader::new();
     // a refused star comes back here so the optimistic flip can be put
@@ -994,7 +1018,7 @@ fn main() -> anyhow::Result<()> {
     let mut lyrics = LyricsPane::default();
     // where the last frame put everything, filled in by the draw pass
     // below and read by the next mouse event; same reason
-    // `LyricsPane::saw_width` is written from in there, taken all the way.
+    // `LyricsPane::saw_size` is written from in there, taken all the way.
     // Declared without a value because every iteration replaces it
     // before anything reads it. See `hit` and
     // docs/input-precedence.md.
@@ -1255,6 +1279,47 @@ fn main() -> anyhow::Result<()> {
         // reads this, so none of them can show a track mpv isn't
         // actually playing.
         let mut now_playing = play_queue.current().cloned();
+        // If the user leaves lyrics open across an automatic queue
+        // advance, fetch for the new song instead of showing the prior
+        // track's timestamps against the new playback clock.
+        if lyrics.is_open() && now_playing.as_ref().map(label).as_deref() != Some(lyrics.track()) {
+            lyrics.close();
+            if let Some(item) = now_playing.as_ref() {
+                if let Some((artist, title, album)) = lyrics_query(item) {
+                    if let Some((server, id)) = lyrics_remote(item) {
+                        lyrics_loader.request_subsonic(
+                            &lyrics_client,
+                            server,
+                            id,
+                            label(item),
+                            &artist,
+                            &title,
+                            &album,
+                            None,
+                        );
+                    } else if let Some(path) = lyrics_path(item) {
+                        lyrics_loader.request_local(
+                            &lyrics_client,
+                            label(item),
+                            &artist,
+                            &title,
+                            &album,
+                            None,
+                            path,
+                        );
+                    } else {
+                        lyrics_loader.request(
+                            &lyrics_client,
+                            label(item),
+                            &artist,
+                            &title,
+                            &album,
+                            None,
+                        );
+                    }
+                }
+            }
+        }
         // hoisted from further down with the macros below, which
         // borrow it: `start.elapsed()` is free to read early.
         let shellsong_now = start.elapsed();
@@ -2052,10 +2117,10 @@ fn main() -> anyhow::Result<()> {
                     main_content,
                 );
             } else if lyrics.is_open() {
-                // the width is reported before the lines are taken:
-                // `lines()` borrows the pane, and `saw_width` needs it
-                // mutably.
-                lyrics.saw_width(main_content.width);
+                // report dimensions before taking a line borrow; the
+                // following cursor and wrapping both depend on them.
+                lyrics.saw_size(main_content.width, main_content.height);
+                let active_line = lyrics.follow_playback(elapsed_secs, Instant::now());
                 let borrowed: Vec<&str> = lyrics
                     .lines()
                     .unwrap_or_default()
@@ -2077,7 +2142,12 @@ fn main() -> anyhow::Result<()> {
                     LyricsView {
                         lines: &borrowed,
                         scroll: lyrics.scroll(),
+                        active_line,
                         track: lyrics.track(),
+                        source: lyrics.source(),
+                        synced: lyrics.is_synced(),
+                        following: lyrics.following(),
+                        attribution: lyrics.attribution(),
                     },
                     main_content,
                 );
@@ -2677,13 +2747,8 @@ fn main() -> anyhow::Result<()> {
         if let Some((track, result)) = lyrics_loader.poll() {
             match result {
                 Ok(Some(l)) => {
-                    lyrics.open(
-                        wim::core::lyrics_text(&l)
-                            .lines()
-                            .map(str::to_string)
-                            .collect(),
-                        track,
-                    );
+                    lyrics_client.track_display(&l);
+                    lyrics.open_lyrics(&l, track);
                 }
                 Ok(None) => notifications.push(Severity::Info, format!("no lyrics for {track}")),
                 Err(e) => notifications.push(Severity::Error, format!("lyrics lookup failed: {e}")),
@@ -4915,14 +4980,37 @@ fn main() -> anyhow::Result<()> {
                                 // asks and returns; the reply lands in
                                 // the main loop's drain. pressing this
                                 // used to block the whole ui on lrclib.
-                                lyrics_loader.request(
-                                    &lyrics_client,
-                                    label(item),
-                                    &artist,
-                                    &title,
-                                    &album,
-                                    None,
-                                );
+                                if let Some((server, id)) = lyrics_remote(item) {
+                                    lyrics_loader.request_subsonic(
+                                        &lyrics_client,
+                                        server,
+                                        id,
+                                        label(item),
+                                        &artist,
+                                        &title,
+                                        &album,
+                                        None,
+                                    );
+                                } else if let Some(path) = lyrics_path(item) {
+                                    lyrics_loader.request_local(
+                                        &lyrics_client,
+                                        label(item),
+                                        &artist,
+                                        &title,
+                                        &album,
+                                        None,
+                                        path,
+                                    );
+                                } else {
+                                    lyrics_loader.request(
+                                        &lyrics_client,
+                                        label(item),
+                                        &artist,
+                                        &title,
+                                        &album,
+                                        None,
+                                    );
+                                }
                             }
                             None => notifications.push(Severity::Info, "no lyrics for this item"),
                         },

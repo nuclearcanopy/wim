@@ -1126,10 +1126,9 @@ pub fn lyrics_text(l: &lyrics::Lyrics) -> String {
         .unwrap_or_else(|| "(no lyrics text available)".to_string())
 }
 
-/// (artist, title, album) for a lyrics lookup; only meaningful for
-/// local music; `SearchItem` doesn't carry duration, so lookups always
-/// fall through to lrclib's fuzzy `/search` rather than its exact
-/// `/get`. See ROADMAP.md.
+/// (artist, title, album) for a lyrics lookup. Local duration is not
+/// carried in `SearchItem`; remote songs can additionally ask their
+/// OpenSubsonic server by stable song id.
 pub fn lyrics_query(item: &SearchItem) -> Option<(String, String, String)> {
     match item {
         SearchItem::LocalMusic {
@@ -1142,6 +1141,26 @@ pub fn lyrics_query(item: &SearchItem) -> Option<(String, String, String)> {
             title.clone(),
             album.clone().unwrap_or_default(),
         )),
+        SearchItem::Song {
+            title,
+            artist,
+            album,
+            ..
+        } => Some((artist.clone(), title.clone(), album.clone())),
+        _ => None,
+    }
+}
+
+pub fn lyrics_remote(item: &SearchItem) -> Option<(Arc<subsonic::Client>, String)> {
+    match item {
+        SearchItem::Song { id, client, .. } => Some((Arc::clone(client), id.clone())),
+        _ => None,
+    }
+}
+
+pub fn lyrics_path(item: &SearchItem) -> Option<&std::path::Path> {
+    match item {
+        SearchItem::LocalMusic { path, .. } => Some(path),
         _ => None,
     }
 }
