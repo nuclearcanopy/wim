@@ -85,7 +85,7 @@ in
       providers = mkOption {
         type = types.listOf types.str;
         default = [ "local" "opensubsonic" "lrclib" "musixmatch" "lyrics-ovh" ];
-        description = "Ordered lyrics providers; choose from local, opensubsonic, lrclib, musixmatch, and lyrics-ovh.";
+        description = "Ordered lyrics providers; choose from local, opensubsonic, lrclib, karalyr, musixmatch, and lyrics-ovh.";
       };
       apiKeyFiles = mkOption {
         type = types.attrsOf types.path;

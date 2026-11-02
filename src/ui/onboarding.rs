@@ -64,11 +64,11 @@ const CONTROLS: &[(Key, &str)] = &[
     (Key::Bound(KeyAction::Quit), "quit"),
 ];
 
-/// Welcome, controls, navidrome, listenbrainz, paths, done. The rail
-/// counts all six including the bookends, since "step 1 of 6" on the
+/// Welcome, controls, navidrome, listenbrainz, lyrics, paths, done. The rail
+/// counts all seven including the bookends, since "step 1 of 7" on the
 /// welcome screen is what tells the user the flow is short and finite
 /// before they commit to it.
-pub const TOTAL_STEPS: usize = 6;
+pub const TOTAL_STEPS: usize = 7;
 
 /// One content row. `level` is a `theme` brightness, never a hue.
 struct Row {
@@ -229,7 +229,7 @@ pub(crate) fn chrome(buf: &mut Buffer, area: Rect, step: usize) -> Rect {
     }
 }
 
-/// "● ● ○ ○ ○ ○   step 2 of 6". Position, not just a count: the dots
+/// "● ● ○ ○ ○ ○ ○   step 2 of 7". Position, not just a count: the dots
 /// make the remaining distance visible at a glance, the words make it
 /// unambiguous. Current step is brightest, completed ones mid, the rest
 /// dim, so the eye lands on where it is now.
@@ -343,6 +343,52 @@ pub struct ListenBrainzView<'a> {
     pub input: &'a str,
 }
 
+pub struct LyricsSetupView<'a> {
+    pub providers: &'a [String],
+    pub key_file: &'a str,
+}
+
+impl Widget for LyricsSetupView<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let choices = [
+            ("local", "sidecars and embedded tags"),
+            ("opensubsonic", "lyrics from your music server"),
+            ("lrclib", "synced lyrics, no key needed"),
+            ("karalyr", "word-synced lyrics; non-commercial terms"),
+            ("musixmatch", "optional; requires an API key"),
+            ("lyrics-ovh", "plain-text fallback, no key needed"),
+        ];
+        let mut screen = Screen::new(5)
+            .centred("lyrics sources", NEAR_WHITE)
+            .centred("f1-f6 toggle sources; the no-key defaults work as-is", DIM)
+            .gap();
+        for (index, (provider, description)) in choices.iter().enumerate() {
+            let enabled = self.providers.iter().any(|selected| selected == provider);
+            screen = screen.row(
+                format!(
+                    "f{} [{}] {provider:<13} {description}",
+                    index + 1,
+                    if enabled { "x" } else { " " }
+                ),
+                if enabled { NEAR_WHITE } else { DIM },
+            );
+        }
+        screen
+            .gap()
+            .row("Musixmatch key file (optional; don't paste the key):", DIM)
+            .row(
+                format!(
+                    "{}_",
+                    tail_fit(self.key_file, (area.width as usize).saturating_sub(8))
+                ),
+                NEAR_WHITE,
+            )
+            .gap()
+            .centred("enter to save and continue, esc to keep defaults", MID)
+            .render(area, buf);
+    }
+}
+
 impl Widget for ListenBrainzView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let prefix = "token: ";
@@ -376,7 +422,7 @@ pub struct LibraryPathsView<'a> {
 impl Widget for LibraryPathsView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let width_budget = (area.width as usize).saturating_sub(8);
-        let mut screen = Screen::new(5)
+        let mut screen = Screen::new(6)
             .centred("where's your media?", NEAR_WHITE)
             .gap();
 
@@ -416,7 +462,7 @@ pub struct DoneView;
 
 impl Widget for DoneView {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        Screen::new(6)
+        Screen::new(7)
             .centred("you're all set", NEAR_WHITE)
             .gap()
             .centred("press any key to start", DIM)
@@ -469,6 +515,23 @@ mod tests {
     }
 
     #[test]
+    fn lyrics_setup_shows_provider_choices_and_key_file_field() {
+        let providers = vec!["local".to_string(), "lrclib".to_string()];
+        let mut buf = buffer(80, 24);
+        LyricsSetupView {
+            providers: &providers,
+            key_file: "/run/agenix/musixmatch",
+        }
+        .render(Rect::new(0, 0, 80, 24), &mut buf);
+        let rendered = grid(&buf);
+        assert!(rendered.contains("lyrics sources"));
+        assert!(rendered.contains("f4 [ ] karalyr"));
+        assert!(rendered.contains("f5 [ ] musixmatch"));
+        assert!(rendered.contains("f3 [x] lrclib"));
+        assert!(rendered.contains("/run/agenix/musixmatch"));
+    }
+
+    #[test]
     fn the_welcome_screen_shows_the_wordmark_not_the_words() {
         let g = render_welcome(60, 20);
         // a row of the ANSI-Shadow "WIM" art, which is what index 0 is.
@@ -503,7 +566,7 @@ mod tests {
     /// of this is left" on every screen.
     #[test]
     fn the_rail_marks_the_current_step_on_each_screen() {
-        let cases: [(&str, u16); 4] = [("welcome", 1), ("controls", 2), ("paths", 5), ("done", 6)];
+        let cases: [(&str, u16); 4] = [("welcome", 1), ("controls", 2), ("paths", 6), ("done", 7)];
         for (name, step) in cases {
             let mut buf = buffer(60, 24);
             let area = Rect::new(0, 0, 60, 24);
@@ -519,7 +582,7 @@ mod tests {
             }
             let g = grid(&buf);
             assert!(
-                g.contains(&format!("step {step} of 6")),
+                g.contains(&format!("step {step} of 7")),
                 "{name} should say step {step}:\n{g}"
             );
         }
@@ -531,7 +594,7 @@ mod tests {
         let mut buf = buffer(24, 10);
         DoneView.render(Rect::new(0, 0, 24, 10), &mut buf);
         let g = grid(&buf);
-        assert!(g.contains("step 6 of 6"), "{g}");
+        assert!(g.contains("step 7 of 7"), "{g}");
         assert!(
             !g.contains('●'),
             "dots should be dropped, not clipped:\n{g}"
@@ -757,7 +820,7 @@ mod tests {
             // rail owns the row just inside the bottom frame edge.
             let lines: Vec<&str> = g.lines().collect();
             let rail = lines[lines.len() - 2];
-            assert!(rail.contains("step 2 of 6"), "{w}x{h} rail:\n{g}");
+            assert!(rail.contains("step 2 of 7"), "{w}x{h} rail:\n{g}");
         }
     }
 
@@ -770,7 +833,7 @@ mod tests {
         let g = grid(&buf);
         let rail = g.lines().nth(10).unwrap();
         assert!(
-            rail.contains("step 2 of 6"),
+            rail.contains("step 2 of 7"),
             "rail should be the interior's last row:\n{g}"
         );
     }
