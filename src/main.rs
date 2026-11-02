@@ -72,7 +72,7 @@ use wim::ui::miniplayer::MiniPlayerBar;
 use wim::ui::nav_manager::NavManagerListView;
 use wim::ui::notify::NotificationOverlay;
 use wim::ui::onboarding::{
-    ControlsView, DoneView, LibraryPathsView, ListenBrainzView, WelcomeView,
+    ControlsView, DoneView, LibraryPathsView, ListenBrainzView, LyricsSetupView, WelcomeView,
 };
 use wim::ui::player::PlayerView;
 use wim::ui::results_list::{label, ResultsList};
@@ -934,7 +934,7 @@ fn main() -> anyhow::Result<()> {
     // crossing the threshold (or a second manual download press)
     // doesn't kick off a duplicate transfer of the same file.
     let mut downloading: HashSet<String> = HashSet::new();
-    let lyrics_client =
+    let mut lyrics_client =
         lyrics::Client::with_providers(cfg.lyrics.providers.clone(), cfg.resolve_lyrics_api_keys());
     // the fetch runs off-thread; the key handler only asks.
     let mut lyrics_loader = lyrics::Loader::new();
@@ -1652,6 +1652,13 @@ fn main() -> anyhow::Result<()> {
                             area,
                         );
                     }
+                    Step::Lyrics => f.render_widget(
+                        LyricsSetupView {
+                            providers: &ob.lyrics_providers,
+                            key_file: &ob.musixmatch_key_file_input,
+                        },
+                        area,
+                    ),
                     Step::LibraryPaths => {
                         f.render_widget(
                             LibraryPathsView {
@@ -3087,6 +3094,7 @@ fn main() -> anyhow::Result<()> {
                     match ob.step {
                         Step::Navidrome => ob.login.current_mut().push_str(text),
                         Step::ListenBrainz => ob.listenbrainz_token_input.push_str(text),
+                        Step::Lyrics => ob.musixmatch_key_file_input.push_str(text),
                         Step::LibraryPaths => ob.path_input.push_str(text),
                         _ => {}
                     }
@@ -3393,6 +3401,48 @@ fn main() -> anyhow::Result<()> {
                                     notifications
                                         .push(Severity::Info, "listenbrainz scrobbling enabled");
                                 }
+                                ob.advance();
+                            }
+                            _ => {}
+                        },
+                        Step::Lyrics => match key.code {
+                            KeyCode::Esc => ob.advance(),
+                            KeyCode::F(1..=6) => {
+                                let provider = match key.code {
+                                    KeyCode::F(1) => "local",
+                                    KeyCode::F(2) => "opensubsonic",
+                                    KeyCode::F(3) => "lrclib",
+                                    KeyCode::F(4) => "karalyr",
+                                    KeyCode::F(5) => "musixmatch",
+                                    _ => "lyrics-ovh",
+                                };
+                                if let Some(index) = ob
+                                    .lyrics_providers
+                                    .iter()
+                                    .position(|selected| selected == provider)
+                                {
+                                    ob.lyrics_providers.remove(index);
+                                } else {
+                                    ob.lyrics_providers.push(provider.to_owned());
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                ob.musixmatch_key_file_input.pop();
+                            }
+                            KeyCode::Char(c) => ob.musixmatch_key_file_input.push(c),
+                            KeyCode::Enter => {
+                                cfg.lyrics.providers = ob.lyrics_providers.clone();
+                                let key_file = ob.musixmatch_key_file_input.trim();
+                                if !key_file.is_empty() {
+                                    cfg.lyrics
+                                        .api_key_files
+                                        .insert("musixmatch".into(), key_file.to_owned());
+                                }
+                                config::save_or_warn(&cfg, &mut notifications);
+                                lyrics_client = lyrics::Client::with_providers(
+                                    cfg.lyrics.providers.clone(),
+                                    cfg.resolve_lyrics_api_keys(),
+                                );
                                 ob.advance();
                             }
                             _ => {}

@@ -4,6 +4,23 @@ use std::time::{Duration, Instant};
 
 use wim::lyrics::{parse_synced, Lyrics};
 use wim::lyricspane::LyricsPane;
+use wim::onboarding::{Onboarding, Step};
+
+#[test]
+fn first_run_setup_includes_lyrics_before_library_paths() {
+    let mut setup = Onboarding::new(Vec::new());
+    for expected in [
+        Step::Controls,
+        Step::Navidrome,
+        Step::ListenBrainz,
+        Step::Lyrics,
+        Step::LibraryPaths,
+        Step::Done,
+    ] {
+        setup.advance();
+        assert_eq!(setup.step, expected);
+    }
+}
 
 #[test]
 fn lrc_offsets_multiple_timestamps_and_fractional_precision_are_applied() {
@@ -15,6 +32,13 @@ fn lrc_offsets_multiple_timestamps_and_fractional_precision_are_applied() {
     assert!((parsed[2].at - 61.903).abs() < 0.001);
     assert_eq!(parsed[0].text, "same");
     assert_eq!(parsed[2].text, "next");
+}
+
+#[test]
+fn enhanced_lrc_word_timestamps_are_removed_from_display_text() {
+    let parsed = parse_synced("[00:12.00]<00:12.00>Hello <00:12.50>there");
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].text, "Hello there");
 }
 
 #[test]

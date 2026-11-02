@@ -106,7 +106,7 @@ pub fn parse_synced(raw: &str) -> Vec<TimedLine> {
         if timestamps.is_empty() {
             continue;
         }
-        let text = rest.trim().to_string();
+        let text = strip_enhanced_timestamps(rest.trim());
         for at in timestamps {
             lines.push(TimedLine {
                 at: at.max(0.0),
@@ -116,6 +116,32 @@ pub fn parse_synced(raw: &str) -> Vec<TimedLine> {
     }
     lines.sort_by(|a, b| a.at.total_cmp(&b.at));
     lines
+}
+
+fn strip_enhanced_timestamps(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        output.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('>') else {
+            output.push_str(&rest[open..]);
+            return output;
+        };
+        let stamp = &after_open[..close];
+        let valid = stamp.split_once(':').is_some_and(|(minutes, seconds)| {
+            minutes.parse::<u64>().is_ok()
+                && seconds
+                    .parse::<f64>()
+                    .is_ok_and(|value| value.is_finite() && (0.0..60.0).contains(&value))
+        });
+        if !valid {
+            output.push_str(&rest[open..open + close + 2]);
+        }
+        rest = &after_open[close + 1..];
+    }
+    output.push_str(rest);
+    output
 }
 
 #[derive(Clone)]
@@ -252,6 +278,7 @@ impl Client {
         for provider in &self.providers {
             let result = match provider.as_str() {
                 "lrclib" => self.lookup_lrclib(artist, track, album, duration_secs),
+                "karalyr" => self.karalyr_lookup(artist, track, album, duration_secs),
                 "lyrics-ovh" => self.lyrics_ovh(artist, track),
                 "musixmatch" => self
                     .api_keys
@@ -391,6 +418,47 @@ impl Client {
             }
         }
         self.search(artist, track)
+    }
+
+    fn karalyr_lookup(
+        &self,
+        artist: &str,
+        track: &str,
+        album: &str,
+        duration_secs: Option<u32>,
+    ) -> anyhow::Result<Option<Lyrics>> {
+        if artist.trim().is_empty() || track.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut request = self
+            .agent
+            .get("https://karalyr.com/api/get")
+            .set("X-Karalyr-Client", "wim/0.1")
+            .query("artist_name", artist)
+            .query("track_name", track);
+        if !album.trim().is_empty() {
+            request = request.query("album_name", album);
+        }
+        if let Some(duration) = duration_secs {
+            request = request.query("duration", &duration.to_string());
+        }
+        match request.call() {
+            Ok(response) => {
+                let mut lyrics: Lyrics = response.into_json()?;
+                if lyrics
+                    .synced
+                    .as_deref()
+                    .is_some_and(|text| !parse_synced(text).is_empty())
+                {
+                    lyrics.source = "Karalyr".into();
+                    Ok(Some(lyrics))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn lyrics_ovh(&self, artist: &str, track: &str) -> anyhow::Result<Option<Lyrics>> {
