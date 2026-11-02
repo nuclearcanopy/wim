@@ -135,3 +135,13 @@ within a pane:
 
 the queue auto-advances when the current track ends; nothing plays next
 if the queue is empty.
+
+## lyrics
+
+Press `L` while a local or Navidrome song is playing. WIM prefers
+timestamped lyrics and follows the current playback position; manual
+scrolling pauses following briefly, then it resumes automatically.
+Local `.lrc` sidecars and embedded lyrics, OpenSubsonic server lyrics,
+LRCLIB, Musixmatch (with your own API key), and lyrics.ovh can be ordered
+or disabled in `config.toml`; details and credential-file configuration
+are in [`docs/lyrics.md`](docs/lyrics.md).

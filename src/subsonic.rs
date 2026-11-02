@@ -852,6 +852,15 @@ impl Client {
             .read_to_end(&mut bytes)?;
         Ok(bytes)
     }
+
+    /// OpenSubsonic's Song Lyrics extension can return timestamped and
+    /// word-synchronized lyrics stored by the server.
+    pub fn get_song_lyrics(&self, song_id: &str) -> anyhow::Result<serde_json::Value> {
+        self.get(
+            "getLyricsBySongId",
+            &[("id", song_id), ("enhanced", "true")],
+        )
+    }
 }
 
 /// The artist-page data path: `stream_artist_tracks` is what the

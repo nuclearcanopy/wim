@@ -100,6 +100,9 @@ pub enum VideoOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Ordered lyrics sources; API keys are referenced by secret files.
+    #[serde(default)]
+    pub lyrics: LyricsConfig,
     /// Multiple servers, all merged into one unified search corpus;
     /// consistent with "search spans everything" rather than requiring
     /// an "active server" concept to switch between. Add via the 'n'
@@ -241,6 +244,36 @@ pub struct Config {
     pub ascii_fps: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LyricsConfig {
+    #[serde(default = "default_lyrics_providers")]
+    pub providers: Vec<String>,
+    #[serde(default)]
+    pub api_key_files: HashMap<String, String>,
+}
+
+fn default_lyrics_providers() -> Vec<String> {
+    [
+        "local",
+        "opensubsonic",
+        "lrclib",
+        "musixmatch",
+        "lyrics-ovh",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+impl Default for LyricsConfig {
+    fn default() -> Self {
+        Self {
+            providers: default_lyrics_providers(),
+            api_key_files: HashMap::new(),
+        }
+    }
+}
+
 fn default_mouse() -> bool {
     true
 }
@@ -286,6 +319,18 @@ pub const CROSSFADE_MIN: f64 = 1.0;
 pub const CROSSFADE_MAX: f64 = 15.0;
 
 impl Config {
+    pub fn resolve_lyrics_api_keys(&self) -> HashMap<String, String> {
+        self.lyrics
+            .api_key_files
+            .iter()
+            .filter_map(|(provider, path)| {
+                fs::read_to_string(path)
+                    .ok()
+                    .map(|value| (provider.clone(), value.trim().to_owned()))
+            })
+            .collect()
+    }
+
     /// `Ok(None)` means no key was configured at all; an `Err` means
     /// one was and the file would not read. Same shape as
     /// `NavidromeConfig::resolve_password`, and for the same reason:
@@ -334,6 +379,16 @@ impl Config {
     /// gains are left to `layout::from_sizes`/`eq::clamp_gains`.
     fn sanitize(&mut self) -> Vec<String> {
         let mut w = Vec::new();
+        self.lyrics.providers.retain(|provider| {
+            let known = matches!(
+                provider.as_str(),
+                "local" | "opensubsonic" | "lrclib" | "musixmatch" | "lyrics-ovh"
+            );
+            if !known {
+                w.push(format!("unknown lyrics provider '{provider}', ignored"));
+            }
+            known
+        });
         let fade = crossfade_seconds(self.crossfade_seconds);
         if fade.to_bits() != self.crossfade_seconds.to_bits() {
             w.push(format!(
@@ -427,6 +482,13 @@ impl Config {
         }
         if let Err(e) = self.read_opensubtitles_api_key() {
             out.push(format!("subtitle fetching is off: {e:#}"));
+        }
+        for (provider, path) in &self.lyrics.api_key_files {
+            if let Err(error) = fs::read_to_string(path) {
+                out.push(format!(
+                    "lyrics provider {provider} is off: cannot read api_key_files.{provider} at {path}: {error}"
+                ));
+            }
         }
         // a navidrome `password_file` that will not read is not listed
         // here: that one already surfaces at connect time, since
@@ -524,6 +586,7 @@ impl Default for SubtitleConfig {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            lyrics: LyricsConfig::default(),
             navidrome_servers: Vec::new(),
             album_art: AlbumArtMode::Auto,
             ascii_fps: None,
@@ -657,6 +720,7 @@ fn fix_int<T: Ord + Copy + std::fmt::Display>(
 /// `every_config_field_is_a_known_key` test pins the list against the
 /// struct.
 const KNOWN_KEYS: &[&str] = &[
+    "lyrics",
     "navidrome_servers",
     "album_art",
     "ascii_fps",
@@ -684,6 +748,9 @@ const KNOWN_KEYS: &[&str] = &[
     "mouse",
     "video_output",
 ];
+
+#[cfg(test)]
+const LYRICS_KEYS: &[&str] = &["providers", "api_key_files"];
 
 const SUBTITLE_KEYS: &[&str] = &[
     "delay_secs",
@@ -1059,6 +1126,7 @@ pasword = "x"
     #[test]
     fn every_config_field_is_a_known_key() {
         let full = Config {
+            lyrics: LyricsConfig::default(),
             navidrome_servers: vec![NavidromeConfig {
                 url: "https://music.example".into(),
                 username: "me".into(),
@@ -1125,6 +1193,7 @@ pasword = "x"
             }
         };
         nested("subtitles", SUBTITLE_KEYS);
+        nested("lyrics", LYRICS_KEYS);
         nested("scrobble", SCROBBLE_KEYS);
         nested("navidrome_servers", NAVIDROME_KEYS);
     }
