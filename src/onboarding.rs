@@ -18,6 +18,7 @@ pub enum Step {
     Controls,
     Navidrome,
     ListenBrainz,
+    Lyrics,
     LibraryPaths,
     Done,
 }
@@ -33,6 +34,8 @@ pub struct Onboarding {
     /// this one has merged with (not present here yet; see
     /// `onboarding.rs` module doc).
     pub listenbrainz_token_input: String,
+    pub lyrics_providers: Vec<String>,
+    pub musixmatch_key_file_input: String,
     pub path_input: String,
     pub library_paths: Vec<String>,
 }
@@ -44,6 +47,8 @@ impl Onboarding {
             login: LoginForm::new(),
             login_message: String::new(),
             listenbrainz_token_input: String::new(),
+            lyrics_providers: crate::config::LyricsConfig::default().providers,
+            musixmatch_key_file_input: String::new(),
             path_input: String::new(),
             library_paths: default_library_paths,
         }
@@ -54,7 +59,8 @@ impl Onboarding {
             Step::Welcome => Step::Controls,
             Step::Controls => Step::Navidrome,
             Step::Navidrome => Step::ListenBrainz,
-            Step::ListenBrainz => Step::LibraryPaths,
+            Step::ListenBrainz => Step::Lyrics,
+            Step::Lyrics => Step::LibraryPaths,
             Step::LibraryPaths => Step::Done,
             Step::Done => Step::Done,
         };

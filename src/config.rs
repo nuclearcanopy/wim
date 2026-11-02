@@ -382,7 +382,7 @@ impl Config {
         self.lyrics.providers.retain(|provider| {
             let known = matches!(
                 provider.as_str(),
-                "local" | "opensubsonic" | "lrclib" | "musixmatch" | "lyrics-ovh"
+                "local" | "opensubsonic" | "lrclib" | "karalyr" | "musixmatch" | "lyrics-ovh"
             );
             if !known {
                 w.push(format!("unknown lyrics provider '{provider}', ignored"));
