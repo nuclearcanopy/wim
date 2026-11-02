@@ -23,6 +23,9 @@ pub struct SwimSurface {
     /// Whether the last `view(now)` asked for the full readout, so a
     /// second one does not repeat itself. Purely cosmetic.
     pub verbose_now: bool,
+    /// Interactive prompt requested a live lyrics display. One-shot
+    /// commands still print lyrics to stdout after the same lookup.
+    pub lyrics_requested: bool,
     /// Ops the core handed over to be run as a program, waiting for
     /// the host to pick them up (`Host::step`).
     ///
@@ -80,7 +83,10 @@ impl Surface for Borrowed<'_> {
     fn open_screen(&mut self, target: ViewTarget, core: &mut CoreCtx) -> (Dispatch, Report) {
         match target {
             ViewTarget::Now => self.print_now(core),
-            ViewTarget::Lyrics => print_lyrics(core),
+            ViewTarget::Lyrics => {
+                self.state.lyrics_requested = true;
+                print_lyrics(core)
+            }
             // `decline`'s generic wording would read "...; wim does"
             // after a message that already named the key, so these
             // say it once, themselves.

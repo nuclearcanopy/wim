@@ -102,6 +102,9 @@ pub struct Host {
     pub remote_starred: HashSet<String>,
     pub lyrics_client: lyrics::Client,
     pub lyrics_loader: lyrics::Loader,
+    pub lyrics_pane: wim::lyricspane::LyricsPane,
+    pub first_run: bool,
+    pub interactive_prompt: bool,
     pub track_resolver: TrackResolver,
     pub star_tx: mpsc::Sender<StarFailed>,
     pub star_rx: mpsc::Receiver<StarFailed>,
@@ -142,6 +145,7 @@ impl Host {
     /// terminal: the scan and the catalog warm on their own threads
     /// and the prompt is usable before either answers.
     pub fn start() -> anyhow::Result<Host> {
+        let first_run = !config::config_path()?.exists();
         let cfg = config::load_or_init()?;
         trace::mark("config loaded");
 
@@ -172,6 +176,10 @@ impl Host {
         let base_volume = core::current_volume(&player).unwrap_or(100.0);
         let crossfade_enabled = cfg.crossfade_enabled;
         let gap_at_start = cfg.gap_seconds;
+        let lyrics_client = lyrics::Client::with_providers(
+            cfg.lyrics.providers.clone(),
+            cfg.resolve_lyrics_api_keys(),
+        );
         let (star_tx, star_rx) = mpsc::channel();
         Ok(Host {
             cfg,
@@ -192,11 +200,11 @@ impl Host {
             scrobble: ScrobbleState::default(),
             favorites: favorites::load(),
             remote_starred: HashSet::new(),
-            lyrics_client: lyrics::Client::with_providers(
-                cfg.lyrics.providers.clone(),
-                cfg.resolve_lyrics_api_keys(),
-            ),
+            lyrics_client,
             lyrics_loader: lyrics::Loader::new(),
+            lyrics_pane: wim::lyricspane::LyricsPane::default(),
+            first_run,
+            interactive_prompt: false,
             track_resolver: TrackResolver::new(),
             star_tx,
             star_rx,
@@ -307,15 +315,31 @@ impl Host {
         if let Some((track, result)) = self.lyrics_loader.poll() {
             match result {
                 Ok(Some(l)) => {
-                    let text = wim::core::lyrics_text(&l);
-                    let count = text.lines().count();
-                    for line in text.lines() {
-                        self.console.note(line.to_string());
+                    self.lyrics_client.track_display(&l);
+                    if self.interactive_prompt && self.swim.lyrics_requested {
+                        self.lyrics_pane.open_lyrics(&l, track);
+                        self.swim.lyrics_requested = false;
+                    } else {
+                        let text = wim::core::lyrics_text(&l);
+                        let count = text.lines().count();
+                        for line in text.lines() {
+                            self.console.note(line.to_string());
+                        }
+                        if let Some(attribution) = l.attribution.as_deref() {
+                            self.console.note(attribution.to_owned());
+                        }
+                        self.console.note(format!("{count} lines for {track}"));
+                        self.swim.lyrics_requested = false;
                     }
-                    self.console.note(format!("{count} lines for {track}"));
                 }
-                Ok(None) => self.console.note(format!("no lyrics for {track}")),
-                Err(e) => self.console.note(format!("lyrics lookup failed: {e}")),
+                Ok(None) => {
+                    self.swim.lyrics_requested = false;
+                    self.console.note(format!("no lyrics for {track}"));
+                }
+                Err(e) => {
+                    self.swim.lyrics_requested = false;
+                    self.console.note(format!("lyrics lookup failed: {e}"));
+                }
             }
         }
 
@@ -402,6 +426,10 @@ impl Host {
             }
             if let Some(bound) = started.bound {
                 self.console.note(bound);
+            }
+            if self.interactive_prompt && (self.lyrics_pane.is_open() || self.swim.lyrics_requested)
+            {
+                self.request_lyrics(&track);
             }
         }
 
@@ -577,5 +605,41 @@ impl Host {
         // on the way out still gets reported.
         self.pump();
         self.console.lines.iter().any(|l| l.kind == LineKind::Error)
+    }
+
+    fn request_lyrics(&mut self, item: &SearchItem) {
+        let Some((artist, title, album)) = core::lyrics_query(item) else {
+            self.lyrics_pane.close();
+            self.swim.lyrics_requested = false;
+            return;
+        };
+        self.lyrics_pane.close();
+        self.swim.lyrics_requested = true;
+        let name = label(item);
+        if let Some((server, id)) = core::lyrics_remote(item) {
+            self.lyrics_loader.request_subsonic(
+                &self.lyrics_client,
+                server,
+                id,
+                name,
+                &artist,
+                &title,
+                &album,
+                None,
+            );
+        } else if let Some(path) = core::lyrics_path(item) {
+            self.lyrics_loader.request_local(
+                &self.lyrics_client,
+                name,
+                &artist,
+                &title,
+                &album,
+                None,
+                path,
+            );
+        } else {
+            self.lyrics_loader
+                .request(&self.lyrics_client, name, &artist, &title, &album, None);
+        }
     }
 }

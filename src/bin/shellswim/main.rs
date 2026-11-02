@@ -11,14 +11,18 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout};
+use ratatui::style::Style;
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use wim::core::{self, Drive};
 use wim::playqueue::PlayQueue;
 use wim::search::SearchItem;
 use wim::shellsong::{Console, ConsoleAction, LineKind};
 use wim::swimconsole::{SwimBar, SwimConsole};
+use wim::theme::{shade, DIM, NEAR_WHITE};
 use wim::ui::divider::HorizontalRule;
+use wim::ui::lyrics_view::LyricsView;
 use wim::ui::results_list::label;
 use wim::{anim, config, mpv, term, trace};
 
@@ -100,6 +104,11 @@ fn oneshot(cli: &Cli) -> anyhow::Result<()> {
 
 fn prompt() -> anyhow::Result<()> {
     let mut host = Host::start()?;
+    host.interactive_prompt = true;
+    let mut lyrics_setup = host.first_run.then(|| LyricsSetup {
+        providers: host.cfg.lyrics.providers.clone(),
+        key_file: String::new(),
+    });
 
     // the display's refresh rate decides how often the scrubber is
     // sampled, never how fast anything runs; one subprocess on a
@@ -143,6 +152,18 @@ fn prompt() -> anyhow::Result<()> {
                     .between_tracks
                     .remaining(Instant::now())
                     .map(|d| d.as_secs_f64()),
+                lyrics: host.lyrics_pane.is_open().then(|| {
+                    let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+                    host.lyrics_pane.saw_size(
+                        ((u32::from(width) * 45) / 100) as u16,
+                        height.saturating_sub(4),
+                    );
+                    let active = host
+                        .lyrics_pane
+                        .follow_playback(host.playback.elapsed_secs, Instant::now());
+                    (&host.lyrics_pane, active)
+                }),
+                setup: lyrics_setup.as_ref(),
             },
         )?;
         if first_frame {
@@ -152,7 +173,9 @@ fn prompt() -> anyhow::Result<()> {
 
         // the scrubber moves while something plays and costs nothing
         // when nothing does.
-        let animating = host.program.is_some()
+        let animating = lyrics_setup.is_some()
+            || host.lyrics_pane.is_open()
+            || host.program.is_some()
             || host.console.cycle().is_some()
             || (now_playing.is_some() && !host.playback.paused);
         let timeout = if animating {
@@ -165,6 +188,10 @@ fn prompt() -> anyhow::Result<()> {
         }
         match event::read()? {
             Event::Paste(text) => {
+                if let Some(setup) = &mut lyrics_setup {
+                    setup.key_file.push_str(&text);
+                    continue;
+                }
                 // `paste` recomputes the suggestion, so it takes the
                 // candidates too; a ghost-less paste was a real bug
                 // (docs/shellsong.md).
@@ -179,6 +206,60 @@ fn prompt() -> anyhow::Result<()> {
                     && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
                 {
                     break;
+                }
+                if let Some(setup) = &mut lyrics_setup {
+                    match key.code {
+                        KeyCode::Esc => lyrics_setup = None,
+                        KeyCode::F(1..=6) => {
+                            let provider = setup.provider_for_key(key.code);
+                            if let Some(index) = setup
+                                .providers
+                                .iter()
+                                .position(|selected| selected == provider)
+                            {
+                                setup.providers.remove(index);
+                            } else {
+                                setup.providers.push(provider.to_owned());
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            setup.key_file.pop();
+                        }
+                        KeyCode::Enter => {
+                            host.cfg.lyrics.providers = setup.providers.clone();
+                            if !setup.key_file.trim().is_empty() {
+                                host.cfg
+                                    .lyrics
+                                    .api_key_files
+                                    .insert("musixmatch".into(), setup.key_file.trim().to_owned());
+                            }
+                            match config::save(&host.cfg) {
+                                Ok(()) => host.console.note("lyrics setup saved".to_owned()),
+                                Err(error) => host.console.fail(format!("saving config: {error}")),
+                            }
+                            host.lyrics_client = wim::lyrics::Client::with_providers(
+                                host.cfg.lyrics.providers.clone(),
+                                host.cfg.resolve_lyrics_api_keys(),
+                            );
+                            host.first_run = false;
+                            lyrics_setup = None;
+                        }
+                        KeyCode::Char(c) => setup.key_file.push(c),
+                        _ => {}
+                    }
+                    continue;
+                }
+                if host.lyrics_pane.is_open() {
+                    match key.code {
+                        KeyCode::Esc => {
+                            host.lyrics_pane.close();
+                            host.swim.lyrics_requested = false;
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => host.lyrics_pane.scroll_by(1),
+                        KeyCode::Char('k') | KeyCode::Up => host.lyrics_pane.scroll_by(-1),
+                        _ => {}
+                    }
+                    continue;
                 }
                 // '?' on an empty line is the short command list: the
                 // one thing a new user should not need the docs for.
@@ -238,6 +319,67 @@ struct Screen<'a> {
     /// Seconds left of a between-track gap; shellswim is mostly this
     /// bar, so "paused with no reason given" is most of the screen.
     gap_remaining: Option<f64>,
+    lyrics: Option<(&'a wim::lyricspane::LyricsPane, Option<usize>)>,
+    setup: Option<&'a LyricsSetup>,
+}
+
+struct LyricsSetup {
+    providers: Vec<String>,
+    key_file: String,
+}
+
+impl LyricsSetup {
+    fn provider_for_key(&self, key: KeyCode) -> &'static str {
+        match key {
+            KeyCode::F(1) => "local",
+            KeyCode::F(2) => "opensubsonic",
+            KeyCode::F(3) => "lrclib",
+            KeyCode::F(4) => "karalyr",
+            KeyCode::F(5) => "musixmatch",
+            _ => "lyrics-ovh",
+        }
+    }
+
+    fn text(&self) -> String {
+        let choices = [
+            ("local", "sidecars and embedded tags"),
+            ("opensubsonic", "server-provided lyrics"),
+            ("lrclib", "synced; no API key"),
+            ("karalyr", "word-synced; non-commercial terms"),
+            ("musixmatch", "optional; requires an API key"),
+            ("lyrics-ovh", "plain text; no API key"),
+        ];
+        let mut rows = vec![
+            "Choose lyrics sources (F1-F6 toggle; defaults work without setup):".to_owned(),
+            String::new(),
+        ];
+        rows.extend(
+            choices
+                .iter()
+                .enumerate()
+                .map(|(index, (provider, description))| {
+                    format!(
+                        " F{} [{}] {:<13} {}",
+                        index + 1,
+                        if self.providers.iter().any(|selected| selected == provider) {
+                            'x'
+                        } else {
+                            ' '
+                        },
+                        provider,
+                        description
+                    )
+                }),
+        );
+        rows.extend([
+            String::new(),
+            "Musixmatch API key file (optional; do not paste the key):".to_owned(),
+            format!(" {}_", self.key_file),
+            String::new(),
+            "Enter saves and continues; Esc keeps the defaults".to_owned(),
+        ]);
+        rows.join("\n")
+    }
 }
 
 fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
@@ -257,13 +399,75 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
             Constraint::Length(1),
         ])
         .areas(f.area());
-        f.render_widget(
-            SwimConsole {
-                console: s.console,
-                cursor_visible,
-            },
-            body,
-        );
+        if let Some(setup) = s.setup {
+            let widget = Paragraph::new(setup.text())
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(shade(NEAR_WHITE)))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("shellswim · first-run setup")
+                        .border_style(Style::default().fg(shade(DIM))),
+                );
+            f.render_widget(widget, f.area());
+            return;
+        }
+        if let Some((pane, active_line)) = s.lyrics {
+            let [console_area, lyrics_area] =
+                Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                    .areas(body);
+            let divider_x = console_area.x + console_area.width.saturating_sub(1);
+            let console_area = ratatui::layout::Rect {
+                width: console_area.width.saturating_sub(1),
+                ..console_area
+            };
+            let lines: Vec<&str> = pane
+                .lines()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str)
+                .collect();
+            f.render_widget(
+                LyricsView {
+                    lines: &lines,
+                    scroll: pane.scroll(),
+                    active_line,
+                    track: pane.track(),
+                    source: pane.source(),
+                    synced: pane.is_synced(),
+                    following: pane.following(),
+                    attribution: pane.attribution(),
+                },
+                lyrics_area,
+            );
+            f.render_widget(
+                wim::ui::divider::VerticalRule {
+                    highlighted: false,
+                    junction_rows: Vec::new(),
+                },
+                ratatui::layout::Rect {
+                    x: divider_x,
+                    width: 1,
+                    ..body
+                },
+            );
+            f.render_widget(
+                SwimConsole {
+                    console: s.console,
+                    cursor_visible,
+                },
+                console_area,
+            );
+        } else {
+            f.render_widget(
+                SwimConsole {
+                    console: s.console,
+                    cursor_visible,
+                },
+                body,
+            );
+        }
         f.render_widget(
             HorizontalRule {
                 highlighted: false,
