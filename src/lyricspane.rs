@@ -118,6 +118,20 @@ impl LyricsPane {
         self.manual_until = Some(Instant::now() + Duration::from_secs(3));
     }
 
+    pub fn scroll_by(&mut self, delta: isize) {
+        let Some(lines) = self.lines.as_deref() else {
+            return;
+        };
+        let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let total = crate::ui::lyrics_view::wrapped_len(&borrowed, self.width());
+        let body_height = self.height.saturating_sub(crate::ui::header::ROWS) as usize;
+        let footer =
+            crate::ui::lyrics_view::attribution_rows(self.attribution.as_deref(), self.width());
+        let visible = body_height.saturating_sub(footer).max(1);
+        let max = total.saturating_sub(visible);
+        self.set_scroll(self.scroll.saturating_add_signed(delta).min(max));
+    }
+
     pub fn active_line(&self, position: Option<f64>) -> Option<usize> {
         let position = position?;
         let index = self.timed.partition_point(|line| line.at <= position);
@@ -223,5 +237,21 @@ mod tests {
         assert_eq!(pane.scroll(), 0, "manual scroll has not expired");
         pane.follow_playback(Some(9.0), start + Duration::from_secs(4));
         assert!(pane.following());
+    }
+
+    #[test]
+    fn scroll_by_is_clamped_and_starts_the_manual_follow_pause() {
+        let lyrics = Lyrics {
+            plain: Some("one\ntwo\nthree".into()),
+            ..Lyrics::default()
+        };
+        let mut pane = LyricsPane::default();
+        pane.open_lyrics(&lyrics, "song".into());
+        pane.saw_size(40, 4);
+        pane.scroll_by(100);
+        assert_eq!(pane.scroll(), 2);
+        assert!(!pane.following());
+        pane.scroll_by(-100);
+        assert_eq!(pane.scroll(), 0);
     }
 }
