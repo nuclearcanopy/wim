@@ -24,7 +24,7 @@
 
 use std::ffi::{CString, OsString};
 use std::fs::{File, OpenOptions};
-use std::io::{self, ErrorKind, Read};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -510,6 +510,16 @@ pub struct FrameSource {
 impl FrameSource {
     /// Spawns a frame instance for `media`, decoding at `grid`, from
     /// media time `start`, with the audible instance's `container-fps`.
+    ///
+    /// `media` may be a local path or a remote url. An `http(s)` url is
+    /// handed to mpv on stdin (`--playlist=-`) rather than argv, so a
+    /// signed stream url never becomes world-readable in
+    /// `/proc/<pid>/cmdline`; anything else is a positional. A url
+    /// source needs the server to answer http range requests — an
+    /// mp4's moov atom is not at the front, and the demuxer seeks to it
+    /// (measured: without ranges mpv dies with "Cannot seek backward
+    /// in linear streams"). Real cdns do; `python -m http.server` does
+    /// not.
     pub fn spawn(media: &Path, grid: Grid, start: f64, fps: f64) -> io::Result<FrameSource> {
         let len = grid.frame_len();
         if len == 0 {
@@ -586,16 +596,44 @@ impl FrameSource {
         }
         let mut out = OsString::from("--o=");
         out.push(&self.fifo);
-        cmd.arg(out).arg(&self.media);
-        // all three, unlike the audible instance, which has to inherit
-        // stdout so a drawing vo's escapes reach the terminal. this one
-        // must never write to the terminal at all.
-        self.child = Some(
-            cmd.stdin(Stdio::null())
+        cmd.arg(out);
+        // a resolved stream url is a signed secret, and argv is
+        // world-readable in /proc, so a url is never a command-line
+        // word: it goes in as a one-line playlist on stdin (measured
+        // against a real mpv: encode mode takes the playlist entry
+        // exactly as it took the positional). everything else stays a
+        // positional, which for the lavfi pseudo-urls is also the only
+        // thing that works — playlist entries are url-only, and mpv
+        // has no protocol handler for av:// from a playlist.
+        let url = self
+            .media
+            .to_str()
+            .is_some_and(|m| m.starts_with("http://") || m.starts_with("https://"));
+        let child = if url {
+            let mut spawned = cmd
+                .arg("--playlist=-")
+                .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .spawn()?,
-        );
+                .spawn()?;
+            let mut stdin = spawned.stdin.take().expect("spawned with a piped stdin");
+            let _ = stdin.write_all(self.media.as_os_str().as_bytes());
+            let _ = stdin.write_all(b"\n");
+            // `stdin` dropped here: eof is what tells mpv the playlist
+            // is finished, so a handle held open stalls it at
+            // playlist-parse time.
+            spawned
+        } else {
+            // stdout/stderr null, unlike the audible instance, which
+            // has to inherit stdout so a drawing vo's escapes reach the
+            // terminal. this one must never write to the terminal.
+            cmd.arg(&self.media)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?
+        };
+        self.child = Some(child);
 
         // O_NONBLOCK on both counts: a blocking open of a fifo's read
         // end waits for a writer forever, and a blocking read would put
@@ -1181,6 +1219,110 @@ mod tests {
             assert_eq!(wait_frame(&mut src), Pull::Frame, "frame {i} of {n}");
         }
         src.frame_bytes().to_vec()
+    }
+
+    /// A one-file http server that answers range requests, which is
+    /// what a real cdn does and what an mp4 over http needs: the moov
+    /// atom is not at the front, so the demuxer seeks to it, and
+    /// without ranges mpv dies with "Cannot seek backward in linear
+    /// streams" (measured; `python -m http.server` has no ranges and
+    /// cannot stand in for a cdn).
+    fn range_server(bytes: Vec<u8>) -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let addr = listener.local_addr().expect("addr");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                let request = read_request(&mut stream);
+                let (start, end) = match request
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .and_then(|spec| spec.trim().strip_prefix("bytes="))
+                {
+                    Some(spec) => {
+                        let (first, last) = spec.split_once('-').unwrap_or((spec, ""));
+                        let first = first.parse::<usize>().unwrap_or(0);
+                        let last = if last.is_empty() {
+                            bytes.len().saturating_sub(1)
+                        } else {
+                            last.parse::<usize>().unwrap_or(0)
+                        };
+                        (first, last.min(bytes.len().saturating_sub(1)))
+                    }
+                    None => (0, bytes.len().saturating_sub(1)),
+                };
+                let body = &bytes[start..=end.min(bytes.len().saturating_sub(1))];
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\n\
+                     Content-Range: bytes {start}-{end}/{total}\r\n\
+                     Content-Length: {len}\r\n\
+                     Accept-Ranges: bytes\r\n\
+                     Connection: close\r\n\r\n",
+                    total = bytes.len(),
+                    len = body.len(),
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        (addr, stop)
+    }
+
+    /// Reads one request head (to the blank line) off a connection.
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        // bounded by PATIENCE-scale time, not request size
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !head.ends_with(b"\r\n\r\n") && Instant::now() < deadline {
+            match stream.read(&mut byte) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => head.push(byte[0]),
+            }
+        }
+        String::from_utf8_lossy(&head).into_owned()
+    }
+
+    /// The remote half of the frame source: a resolved stream url
+    /// decodes to the same bytes the local file does, and the url —
+    /// a signed secret, world-readable in `/proc/<pid>/cmdline` if it
+    /// were an argv word — never appears in the child's command line.
+    #[test]
+    fn an_http_source_decodes_and_the_url_stays_out_of_argv() {
+        let grid = Grid::new(32, 16, 2.0);
+        let clip = Clip::mpeg4("320x240", 25, 75);
+        let local = nth_frame(&clip.media(), grid, 0);
+        let (addr, stop) = range_server(std::fs::read(&clip.path).expect("clip bytes"));
+        // the fake signed token is what must never leak; the test fails
+        // on its own machinery if it does.
+        let url = format!("http://{addr}/clip.mp4?token=wim-test-signed-secret");
+        let mut src = FrameSource::spawn(Path::new(&url), grid, 0.0, FPS)
+            .expect("mpv must be on PATH and the server up");
+        assert_eq!(wait_frame(&mut src), Pull::Frame, "no frame over http");
+        assert_eq!(src.frame_bytes(), &local[..], "http is not the local decode");
+        // the privacy pin: the url is on stdin, never in argv.
+        let pid = src.child.as_ref().expect("spawned").id();
+        let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+            .expect("linux exposes the command line");
+        assert!(
+            !cmdline.contains("wim-test-signed-secret"),
+            "the signed url leaked into argv: {cmdline:?}"
+        );
+        assert!(cmdline.contains("--playlist=-"), "via stdin or not at all");
+        drop(src);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The whole premise: a real decoded frame arrives, and it is
