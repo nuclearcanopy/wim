@@ -173,15 +173,6 @@ pub fn front(tiers: Tiers) -> Option<Modal> {
     TIERS.iter().copied().find(|m| tiers.up(*m))
 }
 
-/// Which of the two surfaces drawing `controlsbar::Field` a control
-/// belongs to; they are on screen at the same time and carry separate
-/// cursors, so a hit has to say which cursor it moved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Transport {
-    Bar,
-    Player,
-}
-
 /// A text box drawn inside a visible pane, rather than over it; the
 /// two tiers of `Modal` that do not swallow a click, named again here
 /// because a click *in* one of them is how it gets the keyboard.
@@ -224,7 +215,6 @@ impl Scrollable {
 /// that did not fit simply has no entry here and cannot be clicked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Control {
-    pub transport: Transport,
     pub field: Field,
     pub rect: Rect,
 }
@@ -267,12 +257,12 @@ pub struct HitMap {
     /// on something the user cannot see, the same as under a covering
     /// tier (`ui::notify::boxes`).
     pub toasts: Vec<Rect>,
-    /// The scrubber's track cells, per surface that drew one; both are
-    /// on screen while the player is maximized. This, not the whole
-    /// progress element, is what an x offset is a fraction of: the time
-    /// readouts either side are part of the element but are not
-    /// positions on the track.
-    pub tracks: Vec<(Transport, Rect)>,
+    /// The scrubber's track cells. The bottom bar is the one transport
+    /// surface, so there is one track; this, not the whole progress
+    /// element, is what an x offset is a fraction of: the time readouts
+    /// either side are part of the element but are not positions on
+    /// the track.
+    pub tracks: Option<Rect>,
 }
 
 /// A mouse event reduced to the parts a decision needs. Raw-mode input
@@ -317,7 +307,7 @@ pub enum Act {
     /// `Some` only for a press on the scrubber's track, and says where
     /// the drag opens, which is the one thing a pointer knows about a
     /// control and a key does not.
-    Press(Transport, Field, Option<f64>),
+    Press(Field, Option<f64>),
     ScrubTo(f64),
     ScrubCommit(f64),
     /// One notch over the list under the pointer, whether or not it has
@@ -341,22 +331,22 @@ fn inside(rect: Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
 
-/// The whole decision. `dragging` names the surface whose scrubber has
-/// a drag open, which is the one thing a click's meaning depends on
-/// beyond where it landed: a release has to reach that scrubber even
-/// when the pointer wandered off it first.
-pub fn act(map: &HitMap, click: Click, dragging: Option<Transport>) -> Act {
+/// The whole decision. `dragging` says whether the bottom bar's
+/// scrubber has a drag open, which is the one thing a click's meaning
+/// depends on beyond where it landed: a release has to reach that
+/// scrubber even when the pointer wandered off it first.
+pub fn act(map: &HitMap, click: Click, dragging: bool) -> Act {
     let Click { kind, col, row } = click;
 
     // an open drag keeps the pointer regardless of where it goes, the
     // same way the keyboard's scrub tier sits above the bar's own
     // selection keys: nothing may move the cursor out from under a
     // seek that has not been committed.
-    if let Some(surface) = dragging {
-        if let Some((_, track)) = map.tracks.iter().find(|(t, _)| *t == surface) {
+    if dragging {
+        if let Some(track) = map.tracks {
             match kind {
-                Kind::Drag => return Act::ScrubTo(frac_at(*track, col)),
-                Kind::Up => return Act::ScrubCommit(frac_at(*track, col)),
+                Kind::Drag => return Act::ScrubTo(frac_at(track, col)),
+                Kind::Up => return Act::ScrubCommit(frac_at(track, col)),
                 _ => {}
             }
         }
@@ -387,21 +377,16 @@ pub fn act(map: &HitMap, click: Click, dragging: Option<Transport>) -> Act {
         return Act::Nothing;
     }
 
-    // controls are drawn inside `bottom` (or inside the workspace, for
-    // the maximized player), so they have to be tested before the pane
-    // that contains them or the pane would answer for them.
+    // controls are drawn inside `bottom`, so they have to be tested
+    // before the pane that contains them or the pane would answer for
+    // them.
     if let Some(control) = map.controls.iter().rev().find(|c| inside(c.rect, col, row)) {
         if control.field == Field::Progress {
-            let own = map
-                .tracks
-                .iter()
-                .find(|(t, _)| *t == control.transport)
-                .filter(|(_, track)| inside(*track, col, row));
-            if let Some((transport, track)) = own {
-                return Act::Press(*transport, Field::Progress, Some(frac_at(*track, col)));
+            if let Some(track) = map.tracks.filter(|t| inside(*t, col, row)) {
+                return Act::Press(Field::Progress, Some(frac_at(track, col)));
             }
         }
-        return Act::Press(control.transport, control.field, None);
+        return Act::Press(control.field, None);
     }
 
     if let Some((which, _)) = map.boxes.iter().find(|(_, r)| inside(*r, col, row)) {
@@ -484,7 +469,6 @@ mod tests {
         map.controls = fields
             .iter()
             .map(|&(field, x, width)| Control {
-                transport: Transport::Bar,
                 field,
                 rect: Rect::new(x, 19, width, 1),
             })
@@ -494,19 +478,19 @@ mod tests {
     #[test]
     fn a_click_in_a_pane_focuses_that_pane() {
         let m = map();
-        assert_eq!(act(&m, down(5, 5), None), Act::Focus(Focus::Sidebar));
-        assert_eq!(act(&m, down(30, 5), None), Act::Focus(Focus::Workspace));
-        assert_eq!(act(&m, down(30, 19), None), Act::Focus(Focus::BottomBar));
+        assert_eq!(act(&m, down(5, 5), false), Act::Focus(Focus::Sidebar));
+        assert_eq!(act(&m, down(30, 5), false), Act::Focus(Focus::Workspace));
+        assert_eq!(act(&m, down(30, 19), false), Act::Focus(Focus::BottomBar));
     }
 
     #[test]
     fn a_click_on_nothing_resolves_to_nothing_not_to_the_nearest_thing() {
         let m = map();
         // the divider column between the two panes belongs to neither.
-        assert_eq!(act(&m, down(20, 5), None), Act::Nothing);
+        assert_eq!(act(&m, down(20, 5), false), Act::Nothing);
         // and past the frame entirely.
-        assert_eq!(act(&m, down(200, 5), None), Act::Nothing);
-        assert_eq!(act(&m, down(5, 90), None), Act::Nothing);
+        assert_eq!(act(&m, down(200, 5), false), Act::Nothing);
+        assert_eq!(act(&m, down(5, 90), false), Act::Nothing);
     }
 
     #[test]
@@ -532,13 +516,13 @@ mod tests {
             (Field::Crossfade, 22),
         ] {
             assert_eq!(
-                act(&m, down(x, 19), None),
-                Act::Press(Transport::Bar, field, None),
+                act(&m, down(x, 19), false),
+                Act::Press(field, None),
                 "{field:?} at column {x}"
             );
         }
         // the gaps between controls are still the bar, not a control.
-        assert_eq!(act(&m, down(6, 19), None), Act::Focus(Focus::BottomBar));
+        assert_eq!(act(&m, down(6, 19), false), Act::Focus(Focus::BottomBar));
     }
 
     #[test]
@@ -548,13 +532,10 @@ mod tests {
         // two: everything past them has no rect at all, so the cells
         // they would have occupied are plain bottom bar.
         bar(&mut m, &[(Field::Pause, 4, 1), (Field::Loop, 7, 1)]);
-        assert_eq!(
-            act(&m, down(4, 19), None),
-            Act::Press(Transport::Bar, Field::Pause, None)
-        );
+        assert_eq!(act(&m, down(4, 19), false), Act::Press(Field::Pause, None));
         for x in [10, 13, 16, 21] {
             assert_eq!(
-                act(&m, down(x, 19), None),
+                act(&m, down(x, 19), false),
                 Act::Focus(Focus::BottomBar),
                 "column {x} was a dropped control"
             );
@@ -568,14 +549,13 @@ mod tests {
         // element that also carries the two time readouts.
         let track = Rect::new(30, 19, 11, 1);
         m.controls = vec![Control {
-            transport: Transport::Bar,
             field: Field::Progress,
             rect: Rect::new(24, 19, 24, 1),
         }];
-        m.tracks = vec![(Transport::Bar, track)];
+        m.tracks = Some(track);
 
-        let frac = |col| match act(&m, down(col, 19), None) {
-            Act::Press(Transport::Bar, Field::Progress, Some(f)) => f,
+        let frac = |col| match act(&m, down(col, 19), false) {
+            Act::Press(Field::Progress, Some(f)) => f,
             other => panic!("column {col} gave {other:?}"),
         };
         assert_eq!(frac(30), 0.0);
@@ -587,22 +567,22 @@ mod tests {
         // (exactly what enter does) rather than a seek to an end the
         // user did not click on.
         assert_eq!(
-            act(&m, down(29, 19), None),
-            Act::Press(Transport::Bar, Field::Progress, None)
+            act(&m, down(29, 19), false),
+            Act::Press(Field::Progress, None)
         );
         assert_eq!(
-            act(&m, down(41, 19), None),
-            Act::Press(Transport::Bar, Field::Progress, None)
+            act(&m, down(41, 19), false),
+            Act::Press(Field::Progress, None)
         );
         // past the element too, and it is just the bar again.
-        assert_eq!(act(&m, down(50, 19), None), Act::Focus(Focus::BottomBar));
+        assert_eq!(act(&m, down(50, 19), false), Act::Focus(Focus::BottomBar));
     }
 
     #[test]
     fn a_drag_clamps_to_the_track_wherever_the_pointer_wandered() {
         let mut m = map();
-        m.tracks = vec![(Transport::Bar, Rect::new(30, 19, 11, 1))];
-        let at = |kind, col| act(&m, Click { kind, col, row: 3 }, Some(Transport::Bar));
+        m.tracks = Some(Rect::new(30, 19, 11, 1));
+        let at = |kind, col| act(&m, Click { kind, col, row: 3 }, true);
         assert_eq!(at(Kind::Drag, 35), Act::ScrubTo(0.5));
         // dragged off the left end, and off the right, and onto a row
         // the track is not even on: an open drag owns the pointer.
@@ -618,7 +598,7 @@ mod tests {
                     col: 35,
                     row: 3
                 },
-                None
+                false
             ),
             Act::Nothing
         );
@@ -632,9 +612,9 @@ mod tests {
             m.modal = Some(modal);
             // the sidebar, the workspace and a live bottom-bar control
             // the menu does not even paint over: all swallowed.
-            assert_eq!(act(&m, down(5, 5), None), Act::Swallowed(modal));
-            assert_eq!(act(&m, down(30, 5), None), Act::Swallowed(modal));
-            assert_eq!(act(&m, down(4, 19), None), Act::Swallowed(modal));
+            assert_eq!(act(&m, down(5, 5), false), Act::Swallowed(modal));
+            assert_eq!(act(&m, down(30, 5), false), Act::Swallowed(modal));
+            assert_eq!(act(&m, down(4, 19), false), Act::Swallowed(modal));
             assert_eq!(
                 act(
                     &m,
@@ -643,7 +623,7 @@ mod tests {
                         col: 5,
                         row: 5
                     },
-                    None
+                    false
                 ),
                 Act::Swallowed(modal)
             );
@@ -655,7 +635,7 @@ mod tests {
         let mut m = map();
         for modal in [Modal::EditingQuery, Modal::BrowseFilter] {
             m.modal = Some(modal);
-            assert_eq!(act(&m, down(30, 5), None), Act::Focus(Focus::Workspace));
+            assert_eq!(act(&m, down(30, 5), false), Act::Focus(Focus::Workspace));
         }
     }
 
@@ -675,16 +655,16 @@ mod tests {
             rows: vec![Some(0); 5],
             len: 5,
         }];
-        assert_eq!(act(&m, down(5, 1), None), Act::Edit(TextBox::Query));
-        assert_eq!(act(&m, down(40, 3), None), Act::Edit(TextBox::BrowseFilter));
+        assert_eq!(act(&m, down(5, 1), false), Act::Edit(TextBox::Query));
+        assert_eq!(act(&m, down(40, 3), false), Act::Edit(TextBox::BrowseFilter));
         // one row below the box is the list again, not the box.
         assert_eq!(
-            act(&m, down(5, 4), None),
+            act(&m, down(5, 4), false),
             Act::Select(Scrollable::SidebarResults, 0)
         );
         // and an overlay still swallows a click on a box underneath.
         m.modal = Some(Modal::Help);
-        assert_eq!(act(&m, down(5, 1), None), Act::Swallowed(Modal::Help));
+        assert_eq!(act(&m, down(5, 1), false), Act::Swallowed(Modal::Help));
     }
 
     #[test]
@@ -741,18 +721,18 @@ mod tests {
             len: 10,
         }];
         assert_eq!(
-            act(&m, down(5, 5), None),
+            act(&m, down(5, 5), false),
             Act::Select(Scrollable::SidebarResults, 7)
         );
         assert_eq!(
-            act(&m, down(5, 7), None),
+            act(&m, down(5, 7), false),
             Act::Select(Scrollable::SidebarResults, 9)
         );
         // the header row and the blank below the last result are the
         // pane, not an item: no selection moves to a row that is not
         // one.
-        assert_eq!(act(&m, down(5, 4), None), Act::Focus(Focus::Sidebar));
-        assert_eq!(act(&m, down(5, 8), None), Act::Focus(Focus::Sidebar));
+        assert_eq!(act(&m, down(5, 4), false), Act::Focus(Focus::Sidebar));
+        assert_eq!(act(&m, down(5, 8), false), Act::Focus(Focus::Sidebar));
     }
 
     /// A toast owns every cell of its own box and is painted after the
@@ -779,7 +759,7 @@ mod tests {
         ];
         for (col, row) in [(5, 4), (15, 6), (5, 1), (4, 19)] {
             assert_eq!(
-                act(&m, down(col, row), None),
+                act(&m, down(col, row), false),
                 Act::Nothing,
                 "({col},{row}) is under a toast"
             );
@@ -787,11 +767,11 @@ mod tests {
         // one row below the toast the list answers again, and one
         // column right of it.
         assert_eq!(
-            act(&m, down(5, 7), None),
+            act(&m, down(5, 7), false),
             Act::Select(Scrollable::SidebarResults, 3)
         );
         assert_eq!(
-            act(&m, down(16, 4), None),
+            act(&m, down(16, 4), false),
             Act::Select(Scrollable::SidebarResults, 0)
         );
         // the wheel still reaches the list under a toast: a notch acts
@@ -805,7 +785,7 @@ mod tests {
                     col: 5,
                     row: 4
                 },
-                None
+                false
             ),
             Act::Wheel(Scrollable::SidebarResults, true)
         );
@@ -828,7 +808,7 @@ mod tests {
                 len: 40,
             },
         ];
-        let wheel = |col, row, kind| act(&m, Click { kind, col, row }, None);
+        let wheel = |col, row, kind| act(&m, Click { kind, col, row }, false);
         assert_eq!(
             wheel(5, 5, Kind::WheelDown),
             Act::Wheel(Scrollable::SidebarResults, true)
@@ -933,7 +913,7 @@ mod tests {
                         col: 5,
                         row: 5
                     },
-                    None
+                    false
                 ),
                 Act::Nothing
             );
@@ -1013,7 +993,7 @@ mod tests {
             let mut songs_seen = 0;
             for row in 0..height {
                 let (painted, text) = song_on_row(&buf, rect, row);
-                let what = act(&m, down(rect.x + 1, rect.y + row), None);
+                let what = act(&m, down(rect.x + 1, rect.y + row), false);
                 match painted {
                     Some(i) => {
                         songs_seen += 1;
@@ -1074,7 +1054,7 @@ mod tests {
             let mut entries_seen = 0;
             for row in 0..body.height {
                 let (painted, text) = song_on_row(&buf, body, row);
-                let what = act(&m, down(body.x + 1, body.y + row), None);
+                let what = act(&m, down(body.x + 1, body.y + row), false);
                 match painted {
                     Some(i) => {
                         entries_seen += 1;
@@ -1098,20 +1078,18 @@ mod tests {
         }
     }
 
+    /// A control answers before the pane it is drawn inside, wherever
+    /// that is — the pane would otherwise claim the click for itself.
     #[test]
-    fn the_maximized_players_controls_carry_their_own_surface() {
+    fn a_control_answers_before_the_pane_it_sits_in() {
         let mut m = map();
         m.controls = vec![Control {
-            transport: Transport::Player,
             field: Field::Shuffle,
             rect: Rect::new(30, 9, 12, 1),
         }];
-        assert_eq!(
-            act(&m, down(33, 9), None),
-            Act::Press(Transport::Player, Field::Shuffle, None)
-        );
-        // one row off it is the workspace the player is drawn in.
-        assert_eq!(act(&m, down(33, 10), None), Act::Focus(Focus::Workspace));
+        assert_eq!(act(&m, down(33, 9), false), Act::Press(Field::Shuffle, None));
+        // one row off it is the workspace the control was drawn in.
+        assert_eq!(act(&m, down(33, 10), false), Act::Focus(Focus::Workspace));
     }
 }
 
