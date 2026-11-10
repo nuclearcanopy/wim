@@ -199,20 +199,23 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
         Page::Search => rows_for_items(&workspace.hits, workspace.selected, area.width),
         Page::Account => rows_for_items(&workspace.account, workspace.selected, area.width),
         Page::Files => match workspace.account_selected.as_ref() {
-            Some(item) => (
-                item.playable_files_for_display()
+            Some(item) => {
+                let files = item.playable_files_for_display();
+                let rows = files
                     .iter()
-                    .map(|(name, size, video)| {
+                    .enumerate()
+                    .map(|(i, (name, size, video))| {
+                        let marker = if i == workspace.selected { "> " } else { "  " };
                         let details = format!(
                             "[{}] · {}",
                             if *video { "video" } else { "audio" },
                             format_size(*size)
                         );
-                        fit_row("  ", name, &details, area.width, false)
+                        fit_row(marker, name, &details, area.width, i == workspace.selected)
                     })
-                    .collect(),
-                usize::MAX,
-            ),
+                    .collect();
+                (rows, workspace.selected)
+            }
             None => (Vec::new(), usize::MAX),
         },
     };
