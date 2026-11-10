@@ -2759,26 +2759,29 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 Ok(client) => client,
                 Err(_) => return op_fail("TorBox is not configured; set torbox_token_file"),
             };
-            match client.search_hits(&query) {
-                Ok(hits) => {
-                    if hits.is_empty() {
-                        return op_note("TorBox found no metadata results".to_string());
+            match client.search_library(&query) {
+                Ok(search) => {
+                    if search.matches.is_empty() {
+                        return op_note(if search.failed_services.is_empty() {
+                            "TorBox library search found no matches".to_string()
+                        } else {
+                            "TorBox library search found no matches; some services could not be listed"
+                                .to_string()
+                        });
                     }
-                    for hit in hits.iter().take(20) {
+                    for item in search.matches.iter().take(20) {
                         core.console.note(format!(
-                            "{} [{}:{}]{}",
-                            hit.title,
-                            hit.source,
-                            hit.id,
-                            hit.media_type
-                                .as_deref()
-                                .map(|kind| format!(" · {kind}"))
-                                .unwrap_or_default()
+                            "{} · {} · {} files",
+                            item.name,
+                            item.status,
+                            item.files.len()
                         ));
                     }
-                    op_note(format!("{} TorBox metadata results", hits.len()))
+                    op_note(format!("{} TorBox library results", search.matches.len()))
                 }
-                Err(_) => op_fail("TorBox search failed; check token, network, and account plan"),
+                Err(_) => {
+                    op_fail("TorBox library search failed; check token, network, and account")
+                }
             }
         }
         Op::TorBoxStatus => {

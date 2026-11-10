@@ -3595,14 +3595,8 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Enter if torbox_workspace.page == Page::Account => {
                             torbox_workspace.open_account_item();
                         }
-                        KeyCode::Char('a') if torbox_workspace.page == Page::Releases => {
-                            torbox_workspace.add_selected();
-                        }
-                        KeyCode::Backspace if torbox_workspace.page == Page::Releases => {
-                            torbox_workspace.page = Page::Search;
-                        }
                         KeyCode::Enter if torbox_workspace.page == Page::Search => {
-                            torbox_workspace.open_releases();
+                            torbox_workspace.open_hit();
                         }
                         _ => {}
                     }

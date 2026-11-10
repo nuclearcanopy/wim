@@ -118,30 +118,40 @@ fn run_torbox_op(cfg: &config::Config, op: Op) -> Result<TorBoxPayload, String> 
                 "TorBox connection failed; check token file, network/VPN access, and account".into()
             }),
         Op::TorBoxSearch(query) => client
-            .search_hits(&query)
-            .map(|hits| {
-                if hits.is_empty() {
-                    return TorBoxPayload::Lines(vec!["no TorBox metadata results".into()]);
+            .search_library(&query)
+            .map(|search| {
+                if search.matches.is_empty() {
+                    return TorBoxPayload::Lines(vec!["no TorBox library matches".into()]);
                 }
-                TorBoxPayload::Lines(
-                    hits.into_iter()
-                        .take(100)
-                        .map(|hit| {
-                            format!(
-                                "{} [{}:{}]{}",
-                                hit.title,
-                                hit.source,
-                                hit.id,
-                                hit.media_type
-                                    .map(|t| format!(" · {t}"))
-                                    .unwrap_or_default()
-                            )
-                        })
-                        .collect(),
-                )
+                let mut lines: Vec<String> = search
+                    .matches
+                    .iter()
+                    .take(100)
+                    .map(|item| {
+                        format!(
+                            "{} · {} · id={} · {} files",
+                            item.name,
+                            item.status,
+                            item.id,
+                            item.files.len()
+                        )
+                    })
+                    .collect();
+                if !search.failed_services.is_empty() {
+                    let failed: Vec<&str> = search
+                        .failed_services
+                        .iter()
+                        .map(|service| service.as_str())
+                        .collect();
+                    lines.push(format!(
+                        "note: these services could not be listed; results may be incomplete: {}",
+                        failed.join(", ")
+                    ));
+                }
+                TorBoxPayload::Lines(lines)
             })
             .map_err(|_| {
-                "TorBox search failed; check token, network/VPN access, and account".into()
+                "TorBox library search failed; check token, network/VPN access, and account".into()
             }),
         Op::TorBoxList(service) => client
             .all_account_items(service)
