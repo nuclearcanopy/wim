@@ -27,6 +27,17 @@ const ART_MIN_COLS: u16 = 14;
 /// `browse::layout`'s big-art path.
 const ART_SHARE: f32 = 0.6;
 
+/// Whether the layout reserves the cover panel, as `PlayerView`'s
+/// render decides it. The host needs the same answer to paint video
+/// frames on the rect the view reserved, and the two must not drift:
+/// a rect the view did not reserve is the title's rows, and a rect the
+/// host does not know is a frame painted nowhere. Video claims the
+/// rect in every art mode — it is not a cover, and `ArtMode::Off` is
+/// the cover-panel switch, not the video one.
+pub fn has_art(video: bool, art: bool, gap: bool, art_mode: ArtMode) -> bool {
+    video || ((art || gap) && art_mode != ArtMode::Off)
+}
+
 /// Where every piece of the now-playing screen goes. Returned by
 /// `layout` rather than decided inside `render` so the host can put a
 /// `ratatui-image` overlay on exactly the `art` rect this picked, same
@@ -131,6 +142,11 @@ pub struct PlayerView<'a> {
     /// overlay, which goes on the `PlayerLayout::art` rect this view
     /// used; same contract as `BrowseListView`.
     pub art_mode: ArtMode,
+    /// A video is playing and the host paints frames on the cover
+    /// rect after this view draws: the rect is reserved (in every art
+    /// mode) but no cover is drawn under it, because the frames land
+    /// on top anyway and a cover would be one frame of flicker.
+    pub video: bool,
     /// `Some` while a timed silence is playing, which has no cover and
     /// never will. The cover rect goes to a countdown instead of being
     /// left blank for the length of the gap; see `ui::gap`.
@@ -161,9 +177,17 @@ pub struct PlayerView<'a> {
 impl Widget for PlayerView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // a gap claims the cover rect the same way a cover does, so
-        // the layout reserves it. `ArtMode::Off` still means off: a
-        // user who turned the panel off did not ask for a big clock.
-        let has_art = (self.art.is_some() || self.gap.is_some()) && self.art_mode != ArtMode::Off;
+        // the layout reserves it. `ArtMode::Off` still means off for a
+        // cover: a user who turned the panel off did not ask for a big
+        // clock. a video claims it too, in every mode — `has_art` is
+        // the one place that rule lives, so the host painting frames
+        // reserves the same rect this view did.
+        let has_art = has_art(
+            self.video,
+            self.art.is_some(),
+            self.gap.is_some(),
+            self.art_mode,
+        );
         let Some(l) = layout(
             area,
             has_art,
@@ -177,12 +201,12 @@ impl Widget for PlayerView<'_> {
             // checked before the cover, not after: a silence has no
             // art, so the two cannot both apply, and ordering it this
             // way means a future entry kind with both still draws
-            // something deterministic. drawn in every art mode,
-            // including the `Full*` ones, because the host has no
-            // image to overlay for a gap.
+            // something deterministic. video comes next for the same
+            // reason: its frames are the host's, painted after this
+            // view, so the view draws nothing in the rect at all.
             if let Some(gap) = self.gap {
                 GapPanel { gap }.render(rect, buf);
-            } else if self.art_mode.is_ascii() {
+            } else if !self.video && self.art_mode.is_ascii() {
                 CachedArt {
                     image: self.art,
                     cell_aspect: self.cell_aspect,
@@ -278,6 +302,7 @@ mod tests {
             art,
             art_key: "a:artist\u{1}album",
             art_mode: ArtMode::AsciiBw,
+            video: false,
             gap: None,
             cell_aspect: 2.0,
             elapsed_secs: Some(30.0),
@@ -613,6 +638,63 @@ mod tests {
             });
             assert_eq!(buf.area, Rect::new(0, 0, w, h));
         }
+    }
+
+    /// Video claims the cover rect in every art mode — `ArtMode::Off`
+    /// is the cover-panel switch, not the video one — and the view
+    /// draws nothing there, because the host's frames are painted on
+    /// top after this view. The host reserves the same rect through
+    /// `has_art`, so the two cannot disagree about where the picture
+    /// goes.
+    #[test]
+    fn video_claims_the_rect_in_every_art_mode_and_draws_no_cover_under_it() {
+        let keymap = Keymap::default();
+        let cover = art();
+        for mode in [
+            ArtMode::Off,
+            ArtMode::AsciiBw,
+            ArtMode::AsciiColor,
+            ArtMode::FullBw,
+            ArtMode::FullColor,
+        ] {
+            let area = Rect::new(0, 0, 60, 24);
+            let mut v = view(&keymap, Some(&cover));
+            v.art_mode = mode;
+            v.video = true;
+            let mut buf = buffer(60, 24);
+            v.render(area, &mut buf);
+
+            let want = has_art(true, true, false, mode);
+            let got = layout(
+                area,
+                want,
+                false,
+                2.0,
+            )
+            .unwrap()
+            .art;
+            let text = grid(&buf);
+            if let Some(rect) = got {
+                // the rect the host will paint on is the one the view
+                // reserved, and the view left it empty: a cover under
+                // the frames would be one frame of flicker.
+                for y in rect.y..rect.y + rect.height {
+                    for x in rect.x..rect.x + rect.width {
+                        assert_eq!(
+                            buf.cell((x, y)).unwrap().symbol(),
+                            ".",
+                            "{mode:?}: the view drew under the video at {x},{y}"
+                        );
+                    }
+                }
+                assert!(text.contains("a song"), "{mode:?}: the title still draws");
+            } else {
+                panic!("{mode:?}: a video this size has a rect to show in");
+            }
+        }
+        // and with the cover panel off and no video, there is no rect:
+        // `Off` still means off for a cover.
+        assert!(!has_art(false, true, false, ArtMode::Off));
     }
 }
 

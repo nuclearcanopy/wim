@@ -115,11 +115,13 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// Only a local video file is video. A remote song can carry a
-    /// video stream and is still not what this question is about:
-    /// it decides whether mpv gets a drawing vo.
+    /// What counts as video: this decides whether mpv gets a drawing
+    /// vo *and* whether the workspace paints frames inline, so a
+    /// remote video file is video here and a remote song is not — a
+    /// TorBox song can carry a video stream and still must never take
+    /// the screen.
     #[test]
-    fn only_a_local_video_counts_as_video() {
+    fn local_and_remote_video_count_and_music_does_not() {
         let video = SearchItem::LocalVideo {
             path: PathBuf::from("/v/clip.mkv"),
             title: "clip".into(),
@@ -132,5 +134,30 @@ mod tests {
             artist: None,
             album: None,
         })));
+        // a remote video file: the frame source decodes its resolved
+        // url, and 'v' hands it to mpv like a local one. the client is
+        // built offline the way queues.rs's tests build it — no ping,
+        // no network, and the token is a throwaway.
+        let dir = std::env::temp_dir().join(format!("wim-vidtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token_path = dir.join("token");
+        std::fs::write(&token_path, "unit-test-token").unwrap();
+        let client = std::sync::Arc::new(
+            crate::torbox::Client::from_token_file(&token_path).unwrap(),
+        );
+        let torbox = |video: bool| SearchItem::TorBoxFile {
+            service: crate::torbox::Service::Torrent,
+            item_id: 1,
+            file_id: if video { 2 } else { 3 },
+            title: "remote file".into(),
+            video,
+            client: client.clone(),
+            resolved_url: None,
+        };
+        assert!(now_playing_is_video(&Some(torbox(true))));
+        // a remote song, even from the same account: not video.
+        assert!(!now_playing_is_video(&Some(torbox(false))));
+        std::fs::remove_file(&token_path).ok();
+        std::fs::remove_dir(&dir).ok();
     }
 }

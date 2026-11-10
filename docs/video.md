@@ -526,9 +526,12 @@ three things it does that the decision table cannot:
   `showing.is_ascii()`. ascii and a drawing vo cannot both think they
   own the screen, because there is only one answer.
 
-in the draw closure the ascii branch comes before every other one and
-returns, so the ui is never painted under the frames. notifications are
-the exception, drawn on top: an alert behind the picture is an alert
+in the draw closure the fullscreen-ascii branch comes before every
+other one and returns, so the ui is never painted under the frames;
+it is gated on `showing.is_ascii() && ascii.active()`, not `active()`
+alone, because the same frame source also runs for inline video
+(below), where the ui draws around it. notifications are the
+exception, drawn on top: an alert behind the picture is an alert
 nobody sees.
 
 the position is the `elapsed_secs` every widget already reads, so the
@@ -695,12 +698,55 @@ extension is in `library::VIDEO_EXTENSIONS`. a music track, local or
 remote, can therefore never acquire a drawing vo; audio-only playback
 never leaves `--vo=null`.
 
+## inline frames: video in the workspace
+
+a video that plays shows up where the cover art goes — the player
+view's art rect — with the sidebar, the title and the bottom bar all
+still on screen. no key pressed, no fullscreen entered: the frames
+are wim's own cells, painted by the same `FrameSource` the fullscreen
+ascii pane uses, at the grid of the rect they land on.
+
+the wiring, so the pieces cannot disagree:
+
+- **`ui::player::has_art` is the one place the "is the cover rect
+  reserved" rule lives.** `PlayerView::render` and the host's paint
+  both call it, so the rect the frames are painted on is the rect the
+  view reserved — a rect the view did not reserve would be the
+  title's rows, and a rect the host does not know is a frame painted
+  nowhere. video claims the rect in every art mode: `ArtMode::Off` is
+  the cover-panel switch, not the video one.
+- **the view draws nothing under the frames** — no cover, no gap
+  panel — because the frames land on top anyway and a cover would be
+  one frame of flicker.
+- **the rect is decided in the draw and consumed by the next
+  `update`.** the frame source's grid has to be the rect's, and the
+  rect only exists once the layout has run, so the draw stashes it
+  and the loop's `ascii.update` uses it one frame later. a resize
+  respawns at the new grid on the next pass; the first frame after a
+  video starts has no rect yet, so the source starts a frame late
+  rather than latching a refusal against a grid with no cells.
+- **`showing` stays the one decision.** fullscreen ('v', mpv's own
+  vo) and fullscreen-ascii take the screen back from inline the same
+  way they always took it from the ui: `inline_video` is false
+  whenever `video_fullscreen` is on, so `update` stops the source
+  and mpv owns the screen alone.
+- **the spectrum is music's.** a video gets the whole pane with no
+  meter rail; the player layout's meter rows stay reserved either
+  way, so a video pane has two quiet rows where the meter would be.
+- **remote urls are media.** a resolved TorBox stream url (or a
+  watch-source url) drives the frame source the same way a local
+  path does, with the two url constraints from the section above:
+  ranges, and stdin-not-argv. a `TorBoxFile` whose url never
+  resolved shows the title and nothing else.
+
 ## what is still missing for in-workspace video
 
-fullscreen is the whole scope here. compositing video into a sub-rect of
-the tui (the `main_content` pane, next to the sidebar and the bottom
-bar) does not work yet and is a separate, harder problem. what stands in
-the way:
+wim-painted inline frames are built (the section above). what is
+still missing is *mpv's pixels* composited into a sub-rect — true
+colour, real video output, at the cost of the vo owning its own
+escapes. compositing that into a sub-rect of the tui (the
+`main_content` pane, next to the sidebar and the bottom bar) does not
+work yet and is a separate, harder problem. what stands in the way:
 
 1. ~~**wim repaints every cell it owns, every frame.**~~ **this was
    wrong, and it was the item called "the real work".** the claim was

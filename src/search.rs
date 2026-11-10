@@ -38,7 +38,10 @@ impl EphemeralUrl {
         Self(url)
     }
 
-    pub(crate) fn expose(&self) -> &str {
+    /// The url itself, for the playback path only — handing media to
+    /// mpv is the one thing that needs the string. Never a log, a
+    /// debug print, or a serialized field; `Debug` redacts.
+    pub fn expose(&self) -> &str {
         &self.0
     }
 }
