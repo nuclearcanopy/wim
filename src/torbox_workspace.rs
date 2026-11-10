@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 
-use crate::torbox::{AccountItem, Client, MetadataHit, Service, TorrentRelease};
+use crate::torbox::{AccountItem, Client, LibrarySearch, Service};
 
 pub const ACCOUNT_PAGE_SIZE: usize = 100;
 
@@ -13,14 +13,12 @@ pub const ACCOUNT_PAGE_SIZE: usize = 100;
 pub enum Page {
     Setup,
     Search,
-    Releases,
     Account,
     Files,
 }
 
 enum Reply {
-    Search(u64, Result<Vec<MetadataHit>, String>),
-    Releases(u64, Result<Vec<TorrentRelease>, String>),
+    Search(u64, Result<LibrarySearch, String>),
     Added(u64, Result<String, String>),
     Account(u64, Service, Result<Vec<AccountItem>, String>),
     Controlled(u64, Result<String, String>),
@@ -35,12 +33,10 @@ pub struct Workspace {
     generation: u64,
     pub page: Page,
     pub query: String,
-    pub hits: Vec<MetadataHit>,
-    pub releases: Vec<TorrentRelease>,
+    pub hits: Vec<AccountItem>,
     pub selected: usize,
     pub loading: bool,
     pub message: Option<String>,
-    confirm_add: Option<usize>,
     pub service: Service,
     pub account: Vec<AccountItem>,
     pub account_selected: Option<AccountItem>,
@@ -70,11 +66,9 @@ impl Workspace {
             page: Page::Search,
             query: String::new(),
             hits: Vec::new(),
-            releases: Vec::new(),
             selected: 0,
             loading: false,
             message,
-            confirm_add: None,
             service: Service::Torrent,
             account: Vec::new(),
             account_selected: None,
@@ -101,29 +95,23 @@ impl Workspace {
                     self.loading = false;
                     self.page = Page::Search;
                     match result {
-                        Ok(hits) => {
-                            self.hits = hits;
+                        Ok(search) => {
+                            self.hits = search.matches;
                             self.selected = 0;
                             self.message = if self.hits.is_empty() {
-                                Some("no metadata results".into())
+                                Some(if search.failed_services.is_empty() {
+                                    "no library matches".into()
+                                } else {
+                                    "no library matches; some TorBox services could not be listed"
+                                        .into()
+                                })
                             } else {
-                                None
-                            };
-                        }
-                        Err(error) => self.message = Some(error),
-                    }
-                }
-                Reply::Releases(generation, result) if generation == self.generation => {
-                    self.loading = false;
-                    self.page = Page::Releases;
-                    match result {
-                        Ok(releases) => {
-                            self.releases = releases;
-                            self.selected = 0;
-                            self.message = if self.releases.is_empty() {
-                                Some("no torrent releases found".into())
-                            } else {
-                                None
+                                search.failed_services.first().map(|service| {
+                                    format!(
+                                        "note: the {} list failed; results may be incomplete",
+                                        service.as_str()
+                                    )
+                                })
                             };
                         }
                         Err(error) => self.message = Some(error),
@@ -131,7 +119,6 @@ impl Workspace {
                 }
                 Reply::Added(generation, result) if generation == self.generation => {
                     self.loading = false;
-                    self.confirm_add = None;
                     self.message = Some(match result {
                         Ok(message) => message,
                         Err(error) => error,
@@ -188,7 +175,6 @@ impl Workspace {
         match self.page {
             Page::Setup => 0,
             Page::Search => self.hits.len(),
-            Page::Releases => self.releases.len(),
             Page::Account => self.account.len(),
             Page::Files => match (&self.account_selected, &self.client) {
                 (Some(item), Some(client)) => item.playable_items(client.clone()).len(),
@@ -202,14 +188,14 @@ impl Workspace {
         if len > 0 {
             self.selected = (self.selected as isize + delta).clamp(0, len as isize - 1) as usize;
         }
-        self.confirm_add = None;
         self.confirm_delete = None;
     }
 
     pub fn search(&mut self) {
         let query = self.query.trim().to_owned();
         if query.is_empty() {
-            self.message = Some("type a title, then press enter to search TorBox".into());
+            self.message =
+                Some("type a title, then press enter to search your TorBox library".into());
             return;
         }
         let Some(client) = self.client.clone() else {
@@ -220,11 +206,11 @@ impl Workspace {
         self.search_editing = false;
         let (generation, tx) = (self.generation, self.tx.clone());
         self.loading = true;
-        self.message = Some(format!("searching TorBox for {query:?}…"));
+        self.message = Some(format!("searching your TorBox library for {query:?}…"));
         thread::spawn(move || {
             let result = client
-                .search_hits(&query)
-                .map_err(|error| format!("TorBox metadata search failed: {error:#}"));
+                .search_library(&query)
+                .map_err(|error| format!("TorBox library search failed: {error:#}"));
             let _ = tx.send(Reply::Search(generation, result));
         });
     }
@@ -254,7 +240,6 @@ impl Workspace {
         self.loading = true;
         self.service = service;
         self.confirm_delete = None;
-        self.confirm_add = None;
         self.message = Some(format!("loading TorBox {} account…", service.as_str()));
         thread::spawn(move || {
             let result = client
@@ -417,56 +402,24 @@ impl Workspace {
         });
     }
 
-    pub fn open_releases(&mut self) {
-        let Some(hit) = self.hits.get(self.selected).cloned() else {
+    /// Open the selected library hit's playable files. This never starts
+    /// playback by itself and never adds anything to the account: the item
+    /// is already in the user's TorBox library.
+    pub fn open_hit(&mut self) {
+        let Some(item) = self.hits.get(self.selected).cloned() else {
             return;
         };
-        let Some(client) = self.client.clone() else {
-            return;
-        };
-        self.generation = self.generation.wrapping_add(1);
-        let (generation, tx) = (self.generation, self.tx.clone());
-        self.loading = true;
-        self.message = Some(format!("finding torrent sources for {}…", hit.title));
-        thread::spawn(move || {
-            let result = client
-                .releases_for_metadata(&hit.source, &hit.id)
-                .map_err(|_| "TorBox could not load torrent sources".to_string());
-            let _ = tx.send(Reply::Releases(generation, result));
-        });
-    }
-
-    /// First press on an uncached result arms confirmation; the next press
-    /// submits it. Cached results still require an intentional add keypress.
-    pub fn add_selected(&mut self) {
-        let Some(release) = self.releases.get(self.selected).cloned() else {
-            return;
-        };
-        let Some(magnet) = release.magnet.clone() else {
-            self.message = Some("this release has no magnet link".into());
-            return;
-        };
-        if release.cached == Some(false) && self.confirm_add != Some(self.selected) {
-            self.confirm_add = Some(self.selected);
-            self.message =
-                Some("uncached item may use account capacity; press 'a' again to add".into());
+        if item.playable_files_for_display().is_empty() {
+            self.message = Some(format!(
+                "'{}' has no playable files (status: {})",
+                item.name, item.status
+            ));
             return;
         }
-        let Some(client) = self.client.clone() else {
-            return;
-        };
-        self.generation = self.generation.wrapping_add(1);
-        let (generation, tx) = (self.generation, self.tx.clone());
-        self.loading = true;
-        self.message = Some(format!("adding {} to TorBox…", release.name));
-        thread::spawn(move || {
-            let result = client
-                .add_magnet(&magnet)
-                .and_then(|response| response.ensure_success())
-                .map(|_| "added to TorBox; refresh the account list to see its files".to_string())
-                .map_err(|_| "TorBox could not add this magnet; check account limits".to_string());
-            let _ = tx.send(Reply::Added(generation, result));
-        });
+        self.account_selected = Some(item);
+        self.page = Page::Files;
+        self.selected = 0;
+        self.message = None;
     }
 }
 
@@ -530,6 +483,93 @@ mod tests {
             .unwrap()
             .contains("press d again"));
         assert!(!workspace.loading);
+        std::fs::remove_file(token_path).ok();
+    }
+
+    fn temp_workspace() -> (Workspace, std::path::PathBuf) {
+        let token_path = std::env::temp_dir().join(format!(
+            "wim-tbx-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::write(&token_path, "test").unwrap();
+        (
+            Workspace::new(Ok(Client::from_token_file(&token_path).unwrap())),
+            token_path,
+        )
+    }
+
+    #[test]
+    fn enter_on_a_library_hit_opens_its_files_without_adding_anything() {
+        let (mut workspace, token_path) = temp_workspace();
+        workspace.hits = vec![
+            AccountItem {
+                service: Service::Torrent,
+                id: 1,
+                name: "first".into(),
+                status: "cached".into(),
+                progress: None,
+                files: vec![],
+            },
+            AccountItem {
+                service: Service::Torrent,
+                id: 2,
+                name: "Silo.S03".into(),
+                status: "cached".into(),
+                progress: Some(1.0),
+                files: vec![
+                    AccountFile {
+                        id: 0,
+                        name: "readme.txt".into(),
+                        size: 5,
+                    },
+                    AccountFile {
+                        id: 4,
+                        name: "Silo.S03E01.mkv".into(),
+                        size: 4000,
+                    },
+                ],
+            },
+        ];
+        workspace.selected = 1;
+        workspace.open_hit();
+        assert_eq!(workspace.page, Page::Files);
+        assert!(workspace.message.is_none());
+        assert_eq!(workspace.account_selected.as_ref().unwrap().id, 2);
+        // The playable selection is exactly the selected hit's file.
+        let playable = workspace.selected_playable().unwrap();
+        assert!(matches!(
+            playable,
+            crate::search::SearchItem::TorBoxFile {
+                item_id: 2,
+                file_id: 4,
+                ..
+            }
+        ));
+        std::fs::remove_file(token_path).ok();
+    }
+
+    #[test]
+    fn enter_on_a_hit_without_playable_files_explains_itself() {
+        let (mut workspace, token_path) = temp_workspace();
+        workspace.hits = vec![AccountItem {
+            service: Service::Torrent,
+            id: 3,
+            name: "still-downloading".into(),
+            status: "downloading".into(),
+            progress: Some(0.4),
+            files: vec![AccountFile {
+                id: 0,
+                name: "partial.part".into(),
+                size: 10,
+            }],
+        }];
+        workspace.selected = 0;
+        workspace.open_hit();
+        assert_eq!(workspace.page, Page::Search);
+        let message = workspace.message.as_deref().unwrap();
+        assert!(message.contains("no playable files"), "{message}");
+        assert!(message.contains("downloading"), "{message}");
         std::fs::remove_file(token_path).ok();
     }
 }
