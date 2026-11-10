@@ -69,6 +69,44 @@ overlap but ripples badly between centers; with all ten bands at +6 dB,
 `width=0.7` measured +4.2 to +7.8 dB and `width=0.5` measured +2.6 to
 +6.9 dB, against +4.7 to +6.4 dB for the compensated 1-octave chain.
 
+## the player spectrum taps the audio without coloring it
+
+The maximized player's visualizer uses a parallel log-frequency filter
+bank (30 Hz–18 kHz). The dry stereo signal is split into a dry branch
+and one downmixed bandpass branch per visible bar; `astats` measures
+each mono branch, then `pan` sends only the original dry pair to mpv's
+output. The band count is configurable from 4 to 32 (10 by default). Analysis
+metadata is pushed over mpv IPC; it is not polled once per rendered
+frame. A 1 kHz stereo sine was strongest in band 6, 100 Hz in band 2,
+and 10 kHz in band 10. Captured PCM from the 10-band filter graph
+matched the dry 48 kHz stereo sine exactly (0 sample delta).
+
+`astats` is explicitly restricted to per-channel RMS with aggregate
+measurements disabled. The UI consumes no other `astats` fields; computing
+all default statistics for all 30+ analysis channels needlessly made the
+filter graph CPU-bound. With mpv 0.41 and `--untimed`, a generated pink-noise
+source took 3.63 s / 3.60 CPU s to process 2 s at 30 bands and 4.04 s / 4.11
+CPU s at 32 bands with default statistics. RMS-only took 2.10 s / 0.39 CPU s
+and 2.10 s / 0.42 CPU s respectively (about 89–90% less CPU); the dry 2 s
+baseline was 2.07 s / 0.15 CPU s. These are local single-run measurements,
+not a cross-machine performance guarantee.
+
+The analysis signal is downmixed to mono once, before it is split into
+bandpass branches, rather than running a separate stereo-to-mono `pan`
+filter in every branch. Three interleaved runs at 30 bands reduced median
+mpv CPU time from 0.664 s to 0.638 s per 2 s of pink noise; at 32 bands it
+fell from 0.681 s to 0.648 s. The PCM output remains on its separate dry
+stereo branch. `Playback::spectrum` also borrows its fixed-size level
+array instead of allocating a new vector on every UI frame.
+
+The resulting measurements are smoothed with time-based attack/release
+in the UI. Paused, stale, or missing metadata targets silence, so the
+visualizer settles rather than inventing a fallback animation.
+
+The equalizer can be bypassed in settings without discarding the chosen
+curve. The analysis bank stays active either way and the audible branch
+keeps the same dry-path contract.
+
 ## the stream wim asked for was not pinned
 
 `stream_url` used to send `/rest/stream?id=...&c=wim` with no `format`

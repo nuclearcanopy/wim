@@ -63,6 +63,8 @@ module is exposed as `homeManagerModules.default`:
         passwordFile = config.age.secrets.navidrome-password.path; # or any path
       }
     ];
+    # Separate TorBox workspace; token file can be an agenix secret path.
+    torboxTokenFile = config.age.secrets.torbox-token.path;
     albumArt = "auto"; # auto | ascii-bw | ascii-color | full-bw | full-color | off
     libraryPaths = [ ]; # defaults to ~/Music, ~/Videos when empty
   };
@@ -107,6 +109,13 @@ runtime, which also switches to fullscreen.
 means the file's own rate. it only ever lowers it, since asking for
 more frames than the file has just makes mpv duplicate them. a large
 cell grid on a slow machine is the case for halving it.
+
+The maximized player shows a smoothed, logarithmic frequency visualizer
+as a right-edge rail with one terminal column per band;
+`visualizer_bands` defaults to 10 and can be set from 4 to 32. In the
+settings menu (`u`), `h`/`l` adjusts the band count and toggles the
+equalizer off/on. EQ is enabled by default with the flat preset; turning
+it off preserves the selected curve for when it is enabled again.
 
 ## keybindings
 

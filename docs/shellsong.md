@@ -11,7 +11,15 @@ screen; you type calls into it.
 : moveto(1m20s)
 : view(q, bladee)
 : view(queue)
+: torbox_search(Foundation)
+: torbox_list(torrent)
+: torbox_play(torrent, 12345, 7)
 ```
+
+TorBox commands use the separately configured TorBox token file. They do
+not affect ordinary `search(...)`: `torbox_search(...)` queries online
+metadata. `torbox_add(...)` and `torbox_control(..., delete)` make explicit
+changes to the remote account. See `docs/torbox.md` for all operations.
 
 implemented in `src/shellsong.rs` (language and completion, pure) and
 `src/ui/shellsong.rs` (the overlay, pure render).
