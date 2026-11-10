@@ -308,7 +308,7 @@ mod tests {
             first.starts_with('\u{250c}') && first.ends_with('\u{2510}'),
             "no frame:\n{g}"
         );
-        assert!(g.contains("step 3 of 6"), "no rail:\n{g}");
+        assert!(g.contains("step 3 of 8"), "no rail:\n{g}");
         assert!(g.contains("navidrome setup"), "content gone:\n{g}");
         assert!(g.contains("username: ana"), "fields gone:\n{g}");
     }

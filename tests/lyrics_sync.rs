@@ -12,6 +12,7 @@ fn first_run_setup_includes_lyrics_before_library_paths() {
     for expected in [
         Step::Controls,
         Step::Navidrome,
+        Step::TorBox,
         Step::ListenBrainz,
         Step::Lyrics,
         Step::LibraryPaths,

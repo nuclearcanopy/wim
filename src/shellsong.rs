@@ -87,6 +87,9 @@ impl Kind {
     pub fn of(item: &SearchItem) -> Kind {
         match item {
             SearchItem::LocalMusic { .. } | SearchItem::Song { .. } => Kind::Song,
+            SearchItem::TorBoxFile { video: false, .. } => Kind::Song,
+            SearchItem::TorBoxFile { video: true, .. } => Kind::Video,
+            SearchItem::WatchSource { .. } => Kind::Video,
             SearchItem::Album { .. } => Kind::Album,
             SearchItem::Artist { .. } => Kind::Artist,
             SearchItem::Playlist { .. } => Kind::Playlist,
@@ -459,6 +462,15 @@ fn view_target(word: &str) -> Option<ViewTarget> {
     VIEW_NAMES.iter().find(|v| v.word == word).map(|v| v.target)
 }
 
+fn torbox_service(word: &str) -> Option<crate::torbox::Service> {
+    match word {
+        "torrent" => Some(crate::torbox::Service::Torrent),
+        "usenet" => Some(crate::torbox::Service::Usenet),
+        "web" => Some(crate::torbox::Service::WebDownload),
+        _ => None,
+    }
+}
+
 fn view_name(target: ViewTarget) -> &'static str {
     VIEW_NAMES
         .iter()
@@ -503,6 +515,28 @@ pub enum Op {
     ToggleCrossfade,
     /// replace the query and re-filter, exactly as typing it would.
     Search(String),
+    TorBoxSearch(String),
+    TorBoxStatus,
+    TorBoxList(crate::torbox::Service),
+    TorBoxAdd {
+        service: crate::torbox::Service,
+        link: String,
+    },
+    TorBoxPlay {
+        service: crate::torbox::Service,
+        id: u64,
+        file_id: u64,
+    },
+    TorBoxQueue {
+        service: crate::torbox::Service,
+        id: u64,
+        file_id: u64,
+    },
+    TorBoxControl {
+        service: crate::torbox::Service,
+        id: u64,
+        operation: String,
+    },
     MoveSelection(i32),
     SelectTop,
     SelectBottom,
@@ -619,6 +653,13 @@ impl Op {
             Op::SetEqPreset(name) => format!("eq: {name}"),
             Op::ToggleCrossfade => "crossfade toggled".into(),
             Op::Search(q) => format!("search: {q}"),
+            Op::TorBoxSearch(q) => format!("TorBox search: {q}"),
+            Op::TorBoxStatus => "checking TorBox connection".into(),
+            Op::TorBoxList(service) => format!("TorBox {} account", service.as_str()),
+            Op::TorBoxAdd { service, .. } => format!("add {} link to TorBox", service.as_str()),
+            Op::TorBoxPlay { id, file_id, .. } => format!("play TorBox file {id}/{file_id}"),
+            Op::TorBoxQueue { id, file_id, .. } => format!("queue TorBox file {id}/{file_id}"),
+            Op::TorBoxControl { id, operation, .. } => format!("TorBox {operation} item {id}"),
             Op::MoveSelection(d) if *d < 0 => "up".into(),
             Op::MoveSelection(_) => "down".into(),
             Op::SelectTop => "top".into(),
@@ -775,6 +816,8 @@ pub enum Words {
     Setting,
     /// how a local video is drawn, i.e. `config.video_output`.
     VideoMode,
+    TorBoxService,
+    TorBoxOperation,
 }
 
 impl Words {
@@ -804,6 +847,8 @@ impl Words {
             // the same five `config.video_output` takes, spelled the
             // way config.toml spells them.
             Words::VideoMode => &["auto", "tct", "kitty", "ascii", "off"],
+            Words::TorBoxService => &["torrent", "usenet", "web"],
+            Words::TorBoxOperation => &["pause", "resume", "reannounce", "delete"],
         }
     }
 
@@ -1127,6 +1172,70 @@ pub const COMMANDS: &[Command] = &[
         &[req("query", Ty::Query)],
         &[],
         "run a search and leave the results up",
+    ),
+    cmd(
+        "torbox_search",
+        &[],
+        &[req("query", Ty::Query)],
+        &[],
+        "search TorBox metadata separately from local search",
+    ),
+    cmd(
+        "torbox_status",
+        &[],
+        NONE,
+        &[],
+        "test TorBox token-file connectivity without showing the token",
+    ),
+    cmd(
+        "torbox_list",
+        &[],
+        &[req("service", Ty::Words(Words::TorBoxService))],
+        &[],
+        "list TorBox account items",
+    ),
+    cmd(
+        "torbox_add",
+        &[],
+        &[
+            req("service", Ty::Words(Words::TorBoxService)),
+            req("link", Ty::Query),
+        ],
+        &[],
+        "add a TorBox magnet, NZB link, or web download",
+    ),
+    cmd(
+        "torbox_play",
+        &[],
+        &[
+            req("service", Ty::Words(Words::TorBoxService)),
+            req("id", Ty::Query),
+            req("file_id", Ty::Query),
+        ],
+        &[],
+        "play a file in a TorBox account item",
+    ),
+    cmd(
+        "torbox_queue",
+        &[],
+        &[
+            req("service", Ty::Words(Words::TorBoxService)),
+            req("id", Ty::Query),
+            req("file_id", Ty::Query),
+        ],
+        &[],
+        "queue a TorBox account file by stable IDs",
+    ),
+    cmd(
+        "torbox_control",
+        &[],
+        &[
+            req("service", Ty::Words(Words::TorBoxService)),
+            req("id", Ty::Query),
+            req("operation", Ty::Words(Words::TorBoxOperation)),
+        ],
+        &[],
+        "pause, resume, or explicitly delete a TorBox item",
     ),
     cmd(
         "play",
@@ -2638,6 +2747,61 @@ impl Call {
                 Some(Arg::Name(q)) => Op::Search(q.clone()),
                 _ => return None,
             },
+            "torbox_search" => match first {
+                Some(Arg::Name(query)) => Op::TorBoxSearch(query.clone()),
+                _ => return None,
+            },
+            "torbox_status" => Op::TorBoxStatus,
+            "torbox_list" => Op::TorBoxList(torbox_service(self.keyword(Words::TorBoxService)?)?),
+            "torbox_add" => {
+                let service = torbox_service(self.keyword(Words::TorBoxService)?)?;
+                let Some(Arg::Name(link)) = self.args.get(1) else {
+                    return None;
+                };
+                Op::TorBoxAdd {
+                    service,
+                    link: link.clone(),
+                }
+            }
+            "torbox_play" => {
+                let service = torbox_service(self.keyword(Words::TorBoxService)?)?;
+                let (Some(Arg::Name(id)), Some(Arg::Name(file_id))) =
+                    (self.args.get(1), self.args.get(2))
+                else {
+                    return None;
+                };
+                Op::TorBoxPlay {
+                    service,
+                    id: id.parse().ok()?,
+                    file_id: file_id.parse().ok()?,
+                }
+            }
+            "torbox_queue" => {
+                let service = torbox_service(self.keyword(Words::TorBoxService)?)?;
+                let (Some(Arg::Name(id)), Some(Arg::Name(file_id))) =
+                    (self.args.get(1), self.args.get(2))
+                else {
+                    return None;
+                };
+                Op::TorBoxQueue {
+                    service,
+                    id: id.parse().ok()?,
+                    file_id: file_id.parse().ok()?,
+                }
+            }
+            "torbox_control" => {
+                let service = torbox_service(self.keyword(Words::TorBoxService)?)?;
+                let (Some(Arg::Name(id)), Some(Arg::Word(operation))) =
+                    (self.args.get(1), self.args.get(2))
+                else {
+                    return None;
+                };
+                Op::TorBoxControl {
+                    service,
+                    id: id.parse().ok()?,
+                    operation: (*operation).to_string(),
+                }
+            }
             "clear" => Op::ClearConsole,
             "clear_queue" => Op::ClearQueue,
             "remove" => match first {
@@ -4769,6 +4933,50 @@ mod tests {
         drive(input, vec![Kind::Song]).0
     }
 
+    #[test]
+    fn torbox_commands_parse_with_explicit_service_and_account_ids() {
+        assert_eq!(ops("torbox_status()"), vec![Op::TorBoxStatus]);
+        assert_eq!(
+            ops("torbox_search(Foundation)"),
+            vec![Op::TorBoxSearch("Foundation".into())]
+        );
+        assert_eq!(
+            ops("torbox_list(usenet)"),
+            vec![Op::TorBoxList(crate::torbox::Service::Usenet)]
+        );
+        assert_eq!(
+            ops("torbox_play(web,12345,7)"),
+            vec![Op::TorBoxPlay {
+                service: crate::torbox::Service::WebDownload,
+                id: 12345,
+                file_id: 7,
+            }]
+        );
+        assert_eq!(
+            ops("torbox_queue(web,12345,7)"),
+            vec![Op::TorBoxQueue {
+                service: crate::torbox::Service::WebDownload,
+                id: 12345,
+                file_id: 7,
+            }]
+        );
+        assert_eq!(
+            ops("torbox_control(torrent,12345,delete)"),
+            vec![Op::TorBoxControl {
+                service: crate::torbox::Service::Torrent,
+                id: 12345,
+                operation: "delete".into(),
+            }]
+        );
+        assert_eq!(
+            ops("torbox_add(torrent,magnet:?xt=urn:btih:abc)"),
+            vec![Op::TorBoxAdd {
+                service: crate::torbox::Service::Torrent,
+                link: "magnet:?xt=urn:btih:abc".into(),
+            }]
+        );
+    }
+
     fn notes(input: &str) -> Vec<String> {
         drive(input, vec![Kind::Song]).1
     }
@@ -5351,7 +5559,12 @@ mod tests {
             .params
             .iter()
             .filter(|p| p.required)
-            .map(|p| sample_arg(p.ty))
+            .map(|p| match (c.name, p.name) {
+                ("torbox_play" | "torbox_queue" | "torbox_control", "id" | "file_id") => {
+                    "12345".into()
+                }
+                _ => sample_arg(p.ty),
+            })
             .collect();
         format!("{}({})", c.name, args.join(", "))
     }
@@ -7194,7 +7407,7 @@ mod tests {
             let pieces = 1 + (rng.next() % 12) as usize;
             let mut line = String::new();
             for _ in 0..pieces {
-                line.push_str(rng.pick(FRAGMENTS));
+                line.push_str(rng.pick::<&str>(FRAGMENTS));
             }
             if Program::parse(&line).is_ok() {
                 parsed += 1;
@@ -7289,6 +7502,8 @@ mod tests {
             Ty::Words(Words::FadeDir),
             Ty::Words(Words::Tier),
             Ty::Words(Words::Setting),
+            Ty::Words(Words::TorBoxService),
+            Ty::Words(Words::TorBoxOperation),
         ];
         for ty in &every {
             match ty.completes() {
@@ -8828,6 +9043,13 @@ queue(morning)
                 "tempo",
                 "toggle",
                 "top",
+                "torbox_add",
+                "torbox_control",
+                "torbox_list",
+                "torbox_play",
+                "torbox_queue",
+                "torbox_search",
+                "torbox_status",
                 "undo",
                 "unfav",
                 "unfavorite",
@@ -9056,6 +9278,13 @@ queue(morning)
                 "tempo",
                 "toggle",
                 "top",
+                "torbox_add",
+                "torbox_control",
+                "torbox_list",
+                "torbox_play",
+                "torbox_queue",
+                "torbox_search",
+                "torbox_status",
                 "undo",
                 "unfav",
                 "unfavorite",
@@ -9378,6 +9607,13 @@ queue(morning)
                 "tempo",
                 "toggle",
                 "top",
+                "torbox_add",
+                "torbox_control",
+                "torbox_list",
+                "torbox_play",
+                "torbox_queue",
+                "torbox_search",
+                "torbox_status",
                 "undo",
                 "unfav",
                 "unfavorite",

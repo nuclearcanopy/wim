@@ -179,6 +179,8 @@ fn is_starred(track: &SearchItem, favorites: &Favorites, remote_starred: &HashSe
         | SearchItem::Artist { .. }
         | SearchItem::Album { .. }
         | SearchItem::Playlist { .. } => false,
+        SearchItem::TorBoxFile { .. } => false,
+        SearchItem::WatchSource { .. } => false,
     }
 }
 

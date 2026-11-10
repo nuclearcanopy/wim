@@ -1,144 +1,147 @@
+use std::time::Duration;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
 use crate::theme::shade;
 
-/// Height-varying unicode blocks, one column per history sample
-/// (newest on the right), reading as a scrolling level meter even
-/// though it's driven by a single overall value per frame rather than
-/// a true per-frequency-band spectrum (see `main.rs::audio_level`).
-pub struct LevelMeter<'a> {
-    pub history: &'a [f32],
+const ATTACK: f32 = 0.055;
+const RELEASE: f32 = 0.24;
+const BAR_HEIGHT: u16 = 8;
+const BAR_GLYPH: char = '▏';
+
+/// Time-based attack/release envelope. The alpha is derived from elapsed
+/// time so the animation has the same feel at 30 Hz and 144 Hz.
+#[derive(Default)]
+pub struct SpectrumSmoother {
+    levels: Vec<f32>,
+    last_update: Option<Duration>,
 }
 
-const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+impl SpectrumSmoother {
+    pub fn update(&mut self, target: Option<&[f32]>, bands: usize, now: Duration) -> &[f32] {
+        self.levels.resize(bands.clamp(4, 32), 0.0);
+        let dt = self
+            .last_update
+            .map_or(0.0, |last| now.saturating_sub(last).as_secs_f32().min(0.25));
+        self.last_update = Some(now);
+        for (i, level) in self.levels.iter_mut().enumerate() {
+            let want = target
+                .and_then(|v| v.get(i))
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let tau = if want > *level { ATTACK } else { RELEASE };
+            let alpha = 1.0 - (-dt / tau).exp();
+            *level += (want - *level) * alpha;
+        }
+        &self.levels
+    }
+}
 
-impl Widget for LevelMeter<'_> {
+/// Compact vertical spectrum bars. The thin glyph leaves visual space
+/// between adjacent bands while each band still owns one cell column.
+pub struct SpectrumMeter<'a> {
+    pub levels: &'a [f32],
+}
+
+/// Reserve a one-cell-per-band strip at the player's right edge without
+/// letting it consume more than half the pane on narrow terminals.
+pub fn player_spectrum_layout(area: Rect, bands: usize) -> (Rect, Rect) {
+    let strip_width = (bands.min(32) as u16).min(area.width / 2);
+    let content = Rect {
+        width: area.width - strip_width,
+        ..area
+    };
+    let strip_height = area.height.min(BAR_HEIGHT);
+    let spectrum = Rect {
+        x: content.x + content.width,
+        y: area.y + area.height - strip_height,
+        width: strip_width,
+        height: strip_height,
+    };
+    (content, spectrum)
+}
+
+impl Widget for SpectrumMeter<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 || area.width == 0 {
+        if area.width == 0 || area.height == 0 || self.levels.is_empty() {
             return;
         }
-        let y = area.y + area.height / 2;
-        let cols = area.width as usize;
-        let start = self.history.len().saturating_sub(cols);
-        for (col, &level) in self.history[start..].iter().enumerate() {
-            let x = area.x + col as u16;
-            let glyph_idx = ((level.clamp(0.0, 1.0) * (GLYPHS.len() - 1) as f32).round()) as usize;
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_char(GLYPHS[glyph_idx]);
-                cell.set_fg(shade(0.3 + level * 0.5));
+        let columns = (area.width as usize).min(self.levels.len());
+        let rows = area.height as usize;
+        for col in 0..columns {
+            let band = if columns == self.levels.len() {
+                col
+            } else {
+                col * (self.levels.len() - 1) / columns.saturating_sub(1).max(1)
+            };
+            let level = self.levels[band].clamp(0.0, 1.0);
+            let steps = (level * rows as f32).round() as usize;
+            for row in 0..rows {
+                let from_bottom = rows - row - 1;
+                if let Some(cell) = buf.cell_mut((area.x + col as u16, area.y + row as u16)) {
+                    if steps > from_bottom {
+                        cell.set_char(BAR_GLYPH);
+                        cell.set_fg(shade(0.25 + 0.65 * level));
+                    } else {
+                        cell.set_char(' ');
+                    }
+                }
             }
         }
     }
 }
 
-/// What the meter costs per frame, which is the question worth having
-/// an answer to for a widget that repaints continuously: one cell per
-/// visible column, no allocation, and nothing carried between frames.
-///
-/// A measurement, not an assertion: the numbers move with the box and
-/// a ceiling here would be a flake. Run it with
-/// `cargo test --release --lib ui::visualizer::frame_budget -- --ignored --nocapture`;
-/// the dev profile is `opt-level = 0` and reads several times the
-/// shipping cost, which is why the build is printed first.
 #[cfg(test)]
-mod frame_budget {
+mod tests {
     use super::*;
-    use std::time::Instant;
+    use crate::ui::testbuf::{buffer, grid};
 
-    /// Alternating batches in one process, best of each; sequential
-    /// runs on this box differ 1.6-1.8x under load. Same harness as
-    /// `framesource::frame_budget`.
-    fn best_each(
-        rounds: usize,
-        iters: usize,
-        a: &mut dyn FnMut(),
-        b: &mut dyn FnMut(),
-    ) -> (f64, f64) {
-        let mut best = (f64::MAX, f64::MAX);
-        let time = |f: &mut dyn FnMut()| {
-            let at = Instant::now();
-            for _ in 0..iters {
-                f();
-            }
-            at.elapsed().as_secs_f64() * 1e6 / iters as f64
-        };
-        for _ in 0..rounds {
-            best.0 = best.0.min(time(a));
-            best.1 = best.1.min(time(b));
+    #[test]
+    fn attack_and_release_are_time_based_and_silence_decays_to_zero() {
+        let mut a = SpectrumSmoother::default();
+        let mut b = SpectrumSmoother::default();
+        a.update(None, 10, Duration::ZERO);
+        b.update(None, 10, Duration::ZERO);
+        let high = [1.0; 10];
+        let va = a.update(Some(&high), 10, Duration::from_millis(50))[0];
+        let mut vb = 0.0;
+        for ms in (10..=50).step_by(10) {
+            vb = b.update(Some(&high), 10, Duration::from_millis(ms))[0];
         }
-        best
-    }
-
-    /// Levels that actually differ per column: a flat history would
-    /// make the one candidate optimization below (reusing the last
-    /// column's `Color`) look free when real audio never is.
-    fn history(n: usize) -> Vec<f32> {
-        (0..n)
-            .map(|i| ((i as f32 * 0.37).sin() * 0.5 + 0.5).clamp(0.0, 1.0))
-            .collect()
+        assert!((va - vb).abs() < 1e-6);
+        assert!(va > 0.5);
+        for ms in (100..=5000).step_by(50) {
+            a.update(None, 10, Duration::from_millis(ms));
+        }
+        assert!(a.update(None, 10, Duration::from_millis(5050))[0] < 0.001);
     }
 
     #[test]
-    #[ignore = "a measurement; run it explicitly"]
-    fn what_the_level_meter_costs_per_frame() {
-        // 144hz is `anim::MAX_HZ`, the fastest the poll loop redraws,
-        // so it is the tightest deadline this widget has.
-        let budget = 1e6 / crate::anim::MAX_HZ as f64;
-        println!(
-            "--- level meter, budget {budget:.0}us at {}hz, {} build",
-            crate::anim::MAX_HZ,
-            if cfg!(debug_assertions) {
-                "DEBUG (not the shipping cost; re-run with --release)"
-            } else {
-                "release"
-            }
-        );
-        // the pair is a bottom-bar-sized meter against a full-width
-        // one, which is what says the cost is per visible column and
-        // not per history sample: the history is the same length for
-        // both, and only the rect differs.
-        let samples = history(400);
-        for (narrow, wide) in [(24u16, 120u16), (40, 320)] {
-            let mut small = crate::ui::testbuf::buffer(wide, 3);
-            let mut large = crate::ui::testbuf::buffer(wide, 3);
-            let mut thin = || {
-                LevelMeter { history: &samples }.render(Rect::new(0, 0, narrow, 3), &mut small);
-            };
-            let mut full = || {
-                LevelMeter { history: &samples }.render(Rect::new(0, 0, wide, 3), &mut large);
-            };
-            let (a, b) = best_each(5, 2000, &mut thin, &mut full);
-            println!(
-                "  {narrow:>3} cols {a:>6.3}us ({:>5.3}% of budget)   {wide:>3} cols {b:>6.3}us ({:>5.3}%)   {:.1}x for {:.1}x the columns",
-                a / budget * 100.0,
-                b / budget * 100.0,
-                b / a,
-                f64::from(wide) / f64::from(narrow),
-            );
-            // the floor, so this is a test and not just a printer: a
-            // meter that painted nothing would measure beautifully.
-            // `testbuf::buffer` fills with '.', so an unpainted
-            // column still reads as one.
-            let row = 3 / 2;
-            for (label, buf, cols) in [("narrow", &small, narrow), ("wide", &large, wide)] {
-                for x in 0..cols {
-                    let ch = crate::ui::testbuf::char_at(buf, x, row);
-                    assert!(
-                        GLYPHS.contains(&ch),
-                        "{label} meter drew {ch:?} in column {x} of {cols}"
-                    );
-                }
-            }
-            // and the narrow one stayed inside its own rect.
-            for x in narrow..wide {
-                assert_eq!(
-                    crate::ui::testbuf::char_at(&small, x, row),
-                    '.',
-                    "a {narrow}-column meter painted column {x}"
-                );
-            }
-        }
+    fn meter_draws_one_vertical_cell_column_per_band() {
+        let levels = [0.0, 0.5, 1.0, 0.0];
+        let mut buf = buffer(6, 5);
+        SpectrumMeter { levels: &levels }.render(Rect::new(1, 0, 4, 5), &mut buf);
+        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), ".");
+        assert_eq!(buf.cell((5, 4)).unwrap().symbol(), ".");
+        assert_eq!(buf.cell((1, 4)).unwrap().symbol(), " ");
+        assert_eq!(buf.cell((2, 4)).unwrap().symbol(), BAR_GLYPH.to_string());
+        assert_eq!(buf.cell((3, 0)).unwrap().symbol(), BAR_GLYPH.to_string());
+        assert_eq!(buf.cell((3, 4)).unwrap().symbol(), BAR_GLYPH.to_string());
+        assert_eq!(grid(&buf).lines().count(), 5);
+    }
+
+    #[test]
+    fn player_layout_glues_one_cell_bars_to_the_right_edge() {
+        let area = Rect::new(4, 2, 80, 20);
+        let (content, spectrum) = player_spectrum_layout(area, 30);
+        assert_eq!(content.width, 50);
+        assert_eq!(spectrum.x, content.x + content.width);
+        assert_eq!(spectrum.width, 30);
+        assert_eq!(spectrum.x + spectrum.width, area.x + area.width);
+        assert_eq!(spectrum.y, area.y + area.height - BAR_HEIGHT);
+        assert_eq!(spectrum.height, BAR_HEIGHT);
     }
 }

@@ -109,6 +109,9 @@ pub struct Config {
     /// profile manager; adding never replaces an existing one.
     #[serde(default)]
     pub navidrome_servers: Vec<NavidromeConfig>,
+    /// TorBox API token file. The token itself must never be stored in config.
+    #[serde(default)]
+    pub torbox_token_file: Option<String>,
     #[serde(default)]
     pub album_art: AlbumArtMode,
     /// Directories to scan for local music and video.
@@ -174,6 +177,13 @@ pub struct Config {
     /// `eq_gains` is active instead. See `eq::restore`.
     #[serde(default = "default_eq_preset")]
     pub eq_preset: Option<String>,
+    /// Applies the selected EQ curve to playback. The curve remains
+    /// selected while disabled so toggling it back on restores it.
+    #[serde(default = "default_eq_enabled")]
+    pub eq_enabled: bool,
+    /// Number of frequency bars shown in the maximized-player visualizer.
+    #[serde(default = "default_visualizer_bands")]
+    pub visualizer_bands: u8,
     /// Always kept in sync with whatever's actually applied (the
     /// active curve's gains, or a hand-tuned set); read back on
     /// startup alongside `eq_preset`, so both a nameless custom eq
@@ -286,6 +296,14 @@ fn default_eq_preset() -> Option<String> {
     Some(eq::PRESETS[0].name.to_string())
 }
 
+fn default_eq_enabled() -> bool {
+    true
+}
+
+fn default_visualizer_bands() -> u8 {
+    10
+}
+
 fn default_sidebar_width() -> u16 {
     crate::layout::SIDEBAR_DEFAULT
 }
@@ -379,6 +397,14 @@ impl Config {
     /// gains are left to `layout::from_sizes`/`eq::clamp_gains`.
     fn sanitize(&mut self) -> Vec<String> {
         let mut w = Vec::new();
+        let bands = self.visualizer_bands.clamp(4, 32);
+        if bands != self.visualizer_bands {
+            w.push(format!(
+                "visualizer_bands = {} is outside 4 to 32; using {bands}",
+                self.visualizer_bands
+            ));
+            self.visualizer_bands = bands;
+        }
         self.lyrics.providers.retain(|provider| {
             let known = matches!(
                 provider.as_str(),
@@ -588,6 +614,7 @@ impl Default for Config {
         Config {
             lyrics: LyricsConfig::default(),
             navidrome_servers: Vec::new(),
+            torbox_token_file: None,
             album_art: AlbumArtMode::Auto,
             ascii_fps: None,
             library_paths: Vec::new(),
@@ -603,6 +630,8 @@ impl Default for Config {
             scrobble: ScrobbleConfig::default(),
             logo_style: None,
             eq_preset: default_eq_preset(),
+            eq_enabled: default_eq_enabled(),
+            visualizer_bands: default_visualizer_bands(),
             eq_gains: None,
             eq_custom_presets: eq::CustomPresets::default(),
             sidebar_width: default_sidebar_width(),
@@ -722,6 +751,7 @@ fn fix_int<T: Ord + Copy + std::fmt::Display>(
 const KNOWN_KEYS: &[&str] = &[
     "lyrics",
     "navidrome_servers",
+    "torbox_token_file",
     "album_art",
     "ascii_fps",
     "library_paths",
@@ -737,6 +767,8 @@ const KNOWN_KEYS: &[&str] = &[
     "scrobble",
     "logo_style",
     "eq_preset",
+    "eq_enabled",
+    "visualizer_bands",
     "eq_gains",
     "eq_custom_presets",
     "keybinds",
@@ -1074,6 +1106,22 @@ blur = nan
         assert_eq!(loaded.warnings.len(), 8, "{:?}", loaded.warnings);
     }
 
+    #[test]
+    fn eq_defaults_flat_and_enabled_and_visualizer_bands_are_bounded() {
+        let defaults = Config::default();
+        assert_eq!(defaults.eq_preset.as_deref(), Some("flat"));
+        assert!(defaults.eq_enabled);
+        assert_eq!(defaults.visualizer_bands, 10);
+
+        let loaded = validate("eq_enabled = false\nvisualizer_bands = 99\n").unwrap();
+        assert!(!loaded.cfg.eq_enabled);
+        assert_eq!(loaded.cfg.visualizer_bands, 32);
+        assert!(loaded
+            .warnings
+            .iter()
+            .any(|w| w.contains("visualizer_bands")));
+    }
+
     /// `libary_paths` parsed clean and was read by nothing, so the
     /// library came up empty with nothing said about why. Named and
     /// ignored rather than refused: see `unknown_keys`.
@@ -1135,6 +1183,7 @@ pasword = "x"
                 max_bitrate_kbps: Some(320),
                 transcode_format: Some("opus".into()),
             }],
+            torbox_token_file: Some("/run/agenix/torbox".into()),
             album_art: AlbumArtMode::Auto,
             ascii_fps: Some(12.0),
             library_paths: vec!["/music".into()],
@@ -1150,6 +1199,8 @@ pasword = "x"
             scrobble: ScrobbleConfig::default(),
             logo_style: Some("ANSI Shadow".into()),
             eq_preset: Some("flat".into()),
+            eq_enabled: true,
+            visualizer_bands: 10,
             eq_gains: Some([0.0; 10]),
             eq_custom_presets: eq::CustomPresets::default(),
             keybinds: HashMap::new(),

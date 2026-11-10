@@ -235,7 +235,10 @@ pub fn row_items(items: &dyn Rows, selected: usize, area: Rect) -> Vec<Option<us
 pub(crate) fn kind_code(item: &SearchItem) -> char {
     match item {
         SearchItem::LocalMusic { .. } | SearchItem::Song { .. } => 's',
+        SearchItem::TorBoxFile { video: false, .. } => 's',
         SearchItem::LocalVideo { .. } => 'v',
+        SearchItem::TorBoxFile { video: true, .. } => 'v',
+        SearchItem::WatchSource { .. } => 'v',
         SearchItem::Artist { .. } => 'a',
         SearchItem::Album { .. } => 'l',
         SearchItem::Playlist { .. } => 'p',
@@ -255,6 +258,8 @@ pub(crate) fn source_code(item: &SearchItem) -> char {
         | SearchItem::Album { .. }
         | SearchItem::Song { .. }
         | SearchItem::Playlist { .. } => 'n',
+        SearchItem::TorBoxFile { .. } => 't',
+        SearchItem::WatchSource { .. } => 'w',
     }
 }
 
@@ -277,6 +282,8 @@ pub fn label(item: &SearchItem) -> String {
         } => format!("{title} · {artist} ({album})"),
         SearchItem::Playlist { name, .. } => name.clone(),
         SearchItem::Silence { secs } => format!("silence · {}", fmt_span(*secs)),
+        SearchItem::TorBoxFile { title, .. } => title.clone(),
+        SearchItem::WatchSource { title, .. } => title.clone(),
     }
 }
 
@@ -303,6 +310,8 @@ fn row_label(item: &SearchItem, hovered: bool) -> Cow<'_, str> {
         // decoration; for a silence the *duration* is the identity,
         // and a column of bare "silence" rows would be unreadable.
         SearchItem::Silence { .. } => Cow::Owned(label(item)),
+        SearchItem::TorBoxFile { title, .. } => Cow::Borrowed(title),
+        SearchItem::WatchSource { title, .. } => Cow::Borrowed(title),
     }
 }
 
@@ -337,6 +346,8 @@ fn is_starred(item: &SearchItem, favorites: &Favorites, remote_starred: &HashSet
         | SearchItem::Artist { .. }
         | SearchItem::Album { .. }
         | SearchItem::Playlist { .. } => false,
+        SearchItem::TorBoxFile { .. } => false,
+        SearchItem::WatchSource { .. } => false,
     }
 }
 
@@ -1080,6 +1091,8 @@ mod tests {
                 SearchItem::Song { title, .. } => title.clone(),
                 SearchItem::Playlist { name, .. } => name.clone(),
                 SearchItem::Silence { .. } => label(item),
+                SearchItem::TorBoxFile { title, .. } => title.clone(),
+                SearchItem::WatchSource { title, .. } => title.clone(),
             }
         };
         format!(

@@ -32,5 +32,7 @@ pub mod suggestions;
 #[cfg(test)]
 pub mod testbuf;
 pub mod textfit;
+pub mod torbox;
 pub mod undo_tree;
 pub mod visualizer;
+pub mod watch;

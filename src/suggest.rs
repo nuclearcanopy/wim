@@ -640,7 +640,10 @@ impl Catalog {
                     None,
                 );
             }
-            SearchItem::LocalVideo { .. } | SearchItem::Playlist { .. } => {}
+            SearchItem::LocalVideo { .. }
+            | SearchItem::TorBoxFile { .. }
+            | SearchItem::WatchSource { .. }
+            | SearchItem::Playlist { .. } => {}
         }
     }
 

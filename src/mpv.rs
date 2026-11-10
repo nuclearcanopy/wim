@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -23,6 +23,7 @@ const OBS_PAUSE: u64 = 5;
 const OBS_LEVEL_RMS: u64 = 6;
 const OBS_EOF_REACHED: u64 = 7;
 const OBS_MUTE: u64 = 8;
+const OBS_SPECTRUM: u64 = 9;
 
 /// How long any one blocking command waits for mpv's reply.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -61,17 +62,18 @@ pub const PROP_MUTE: &str = "mute";
 /// loop-all path never runs; `set_keep_open` is therefore toggled per
 /// track rather than pinned on.
 pub const PROP_EOF_REACHED: &str = "eof-reached";
-/// RMS output level in dBFS, from the labeled `astats` tap
-/// `eq::build_af_filter` puts at the end of the af chain; drives the
-/// now-playing level meter. Spelled out rather than built with
+/// RMS output level in dBFS, from the first (dry-left) channel in the
+/// labeled `astats` analysis filter. Spelled out rather than built with
 /// `format!` so it can be matched in `Playback::apply` for free; a
 /// test ties it back to `eq::LEVEL_METADATA_LABEL`.
 ///
 /// The label has to be mpv's *own* filter label (`af=@wimlevel:lavfi=
 /// [...]`), not a label inside the lavfi graph: `af-metadata/<label>`
-/// resolves nothing at all for the latter, which is what left this
-/// meter dead while still paying a round trip per frame for it.
-pub const PROP_LEVEL_RMS: &str = "af-metadata/wimlevel/lavfi.astats.Overall.RMS_level";
+/// resolves nothing at all for the latter.
+pub const PROP_LEVEL_RMS: &str = "af-metadata/wimlevel/lavfi.astats.1.RMS_level";
+/// The complete astats metadata object. Each analysis band occupies
+/// one mono channel after the dry stereo pair.
+pub const PROP_SPECTRUM: &str = "af-metadata/wimlevel";
 
 /// How long the last pushed level reading is believed. mpv pushes
 /// ~20/s while audio flows and simply stops pushing when it doesn't
@@ -113,6 +115,9 @@ pub struct Playback {
     /// because the pair is only meaningful together, see `level`.
     level_db: Option<f64>,
     level_at: Option<Instant>,
+    spectrum_level: [f32; 32],
+    spectrum_bands: usize,
+    spectrum_at: Option<Instant>,
 }
 
 impl Playback {
@@ -139,15 +144,48 @@ impl Playback {
                     .or_else(|| value.as_str().and_then(|s| s.parse().ok()));
                 self.level_at = self.level_db.map(|_| Instant::now());
             }
+            PROP_SPECTRUM => {
+                self.spectrum_level = [0.0; 32];
+                self.spectrum_bands = 0;
+                if let Some(metadata) = value.as_object() {
+                    for (key, value) in metadata {
+                        let Some(channel) = key
+                            .strip_prefix("lavfi.astats.")
+                            .and_then(|key| key.strip_suffix(".RMS_level"))
+                            .and_then(|channel| channel.parse::<usize>().ok())
+                        else {
+                            continue;
+                        };
+                        // The dry stereo output is channels 1/2; analysis
+                        // bands follow as mono channels. Iterating the small
+                        // metadata map avoids formatting and allocating 32
+                        // lookup keys on every update.
+                        let Some(band) = channel.checked_sub(3).filter(|&i| i < 32) else {
+                            continue;
+                        };
+                        let Some(db) = value
+                            .as_f64()
+                            .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+                        else {
+                            continue;
+                        };
+                        self.spectrum_level[band] = if db.is_finite() {
+                            ((db as f32 + 58.0) / 48.0).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        self.spectrum_bands = self.spectrum_bands.max(band + 1);
+                    }
+                }
+                self.spectrum_at = (self.spectrum_bands > 0).then(Instant::now);
+            }
             _ => return false,
         }
         true
     }
 
-    /// Output level 0..1 for the level meter, or `None` when no fresh
-    /// reading is in hand (paused, stopped, or an af chain without the
-    /// tap); callers fall back to their own idle animation. Costs no
-    /// IPC: this is the last value mpv pushed.
+    /// Last output level reading, retained for callers that need a
+    /// scalar meter. Returns `None` when no fresh reading is in hand.
     pub fn level(&self) -> Option<f32> {
         self.level_as_of(Instant::now())
     }
@@ -168,6 +206,17 @@ impl Playback {
             scaled.clamp(0.0, 1.0)
         })
     }
+
+    /// Frequency-band levels from the last astats metadata event, if
+    /// fresh. Missing channels (e.g. configured bands beyond the graph)
+    /// are returned as silence.
+    pub fn spectrum(&self, bands: usize) -> Option<&[f32]> {
+        let now = Instant::now();
+        if now.duration_since(self.spectrum_at?) > LEVEL_FRESH_FOR || self.paused {
+            return None;
+        }
+        Some(&self.spectrum_level[..bands.min(self.spectrum_bands)])
+    }
 }
 
 struct Pending {
@@ -180,11 +229,38 @@ struct Pending {
 pub struct Mpv {
     child: Child,
     sock_path: PathBuf,
-    sock: Mutex<UnixStream>,
+    /// Resolved on the first command rather than at spawn.
+    ///
+    /// mpv creates its ipc socket 65-120ms after exec, which was 97%
+    /// of wim's whole startup (72.7ms of 73.5ms, measured) and all of
+    /// it spent waiting. fork and exec cost 0.4ms, so the wait is the
+    /// only expensive part and it does not have to be on the critical
+    /// path: nothing can be played until the user asks for something.
+    sock: Mutex<Link>,
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, Pending>>>,
     events: Receiver<Event>,
 }
+
+/// The ipc socket, before and after the connector thread finds it.
+enum Link {
+    /// Waiting on the connector. The receiver yields exactly once.
+    Pending(Receiver<Result<UnixStream, String>>),
+    Live(UnixStream),
+    /// mpv never came up. Kept rather than retried: a connect that
+    /// already spent its budget will not start working, and every
+    /// later command should say the same thing instead of each paying
+    /// the budget again.
+    Dead(String),
+}
+
+/// Request ids the connector's own setup uses, so they cannot collide
+/// with `next_id`'s. Nothing waits on these replies; the reader drops
+/// a reply whose id is not in `pending`, which is the same path a
+/// timed-out command's late reply takes.
+const SETUP_ID_BASE: u64 = 1;
+/// Where ordinary commands start, past the setup block.
+const FIRST_COMMAND_ID: u64 = 1000;
 
 /// Asks the kernel to SIGTERM mpv if this process dies without
 /// getting to clean up. `Drop` already sends `quit` on an orderly
@@ -282,87 +358,202 @@ impl Mpv {
             .spawn()
             .context("spawning mpv; is it installed and on PATH?")?;
 
-        // mpv creates the socket asynchronously after startup, usually
-        // 30-80ms in. a flat 20ms sleep per attempt spent most of that
-        // asleep past the socket actually being ready, so back off
-        // instead: 1ms doubling to 20ms, same ~1s total budget.
-        const CONNECT_BUDGET: Duration = Duration::from_secs(1);
-        const MAX_BACKOFF: Duration = Duration::from_millis(20);
-        let sock = {
-            let mut waited = Duration::ZERO;
-            let mut backoff = Duration::from_millis(1);
-            loop {
-                match UnixStream::connect(&sock_path) {
-                    Ok(s) => break s,
-                    Err(_) if waited < CONNECT_BUDGET => {
-                        thread::sleep(backoff);
-                        waited += backoff;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                    }
-                    Err(e) => return Err(e).context("connecting to mpv ipc socket"),
-                }
-            }
-        };
-
         let pending: Arc<Mutex<HashMap<u64, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, event_rx) = mpsc::channel();
+        let (link_tx, link_rx) = mpsc::channel();
 
-        let reader_sock = sock.try_clone().context("cloning mpv ipc socket")?;
+        // the connect wait, off the critical path. the fork above
+        // stays on this thread on purpose: `reap_with_parent` sets
+        // `PR_SET_PDEATHSIG`, which fires when the parent *thread*
+        // exits, so forking from a worker would kill mpv the moment
+        // that worker finished.
+        let connect_path = sock_path.clone();
         let reader_pending = pending.clone();
         thread::spawn(move || {
-            let mut lines = BufReader::new(reader_sock).lines();
-            while let Some(Ok(line)) = lines.next() {
-                if line.trim().is_empty() {
-                    continue;
+            let sock = match connect(&connect_path) {
+                Ok(sock) => sock,
+                Err(why) => {
+                    let _ = link_tx.send(Err(why));
+                    return;
                 }
-                let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if let Some(id) = v.get("request_id").and_then(Value::as_u64) {
-                    if let Some(p) = reader_pending.lock().unwrap().remove(&id) {
-                        let result = match v.get("error").and_then(Value::as_str) {
-                            Some("success") | None => {
-                                Ok(v.get("data").cloned().unwrap_or(Value::Null))
-                            }
-                            Some(err) => Err(err.to_string()),
-                        };
-                        let _ = p.reply_tx.send(result);
-                    }
-                    continue;
-                }
-                match v.get("event").and_then(Value::as_str) {
-                    Some("property-change") => {
-                        // mpv omits `data` entirely (rather than
-                        // sending null) when the property has become
-                        // unavailable: af cleared, playback stopped.
-                        // requiring it dropped exactly the event that
-                        // says "this reading is gone", leaving the
-                        // last one standing forever.
-                        if let Some(name) = v.get("name").and_then(Value::as_str) {
-                            let _ = event_tx.send(Event::PropertyChange {
-                                name: name.to_string(),
-                                value: v.get("data").cloned().unwrap_or(Value::Null),
-                            });
-                        }
-                    }
-                    Some(_) => {
-                        let _ = event_tx.send(Event::Other(v));
-                    }
-                    None => {}
-                }
+            };
+            let Ok(reader_sock) = sock.try_clone() else {
+                let _ = link_tx.send(Err("cloning mpv ipc socket".to_string()));
+                return;
+            };
+            thread::spawn(move || read_replies(reader_sock, reader_pending, event_tx));
+            // the setup goes down the socket *before* it is published,
+            // so a command the user typed in the first 70ms cannot
+            // overtake the property observers or replaygain: it cannot
+            // reach the socket until this send happens.
+            let mut sock = sock;
+            if let Err(why) = write_setup(&mut sock) {
+                let _ = link_tx.send(Err(why));
+                return;
             }
+            let _ = link_tx.send(Ok(sock));
         });
 
         Ok(Mpv {
             child,
             sock_path,
-            sock: Mutex::new(sock),
-            next_id: AtomicU64::new(1),
+            sock: Mutex::new(Link::Pending(link_rx)),
+            next_id: AtomicU64::new(FIRST_COMMAND_ID),
             pending,
             events: event_rx,
         })
     }
 
+    /// Resolves the socket if the connector has finished, and runs `f`
+    /// on it. The first caller pays whatever is left of mpv's startup;
+    /// every one after it pays a mutex.
+    fn with_sock<R>(&self, f: impl FnOnce(&mut UnixStream) -> Result<R>) -> Result<R> {
+        let mut guard = self.sock.lock().unwrap();
+        if let Link::Pending(rx) = &*guard {
+            // one yield, so a `recv` here either gets the socket or
+            // learns the connector gave up.
+            *guard = match rx.recv() {
+                Ok(Ok(sock)) => Link::Live(sock),
+                Ok(Err(why)) => Link::Dead(why),
+                Err(_) => Link::Dead("the mpv connector thread died".to_string()),
+            };
+        }
+        match &mut *guard {
+            Link::Live(sock) => f(sock),
+            Link::Dead(why) => bail!("{why}"),
+            Link::Pending(_) => unreachable!("resolved just above"),
+        }
+    }
+}
+
+/// mpv creates the socket asynchronously after exec, 65-120ms in on
+/// this box. A flat 20ms sleep per attempt spent most of that asleep
+/// past the socket actually being ready, so back off instead: 1ms
+/// doubling to 20ms, same ~1s total budget.
+fn connect(sock_path: &Path) -> Result<UnixStream, String> {
+    const CONNECT_BUDGET: Duration = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_millis(20);
+    let mut waited = Duration::ZERO;
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match UnixStream::connect(sock_path) {
+            Ok(s) => return Ok(s),
+            Err(_) if waited < CONNECT_BUDGET => {
+                thread::sleep(backoff);
+                waited += backoff;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+            // the path is deliberately not in the message: it is a
+            // temp socket name, but every other error string in this
+            // repo that carried a path or url turned out to carry a
+            // credential too, so the habit is the rule.
+            Err(e) => return Err(format!("connecting to mpv ipc socket: {}", e.kind())),
+        }
+    }
+}
+
+/// The one setting that is safe to apply before the socket is handed
+/// over: per-track replaygain.
+///
+/// Order-independent, which is why it can live here: mpv reads the
+/// gain from each file's own tags as it plays, so setting it when no
+/// file exists yet is exactly right. **The property observers are
+/// deliberately not here.** Registering one makes mpv report that
+/// property's current value at once, and wim registers them only
+/// after restoring last session's track, or the first `idle-active`
+/// describes an mpv that has not started playing. That ordering is
+/// the front-end's to choose, so each one still calls
+/// `observe_playback` itself.
+fn write_setup(sock: &mut UnixStream) -> Result<(), String> {
+    let lines: Vec<Vec<Value>> = vec![vec![
+        json!("set_property"),
+        json!("replaygain"),
+        json!("track"),
+    ]];
+    for (n, args) in lines.into_iter().enumerate() {
+        let payload = json!({ "command": args, "request_id": SETUP_ID_BASE + n as u64 });
+        let mut line = match serde_json::to_vec(&payload) {
+            Ok(line) => line,
+            Err(e) => return Err(format!("encoding mpv setup: {e}")),
+        };
+        line.push(b'\n');
+        if let Err(e) = sock.write_all(&line) {
+            return Err(format!("writing mpv setup: {}", e.kind()));
+        }
+    }
+    Ok(())
+}
+
+/// Every property the frame loop reads, as `observe_property` calls.
+///
+/// One list, because the connector sends it at startup and
+/// `observe_playback` re-sends it after a reconnect; two copies would
+/// drift and the symptom is a reading that silently never updates.
+fn observe_commands() -> Vec<Vec<Value>> {
+    [
+        (OBS_PLAYLIST_POS, PROP_PLAYLIST_POS),
+        (OBS_IDLE_ACTIVE, PROP_IDLE_ACTIVE),
+        (OBS_TIME_POS, PROP_TIME_POS),
+        (OBS_DURATION, PROP_DURATION),
+        (OBS_PAUSE, PROP_PAUSE),
+        (OBS_MUTE, PROP_MUTE),
+        (OBS_LEVEL_RMS, PROP_LEVEL_RMS),
+        (OBS_SPECTRUM, PROP_SPECTRUM),
+        (OBS_EOF_REACHED, PROP_EOF_REACHED),
+    ]
+    .into_iter()
+    .map(|(id, name)| vec![json!("observe_property"), json!(id), json!(name)])
+    .collect()
+}
+
+/// The reply reader, formerly inline in `spawn`.
+fn read_replies(
+    reader_sock: UnixStream,
+    reader_pending: Arc<Mutex<HashMap<u64, Pending>>>,
+    event_tx: Sender<Event>,
+) {
+    let mut lines = BufReader::new(reader_sock).lines();
+    while let Some(Ok(line)) = lines.next() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(id) = v.get("request_id").and_then(Value::as_u64) {
+            if let Some(p) = reader_pending.lock().unwrap().remove(&id) {
+                let result = match v.get("error").and_then(Value::as_str) {
+                    Some("success") | None => Ok(v.get("data").cloned().unwrap_or(Value::Null)),
+                    Some(err) => Err(err.to_string()),
+                };
+                let _ = p.reply_tx.send(result);
+            }
+            continue;
+        }
+        match v.get("event").and_then(Value::as_str) {
+            Some("property-change") => {
+                // mpv omits `data` entirely (rather than
+                // sending null) when the property has become
+                // unavailable: af cleared, playback stopped.
+                // requiring it dropped exactly the event that
+                // says "this reading is gone", leaving the
+                // last one standing forever.
+                if let Some(name) = v.get("name").and_then(Value::as_str) {
+                    let _ = event_tx.send(Event::PropertyChange {
+                        name: name.to_string(),
+                        value: v.get("data").cloned().unwrap_or(Value::Null),
+                    });
+                }
+            }
+            Some(_) => {
+                let _ = event_tx.send(Event::Other(v));
+            }
+            None => {}
+        }
+    }
+}
+
+impl Mpv {
     pub fn events(&self) -> &Receiver<Event> {
         &self.events
     }
@@ -379,11 +570,7 @@ impl Mpv {
         let payload = json!({ "command": args, "request_id": id });
         let mut line = serde_json::to_vec(&payload)?;
         line.push(b'\n');
-        self.sock
-            .lock()
-            .unwrap()
-            .write_all(&line)
-            .context("writing to mpv ipc socket")?;
+        self.with_sock(|sock| sock.write_all(&line).context("writing to mpv ipc socket"))?;
 
         match rx.recv_timeout(REPLY_TIMEOUT) {
             Ok(Ok(v)) => Ok(v),
@@ -406,11 +593,7 @@ impl Mpv {
         let payload = json!({ "command": args, "request_id": id });
         let mut line = serde_json::to_vec(&payload)?;
         line.push(b'\n');
-        self.sock
-            .lock()
-            .unwrap()
-            .write_all(&line)
-            .context("writing to mpv ipc socket")?;
+        self.with_sock(|sock| sock.write_all(&line).context("writing to mpv ipc socket"))?;
         Ok(())
     }
 
@@ -438,7 +621,7 @@ impl Mpv {
             }
         }
 
-        if let Err(e) = self.sock.lock().unwrap().write_all(&wire) {
+        if let Err(e) = self.with_sock(|sock| Ok(sock.write_all(&wire)?)) {
             let mut pending = self.pending.lock().unwrap();
             for id in &ids {
                 pending.remove(id);
@@ -517,20 +700,7 @@ impl Mpv {
     /// already loaded or the first events describe an mpv that's still
     /// idle. Pipelined: five registrations, one round trip.
     pub fn observe_playback(&self) -> Result<()> {
-        let cmds: Vec<Vec<Value>> = [
-            (OBS_PLAYLIST_POS, PROP_PLAYLIST_POS),
-            (OBS_IDLE_ACTIVE, PROP_IDLE_ACTIVE),
-            (OBS_TIME_POS, PROP_TIME_POS),
-            (OBS_DURATION, PROP_DURATION),
-            (OBS_PAUSE, PROP_PAUSE),
-            (OBS_MUTE, PROP_MUTE),
-            (OBS_LEVEL_RMS, PROP_LEVEL_RMS),
-            (OBS_EOF_REACHED, PROP_EOF_REACHED),
-        ]
-        .into_iter()
-        .map(|(id, name)| vec![json!("observe_property"), json!(id), json!(name)])
-        .collect();
-        for result in self.command_batch(&cmds) {
+        for result in self.command_batch(&observe_commands()) {
             result?;
         }
         Ok(())
@@ -901,7 +1071,7 @@ mod tests {
         assert_eq!(
             PROP_LEVEL_RMS,
             format!(
-                "af-metadata/{}/lavfi.astats.Overall.RMS_level",
+                "af-metadata/{}/lavfi.astats.1.RMS_level",
                 crate::eq::LEVEL_METADATA_LABEL
             )
         );
@@ -916,6 +1086,19 @@ mod tests {
         assert!(pb.apply(PROP_LEVEL_RMS, &json!("-21.008032")));
         let level = pb.level().expect("fresh reading");
         assert!((level - (60.0 - 21.008032) / 60.0).abs() < 1e-5, "{level}");
+    }
+
+    #[test]
+    fn spectrum_metadata_reads_mono_channels_as_frequency_bands() {
+        let mut pb = Playback::default();
+        let mut metadata = serde_json::Map::new();
+        for (channel, db) in [(3, "-12"), (4, "-48")] {
+            metadata.insert(format!("lavfi.astats.{channel}.RMS_level"), json!(db));
+        }
+        assert!(pb.apply(PROP_SPECTRUM, &Value::Object(metadata)));
+        let spectrum = pb.spectrum(2).expect("fresh spectrum");
+        assert!(spectrum[0] > 0.9, "strong low band: {spectrum:?}");
+        assert!(spectrum[1] < 0.25, "weak high band: {spectrum:?}");
     }
 
     #[test]

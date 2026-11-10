@@ -18,7 +18,7 @@ use crate::ui::gap::{Gap, GapPanel};
 use crate::ui::progress::readouts;
 use crate::ui::textfit::{truncate_with_ellipsis, width};
 
-/// Rows at the bottom of the pane the level meter owns (main.rs draws
+/// Rows at the bottom of the pane the spectrum owns (main.rs draws
 /// it over whatever was there, on the same `main_content.height > 2`
 /// condition mirrored below), so the stack stops above them.
 pub const METER_ROWS: u16 = 2;
@@ -92,8 +92,8 @@ pub fn layout(
     if area.width == 0 || area.height == 0 {
         return None;
     }
-    // main.rs only draws the level meter when the pane is taller than
-    // the meter itself, so below that there is nothing to reserve.
+    // main.rs only draws the spectrum when the pane is taller than the
+    // visualizer itself, so below that there is nothing to reserve.
     let body_h = if area.height > METER_ROWS {
         area.height - METER_ROWS
     } else {
@@ -1199,7 +1199,7 @@ mod tests {
 
     #[test]
     fn a_small_pane_keeps_the_transport_and_drops_everything_else() {
-        // five rows, two of which the level meter owns: title,
+        // five rows, two of which the spectrum owns: title,
         // controls, scrubber and nothing else.
         let core = layout(Rect::new(0, 0, 40, 5), true, true, 2.0).unwrap();
         assert!(core.art.is_none() && core.context_y.is_none() && core.hint_y.is_none());
@@ -1221,7 +1221,7 @@ mod tests {
         for h in 1..40u16 {
             let area = Rect::new(0, 0, 40, h);
             let l = layout(area, true, true, 2.0).unwrap();
-            // the bottom two rows belong to the level meter whenever
+            // the bottom two rows belong to the spectrum whenever
             // there is a meter at all.
             let last = if h > METER_ROWS { h - METER_ROWS } else { h };
             for row in [

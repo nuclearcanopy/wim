@@ -184,7 +184,13 @@ impl Snapshot {
         if let Some(muted) = self.muted {
             let _ = core.player.set_property("mute", serde_json::json!(muted));
         }
-        apply_eq_gains(core.app, core.player, core.notifications);
+        apply_eq_gains(
+            core.app,
+            core.player,
+            core.notifications,
+            core.cfg.eq_enabled,
+            core.cfg.visualizer_bands as usize,
+        );
 
         let restored = self.restore_queue(core);
         // after the queue: `load_playlist`'s own caller
@@ -290,6 +296,7 @@ pub fn classify(op: &Op) -> Reversibility {
         | Op::SetEqPreset(_)
         | Op::ToggleCrossfade
         | Op::Search(_)
+        | Op::TorBoxPlay { .. }
         | Op::Play(_)
         | Op::Enqueue { .. }
         | Op::ClearQueue
@@ -313,6 +320,8 @@ pub fn classify(op: &Op) -> Reversibility {
         // --- left the process; undo refuses with a reason
         Op::Star { .. } => Barrier("a star is a write to the server"),
         Op::Download(_) => Barrier("a download wrote a file"),
+        Op::TorBoxAdd { .. } => Barrier("a TorBox download was created in the remote account"),
+        Op::TorBoxControl { .. } => Barrier("a TorBox account item was changed remotely"),
         Op::SaveQueue(_) => Barrier("a saved queue wrote a file"),
         Op::OpenPage(_) => Barrier("a page was handed to a browser"),
         Op::Rescan => Barrier("a rescan rebuilt the library from disk"),
@@ -323,6 +332,10 @@ pub fn classify(op: &Op) -> Reversibility {
         | Op::SelectBottom
         | Op::View(_)
         | Op::ClearConsole
+        | Op::TorBoxSearch(_)
+        | Op::TorBoxStatus
+        | Op::TorBoxList(_)
+        | Op::TorBoxQueue { .. }
         // walking the tree is not an edit to it. recording an undo
         // would turn undoing-the-undo into a new branch rather than a
         // redo, and the tree would fork on every change of mind.
@@ -1571,7 +1584,15 @@ mod restore {
 
         // a band nudge in the eq menu, which is all `eq_custom` ever
         // means.
-        eq_menu_keys::adjust_eq_band(&mut h.app, &player, &mut h.notifications, 3, 1.0);
+        eq_menu_keys::adjust_eq_band(
+            &mut h.app,
+            &player,
+            &mut h.notifications,
+            3,
+            1.0,
+            true,
+            h.cfg.visualizer_bands as usize,
+        );
         assert_ne!(eq_menu_keys::eq_label(&h.app, &h.cfg), label);
 
         h.restore(&player, &snapshot);

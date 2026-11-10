@@ -29,6 +29,26 @@ use crate::subsonic::{
 };
 use crate::trace;
 
+/// An in-memory media URL that must never be written into debug logs.
+#[derive(Clone)]
+pub struct EphemeralUrl(String);
+
+impl EphemeralUrl {
+    pub fn new(url: String) -> Self {
+        Self(url)
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for EphemeralUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[ephemeral URL redacted]")
+    }
+}
+
 /// Results-list section a `SearchItem` groups under; see
 /// `SearchItem::category`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +154,23 @@ pub enum SearchItem {
         album: String,
         client: Arc<Client>,
     },
+    TorBoxFile {
+        service: crate::torbox::Service,
+        item_id: u64,
+        file_id: u64,
+        title: String,
+        video: bool,
+        client: Arc<crate::torbox::Client>,
+        /// Ephemeral link resolved by `TrackResolver`; never serialized.
+        resolved_url: Option<String>,
+    },
+    /// A user-selected direct online-media source. `url` is ephemeral and is
+    /// deliberately excluded from all queue/resume serialization.
+    WatchSource {
+        identity: crate::media::PlaybackIdentity,
+        title: String,
+        url: EphemeralUrl,
+    },
     Playlist {
         id: String,
         name: String,
@@ -166,6 +203,8 @@ impl SearchItem {
                 ..
             } => format!("{title} {artist} {album}"),
             SearchItem::Playlist { name, .. } => name.clone(),
+            SearchItem::TorBoxFile { title, .. } => title.clone(),
+            SearchItem::WatchSource { title, .. } => title.clone(),
             // never in the corpus, so never scored; answered rather
             // than left unreachable because a silence does have a
             // name and this is where names live.
@@ -185,6 +224,8 @@ impl SearchItem {
             SearchItem::Album { id, .. } => Some((1, id.as_str())),
             SearchItem::Song { id, .. } => Some((2, id.as_str())),
             SearchItem::Playlist { id, .. } => Some((3, id.as_str())),
+            SearchItem::TorBoxFile { .. } => None,
+            SearchItem::WatchSource { identity, .. } => Some((8, identity.source_id.as_str())),
             SearchItem::LocalMusic { .. }
             | SearchItem::LocalVideo { .. }
             | SearchItem::Silence { .. } => None,
@@ -203,6 +244,16 @@ impl SearchItem {
             SearchItem::Album { id, .. } => (1, Cow::Borrowed(id)),
             SearchItem::Song { id, .. } => (2, Cow::Borrowed(id)),
             SearchItem::Playlist { id, .. } => (3, Cow::Borrowed(id)),
+            SearchItem::TorBoxFile {
+                service,
+                item_id,
+                file_id,
+                ..
+            } => (
+                7,
+                Cow::Owned(format!("{}:{item_id}:{file_id}", service.as_str())),
+            ),
+            SearchItem::WatchSource { identity, .. } => (8, Cow::Borrowed(&identity.source_id)),
             SearchItem::LocalMusic { path, .. } => (4, path.to_string_lossy()),
             SearchItem::LocalVideo { path, .. } => (5, path.to_string_lossy()),
             // the duration is the identity: two silences of different
@@ -221,7 +272,9 @@ impl SearchItem {
         match self {
             SearchItem::LocalMusic { title, .. }
             | SearchItem::LocalVideo { title, .. }
-            | SearchItem::Song { title, .. } => title,
+            | SearchItem::Song { title, .. }
+            | SearchItem::TorBoxFile { title, .. } => title,
+            SearchItem::WatchSource { title, .. } => title,
             SearchItem::Artist { name, .. }
             | SearchItem::Album { name, .. }
             | SearchItem::Playlist { name, .. } => name,
@@ -240,8 +293,12 @@ impl SearchItem {
         match self {
             SearchItem::Artist { .. } => Category::Artists,
             SearchItem::Album { .. } => Category::Albums,
-            SearchItem::LocalMusic { .. } | SearchItem::Song { .. } => Category::Songs,
+            SearchItem::LocalMusic { .. }
+            | SearchItem::Song { .. }
+            | SearchItem::TorBoxFile { video: false, .. } => Category::Songs,
             SearchItem::LocalVideo { .. } => Category::Videos,
+            SearchItem::TorBoxFile { video: true, .. } => Category::Videos,
+            SearchItem::WatchSource { .. } => Category::Videos,
             SearchItem::Playlist { .. } => Category::Playlists,
             // unreachable: a silence is built into a queue, never
             // added to the corpus, so it is never sectioned. songs
@@ -263,6 +320,8 @@ impl SearchItem {
             SearchItem::LocalMusic { .. }
             | SearchItem::LocalVideo { .. }
             | SearchItem::Silence { .. } => None,
+            SearchItem::TorBoxFile { .. } => Some("TorBox"),
+            SearchItem::WatchSource { .. } => Some("Watch"),
         }
     }
 
@@ -277,6 +336,8 @@ impl SearchItem {
             SearchItem::LocalMusic { .. }
             | SearchItem::LocalVideo { .. }
             | SearchItem::Silence { .. } => None,
+            SearchItem::TorBoxFile { .. } => None,
+            SearchItem::WatchSource { .. } => None,
         }
     }
 }
@@ -1469,6 +1530,23 @@ fn typo_score(distance: usize) -> u32 {
 mod tests {
     use super::*;
     use crate::config::NavidromeConfig;
+
+    #[test]
+    fn watch_source_urls_are_redacted_from_debug_and_held_only_ephemerally() {
+        let item = SearchItem::WatchSource {
+            identity: crate::media::PlaybackIdentity {
+                media_id: "media-1".into(),
+                episode_id: Some("episode-1".into()),
+                source_id: "source-hash".into(),
+            },
+            title: "Example Movie · Source 1".into(),
+            url: EphemeralUrl::new("https://cdn.invalid/video?signature=secret".into()),
+        };
+        assert_eq!(item.identity(), (8, Cow::Borrowed("source-hash")));
+        assert_eq!(item.category(), Category::Videos);
+        assert!(!format!("{item:?}").contains("signature=secret"));
+        assert!(format!("{item:?}").contains("ephemeral URL redacted"));
+    }
 
     /// Never dialed; `Client::new` just builds the struct (ping/fetch
     /// calls are separate), so this is safe to construct in tests with

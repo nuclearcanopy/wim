@@ -58,14 +58,14 @@ macro_rules! core_ctx {
 }
 
 use wim::core::{
-    self, drive, BetweenTracks, CoreCtx, Drive, Intent, RemoteSearchOutcome, ScrobbleState,
-    StarFailed, SubtitleOutcome, TrackResolver,
+    self, BetweenTracks, CoreCtx, Drive, Intent, RemoteSearchOutcome, ScrobbleState, StarFailed,
+    SubtitleOutcome, TrackResolver,
 };
 use wim::download::DownloadEvent;
 use wim::notify::Notifications;
 use wim::playqueue::{PlayQueue, PosChange};
 use wim::search::SearchItem;
-use wim::shellsong::{Console, LineKind, Program};
+use wim::shellsong::{Console, LineKind, Op, Program};
 use wim::shellsong_host::{CorpusCandidates, Ramp, SearchSettle};
 use wim::ui::results_list::label;
 use wim::{app, cache, config, favorites, library, lyrics, mpv, search, trace};
@@ -75,11 +75,179 @@ use crate::surface::SwimSurface;
 /// How long a one-shot waits for a command that is still resolving a
 /// name against a server. The language times its own await out at 8s;
 /// this is the backstop for a program that never gets that far.
-const ONESHOT_CAP: Duration = Duration::from_secs(20);
+const ONESHOT_CAP: Duration = Duration::from_secs(30);
 
 /// A one-shot steps this often, which is slow enough to cost nothing
 /// and fast enough that a local `play()` finishes in one or two.
 const ONESHOT_TICK: Duration = Duration::from_millis(10);
+
+enum TorBoxPayload {
+    Lines(Vec<String>),
+    Item(SearchItem, bool),
+}
+
+struct TorBoxReply {
+    label: String,
+    result: Result<TorBoxPayload, String>,
+}
+
+fn is_torbox_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::TorBoxSearch(_)
+            | Op::TorBoxStatus
+            | Op::TorBoxList(_)
+            | Op::TorBoxAdd { .. }
+            | Op::TorBoxPlay { .. }
+            | Op::TorBoxQueue { .. }
+            | Op::TorBoxControl { .. }
+    )
+}
+
+fn run_torbox_op(cfg: &config::Config, op: Op) -> Result<TorBoxPayload, String> {
+    use wim::torbox::{Client, Service};
+    let queue = matches!(&op, Op::TorBoxQueue { .. });
+    let client = Client::from_config(cfg).map_err(|_| {
+        "TorBox is not configured; set torbox_token_file or WIM_TORBOX_TOKEN_FILE".to_string()
+    })?;
+    match op {
+        Op::TorBoxStatus => client
+            .account_items(Service::Torrent, 0, 1)
+            .map(|_| TorBoxPayload::Lines(vec!["TorBox connection verified".into()]))
+            .map_err(|_| {
+                "TorBox connection failed; check token file, network/VPN access, and account".into()
+            }),
+        Op::TorBoxSearch(query) => client
+            .search_hits(&query)
+            .map(|hits| {
+                if hits.is_empty() {
+                    return TorBoxPayload::Lines(vec!["no TorBox metadata results".into()]);
+                }
+                TorBoxPayload::Lines(
+                    hits.into_iter()
+                        .take(100)
+                        .map(|hit| {
+                            format!(
+                                "{} [{}:{}]{}",
+                                hit.title,
+                                hit.source,
+                                hit.id,
+                                hit.media_type
+                                    .map(|t| format!(" · {t}"))
+                                    .unwrap_or_default()
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .map_err(|_| {
+                "TorBox search failed; check token, network/VPN access, and account".into()
+            }),
+        Op::TorBoxList(service) => client
+            .all_account_items(service)
+            .map(|items| {
+                let mut lines = Vec::new();
+                for item in &items {
+                    lines.push(format!(
+                        "{} · {} · id={} · {} files",
+                        item.name,
+                        item.status,
+                        item.id,
+                        item.files.len()
+                    ));
+                    for file in item
+                        .files
+                        .iter()
+                        .filter(|file| wim::torbox::is_playable_file_name(&file.name))
+                    {
+                        lines.push(format!(
+                            "  {} · file_id={} · {} bytes",
+                            file.name, file.id, file.size
+                        ));
+                    }
+                }
+                if lines.is_empty() {
+                    lines.push(format!("no {} account items", service.as_str()));
+                }
+                lines.push(format!(
+                    "{} {} account items",
+                    items.len(),
+                    service.as_str()
+                ));
+                TorBoxPayload::Lines(lines)
+            })
+            .map_err(|_| {
+                "TorBox account listing failed; check token, network/VPN access, and account".into()
+            }),
+        Op::TorBoxAdd { service, link } => {
+            let response = match service {
+                Service::Torrent => client.add_magnet(&link),
+                Service::Usenet => client.add_usenet_link(&link),
+                Service::WebDownload => client.add_web_download(&link),
+            }
+            .map_err(|_| format!("TorBox could not add this {} link", service.as_str()))?;
+            response
+                .ensure_success()
+                .map_err(|_| format!("TorBox rejected this {} link", service.as_str()))?;
+            Ok(TorBoxPayload::Lines(vec![format!(
+                "added to TorBox {}; refresh with torbox_list({})",
+                service.as_str(),
+                match service {
+                    Service::WebDownload => "web",
+                    other => other.as_str(),
+                }
+            )]))
+        }
+        Op::TorBoxPlay {
+            service,
+            id,
+            file_id,
+        }
+        | Op::TorBoxQueue {
+            service,
+            id,
+            file_id,
+        } => {
+            let account_item = client
+                .find_account_item(service, id)
+                .map_err(|_| {
+                    "TorBox account lookup failed; check token, network/VPN access, and account"
+                        .to_string()
+                })?
+                .ok_or_else(|| format!("TorBox item {id} was not found"))?;
+            let client = std::sync::Arc::new(client);
+            let item = account_item
+                .playable_items(client)
+                .into_iter()
+                .find(|item| matches!(item, SearchItem::TorBoxFile { file_id: found, .. } if *found == file_id))
+                .ok_or_else(|| format!("playable TorBox file {file_id} was not found in item {id}"))?;
+            Ok(TorBoxPayload::Item(item, queue))
+        }
+        Op::TorBoxControl {
+            service,
+            id,
+            operation,
+        } => {
+            client
+                .control(service, id, &operation)
+                .map_err(|_| format!("TorBox could not {operation} item {id}"))?
+                .ensure_success()
+                .map_err(|_| format!("TorBox rejected {operation} for item {id}"))?;
+            Ok(TorBoxPayload::Lines(vec![format!(
+                "TorBox {operation} complete for item {id}"
+            )]))
+        }
+        _ => Err("not a TorBox operation".into()),
+    }
+}
+
+fn launch_torbox_op(op: Op, cfg: config::Config, tx: Sender<TorBoxReply>) {
+    let label = op.describe();
+    std::thread::spawn(move || {
+        let result = run_torbox_op(&cfg, op);
+        let _ = tx.send(TorBoxReply { label, result });
+    });
+}
 
 pub struct Host {
     pub cfg: config::Config,
@@ -138,6 +306,9 @@ pub struct Host {
     pub program: Option<Box<Program>>,
     pub swim: SwimSurface,
     pub start: Instant,
+    torbox_tx: Sender<TorBoxReply>,
+    torbox_rx: Receiver<TorBoxReply>,
+    torbox_pending: bool,
 }
 
 impl Host {
@@ -158,10 +329,12 @@ impl Host {
         // already complete track names.
         let warming = search::spawn_warm_from_cache(&cfg.navidrome_servers);
 
+        // returns as soon as mpv is forked; the socket wait is on a
+        // connector thread. nothing below touches the player, so the
+        // prompt no longer waits for it: `observe_playback` happens
+        // after the first frame, in `main`.
         let player = mpv::Mpv::spawn()?;
-        trace::mark("mpv spawned");
-        player.set_replaygain("track")?;
-        player.observe_playback()?;
+        trace::mark("mpv forked");
 
         let mut app = app::App::new(warming.take());
         app.scanning_library = true;
@@ -173,7 +346,14 @@ impl Host {
         let (remote_search_result_tx, remote_search_result_rx) = mpsc::channel();
         core::spawn_background_search(remote_search_rx, remote_search_result_tx);
 
-        let base_volume = core::current_volume(&player).unwrap_or(100.0);
+        // not read from mpv: that is an ipc round trip, so it would
+        // put the 65-120ms socket wait back on the startup path for a
+        // value that is provably 100 here. `--no-config` means no
+        // mpv.conf can have set it and nothing has loaded a file yet,
+        // so mpv is at its documented default; `a_fresh_mpv_starts_at_
+        // full_volume` checks that against a real mpv rather than
+        // trusting it.
+        let base_volume = wim::shellsong_host::VOLUME_CEILING;
         let crossfade_enabled = cfg.crossfade_enabled;
         let gap_at_start = cfg.gap_seconds;
         let lyrics_client = lyrics::Client::with_providers(
@@ -181,6 +361,7 @@ impl Host {
             cfg.resolve_lyrics_api_keys(),
         );
         let (star_tx, star_rx) = mpsc::channel();
+        let (torbox_tx, torbox_rx) = mpsc::channel();
         Ok(Host {
             cfg,
             player,
@@ -228,6 +409,9 @@ impl Host {
             program: None,
             swim: SwimSurface::default(),
             start: Instant::now(),
+            torbox_tx,
+            torbox_rx,
+            torbox_pending: false,
         })
     }
 
@@ -264,18 +448,51 @@ impl Host {
     /// Each one is a `try_recv`, so this is the whole reason nothing
     /// in shellswim blocks.
     pub fn pump(&mut self) {
+        while let Ok(reply) = self.torbox_rx.try_recv() {
+            self.torbox_pending = false;
+            let now = self.start.elapsed();
+            let now_playing = self.play_queue.current().cloned();
+            let mut surf = self.swim.borrowed();
+            let mut core = core_ctx!(self, now, now_playing);
+            match reply.result {
+                Ok(TorBoxPayload::Lines(lines)) => {
+                    for line in lines {
+                        core.console.note(line);
+                    }
+                }
+                Ok(TorBoxPayload::Item(item, queue)) => {
+                    let action = if queue {
+                        app::Action::Queued(item)
+                    } else {
+                        app::Action::Play(item)
+                    };
+                    match core::dispatch_action(action, &mut core, &mut surf) {
+                        core::Dispatch::Continue => {}
+                        core::Dispatch::Quit => self.torbox_pending = false,
+                    }
+                }
+                Err(error) => core.console.fail(format!("{}: {error}", reply.label)),
+            }
+        }
         // a queue batch resolved; the resolver already dropped any from
         // a superseded request, which here would append to the queue
         // rather than merely drawing something stale.
         while let Some((into, label, tracks)) = self.track_resolver.poll() {
             let now = self.start.elapsed();
             let now_playing = self.play_queue.current().cloned();
+            let mut surf = self.swim.borrowed();
             let mut core = core_ctx!(self, now, now_playing);
             match tracks {
                 Ok(tracks) if tracks.is_empty() => core
                     .console
                     .note(format!("nothing to {} in {label}", into.verb())),
                 Ok(tracks) => match into {
+                    Intent::Play => {
+                        match core::start_session(tracks, false, &mut core, &mut surf) {
+                            Ok(status) => core.console.note(status),
+                            Err(why) => core.console.error = Some(why),
+                        }
+                    }
                     Intent::Back => {
                         core::append_resolved(&tracks, &mut core);
                         // the row for this queue op was written before the
@@ -547,6 +764,9 @@ impl Host {
     /// from disjoint fields of `self`, which is the whole reason
     /// `CoreCtx` and `Surface` are separate arguments.
     pub fn step(&mut self) -> Drive {
+        if self.torbox_pending {
+            return Drive::Await;
+        }
         // the same rule wim's loop uses: a program the core queued
         // starts only once nothing else is running, so bound settings
         // cannot interrupt something the user typed.
@@ -560,7 +780,27 @@ impl Host {
         let now_playing = self.play_queue.current().cloned();
         let mut surf = self.swim.borrowed();
         let mut core = core_ctx!(self, now, now_playing);
-        let outcome = drive(program, &mut core, &mut surf, |c| c.settle.settled(c.now));
+        let tx = self.torbox_tx.clone();
+        let cfg = self.cfg.clone();
+        let pending = &mut self.torbox_pending;
+        let outcome = core::drive_with(
+            program,
+            &mut core,
+            &mut surf,
+            |c| c.settle.settled(c.now),
+            |op, core, surf| {
+                if is_torbox_op(&op) {
+                    launch_torbox_op(op, cfg.clone(), tx.clone());
+                    *pending = true;
+                    core::OpDrive::Await
+                } else {
+                    match core::apply_op(op, core, surf) {
+                        core::Dispatch::Continue => core::OpDrive::Continue,
+                        core::Dispatch::Quit => core::OpDrive::Quit,
+                    }
+                }
+            },
+        );
         if outcome != Drive::Await {
             self.program = None;
         }

@@ -22,10 +22,12 @@ pub fn adjust_eq_band(
     notifications: &mut Notifications,
     band: usize,
     dir: f64,
+    enabled: bool,
+    bands: usize,
 ) {
     app.eq_gains[band] = (app.eq_gains[band] + dir).clamp(-eq::GAIN_LIMIT, eq::GAIN_LIMIT);
     app.eq_custom = true;
-    apply_eq_gains(app, player, notifications);
+    apply_eq_gains(app, player, notifications, enabled, bands);
 }
 
 /// A built-in or saved curve's name, that name plus "(modified)" once

@@ -187,6 +187,8 @@ pub fn identity_of(item: &SearchItem) -> Identity {
             ..
         } => (title.clone(), artist.clone(), album.clone()),
         SearchItem::LocalVideo { title, .. } => (title.clone(), None, None),
+        SearchItem::TorBoxFile { title, .. } => (title.clone(), None, None),
+        SearchItem::WatchSource { title, .. } => (title.clone(), None, None),
         SearchItem::Song {
             title,
             artist,
