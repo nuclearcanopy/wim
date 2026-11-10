@@ -385,13 +385,13 @@ impl Client {
     /// torrent sources for a selected result.
     pub fn search(&self, query: &str) -> Result<ApiResponse<serde_json::Value>> {
         anyhow::ensure!(!query.trim().is_empty(), "search query is empty");
-        let url = format!("{}/search/{}", SEARCH_BASE, path_segment(query.trim()));
+        let url = metadata_search_url(query.trim());
         let response = self
             .agent
             .get(&url)
             .set("Authorization", &format!("Bearer {}", self.token.0))
             .call()
-            .map_err(|e| api_error("/search/<query>", e))?;
+            .map_err(|e| api_error("/meta/search/<query>", e))?;
         Ok(response.into_json()?)
     }
 
@@ -481,6 +481,10 @@ fn path_segment(value: &str) -> String {
     encoded
 }
 
+fn metadata_search_url(query: &str) -> String {
+    format!("{SEARCH_BASE}/meta/search/{}", path_segment(query))
+}
+
 fn api_error(endpoint: &str, error: ureq::Error) -> anyhow::Error {
     // Never include a request URL here: requestdl carries the token in its
     // query string according to TorBox's API contract.
@@ -488,8 +492,14 @@ fn api_error(endpoint: &str, error: ureq::Error) -> anyhow::Error {
         ureq::Error::Status(code, _) => {
             anyhow::anyhow!("TorBox request to {endpoint} returned HTTP {code}")
         }
-        ureq::Error::Transport(_) => {
-            anyhow::anyhow!("TorBox request to {endpoint} failed due to a network error")
+        ureq::Error::Transport(error) => {
+            let reason = match error.kind() {
+                ureq::ErrorKind::Dns => "DNS lookup failed",
+                ureq::ErrorKind::ConnectionFailed => "connection failed",
+                ureq::ErrorKind::ProxyConnect => "proxy connection failed",
+                _ => "network error",
+            };
+            anyhow::anyhow!("TorBox request to {endpoint} failed: {reason}")
         }
     }
 }
@@ -840,6 +850,10 @@ mod tests {
     #[test]
     fn search_path_segments_are_percent_encoded() {
         assert_eq!(path_segment("The 100/Season 2"), "The%20100%2FSeason%202");
+        assert_eq!(
+            metadata_search_url("The 100/Season 2"),
+            "https://search-api.torbox.app/meta/search/The%20100%2FSeason%202"
+        );
     }
 
     #[test]
