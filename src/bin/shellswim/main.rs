@@ -169,6 +169,14 @@ fn prompt() -> anyhow::Result<()> {
         if first_frame {
             trace::mark("first frame drawn");
             first_frame = false;
+            // the first thing that needs the socket, so it is also
+            // what pays whatever is left of mpv's startup. deliberately
+            // after the draw: the prompt is on screen first, and a
+            // human cannot type inside the ~70ms this waits.
+            if let Err(e) = host.player.observe_playback() {
+                host.console.error = Some(format!("mpv will not report playback position: {e}"));
+            }
+            trace::mark("player observed");
         }
 
         // the scrubber moves while something plays and costs nothing

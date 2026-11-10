@@ -57,7 +57,7 @@ use wim::shellsong::{Console, ConsoleAction, ViewTarget};
 use wim::shellsong_host::{CorpusCandidates, Ramp, SearchSettle, SleepStep};
 use wim::theme::{shade, NEAR_BLACK};
 use wim::transport::{
-    activate_transport, audio_level, commit_scrub, now_playing_is_video, ScrubAt, TransportCtx,
+    activate_transport, commit_scrub, now_playing_is_video, ScrubAt, TransportCtx,
 };
 use wim::ui::banner::Banner;
 use wim::ui::browse::BrowseListView;
@@ -78,7 +78,7 @@ use wim::ui::player::PlayerView;
 use wim::ui::results_list::{label, ResultsList};
 use wim::ui::searchbox::SearchBox;
 use wim::ui::shellsong::ShellsongConsole;
-use wim::ui::visualizer::LevelMeter;
+use wim::ui::visualizer::{SpectrumMeter, SpectrumSmoother};
 use wim::Focus;
 
 /// The one way a browse view is opened, so the keyboard's two enter
@@ -764,6 +764,20 @@ fn main() -> anyhow::Result<()> {
 
     let player = mpv::Mpv::spawn()?;
     trace::mark("mpv spawned");
+    // All mpv HTTP(S) streams use the local address-pinning relay. Only
+    // explicitly configured Navidrome origins may resolve to private LAN
+    // addresses; every other destination must resolve wholly public.
+    let trusted_stream_origins = cfg
+        .navidrome_servers
+        .iter()
+        .map(|server| server.url.clone())
+        .collect::<Vec<_>>();
+    let media_proxy = wim::media_proxy::MediaProxy::start(&trusted_stream_origins).ok();
+    let watch_proxy_ready = media_proxy.as_ref().is_some_and(|proxy| {
+        player
+            .set_property("http-proxy", serde_json::json!(proxy.proxy_url()))
+            .is_ok()
+    });
     // per-track normalization is the sensible default; mpv reads the
     // gain from each file's own embedded tags as it plays.
     player.set_replaygain("track")?;
@@ -777,16 +791,22 @@ fn main() -> anyhow::Result<()> {
     // everywhere rather than individually named commands).
     let (mut keymap, keybind_warnings) = Keymap::from_overrides_reporting(&cfg.keybinds);
     let mut app = app::App::new(warming_corpus.take());
+    let mut torbox_workspace = wim::torbox_workspace::Workspace::new(
+        wim::torbox::Client::from_config(&cfg).map_err(|_| "TorBox is not configured".to_string()),
+    );
+    let mut torbox_open = false;
+    let mut watch_workspace = wim::watch_workspace::Workspace::new();
+    let mut watch_open = false;
     // so the first frame says "scanning" rather than "no local music
     // found"; cleared when the scan thread drops its sender. the
     // server equivalent is set below.
     app.scanning_library = true;
-    // restores whichever eq state was last active (a built-in, one of
+    // restores whichever eq curve was last selected (a built-in, one of
     // the user's saved curves, either of those nudged since, or a
     // nameless hand-tuned set) by name rather than a raw index, same
     // reasoning as `logo_style`; applied to mpv immediately so a
-    // persisted eq (and the level meter's `astats` tap, see
-    // `audio_level`) is live from the first frame, not only after the
+    // persisted eq and the spectrum analysis taps (see
+    // `build_player_af_filter`) is live from the first frame, not only after the
     // first manual 'e' press. the three-state resolution itself is
     // `eq::restore`, which is pure and unit-tested.
     let restored = eq::restore(
@@ -800,7 +820,11 @@ fn main() -> anyhow::Result<()> {
     if let Some(eq::Source::Builtin(i)) = restored.source {
         app.eq_preset = i;
     }
-    let _ = player.set_af(&eq::build_af_filter(&app.eq_gains));
+    let _ = player.set_af(&eq::build_player_af_filter(
+        &app.eq_gains,
+        cfg.eq_enabled,
+        cfg.visualizer_bands as usize,
+    ));
     // which pane j/k/arrows/enter navigate: the sidebar's own results
     // list, the workspace (whatever's actually open there), or the
     // bottom bar's own controls. only ever changed from
@@ -912,9 +936,8 @@ fn main() -> anyhow::Result<()> {
     // default (index 0, ANSI Shadow). Restored from config by name,
     // not a raw index (see `Config::logo_style`'s own reasoning).
     let mut logo_index = ui::banner::logo_index_for_name(cfg.logo_style.as_deref());
-    // rolling window for the now-playing level meter; a fixed-size
-    // ring (just truncate the front) rather than growing forever.
-    let mut level_history: Vec<f32> = Vec::new();
+    // Per-band attack/release state for the maximized-player spectrum.
+    let mut spectrum_smoother = SpectrumSmoother::default();
     let mut notifications = Notifications::default();
     for warning in config_warnings.into_iter().chain(keybind_warnings) {
         notifications.push(Severity::Alert, warning);
@@ -1087,7 +1110,12 @@ fn main() -> anyhow::Result<()> {
         } else {
             cfg.library_paths.clone()
         };
-        Some(Onboarding::new(defaults))
+        let mut onboarding = Onboarding::new(defaults);
+        onboarding.torbox_token_file_input = std::env::var("WIM_TORBOX_TOKEN_FILE")
+            .ok()
+            .or_else(|| cfg.torbox_token_file.clone())
+            .unwrap_or_default();
+        Some(onboarding)
     } else {
         None
     };
@@ -1261,6 +1289,25 @@ fn main() -> anyhow::Result<()> {
     let mut first_frame_drawn = false;
     loop {
         notifications.expire();
+        torbox_workspace.poll();
+        watch_workspace.poll();
+        if let Some(path) = torbox_workspace.take_configured_path() {
+            cfg.torbox_token_file = Some(path);
+            config::save_or_warn(&cfg, &mut notifications);
+            if onboarding
+                .as_ref()
+                .is_some_and(|ob| ob.step == Step::TorBox)
+            {
+                if let Some(ob) = &mut onboarding {
+                    ob.advance();
+                }
+            }
+        }
+        if let (Some(ob), Some(error)) = (&mut onboarding, torbox_workspace.take_setup_error()) {
+            if ob.step == Step::TorBox {
+                ob.torbox_message = error;
+            }
+        }
         // once per frame, not once per widget that wants it: the
         // scrubber in the bottom bar, the mini bar and the full player
         // all read the same position, and each call is three ipc
@@ -1644,6 +1691,14 @@ fn main() -> anyhow::Result<()> {
                             area,
                         );
                     }
+                    Step::TorBox => f.render_widget(
+                        ui::torbox::SetupView {
+                            path: &ob.torbox_token_file_input,
+                            message: &ob.torbox_message,
+                            busy: torbox_workspace.setup_busy,
+                        },
+                        area,
+                    ),
                     Step::ListenBrainz => {
                         f.render_widget(
                             ListenBrainzView {
@@ -1926,6 +1981,14 @@ fn main() -> anyhow::Result<()> {
             // rect instead of the player.
             if show_full_player {
                 let item = now_playing.as_ref().expect("show_full_player implies Some");
+                // Keep one terminal cell per spectrum band. The meter
+                // occupies a fixed-width rail at the far right of the
+                // maximized player, rather than stretching horizontally
+                // across the player or covering its text/artwork.
+                let (player_content, spectrum_area) = ui::visualizer::player_spectrum_layout(
+                    main_content,
+                    cfg.visualizer_bands as usize,
+                );
                 let previous_label = previous_track.as_ref().map(label);
                 let next_label = play_queue.peek_next().map(label);
                 // the cover for what is *playing*: an open browse view's
@@ -1971,7 +2034,7 @@ fn main() -> anyhow::Result<()> {
                     scrubbing: scrub.is_some(),
                     keymap: &keymap,
                 };
-                let transport = player_view.transport(main_content);
+                let transport = player_view.transport(player_content);
                 for (field, rect) in transport.controls {
                     hits.controls.push(hit::Control {
                         transport: hit::Transport::Player,
@@ -1982,7 +2045,7 @@ fn main() -> anyhow::Result<()> {
                 if let Some(rect) = transport.track {
                     hits.tracks.push((hit::Transport::Player, rect));
                 }
-                f.render_widget(player_view, main_content);
+                f.render_widget(player_view, player_content);
                 if art_mode.is_full() {
                     // same contract as the browse view: the widget drew
                     // no ascii art, the real image goes on the exact
@@ -1990,7 +2053,7 @@ fn main() -> anyhow::Result<()> {
                     if let (Some(protocol), Some(art_rect)) = (
                         player_art.protocol(),
                         ui::player::layout(
-                            main_content,
+                            player_content,
                             playing_art.is_some(),
                             has_context,
                             aspect,
@@ -2001,23 +2064,14 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                level_history.push(audio_level(&playback, frame_elapsed));
-                let max_history = main_content.width.max(1) as usize;
-                if level_history.len() > max_history {
-                    level_history.drain(..level_history.len() - max_history);
-                }
-                if main_content.height > 2 {
-                    let meter_rect = Rect {
-                        y: main_content.y + main_content.height - 2,
-                        height: 2,
-                        ..main_content
-                    };
-                    f.render_widget(
-                        LevelMeter {
-                            history: &level_history,
-                        },
-                        meter_rect,
-                    );
+                let spectrum = playback.spectrum(cfg.visualizer_bands as usize);
+                let levels = spectrum_smoother.update(
+                    spectrum,
+                    cfg.visualizer_bands as usize,
+                    frame_elapsed,
+                );
+                if spectrum_area.width > 0 {
+                    f.render_widget(SpectrumMeter { levels }, spectrum_area);
                 }
             } else if let Some(bv) = &browse_view {
                 let rows = ui::browse::rows(main_content, bv, art_mode, aspect);
@@ -2197,6 +2251,10 @@ fn main() -> anyhow::Result<()> {
                         art.protocol_type(),
                     ),
                     SettingsField::AsciiFps => ui::settings_menu::ascii_fps_value(cfg.ascii_fps),
+                    SettingsField::EqEnabled => {
+                        if cfg.eq_enabled { "on" } else { "off" }.to_string()
+                    }
+                    SettingsField::VisualizerBands => format!("{} bands", cfg.visualizer_bands),
                     SettingsField::Crossfade => {
                         if crossfade_enabled { "on" } else { "off" }.to_string()
                     }
@@ -2212,6 +2270,15 @@ fn main() -> anyhow::Result<()> {
                         format!("{:.0}s", cfg.scrobble.threshold_seconds)
                     }
                     SettingsField::ListenbrainzToken => token_value.clone(),
+                    SettingsField::TorboxTokenFile => {
+                        if std::env::var_os("WIM_TORBOX_TOKEN_FILE").is_some() {
+                            "environment override (press enter to review)".to_string()
+                        } else if cfg.torbox_token_file.is_some() {
+                            "token file configured (enter to test/change)".to_string()
+                        } else {
+                            "not connected (enter to set up)".to_string()
+                        }
+                    }
                 });
                 let shown: Vec<&str> = values.iter().map(String::as_str).collect();
                 f.render_widget(
@@ -2402,6 +2469,12 @@ fn main() -> anyhow::Result<()> {
                     },
                     area,
                 );
+            }
+            if torbox_open {
+                ui::torbox::render(f, area, &torbox_workspace);
+            }
+            if watch_open {
+                ui::watch::render(f, area, &watch_workspace);
             }
         })?;
 
@@ -3052,6 +3125,12 @@ fn main() -> anyhow::Result<()> {
                     format!("nothing to {} in {label}", into.verb()),
                 ),
                 Ok(tracks) => match into {
+                    Intent::Play => {
+                        match wim::core::start_session(tracks, false, &mut core, &mut surf) {
+                            Ok(status) => core.notifications.push(Severity::Info, status),
+                            Err(why) => core.notifications.push(Severity::Error, why),
+                        }
+                    }
                     Intent::Back => {
                         append_resolved(&tracks, &mut core);
                         // the row for this queue op was written before the
@@ -3093,6 +3172,7 @@ fn main() -> anyhow::Result<()> {
                 if let Some(ob) = &mut onboarding {
                     match ob.step {
                         Step::Navidrome => ob.login.current_mut().push_str(text),
+                        Step::TorBox => ob.torbox_token_file_input.push_str(text),
                         Step::ListenBrainz => ob.listenbrainz_token_input.push_str(text),
                         Step::Lyrics => ob.musixmatch_key_file_input.push_str(text),
                         Step::LibraryPaths => ob.path_input.push_str(text),
@@ -3102,6 +3182,18 @@ fn main() -> anyhow::Result<()> {
                     if let NavManagerStep::Add(form) = &mut nm.step {
                         form.current_mut().push_str(text);
                     }
+                } else if torbox_open && torbox_workspace.link_input.is_some() {
+                    if let Some(input) = &mut torbox_workspace.link_input {
+                        input.push_str(text);
+                    }
+                } else if torbox_open && torbox_workspace.page == wim::torbox_workspace::Page::Setup
+                {
+                    torbox_workspace.token_path_input.push_str(text);
+                } else if torbox_open
+                    && torbox_workspace.page == wim::torbox_workspace::Page::Search
+                    && torbox_workspace.search_editing
+                {
+                    torbox_workspace.query.push_str(text);
                 } else if settings_menu_open && settings_token_editing {
                     // long random tokens are exactly the kind of thing
                     // worth pasting rather than typing by hand.
@@ -3353,6 +3445,297 @@ fn main() -> anyhow::Result<()> {
                     break;
                 }
 
+                if torbox_open {
+                    use wim::torbox_workspace::Page;
+                    if torbox_workspace.link_input.is_some() {
+                        match key.code {
+                            KeyCode::Esc => torbox_workspace.link_input = None,
+                            KeyCode::Backspace => {
+                                if let Some(input) = &mut torbox_workspace.link_input {
+                                    input.pop();
+                                }
+                            }
+                            KeyCode::Enter => torbox_workspace.commit_add(),
+                            KeyCode::Char(c) => {
+                                if let Some(input) = &mut torbox_workspace.link_input {
+                                    input.push(c);
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    match key.code {
+                        KeyCode::Esc if torbox_workspace.page == Page::Setup => {
+                            torbox_workspace.page = Page::Search;
+                        }
+                        KeyCode::Esc
+                            if torbox_workspace.page == Page::Search
+                                && torbox_workspace.search_editing =>
+                        {
+                            torbox_workspace.search_editing = false;
+                        }
+                        KeyCode::Esc => torbox_open = false,
+                        KeyCode::Backspace if torbox_workspace.page == Page::Setup => {
+                            torbox_workspace.token_path_input.pop();
+                        }
+                        KeyCode::Char(c) if torbox_workspace.page == Page::Setup => {
+                            torbox_workspace.token_path_input.push(c);
+                        }
+                        KeyCode::Enter if torbox_workspace.page == Page::Setup => {
+                            if !torbox_workspace.setup_busy {
+                                torbox_workspace.commit_setup();
+                            }
+                        }
+                        KeyCode::Char(c)
+                            if torbox_workspace.page == Page::Search
+                                && torbox_workspace.search_editing =>
+                        {
+                            torbox_workspace.query.push(c);
+                        }
+                        KeyCode::Backspace
+                            if torbox_workspace.page == Page::Search
+                                && torbox_workspace.search_editing =>
+                        {
+                            torbox_workspace.query.pop();
+                        }
+                        KeyCode::Enter
+                            if torbox_workspace.page == Page::Search
+                                && torbox_workspace.search_editing =>
+                        {
+                            torbox_workspace.search();
+                        }
+                        KeyCode::Char('/') if torbox_workspace.page == Page::Search => {
+                            torbox_workspace.begin_search_edit();
+                        }
+                        KeyCode::Char('c') => {
+                            torbox_workspace.begin_setup(cfg.torbox_token_file.as_deref());
+                        }
+                        KeyCode::Char('s') if torbox_workspace.page != Page::Search => {
+                            torbox_workspace.begin_search_edit();
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => torbox_workspace.move_selection(-1),
+                        KeyCode::Down | KeyCode::Char('j') => torbox_workspace.move_selection(1),
+                        KeyCode::Char('b') if torbox_workspace.page == Page::Search => {
+                            torbox_workspace.load_account(torbox_workspace.service)
+                        }
+                        KeyCode::Char('1') => {
+                            torbox_workspace.load_account(wim::torbox::Service::Torrent)
+                        }
+                        KeyCode::Char('2') => {
+                            torbox_workspace.load_account(wim::torbox::Service::Usenet)
+                        }
+                        KeyCode::Char('3') => {
+                            torbox_workspace.load_account(wim::torbox::Service::WebDownload)
+                        }
+                        KeyCode::Char('r') if torbox_workspace.page == Page::Account => {
+                            torbox_workspace.load_account(torbox_workspace.service);
+                        }
+                        KeyCode::Char('n') if torbox_workspace.page == Page::Account => {
+                            torbox_workspace.load_more_account();
+                        }
+                        KeyCode::Char('+') if torbox_workspace.page == Page::Account => {
+                            torbox_workspace.begin_add();
+                        }
+                        KeyCode::Char('d') if torbox_workspace.page == Page::Account => {
+                            torbox_workspace.control_selected("delete");
+                        }
+                        KeyCode::Char('p') if torbox_workspace.page == Page::Account => {
+                            let op = torbox_workspace
+                                .account
+                                .get(torbox_workspace.selected)
+                                .and_then(|item| match item.service {
+                                    wim::torbox::Service::Torrent => {
+                                        if item.status.to_ascii_lowercase().contains("paused") {
+                                            Some("resume")
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    wim::torbox::Service::Usenet => Some(
+                                        if item.status.to_ascii_lowercase().contains("paused") {
+                                            "resume"
+                                        } else {
+                                            "pause"
+                                        },
+                                    ),
+                                    wim::torbox::Service::WebDownload => None,
+                                });
+                            if let Some(op) = op {
+                                torbox_workspace.control_selected(op);
+                            } else {
+                                torbox_workspace.message =
+                                    Some("this service only supports resume or delete here".into());
+                            }
+                        }
+                        KeyCode::Char('R') if torbox_workspace.page == Page::Account => {
+                            if torbox_workspace.service == wim::torbox::Service::Torrent {
+                                torbox_workspace.control_selected("reannounce");
+                            }
+                        }
+                        KeyCode::Backspace if torbox_workspace.page == Page::Files => {
+                            torbox_workspace.page = Page::Account;
+                            torbox_workspace.selected = 0;
+                        }
+                        KeyCode::Enter if torbox_workspace.page == Page::Files => {
+                            if let Some(item) = torbox_workspace.selected_playable() {
+                                let mut surf = wim_surface!();
+                                let mut core = core_ctx!();
+                                dispatch_action(app::Action::Play(item), &mut core, &mut surf);
+                                torbox_open = false;
+                            }
+                        }
+                        KeyCode::Char('q') if torbox_workspace.page == Page::Files => {
+                            if let Some(item) = torbox_workspace.selected_playable() {
+                                let mut surf = wim_surface!();
+                                let mut core = core_ctx!();
+                                dispatch_action(app::Action::Queued(item), &mut core, &mut surf);
+                            }
+                        }
+                        KeyCode::Enter if torbox_workspace.page == Page::Account => {
+                            torbox_workspace.open_account_item();
+                        }
+                        KeyCode::Char('a') if torbox_workspace.page == Page::Releases => {
+                            torbox_workspace.add_selected();
+                        }
+                        KeyCode::Backspace if torbox_workspace.page == Page::Releases => {
+                            torbox_workspace.page = Page::Search;
+                        }
+                        KeyCode::Enter if torbox_workspace.page == Page::Search => {
+                            torbox_workspace.open_releases();
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if watch_open {
+                    use wim::watch_workspace::Page;
+                    match key.code {
+                        KeyCode::Esc
+                            if watch_workspace.page == Page::Search
+                                && watch_workspace.search_editing =>
+                        {
+                            watch_workspace.search_editing = false;
+                        }
+                        KeyCode::Esc => watch_open = false,
+                        KeyCode::Char(c)
+                            if watch_workspace.page == Page::Search
+                                && watch_workspace.search_editing =>
+                        {
+                            watch_workspace.query.push(c);
+                        }
+                        KeyCode::Backspace
+                            if watch_workspace.page == Page::Search
+                                && watch_workspace.search_editing =>
+                        {
+                            watch_workspace.query.pop();
+                        }
+                        KeyCode::Char('/') if watch_workspace.page == Page::Search => {
+                            watch_workspace.search_editing = true;
+                        }
+                        KeyCode::Char('r') if watch_workspace.page != Page::Search => {
+                            watch_workspace.spoilers_revealed = !watch_workspace.spoilers_revealed;
+                        }
+                        KeyCode::Char('[') if watch_workspace.page == Page::Episodes => {
+                            watch_workspace.move_season(-1)
+                        }
+                        KeyCode::Char(']') if watch_workspace.page == Page::Episodes => {
+                            watch_workspace.move_season(1)
+                        }
+                        KeyCode::Up | KeyCode::Char('k') if !watch_workspace.search_editing => {
+                            watch_workspace.move_selection(-1)
+                        }
+                        KeyCode::Down | KeyCode::Char('j') if !watch_workspace.search_editing => {
+                            watch_workspace.move_selection(1)
+                        }
+                        KeyCode::Enter
+                            if watch_workspace.page == Page::Search
+                                && watch_workspace.search_editing =>
+                        {
+                            watch_workspace.search()
+                        }
+                        KeyCode::Enter if watch_workspace.page == Page::Search => {
+                            watch_workspace.open_selected()
+                        }
+                        KeyCode::Enter
+                            if watch_workspace.page == Page::Detail
+                                && watch_workspace.detail.as_ref().is_some_and(|item| {
+                                    item.kind == wim::media::MediaKind::Series
+                                }) =>
+                        {
+                            watch_workspace.enter_episodes()
+                        }
+                        KeyCode::Enter
+                            if matches!(watch_workspace.page, Page::Detail | Page::Episodes) =>
+                        {
+                            watch_workspace.load_selected_sources()
+                        }
+                        KeyCode::Enter if watch_workspace.page == Page::Sources => {
+                            if !watch_proxy_ready {
+                                watch_workspace.message = Some(
+                                    "secure media relay is unavailable; source playback is disabled".into(),
+                                );
+                            } else if let Some(prepared) = watch_workspace.prepared_source.take() {
+                                let item = prepared.into_search_item();
+                                let mut surf = wim_surface!();
+                                let mut core = core_ctx!();
+                                dispatch_action(app::Action::Play(item), &mut core, &mut surf);
+                                watch_open = false;
+                            } else {
+                                watch_workspace.prepare_selected_source();
+                            }
+                        }
+                        KeyCode::Backspace if watch_workspace.page == Page::Detail => {
+                            watch_workspace.enter_search()
+                        }
+                        KeyCode::Backspace if watch_workspace.page == Page::Episodes => {
+                            watch_workspace.page = Page::Detail;
+                            watch_workspace.selected = 0;
+                        }
+                        KeyCode::Backspace if watch_workspace.page == Page::Sources => {
+                            watch_workspace.page = if watch_workspace
+                                .detail
+                                .as_ref()
+                                .is_some_and(|item| item.kind == wim::media::MediaKind::Series)
+                            {
+                                Page::Episodes
+                            } else {
+                                Page::Detail
+                            };
+                            watch_workspace.selected = 0;
+                        }
+                        KeyCode::Char('s') if watch_workspace.page != Page::Search => {
+                            watch_workspace.enter_search()
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if onboarding.is_none() && key.code == KeyCode::Char('W') {
+                    watch_open = true;
+                    if !watch_workspace.is_configured() && !watch_workspace.loading {
+                        match std::env::var("WIM_STREMIO_ADDON_URL") {
+                            Ok(url) if !url.trim().is_empty() => watch_workspace.configure(url),
+                            _ => watch_workspace.message = Some("set WIM_STREMIO_ADDON_URL to an add-on HTTPS URL; no provider is enabled by default".into()),
+                        }
+                    } else if watch_workspace.page == wim::watch_workspace::Page::Search {
+                        watch_workspace.search_editing = true;
+                    }
+                    continue;
+                }
+
+                if onboarding.is_none() && key.code == KeyCode::Char('T') {
+                    torbox_open = true;
+                    if !torbox_workspace.is_configured() {
+                        torbox_workspace.begin_setup(cfg.torbox_token_file.as_deref());
+                    } else if torbox_workspace.page == wim::torbox_workspace::Page::Search {
+                        torbox_workspace.begin_search_edit();
+                    }
+                    continue;
+                }
+
                 if let Some(ob) = &mut onboarding {
                     match ob.step {
                         Step::Welcome | Step::Controls => ob.advance(),
@@ -3383,6 +3766,28 @@ fn main() -> anyhow::Result<()> {
                                         ob.advance();
                                     }
                                     Err(msg) => ob.login_message = format!("{msg} (esc to skip)"),
+                                }
+                            }
+                            _ => {}
+                        },
+                        Step::TorBox => match key.code {
+                            KeyCode::Esc => {
+                                torbox_workspace.cancel_setup();
+                                ob.advance();
+                            }
+                            KeyCode::Char(c) => ob.torbox_token_file_input.push(c),
+                            KeyCode::Backspace => {
+                                ob.torbox_token_file_input.pop();
+                            }
+                            KeyCode::Enter if !torbox_workspace.setup_busy => {
+                                let path = ob.torbox_token_file_input.trim().to_owned();
+                                if path.is_empty() {
+                                    ob.advance();
+                                } else {
+                                    ob.torbox_message =
+                                        "checking the token file and connection…".into();
+                                    torbox_workspace.token_path_input = path;
+                                    torbox_workspace.commit_setup();
                                 }
                             }
                             _ => {}
@@ -3864,6 +4269,61 @@ fn main() -> anyhow::Result<()> {
                             cfg.ascii_fps = config::step_ascii_fps(cfg.ascii_fps, 1);
                             config::save_or_warn(&cfg, &mut notifications);
                         }
+                        KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right
+                            if settings_field() == SettingsField::EqEnabled =>
+                        {
+                            let enabled = matches!(key.code, KeyCode::Char('l') | KeyCode::Right);
+                            if enabled == cfg.eq_enabled {
+                                continue;
+                            }
+                            if let Err(e) = player.set_af(&eq::build_player_af_filter(
+                                &app.eq_gains,
+                                enabled,
+                                cfg.visualizer_bands as usize,
+                            )) {
+                                notifications
+                                    .push(Severity::Error, format!("error setting eq: {e}"));
+                            } else {
+                                cfg.eq_enabled = enabled;
+                                config::save_or_warn(&cfg, &mut notifications);
+                            }
+                        }
+                        KeyCode::Char('h') | KeyCode::Left
+                            if settings_field() == SettingsField::VisualizerBands =>
+                        {
+                            let bands = cfg.visualizer_bands.saturating_sub(1).max(4);
+                            if let Err(e) = player.set_af(&eq::build_player_af_filter(
+                                &app.eq_gains,
+                                cfg.eq_enabled,
+                                bands as usize,
+                            )) {
+                                notifications.push(
+                                    Severity::Error,
+                                    format!("error setting visualizer: {e}"),
+                                );
+                            } else {
+                                cfg.visualizer_bands = bands;
+                                config::save_or_warn(&cfg, &mut notifications);
+                            }
+                        }
+                        KeyCode::Char('l') | KeyCode::Right
+                            if settings_field() == SettingsField::VisualizerBands =>
+                        {
+                            let bands = (cfg.visualizer_bands + 1).min(32);
+                            if let Err(e) = player.set_af(&eq::build_player_af_filter(
+                                &app.eq_gains,
+                                cfg.eq_enabled,
+                                bands as usize,
+                            )) {
+                                notifications.push(
+                                    Severity::Error,
+                                    format!("error setting visualizer: {e}"),
+                                );
+                            } else {
+                                cfg.visualizer_bands = bands;
+                                config::save_or_warn(&cfg, &mut notifications);
+                            }
+                        }
                         KeyCode::Char('h') | KeyCode::Left
                             if settings_field() == SettingsField::Crossfade =>
                         {
@@ -3937,6 +4397,11 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Enter if settings_field() == SettingsField::ListenbrainzToken => {
                             settings_token_editing = true;
                             settings_token_input.clear();
+                        }
+                        KeyCode::Enter if settings_field() == SettingsField::TorboxTokenFile => {
+                            settings_menu_open = false;
+                            torbox_workspace.begin_setup(cfg.torbox_token_file.as_deref());
+                            torbox_open = true;
                         }
                         _ => {}
                     }
@@ -4116,16 +4581,34 @@ fn main() -> anyhow::Result<()> {
                                 &mut notifications,
                                 &cfg.eq_custom_presets,
                                 eq_menu.selected(),
+                                cfg.eq_enabled,
+                                cfg.visualizer_bands as usize,
                             );
                         }
                         KeyCode::Char('h') | KeyCode::Left => {
                             if let ui::eq_menu::Cursor::Band(band) = at {
-                                adjust_eq_band(&mut app, &player, &mut notifications, band, -1.0);
+                                adjust_eq_band(
+                                    &mut app,
+                                    &player,
+                                    &mut notifications,
+                                    band,
+                                    -1.0,
+                                    cfg.eq_enabled,
+                                    cfg.visualizer_bands as usize,
+                                );
                             }
                         }
                         KeyCode::Char('l') | KeyCode::Right => {
                             if let ui::eq_menu::Cursor::Band(band) = at {
-                                adjust_eq_band(&mut app, &player, &mut notifications, band, 1.0);
+                                adjust_eq_band(
+                                    &mut app,
+                                    &player,
+                                    &mut notifications,
+                                    band,
+                                    1.0,
+                                    cfg.eq_enabled,
+                                    cfg.visualizer_bands as usize,
+                                );
                             }
                         }
                         _ => {}

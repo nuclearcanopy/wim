@@ -1,5 +1,5 @@
-//! First-run onboarding: welcome, controls, navidrome setup,
-//! listenbrainz token (optional, skippable), library paths; a proper
+//! First-run onboarding: welcome, controls, Navidrome and optional TorBox
+//! setup, listenbrainz token (optional, skippable), lyrics, and library paths; a proper
 //! guided sequence rather than a disconnected login popup appearing
 //! with no context. Pure state only; main.rs owns the
 //! network/filesystem orchestration (pinging navidrome, saving config),
@@ -17,6 +17,7 @@ pub enum Step {
     Welcome,
     Controls,
     Navidrome,
+    TorBox,
     ListenBrainz,
     Lyrics,
     LibraryPaths,
@@ -27,6 +28,8 @@ pub struct Onboarding {
     pub step: Step,
     pub login: LoginForm,
     pub login_message: String,
+    pub torbox_token_file_input: String,
+    pub torbox_message: String,
     /// Raw token as typed so far; entirely optional, skippable with
     /// esc or an empty enter (see main.rs's `Step::ListenBrainz`
     /// handling). Also the integration point for "prompt again on
@@ -46,6 +49,8 @@ impl Onboarding {
             step: Step::Welcome,
             login: LoginForm::new(),
             login_message: String::new(),
+            torbox_token_file_input: String::new(),
+            torbox_message: String::new(),
             listenbrainz_token_input: String::new(),
             lyrics_providers: crate::config::LyricsConfig::default().providers,
             musixmatch_key_file_input: String::new(),
@@ -58,7 +63,8 @@ impl Onboarding {
         self.step = match self.step {
             Step::Welcome => Step::Controls,
             Step::Controls => Step::Navidrome,
-            Step::Navidrome => Step::ListenBrainz,
+            Step::Navidrome => Step::TorBox,
+            Step::TorBox => Step::ListenBrainz,
             Step::ListenBrainz => Step::Lyrics,
             Step::Lyrics => Step::LibraryPaths,
             Step::LibraryPaths => Step::Done,

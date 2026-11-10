@@ -20,6 +20,8 @@ pub enum Field {
     AlbumArt,
     VideoOutput,
     AsciiFps,
+    EqEnabled,
+    VisualizerBands,
     Crossfade,
     CrossfadeSeconds,
     CacheDaysThreshold,
@@ -27,15 +29,18 @@ pub enum Field {
     ScrobblePercent,
     ScrobbleSeconds,
     ListenbrainzToken,
+    TorboxTokenFile,
 }
 
-/// Every row, in the order they are drawn. The two display settings
-/// sit together at the top, and the token stays last because it is the
-/// only one that opens an editor and the footer hint names it.
-pub const FIELDS: [Field; 10] = [
+/// Every row, in the order they are drawn. Display and playback settings
+/// stay near the top; the token stays last because it is the only one
+/// that opens an editor and the footer hint names it.
+pub const FIELDS: [Field; 13] = [
     Field::AlbumArt,
     Field::VideoOutput,
     Field::AsciiFps,
+    Field::EqEnabled,
+    Field::VisualizerBands,
     Field::Crossfade,
     Field::CrossfadeSeconds,
     Field::CacheDaysThreshold,
@@ -43,6 +48,7 @@ pub const FIELDS: [Field; 10] = [
     Field::ScrobblePercent,
     Field::ScrobbleSeconds,
     Field::ListenbrainzToken,
+    Field::TorboxTokenFile,
 ];
 
 pub const FIELD_COUNT: usize = FIELDS.len();
@@ -53,6 +59,8 @@ impl Field {
             Field::AlbumArt => "album art",
             Field::VideoOutput => "video output",
             Field::AsciiFps => "text-cell video rate",
+            Field::EqEnabled => "equalizer",
+            Field::VisualizerBands => "visualizer bands",
             Field::Crossfade => "crossfade",
             Field::CrossfadeSeconds => "crossfade seconds",
             Field::CacheDaysThreshold => "cache after days played",
@@ -60,6 +68,7 @@ impl Field {
             Field::ScrobblePercent => "scrobble % threshold",
             Field::ScrobbleSeconds => "scrobble seconds threshold",
             Field::ListenbrainzToken => "listenbrainz token",
+            Field::TorboxTokenFile => "TorBox connection",
         }
     }
 }
@@ -165,9 +174,15 @@ impl Widget for SettingsMenu<'_> {
         // what is left: it had no offset at all, so on a short pane
         // the last fields were selectable but never drawn. the second
         // hint is a pointer elsewhere and is left to clip.
-        let footer = 2;
+        // Reserve a spacer and both guidance rows inside the frame. The
+        // second hint used to land on the bottom border at normal terminal
+        // heights, making the keymap/subtitle entry points disappear.
         let list_top = y;
         let room = (area.y + area.height).saturating_sub(list_top);
+        // On short panes, keep selection rows and the primary hint ahead of
+        // the secondary discovery hint. On a normal pane reserve both hints
+        // and a spacer so neither is painted over the bottom frame.
+        let footer = if room >= 10 { 4 } else { 2 };
         let rows = room.saturating_sub(footer).min(FIELD_COUNT as u16);
         let offset = crate::ui::scroll::offset_for(self.selected, rows as usize);
         // one column of gutter for the scroll cue, and only while
@@ -216,7 +231,7 @@ impl Widget for SettingsMenu<'_> {
             buf,
             area,
             y,
-            "j/k select, h/l adjust, enter on 'listenbrainz token' to set/change it",
+            "j/k select, h/l adjust, enter on a token row to configure it",
             shade(DIM),
         );
         y += 1;
@@ -266,6 +281,8 @@ mod tests {
                 "on",
                 "auto (tct)",
                 "the file's own rate",
+                "on",
+                "10 bands",
                 "off",
                 "3",
                 "7",
@@ -273,14 +290,14 @@ mod tests {
                 "50",
                 "240",
                 "set",
+                "not connected",
             ],
         );
         assert_eq!(grid(&buf), SNAPSHOT.join("\n"));
     }
 
-    /// Two more rows than there is room for the secondary hint, so
-    /// it clips: `footer` reserves the primary hint only, which is the
-    /// rule this file already had and this snapshot now exercises.
+    /// The menu reserves both footer hints without painting over the
+    /// bottom frame; on this short pane the list scrolls to make room.
     const SNAPSHOT: [&str; 17] = [
         "┌──────────────────────────────────────────────────────────────────────────────┐",
         "│ settings │ u or esc to close                                                 │",
@@ -289,15 +306,15 @@ mod tests {
         "│ > album art                   on                                             │",
         "│   video output                auto (tct)                                     │",
         "│   text-cell video rate        the file's own rate                            │",
+        "│   equalizer                   on                                             │",
+        "│   visualizer bands            10 bands                                       │",
         "│   crossfade                   off                                            │",
         "│   crossfade seconds           3                                              │",
-        "│   cache after days played     7                                              │",
-        "│   cache eviction days         30                                             │",
-        "│   scrobble % threshold        50                                             │",
-        "│   scrobble seconds threshold  240                                            │",
-        "│   listenbrainz token          set                                            │",
+        "│   cache after days played     7                                            ▾ │",
         "│                                                                              │",
-        "│ j/k select, h/l adjust, enter on 'listenbrainz token' to set/change it       │",
+        "│ j/k select, h/l adjust, enter on a token row to configure it                 │",
+        "│ other settings: '?' keybinds, 't' subtitles, left/right on the home screen l │",
+        "│                                                                              │",
         "└──────────────────────────────────────────────────────────────────────────────┘",
     ];
 
@@ -310,7 +327,7 @@ mod tests {
         render(
             area,
             &mut buf,
-            ["日本x", "", "", "", "", "", "", "", "", ""],
+            ["日本x", "", "", "", "", "", "", "", "", "", "", "", ""],
         );
         let g = grid(&buf);
         let row: Vec<char> = g
@@ -427,7 +444,7 @@ mod tests {
         };
         assert_eq!(cue(0, 10), (false, true), "more below only");
         assert_eq!(cue(FIELD_COUNT - 1, 10), (true, false), "above only");
-        assert_eq!(cue(0, 17), (false, false), "every field fits");
+        assert_eq!(cue(0, 17), (false, true), "only the last field is below");
     }
 
     #[test]
@@ -439,7 +456,7 @@ mod tests {
         let area = Rect::new(0, 0, 100, 20);
         let mut buf = Buffer::empty(area);
         SettingsMenu {
-            values: &["", "", "", "", "", "", "", "", "", ""],
+            values: &["", "", "", "", "", "", "", "", "", "", "", "", ""],
             selected: 0,
             keymap: &keymap,
         }
@@ -487,6 +504,7 @@ mod eyeball {
             "50%",
             "240s",
             "not set (enter to add)",
+            "not connected (enter to set up)",
         ];
         let last = FIELD_COUNT - 1;
         for (w, h, selected) in [
@@ -600,7 +618,7 @@ mod video_row_tests {
     #[test]
     fn the_cursor_always_names_a_row() {
         assert_eq!(field_at(0), Field::AlbumArt);
-        assert_eq!(field_at(FIELD_COUNT - 1), Field::ListenbrainzToken);
+        assert_eq!(field_at(FIELD_COUNT - 1), Field::TorboxTokenFile);
         assert_eq!(field_at(FIELD_COUNT), Field::AlbumArt);
         assert_eq!(field_at(usize::MAX), Field::AlbumArt);
     }
@@ -636,6 +654,8 @@ mod eyeball_video {
                 Field::AlbumArt => "ascii-bw ('i' also cycles this)".to_string(),
                 Field::VideoOutput => video_output_value(VideoOutput::Auto, None, probed),
                 Field::AsciiFps => ascii_fps_value(None),
+                Field::EqEnabled => "on".to_string(),
+                Field::VisualizerBands => "10 bands".to_string(),
                 Field::Crossfade => "off".to_string(),
                 Field::CrossfadeSeconds => "3.0s".to_string(),
                 Field::CacheDaysThreshold => "2 days played".to_string(),
@@ -643,6 +663,7 @@ mod eyeball_video {
                 Field::ScrobblePercent => "50%".to_string(),
                 Field::ScrobbleSeconds => "240s".to_string(),
                 Field::ListenbrainzToken => "set (enter to change)".to_string(),
+                Field::TorboxTokenFile => "not connected (enter to set up)".to_string(),
             })
             .collect();
         let borrowed: Vec<&str> = rows.iter().map(String::as_str).collect();

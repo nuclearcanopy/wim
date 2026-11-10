@@ -39,6 +39,7 @@ use crate::subsonic::Client;
 pub enum Kind {
     Local,
     Remote,
+    TorBox,
     /// A timed silence. Has neither a path nor a server, so it is the
     /// one kind `kind()`'s pre-kinds inference can never guess; a
     /// queue holding one is only loadable because the discriminant is
@@ -170,6 +171,14 @@ pub struct Entry {
     /// identical to what it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torbox_service: Option<crate::torbox::Service>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torbox_item_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torbox_file_id: Option<u64>,
+    #[serde(default)]
+    pub video: bool,
 }
 
 impl Entry {
@@ -185,6 +194,12 @@ impl Entry {
         }
         if self.server.is_some() && self.id.is_some() {
             return Some(Kind::Remote);
+        }
+        if self.torbox_service.is_some()
+            && self.torbox_item_id.is_some()
+            && self.torbox_file_id.is_some()
+        {
+            return Some(Kind::TorBox);
         }
         None
     }
@@ -281,22 +296,40 @@ pub fn load(name: &str, clients: &[Arc<Client>]) -> Option<Vec<SearchItem>> {
 /// came back as twelve tracks with nothing said about the other
 /// thirty-eight. Callers that can show a message should prefer this.
 pub fn load_report(name: &str, clients: &[Arc<Client>]) -> Option<Loaded> {
+    load_report_with_torbox(name, clients, None)
+}
+
+pub fn load_report_with_torbox(
+    name: &str,
+    clients: &[Arc<Client>],
+    torbox: Option<Arc<crate::torbox::Client>>,
+) -> Option<Loaded> {
     let path = dir().ok()?.join(format!("{}.toml", slug(name)));
     let raw = fs::read_to_string(path).ok()?;
     let saved: SavedQueue = toml::from_str(&raw).ok()?;
-    Some(rebuild(&saved, clients))
+    Some(rebuild_with_torbox(&saved, clients, torbox.as_ref()))
 }
 
 /// Split out from `load_report` so the rebuild rules are testable
 /// without touching the filesystem.
+#[cfg(test)]
 fn rebuild(saved: &SavedQueue, clients: &[Arc<Client>]) -> Loaded {
+    rebuild_with_torbox(saved, clients, None)
+}
+
+fn rebuild_with_torbox(
+    saved: &SavedQueue,
+    clients: &[Arc<Client>],
+    torbox: Option<&Arc<crate::torbox::Client>>,
+) -> Loaded {
     let mut out = Loaded::default();
     for entry in &saved.entries {
-        match item_of(entry, clients) {
+        match item_of_with_torbox(entry, clients, torbox) {
             Some(item) => out.items.push(item),
             None => out.dropped.push(match entry.kind() {
                 Some(Kind::Local) => Dropped::Moved(entry.label()),
                 Some(Kind::Remote) => Dropped::ServerGone(entry.label()),
+                Some(Kind::TorBox) => Dropped::Unrecognised(entry.label()),
                 // a silence always rebuilds (it needs nothing from
                 // the filesystem or a server), so that half is
                 // unreachable; a kind from a newer wim is the live
@@ -356,7 +389,26 @@ fn entry_of(item: &SearchItem) -> Option<Entry> {
             kind: Some(Kind::Remote),
             ..Entry::default()
         }),
-        SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => None,
+        SearchItem::TorBoxFile {
+            service,
+            item_id,
+            file_id,
+            title,
+            video,
+            ..
+        } => Some(Entry {
+            title: title.clone(),
+            kind: Some(Kind::TorBox),
+            torbox_service: Some(*service),
+            torbox_item_id: Some(*item_id),
+            torbox_file_id: Some(*file_id),
+            video: *video,
+            ..Entry::default()
+        }),
+        SearchItem::Artist { .. }
+        | SearchItem::Album { .. }
+        | SearchItem::Playlist { .. }
+        | SearchItem::WatchSource { .. } => None,
     }
 }
 
@@ -364,7 +416,16 @@ fn entry_of(item: &SearchItem) -> Option<Entry> {
 /// `persistence::item_from_path`, which is already the one place that
 /// knows how to classify a file; a remote song needs its server to
 /// still be connected, since the client is what builds a stream url.
+#[cfg(test)]
 fn item_of(entry: &Entry, clients: &[Arc<Client>]) -> Option<SearchItem> {
+    item_of_with_torbox(entry, clients, None)
+}
+
+fn item_of_with_torbox(
+    entry: &Entry,
+    clients: &[Arc<Client>],
+    torbox: Option<&Arc<crate::torbox::Client>>,
+) -> Option<SearchItem> {
     // the kind decides, not which fields happen to be filled in: an
     // entry from a newer wim can carry a path or a server and still
     // not be rebuildable as either.
@@ -386,6 +447,15 @@ fn item_of(entry: &Entry, clients: &[Arc<Client>]) -> Option<SearchItem> {
                 client: client.clone(),
             })
         }
+        Kind::TorBox => Some(SearchItem::TorBoxFile {
+            service: entry.torbox_service?,
+            item_id: entry.torbox_item_id?,
+            file_id: entry.torbox_file_id?,
+            title: entry.title.clone(),
+            video: entry.video,
+            client: Arc::clone(torbox?),
+            resolved_url: None,
+        }),
         Kind::Unknown => None,
     }
 }
@@ -433,6 +503,44 @@ mod tests {
 
         let back = item_of(&entry, &[]).expect("and loads with no clients at all");
         assert!(matches!(back, SearchItem::Silence { secs: 900 }));
+    }
+
+    #[test]
+    fn torbox_queue_entries_keep_stable_ids_and_never_keep_the_stream_url() {
+        let dir = std::env::temp_dir().join(format!("wim-torbox-queue-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let token_path = dir.join("token");
+        fs::write(&token_path, "unit-test-token").unwrap();
+        let client = Arc::new(crate::torbox::Client::from_token_file(&token_path).unwrap());
+        let item = SearchItem::TorBoxFile {
+            service: crate::torbox::Service::Torrent,
+            item_id: 14,
+            file_id: 3,
+            title: "episode.mkv".into(),
+            video: true,
+            client: client.clone(),
+            resolved_url: Some("https://cdn.invalid/signed?token=do-not-save".into()),
+        };
+        let entry = entry_of(&item).unwrap();
+        let toml = toml::to_string(&entry).unwrap();
+        assert!(toml.contains("torbox_item_id = 14"));
+        assert!(toml.contains("torbox_file_id = 3"));
+        assert!(!toml.contains("cdn.invalid"));
+        assert!(!toml.contains("do-not-save"));
+
+        let loaded = item_of_with_torbox(&entry, &[], Some(&client)).unwrap();
+        assert!(matches!(
+            loaded,
+            SearchItem::TorBoxFile {
+                service: crate::torbox::Service::Torrent,
+                item_id: 14,
+                file_id: 3,
+                video: true,
+                resolved_url: None,
+                ..
+            }
+        ));
+        fs::remove_dir_all(dir).ok();
     }
 
     /// The compatibility half: a silence adds no keys to an entry that
@@ -493,6 +601,18 @@ mod tests {
             title: "clip".into(),
         })
         .is_some());
+        assert!(entry_of(&SearchItem::WatchSource {
+            identity: crate::media::PlaybackIdentity {
+                media_id: "film".into(),
+                episode_id: None,
+                source_id: "stable-hash".into(),
+            },
+            title: "Film · Source 1".into(),
+            url: crate::search::EphemeralUrl::new(
+                "https://cdn.invalid/film?signature=do-not-save".into(),
+            ),
+        })
+        .is_none());
     }
 
     #[test]

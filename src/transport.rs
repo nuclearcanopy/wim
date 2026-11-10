@@ -6,9 +6,8 @@
 //! those or reads playback to draw one, and none of it knows about
 //! panes, menus or the input tiers.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crate::anim;
 use crate::core::{apply_op, CoreCtx, Surface};
 use crate::mpv;
 use crate::notify::{Notifications, Severity};
@@ -100,22 +99,15 @@ pub fn commit_scrub(
     *scrub_sent_at = None;
 }
 
-/// Current output level, 0..1, for the now-playing level meter. Reads
-/// the `astats` tap `build_af_filter` (eq.rs) puts at the end of the af
-/// chain, which mpv pushes (`mpv::PROP_LEVEL_RMS`) rather than being
-/// asked for: this used to be a blocking IPC round trip per frame. No
-/// fresh reading (paused, stopped, or an mpv that doesn't resolve the
-/// property) falls back to a calm idle breathe instead of silently
-/// showing a dead meter, driven off `elapsed` like every other
-/// animation.
-pub fn audio_level(playback: &mpv::Playback, elapsed: Duration) -> f32 {
-    playback.level().unwrap_or_else(|| {
-        (anim::pulse(elapsed, anim::LEVEL_FALLBACK_PERIOD) * 0.6 + 0.05).clamp(0.0, 1.0)
-    })
-}
-
 pub fn now_playing_is_video(now_playing: &Option<SearchItem>) -> bool {
-    matches!(now_playing, Some(SearchItem::LocalVideo { .. }))
+    matches!(
+        now_playing,
+        Some(
+            SearchItem::LocalVideo { .. }
+                | SearchItem::TorBoxFile { video: true, .. }
+                | SearchItem::WatchSource { .. }
+        )
+    )
 }
 
 #[cfg(test)]
@@ -140,21 +132,5 @@ mod tests {
             artist: None,
             album: None,
         })));
-    }
-
-    /// With no reading from mpv the meter breathes rather than sitting
-    /// dead, and the fallback has to stay inside the meter's range.
-    #[test]
-    fn a_missing_level_breathes_instead_of_reading_zero() {
-        let playback = mpv::Playback::default();
-        for ms in [0u64, 250, 500, 900, 1500] {
-            let level = audio_level(&playback, Duration::from_millis(ms));
-            assert!((0.0..=1.0).contains(&level), "{ms}ms gave {level}");
-        }
-        // and it actually moves, which is the point of a fallback
-        // rather than a constant.
-        let a = audio_level(&playback, Duration::ZERO);
-        let b = audio_level(&playback, anim::LEVEL_FALLBACK_PERIOD / 2);
-        assert!((a - b).abs() > 0.01, "{a} vs {b} is not a breathe");
     }
 }

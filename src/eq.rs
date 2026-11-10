@@ -446,6 +446,53 @@ pub fn build_af_filter(gains: &[f64; 10]) -> String {
     format!("@{LEVEL_METADATA_LABEL}:lavfi=[{}]", stages.join(","))
 }
 
+/// Builds the player's EQ plus a transparent parallel analysis bank.
+/// The dry stereo branch is the output; bandpass branches are merged
+/// only long enough for astats to report one mono RMS per band, then
+/// `pan` selects the untouched dry channels for playback.
+pub fn build_player_af_filter(gains: &[f64; 10], enabled: bool, bands: usize) -> String {
+    let bands = bands.clamp(4, 32);
+    let mut stages = Vec::new();
+    if enabled && !is_flat(gains) {
+        for (hz, g) in BAND_HZ.iter().zip(compensated_gains(gains).iter()) {
+            if g.abs() >= MIN_AUDIBLE_DB {
+                stages.push(format!("equalizer=f={hz}:width_type=o:width=1:g={g:.3}"));
+            }
+        }
+    }
+    stages.push("aformat=channel_layouts=stereo,asplit=2[dry][analysis]".to_string());
+
+    let mut graph = stages.join(",");
+    graph.push_str(&format!(
+        ";[analysis]pan=mono|c0=0.5*c0+0.5*c1,asplit={bands}{}",
+        (0..bands).map(|i| format!("[src{i}]")).collect::<String>()
+    ));
+    for i in 0..bands {
+        // Equal-width log-frequency bands from 30 Hz to 18 kHz.
+        // Geometric centers make the low end legible without wasting
+        // most bars on frequencies the ear groups together.
+        let low = 30.0 * (18_000.0_f64 / 30.0).powf(i as f64 / bands as f64);
+        let high = 30.0 * (18_000.0_f64 / 30.0).powf((i + 1) as f64 / bands as f64);
+        let center = (low * high).sqrt();
+        let width_octaves = (high / low).log2();
+        graph.push_str(&format!(
+            ";[src{i}]bandpass=f={center:.3}:width_type=o:width={width_octaves:.4}[band{i}]"
+        ));
+    }
+    graph.push_str(";[dry]");
+    for i in 0..bands {
+        graph.push_str(&format!("[band{i}]"));
+    }
+    graph.push_str(&format!(
+        // `astats` defaults to calculating dozens of measurements for
+        // every channel. At 32 bands that work dominates audio decode;
+        // the UI needs only per-channel RMS, and no aggregate reading.
+        "amerge=inputs={},astats=metadata=1:reset=1:measure_perchannel=RMS_level:measure_overall=none,pan=stereo|c0=c0|c1=c1",
+        bands + 1
+    ));
+    format!("@{LEVEL_METADATA_LABEL}:lavfi=[{graph}]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,6 +556,32 @@ mod tests {
             assert!(filter.starts_with(&format!("@{LEVEL_METADATA_LABEL}:lavfi=[")));
             assert!(filter.contains("astats=metadata=1:reset=1"));
         }
+    }
+
+    #[test]
+    fn player_filter_adds_a_stereo_transparent_analysis_bank() {
+        let filter = build_player_af_filter(&[0.0; 10], true, 10);
+        assert!(filter.starts_with(&format!("@{}:lavfi=[", LEVEL_METADATA_LABEL)));
+        assert!(filter.contains("asplit=2[dry][analysis]"));
+        assert!(filter.contains("pan=mono|c0=0.5*c0+0.5*c1,asplit=10"));
+        assert!(filter.contains("bandpass=f="));
+        assert!(filter.contains(
+            "astats=metadata=1:reset=1:measure_perchannel=RMS_level:measure_overall=none"
+        ));
+        assert!(filter.ends_with("pan=stereo|c0=c0|c1=c1]"));
+        assert_eq!(filter.matches("[src").count(), 20);
+        assert_eq!(filter.matches("[band").count(), 20);
+    }
+
+    #[test]
+    fn disabled_eq_preserves_analysis_and_bypasses_equalizers() {
+        let gains = [6.0, 5.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let enabled = build_player_af_filter(&gains, true, 10);
+        let disabled = build_player_af_filter(&gains, false, 10);
+        assert!(enabled.contains("equalizer="));
+        assert!(!disabled.contains("equalizer="));
+        assert!(disabled.contains("asplit=2[dry][analysis]"));
+        assert!(disabled.ends_with("pan=stereo|c0=c0|c1=c1]"));
     }
 
     /// Forward-applies `BAND_SPILL`, i.e. what the cascade realizes at

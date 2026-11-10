@@ -27,6 +27,8 @@ pub mod library;
 pub mod listenbrainz;
 pub mod lyrics;
 pub mod lyricspane;
+pub mod media;
+pub mod media_proxy;
 pub mod mpv;
 pub mod namehint;
 pub mod navmanager;
@@ -39,16 +41,20 @@ pub mod queues;
 pub mod search;
 pub mod shellsong;
 pub mod shellsong_host;
+pub mod stremio;
 pub mod subsonic;
 pub mod suggest;
 pub mod swimconsole;
 pub mod term;
 pub mod theme;
+pub mod torbox;
+pub mod torbox_workspace;
 pub mod trace;
 pub mod transport;
 pub mod ui;
 pub mod undo;
 pub mod video;
+pub mod watch_workspace;
 
 /// Which pane plain navigation (j/k/arrows/enter) currently targets.
 /// Lives at the crate root rather than in a front-end because
