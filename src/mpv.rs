@@ -550,9 +550,32 @@ fn read_replies(
                 // never the payload: payloads can carry paths, and the
                 // names alone already show the load/pause/eof sequence
                 // a playback attempt made. `tick` fires about once a
-                // second forever, so it is noise here.
+                // second forever, so it is noise here. The log's value
+                // type is a fixed vocabulary, so the names are matched
+                // to it here rather than passed through: anything not
+                // in the list is "other", which still shows the
+                // sequence without inventing a text channel.
                 if name != "tick" {
-                    crate::trace::diag("mpv", "event", &[("event", name.to_string())]);
+                    const LOGGED_EVENTS: &[&str] = &[
+                        "file-loaded",
+                        "end-file",
+                        "start-file",
+                        "idle",
+                        "pause",
+                        "unpause",
+                        "seek",
+                        "playback-restart",
+                    ];
+                    let label = LOGGED_EVENTS
+                        .iter()
+                        .find(|logged| **logged == name)
+                        .copied()
+                        .unwrap_or("other");
+                    crate::trace::diag(
+                        "mpv",
+                        "event",
+                        &[("event", crate::trace::Value::Label(label))],
+                    );
                 }
                 let _ = event_tx.send(Event::Other(v));
             }
