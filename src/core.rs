@@ -575,13 +575,20 @@ impl TrackResolver {
         });
         let (items, tx, shared) = (items, self.tx.clone(), Arc::clone(&self.epoch));
         let sent = label.clone();
-        let intent = format!("{into:?}");
         trace::diag(
             "resolve",
             "start",
             &[
-                ("intent", intent.clone()),
-                ("items", items.len().to_string()),
+                (
+                    "intent",
+                    trace::Value::Label(match into {
+                        Intent::Play => "play",
+                        Intent::Back => "back",
+                        Intent::Front => "front",
+                        Intent::Download => "download",
+                    }),
+                ),
+                ("items", trace::Value::Num(items.len() as f64)),
             ],
         );
         let started = Instant::now();
@@ -613,19 +620,20 @@ impl TrackResolver {
                                     "resolve",
                                     "link-ok",
                                     &[
-                                        ("ms", started_at.elapsed().as_secs_f64().to_string()),
-                                        ("service", service.as_str().to_string()),
+                                        ("ms", trace::Value::Num(started_at.elapsed().as_secs_f64() * 1000.0)),
+                                        ("service", trace::Value::Label(service.as_str())),
                                     ],
                                 );
                             }
                             Err(why) => {
+                                // the failure is the event; the reason
+                                // text goes to the user's notification,
+                                // not the log, where it would be the
+                                // one free-form string in the file.
                                 trace::diag(
                                     "resolve",
                                     "item-failed",
-                                    &[
-                                        ("service", service.as_str().to_string()),
-                                        ("why", why.clone()),
-                                    ],
+                                    &[("service", trace::Value::Label(service.as_str()))],
                                 );
                                 return Err(why);
                             }
@@ -643,14 +651,10 @@ impl TrackResolver {
                 "resolve",
                 "done",
                 &[
-                    ("ms", started.elapsed().as_secs_f64().to_string()),
+                    ("ms", trace::Value::Num(started.elapsed().as_secs_f64() * 1000.0)),
                     (
                         "outcome",
-                        if tracks.is_ok() {
-                            "ok".to_string()
-                        } else {
-                            "fail".to_string()
-                        },
+                        trace::Value::Label(if tracks.is_ok() { "ok" } else { "fail" }),
                     ),
                 ],
             );
