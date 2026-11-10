@@ -18,6 +18,7 @@ use crate::playqueue::PlayQueue;
 use crate::search::SearchItem;
 use crate::shellsong::{self, Console, GoTarget, Op, Program, Target, ViewTarget};
 use crate::shellsong_host::{Ramp, SearchSettle};
+use crate::trace;
 use crate::ui::controlsbar::Field;
 use crate::ui::results_list::label;
 use crate::{
@@ -574,6 +575,16 @@ impl TrackResolver {
         });
         let (items, tx, shared) = (items, self.tx.clone(), Arc::clone(&self.epoch));
         let sent = label.clone();
+        let intent = format!("{into:?}");
+        trace::diag(
+            "resolve",
+            "start",
+            &[
+                ("intent", intent.clone()),
+                ("items", items.len().to_string()),
+            ],
+        );
+        let started = Instant::now();
         thread::spawn(move || {
             let tracks = items.into_iter().try_fold(Vec::new(), |mut acc, item| {
                 let mut resolved = resolve_tracks(&item)?;
@@ -587,21 +598,62 @@ impl TrackResolver {
                         ..
                     } = track
                     {
+                        let started_at = Instant::now();
                         let response = client
                             .download_url(*service, *item_id, *file_id)
                             .map_err(|e| format!("couldn't resolve TorBox playback link: {e}"))?;
-                        *resolved_url = Some(response.into_data().map_err(|_| {
+                        let outcome = response.into_data().map_err(|_| {
                             "TorBox could not resolve this file; check download status or account limits"
                                 .to_string()
-                        })?);
+                        });
+                        match outcome {
+                            Ok(url) => {
+                                *resolved_url = Some(url);
+                                trace::diag(
+                                    "resolve",
+                                    "link-ok",
+                                    &[
+                                        ("ms", started_at.elapsed().as_secs_f64().to_string()),
+                                        ("service", service.as_str().to_string()),
+                                    ],
+                                );
+                            }
+                            Err(why) => {
+                                trace::diag(
+                                    "resolve",
+                                    "item-failed",
+                                    &[
+                                        ("service", service.as_str().to_string()),
+                                        ("why", why.clone()),
+                                    ],
+                                );
+                                return Err(why);
+                            }
+                        }
                     }
                 }
                 acc.append(&mut resolved);
                 Ok::<_, String>(acc)
             });
             if into.queue_bound() && shared.load(Ordering::SeqCst) != epoch {
+                trace::diag("resolve", "stale-dropped", &[]);
                 return;
             }
+            trace::diag(
+                "resolve",
+                "done",
+                &[
+                    ("ms", started.elapsed().as_secs_f64().to_string()),
+                    (
+                        "outcome",
+                        if tracks.is_ok() {
+                            "ok".to_string()
+                        } else {
+                            "fail".to_string()
+                        },
+                    ),
+                ],
+            );
             let _ = tx.send(ResolvedBatch {
                 epoch,
                 ticket,

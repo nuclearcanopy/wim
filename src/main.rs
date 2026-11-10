@@ -735,6 +735,14 @@ fn main() -> anyhow::Result<()> {
         },
     };
     trace::init();
+    // runtime diagnostics: opt-in via WIM_DIAGNOSTICS_FILE. when the
+    // file cannot be opened the run proceeds without it, but the user
+    // asked for a trace and must not silently lose it.
+    if std::env::var_os("WIM_DIAGNOSTICS_FILE").is_some_and(|p| !p.is_empty())
+        && !trace::init_diagnostics()
+    {
+        eprintln!("[wim] WIM_DIAGNOSTICS_FILE could not be opened; running without diagnostics");
+    }
     let is_first_run = !config::config_path()?.exists();
     // held until the notification area exists (the terminal is not up
     // yet), then said once: a key nothing reads, a number that had to
@@ -1287,7 +1295,27 @@ fn main() -> anyhow::Result<()> {
     // first pass through the loop instead of before it; see the drain
     // right after `draw`.
     let mut first_frame_drawn = false;
+    let mut last_loop_top = Instant::now();
     loop {
+        // iteration gap: the event poll at the bottom of the body waits
+        // at most one frame interval (or IDLE_POLL when idle), so a gap
+        // far past that means the body itself blocked — slow ipc, a slow
+        // draw, or a stuck call — and every keypress waited with it.
+        let loop_top = Instant::now();
+        let gap_ms = loop_top.duration_since(last_loop_top).as_secs_f64() * 1000.0;
+        last_loop_top = loop_top;
+        if gap_ms > 250.0 {
+            trace::diag(
+                "loop",
+                "slow-iteration",
+                &[
+                    ("gap-ms", format!("{gap_ms:.0}")),
+                    ("torbox", torbox_open.to_string()),
+                    ("watch", watch_open.to_string()),
+                    ("console", console_open.to_string()),
+                ],
+            );
+        }
         notifications.expire();
         torbox_workspace.poll();
         watch_workspace.poll();
@@ -1548,7 +1576,33 @@ fn main() -> anyhow::Result<()> {
             eq_menu: eq_menu.is_open(),
             keybinds_menu: keybinds_menu_open,
         };
-        let overlay = tiers.covers_screen();
+        // the torbox and watch menus are screen-covering overlays the
+        // same as every tier in `Tiers`; leaving them out here let mpv
+        // draw a fullscreen video straight over the open menu — keys
+        // kept going to the invisible menu while the screen showed only
+        // the video, which is exactly "couldn't move around the menus,
+        // then it was just a video".
+        let overlay = tiers.covers_screen() || torbox_open || watch_open;
+        if trace::diag_enabled() {
+            // state-change only: these are per-frame locals.
+            thread_local! {
+                static PREV_OVERLAY: std::cell::Cell<Option<(bool, bool, bool)>> =
+                    const { std::cell::Cell::new(None) };
+            }
+            let state = (torbox_open, watch_open, overlay);
+            if PREV_OVERLAY.get() != Some(state) {
+                PREV_OVERLAY.set(Some(state));
+                trace::diag(
+                    "overlay",
+                    "change",
+                    &[
+                        ("torbox", torbox_open.to_string()),
+                        ("watch", watch_open.to_string()),
+                        ("covers", overlay.to_string()),
+                    ],
+                );
+            }
+        }
         // `video()`'s request, applied before the decision it changes so
         // it lands on this frame. the override goes with it: shift-`v`
         // wins over config, so leaving it would make the command
@@ -1591,12 +1645,22 @@ fn main() -> anyhow::Result<()> {
                     Ok(()) => {
                         video_vo = Some(vo);
                         video_geometry = size;
+                        trace::diag(
+                            "video",
+                            "arm",
+                            &[
+                                ("vo", vo.mpv_name().to_string()),
+                                ("w", size.0.to_string()),
+                                ("h", size.1.to_string()),
+                            ],
+                        );
                     }
                     Err(_) => {
                         // leave the screen alone and stop asking, rather
                         // than retrying the handover every frame.
                         video_fullscreen = false;
                         notifications.push(Severity::Alert, "video: mpv refused the video output");
+                        trace::diag("video", "arm-failed", &[]);
                     }
                 }
             }
@@ -1604,12 +1668,18 @@ fn main() -> anyhow::Result<()> {
                 let _ = player.set_video_output(video::Vo::Null.mpv_name());
                 video_vo = None;
                 let _ = guard.reclaim();
+                trace::diag("video", "disarm", &[]);
             }
             video::Move::Rebounce { vo, size } => {
                 let _ = player.set_video_output(video::Vo::Null.mpv_name());
                 let _ = player.set_video_geometry(size.0, size.1);
                 let _ = player.set_video_output(vo.mpv_name());
                 video_geometry = size;
+                trace::diag(
+                    "video",
+                    "rebounce",
+                    &[("w", size.0.to_string()), ("h", size.1.to_string())],
+                );
             }
         }
         // the ascii pane, driven off the same `elapsed_secs` every
@@ -3447,6 +3517,43 @@ fn main() -> anyhow::Result<()> {
 
                 if torbox_open {
                     use wim::torbox_workspace::Page;
+                    // Control keys only, and only here: while the query
+                    // editor is up, `Char` keys are typed user text and
+                    // are never logged. A `Char` outside the editor is a
+                    // command letter (j/k/b/c/1/2/3…), not user text.
+                    let diag_key: Option<String> = match key.code {
+                        KeyCode::Enter => Some("enter".into()),
+                        KeyCode::Esc => Some("esc".into()),
+                        KeyCode::Backspace => Some("backspace".into()),
+                        KeyCode::Up => Some("up".into()),
+                        KeyCode::Down => Some("down".into()),
+                        KeyCode::Char(c)
+                            if !(torbox_workspace.page == Page::Search
+                                && torbox_workspace.search_editing) =>
+                        {
+                            Some(format!("char:{c}"))
+                        }
+                        _ => None,
+                    };
+                    if let Some(key_name) = diag_key {
+                        trace::diag(
+                            "input",
+                            "key",
+                            &[
+                                ("key", key_name),
+                                ("page", format!("{:?}", torbox_workspace.page)),
+                                ("editing", torbox_workspace.search_editing.to_string()),
+                                (
+                                    "selected",
+                                    format!(
+                                        "{}/{}",
+                                        torbox_workspace.selected,
+                                        torbox_workspace.item_count()
+                                    ),
+                                ),
+                            ],
+                        );
+                    }
                     if torbox_workspace.link_input.is_some() {
                         match key.code {
                             KeyCode::Esc => torbox_workspace.link_input = None,
@@ -3579,6 +3686,23 @@ fn main() -> anyhow::Result<()> {
                         }
                         KeyCode::Enter if torbox_workspace.page == Page::Files => {
                             if let Some(item) = torbox_workspace.selected_playable() {
+                                if let crate::search::SearchItem::TorBoxFile {
+                                    service,
+                                    item_id,
+                                    file_id,
+                                    ..
+                                } = &item
+                                {
+                                    trace::diag(
+                                        "torbox",
+                                        "play-dispatch",
+                                        &[
+                                            ("service", service.as_str().to_string()),
+                                            ("item", item_id.to_string()),
+                                            ("file", file_id.to_string()),
+                                        ],
+                                    );
+                                }
                                 let mut surf = wim_surface!();
                                 let mut core = core_ctx!();
                                 dispatch_action(app::Action::Play(item), &mut core, &mut surf);
@@ -3587,6 +3711,23 @@ fn main() -> anyhow::Result<()> {
                         }
                         KeyCode::Char('q') if torbox_workspace.page == Page::Files => {
                             if let Some(item) = torbox_workspace.selected_playable() {
+                                if let crate::search::SearchItem::TorBoxFile {
+                                    service,
+                                    item_id,
+                                    file_id,
+                                    ..
+                                } = &item
+                                {
+                                    trace::diag(
+                                        "torbox",
+                                        "queue-dispatch",
+                                        &[
+                                            ("service", service.as_str().to_string()),
+                                            ("item", item_id.to_string()),
+                                            ("file", file_id.to_string()),
+                                        ],
+                                    );
+                                }
                                 let mut surf = wim_surface!();
                                 let mut core = core_ctx!();
                                 dispatch_action(app::Action::Queued(item), &mut core, &mut surf);
@@ -6251,6 +6392,26 @@ mod video_command_tests {
         assert!(
             drain < decision,
             "the request is applied after the frame that would have used it"
+        );
+    }
+
+    /// The torbox and watch menus cover the screen the same as every
+    /// `Tiers` modal, but they are handled before the tier cascade and
+    /// live only as locals in main, so nothing type-checked them into
+    /// the video decision. Leaving them out let mpv draw a fullscreen
+    /// video straight over the open menu — keys kept going to the
+    /// invisible menu while the screen showed only the video.
+    #[test]
+    fn the_torbox_and_watch_menus_take_the_screen_back_from_video() {
+        let src = include_str!("main.rs");
+        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
+        let at = code
+            .find("let overlay = tiers.covers_screen()")
+            .expect("the overlay decision moved");
+        let decision = &code[at..(at + 200).min(code.len())];
+        assert!(
+            decision.contains("torbox_open") && decision.contains("watch_open"),
+            "the torbox/watch menus do not take the screen back from video:\n{decision}"
         );
     }
 }
