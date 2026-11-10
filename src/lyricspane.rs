@@ -249,7 +249,11 @@ mod tests {
         pane.open_lyrics(&lyrics, "song".into());
         pane.saw_size(40, 4);
         pane.scroll_by(100);
-        assert_eq!(pane.scroll(), 2);
+        // 3 lines, and a 4-row pane spends 2 of them on the header
+        // (`ui::header::ROWS`), so 2 rows are visible and the last page
+        // starts at line 1: scrolling to 2 would push the final line
+        // off the top for a blank row at the bottom.
+        assert_eq!(pane.scroll(), 1);
         assert!(!pane.following());
         pane.scroll_by(-100);
         assert_eq!(pane.scroll(), 0);
