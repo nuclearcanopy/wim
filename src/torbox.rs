@@ -11,7 +11,6 @@ use serde::Deserialize;
 use zeroize::Zeroize;
 
 const API_BASE: &str = "https://api.torbox.app/v1/api";
-const SEARCH_BASE: &str = "https://search-api.torbox.app";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -385,14 +384,52 @@ impl Client {
     /// torrent sources for a selected result.
     pub fn search(&self, query: &str) -> Result<ApiResponse<serde_json::Value>> {
         anyhow::ensure!(!query.trim().is_empty(), "search query is empty");
-        let url = metadata_search_url(query.trim());
+        // Use main API's torrent list with query param as fallback for Voyager search
+        let url = format!(
+            "{API_BASE}/torrents/mylist?offset=0&limit=50&query={}",
+            path_segment(query.trim())
+        );
         let response = self
             .agent
             .get(&url)
             .set("Authorization", &format!("Bearer {}", self.token.0))
             .call()
-            .map_err(|e| api_error("/meta/search/<query>", e))?;
-        Ok(response.into_json()?)
+            .map_err(|e| api_error("/torrents/mylist?query=<query>", e))?;
+        // Adapt torrent results to look like metadata hits for compatibility
+        let mut response_json: serde_json::Value = response.into_json()?;
+        if let Some(data) = response_json.get_mut("data").and_then(|d| d.as_array_mut()) {
+            for item in data {
+                if let Some(obj) = item.as_object_mut() {
+                    // Add source field for MetadataHit compatibility
+                    obj.entry("source")
+                        .or_insert_with(|| serde_json::Value::String("torrent".into()));
+                    // Rename name to title for better compatibility
+                    if let Some(name) = obj.get("name").cloned() {
+                        obj.entry("title").or_insert(name);
+                    }
+                }
+            }
+        }
+        Ok(ApiResponse {
+            success: response_json
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            error: response_json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            detail: response_json
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            data: Some(
+                response_json
+                    .get("data")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::Array(vec![])),
+            ),
+        })
     }
 
     pub fn search_hits(&self, query: &str) -> Result<Vec<MetadataHit>> {
@@ -406,7 +443,7 @@ impl Client {
         Ok(rows.iter().filter_map(MetadataHit::from_value).collect())
     }
 
-    /// Resolve torrent sources for a Voyager metadata result. `source` and
+    /// Resolve torrent sources for a metadata result. `source` and
     /// `id` should come directly from the search result, not user-built URLs.
     pub fn torrents_for_metadata(
         &self,
@@ -423,16 +460,20 @@ impl Client {
             !id.is_empty()
                 && id
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b':'),
             "invalid metadata id"
         );
-        let url = format!("{SEARCH_BASE}/torrents/{source}:{id}");
+        // Use main API with {source}_id parameter as fallback for Voyager metadata resolution
+        let url = format!(
+            "{API_BASE}/torrents/mylist?offset=0&limit=50&{}_id={}",
+            source, id
+        );
         let response = self
             .agent
             .get(&url)
             .set("Authorization", &format!("Bearer {}", self.token.0))
             .call()
-            .map_err(|e| api_error("/torrents/<metadata-id>", e))?;
+            .map_err(|e| api_error("/torrents/mylist?{source}_id=<id>", e))?;
         Ok(response.into_json()?)
     }
 
@@ -479,10 +520,6 @@ fn path_segment(value: &str) -> String {
         }
     }
     encoded
-}
-
-fn metadata_search_url(query: &str) -> String {
-    format!("{SEARCH_BASE}/meta/search/{}", path_segment(query))
 }
 
 fn api_error(endpoint: &str, error: ureq::Error) -> anyhow::Error {
@@ -850,10 +887,6 @@ mod tests {
     #[test]
     fn search_path_segments_are_percent_encoded() {
         assert_eq!(path_segment("The 100/Season 2"), "The%20100%2FSeason%202");
-        assert_eq!(
-            metadata_search_url("The 100/Season 2"),
-            "https://search-api.torbox.app/meta/search/The%20100%2FSeason%202"
-        );
     }
 
     #[test]
