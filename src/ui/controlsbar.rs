@@ -139,16 +139,13 @@ pub enum Nav {
     Inert,
 }
 
-/// Which key set a surface answers to. The bar is a one-row strip that
-/// owns h/l outright and has nothing above or below it, so it also
-/// swallows up/down. The maximized player is a whole screen where
-/// those letters still have to reach their global bindings ('l' is
-/// cycle-loop), so there it is arrows only and anything else falls
-/// through untouched.
+/// The key set the one transport surface answers to. The bar is a
+/// one-row strip that owns h/l outright and has nothing above or below
+/// it, so it also swallows up/down. The maximized player draws no
+/// controls, so there is no second alphabet to answer to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavKeys {
     BarStrip,
-    ArrowsOnly,
 }
 
 pub fn nav(code: KeyCode, keys: NavKeys) -> Option<Nav> {
@@ -967,23 +964,16 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_owns_hl_and_updown_but_the_player_leaves_them_alone() {
-        for keys in [NavKeys::BarStrip, NavKeys::ArrowsOnly] {
-            assert_eq!(nav(KeyCode::Right, keys), Some(Nav::Next));
-            assert_eq!(nav(KeyCode::Left, keys), Some(Nav::Prev));
-            assert_eq!(nav(KeyCode::Enter, keys), Some(Nav::Activate));
-            assert_eq!(nav(KeyCode::Char('x'), keys), None);
-        }
-        assert_eq!(nav(KeyCode::Char('l'), NavKeys::BarStrip), Some(Nav::Next));
-        assert_eq!(nav(KeyCode::Char('h'), NavKeys::BarStrip), Some(Nav::Prev));
-        assert_eq!(nav(KeyCode::Up, NavKeys::BarStrip), Some(Nav::Inert));
-        assert_eq!(nav(KeyCode::Down, NavKeys::BarStrip), Some(Nav::Inert));
-        // on a full screen 'l' is still the global cycle-loop key and
-        // up/down still mean whatever they mean elsewhere.
-        assert_eq!(nav(KeyCode::Char('l'), NavKeys::ArrowsOnly), None);
-        assert_eq!(nav(KeyCode::Char('h'), NavKeys::ArrowsOnly), None);
-        assert_eq!(nav(KeyCode::Up, NavKeys::ArrowsOnly), None);
-        assert_eq!(nav(KeyCode::Down, NavKeys::ArrowsOnly), None);
+    fn the_bar_owns_hl_and_updown() {
+        let keys = NavKeys::BarStrip;
+        assert_eq!(nav(KeyCode::Right, keys), Some(Nav::Next));
+        assert_eq!(nav(KeyCode::Left, keys), Some(Nav::Prev));
+        assert_eq!(nav(KeyCode::Enter, keys), Some(Nav::Activate));
+        assert_eq!(nav(KeyCode::Char('x'), keys), None);
+        assert_eq!(nav(KeyCode::Char('l'), keys), Some(Nav::Next));
+        assert_eq!(nav(KeyCode::Char('h'), keys), Some(Nav::Prev));
+        assert_eq!(nav(KeyCode::Up, keys), Some(Nav::Inert));
+        assert_eq!(nav(KeyCode::Down, keys), Some(Nav::Inert));
     }
 
     #[test]
@@ -1451,7 +1441,7 @@ mod tests {
     /// presses that control" means.
     #[test]
     fn clicking_the_cell_a_control_was_painted_on_presses_that_control() {
-        use crate::hit::{act, Act, Click, Control, HitMap, Kind, Transport};
+        use crate::hit::{act, Act, Click, Control, HitMap, Kind};
 
         for width_cells in [20u16, 40, 60, 100, 160] {
             let (buf, layout) = bar_and_layout(width_cells, 2, |cb| {
@@ -1468,16 +1458,11 @@ mod tests {
                     .controls
                     .iter()
                     .map(|(field, rect)| Control {
-                        transport: Transport::Bar,
                         field: *field,
                         rect: *rect,
                     })
                     .collect(),
-                tracks: layout
-                    .track
-                    .map(|t| (Transport::Bar, t))
-                    .into_iter()
-                    .collect(),
+                tracks: layout.track,
                 ..Default::default()
             };
             let click = |col| {
@@ -1488,7 +1473,7 @@ mod tests {
                         col,
                         row: 1,
                     },
-                    None,
+                    false,
                 )
             };
 
@@ -1510,7 +1495,7 @@ mod tests {
                 let col = col_of(&buf, 1, ch);
                 assert_eq!(
                     click(col),
-                    Act::Press(Transport::Bar, field, None),
+                    Act::Press(field, None),
                     "{field:?} is drawn at column {col} of a {width_cells}-cell bar"
                 );
                 pressed += 1;
@@ -1523,7 +1508,7 @@ mod tests {
             if let Some(t) = layout.track {
                 for x in t.x..t.x + t.width {
                     let frac = match click(x) {
-                        Act::Press(Transport::Bar, Field::Progress, Some(frac)) => frac,
+                        Act::Press(Field::Progress, Some(frac)) => frac,
                         other => panic!("column {x} of the track gave {other:?}"),
                     };
                     let head = track(frac, t.width as usize, false)

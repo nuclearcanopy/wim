@@ -1244,11 +1244,6 @@ fn main() -> anyhow::Result<()> {
     // `flash`, a steady cursor position rather than a transient
     // acknowledgment, but both feed `ControlsBar`'s rendering.
     let mut bottombar_selected = Field::Pause;
-    // the maximized player's own cursor over the same `Field` set: one
-    // alphabet, one enter dispatch, one scrub for both surfaces, but a
-    // position each so moving focus doesn't drag the other's cursor
-    // along with it.
-    let mut player_selected = Field::Pause;
     // `Some` while enter-on-the-scrubber holds a drag open: arrows
     // move `Scrub::target_secs` locally and the absolute seek is
     // coalesced behind it, so holding one down can't spend an ipc
@@ -2463,15 +2458,9 @@ fn main() -> anyhow::Result<()> {
             };
             let bar = controls_bar.layout(controls_rect);
             for (field, rect) in bar.controls {
-                hits.controls.push(hit::Control {
-                    transport: hit::Transport::Bar,
-                    field,
-                    rect,
-                });
+                hits.controls.push(hit::Control { field, rect });
             }
-            if let Some(rect) = bar.track {
-                hits.tracks.push((hit::Transport::Bar, rect));
-            }
+            hits.tracks = bar.track;
             f.render_widget(controls_bar, controls_rect);
             f.render_widget(
                 ui::helpbox::HelpBox { label: &help_label },
@@ -3285,15 +3274,12 @@ fn main() -> anyhow::Result<()> {
             // the mouse, answered against the map the draw above
             // recorded: `hit::act` is given the frame the user was
             // actually looking at and decides everything, and this
-            // only applies the answer. a drag belongs to the focused
-            // surface's scrubber, which is the only one it can have
-            // been opened on (the keyboard opens one on the focused
-            // pane, and a click sets focus to whatever it hit).
+            // only applies the answer. a drag belongs to the bar's
+            // scrubber, which is the only one there is: the keyboard
+            // opens a scrub from the bar's own cursor, and a click
+            // on a control moves the cursor there first.
             if let Event::Mouse(m) = &ev {
-                let dragging = scrub.is_some().then_some(match focus {
-                    Focus::BottomBar => hit::Transport::Bar,
-                    _ => hit::Transport::Player,
-                });
+                let dragging = scrub.is_some();
                 let click = hit::Click {
                     kind: mouse_kind(m.kind),
                     col: m.column,
@@ -3376,7 +3362,7 @@ fn main() -> anyhow::Result<()> {
                             hit::Scrollable::Lyrics => {}
                         }
                     }
-                    hit::Act::Press(transport, field, frac) => {
+                    hit::Act::Press(field, frac) => {
                         // the cursor moves onto what was clicked and
                         // then the one activation path runs, so a
                         // click and enter on the same glyph are the
@@ -3385,16 +3371,12 @@ fn main() -> anyhow::Result<()> {
                             Some(frac) => ScrubAt::Fraction(frac),
                             None => ScrubAt::Position,
                         };
-                        match transport {
-                            hit::Transport::Bar => {
-                                focus = Focus::BottomBar;
-                                bottombar_selected = field;
-                            }
-                            hit::Transport::Player => {
-                                focus = Focus::Workspace;
-                                player_selected = field;
-                            }
-                        }
+                        // the cursor moves onto what was clicked and
+                        // then the one activation path runs, so a
+                        // click and enter on the same glyph are the
+                        // same operation (`activate_transport`).
+                        focus = Focus::BottomBar;
+                        bottombar_selected = field;
                         let mut tctx = TransportCtx {
                             scrub: &mut scrub,
                             scrub_pending: &mut scrub_pending,
@@ -4902,38 +4884,29 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // pane-local navigation for whichever surface is
-                // showing the transport: the bottom bar, or the
-                // maximized player, which draws the same `Field` set
-                // bigger. Same "only the arrows and enter care which
-                // pane has focus" rule as the browse view further
-                // down: global playback controls (space/f/b/c/etc.)
-                // fall through untouched below regardless of focus,
-                // only these keys are intercepted here. The cursor
-                // differs per pane, the dispatch below does not; see
-                // `controlsbar::nav` for why only the bar gets h/l.
-                let player_transport = now_playing.is_some()
-                    && !player_minimized
-                    && !now_playing_is_video(&now_playing)
-                    && focus == Focus::Workspace;
-                let transport = match focus {
-                    Focus::BottomBar => Some((&mut bottombar_selected, NavKeys::BarStrip)),
-                    _ if player_transport => Some((&mut player_selected, NavKeys::ArrowsOnly)),
-                    _ => None,
-                };
-                if let Some((cursor, nav_keys)) = transport {
-                    match controlsbar::nav(key.code, nav_keys) {
+                // pane-local navigation for the one surface showing
+                // the transport: the bottom bar. Same "only the arrows
+                // and enter care which pane has focus" rule as the
+                // browse view further down: global playback controls
+                // (space/f/b/c/etc.) fall through untouched below
+                // regardless of focus, only these keys are intercepted
+                // here. The maximized player draws no controls of its
+                // own — one transport, one cursor — so a workspace
+                // arrow has nothing to move and falls through to the
+                // view that owns it.
+                if focus == Focus::BottomBar {
+                    match controlsbar::nav(key.code, NavKeys::BarStrip) {
                         Some(Nav::Next) => {
-                            *cursor = cursor.next();
+                            bottombar_selected = bottombar_selected.next();
                             continue;
                         }
                         Some(Nav::Prev) => {
-                            *cursor = cursor.prev();
+                            bottombar_selected = bottombar_selected.prev();
                             continue;
                         }
                         Some(Nav::Inert) => continue,
                         Some(Nav::Activate) => {
-                            let field = *cursor;
+                            let field = bottombar_selected;
                             let mut tctx = TransportCtx {
                                 scrub: &mut scrub,
                                 scrub_pending: &mut scrub_pending,

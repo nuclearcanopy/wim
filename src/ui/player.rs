@@ -264,6 +264,14 @@ mod tests {
         }))
     }
 
+    /// A cover with a real hue in it, for the `ascii-color` test: a
+    /// grey source would pass it without proving anything.
+    fn hued_art() -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::from_fn(8, 8, |x, y| {
+            image::Rgb([(x * 31) as u8, (y * 17) as u8, 200])
+        }))
+    }
+
     fn view<'a>(keymap: &'a Keymap, art: Option<&'a DynamicImage>) -> PlayerView<'a> {
         PlayerView {
             title: "a song",
@@ -432,6 +440,178 @@ mod tests {
             if let Some(y) = l.context_y {
                 assert!(y < h - METER_ROWS, "context on row {y} of {h}");
             }
+        }
+    }
+
+    /// Recovered from before the bottom-bar-only refactor, along with
+    /// the layout function they test: the cover rect is square in
+    /// *cells given the cell aspect*, centred, and above the title.
+    #[test]
+    fn the_cover_rect_is_square_ish_and_derived_from_the_width_it_got() {
+        for (w, h, aspect) in [(80u16, 40u16, 2.0f32), (40, 40, 2.0), (120, 30, 2.4)] {
+            let l = layout(Rect::new(0, 0, w, h), true, false, aspect).unwrap();
+            let art = l.art.expect("a pane this size has room for art");
+            // cells are `aspect` times taller than wide, so a square
+            // cover is that many times wider in cells than it is tall.
+            let ideal = art.height as f32 * aspect;
+            assert!(
+                (art.width as f32 - ideal).abs() <= 1.0,
+                "{w}x{h}@{aspect}: {art:?} is not square"
+            );
+            assert!(art.x + art.width <= w, "{art:?} overflows a {w}-cell pane");
+            // centred, and above the title rather than beside it.
+            assert!(art.y + art.height < l.title_y, "{art:?} vs {l:?}");
+            assert_eq!(art.x, (w - art.width) / 2);
+        }
+    }
+
+    /// The host-overlay contract: in a `Full*` mode the widget draws
+    /// nothing into the art rect and the host's image protocol goes on
+    /// exactly the rect `layout` reported — both sides get the same
+    /// answer from the same arguments.
+    #[test]
+    fn the_rect_the_widget_drew_into_is_the_rect_the_host_overlays() {
+        let area = Rect::new(3, 2, 70, 34);
+        let reported = layout(area, true, false, 2.0).unwrap().art.unwrap();
+        let keymap = Keymap::default();
+        let cover = art();
+
+        let mut real = view(&keymap, Some(&cover));
+        real.art_mode = ArtMode::FullColor;
+        let mut real_buf = buffer(80, 40);
+        real.render(area, &mut real_buf);
+
+        let mut ascii = view(&keymap, Some(&cover));
+        ascii.art_mode = ArtMode::AsciiBw;
+        let mut ascii_buf = buffer(80, 40);
+        ascii.render(area, &mut ascii_buf);
+
+        for y in reported.y..reported.y + reported.height {
+            for x in reported.x..reported.x + reported.width {
+                assert_eq!(
+                    real_buf.cell((x, y)).unwrap().symbol(),
+                    ".",
+                    "real mode drew into the host's overlay rect at {x},{y}"
+                );
+                // which block glyph a cell gets depends on its own
+                // four samples, so the claim under test is that every
+                // cell in the reported rect was painted at all.
+                assert_ne!(
+                    ascii_buf.cell((x, y)).unwrap().symbol(),
+                    ".",
+                    "ascii art did not fill the rect it reported at {x},{y}"
+                );
+            }
+        }
+        // ...and nothing outside it, in either mode.
+        assert_eq!(
+            ascii_buf
+                .cell((reported.x, reported.y + reported.height))
+                .unwrap()
+                .symbol(),
+            "."
+        );
+    }
+
+    /// The monochrome exception, bounded: `ascii-color` may put hues in
+    /// the cover rect and nowhere else. The title and context stay
+    /// `theme::shade`, and `ascii-bw` stays strictly grey over the
+    /// whole pane including the cover.
+    #[test]
+    fn ascii_color_tints_the_cover_and_nothing_else() {
+        use ratatui::style::Color;
+        let is_grey = |c: Color| match c {
+            Color::Rgb(r, g, b) => r == g && g == b,
+            // `Reset` is the untouched default, not a hue.
+            Color::Reset => true,
+            other => panic!("not a shade or a tint: {other:?}"),
+        };
+        let area = Rect::new(0, 0, 80, 40);
+        let cover = hued_art();
+        let reported = layout(area, true, false, 2.0).unwrap().art.unwrap();
+        let keymap = Keymap::default();
+
+        for (mode, want_tint) in [(ArtMode::AsciiColor, true), (ArtMode::AsciiBw, false)] {
+            let mut v = view(&keymap, Some(&cover));
+            v.art_mode = mode;
+            let mut buf = buffer(80, 40);
+            v.render(area, &mut buf);
+
+            let mut tinted = 0;
+            for y in area.y..area.y + area.height {
+                for x in area.x..area.x + area.width {
+                    let cell = buf.cell((x, y)).unwrap();
+                    let grey = is_grey(cell.fg) && is_grey(cell.bg);
+                    let in_art = (reported.x..reported.x + reported.width).contains(&x)
+                        && (reported.y..reported.y + reported.height).contains(&y);
+                    assert!(
+                        grey || in_art,
+                        "{mode:?} leaked a hue outside the cover at {x},{y}: {cell:?}"
+                    );
+                    tinted += u32::from(!grey);
+                }
+            }
+            assert_eq!(tinted > 0, want_tint, "{mode:?} painted {tinted} tinted cells");
+        }
+    }
+
+    #[test]
+    fn art_is_dropped_below_the_size_it_stops_being_readable_at() {
+        // too few rows: the title is worth more than a 2-row thumbnail.
+        assert!(
+            layout(Rect::new(0, 0, 80, 12), true, false, 2.0)
+                .unwrap()
+                .art
+                .is_none()
+        );
+        // and too narrow, even with rows to spare.
+        assert!(
+            layout(Rect::new(0, 0, 13, 40), true, false, 2.0)
+                .unwrap()
+                .art
+                .is_none()
+        );
+        // the pane that does get art keeps the title and context too.
+        let l = layout(Rect::new(0, 0, 80, 30), true, true, 2.0).unwrap();
+        assert!(l.art.is_some() && l.context_y.is_some());
+    }
+
+    #[test]
+    fn no_art_at_all_lays_out_exactly_like_a_short_pane() {
+        let with = layout(Rect::new(0, 0, 80, 12), true, false, 2.0).unwrap();
+        let without = layout(Rect::new(0, 0, 80, 12), false, false, 2.0).unwrap();
+        assert_eq!(with, without);
+    }
+
+    #[test]
+    fn nothing_is_drawn_outside_the_pane_or_under_the_level_meter() {
+        for h in 1..40u16 {
+            let area = Rect::new(0, 0, 40, h);
+            let l = layout(area, true, true, 2.0).unwrap();
+            // the bottom two rows belong to the spectrum whenever
+            // there is a meter at all.
+            let last = if h > METER_ROWS { h - METER_ROWS } else { h };
+            for row in [Some(l.title_y), l.context_y].into_iter().flatten() {
+                assert!(row < last, "row {row} of {l:?} is outside 0..{last} (h={h})");
+            }
+            if let Some(art) = l.art {
+                assert!(art.y + art.height < last, "{art:?} under the meter (h={h})");
+            }
+        }
+    }
+
+    #[test]
+    fn degenerate_panes_render_without_panicking() {
+        // a zero-width or zero-height pane has no layout at all.
+        for (w, h) in [(0u16, 0u16), (1, 0), (0, 10), (0, 1)] {
+            assert!(layout(Rect::new(0, 0, w, h), true, true, 2.0).is_none());
+        }
+        for (w, h) in [(1u16, 1u16), (2, 1), (1, 40), (3, 3), (14, 16), (40, 2)] {
+            let buf = render(w, h, |v| {
+                v.previous = Some("before");
+                v.next = Some("after");
+            });
+            assert_eq!(buf.area, Rect::new(0, 0, w, h));
         }
     }
 }
