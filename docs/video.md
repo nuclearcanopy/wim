@@ -458,6 +458,38 @@ still not it: every frame is a blocking ipc round trip competing with
 wim's own property traffic, plus a png encode, a file write and a file
 read for data wim already had in raw form a step earlier.
 
+### remote sources: ranges, and the url is a secret
+
+`FrameSource` is not local-only: `spawn` takes any media mpv can
+open, and a resolved TorBox stream url is one (an `http(s)` url, that
+is; the lavfi pseudo-urls the tests use are the other kind). two
+things are different about a url, and both are measured:
+
+**the server has to answer range requests.** an mp4's moov atom is
+not at the front of the file, so the demuxer seeks to it, and over
+http without ranges mpv dies with `Cannot seek backward in linear
+streams!` and writes nothing. real cdns answer ranges;
+`python -m http.server` does not and cannot stand in for one — the
+test suite carries its own range server
+(`an_http_source_decodes_and_the_url_stays_out_of_argv`) for exactly
+that reason.
+
+**the url never becomes an argv word.** a signed stream url is a
+credential, and `/proc/<pid>/cmdline` is world-readable, so an
+`http(s)` media name goes to mpv on stdin as a one-line playlist
+(`--playlist=-`) instead of the command line. encode mode takes the
+playlist entry exactly as it took the positional (measured, same
+frames), and the test pins it: it reads the child's own
+`/proc/<pid>/cmdline` and fails if the fake signed token appears in
+it. anything that is not an `http(s)` url stays a positional,
+including `av://lavfi:` — playlist entries are url-only, and mpv has
+no protocol handler for `av://` from a playlist (measured: `No
+protocol handler found`), so the tests' pseudo-sources could not
+move.
+
+the audible instance never had this problem: it receives its urls
+over the ipc socket (`loadfile`), which is not argv at all.
+
 ## the host half, and what is pure in it
 
 the frame source is the hard part; the lifecycle around it is four
