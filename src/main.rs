@@ -12,6 +12,7 @@ use wim::{
 };
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -894,6 +895,11 @@ fn main() -> anyhow::Result<()> {
     // mpv only reads it on init. see docs/video.md.
     let mut video_fullscreen = false;
     let mut video_vo: Option<video::Vo> = None;
+    // the art rect the last draw reserved for inline video: the frame
+    // source decodes at the grid the picture is painted on, and the
+    // draw is where that rect is decided. one frame stale at most — a
+    // resize repaints and the next `update` respawns at the new grid.
+    let mut inline_art_rect: Option<Rect> = None;
     // the runtime half of `video_output`: `None` follows config.toml,
     // and the ascii key is the only thing that sets it, so a restart
     // goes back to whatever is configured.
@@ -1684,15 +1690,45 @@ fn main() -> anyhow::Result<()> {
         // widget reads, so the picture and the scrubber cannot drift.
         // the fifo is the clock: a paused player stops advancing this,
         // so nothing is read and the frame instance blocks in `write`.
+        // a resolved stream url is media the frame source decodes the
+        // same way a local file is (docs/video.md: the server has to
+        // answer ranges, and the url goes to mpv on stdin, not argv);
+        // unresolved means resolution failed and there is nothing to
+        // show but the title.
         let ascii_media = match &now_playing {
             Some(SearchItem::LocalVideo { path, .. }) => Some(path.as_path()),
+            Some(SearchItem::TorBoxFile {
+                resolved_url: Some(url),
+                ..
+            }) => Some(Path::new(url.as_str())),
+            Some(SearchItem::WatchSource { url, .. }) => Some(Path::new(url.expose())),
             _ => None,
         };
-        if let Err(e) = ascii.update(
-            showing.is_ascii(),
-            ascii_media,
-            framesource::Grid::for_area(Rect::new(0, 0, size.0, size.1), aspect),
-            // an unknown position is the start of the file, which is
+        // inline video: a video plays, the player view is up, and the
+        // screen is wim's — not fullscreen, where mpv's own vo (or the
+        // fullscreen ascii pane) owns the screen instead. the frames
+        // go on the art rect the last draw reserved; the first frame
+        // after a video starts has no rect yet, so the source starts a
+        // frame late rather than latching a refusal against a grid
+        // with no cells.
+        let inline_video = !video_fullscreen
+            && !player_minimized
+            && !overlay
+            && now_playing_is_video(&now_playing);
+        let (want_frames, frame_grid) = if showing.is_ascii() {
+            (
+                true,
+                framesource::Grid::for_area(Rect::new(0, 0, size.0, size.1), aspect),
+            )
+        } else if inline_video {
+            match inline_art_rect {
+                Some(rect) => (true, framesource::Grid::for_area(rect, aspect)),
+                None => (false, framesource::Grid::new(0, 0, aspect)),
+            }
+        } else {
+            (false, framesource::Grid::new(0, 0, aspect))
+        };
+        if let Err(e) = ascii.update(want_frames, ascii_media, frame_grid,            // an unknown position is the start of the file, which is
             // what a just-loaded track is anyway.
             elapsed_secs.unwrap_or(0.0),
             // one ipc round trip per spawn, never per frame.
@@ -1728,11 +1764,15 @@ fn main() -> anyhow::Result<()> {
         guard.draw_unless_video(video_vo.is_some(), |f| {
             let area = f.area();
 
-            // ascii video owns the whole screen, the same as a drawing
-            // vo would, except wim is the one painting so notifications
-            // still land on top; an alert behind the picture is an
-            // alert the user never sees.
-            if ascii.active() {
+            // fullscreen ascii video owns the whole screen, the same as
+            // a drawing vo would, except wim is the one painting so
+            // notifications still land on top; an alert behind the
+            // picture is an alert the user never sees. `active` alone
+            // is not the gate: the frame source also runs for inline
+            // video, where the ui draws around it and only the art
+            // rect holds frames — `showing` is the one decision that
+            // knows which of the two this frame is.
+            if showing.is_ascii() && ascii.active() {
                 ascii.paint(area, ui::raster::Tone::Mono, f.buffer_mut());
                 f.render_widget(
                     NotificationOverlay {
@@ -2049,14 +2089,25 @@ fn main() -> anyhow::Result<()> {
             // rect instead of the player.
             if show_full_player {
                 let item = now_playing.as_ref().expect("show_full_player implies Some");
-                // Keep one terminal cell per spectrum band. The meter
-                // occupies a fixed-width rail at the far right of the
-                // maximized player, rather than stretching horizontally
-                // across the player or covering its text/artwork.
-                let (player_content, spectrum_area) = ui::visualizer::player_spectrum_layout(
-                    main_content,
-                    cfg.visualizer_bands as usize,
-                );
+                // video gets the whole pane: the spectrum is music's
+                // visualizer, and its rail would cut the picture down
+                // for a wall of silence. the meter's own rows stay
+                // reserved by the player layout either way.
+                let (player_content, spectrum_area) = if now_playing_is_video(&now_playing) {
+                    (
+                        main_content,
+                        Rect {
+                            width: 0,
+                            height: 0,
+                            ..main_content
+                        },
+                    )
+                } else {
+                    ui::visualizer::player_spectrum_layout(
+                        main_content,
+                        cfg.visualizer_bands as usize,
+                    )
+                };
                 let previous_label = previous_track.as_ref().map(label);
                 let next_label = play_queue.peek_next().map(label);
                 // the cover for what is *playing*: an open browse view's
@@ -2085,6 +2136,10 @@ fn main() -> anyhow::Result<()> {
                     art: playing_art,
                     art_key: &coverart::art_key(item),
                     art_mode,
+                    // frames land on the art rect after this view; the
+                    // view reserves the rect and draws no cover under
+                    // them.
+                    video: inline_video,
                     cell_aspect: aspect,
                     // mid-drag the screen draws the pending target,
                     // not mpv's position, same as the bottom bar.
@@ -2101,21 +2156,43 @@ fn main() -> anyhow::Result<()> {
                     keymap: &keymap,
                 };
                 f.render_widget(player_view, player_content);
-                if art_mode.is_full() {
-                    // same contract as the browse view: the widget drew
-                    // no ascii art, the real image goes on the exact
-                    // rect its own layout picked.
-                    if let (Some(protocol), Some(art_rect)) = (
-                        player_art.protocol(),
-                        ui::player::layout(
-                            player_content,
-                            playing_art.is_some(),
-                            has_context,
-                            aspect,
-                        )
-                        .and_then(|l| l.art),
-                    ) {
-                        f.render_stateful_widget(StatefulImage::default(), art_rect, protocol);
+                // `has_art` is the one place the rule lives, so this is
+                // the same rect the view reserved — the contract the
+                // video frames and the `Full*` cover overlay both
+                // depend on.
+                let player_art_rect = ui::player::layout(
+                    player_content,
+                    ui::player::has_art(
+                        inline_video,
+                        playing_art.is_some(),
+                        matches!(item, SearchItem::Silence { .. }),
+                        art_mode,
+                    ),
+                    has_context,
+                    aspect,
+                )
+                .and_then(|l| l.art);
+                if inline_video {
+                    // the picture for this frame, and the grid the
+                    // frame source decodes at on the next pass. painted
+                    // after the view and instead of the cover overlay:
+                    // the frames own the rect, and a cover under them
+                    // would be one frame of flicker.
+                    inline_art_rect = player_art_rect;
+                    if let Some(rect) = player_art_rect {
+                        ascii.paint(rect, ui::raster::Tone::Mono, f.buffer_mut());
+                    }
+                } else {
+                    inline_art_rect = None;
+                    if art_mode.is_full() {
+                        // same contract as the browse view: the widget
+                        // drew no ascii art, the real image goes on the
+                        // exact rect its own layout picked.
+                        if let (Some(protocol), Some(art_rect)) =
+                            (player_art.protocol(), player_art_rect)
+                        {
+                            f.render_stateful_widget(StatefulImage::default(), art_rect, protocol);
+                        }
                     }
                 }
 
@@ -6430,12 +6507,20 @@ mod ascii_pane_tests {
         );
 
         let at = code
-            .find("ascii.update(")
+            .find("let inline_video = !video_fullscreen")
             .expect("nothing drives the frame source, so the pane is dead code");
-        let call = &code[at..(at + 300).min(code.len())];
+        let decision = &code[at..(at + 900).min(code.len())];
         assert!(
-            call.contains("showing.is_ascii()"),
-            "the pane re-derives whether ascii is wanted instead of taking it:\n{call}"
+            decision.contains("showing.is_ascii()"),
+            "the fullscreen pane re-derives whether ascii is wanted instead of taking it:\n{decision}"
+        );
+        assert!(
+            decision.contains("let (want_frames, frame_grid) = if showing.is_ascii() {"),
+            "the frames are driven by some decision other than the ones beside them:\n{decision}"
+        );
+        assert!(
+            decision.contains("inline_art_rect"),
+            "inline video decodes at some grid other than the rect it is painted on:\n{decision}"
         );
 
         // anchored at the decision, not file-wide: the key handler reads
@@ -6459,8 +6544,11 @@ mod ascii_pane_tests {
             "turning it on leaves the pane hidden, so the press looks like a no-op:\n{press}"
         );
 
+        // `active` alone is not the fullscreen gate: the same source
+        // runs for inline video, where the ui draws around it and only
+        // the art rect holds frames.
         let at = code
-            .find("if ascii.active() {")
+            .find("if showing.is_ascii() && ascii.active() {")
             .expect("the draw never checks for frames, so the ui is drawn over them");
         let branch = &code[at..(at + 400).min(code.len())];
         assert!(
@@ -6470,6 +6558,29 @@ mod ascii_pane_tests {
         assert!(
             branch.contains("return;"),
             "it paints frames and then falls through into the ui:\n{branch}"
+        );
+
+        // the inline paint: frames go on the rect the player view
+        // reserved, through the same `has_art` the view used, and the
+        // rect is handed back so the source decodes at the size the
+        // picture is painted at. anchored at the draw branch's
+        // `has_art` call — the loop body has its own `if inline_video`
+        // for the grid, which must not be mistaken for the paint.
+        let at = code
+            .find("ui::player::has_art(")
+            .expect("inline video never reserves the rect through the view's own rule");
+        let branch = &code[at..(at + 900).min(code.len())];
+        assert!(
+            branch.contains("if inline_video {"),
+            "the rect is reserved and never painted on:\n{branch}"
+        );
+        assert!(
+            branch.contains("ascii.paint(rect,"),
+            "the rect is reserved and never painted on:\n{branch}"
+        );
+        assert!(
+            branch.contains("inline_art_rect = player_art_rect;"),
+            "the grid the source decodes at is not the rect it painted:\n{branch}"
         );
     }
 }
