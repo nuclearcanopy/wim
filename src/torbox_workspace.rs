@@ -222,9 +222,9 @@ impl Workspace {
         self.loading = true;
         self.message = Some(format!("searching TorBox for {query:?}…"));
         thread::spawn(move || {
-            let result = client.search_hits(&query).map_err(|_| {
-                "TorBox search failed; check the token, network, and account plan".to_string()
-            });
+            let result = client
+                .search_hits(&query)
+                .map_err(|error| format!("TorBox metadata search failed: {error:#}"));
             let _ = tx.send(Reply::Search(generation, result));
         });
     }
