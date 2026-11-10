@@ -30,6 +30,7 @@ toml = "0.8"
 dirs = "5"
 nucleo-matcher = "0.3"
 ureq = { version = "2", features = ["json"] }
+url = "2"
 md-5 = "0.10"
 rand = "0.8"
 walkdir = "2"

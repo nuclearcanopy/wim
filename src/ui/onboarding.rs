@@ -64,11 +64,11 @@ const CONTROLS: &[(Key, &str)] = &[
     (Key::Bound(KeyAction::Quit), "quit"),
 ];
 
-/// Welcome, controls, navidrome, listenbrainz, lyrics, paths, done. The rail
+/// Welcome, controls, navidrome, TorBox, listenbrainz, lyrics, paths, done. The rail
 /// counts all seven including the bookends, since "step 1 of 7" on the
 /// welcome screen is what tells the user the flow is short and finite
 /// before they commit to it.
-pub const TOTAL_STEPS: usize = 7;
+pub const TOTAL_STEPS: usize = 8;
 
 /// One content row. `level` is a `theme` brightness, never a hue.
 struct Row {
@@ -206,6 +206,7 @@ impl Screen {
 /// `LoginView`'s place in the flow. It lives in login.rs, which cannot
 /// know what it is embedded in.
 pub const NAVIDROME_STEP: usize = 3;
+pub const TORBOX_STEP: usize = 4;
 
 /// Wraps `area` in the flow's chrome (frame plus the step rail) and
 /// returns the interior left over for content. Shared with
@@ -358,7 +359,7 @@ impl Widget for LyricsSetupView<'_> {
             ("musixmatch", "optional; requires an API key"),
             ("lyrics-ovh", "plain-text fallback, no key needed"),
         ];
-        let mut screen = Screen::new(5)
+        let mut screen = Screen::new(6)
             .centred("lyrics sources", NEAR_WHITE)
             .centred("f1-f6 toggle sources; the no-key defaults work as-is", DIM)
             .gap();
@@ -395,7 +396,7 @@ impl Widget for ListenBrainzView<'_> {
         let value_width = (area.width as usize).saturating_sub(prefix.len() + 6);
         let masked = "*".repeat(self.input.chars().count());
 
-        Screen::new(4)
+        Screen::new(5)
             .centred("scrobble to listenbrainz?", NEAR_WHITE)
             .centred("optional; skip it and nothing breaks", DIM)
             .gap()
@@ -422,7 +423,7 @@ pub struct LibraryPathsView<'a> {
 impl Widget for LibraryPathsView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let width_budget = (area.width as usize).saturating_sub(8);
-        let mut screen = Screen::new(6)
+        let mut screen = Screen::new(7)
             .centred("where's your media?", NEAR_WHITE)
             .gap();
 
@@ -462,7 +463,7 @@ pub struct DoneView;
 
 impl Widget for DoneView {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        Screen::new(7)
+        Screen::new(8)
             .centred("you're all set", NEAR_WHITE)
             .gap()
             .centred("press any key to start", DIM)
@@ -566,7 +567,7 @@ mod tests {
     /// of this is left" on every screen.
     #[test]
     fn the_rail_marks_the_current_step_on_each_screen() {
-        let cases: [(&str, u16); 4] = [("welcome", 1), ("controls", 2), ("paths", 6), ("done", 7)];
+        let cases: [(&str, u16); 4] = [("welcome", 1), ("controls", 2), ("paths", 7), ("done", 8)];
         for (name, step) in cases {
             let mut buf = buffer(60, 24);
             let area = Rect::new(0, 0, 60, 24);
@@ -582,7 +583,7 @@ mod tests {
             }
             let g = grid(&buf);
             assert!(
-                g.contains(&format!("step {step} of 7")),
+                g.contains(&format!("step {step} of 8")),
                 "{name} should say step {step}:\n{g}"
             );
         }
@@ -594,7 +595,7 @@ mod tests {
         let mut buf = buffer(24, 10);
         DoneView.render(Rect::new(0, 0, 24, 10), &mut buf);
         let g = grid(&buf);
-        assert!(g.contains("step 7 of 7"), "{g}");
+        assert!(g.contains("step 8 of 8"), "{g}");
         assert!(
             !g.contains('●'),
             "dots should be dropped, not clipped:\n{g}"
@@ -820,7 +821,7 @@ mod tests {
             // rail owns the row just inside the bottom frame edge.
             let lines: Vec<&str> = g.lines().collect();
             let rail = lines[lines.len() - 2];
-            assert!(rail.contains("step 2 of 7"), "{w}x{h} rail:\n{g}");
+            assert!(rail.contains("step 2 of 8"), "{w}x{h} rail:\n{g}");
         }
     }
 
@@ -833,7 +834,7 @@ mod tests {
         let g = grid(&buf);
         let rail = g.lines().nth(10).unwrap();
         assert!(
-            rail.contains("step 2 of 7"),
+            rail.contains("step 2 of 8"),
             "rail should be the interior's last row:\n{g}"
         );
     }

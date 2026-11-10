@@ -104,6 +104,12 @@ in
       description = "Navidrome/Subsonic servers to connect on startup.";
     };
 
+    torboxTokenFile = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      description = "Runtime file containing the TorBox API token; use agenix/sops-nix, never a plaintext token option.";
+    };
+
     albumArt = mkOption {
       type = types.enum [
         "auto"
@@ -435,6 +441,8 @@ in
       }
       // lib.optionalAttrs (s.maxBitrateKbps != null) { max_bitrate_kbps = s.maxBitrateKbps; }
       // lib.optionalAttrs (s.transcodeFormat != null) { transcode_format = s.transcodeFormat; }) cfg.navidromeServers;
+    } // lib.optionalAttrs (cfg.torboxTokenFile != null) {
+      torbox_token_file = toString cfg.torboxTokenFile;
     } // lib.optionalAttrs (cfg.opensubtitlesApiKeyFile != null) {
       opensubtitles_api_key_file = toString cfg.opensubtitlesApiKeyFile;
     } // lib.optionalAttrs (cfg.listenbrainzUserTokenFile != null) {

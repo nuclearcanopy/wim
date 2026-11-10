@@ -38,6 +38,8 @@ pub fn playable_path(item: &SearchItem) -> Option<String> {
             Some(path.to_string_lossy().into_owned())
         }
         SearchItem::Song { id, client, .. } => Some(client.stream_url(id)),
+        SearchItem::TorBoxFile { resolved_url, .. } => resolved_url.clone(),
+        SearchItem::WatchSource { url, .. } => Some(url.expose().to_owned()),
         SearchItem::Silence { secs } => Some(silence_url(*secs)),
         SearchItem::Artist { .. } | SearchItem::Album { .. } | SearchItem::Playlist { .. } => None,
     }
@@ -406,6 +408,8 @@ pub fn resolve_playable(item: &SearchItem, cache: &Arc<Mutex<CacheIndex>>) -> Op
 /// Where a resolved batch goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
+    /// Resolve a provider stream off-thread, then replace the current session.
+    Play,
     /// Appended, which is what the queue key does.
     Back,
     /// Inserted directly behind what is playing
@@ -424,6 +428,7 @@ impl Intent {
     pub fn verb(self) -> &'static str {
         match self {
             Intent::Back | Intent::Front => "queue",
+            Intent::Play => "play",
             Intent::Download => "download",
         }
     }
@@ -438,7 +443,7 @@ impl Intent {
     /// someone asked for seconds earlier.
     pub fn queue_bound(self) -> bool {
         match self {
-            Intent::Back | Intent::Front => true,
+            Intent::Back | Intent::Front | Intent::Play => true,
             Intent::Download => false,
         }
     }
@@ -540,6 +545,7 @@ impl TrackResolver {
             SearchItem::LocalMusic { .. }
                 | SearchItem::LocalVideo { .. }
                 | SearchItem::Song { .. }
+                | SearchItem::WatchSource { .. }
                 | SearchItem::Silence { .. }
         ) {
             // `resolve_tracks` cannot fail for these, but it owns the
@@ -547,7 +553,17 @@ impl TrackResolver {
             // place that says so.
             return Resolution::Ready(resolve_tracks(item).unwrap_or_else(|_| vec![item.clone()]));
         }
-        let label = item.primary_name().to_string();
+        self.request_items(vec![item.clone()], item.primary_name().to_string(), into)
+    }
+
+    /// Resolve an already-expanded queue into a replacement session. Used for
+    /// saved queues containing TorBox identities: every fresh stream URL is
+    /// resolved off-thread before mpv's playlist is changed.
+    pub fn request_session(&mut self, items: Vec<SearchItem>, label: String) -> Resolution {
+        self.request_items(items, label, Intent::Play)
+    }
+
+    fn request_items(&mut self, items: Vec<SearchItem>, label: String, into: Intent) -> Resolution {
         // read, not bumped: a second request does not supersede the
         // first, it joins it.
         let epoch = self.epoch.load(Ordering::SeqCst);
@@ -556,10 +572,33 @@ impl TrackResolver {
             self.next_ticket += 1;
             t
         });
-        let (item, tx, shared) = (item.clone(), self.tx.clone(), Arc::clone(&self.epoch));
+        let (items, tx, shared) = (items, self.tx.clone(), Arc::clone(&self.epoch));
         let sent = label.clone();
         thread::spawn(move || {
-            let tracks = resolve_tracks(&item);
+            let tracks = items.into_iter().try_fold(Vec::new(), |mut acc, item| {
+                let mut resolved = resolve_tracks(&item)?;
+                for track in &mut resolved {
+                    if let SearchItem::TorBoxFile {
+                        service,
+                        item_id,
+                        file_id,
+                        client,
+                        resolved_url,
+                        ..
+                    } = track
+                    {
+                        let response = client
+                            .download_url(*service, *item_id, *file_id)
+                            .map_err(|e| format!("couldn't resolve TorBox playback link: {e}"))?;
+                        *resolved_url = Some(response.into_data().map_err(|_| {
+                            "TorBox could not resolve this file; check download status or account limits"
+                                .to_string()
+                        })?);
+                    }
+                }
+                acc.append(&mut resolved);
+                Ok::<_, String>(acc)
+            });
             if into.queue_bound() && shared.load(Ordering::SeqCst) != epoch {
                 return;
             }
@@ -718,6 +757,8 @@ pub fn resolve_tracks(item: &SearchItem) -> Result<Vec<SearchItem>, String> {
         SearchItem::LocalMusic { .. }
         | SearchItem::LocalVideo { .. }
         | SearchItem::Song { .. }
+        | SearchItem::TorBoxFile { .. }
+        | SearchItem::WatchSource { .. }
         | SearchItem::Silence { .. } => Ok(vec![item.clone()]),
         SearchItem::Album { id, client, .. } => client
             .get_album(id)
@@ -819,6 +860,8 @@ pub fn toggle_star(
 ) -> Result<bool, String> {
     match item {
         SearchItem::Silence { .. } => Err("a silence cannot be starred".to_string()),
+        SearchItem::TorBoxFile { .. } => Err("TorBox account files cannot be starred".to_string()),
+        SearchItem::WatchSource { .. } => Err("online Watch sources cannot be starred".to_string()),
         SearchItem::LocalMusic { path, .. } | SearchItem::LocalVideo { path, .. } => {
             let key = path.to_string_lossy().into_owned();
             let now_starred = favorites.toggle(&key);
@@ -1199,6 +1242,8 @@ pub fn scrobble_metadata(item: &SearchItem) -> Option<listenbrainz::TrackMetadat
         // match arms and would have scrobbled a silence to
         // listenbrainz as a track called "silence".
         SearchItem::Silence { .. }
+        | SearchItem::TorBoxFile { .. }
+        | SearchItem::WatchSource { .. }
         | SearchItem::LocalVideo { .. }
         | SearchItem::Artist { .. }
         | SearchItem::Album { .. }
@@ -1346,7 +1391,12 @@ pub fn try_play(
 /// video in the workspace is separate, larger work; this is the
 /// narrow fix for audio never deserving a window at all.
 pub fn set_vid_for_item(player: &mpv::Mpv, item: &SearchItem) {
-    let vid = if matches!(item, SearchItem::LocalVideo { .. }) {
+    let vid = if matches!(
+        item,
+        SearchItem::LocalVideo { .. }
+            | SearchItem::TorBoxFile { video: true, .. }
+            | SearchItem::WatchSource { .. }
+    ) {
         serde_json::json!("auto")
     } else {
         serde_json::json!("no")
@@ -1563,8 +1613,15 @@ pub fn resync_upcoming(
 /// next time, not worth surfacing since we're already quitting.
 pub fn save_playback_state(player: &mpv::Mpv, queue: &PlayQueue) {
     let state = persistence::PlaybackState {
-        now_playing_path: queue.current().and_then(playable_path),
-        queue_paths: queue.upcoming().iter().filter_map(playable_path).collect(),
+        // Online Watch URLs may be signed credentials; never copy them to
+        // the plaintext resume state. Stable media progress is tracked
+        // separately from this legacy path-based resume file.
+        now_playing_path: queue.current().and_then(persistent_playable_path),
+        queue_paths: queue
+            .upcoming()
+            .iter()
+            .filter_map(persistent_playable_path)
+            .collect(),
         position_secs: player
             .get_property("time-pos")
             .ok()
@@ -1573,6 +1630,15 @@ pub fn save_playback_state(player: &mpv::Mpv, queue: &PlayQueue) {
     };
     let _ = persistence::save(&state);
 }
+
+fn persistent_playable_path(item: &SearchItem) -> Option<String> {
+    if matches!(item, SearchItem::WatchSource { .. }) {
+        None
+    } else {
+        playable_path(item)
+    }
+}
+
 /// Bundles everything the auto/manual download paths need to touch:
 /// the shared cache index, the channel to report progress back on,
 /// and the set of track ids currently mid-transfer. One struct instead
@@ -1696,6 +1762,8 @@ pub fn is_starred(
         }
         SearchItem::Song { id, .. } => remote_starred.contains(id),
         SearchItem::Silence { .. }
+        | SearchItem::TorBoxFile { .. }
+        | SearchItem::WatchSource { .. }
         | SearchItem::Artist { .. }
         | SearchItem::Album { .. }
         | SearchItem::Playlist { .. } => false,
@@ -1970,6 +2038,8 @@ pub fn apply_eq_row(
     notifications: &mut Notifications,
     saved: &eq::CustomPresets,
     row: usize,
+    enabled: bool,
+    bands: usize,
 ) {
     let (source, gains) = match ui::eq_menu::cursor(row, saved.len()) {
         ui::eq_menu::Cursor::Builtin(i) => {
@@ -1987,14 +2057,20 @@ pub fn apply_eq_row(
     app.eq_source = Some(source);
     app.eq_custom = false;
     app.eq_gains = gains;
-    apply_eq_gains(app, player, notifications);
+    apply_eq_gains(app, player, notifications, enabled, bands);
 }
 /// Pushes `app.eq_gains` to mpv, reporting a failure: the menu paths
 /// used to discard the error while the global cycle-eq key reported
 /// it, so the same failure was visible from one route and silent from
 /// the other.
-pub fn apply_eq_gains(app: &app::App, player: &mpv::Mpv, notifications: &mut Notifications) {
-    if let Err(e) = player.set_af(&eq::build_af_filter(&app.eq_gains)) {
+pub fn apply_eq_gains(
+    app: &app::App,
+    player: &mpv::Mpv,
+    notifications: &mut Notifications,
+    enabled: bool,
+    bands: usize,
+) {
+    if let Err(e) = player.set_af(&eq::build_player_af_filter(&app.eq_gains, enabled, bands)) {
         notifications.push(Severity::Error, format!("error setting eq: {e}"));
     }
 }
@@ -2252,6 +2328,19 @@ fn dispatch_action_inner(action: Action, core: &mut CoreCtx, surf: &mut dyn Surf
         //
         // `minimize: false` because a standalone play (not from an
         // open album or playlist) takes over the full player.
+        Action::Play(item @ SearchItem::TorBoxFile { .. }) => {
+            core.track_resolver.invalidate();
+            match core.track_resolver.request(&item, Intent::Play) {
+                Resolution::Ready(items) => {
+                    if let Err(why) = start_session(items, false, core, surf) {
+                        core.notifications.push(Severity::Error, why);
+                    }
+                }
+                Resolution::Fetching(label) => core
+                    .notifications
+                    .push(Severity::Info, format!("resolving {label} from TorBox...")),
+            }
+        }
         Action::Play(item) => {
             if let Err(why) = start_session(vec![item], false, core, surf) {
                 core.notifications.push(Severity::Error, why);
@@ -2307,7 +2396,11 @@ fn dispatch_action_inner(action: Action, core: &mut CoreCtx, surf: &mut dyn Surf
                 .push(Severity::Error, format!("error setting speed: {e}")),
         },
         Action::SetEq(_name, gains) => {
-            let filter = eq::build_af_filter(&gains);
+            let filter = eq::build_player_af_filter(
+                &gains,
+                core.cfg.eq_enabled,
+                core.cfg.visualizer_bands as usize,
+            );
             match core.player.set_af(&filter) {
                 Ok(()) => surf.flash(Field::Eq),
                 Err(e) => core
@@ -2613,7 +2706,15 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 eq::Source::Builtin(i) => i,
                 eq::Source::Saved(i) => ui::eq_menu::PRESET_COUNT + i,
             };
-            apply_eq_row(core.app, core.player, core.notifications, saved, row);
+            apply_eq_row(
+                core.app,
+                core.player,
+                core.notifications,
+                saved,
+                row,
+                core.cfg.eq_enabled,
+                core.cfg.visualizer_bands as usize,
+            );
             op_done()
         }
         Op::SetGap(secs) => {
@@ -2652,6 +2753,168 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 "search: {query} ({} results so far)",
                 core.app.result_count()
             ))
+        }
+        Op::TorBoxSearch(query) => {
+            let client = match crate::torbox::Client::from_config(core.cfg) {
+                Ok(client) => client,
+                Err(_) => return op_fail("TorBox is not configured; set torbox_token_file"),
+            };
+            match client.search_hits(&query) {
+                Ok(hits) => {
+                    if hits.is_empty() {
+                        return op_note("TorBox found no metadata results".to_string());
+                    }
+                    for hit in hits.iter().take(20) {
+                        core.console.note(format!(
+                            "{} [{}:{}]{}",
+                            hit.title,
+                            hit.source,
+                            hit.id,
+                            hit.media_type
+                                .as_deref()
+                                .map(|kind| format!(" · {kind}"))
+                                .unwrap_or_default()
+                        ));
+                    }
+                    op_note(format!("{} TorBox metadata results", hits.len()))
+                }
+                Err(_) => op_fail("TorBox search failed; check token, network, and account plan"),
+            }
+        }
+        Op::TorBoxStatus => {
+            let client = match crate::torbox::Client::from_config(core.cfg) {
+                Ok(client) => client,
+                Err(_) => return op_fail("TorBox is not configured; set torbox_token_file"),
+            };
+            match client.account_items(crate::torbox::Service::Torrent, 0, 1) {
+                Ok(_) => op_note("TorBox token file connected successfully".to_string()),
+                Err(_) => op_fail(
+                    "TorBox connection failed; check token file, network/VPN access, and account",
+                ),
+            }
+        }
+        Op::TorBoxList(service) => {
+            let client = match crate::torbox::Client::from_config(core.cfg) {
+                Ok(client) => client,
+                Err(_) => return op_fail("TorBox is not configured; set torbox_token_file"),
+            };
+            match client.all_account_items(service) {
+                Ok(items) => {
+                    for item in &items {
+                        core.console.note(format!(
+                            "{} · {} · id={} · {} files",
+                            item.name,
+                            item.status,
+                            item.id,
+                            item.files.len()
+                        ));
+                        for file in item
+                            .files
+                            .iter()
+                            .filter(|file| crate::torbox::is_playable_file_name(&file.name))
+                        {
+                            core.console.note(format!(
+                                "  {} · file_id={} · {} bytes",
+                                file.name, file.id, file.size
+                            ));
+                        }
+                    }
+                    op_note(format!(
+                        "{} {} account items",
+                        items.len(),
+                        service.as_str()
+                    ))
+                }
+                Err(_) => op_fail("TorBox account list failed; check token, network, and plan"),
+            }
+        }
+        Op::TorBoxAdd { service, link } => {
+            let client = match crate::torbox::Client::from_config(core.cfg) {
+                Ok(client) => client,
+                Err(_) => return op_fail("TorBox is not configured; set torbox_token_file"),
+            };
+            let result = match service {
+                crate::torbox::Service::Torrent => client.add_magnet(&link),
+                crate::torbox::Service::Usenet => client.add_usenet_link(&link),
+                crate::torbox::Service::WebDownload => client.add_web_download(&link),
+            };
+            match result.and_then(|response| response.ensure_success()) {
+                Ok(()) => op_note(format!(
+                    "added to TorBox {}; refresh with torbox_list",
+                    service.as_str()
+                )),
+                Err(_) => op_fail(format!(
+                    "TorBox could not add this {} link",
+                    service.as_str()
+                )),
+            }
+        }
+        Op::TorBoxPlay {
+            service,
+            id,
+            file_id,
+        } => {
+            let client = match crate::torbox::Client::from_config(core.cfg) {
+                Ok(client) => Arc::new(client),
+                Err(_) => return op_fail("TorBox is not configured; set torbox_token_file"),
+            };
+            let item = match client.find_account_item(service, id) {
+                Ok(Some(item)) => item,
+                Ok(None) => return op_fail("TorBox item was not found; refresh the account list"),
+                Err(_) => return op_fail("TorBox account list failed"),
+            };
+            let Some(item) = item.playable_items(client).into_iter().find(|file| {
+                matches!(file, SearchItem::TorBoxFile { file_id: found, .. } if *found == file_id)
+            }) else {
+                return op_fail("TorBox file is missing or is not a playable audio/video file");
+            };
+            let dispatch = dispatch_action(Action::Play(item), core, surf);
+            (
+                dispatch,
+                Report::Note(format!("resolving TorBox item {id}/{file_id}")),
+            )
+        }
+        Op::TorBoxQueue {
+            service,
+            id,
+            file_id,
+        } => {
+            let client = match crate::torbox::Client::from_config(core.cfg) {
+                Ok(client) => Arc::new(client),
+                Err(_) => return op_fail("TorBox is not configured; set torbox_token_file"),
+            };
+            let item = match client.find_account_item(service, id) {
+                Ok(Some(item)) => item,
+                Ok(None) => return op_fail("TorBox item was not found; refresh the account list"),
+                Err(_) => return op_fail("TorBox account list failed"),
+            };
+            let Some(item) = item.playable_items(client).into_iter().find(|file| {
+                matches!(file, SearchItem::TorBoxFile { file_id: found, .. } if *found == file_id)
+            }) else {
+                return op_fail("TorBox file is missing or is not a playable audio/video file");
+            };
+            let dispatch = dispatch_action(Action::Queued(item), core, surf);
+            (
+                dispatch,
+                Report::Note(format!("queued TorBox item {id}/{file_id}")),
+            )
+        }
+        Op::TorBoxControl {
+            service,
+            id,
+            operation,
+        } => {
+            let client = match crate::torbox::Client::from_config(core.cfg) {
+                Ok(client) => client,
+                Err(_) => return op_fail("TorBox is not configured; set torbox_token_file"),
+            };
+            match client
+                .control(service, id, &operation)
+                .and_then(|response| response.ensure_success())
+            {
+                Ok(()) => op_note(format!("TorBox {operation} complete for item {id}")),
+                Err(_) => op_fail(format!("TorBox could not {operation} item {id}")),
+            }
         }
         Op::MoveSelection(delta) => surf.move_selection(SelectStep::By(delta), core),
         Op::SelectTop => surf.move_selection(SelectStep::Top, core),
@@ -2782,6 +3045,8 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 }
                 SearchItem::LocalMusic { .. }
                 | SearchItem::LocalVideo { .. }
+                | SearchItem::TorBoxFile { .. }
+                | SearchItem::WatchSource { .. }
                 | SearchItem::Silence { .. } => None,
             };
             match page {
@@ -2923,11 +3188,14 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
         },
         Op::LoadQueue(name) => {
             let clients = shellsong_host::clients_of(&core.app.corpus);
+            let torbox = crate::torbox::Client::from_config(core.cfg)
+                .ok()
+                .map(Arc::new);
             // `load_report` rather than `load`: the plain one discards
             // what it could not rebuild, so a fifty-track queue whose
             // server is gone came back as twelve tracks and said
             // nothing about the other thirty-eight.
-            match queues::load_report(&name, &clients) {
+            match queues::load_report_with_torbox(&name, &clients, torbox) {
                 None => op_fail(namehint::unknown(
                     "saved queue",
                     &name,
@@ -2944,6 +3212,26 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 Some(loaded) => {
                     let count = loaded.items.len();
                     let lost = loaded.dropped.len();
+                    if loaded
+                        .items
+                        .iter()
+                        .any(|item| matches!(item, SearchItem::TorBoxFile { .. }))
+                    {
+                        match core
+                            .track_resolver
+                            .request_session(loaded.items, format!("saved queue '{name}'"))
+                        {
+                            Resolution::Fetching(label) => core
+                                .notifications
+                                .push(Severity::Info, format!("resolving {label}...")),
+                            Resolution::Ready(items) => {
+                                if let Err(why) = start_session(items, false, core, surf) {
+                                    return op_fail(why);
+                                }
+                            }
+                        }
+                        return op_done();
+                    }
                     match start_session(loaded.items, false, core, surf) {
                         Ok(_) if lost == 0 => op_note(format!("loaded '{name}': {count} tracks")),
                         Ok(_) => op_note(format!(
@@ -3205,6 +3493,13 @@ pub enum Drive {
     Quit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpDrive {
+    Continue,
+    Await,
+    Quit,
+}
+
 /// Steps a program as far as it can go this frame, applying each
 /// `Emit` before the next `step`. The one driver, so wim and
 /// shellswim cannot diverge on await handling, on when a program is
@@ -3215,6 +3510,28 @@ pub fn drive(
     surf: &mut dyn Surface,
     settle_now: impl Fn(&CoreCtx) -> bool,
 ) -> Drive {
+    drive_with(
+        program,
+        core,
+        surf,
+        settle_now,
+        |op, core, surf| match apply_op(op, core, surf) {
+            Dispatch::Continue => OpDrive::Continue,
+            Dispatch::Quit => OpDrive::Quit,
+        },
+    )
+}
+
+/// Same program driver with a host-owned async-operation seam. Interactive
+/// frontends use `Await` when an emitted operation has been dispatched to a
+/// worker; the program remains suspended until that host resumes it.
+pub fn drive_with(
+    program: &mut Program,
+    core: &mut CoreCtx,
+    surf: &mut dyn Surface,
+    settle_now: impl Fn(&CoreCtx) -> bool,
+    mut apply: impl FnMut(Op, &mut CoreCtx, &mut dyn Surface) -> OpDrive,
+) -> Drive {
     loop {
         // rebuilt every step, not once per frame: `search(...)` makes
         // the query unsettled again, and a `Resolve` reading a stale
@@ -3224,8 +3541,10 @@ pub fn drive(
         let env = shellsong_env(core.app, core.queue, surf, settled, core.now);
         match program.step(&env) {
             shellsong::Step::Emit(op) => {
-                if apply_op(op, core, surf) == Dispatch::Quit {
-                    return Drive::Quit;
+                match apply(op, core, surf) {
+                    OpDrive::Quit => return Drive::Quit,
+                    OpDrive::Await => return Drive::Await,
+                    OpDrive::Continue => {}
                 }
                 if program.is_done() {
                     return Drive::Done;
@@ -5830,6 +6149,8 @@ mod scrobble_metadata_tests {
         match item {
             SearchItem::LocalMusic { .. } | SearchItem::Song { .. } => true,
             SearchItem::Silence { .. }
+            | SearchItem::TorBoxFile { .. }
+            | SearchItem::WatchSource { .. }
             | SearchItem::LocalVideo { .. }
             | SearchItem::Artist { .. }
             | SearchItem::Album { .. }
@@ -7037,5 +7358,25 @@ mod auto_download_wiring_tests {
             after_first,
             "a second play must not start a second transfer"
         );
+    }
+
+    #[test]
+    fn signed_watch_urls_are_never_path_resume_values() {
+        let item = SearchItem::WatchSource {
+            identity: crate::media::PlaybackIdentity {
+                media_id: "film".into(),
+                episode_id: None,
+                source_id: "stable-hash".into(),
+            },
+            title: "Film · Source 1".into(),
+            url: crate::search::EphemeralUrl::new(
+                "https://cdn.invalid/film?signature=do-not-persist".into(),
+            ),
+        };
+        assert_eq!(
+            playable_path(&item).as_deref(),
+            Some("https://cdn.invalid/film?signature=do-not-persist")
+        );
+        assert_eq!(persistent_playable_path(&item), None);
     }
 }
