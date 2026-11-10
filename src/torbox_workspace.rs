@@ -207,10 +207,29 @@ impl Workspace {
         let (generation, tx) = (self.generation, self.tx.clone());
         self.loading = true;
         self.message = Some(format!("searching your TorBox library for {query:?}…"));
+        crate::trace::diag(
+            "torbox",
+            "search-start",
+            &[
+                ("query-len", query.len().to_string()),
+                ("generation", generation.to_string()),
+            ],
+        );
         thread::spawn(move || {
             let result = client
                 .search_library(&query)
                 .map_err(|error| format!("TorBox library search failed: {error:#}"));
+            if let Ok(search) = &result {
+                crate::trace::diag(
+                    "torbox",
+                    "search-done",
+                    &[
+                        ("matches", search.matches.len().to_string()),
+                        ("failed", search.failed_services.len().to_string()),
+                        ("generation", generation.to_string()),
+                    ],
+                );
+            }
             let _ = tx.send(Reply::Search(generation, result));
         });
     }
@@ -409,6 +428,17 @@ impl Workspace {
         let Some(item) = self.hits.get(self.selected).cloned() else {
             return;
         };
+        let playable = item.playable_files_for_display().len();
+        crate::trace::diag(
+            "torbox",
+            "open-hit",
+            &[
+                ("index", self.selected.to_string()),
+                ("hits", self.hits.len().to_string()),
+                ("service", item.service.as_str().to_string()),
+                ("playable", playable.to_string()),
+            ],
+        );
         if item.playable_files_for_display().is_empty() {
             self.message = Some(format!(
                 "'{}' has no playable files (status: {})",
