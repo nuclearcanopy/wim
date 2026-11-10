@@ -22,11 +22,22 @@ Account item identities can be saved in named queues as service/item/file IDs;
 temporary stream URLs are excluded. Playback-link resolution runs in the
 existing background track resolver before items enter mpv's playlist.
 
-Voyager provides a text metadata search route and a metadata-ID torrent
-resolution route. Wim's separate metadata search workspace opens with `T`.
-Queries are sent on explicit Enter, separate from normal local/Navidrome
-search. Select a metadata hit and press Enter to load torrent sources; `a`
-adds a magnet, with a second-press confirmation for known uncached releases.
+Voyager's public metadata search API is gone: `search-api.torbox.app` no
+longer resolves, and the main API exposes no metadata-search route. Wim's
+TorBox search (`T`) is therefore an **account library search**: it lists your
+torrent, Usenet, and web-download items through the documented
+`/torrents/mylist`, `/usenet/mylist`, and `/webdl/mylist` endpoints and
+filters them locally, case-insensitively, against item names and file names.
+It never sends your query to a third party, and it cannot find content that
+is not already in your account. A service whose listing fails is reported
+("results may be incomplete") instead of hidden; if every service fails, the
+search fails with the sanitized error.
+
+Select a library result and press Enter to open its playable files; Enter
+plays, `q` queues. Opening a result never adds anything to the account. For
+discovering new media online, use the separate Watch workspace (`W`), which
+talks to an explicitly configured Stremio-compatible addon; TorBox search
+and Watch are independent.
 
 The TorBox workspace opens with `T`. When not configured, it opens the
 connection screen; otherwise `/` edits the TorBox-only search query, Enter
@@ -60,12 +71,12 @@ path and token, then retry from a network TorBox accepts. If you choose to
 change VPN routing, consider the privacy tradeoff; Wim never changes VPN
 settings automatically.
 
-shellswim supports `torbox_status()`, `torbox_search(query)`,
-`torbox_list(torrent|usenet|web)`, `torbox_add(service, link)`,
-`torbox_play(service, item_id, file_id)`, `torbox_queue(service, item_id,
-file_id)`, and `torbox_control(service, item_id, operation)`. Calls run
-asynchronously in interactive mode and are awaited in one-shot commands;
-account-changing commands remain explicit and dry runs do not execute them.
-Use only operations supported by that service as listed above. ASCII video
-capture is not supported for remote TorBox streams; use mpv's normal video
-output.
+shellswim supports `torbox_status()`, `torbox_search(query)` (library
+search, matching the `T` workspace semantics), `torbox_list(torrent|usenet|
+web)`, `torbox_add(service, link)`, `torbox_play(service, item_id, file_id)`,
+`torbox_queue(service, item_id, file_id)`, and `torbox_control(service,
+item_id, operation)`. Calls run asynchronously in interactive mode and are
+awaited in one-shot commands; account-changing commands remain explicit and
+dry runs do not execute them. Use only operations supported by that service
+as listed above. ASCII video capture is not supported for remote TorBox
+streams; use mpv's normal video output.
