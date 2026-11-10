@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -7,62 +6,26 @@ use ratatui::widgets::Widget;
 use crate::app::LoopMode;
 use crate::browse::ArtMode;
 use crate::keymap::{key_label, KeyAction, Keymap};
-use crate::theme::{shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE, WHITE};
+use crate::theme::{shade, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::albumart::CachedArt;
-use crate::ui::controlsbar::{
-    fill_bg, segments_that_fit, track_into, Field, GLYPH_CROSSFADE, GLYPH_EQ, GLYPH_LOOP,
-    GLYPH_PAUSE, GLYPH_PLAY, GLYPH_SHUFFLE, GLYPH_SPEED, SCRUB_BG, SELECT_BG, TRACK_MIN,
-};
 use crate::ui::draw;
 use crate::ui::gap::{Gap, GapPanel};
-use crate::ui::progress::readouts;
 use crate::ui::textfit::{truncate_with_ellipsis, width};
 
 /// Rows at the bottom of the pane the spectrum owns (main.rs draws
 /// it over whatever was there, on the same `main_content.height > 2`
 /// condition mirrored below), so the stack stops above them.
-pub const METER_ROWS: u16 = 2;
-
-/// Title, control row, scrubber: the three rows a player is, which no
-/// amount of shrinking drops as long as there are rows for them.
-const CORE_ROWS: u16 = 3;
+const METER_ROWS: u16 = 2;
 
 /// The cover is only drawn once it can be at least this big. Smaller
 /// than this it is unreadable mush and the rows are worth more to the
-/// transport, so a short pane degrades to exactly the old screen.
+/// stack, so a short pane degrades to title and context only.
 const ART_MIN_ROWS: u16 = 6;
 const ART_MIN_COLS: u16 = 14;
 
 /// Share of the pane the cover may take, same budget rule as
 /// `browse::layout`'s big-art path.
 const ART_SHARE: f32 = 0.6;
-
-/// Longest scrubber the now-playing screen draws. It is centred under
-/// the title rather than stretched edge to edge like the bottom bar's:
-/// on a wide terminal a full-width track turns a 5-second step into a
-/// one-cell twitch.
-const TRACK_MAX: usize = 56;
-
-/// Separator between controls. Words get a cell more than the bottom
-/// bar's two so that neighbouring selection plates (which pad a cell
-/// either side) cannot touch and read as one wide plate.
-const SEP_WORDS: usize = 3;
-const SEP_GLYPHS: usize = 2;
-
-/// Between hints on the bottom row; a dot, since those are sentences
-/// about keys and two spaces alone did not read as a list.
-const HINT_SEP: &str = "  ·  ";
-
-/// `HINT_SEP`'s width: five columns in six bytes, so neither a byte
-/// count nor a walk per frame. `the_hint_separator_is_five_cells_wide`
-/// holds the two together.
-const HINT_SEP_CELLS: usize = 5;
-
-/// Most hints a row ever lists, as the stack the fit is tried on.
-const HINTS: usize = 4;
-
-/// Controls the transport row carries, likewise.
-const CONTROLS: usize = 6;
 
 /// Where every piece of the now-playing screen goes. Returned by
 /// `layout` rather than decided inside `render` so the host can put a
@@ -77,9 +40,6 @@ pub struct PlayerLayout {
     /// Previous/next track line; the first thing a shrinking pane
     /// drops, since the queue view answers the same question.
     pub context_y: Option<u16>,
-    pub controls_y: Option<u16>,
-    pub progress_y: Option<u16>,
-    pub hint_y: Option<u16>,
 }
 
 /// `None` when nothing fits at all (a zero-width or zero-height pane).
@@ -100,23 +60,11 @@ pub fn layout(
         area.height
     };
 
-    // the core three (title, controls, scrubber) first, then extra
-    // rows in the order they earn their keep: a gap under the title,
-    // the key hint, the hint's own gap, the prev/next line. each
-    // number is the body height that row starts being worth having.
-    let progress = body_h >= 2;
-    let controls = body_h >= CORE_ROWS;
-    let gap_title = body_h >= 4;
-    let hint = body_h >= 5;
-    let gap_hint = body_h >= 6;
-    let context = has_context && body_h >= 7;
-    let stack_h = 1
-        + u16::from(context)
-        + u16::from(gap_title)
-        + u16::from(controls)
-        + u16::from(progress)
-        + u16::from(gap_hint)
-        + u16::from(hint);
+    // title and the prev/next line; the transport itself is the bottom
+    // bar's (one transport, one cursor — the duplicated controls row
+    // this pane used to draw is gone).
+    let context = has_context && body_h >= 2;
+    let stack_h = 1 + u16::from(context);
 
     let remaining = body_h.saturating_sub(stack_h);
     let mut art_rect = None;
@@ -154,29 +102,10 @@ pub fn layout(
         y += 1;
         row
     });
-    if gap_title {
-        y += 1;
-    }
-    let controls_y = controls.then(|| {
-        let row = y;
-        y += 1;
-        row
-    });
-    let progress_y = progress.then(|| {
-        let row = y;
-        y += 1;
-        row
-    });
-    if gap_hint {
-        y += 1;
-    }
     Some(PlayerLayout {
         art,
         title_y,
         context_y,
-        controls_y,
-        progress_y,
-        hint_y: hint.then_some(y),
     })
 }
 
@@ -226,11 +155,6 @@ pub struct PlayerView<'a> {
     pub crossfade_on: bool,
     pub previous: Option<&'a str>,
     pub next: Option<&'a str>,
-    /// Transport cursor; `Some` exactly while this pane has focus, so
-    /// it doubles as "are the arrows mine right now" for the hint.
-    pub selected: Option<Field>,
-    /// `true` while enter-on-the-scrubber has a drag open.
-    pub scrubbing: bool,
     pub keymap: &'a Keymap,
 }
 
@@ -273,76 +197,6 @@ impl Widget for PlayerView<'_> {
         if let Some(y) = l.context_y {
             draw_centered(buf, area, y, &self.context_line(), shade(NEAR_BLACK));
         }
-        if let Some(y) = l.controls_y {
-            let (controls, sep) = self.controls(area.width as usize);
-            self.draw_row(buf, area, y, &controls, sep);
-        }
-        if let Some(y) = l.progress_y {
-            self.draw_row(
-                buf,
-                area,
-                y,
-                &[self.scrubber(area.width as usize)],
-                SEP_WORDS,
-            );
-        }
-        if let Some(y) = l.hint_y {
-            let hint = self.hint(area.width as usize);
-            draw_centered(buf, area, y, &hint, shade(NEAR_BLACK));
-        }
-    }
-}
-
-/// How much of a control's label the row has room for: glyph, name and
-/// value; glyph and name; or the bottom bar's bare glyph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Detail {
-    Full,
-    Named,
-    Glyph,
-}
-
-/// One drawn transport element: its text, whether its control is
-/// active (resting brightness, exactly as on the bottom bar) and which
-/// `Field` the cursor has to be on for it to be the selected one.
-struct Element {
-    field: Field,
-    text: String,
-    /// `text`'s display width. Measured once, where the text is built:
-    /// the fit pass, the row's centring, the rect and the plate all
-    /// want it, and asking four times was most of what a row cost.
-    cells: usize,
-    lit: bool,
-    /// Scrubber only: the track's offset into `text` and its length,
-    /// both in cells, so a click lands on a position on the track
-    /// rather than on one of the readouts either side of it.
-    track: Option<(usize, usize)>,
-}
-
-impl Element {
-    fn new(field: Field, lit: bool, text: String) -> Self {
-        Element {
-            field,
-            cells: width(&text),
-            lit,
-            text,
-            track: None,
-        }
-    }
-
-    /// An element whose width is known without measuring it, which is
-    /// the scrubber: its text is as long as the row, and walking it to
-    /// count cells it was built from showed up on the frame.
-    /// `the_cells_an_element_claims_are_the_cells_it_draws` holds the
-    /// count against the text.
-    fn sized(field: Field, lit: bool, text: String, cells: usize) -> Self {
-        Element {
-            field,
-            cells,
-            lit,
-            text,
-            track: None,
-        }
     }
 }
 
@@ -373,383 +227,6 @@ impl PlayerView<'_> {
         }
         out
     }
-
-    /// The six toggles, and the separator the row ended up using.
-    /// Words while they fit: this screen has a whole pane where the
-    /// bottom bar has one strip, and "crossfade off" is legible where a
-    /// dim `◢◣` is only legible once you already know it. The glyph
-    /// stays in front of the word so the two surfaces still read as the
-    /// same control. A pane too narrow for the values keeps the names
-    /// (brightness already says on/off, same as the bar) before falling
-    /// back to the bar's bare glyphs; words are never truncated.
-    fn controls(&self, avail: usize) -> (Vec<Element>, usize) {
-        for (detail, sep) in [
-            (Detail::Full, SEP_WORDS),
-            (Detail::Named, SEP_GLYPHS),
-            (Detail::Glyph, SEP_GLYPHS),
-        ] {
-            let items = self.elements(detail);
-            // on the stack and already measured: the fit is tried up
-            // to three times a row and the row twice a frame.
-            let mut lengths = [0usize; CONTROLS];
-            for (slot, e) in lengths.iter_mut().zip(&items) {
-                *slot = e.cells;
-            }
-            let fits = segments_that_fit(&lengths[..items.len()], avail, sep);
-            if fits == items.len() {
-                return (items, sep);
-            }
-            // bare glyphs are the last tier, so this is where whole
-            // elements start going from the right rather than a wider
-            // form getting cut off mid-word.
-            if detail == Detail::Glyph {
-                let mut items = items;
-                items.truncate(fits);
-                return (items, sep);
-            }
-        }
-        unreachable!("the glyph tier always returns")
-    }
-
-    fn elements(&self, detail: Detail) -> Vec<Element> {
-        let speed_changed = (self.speed - 1.0).abs() >= 0.005;
-        let onoff = |on: bool| if on { "on" } else { "off" };
-        // a glyph, then whichever words the tier has room for after
-        // it, pushed rather than `format!`ed: six of these are rebuilt
-        // on both of a frame's row passes, and the formatter measured
-        // 4.7x a push per label (`bench::label_cost`).
-        let words = |glyph: &str, rest: &[&str]| {
-            let mut out = String::with_capacity(
-                glyph.len() + rest.iter().map(|w| w.len() + 1).sum::<usize>(),
-            );
-            out.push_str(glyph);
-            for word in rest {
-                out.push(' ');
-                out.push_str(word);
-            }
-            out
-        };
-        let glyph_words = |glyph: char, rest: &[&str]| {
-            let mut buf = [0u8; 4];
-            words(glyph.encode_utf8(&mut buf), rest)
-        };
-        // name without value: the glyph's brightness already carries
-        // on/off, so the middle tier spends its cells on which control
-        // this is, which is the part a glyph can't teach you.
-        let named = |g: char, name: &str, value: &str| match detail {
-            Detail::Full => glyph_words(g, &[name, value]),
-            Detail::Named => glyph_words(g, &[name]),
-            Detail::Glyph => glyph_words(g, &[]),
-        };
-        vec![
-            Element::new(
-                Field::Pause,
-                // lit means "audio is moving", same as the bar: the
-                // play triangle is the bright state.
-                !self.paused && self.gap_remaining.is_none(),
-                match (detail, self.gap_remaining, self.paused) {
-                    // the gap wins the segment: "paused" is true but
-                    // it is not why, and it is not what happens next.
-                    (Detail::Glyph, Some(left), _) => {
-                        format!("{GLYPH_PAUSE}{}", left.max(0.0).ceil() as u64)
-                    }
-                    (_, Some(left), _) => {
-                        format!("{GLYPH_PAUSE} gap {}s", left.max(0.0).ceil() as u64)
-                    }
-                    (Detail::Glyph, None, true) => glyph_words(GLYPH_PAUSE, &[]),
-                    (Detail::Glyph, None, false) => glyph_words(GLYPH_PLAY, &[]),
-                    (_, None, true) => glyph_words(GLYPH_PAUSE, &["paused"]),
-                    (_, None, false) => glyph_words(GLYPH_PLAY, &["playing"]),
-                },
-            ),
-            Element::new(
-                Field::Loop,
-                self.loop_mode != LoopMode::Off,
-                match detail {
-                    Detail::Glyph if self.loop_mode == LoopMode::One => {
-                        format!("{GLYPH_LOOP}1")
-                    }
-                    Detail::Glyph => glyph_words(GLYPH_LOOP, &[]),
-                    _ => named(GLYPH_LOOP, "loop", self.loop_mode.label()),
-                },
-            ),
-            Element::new(
-                Field::Shuffle,
-                self.shuffle_on,
-                named(GLYPH_SHUFFLE, "shuffle", onoff(self.shuffle_on)),
-            ),
-            Element::new(
-                Field::Speed,
-                speed_changed,
-                // the rate stays even at 1.00x on the two word tiers:
-                // the bar drops it to save cells, this screen has them
-                // and "what speed am i playing at" is a thing it should
-                // answer without being asked.
-                match detail {
-                    // the rate is a number, so these go through the
-                    // formatter where the fixed labels do not.
-                    Detail::Full => format!("{GLYPH_SPEED} speed {:.2}x", self.speed),
-                    Detail::Named => format!("{GLYPH_SPEED} {:.2}x", self.speed),
-                    Detail::Glyph if speed_changed => {
-                        format!("{GLYPH_SPEED}{:.2}", self.speed)
-                    }
-                    Detail::Glyph => glyph_words(GLYPH_SPEED, &[]),
-                },
-            ),
-            Element::new(
-                Field::Eq,
-                self.eq_preset != "flat",
-                match detail {
-                    Detail::Full => words(GLYPH_EQ, &["eq", self.eq_preset]),
-                    Detail::Named => words(GLYPH_EQ, &["eq"]),
-                    Detail::Glyph => words(GLYPH_EQ, &[]),
-                },
-            ),
-            Element::new(
-                Field::Crossfade,
-                self.crossfade_on,
-                match detail {
-                    Detail::Full => {
-                        words(GLYPH_CROSSFADE, &["crossfade", onoff(self.crossfade_on)])
-                    }
-                    Detail::Named => words(GLYPH_CROSSFADE, &["crossfade"]),
-                    Detail::Glyph => words(GLYPH_CROSSFADE, &[]),
-                },
-            ),
-        ]
-    }
-
-    fn scrubber(&self, avail: usize) -> Element {
-        // padded to one width for the whole song, so neither the track
-        // nor this centred row shifts a column mid-drag; see
-        // `progress::readouts`.
-        let (elapsed, total) = readouts(self.elapsed_secs, self.duration_secs);
-        let frac = match (self.elapsed_secs, self.duration_secs) {
-            (Some(e), Some(d)) if d > 0.0 => (e / d).clamp(0.0, 1.0),
-            _ => 0.0,
-        };
-        let dragging = self.scrubbing && self.selected == Some(Field::Progress);
-        let (elapsed_cells, total_cells) = (width(&elapsed), width(&total));
-        // two spaces around the track, two cells for the plate.
-        let fixed = elapsed_cells + total_cells + 4;
-        match avail.checked_sub(fixed + TRACK_MIN) {
-            Some(slack) => {
-                let cells = TRACK_MIN + slack.min(TRACK_MAX - TRACK_MIN);
-                // one allocation at its final size, and a width that
-                // is arithmetic: a readout either side of a track of
-                // one-cell glyphs.
-                let mut text = String::with_capacity(elapsed.len() + total.len() + 2 + cells * 3);
-                text.push_str(&elapsed);
-                text.push(' ');
-                track_into(&mut text, frac, cells, dragging);
-                text.push(' ');
-                text.push_str(&total);
-                let mut element = Element::sized(
-                    Field::Progress,
-                    self.elapsed_secs.is_some(),
-                    text,
-                    elapsed_cells + 1 + cells + 1 + total_cells,
-                );
-                element.track = Some((elapsed_cells + 1, cells));
-                element
-            }
-            // too narrow for a track anyone could read a position off,
-            // so the position goes as text rather than as a stub bar.
-            None => Element::sized(
-                Field::Progress,
-                self.elapsed_secs.is_some(),
-                format!("{elapsed} / {total}"),
-                elapsed_cells + 3 + total_cells,
-            ),
-        }
-    }
-
-    /// What the keys do right now, resolved from the live keymap. The
-    /// whole point of this row: the transport used to be legible only
-    /// from the help overlay. Listed most useful first and cut whole
-    /// hints at a time, so a narrow pane loses "minimize" rather than
-    /// half of "move focus".
-    fn hint(&self, avail: usize) -> String {
-        // borrowed where the hint is a fixed sentence, which is most
-        // of them: only the two that name a remappable key are built.
-        let minimize = || Cow::Owned(format!("{}: minimize", self.key(KeyAction::ToggleMinimize)));
-        let parts: Vec<Cow<'static, str>> = if self.scrubbing {
-            vec![
-                "arrows: seek".into(),
-                "shift: coarse".into(),
-                "enter/esc: done".into(),
-            ]
-        } else if let Some(field) = self.selected {
-            vec![
-                self.activate_hint(field).into(),
-                "arrows: pick".into(),
-                "tab: move focus".into(),
-                minimize(),
-            ]
-        } else {
-            vec!["tab: move focus".into(), minimize()]
-        };
-        let mut lengths = [0usize; HINTS];
-        for (slot, p) in lengths.iter_mut().zip(&parts) {
-            *slot = width(p);
-        }
-        // cells, not bytes: the separator is 5 columns and 6 bytes
-        // (the middle dot is two), so `len()` over-charged a cell per
-        // gap and dropped a hint earlier than it needed to.
-        let fits = segments_that_fit(&lengths[..parts.len()], avail, HINT_SEP_CELLS).max(1);
-        parts[..fits].join(HINT_SEP)
-    }
-
-    /// What enter does on the selected control, plus the global key
-    /// that does the same thing where there is one.
-    fn activate_hint(&self, field: Field) -> String {
-        let with_key = |what: &str, action| format!("enter: {what} (or {})", self.key(action));
-        match field {
-            Field::Pause => with_key("play/pause", KeyAction::TogglePause),
-            Field::Loop => with_key("cycle loop", KeyAction::CycleLoop),
-            Field::Shuffle => with_key("toggle shuffle", KeyAction::ToggleShuffle),
-            Field::Speed => with_key("speed up", KeyAction::SpeedUp),
-            // enter opens the menu here; the global key cycles presets
-            // instead, so naming it beside "enter" would be a lie.
-            Field::Eq => "enter: eq menu".into(),
-            Field::Crossfade => with_key("crossfade", KeyAction::ToggleCrossfade),
-            Field::Progress => "enter: seek in this track".into(),
-        }
-    }
-
-    /// One centred row of elements, each plated when the cursor is on
-    /// it. Same convention as the bar: the plate marks the cursor, so
-    /// brightness stays free to mean on/off, and an inactive control is
-    /// only lifted to `MID` so it reads against its own plate.
-    fn draw_row(&self, buf: &mut Buffer, area: Rect, y: u16, items: &[Element], sep: usize) {
-        let limit = area.x + area.width;
-        for (item, placed) in items.iter().zip(row_rects(items, area, y, sep)) {
-            let x = placed.rect.x;
-            let is_selected = self.selected == Some(item.field);
-            let dragging = is_selected && self.scrubbing && item.field == Field::Progress;
-            let level = if dragging {
-                WHITE
-            } else if item.lit {
-                BRIGHT
-            } else {
-                DIM
-            };
-            let level = if is_selected { level.max(MID) } else { level };
-            let bg = if dragging {
-                Some(shade(SCRUB_BG))
-            } else if is_selected {
-                Some(shade(SELECT_BG))
-            } else {
-                None
-            };
-            // one cell of padding each side, so a one-glyph element's
-            // plate reads as a plate and not as a stray lit cell.
-            if let Some(bg) = bg {
-                let end = x.saturating_add(item.cells as u16 + 1);
-                fill_bg(buf, x.saturating_sub(1).max(area.x), end.min(limit), y, bg);
-            }
-            draw::at_styled(
-                buf,
-                x,
-                y,
-                &item.text,
-                shade(level),
-                bg,
-                limit.saturating_sub(x) as usize,
-            );
-        }
-    }
-
-    /// Where this screen's transport ended up, for the host's hit map
-    /// (see `hit::HitMap`). Same contract `layout` has with the art
-    /// overlay: the columns are decided while drawing (centred, at
-    /// whichever detail tier fit), so the host cannot derive them and
-    /// must be handed them.
-    pub fn transport(&self, area: Rect) -> TransportLayout {
-        let Some(l) = layout(
-            area,
-            self.art.is_some() && self.art_mode != ArtMode::Off,
-            self.previous.is_some() || self.next.is_some(),
-            self.cell_aspect,
-        ) else {
-            return TransportLayout::default();
-        };
-        let mut out = TransportLayout::default();
-        if let Some(y) = l.controls_y {
-            let (controls, sep) = self.controls(area.width as usize);
-            for placed in row_rects(&controls, area, y, sep) {
-                out.controls.push((placed.field, placed.rect));
-            }
-        }
-        if let Some(y) = l.progress_y {
-            let items = [self.scrubber(area.width as usize)];
-            for placed in row_rects(&items, area, y, SEP_WORDS) {
-                out.controls.push((placed.field, placed.rect));
-                out.track = placed.track;
-            }
-        }
-        out
-    }
-}
-
-/// The transport as drawn, for hit-testing a click against it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TransportLayout {
-    pub controls: Vec<(Field, Rect)>,
-    /// The scrubber's track cells only; `None` when the pane was too
-    /// narrow for a track and the position went as plain text.
-    pub track: Option<Rect>,
-}
-
-/// One element of a centred row and the columns it lands on.
-struct Placed {
-    field: Field,
-    rect: Rect,
-    track: Option<Rect>,
-}
-
-/// Columns each element of a centred row occupies. `draw_row` paints
-/// from this and `PlayerView::transport` hit-tests against it, so a
-/// click can never land on an element the row dropped or shifted; the
-/// row is centred on its own total width, which is not something a
-/// caller can recover from the field list.
-fn row_rects(items: &[Element], area: Rect, y: u16, sep: usize) -> Vec<Placed> {
-    if items.is_empty() || y >= area.y + area.height {
-        return Vec::new();
-    }
-    let total: usize = items.iter().map(|e| e.cells).sum::<usize>() + sep * (items.len() - 1);
-    let limit = area.x + area.width;
-    let mut out = Vec::with_capacity(items.len());
-    let mut x = area.x + ((area.width as usize).saturating_sub(total) / 2) as u16;
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 {
-            x += sep as u16;
-        }
-        if x >= limit {
-            break;
-        }
-        let drawn = (item.cells as u16).min(limit - x);
-        out.push(Placed {
-            field: item.field,
-            rect: Rect {
-                x,
-                y,
-                width: drawn,
-                height: 1,
-            },
-            track: item.track.and_then(|(offset, cells)| {
-                let tx = x + offset as u16;
-                (tx < limit).then(|| Rect {
-                    x: tx,
-                    y,
-                    width: (cells as u16).min(limit - tx),
-                    height: 1,
-                })
-            }),
-        });
-        x += drawn;
-    }
-    out
 }
 
 fn draw_centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatui::style::Color) {
@@ -777,23 +254,13 @@ fn draw_centered(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: ratatu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::controlsbar::{TRACK_HEAD, TRACK_HEAD_DRAG};
+    use crate::ui::controlsbar::GLYPH_PLAY;
     use crate::ui::testbuf::{buffer, grid};
-    use crossterm::event::KeyCode;
     use image::DynamicImage;
-    use ratatui::style::Color;
 
     fn art() -> DynamicImage {
         DynamicImage::ImageRgb8(image::RgbImage::from_fn(8, 8, |x, _| {
             image::Rgb([(x * 30) as u8, (x * 30) as u8, (x * 30) as u8])
-        }))
-    }
-
-    /// A cover with a real hue in it, for the `ascii-color` tests: a
-    /// grey source would pass them without proving anything.
-    fn hued_art() -> DynamicImage {
-        DynamicImage::ImageRgb8(image::RgbImage::from_fn(8, 8, |x, y| {
-            image::Rgb([(x * 31) as u8, (y * 17) as u8, 200])
         }))
     }
 
@@ -804,11 +271,11 @@ mod tests {
             art_key: "a:artist\u{1}album",
             art_mode: ArtMode::AsciiBw,
             gap: None,
-            gap_remaining: None,
             cell_aspect: 2.0,
             elapsed_secs: Some(30.0),
             duration_secs: Some(120.0),
             paused: false,
+            gap_remaining: None,
             loop_mode: LoopMode::Off,
             shuffle_on: false,
             speed: 1.0,
@@ -816,8 +283,6 @@ mod tests {
             crossfade_on: false,
             previous: None,
             next: None,
-            selected: None,
-            scrubbing: false,
             keymap,
         }
     }
@@ -897,904 +362,77 @@ mod tests {
         }
     }
 
-    /// The full player's transport says the same thing the bar does:
-    /// a gap, not a bare "paused" that invites "did I do that?".
+    /// The transport lives on the bottom bar only — one transport, one
+    /// cursor. The workspace draws the title and the neighbours, and
+    /// none of the control glyphs the bar owns.
     #[test]
-    fn the_transport_names_a_gap_rather_than_claiming_paused() {
+    fn the_workspace_draws_no_transport_controls() {
         let buf = render(90, 24, |v| {
             v.paused = true;
             v.gap_remaining = Some(6.2);
         });
         let text = grid(&buf);
-        assert!(text.contains("gap 7s"), "{text}");
+        assert!(
+            !text.contains(GLYPH_PLAY),
+            "the play glyph belongs to the bottom bar:\n{text}"
+        );
         assert!(
             !text.contains("paused"),
-            "the gap replaces it, not sits beside it:\n{text}"
+            "the bar owns the pause readout too:\n{text}"
         );
     }
 
+    /// The prev/next line is the screen's key hint: each neighbour is
+    /// tagged with the key that actually goes there, from the keymap
+    /// rather than printed as its default.
     #[test]
-    fn with_no_gap_the_transport_is_unchanged() {
-        let buf = render(90, 24, |v| v.paused = true);
-        assert!(grid(&buf).contains("paused"));
-    }
-
-    fn col_of(buf: &Buffer, y: u16, ch: char) -> u16 {
-        (buf.area.x..buf.area.x + buf.area.width)
-            .find(|x| {
-                buf.cell((*x, y))
-                    .is_some_and(|c| c.symbol().starts_with(ch))
-            })
-            .unwrap_or_else(|| panic!("no {ch:?} on row {y}:\n{}", grid(buf)))
-    }
-
-    fn row(buf: &Buffer, y: u16) -> String {
-        grid(buf).lines().nth(y as usize).unwrap().to_string()
-    }
-
-    /// The hit layout the host records has to name the columns the
-    /// glyphs were painted on, at every detail tier the row falls back
-    /// through; this screen's row is centred on its own total width,
-    /// which is precisely what a caller cannot guess.
-    #[test]
-    fn the_exposed_transport_points_at_the_columns_the_row_drew_on() {
-        let keymap = Keymap::default();
-        let cover = art();
-        for (w, h) in [(120u16, 40u16), (80, 30), (50, 20), (30, 10), (20, 6)] {
-            let area = Rect::new(0, 0, w, h);
-            let mut v = view(&keymap, Some(&cover));
-            v.selected = Some(Field::Pause);
-            let t = v.transport(area);
-            let mut v = view(&keymap, Some(&cover));
-            v.selected = Some(Field::Pause);
-            let mut buf = buffer(w, h);
-            v.render(area, &mut buf);
-
-            for (field, glyph) in [
-                (Field::Pause, GLYPH_PLAY),
-                (Field::Loop, GLYPH_LOOP),
-                (Field::Shuffle, GLYPH_SHUFFLE),
-                (Field::Speed, GLYPH_SPEED),
-            ] {
-                let Some((_, rect)) = t.controls.iter().find(|(f, _)| *f == field) else {
-                    assert!(
-                        !grid(&buf).contains(glyph),
-                        "{field:?} has no rect at {w}x{h} but was drawn"
-                    );
-                    continue;
-                };
-                let col = col_of(&buf, rect.y, glyph);
-                assert!(
-                    col >= rect.x && col < rect.x + rect.width,
-                    "{field:?}: {glyph:?} at column {col}, rect {rect:?} ({w}x{h})"
-                );
-            }
-            // and the track rect is track cells, not the readouts
-            // around them, which is what a seek fraction is measured
-            // against.
-            if let Some(track) = t.track {
-                for x in [track.x, track.x + track.width - 1] {
-                    let sym = buf.cell((x, track.y)).unwrap().symbol().to_string();
-                    assert!(
-                        ['━', '─', TRACK_HEAD].iter().any(|c| sym.starts_with(*c)),
-                        "column {x} of the track rect holds {sym:?} at {w}x{h}"
-                    );
-                }
-                assert_eq!(buf.cell((track.x - 1, track.y)).unwrap().symbol(), " ");
-            }
-        }
-    }
-
-    /// An `Element` carries its own width, because the fit pass, the
-    /// row's centring, the rect and the plate each used to measure the
-    /// same text again. The count has to be the width of the text it
-    /// sits beside, or the row is laid out for a string it never
-    /// draws; the scrubber's is arithmetic, which is the one that can
-    /// drift.
-    #[test]
-    fn the_cells_an_element_claims_are_the_cells_it_draws() {
+    fn the_context_line_names_the_neighbours_and_their_keys() {
         let keymap = Keymap::default();
         let cover = art();
         let mut v = view(&keymap, Some(&cover));
-        v.speed = 1.25;
-        v.loop_mode = LoopMode::One;
-        v.eq_preset = "bass";
-        v.selected = Some(Field::Progress);
-        for gap in [None, Some(6.2)] {
-            v.gap_remaining = gap;
-            for detail in [Detail::Full, Detail::Named, Detail::Glyph] {
-                for e in v.elements(detail) {
-                    assert_eq!(
-                        e.cells,
-                        width(&e.text),
-                        "{detail:?} {:?}: {:?}",
-                        e.field,
-                        e.text
-                    );
-                }
-            }
-            // either side of the width a readable track stops fitting
-            // at, where the element swaps to plain text.
-            for avail in 0..64usize {
-                for scrubbing in [false, true] {
-                    v.scrubbing = scrubbing;
-                    let e = v.scrubber(avail);
-                    assert_eq!(
-                        e.cells,
-                        width(&e.text),
-                        "scrubber at {avail} cells, scrubbing={scrubbing}: {:?}",
-                        e.text
-                    );
-                }
-            }
-        }
-    }
-
-    /// The pad `draw_centered` works out itself, by cells: a wide-char
-    /// title centred on a char count drifts right by its own overhang.
-    #[test]
-    fn a_centred_row_is_padded_by_cells_and_stays_inside_its_rect() {
-        let area = Rect::new(0, 0, 20, 1);
-        for (text, cells) in [
-            ("abc", 3u16),
-            ("\u{65E5}\u{672C}\u{8A9E}", 6),
-            ("Beyonce\u{301}", 7),
-        ] {
-            let mut buf = buffer(20, 1);
-            draw_centered(&mut buf, area, 0, text, shade(NEAR_WHITE));
-            let first = (0..20u16)
-                .find(|x| buf.cell((*x, 0)).unwrap().symbol() != ".")
-                .unwrap_or_else(|| panic!("{text:?} drew nothing:\n{}", grid(&buf)));
-            assert_eq!(first, (20 - cells) / 2, "{text:?}:\n{}", grid(&buf));
-        }
-        // and a row below its own rect draws nothing, which is the
-        // guard `draw::centered` was carrying for this.
-        let mut buf = buffer(20, 2);
-        draw_centered(&mut buf, area, 1, "nope", shade(NEAR_WHITE));
-        assert!(!grid(&buf).contains("nope"), "{}", grid(&buf));
-    }
-
-    #[test]
-    fn the_hint_separator_is_five_cells_wide() {
-        // six bytes, five columns: the fit counts columns, and the
-        // constant saves it the walk.
-        assert_eq!(width(HINT_SEP), HINT_SEP_CELLS);
-    }
-
-    #[test]
-    fn the_cover_rect_is_square_ish_and_derived_from_the_width_it_got() {
-        for (w, h, aspect) in [(80u16, 40u16, 2.0f32), (40, 40, 2.0), (120, 30, 2.4)] {
-            let l = layout(Rect::new(0, 0, w, h), true, false, aspect).unwrap();
-            let art = l.art.expect("a pane this size has room for art");
-            // cells are `aspect` times taller than wide, so a square
-            // cover is that many times wider in cells than it is tall.
-            let ideal = art.height as f32 * aspect;
-            assert!(
-                (art.width as f32 - ideal).abs() <= 1.0,
-                "{w}x{h}@{aspect}: {art:?} is not square"
-            );
-            assert!(art.x + art.width <= w, "{art:?} overflows a {w}-cell pane");
-            // centred, and above the title rather than beside it.
-            assert!(art.y + art.height < l.title_y, "{art:?} vs {l:?}");
-            assert_eq!(art.x, (w - art.width) / 2);
-        }
-    }
-
-    #[test]
-    fn the_rect_the_widget_drew_into_is_the_rect_the_host_overlays() {
-        // a `Full*` mode: the widget draws no rasterized art, and the
-        // host puts its image on the rect `layout` reported. Both sides
-        // have to get the same answer from the same arguments.
-        let area = Rect::new(3, 2, 70, 34);
-        let reported = layout(area, true, false, 2.0).unwrap().art.unwrap();
-        let keymap = Keymap::default();
-        let cover = art();
-
-        let mut real = view(&keymap, Some(&cover));
-        real.art_mode = ArtMode::FullColor;
-        let mut real_buf = buffer(80, 40);
-        real.render(area, &mut real_buf);
-
-        let mut ascii = view(&keymap, Some(&cover));
-        ascii.art_mode = ArtMode::AsciiBw;
-        let mut ascii_buf = buffer(80, 40);
-        ascii.render(area, &mut ascii_buf);
-
-        for y in reported.y..reported.y + reported.height {
-            for x in reported.x..reported.x + reported.width {
-                assert_eq!(
-                    real_buf.cell((x, y)).unwrap().symbol(),
-                    ".",
-                    "real mode drew into the host's overlay rect at {x},{y}"
-                );
-                // which block glyph a cell gets depends on its own
-                // four samples, so the claim under test is that every
-                // cell in the reported rect was painted at all.
-                assert_ne!(
-                    ascii_buf.cell((x, y)).unwrap().symbol(),
-                    ".",
-                    "ascii art did not fill the rect it reported at {x},{y}"
-                );
-            }
-        }
-        // ...and nothing outside it, in either mode.
-        assert_eq!(
-            ascii_buf
-                .cell((reported.x, reported.y + reported.height))
-                .unwrap()
-                .symbol(),
-            "."
-        );
-    }
-
-    /// The monochrome exception, bounded: `ascii-color` may put hues in
-    /// the cover rect and nowhere else. Everything around it (title,
-    /// transport, hints) stays `theme::shade`, and `ascii-bw` stays
-    /// strictly grey over the whole pane including the cover.
-    #[test]
-    fn ascii_color_tints_the_cover_and_nothing_else() {
-        let is_grey = |c: Color| match c {
-            Color::Rgb(r, g, b) => r == g && g == b,
-            // `Reset` is the untouched default, not a hue.
-            Color::Reset => true,
-            other => panic!("not a shade or a tint: {other:?}"),
-        };
-        let area = Rect::new(0, 0, 80, 40);
-        let cover = hued_art();
-        let reported = layout(area, true, false, 2.0).unwrap().art.unwrap();
-        let keymap = Keymap::default();
-
-        for (mode, want_tint) in [(ArtMode::AsciiColor, true), (ArtMode::AsciiBw, false)] {
-            let mut v = view(&keymap, Some(&cover));
-            v.art_mode = mode;
-            let mut buf = buffer(80, 40);
-            v.render(area, &mut buf);
-
-            let mut tinted = 0;
-            for y in area.y..area.y + area.height {
-                for x in area.x..area.x + area.width {
-                    let cell = buf.cell((x, y)).unwrap();
-                    let grey = is_grey(cell.fg) && is_grey(cell.bg);
-                    let in_art = (reported.x..reported.x + reported.width).contains(&x)
-                        && (reported.y..reported.y + reported.height).contains(&y);
-                    assert!(
-                        grey || in_art,
-                        "{mode:?} leaked a hue outside the cover at {x},{y}: {cell:?}"
-                    );
-                    tinted += u32::from(!grey);
-                }
-            }
-            assert_eq!(
-                tinted > 0,
-                want_tint,
-                "{mode:?} painted {tinted} tinted cells"
-            );
-        }
-    }
-
-    #[test]
-    fn art_is_dropped_below_the_size_it_stops_being_readable_at() {
-        // too few rows: the transport wants them more than a 2-row
-        // thumbnail does.
-        assert!(layout(Rect::new(0, 0, 80, 12), true, false, 2.0)
-            .unwrap()
-            .art
-            .is_none());
-        // and too narrow, even with rows to spare.
-        assert!(layout(Rect::new(0, 0, 13, 40), true, false, 2.0)
-            .unwrap()
-            .art
-            .is_none());
-        // the pane that does get art keeps the whole transport too.
-        let l = layout(Rect::new(0, 0, 80, 30), true, false, 2.0).unwrap();
-        assert!(l.art.is_some() && l.controls_y.is_some() && l.progress_y.is_some());
-    }
-
-    #[test]
-    fn no_art_at_all_lays_out_exactly_like_a_short_pane() {
-        let with = layout(Rect::new(0, 0, 80, 12), true, false, 2.0).unwrap();
-        let without = layout(Rect::new(0, 0, 80, 12), false, false, 2.0).unwrap();
-        assert_eq!(with, without);
-    }
-
-    #[test]
-    fn a_small_pane_keeps_the_transport_and_drops_everything_else() {
-        // five rows, two of which the spectrum owns: title,
-        // controls, scrubber and nothing else.
-        let core = layout(Rect::new(0, 0, 40, 5), true, true, 2.0).unwrap();
-        assert!(core.art.is_none() && core.context_y.is_none() && core.hint_y.is_none());
-        assert_eq!(
-            (core.title_y, core.controls_y, core.progress_y),
-            (0, Some(1), Some(2))
-        );
-        // two rows (no meter at that height): title and position,
-        // which is what you actually need; the buttons are still on
-        // the bottom bar.
-        let two = layout(Rect::new(0, 0, 40, 2), true, true, 2.0).unwrap();
-        assert_eq!((two.controls_y, two.progress_y), (None, Some(1)));
-        let one = layout(Rect::new(0, 0, 40, 1), true, true, 2.0).unwrap();
-        assert_eq!((one.title_y, one.progress_y), (0, None));
-    }
-
-    #[test]
-    fn nothing_is_drawn_outside_the_pane_or_under_the_level_meter() {
-        for h in 1..40u16 {
-            let area = Rect::new(0, 0, 40, h);
-            let l = layout(area, true, true, 2.0).unwrap();
-            // the bottom two rows belong to the spectrum whenever
-            // there is a meter at all.
-            let last = if h > METER_ROWS { h - METER_ROWS } else { h };
-            for row in [
-                Some(l.title_y),
-                l.context_y,
-                l.controls_y,
-                l.progress_y,
-                l.hint_y,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                assert!(
-                    row < last,
-                    "row {row} of {l:?} is outside 0..{last} (h={h})"
-                );
-            }
-            if let Some(art) = l.art {
-                assert!(art.y + art.height < last, "{art:?} under the meter (h={h})");
-            }
-        }
-    }
-
-    #[test]
-    fn degenerate_panes_render_without_panicking() {
-        // a zero-width or zero-height pane has no layout at all.
-        for (w, h) in [(0u16, 0u16), (1, 0), (0, 10), (0, 1)] {
-            assert!(layout(Rect::new(0, 0, w, h), true, true, 2.0).is_none());
-        }
-        for (w, h) in [(1u16, 1u16), (2, 1), (1, 40), (3, 3), (14, 16), (40, 2)] {
-            let buf = render(w, h, |v| {
-                v.selected = Some(Field::Progress);
-                v.scrubbing = true;
-                v.previous = Some("before");
-                v.next = Some("after");
-            });
-            assert_eq!(buf.area, Rect::new(0, 0, w, h));
-        }
-    }
-
-    #[test]
-    fn the_control_row_spells_the_words_out_when_there_is_room() {
-        let buf = render(100, 30, |_| {});
-        let l = layout(Rect::new(0, 0, 100, 30), true, false, 2.0).unwrap();
-        let line = row(&buf, l.controls_y.unwrap());
-        for word in [
-            "playing",
-            "loop off",
-            "shuffle off",
-            "speed 1.00x",
-            "eq flat",
-            "crossfade off",
-        ] {
-            assert!(line.contains(word), "{word:?} missing:\n{line}");
-        }
-        // the glyphs stay in front of the words, so a control reads as
-        // the same control it is on the bottom bar.
-        assert!(line.contains(GLYPH_SHUFFLE), "{line}");
-    }
-
-    #[test]
-    fn a_pane_too_narrow_for_the_values_keeps_the_names() {
-        let buf = render(60, 30, |v| {
-            v.shuffle_on = true;
-            v.crossfade_on = true;
-        });
-        let l = layout(Rect::new(0, 0, 60, 30), true, false, 2.0).unwrap();
-        let y = l.controls_y.unwrap();
-        let line = row(&buf, y);
-        // the names survive, which is the part a glyph cannot teach;
-        // on/off goes back to being brightness, same as on the bar.
-        for word in ["shuffle", "crossfade", "loop", "eq"] {
-            assert!(line.contains(word), "{word:?} missing:\n{line}");
-        }
-        assert!(!line.contains("shuffle on"), "no room for that:\n{line}");
-        assert_eq!(
-            buf.cell((col_of(&buf, y, GLYPH_SHUFFLE), y)).unwrap().fg,
-            shade(BRIGHT)
-        );
-        assert_eq!(
-            buf.cell((col_of(&buf, y, GLYPH_LOOP), y)).unwrap().fg,
-            shade(DIM)
-        );
-        // the speed still reads as a rate rather than a bare sign.
-        assert!(line.contains("1.00x"), "{line}");
-    }
-
-    #[test]
-    fn a_narrow_pane_falls_back_to_the_bars_glyphs_rather_than_cut_words() {
-        let buf = render(30, 30, |_| {});
-        let l = layout(Rect::new(0, 0, 30, 30), true, false, 2.0).unwrap();
-        let line = row(&buf, l.controls_y.unwrap());
-        assert!(!line.contains("shuffle"), "truncated words:\n{line}");
-        assert!(line.contains(GLYPH_SHUFFLE), "lost the glyph:\n{line}");
-        assert!(line.contains(GLYPH_LOOP), "lost the glyph:\n{line}");
-        // narrower still and whole elements go from the right, never
-        // half an element.
-        let tiny = render(10, 30, |_| {});
-        let tl = layout(Rect::new(0, 0, 10, 30), true, false, 2.0).unwrap();
-        let tiny_line = row(&tiny, tl.controls_y.unwrap());
-        for ch in GLYPH_CROSSFADE.chars() {
-            assert!(!tiny_line.contains(ch), "half a crossfade:\n{tiny_line}");
-        }
-    }
-
-    #[test]
-    fn the_plate_lands_on_exactly_the_selected_control() {
-        let buf = render(100, 30, |v| v.selected = Some(Field::Shuffle));
-        let l = layout(Rect::new(0, 0, 100, 30), true, false, 2.0).unwrap();
-        let y = l.controls_y.unwrap();
-        let col = col_of(&buf, y, GLYPH_SHUFFLE);
-        let plate = shade(SELECT_BG);
-        assert_eq!(buf.cell((col, y)).unwrap().bg, plate);
-        // padded a cell either side, and the word is on the plate too
-        // ("⇄ shuffle off" is 13 cells, so the plate ends at +13).
-        assert_eq!(buf.cell((col - 1, y)).unwrap().bg, plate);
-        assert_eq!(buf.cell((col + 13, y)).unwrap().bg, plate);
-        assert_eq!(buf.cell((col + 14, y)).unwrap().bg, Color::Reset);
-        // nothing else on the row is plated, and the neighbour keeps
-        // its own off-state brightness.
-        let loop_col = col_of(&buf, y, GLYPH_LOOP);
-        assert_eq!(buf.cell((loop_col, y)).unwrap().bg, Color::Reset);
-        assert_eq!(buf.cell((loop_col, y)).unwrap().fg, shade(DIM));
-        // selecting an off control lifts it enough to read off the
-        // plate without faking an "on" state.
-        assert_eq!(buf.cell((col, y)).unwrap().fg, shade(MID));
-        const { assert!(MID < BRIGHT) };
-        // and the scrubber one row down is untouched.
-        assert_eq!(
-            buf.cell((
-                col_of(&buf, l.progress_y.unwrap(), TRACK_HEAD),
-                l.progress_y.unwrap()
-            ))
-            .unwrap()
-            .bg,
-            Color::Reset
-        );
-    }
-
-    #[test]
-    fn scrub_mode_renders_differently_from_a_merely_selected_scrubber() {
-        let l = layout(Rect::new(0, 0, 100, 30), true, false, 2.0).unwrap();
-        let y = l.progress_y.unwrap();
-        let selected = render(100, 30, |v| v.selected = Some(Field::Progress));
-        let dragging = render(100, 30, |v| {
-            v.selected = Some(Field::Progress);
-            v.scrubbing = true;
-        });
-        assert!(!grid(&selected).contains(TRACK_HEAD_DRAG));
-        assert_eq!(
-            selected
-                .cell((col_of(&selected, y, TRACK_HEAD), y))
-                .unwrap()
-                .bg,
-            shade(SELECT_BG)
-        );
-        let head = col_of(&dragging, y, TRACK_HEAD_DRAG);
-        assert!(!grid(&dragging).contains(TRACK_HEAD));
-        assert_eq!(dragging.cell((head, y)).unwrap().bg, shade(SCRUB_BG));
-        assert_eq!(dragging.cell((head, y)).unwrap().fg, shade(WHITE));
-        const { assert!(SCRUB_BG > SELECT_BG) };
-    }
-
-    /// Same crossing as the bottom bar's, and worse here: this row is
-    /// centred on its own total width, so a readout that grew a cell
-    /// moved the track by the growth *and* by half of it again. A drag
-    /// resolves against the previous frame's rect, so that one frame
-    /// answered with the wrong cell's fraction.
-    #[test]
-    fn the_track_does_not_move_when_the_elapsed_readout_crosses_ten_minutes() {
-        let keymap = Keymap::default();
-        let cover = art();
-        for (w, h) in [(120u16, 40u16), (100, 30), (60, 20), (40, 8)] {
-            let area = Rect::new(0, 0, w, h);
-            let mut rects = Vec::new();
-            for secs in [0.0, 598.0, 599.0, 599.9, 600.0, 601.0, 1799.0] {
-                let mut v = view(&keymap, Some(&cover));
-                v.elapsed_secs = Some(secs);
-                v.duration_secs = Some(1800.0);
-                let track = v.transport(area).track.expect("a track at this size");
-                let mut v = view(&keymap, Some(&cover));
-                v.elapsed_secs = Some(secs);
-                v.duration_secs = Some(1800.0);
-                let mut buf = buffer(w, h);
-                v.render(area, &mut buf);
-                for x in [track.x, track.x + track.width - 1] {
-                    let sym = buf.cell((x, track.y)).unwrap().symbol().to_string();
-                    assert!(
-                        ['━', '─', TRACK_HEAD].iter().any(|c| sym.starts_with(*c)),
-                        "at {secs}s column {x} of the track rect holds {sym:?} ({w}x{h})"
-                    );
-                }
-                rects.push((secs, track));
-            }
-            let (_, first) = rects[0];
-            for (secs, rect) in &rects {
-                assert_eq!(
-                    *rect, first,
-                    "the track moved to {rect:?} at {secs}s on a {w}x{h} pane"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_scrubber_goes_to_text_when_no_readable_track_fits() {
-        let buf = render(16, 30, |_| {});
-        let l = layout(Rect::new(0, 0, 16, 30), true, false, 2.0).unwrap();
-        let line = row(&buf, l.progress_y.unwrap());
-        assert!(line.contains("0:30"), "lost the position:\n{line}");
-        assert!(!line.contains(TRACK_HEAD), "a stub track:\n{line}");
-    }
-
-    #[test]
-    fn every_hint_follows_the_live_keymap() {
-        let mut keymap = Keymap::default();
-        keymap.set(KeyAction::ToggleMinimize, KeyCode::Char('z'));
-        keymap.set(KeyAction::TogglePause, KeyCode::F(5));
-        keymap.set(KeyAction::SkipBack, KeyCode::Char('('));
-        let cover = art();
-        let mut v = view(&keymap, Some(&cover));
-        v.selected = Some(Field::Pause);
         v.previous = Some("before");
-        let area = Rect::new(0, 0, 100, 30);
-        let mut buf = buffer(100, 30);
+        v.next = Some("after");
+        let area = Rect::new(0, 0, 90, 24);
+        let mut buf = buffer(90, 24);
         v.render(area, &mut buf);
-        let out = grid(&buf);
-        assert!(out.contains("z: minimize"), "{out}");
-        assert!(out.contains("enter: play/pause (or f5)"), "{out}");
-        assert!(out.contains("( ◂ before"), "{out}");
-        assert!(!out.contains("m: minimize"), "stale default key:\n{out}");
-        assert!(!out.contains("(or space)"), "stale default key:\n{out}");
-    }
-
-    #[test]
-    fn the_hint_says_what_the_arrows_do_only_when_the_pane_has_them() {
-        let unfocused = grid(&render(100, 30, |_| {}));
-        assert!(unfocused.contains("tab: move focus"), "{unfocused}");
-        assert!(!unfocused.contains("arrows: pick"), "{unfocused}");
-
-        let focused = grid(&render(100, 30, |v| v.selected = Some(Field::Loop)));
-        assert!(focused.contains("arrows: pick"), "{focused}");
-        assert!(focused.contains("enter: cycle loop (or l)"), "{focused}");
-
-        // on the scrubber it answers the question the whole screen was
-        // failing to answer: how do you move inside a song.
-        let on_track = grid(&render(100, 30, |v| v.selected = Some(Field::Progress)));
-        assert!(on_track.contains("enter: seek in this track"), "{on_track}");
-        let scrubbing = grid(&render(100, 30, |v| {
-            v.selected = Some(Field::Progress);
-            v.scrubbing = true;
-        }));
-        assert!(scrubbing.contains("arrows: seek"), "{scrubbing}");
-        assert!(scrubbing.contains("shift: coarse"), "{scrubbing}");
-    }
-
-    #[test]
-    fn a_narrow_hint_drops_whole_hints_from_the_right() {
-        let narrow = grid(&render(52, 30, |v| v.selected = Some(Field::Progress)));
-        // what enter does comes first and survives; "minimize" is the
-        // one that goes, and no hint is left half-printed.
-        assert!(narrow.contains("enter: seek in this track"), "{narrow}");
-        assert!(!narrow.contains("minimize"), "{narrow}");
-        assert!(!narrow.contains('…'), "a hint was cut mid-word:\n{narrow}");
-        // and a pane too narrow even for the first one keeps it rather
-        // than drawing an empty row.
-        let tiny = grid(&render(18, 30, |v| v.selected = Some(Field::Progress)));
-        assert!(tiny.contains("enter: seek"), "{tiny}");
-    }
-
-    #[test]
-    fn the_state_a_control_is_in_is_readable_without_pressing_it() {
-        let buf = render(100, 30, |v| {
-            v.loop_mode = LoopMode::All;
-            v.shuffle_on = true;
-            v.speed = 1.25;
-            v.eq_preset = "bass";
-            v.crossfade_on = true;
-            v.paused = true;
-        });
-        let l = layout(Rect::new(0, 0, 100, 30), true, false, 2.0).unwrap();
-        let y = l.controls_y.unwrap();
-        let line = row(&buf, y);
-        for word in [
-            "paused",
-            "loop all",
-            "shuffle on",
-            "speed 1.25x",
-            "eq bass",
-            "crossfade on",
-        ] {
-            assert!(line.contains(word), "{word:?} missing:\n{line}");
-        }
-        // on controls are bright, and pause is dim while paused for the
-        // same reason as on the bar: lit means audio is moving.
-        assert_eq!(
-            buf.cell((col_of(&buf, y, GLYPH_SHUFFLE), y)).unwrap().fg,
-            shade(BRIGHT)
+        let text = grid(&buf);
+        assert!(text.contains("before"), "{text}");
+        assert!(text.contains("after"), "{text}");
+        assert!(
+            text.contains(&key_label(keymap.get(KeyAction::SkipBack))),
+            "the previous hint is the real key:\n{text}"
         );
-        assert_eq!(
-            buf.cell((col_of(&buf, y, GLYPH_PAUSE), y)).unwrap().fg,
-            shade(DIM)
-        );
-    }
-}
-
-/// Per-frame cost of the now-playing screen. Not pass/fail gates:
-/// absolute numbers are machine-dependent, so these print and the
-/// report compares runs.
-///
-/// `cargo test --release --lib -- --ignored --nocapture
-/// --test-threads=1 ui::player::bench`
-#[cfg(test)]
-mod bench {
-    use super::*;
-    use crate::ui::testbuf::buffer;
-    use image::DynamicImage;
-
-    /// Fastest per-iteration time over `batches` batches of `n`, the
-    /// same discipline `search::bench` and `raster::best` use: the
-    /// *minimum*, never the mean, because this machine's other cores
-    /// are not idle during a bench run and a mean measures their
-    /// scheduling as much as this code.
-    fn best(batches: u32, n: u32, mut f: impl FnMut()) -> std::time::Duration {
-        (0..batches)
-            .map(|_| {
-                let t = std::time::Instant::now();
-                for _ in 0..n {
-                    f();
-                }
-                t.elapsed() / n
-            })
-            .min()
-            .unwrap_or_default()
-    }
-
-    /// A cover with structure in it, so the rasterizer's sharpen pass
-    /// does real work rather than hitting its uniform fixed point.
-    fn cover() -> DynamicImage {
-        DynamicImage::ImageRgb8(image::RgbImage::from_fn(640, 640, |x, y| {
-            let v = ((x * 7 + y * 11) % 256) as u8;
-            image::Rgb([v, v.wrapping_add(40), 255 - v])
-        }))
-    }
-
-    /// The busiest realistic frame: every control in a non-default
-    /// state (so no label is the short one), a cursor on the row, a
-    /// prev/next line, and a cover.
-    fn busy<'a>(keymap: &'a Keymap, art: &'a DynamicImage) -> PlayerView<'a> {
-        PlayerView {
-            title: "Into Dust (Remastered) · Mazzy Star",
-            art: Some(art),
-            art_key: "a:mazzy star\u{1}so tonight that i might see",
-            art_mode: ArtMode::AsciiBw,
-            gap: None,
-            gap_remaining: None,
-            cell_aspect: 2.0,
-            elapsed_secs: Some(187.0),
-            duration_secs: Some(382.0),
-            paused: false,
-            loop_mode: LoopMode::All,
-            shuffle_on: true,
-            speed: 1.25,
-            eq_preset: "bass",
-            crossfade_on: true,
-            previous: Some("Fade Into You"),
-            next: Some("Bells Ring"),
-            selected: Some(Field::Progress),
-            scrubbing: false,
-            keymap,
-        }
-    }
-
-    const SIZES: [(u16, u16); 3] = [(80, 24), (120, 40), (200, 60)];
-
-    /// Which profile the numbers came out of: `cargo test` defaults to
-    /// the dev one, where `opt-level = 0` measured a path in this crate
-    /// 11.5x slow, and that is an artefact rather than a result.
-    fn profile() -> &'static str {
-        if cfg!(debug_assertions) {
-            "debug, opt-level 0: an artefact, re-run with --release"
-        } else {
-            "release"
-        }
-    }
-
-    #[test]
-    #[ignore = "timing, run explicitly"]
-    fn label_cost() {
-        let g = std::hint::black_box('\u{21C4}');
-        let name = std::hint::black_box("shuffle");
-        let value = std::hint::black_box("off");
-        let [pushed, formatted] = best_each::<2>(8, 20_000, |which| {
-            std::hint::black_box(match which {
-                0 => {
-                    let mut out = String::with_capacity(name.len() + value.len() + 6);
-                    out.push(g);
-                    out.push(' ');
-                    out.push_str(name);
-                    out.push(' ');
-                    out.push_str(value);
-                    out
-                }
-                _ => format!("{g} {name} {value}"),
-            });
-        });
-        println!(
-            "one control label ({}): pushed {pushed:>9.3?}  formatted {formatted:>9.3?}",
-            profile()
+        assert!(
+            text.contains(&key_label(keymap.get(KeyAction::SkipNext))),
+            "the next hint is the real key:\n{text}"
         );
     }
 
-    /// What an `Element` carrying its own width buys. The row asked
-    /// four times a pass (the fit, the centring total, the rect, the
-    /// plate) and it lays out twice a frame, over text with a glyph in
-    /// front of it: non-ascii, so `textfit::width` has to walk it.
+    /// A pane too short for a readable cover drops the cover (and it
+    /// alone): the title is worth more than mush.
     #[test]
-    #[ignore = "timing, run explicitly"]
-    fn element_width_cost() {
-        let keymap = Keymap::default();
-        let art = cover();
-        let items = busy(&keymap, &art).elements(Detail::Full);
-        let [carried, measured] = best_each::<2>(8, 5000, |which| {
-            let total: usize = match which {
-                0 => items.iter().map(|e| e.cells).sum(),
-                _ => items.iter().map(|e| width(&e.text)).sum(),
-            };
-            std::hint::black_box(total);
-        });
-        println!(
-            "{} element widths ({}): carried {carried:>9.3?}  measured {measured:>9.3?}",
-            items.len(),
-            profile(),
-        );
+    fn a_short_pane_drops_the_cover_but_keeps_the_title() {
+        let l = layout(Rect::new(0, 0, 60, 8), true, false, 2.0).unwrap();
+        assert!(l.art.is_none(), "{l:?}");
+        let buf = render(60, 8, |_| {});
+        assert!(grid(&buf).contains("a song"), "{}", grid(&buf));
     }
 
-    /// Variants timed with their batches alternating, minimum each.
-    /// Measuring them one after another is not a comparison on this
-    /// machine: back-to-back runs of the same binary came out 1.6x
-    /// apart with other builds running, which is larger than the
-    /// split being measured. Alternating makes all of them see the
-    /// same machine.
-    fn best_each<const N: usize>(
-        batches: u32,
-        n: u32,
-        mut f: impl FnMut(usize),
-    ) -> [std::time::Duration; N] {
-        let mut best = [std::time::Duration::MAX; N];
-        for _ in 0..batches {
-            for (i, slot) in best.iter_mut().enumerate() {
-                let t = std::time::Instant::now();
-                for _ in 0..n {
-                    f(i);
-                }
-                *slot = (*slot).min(t.elapsed() / n);
+    /// The stack stops above the rows the spectrum owns, so the meter
+    /// main.rs draws over the pane's bottom never covers the title.
+    #[test]
+    fn the_stack_stops_above_the_spectrum_rows() {
+        for h in [24u16, 20, 16, 12] {
+            let l = layout(Rect::new(0, 0, 90, h), true, true, 2.0).unwrap();
+            let title_y = l.title_y - Rect::new(0, 0, 90, h).y;
+            assert!(
+                title_y < h - METER_ROWS,
+                "title on row {title_y} of {h}, the meter owns the last {METER_ROWS}"
+            );
+            if let Some(y) = l.context_y {
+                assert!(y < h - METER_ROWS, "context on row {y} of {h}");
             }
         }
-        best
-    }
-
-    /// What the whole widget costs per frame, at the three sizes, and
-    /// what `transport` (which main.rs calls for the hit map on the
-    /// same frame, just before `render`) costs on top of it.
-    #[test]
-    #[ignore = "timing, run explicitly"]
-    fn frame_cost() {
-        let keymap = Keymap::default();
-        let art = cover();
-        for (w, h) in SIZES {
-            let area = Rect::new(0, 0, w, h);
-            let mut buf = buffer(w, h);
-            // warm the rasterizer's memo, so this measures a steady
-            // frame rather than the first one after a track change.
-            busy(&keymap, &art).render(area, &mut buf);
-            // 2 is the same frame with the cover panel off, so what is
-            // left is the text and the difference is the rasterizer's
-            // share of a frame.
-            let [render, transport, noart] = best_each::<3>(6, 200, |which| match which {
-                0 => busy(&keymap, &art).render(area, &mut buf),
-                1 => {
-                    std::hint::black_box(busy(&keymap, &art).transport(area));
-                }
-                _ => {
-                    let mut v = busy(&keymap, &art);
-                    v.art_mode = ArtMode::Off;
-                    v.render(area, &mut buf);
-                }
-            });
-            println!(
-                "{w}x{h}: frame {:>10.3?} = art {:>10.3?} + text {noart:>10.3?} \
-                 + transport {transport:>10.3?}   (render {render:>10.3?})",
-                render + transport,
-                render.saturating_sub(noart)
-            );
-        }
-    }
-
-    /// Where the time inside one frame goes. Each piece is timed on
-    /// its own with its inputs left outside the clock; subtracting two
-    /// independently-taken minima is not a measurement, so the pieces
-    /// are reported beside the whole rather than summed to it.
-    #[test]
-    #[ignore = "timing, run explicitly"]
-    fn frame_phases() {
-        let keymap = Keymap::default();
-        let art = cover();
-        for (w, h) in SIZES {
-            let area = Rect::new(0, 0, w, h);
-            let mut buf = buffer(w, h);
-            let v = busy(&keymap, &art);
-            let avail = w as usize;
-            let lay = best(5, 2000, || {
-                std::hint::black_box(layout(area, true, true, 2.0));
-            });
-            let controls = best(5, 2000, || {
-                std::hint::black_box(v.controls(avail));
-            });
-            let elements = best(5, 2000, || {
-                std::hint::black_box(v.elements(Detail::Full));
-            });
-            let scrubber = best(5, 2000, || {
-                std::hint::black_box(v.scrubber(avail));
-            });
-            let hint = best(5, 2000, || {
-                std::hint::black_box(v.hint(avail));
-            });
-            let context = best(5, 2000, || {
-                std::hint::black_box(v.context_line());
-            });
-            // painting the two rows, with the elements they paint
-            // built outside the clock.
-            let (items, sep) = v.controls(avail);
-            let y = layout(area, true, true, 2.0).unwrap().controls_y.unwrap();
-            let paint = best(5, 2000, || v.draw_row(&mut buf, area, y, &items, sep));
-            println!(
-                "{w}x{h}: layout {lay:>9.3?}  controls {controls:>9.3?} \
-                 (elements {elements:>9.3?})  scrubber {scrubber:>9.3?}  \
-                 hint {hint:>9.3?}  context {context:>9.3?}  draw_row {paint:>9.3?}"
-            );
-        }
-    }
-
-    /// The cover panel on its own, at the rect `layout` actually picks
-    /// for each size, so the rasterizer's per-frame share is a number
-    /// rather than a subtraction.
-    #[test]
-    #[ignore = "timing, run explicitly"]
-    fn art_cost() {
-        let art = cover();
-        let style = crate::ui::raster::Style {
-            fit: crate::ui::raster::Fit::Contain,
-            tone: crate::ui::raster::Tone::Mono,
-        };
-        for (w, h) in SIZES {
-            let area = Rect::new(0, 0, w, h);
-            let Some(rect) = layout(area, true, true, 2.0).and_then(|l| l.art) else {
-                println!("{w}x{h}: no art rect");
-                continue;
-            };
-            let mut buf = buffer(w, h);
-            let memoized = best(5, 200, || {
-                crate::ui::raster::with_memo(|m| {
-                    m.render("k", &art, rect, 2.0, style, &mut buf);
-                });
-            });
-            let resampled = best(5, 200, || {
-                crate::ui::raster::with_scratch(|r| r.render(&art, rect, 2.0, style, &mut buf));
-            });
-            println!(
-                "{w}x{h}: art rect {}x{} -> memoized {memoized:>10.3?}  \
-                 resampled {resampled:>10.3?}",
-                rect.width, rect.height
-            );
-        }
     }
 }
+
