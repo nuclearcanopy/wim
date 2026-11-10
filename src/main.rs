@@ -2100,21 +2100,8 @@ fn main() -> anyhow::Result<()> {
                     crossfade_on: crossfade_enabled,
                     previous: previous_label.as_deref(),
                     next: next_label.as_deref(),
-                    selected: (focus == Focus::Workspace).then_some(player_selected),
-                    scrubbing: scrub.is_some(),
                     keymap: &keymap,
                 };
-                let transport = player_view.transport(player_content);
-                for (field, rect) in transport.controls {
-                    hits.controls.push(hit::Control {
-                        transport: hit::Transport::Player,
-                        field,
-                        rect,
-                    });
-                }
-                if let Some(rect) = transport.track {
-                    hits.tracks.push((hit::Transport::Player, rect));
-                }
                 f.render_widget(player_view, player_content);
                 if art_mode.is_full() {
                     // same contract as the browse view: the widget drew
