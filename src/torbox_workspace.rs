@@ -17,6 +17,21 @@ pub enum Page {
     Files,
 }
 
+impl Page {
+    /// The fixed word the diagnostics file may name this page by. The
+    /// trace logs key categories against page names to answer "which
+    /// surface did the key go to"; the vocabulary stays explicit so
+    /// the log can only ever hold these four words.
+    pub fn label(self) -> &'static str {
+        match self {
+            Page::Setup => "setup",
+            Page::Search => "search",
+            Page::Account => "account",
+            Page::Files => "files",
+        }
+    }
+}
+
 enum Reply {
     Search(u64, Result<LibrarySearch, String>),
     Added(u64, Result<String, String>),
@@ -211,8 +226,10 @@ impl Workspace {
             "torbox",
             "search-start",
             &[
-                ("query-len", query.len().to_string()),
-                ("generation", generation.to_string()),
+                // length, never the text: the query is what the user
+                // typed, and the add-link input shares this workspace.
+                ("query-len", crate::trace::Value::Num(query.len() as f64)),
+                ("generation", crate::trace::Value::Num(generation as f64)),
             ],
         );
         thread::spawn(move || {
@@ -224,9 +241,12 @@ impl Workspace {
                     "torbox",
                     "search-done",
                     &[
-                        ("matches", search.matches.len().to_string()),
-                        ("failed", search.failed_services.len().to_string()),
-                        ("generation", generation.to_string()),
+                        ("matches", crate::trace::Value::Num(search.matches.len() as f64)),
+                        (
+                            "failed",
+                            crate::trace::Value::Num(search.failed_services.len() as f64),
+                        ),
+                        ("generation", crate::trace::Value::Num(generation as f64)),
                     ],
                 );
             }
@@ -433,10 +453,10 @@ impl Workspace {
             "torbox",
             "open-hit",
             &[
-                ("index", self.selected.to_string()),
-                ("hits", self.hits.len().to_string()),
-                ("service", item.service.as_str().to_string()),
-                ("playable", playable.to_string()),
+                ("index", crate::trace::Value::Num(self.selected as f64)),
+                ("hits", crate::trace::Value::Num(self.hits.len() as f64)),
+                ("service", crate::trace::Value::Label(item.service.as_str())),
+                ("playable", crate::trace::Value::Num(playable as f64)),
             ],
         );
         if item.playable_files_for_display().is_empty() {

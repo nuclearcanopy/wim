@@ -1309,10 +1309,10 @@ fn main() -> anyhow::Result<()> {
                 "loop",
                 "slow-iteration",
                 &[
-                    ("gap-ms", format!("{gap_ms:.0}")),
-                    ("torbox", torbox_open.to_string()),
-                    ("watch", watch_open.to_string()),
-                    ("console", console_open.to_string()),
+                    ("gap-ms", trace::Value::Num(gap_ms)),
+                    ("torbox", trace::Value::Flag(torbox_open)),
+                    ("watch", trace::Value::Flag(watch_open)),
+                    ("console", trace::Value::Flag(console_open)),
                 ],
             );
         }
@@ -1596,9 +1596,9 @@ fn main() -> anyhow::Result<()> {
                     "overlay",
                     "change",
                     &[
-                        ("torbox", torbox_open.to_string()),
-                        ("watch", watch_open.to_string()),
-                        ("covers", overlay.to_string()),
+                        ("torbox", trace::Value::Flag(torbox_open)),
+                        ("watch", trace::Value::Flag(watch_open)),
+                        ("covers", trace::Value::Flag(overlay)),
                     ],
                 );
             }
@@ -1649,9 +1649,9 @@ fn main() -> anyhow::Result<()> {
                             "video",
                             "arm",
                             &[
-                                ("vo", vo.mpv_name().to_string()),
-                                ("w", size.0.to_string()),
-                                ("h", size.1.to_string()),
+                                ("vo", trace::Value::Label(vo.mpv_name())),
+                                ("w", trace::Value::Num(size.0 as f64)),
+                                ("h", trace::Value::Num(size.1 as f64)),
                             ],
                         );
                     }
@@ -1678,7 +1678,10 @@ fn main() -> anyhow::Result<()> {
                 trace::diag(
                     "video",
                     "rebounce",
-                    &[("w", size.0.to_string()), ("h", size.1.to_string())],
+                    &[
+                        ("w", trace::Value::Num(size.0 as f64)),
+                        ("h", trace::Value::Num(size.1 as f64)),
+                    ],
                 );
             }
         }
@@ -3504,43 +3507,32 @@ fn main() -> anyhow::Result<()> {
 
                 if torbox_open {
                     use wim::torbox_workspace::Page;
-                    // Control keys only, and only here: while the query
-                    // editor is up, `Char` keys are typed user text and
-                    // are never logged. A `Char` outside the editor is a
-                    // command letter (j/k/b/c/1/2/3…), not user text.
-                    let diag_key: Option<String> = match key.code {
-                        KeyCode::Enter => Some("enter".into()),
-                        KeyCode::Esc => Some("esc".into()),
-                        KeyCode::Backspace => Some("backspace".into()),
-                        KeyCode::Up => Some("up".into()),
-                        KeyCode::Down => Some("down".into()),
-                        KeyCode::Char(c)
-                            if !(torbox_workspace.page == Page::Search
-                                && torbox_workspace.search_editing) =>
-                        {
-                            Some(format!("char:{c}"))
-                        }
-                        _ => None,
+                    // Key *category* only, everywhere and unconditionally:
+                    // the character itself is typed user text (the
+                    // add-link input, the search box), so it is never
+                    // logged — the routing bug this trace exists for
+                    // ("keys went to the invisible menu") is answered by
+                    // the category, page and cursor, not the glyph.
+                    let diag_key = match key.code {
+                        KeyCode::Enter => "enter",
+                        KeyCode::Esc => "esc",
+                        KeyCode::Backspace => "backspace",
+                        KeyCode::Up => "up",
+                        KeyCode::Down => "down",
+                        KeyCode::Char(_) => "char",
+                        _ => "other",
                     };
-                    if let Some(key_name) = diag_key {
-                        trace::diag(
-                            "input",
-                            "key",
-                            &[
-                                ("key", key_name),
-                                ("page", format!("{:?}", torbox_workspace.page)),
-                                ("editing", torbox_workspace.search_editing.to_string()),
-                                (
-                                    "selected",
-                                    format!(
-                                        "{}/{}",
-                                        torbox_workspace.selected,
-                                        torbox_workspace.item_count()
-                                    ),
-                                ),
-                            ],
-                        );
-                    }
+                    trace::diag(
+                        "input",
+                        "key",
+                        &[
+                            ("key", trace::Value::Label(diag_key)),
+                            ("page", trace::Value::Label(torbox_workspace.page.label())),
+                            ("editing", trace::Value::Flag(torbox_workspace.search_editing)),
+                            ("selected", trace::Value::Num(torbox_workspace.selected as f64)),
+                            ("items", trace::Value::Num(torbox_workspace.item_count() as f64)),
+                        ],
+                    );
                     if torbox_workspace.link_input.is_some() {
                         match key.code {
                             KeyCode::Esc => torbox_workspace.link_input = None,
@@ -3674,19 +3666,18 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Enter if torbox_workspace.page == Page::Files => {
                             if let Some(item) = torbox_workspace.selected_playable() {
                                 if let crate::search::SearchItem::TorBoxFile {
-                                    service,
-                                    item_id,
-                                    file_id,
-                                    ..
+                                    service, video, ..
                                 } = &item
                                 {
+                                    // service and whether it is a video,
+                                    // never the account's item/file ids:
+                                    // those name the user's library.
                                     trace::diag(
                                         "torbox",
                                         "play-dispatch",
                                         &[
-                                            ("service", service.as_str().to_string()),
-                                            ("item", item_id.to_string()),
-                                            ("file", file_id.to_string()),
+                                            ("service", trace::Value::Label(service.as_str())),
+                                            ("video", trace::Value::Flag(*video)),
                                         ],
                                     );
                                 }
@@ -3699,19 +3690,15 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Char('q') if torbox_workspace.page == Page::Files => {
                             if let Some(item) = torbox_workspace.selected_playable() {
                                 if let crate::search::SearchItem::TorBoxFile {
-                                    service,
-                                    item_id,
-                                    file_id,
-                                    ..
+                                    service, video, ..
                                 } = &item
                                 {
                                     trace::diag(
                                         "torbox",
                                         "queue-dispatch",
                                         &[
-                                            ("service", service.as_str().to_string()),
-                                            ("item", item_id.to_string()),
-                                            ("file", file_id.to_string()),
+                                            ("service", trace::Value::Label(service.as_str())),
+                                            ("video", trace::Value::Flag(*video)),
                                         ],
                                     );
                                 }
