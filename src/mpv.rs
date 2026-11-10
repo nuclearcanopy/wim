@@ -545,7 +545,15 @@ fn read_replies(
                     });
                 }
             }
-            Some(_) => {
+            Some(name) => {
+                // event names only ("end-file", "file-loaded", …), and
+                // never the payload: payloads can carry paths, and the
+                // names alone already show the load/pause/eof sequence
+                // a playback attempt made. `tick` fires about once a
+                // second forever, so it is noise here.
+                if name != "tick" {
+                    crate::trace::diag("mpv", "event", &[("event", name.to_string())]);
+                }
                 let _ = event_tx.send(Event::Other(v));
             }
             None => {}
