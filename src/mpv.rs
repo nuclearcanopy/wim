@@ -814,6 +814,21 @@ impl Mpv {
         Ok(())
     }
 
+    /// Appends several entries in playlist order with one socket write
+    /// and one IPC wait, retaining one result per media item. This is
+    /// for bulk restoration, not interactive enqueue: the caller must
+    /// update its mirrored queue only for successful replies.
+    pub fn playlist_append_batch(&self, paths: &[String]) -> Vec<Result<()>> {
+        let commands = paths
+            .iter()
+            .map(|path| vec![json!("loadfile"), json!(path), json!("append-play")])
+            .collect::<Vec<_>>();
+        self.command_batch(&commands)
+            .into_iter()
+            .map(|result| result.map(|_| ()))
+            .collect()
+    }
+
     /// Clears mpv's playlist except the currently-playing file (mpv's
     /// own semantics for `playlist-clear`), so the upcoming queue can be
     /// rebuilt (e.g. after a shuffle) without interrupting playback.
@@ -1089,29 +1104,59 @@ mod bench {
         let mpv = Mpv::spawn().expect("mpv on PATH");
         let cfg = crate::config::SubtitleConfig::default();
         const N: u32 = 100;
+        // Alternate in the same process and keep the best round of
+        // each: sequential cross-run timings on this machine vary more
+        // than the optimization being measured (see docs/testing.md).
+        let mut seq = Duration::MAX;
+        let mut batched = Duration::MAX;
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            for _ in 0..N {
+                let _ = mpv.set_property("sub-delay", json!(cfg.delay_secs));
+                let _ = mpv.set_property("sub-font-size", json!(cfg.font_size));
+                let _ = mpv.set_property("sub-pos", json!(cfg.position));
+                let _ = mpv.set_property("sub-border-size", json!(cfg.outline_size));
+                let _ = mpv.set_property("sub-blur", json!(cfg.blur));
+                let _ = mpv.set_property("sub-color", json!("#FFFFFFFF"));
+                let _ = mpv.set_property("sub-back-color", json!("#FF000000"));
+            }
+            seq = seq.min(t0.elapsed() / N);
 
-        let t0 = Instant::now();
-        for _ in 0..N {
-            let _ = mpv.set_property("sub-delay", json!(cfg.delay_secs));
-            let _ = mpv.set_property("sub-font-size", json!(cfg.font_size));
-            let _ = mpv.set_property("sub-pos", json!(cfg.position));
-            let _ = mpv.set_property("sub-border-size", json!(cfg.outline_size));
-            let _ = mpv.set_property("sub-blur", json!(cfg.blur));
-            let _ = mpv.set_property("sub-color", json!("#FFFFFFFF"));
-            let _ = mpv.set_property("sub-back-color", json!("#FF000000"));
+            let t0 = Instant::now();
+            for _ in 0..N {
+                mpv.set_subtitle_style(&cfg);
+            }
+            batched = batched.min(t0.elapsed() / N);
         }
-        let seq = t0.elapsed() / N;
-
-        let t0 = Instant::now();
-        for _ in 0..N {
-            mpv.set_subtitle_style(&cfg);
-        }
-        let batched = t0.elapsed() / N;
         println!(
-            "subtitle style: sequential {:.0}us, batched {:.0}us",
+            "subtitle style (best of 5): sequential {:.0}us, batched {:.0}us",
             seq.as_secs_f64() * 1e6,
             batched.as_secs_f64() * 1e6
         );
+    }
+
+    /// End-to-end guard for the bulk queue path: mpv accepts the
+    /// pipelined append-play commands in order, and the API returns one
+    /// success per entry. Explicit because it spawns a real child.
+    #[test]
+    #[ignore]
+    fn playlist_append_batch_reaches_mpv_and_preserves_entry_count() {
+        let mpv = Mpv::spawn().expect("mpv on PATH");
+        mpv.set_property("ao", json!("null")).expect("silent output");
+        let paths = [
+            "av://lavfi:sine=frequency=440:duration=600".to_string(),
+            "av://lavfi:sine=frequency=550:duration=600".to_string(),
+            "av://lavfi:sine=frequency=660:duration=600".to_string(),
+        ];
+        let results = mpv.playlist_append_batch(&paths);
+        assert_eq!(results.len(), paths.len());
+        for result in results {
+            result.expect("every generated playlist entry should be accepted");
+        }
+        let count = mpv
+            .command(&[json!("get_property"), json!("playlist-count")])
+            .expect("read playlist count");
+        assert_eq!(count.as_u64(), Some(paths.len() as u64));
     }
 }
 
