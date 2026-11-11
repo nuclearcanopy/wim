@@ -1,8 +1,9 @@
 //! Search/account interaction state shared by the frontends. Requests run
 //! off-thread; frontends poll this state and render their own presentation.
 
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
 use crate::torbox::{AccountItem, Client, LibrarySearch, Service};
@@ -13,6 +14,8 @@ pub const ACCOUNT_PAGE_SIZE: usize = 100;
 pub enum Page {
     Setup,
     Search,
+    Episodes,
+    Sources,
     Account,
     Files,
 }
@@ -26,6 +29,8 @@ impl Page {
         match self {
             Page::Setup => "setup",
             Page::Search => "search",
+            Page::Episodes => "episodes",
+            Page::Sources => "sources",
             Page::Account => "account",
             Page::Files => "files",
         }
@@ -49,6 +54,9 @@ pub struct Workspace {
     pub page: Page,
     pub query: String,
     pub hits: Vec<AccountItem>,
+    pub episode_show: Option<String>,
+    pub episodes: Vec<EpisodeGroup>,
+    pub sources: Vec<SourceCandidate>,
     pub selected: usize,
     pub loading: bool,
     pub message: Option<String>,
@@ -66,6 +74,21 @@ pub struct Workspace {
     setup_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpisodeGroup {
+    pub season: u32,
+    pub episode: u32,
+    pub sources: Vec<SourceCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCandidate {
+    pub item_index: usize,
+    pub file_index: usize,
+    pub release: String,
+    pub file_name: String,
+}
+
 impl Workspace {
     pub fn new(client: Result<Client, String>) -> Self {
         let (tx, rx) = mpsc::channel();
@@ -81,6 +104,9 @@ impl Workspace {
             page: Page::Search,
             query: String::new(),
             hits: Vec::new(),
+            episode_show: None,
+            episodes: Vec::new(),
+            sources: Vec::new(),
             selected: 0,
             loading: false,
             message,
@@ -189,13 +215,41 @@ impl Workspace {
     pub fn item_count(&self) -> usize {
         match self.page {
             Page::Setup => 0,
-            Page::Search => self.hits.len(),
+            Page::Search => self.search_rows().len(),
+            Page::Episodes => self.episodes.len(),
+            Page::Sources => self.sources.len(),
             Page::Account => self.account.len(),
             Page::Files => match (&self.account_selected, &self.client) {
                 (Some(item), Some(client)) => item.playable_items(client.clone()).len(),
                 _ => 0,
             },
         }
+    }
+
+    /// Search rows are unique parsed show names followed by unmatched/movie
+    /// library entries. Episode filenames stay hidden until a show is opened.
+    pub fn search_rows(&self) -> Vec<SearchRow> {
+        let mut shows = BTreeMap::<String, ()>::new();
+        for item in &self.hits {
+            for file in item.playable_files_for_display() {
+                if let Some((show, _, _)) = parse_episode_name(file.0) {
+                    shows.insert(show, ());
+                }
+            }
+            if let Some((show, _, _)) = parse_episode_name(&item.name) {
+                shows.insert(show, ());
+            }
+        }
+        let mut rows = shows.into_keys().map(SearchRow::Show).collect::<Vec<_>>();
+        rows.extend(self.hits.iter().enumerate().filter_map(|(i, item)| {
+            let episodic = parse_episode_name(&item.name).is_some()
+                || item
+                    .playable_files_for_display()
+                    .iter()
+                    .any(|f| parse_episode_name(f.0).is_some());
+            (!episodic).then_some(SearchRow::LibraryItem(i))
+        }));
+        rows
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -241,7 +295,10 @@ impl Workspace {
                     "torbox",
                     "search-done",
                     &[
-                        ("matches", crate::trace::Value::Num(search.matches.len() as f64)),
+                        (
+                            "matches",
+                            crate::trace::Value::Num(search.matches.len() as f64),
+                        ),
                         (
                             "failed",
                             crate::trace::Value::Num(search.failed_services.len() as f64),
@@ -356,6 +413,7 @@ impl Workspace {
     }
 
     pub fn open_account_item(&mut self) {
+        self.episode_show = None;
         self.account_selected = self.account.get(self.selected).cloned();
         if self.account_selected.is_some() {
             self.page = Page::Files;
@@ -445,7 +503,23 @@ impl Workspace {
     /// playback by itself and never adds anything to the account: the item
     /// is already in the user's TorBox library.
     pub fn open_hit(&mut self) {
-        let Some(item) = self.hits.get(self.selected).cloned() else {
+        match self.search_rows().get(self.selected).cloned() {
+            Some(SearchRow::Show(show)) => {
+                self.episode_show = Some(show.clone());
+                self.episodes = self.episodes_for(&show);
+                self.page = Page::Episodes;
+                self.selected = 0;
+                self.message = None;
+                return;
+            }
+            Some(SearchRow::LibraryItem(index)) => self.open_library_item(index),
+            None => {}
+        }
+    }
+
+    fn open_library_item(&mut self, index: usize) {
+        self.episode_show = None;
+        let Some(item) = self.hits.get(index).cloned() else {
             return;
         };
         let playable = item.playable_files_for_display().len();
@@ -471,6 +545,143 @@ impl Workspace {
         self.selected = 0;
         self.message = None;
     }
+
+    fn episodes_for(&self, show: &str) -> Vec<EpisodeGroup> {
+        let mut groups = BTreeMap::<(u32, u32), Vec<SourceCandidate>>::new();
+        for (item_index, item) in self.hits.iter().enumerate() {
+            let mut matched_file = false;
+            for (file_index, (name, _, _)) in item.playable_files_for_display().iter().enumerate() {
+                if let Some((parsed_show, season, episode)) = parse_episode_name(name) {
+                    if parsed_show.eq_ignore_ascii_case(show) {
+                        matched_file = true;
+                        groups
+                            .entry((season, episode))
+                            .or_default()
+                            .push(SourceCandidate {
+                                item_index,
+                                file_index,
+                                release: item.name.clone(),
+                                file_name: name.to_string(),
+                            });
+                    }
+                }
+            }
+            if !matched_file {
+                if let Some((parsed_show, season, episode)) = parse_episode_name(&item.name) {
+                    if parsed_show.eq_ignore_ascii_case(show) {
+                        let files = item.playable_files_for_display();
+                        if let Some((file_index, (name, _, _))) = files.iter().enumerate().next() {
+                            groups
+                                .entry((season, episode))
+                                .or_default()
+                                .push(SourceCandidate {
+                                    item_index,
+                                    file_index,
+                                    release: item.name.clone(),
+                                    file_name: name.to_string(),
+                                });
+                        }
+                    }
+                }
+            }
+        }
+        groups
+            .into_iter()
+            .map(|((season, episode), sources)| EpisodeGroup {
+                season,
+                episode,
+                sources,
+            })
+            .collect()
+    }
+
+    pub fn open_episode(&mut self) {
+        let Some(episode) = self.episodes.get(self.selected) else {
+            return;
+        };
+        self.sources = episode.sources.clone();
+        self.page = Page::Sources;
+        self.selected = 0;
+        self.message = None;
+    }
+
+    pub fn open_source(&mut self) {
+        let Some(source) = self.sources.get(self.selected).cloned() else {
+            return;
+        };
+        let Some(item) = self.hits.get(source.item_index).cloned() else {
+            return;
+        };
+        self.account_selected = Some(item);
+        self.page = Page::Files;
+        self.selected = source.file_index;
+        self.message = None;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchRow {
+    Show(String),
+    LibraryItem(usize),
+}
+
+/// Recognizes common `Show.S03E04`, `Show S03 Ep4`, and `Show.2024.S03.Ep4`
+/// release names. Returns a display title with separators/year stripped.
+fn parse_episode_name(name: &str) -> Option<(String, u32, u32)> {
+    let bytes = name.as_bytes();
+    for i in 0..bytes.len().saturating_sub(2) {
+        if !matches!(bytes[i], b's' | b'S') {
+            continue;
+        }
+        let Some((season, after_season)) = digits(bytes, i + 1) else {
+            continue;
+        };
+        let mut e = after_season;
+        while e < bytes.len() && matches!(bytes[e], b'.' | b' ' | b'_' | b'-') {
+            e += 1;
+        }
+        if e < bytes.len() && matches!(bytes[e], b'e' | b'E') {
+            e += 1;
+            if e < bytes.len() && matches!(bytes[e], b'p' | b'P') {
+                e += 1;
+            }
+        } else {
+            continue;
+        }
+        while e < bytes.len() && matches!(bytes[e], b'.' | b' ' | b'_' | b'-') {
+            e += 1;
+        }
+        let Some((episode, _)) = digits(bytes, e) else {
+            continue;
+        };
+        let title =
+            name[..i].trim_matches(|c: char| c == '.' || c == '_' || c == '-' || c.is_whitespace());
+        let title = title.rsplit_once('.').map_or(title, |(prefix, tail)| {
+            if tail.len() == 4 && tail.parse::<u16>().is_ok() {
+                prefix
+            } else {
+                title
+            }
+        });
+        if !title.is_empty() {
+            return Some((title.replace(['.', '_'], " "), season, episode));
+        }
+    }
+    None
+}
+
+fn digits(bytes: &[u8], mut at: usize) -> Option<(u32, usize)> {
+    let start = at;
+    while at < bytes.len() && bytes[at].is_ascii_digit() {
+        at += 1;
+    }
+    if at == start {
+        return None;
+    }
+    Some((
+        std::str::from_utf8(&bytes[start..at]).ok()?.parse().ok()?,
+        at,
+    ))
 }
 
 #[cfg(test)]
@@ -527,11 +738,13 @@ mod tests {
             files: Vec::new(),
         });
         workspace.control_selected("delete");
-        assert!(workspace
-            .message
-            .as_deref()
-            .unwrap()
-            .contains("press d again"));
+        assert!(
+            workspace
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("press d again")
+        );
         assert!(!workspace.loading);
         std::fs::remove_file(token_path).ok();
     }
@@ -581,8 +794,17 @@ mod tests {
                 ],
             },
         ];
-        workspace.selected = 1;
+        workspace.selected = 0;
         workspace.open_hit();
+        assert_eq!(workspace.page, Page::Episodes);
+        assert_eq!(workspace.episode_show.as_deref(), Some("Silo"));
+        assert_eq!(
+            (workspace.episodes[0].season, workspace.episodes[0].episode),
+            (3, 1)
+        );
+        workspace.open_episode();
+        assert_eq!(workspace.page, Page::Sources);
+        workspace.open_source();
         assert_eq!(workspace.page, Page::Files);
         assert!(workspace.message.is_none());
         assert_eq!(workspace.account_selected.as_ref().unwrap().id, 2);
@@ -596,6 +818,106 @@ mod tests {
                 ..
             }
         ));
+        std::fs::remove_file(token_path).ok();
+    }
+
+    #[test]
+    fn parses_common_episode_release_names_without_the_year_in_show_title() {
+        assert_eq!(
+            parse_episode_name("Silo.2024.S03.Ep4.1080p.WEB-DL.mkv"),
+            Some(("Silo".into(), 3, 4))
+        );
+        assert_eq!(
+            parse_episode_name("Foundation S2E07.mkv"),
+            Some(("Foundation".into(), 2, 7))
+        );
+        assert_eq!(
+            parse_episode_name("The.Show_S01_E02.mkv"),
+            Some(("The Show".into(), 1, 2))
+        );
+        assert_eq!(parse_episode_name("A Movie (2024).mkv"), None);
+    }
+
+    #[test]
+    fn same_episode_from_different_library_items_becomes_source_choices() {
+        let (mut workspace, token_path) = temp_workspace();
+        workspace.hits = vec![
+            "Silo.2024.S03.Ep4.1080p.WEB-DL.mkv",
+            "Silo.S03E04.BluRay.mkv",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| AccountItem {
+            service: Service::Torrent,
+            id: i as u64 + 1,
+            name: name.into(),
+            status: "cached".into(),
+            progress: Some(1.0),
+            files: vec![AccountFile {
+                id: 0,
+                name: name.into(),
+                size: 4000,
+            }],
+        })
+        .collect();
+        workspace.open_hit();
+        assert_eq!(workspace.page, Page::Episodes);
+        assert_eq!(workspace.episodes.len(), 1);
+        workspace.open_episode();
+        assert_eq!(workspace.sources.len(), 2);
+        assert_ne!(workspace.sources[0].release, workspace.sources[1].release);
+        std::fs::remove_file(token_path).ok();
+    }
+
+    #[test]
+    fn search_rows_collapse_episode_files_but_keep_movies_as_library_items() {
+        let (mut workspace, token_path) = temp_workspace();
+        workspace.hits = vec![
+            AccountItem {
+                service: Service::Torrent,
+                id: 1,
+                name: "Silo season pack".into(),
+                status: "cached".into(),
+                progress: Some(1.0),
+                files: vec![
+                    AccountFile {
+                        id: 1,
+                        name: "Silo.2024.S03.Ep4.mkv".into(),
+                        size: 100,
+                    },
+                    AccountFile {
+                        id: 2,
+                        name: "Silo.2024.S03.Ep5.mkv".into(),
+                        size: 100,
+                    },
+                ],
+            },
+            AccountItem {
+                service: Service::Torrent,
+                id: 2,
+                name: "Silo another release".into(),
+                status: "cached".into(),
+                progress: Some(1.0),
+                files: vec![AccountFile {
+                    id: 3,
+                    name: "Silo.S03E04.BluRay.mkv".into(),
+                    size: 200,
+                }],
+            },
+            AccountItem {
+                service: Service::Torrent,
+                id: 3,
+                name: "Movie.2024.1080p.mkv".into(),
+                status: "cached".into(),
+                progress: Some(1.0),
+                files: vec![],
+            },
+        ];
+        assert_eq!(
+            workspace.search_rows(),
+            vec![SearchRow::Show("Silo".into()), SearchRow::LibraryItem(2),]
+        );
+        assert_eq!(workspace.account.len(), 0, "search grouping is read-only");
         std::fs::remove_file(token_path).ok();
     }
 
