@@ -24,6 +24,10 @@ const OBS_LEVEL_RMS: u64 = 6;
 const OBS_EOF_REACHED: u64 = 7;
 const OBS_MUTE: u64 = 8;
 const OBS_SPECTRUM: u64 = 9;
+const OBS_PAUSED_FOR_CACHE: u64 = 10;
+const OBS_BUFFERING_STATE: u64 = 11;
+const OBS_CACHE_AHEAD: u64 = 12;
+const OBS_SEEKING: u64 = 13;
 
 /// How long any one blocking command waits for mpv's reply.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -62,6 +66,19 @@ pub const PROP_MUTE: &str = "mute";
 /// loop-all path never runs; `set_keep_open` is therefore toggled per
 /// track rather than pinned on.
 pub const PROP_EOF_REACHED: &str = "eof-reached";
+/// mpv paused *itself* because the cache ran dry — the network stall
+/// a motionless progress bar otherwise hides. Not the user's pause;
+/// `playback_status` exists to keep those two apart on screen.
+pub const PROP_PAUSED_FOR_CACHE: &str = "paused-for-cache";
+/// mpv's own estimate of how full the cache is, 0-100, pushed while
+/// it waits. `None` when mpv is not currently stalled.
+pub const PROP_BUFFERING_STATE: &str = "cache-buffering-state";
+/// End timestamp of the demuxer's cached range. Subtract `time-pos`
+/// to get seconds buffered ahead; `demuxer-cache-duration` is the
+/// *span* of all cached data and is not an ahead-of-position measure.
+pub const PROP_CACHE_AHEAD: &str = "demuxer-cache-time";
+/// True while a seek is in flight.
+pub const PROP_SEEKING: &str = "seeking";
 /// RMS output level in dBFS, from the first (dry-left) channel in the
 /// labeled `astats` analysis filter. Spelled out rather than built with
 /// `format!` so it can be matched in `Playback::apply` for free; a
@@ -111,6 +128,17 @@ pub struct Playback {
     /// mpv is holding at the end of a file under `keep-open`; see
     /// `PROP_EOF_REACHED`.
     pub eof_reached: bool,
+    /// mpv paused itself waiting for the cache (the network stall);
+    /// see `PROP_PAUSED_FOR_CACHE`. Deliberately not folded into
+    /// `paused`: the two need different words on screen.
+    pub paused_for_cache: bool,
+    /// mpv's buffering progress while it waits, 0-100.
+    pub buffering_pct: Option<f64>,
+    /// Media seconds buffered ahead of the position.
+    pub cache_ahead_secs: Option<f64>,
+    cache_end_secs: Option<f64>,
+    /// A seek is in flight.
+    pub seeking: bool,
     /// Last pushed `astats` RMS reading and when it landed; private
     /// because the pair is only meaningful together, see `level`.
     level_db: Option<f64>,
@@ -126,7 +154,10 @@ impl Playback {
     /// value (no file loaded), which is `None` rather than stale.
     pub fn apply(&mut self, name: &str, value: &Value) -> bool {
         match name {
-            PROP_TIME_POS => self.elapsed_secs = value.as_f64(),
+            PROP_TIME_POS => {
+                self.elapsed_secs = value.as_f64();
+                self.update_cache_ahead();
+            }
             PROP_DURATION => self.duration_secs = value.as_f64(),
             // an absent `pause` means nothing is loaded, which reads
             // as not-paused everywhere downstream.
@@ -134,6 +165,24 @@ impl Playback {
             PROP_MUTE => self.muted = value.as_bool().unwrap_or(false),
             // absent reads as "not at a held end", same as `pause`.
             PROP_EOF_REACHED => self.eof_reached = value.as_bool().unwrap_or(false),
+            // absent reads as "not stalled" / "not seeking" / "no
+            // cache report", same reasoning as `pause`: a property
+            // with no value must not read as a stall.
+            // mpv exposes this as the number of seconds it has been
+            // paused for cache (not a boolean); tolerate a boolean too
+            // for versions/builds that type it differently.
+            PROP_PAUSED_FOR_CACHE => {
+                self.paused_for_cache = value
+                    .as_bool()
+                    .or_else(|| value.as_f64().map(|secs| secs > 0.0))
+                    .unwrap_or(false)
+            }
+            PROP_BUFFERING_STATE => self.buffering_pct = value.as_f64(),
+            PROP_CACHE_AHEAD => {
+                self.cache_end_secs = value.as_f64();
+                self.update_cache_ahead();
+            }
+            PROP_SEEKING => self.seeking = value.as_bool().unwrap_or(false),
             PROP_LEVEL_RMS => {
                 // mpv hands af-metadata values through as the strings
                 // the filter wrote; `as_f64` alone reads every one of
@@ -182,6 +231,13 @@ impl Playback {
             _ => return false,
         }
         true
+    }
+
+    fn update_cache_ahead(&mut self) {
+        self.cache_ahead_secs = self
+            .cache_end_secs
+            .zip(self.elapsed_secs)
+            .map(|(end, pos)| (end - pos).max(0.0));
     }
 
     /// Last output level reading, retained for callers that need a
@@ -500,6 +556,10 @@ fn observe_commands() -> Vec<Vec<Value>> {
         (OBS_LEVEL_RMS, PROP_LEVEL_RMS),
         (OBS_SPECTRUM, PROP_SPECTRUM),
         (OBS_EOF_REACHED, PROP_EOF_REACHED),
+        (OBS_PAUSED_FOR_CACHE, PROP_PAUSED_FOR_CACHE),
+        (OBS_BUFFERING_STATE, PROP_BUFFERING_STATE),
+        (OBS_CACHE_AHEAD, PROP_CACHE_AHEAD),
+        (OBS_SEEKING, PROP_SEEKING),
     ]
     .into_iter()
     .map(|(id, name)| vec![json!("observe_property"), json!(id), json!(name)])
@@ -838,6 +898,25 @@ impl Mpv {
         self.set_property("keep-open", json!(if hold { "always" } else { "no" }))
     }
 
+    /// How far ahead of the position mpv keeps the demuxer cache,
+    /// in media seconds. This is the preload-while-paused knob: mpv
+    /// keeps reading ahead while paused, but its default
+    /// `demuxer-readahead-secs` is **1** (measured on 0.41.0), so a
+    /// pause on default settings buffers almost nothing and the
+    /// "pause it and let it load" move silently doesn't work. The
+    /// byte cap (`demuxer-max-bytes`, 150 MiB by default) stays
+    /// alone: it is generous enough for minutes of audio and most
+    /// video, and a second knob to keep them consistent is worse
+    /// than one that means what it says.
+    ///
+    /// Applied before the first load (the caller does this right
+    /// after spawn): the property is per-file in mpv, so a mid-run
+    /// change only takes effect on the next track.
+    pub fn set_buffer_ahead(&self, secs: f64) -> Result<()> {
+        let secs = secs.max(1.0);
+        self.set_property("demuxer-readahead-secs", json!(secs))
+    }
+
     pub fn set_volume(&self, vol: f64) -> Result<()> {
         self.set_property("volume", json!(vol))
     }
@@ -1061,6 +1140,34 @@ mod tests {
         assert_eq!(pb.elapsed_secs, Some(12.5));
         assert_eq!(pb.duration_secs, Some(200.0));
         assert!(pb.paused);
+    }
+
+    #[test]
+    fn cache_ahead_is_end_timestamp_minus_position_in_either_update_order() {
+        let mut pb = Playback::default();
+        pb.apply(PROP_TIME_POS, &json!(12.5));
+        pb.apply(PROP_CACHE_AHEAD, &json!(42.5));
+        assert_eq!(pb.cache_ahead_secs, Some(30.0));
+        pb.apply(PROP_TIME_POS, &json!(20.0));
+        assert_eq!(pb.cache_ahead_secs, Some(22.5));
+
+        let mut reverse = Playback::default();
+        reverse.apply(PROP_CACHE_AHEAD, &json!(42.5));
+        reverse.apply(PROP_TIME_POS, &json!(12.5));
+        assert_eq!(reverse.cache_ahead_secs, Some(30.0));
+        reverse.apply(PROP_TIME_POS, &Value::Null);
+        assert_eq!(reverse.cache_ahead_secs, None);
+    }
+
+    #[test]
+    fn paused_for_cache_is_mpvs_elapsed_seconds_not_a_boolean() {
+        let mut pb = Playback::default();
+        pb.apply(PROP_PAUSED_FOR_CACHE, &json!(0.72));
+        assert!(pb.paused_for_cache);
+        pb.apply(PROP_PAUSED_FOR_CACHE, &json!(0.0));
+        assert!(!pb.paused_for_cache);
+        pb.apply(PROP_PAUSED_FOR_CACHE, &Value::Null);
+        assert!(!pb.paused_for_cache);
     }
 
     #[test]

@@ -457,6 +457,21 @@ impl Ascii {
         self.live.is_some()
     }
 
+    /// Whether a first frame has actually landed: `active` says a
+    /// decoder exists, `ready` says there is a picture to show. The
+    /// gap between them is the "loading video…" the player view draws
+    /// instead of an art rect that sits blank for no stated reason.
+    pub fn ready(&self) -> bool {
+        self.live.as_ref().is_some_and(|src| src.ready())
+    }
+
+    /// Whether the media mpv refused to decode (the latch is set):
+    /// the player view says "video unavailable" rather than leaving
+    /// the same blank rect with no explanation at all.
+    pub fn failed(&self) -> bool {
+        self.refused.is_some()
+    }
+
     /// Draws the current frame, or nothing at all if there is no
     /// instance. Painting nothing rather than leaving the cells alone
     /// is the caller's business: `active` is the question it asks.
@@ -666,6 +681,13 @@ impl FrameSource {
     /// until the first `Pull::Frame`.
     pub fn frame(&self) -> &DynamicImage {
         &self.front
+    }
+
+    /// Whether a first frame has landed (`stamp` only ever counts
+    /// up, so a served frame can never un-land); `pub` through
+    /// `Ascii::ready` for the player view's loading note.
+    pub fn ready(&self) -> bool {
+        self.stamp > 0
     }
 
     /// The same frame as packed rgb24, exactly `grid().frame_len()`
