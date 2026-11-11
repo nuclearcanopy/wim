@@ -2694,11 +2694,42 @@ fn main() -> anyhow::Result<()> {
             let (restored, mut lost) =
                 resolve_saved_paths(pending_paths.drain(..), persistence::item_from_path);
             pending_enqueue.extend(restored);
-            for item in pending_enqueue.drain(..) {
-                let done =
-                    enqueue_track(&player, &item, &cache_index, &mut play_queue, app.shuffle);
-                if !done.is_queued() {
-                    lost += 1;
+            if app.shuffle {
+                // Shuffling requires individual playlist moves to keep
+                // mpv and PlayQueue in the same order; retain that path.
+                for item in pending_enqueue.drain(..) {
+                    let done =
+                        enqueue_track(&player, &item, &cache_index, &mut play_queue, true);
+                    if !done.is_queued() {
+                        lost += 1;
+                    }
+                }
+            } else {
+                // Resolving the saved paths is local work; send all
+                // playable entries as one ordered IPC batch instead of
+                // blocking the newly-running UI for one round trip per
+                // track. Keep the queue mirror aligned with each
+                // individual mpv result if one entry is rejected.
+                let mut playable = Vec::with_capacity(pending_enqueue.len());
+                for item in pending_enqueue.drain(..) {
+                    match wim::core::resolve_playable(&item, &cache_index) {
+                        Some(path) => playable.push((item, path)),
+                        None => lost += 1,
+                    }
+                }
+                let paths = playable
+                    .iter()
+                    .map(|(_, path)| path.clone())
+                    .collect::<Vec<_>>();
+                for ((item, _), result) in playable
+                    .into_iter()
+                    .zip(player.playlist_append_batch(&paths))
+                {
+                    if result.is_ok() {
+                        play_queue.append(item, false);
+                    } else {
+                        lost += 1;
+                    }
                 }
             }
             if lost > 0 {
@@ -6742,6 +6773,29 @@ mod saved_queue_tests {
         assert!(
             block.contains("resolve_saved_paths(") && block.contains("item_from_path"),
             "nothing resolves the saved paths after the frame, so the queue is lost:\n{block}"
+        );
+    }
+
+    /// Bulk startup enqueue must stay batched when shuffle is off, and
+    /// the queue mirror only accepts entries whose mpv append reply
+    /// succeeded. Shuffle keeps the per-item path because it must mirror
+    /// each random playlist move.
+    #[test]
+    fn unshuffled_saved_queue_restoration_uses_ordered_batch_ipc() {
+        let src = include_str!("main.rs");
+        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
+        let at = code
+            .find("first_frame_drawn = true;")
+            .expect("the first-frame block moved");
+        let block = &code[at..(at + 2400).min(code.len())];
+        assert!(block.contains("if app.shuffle"), "shuffle handling changed:\n{block}");
+        assert!(
+            block.contains("playlist_append_batch(&paths)"),
+            "unshuffled queue restoration no longer batches IPC:\n{block}"
+        );
+        assert!(
+            block.contains("if result.is_ok()") && block.contains("play_queue.append(item, false)"),
+            "the mirrored queue must only accept successful mpv appends:\n{block}"
         );
     }
 }
