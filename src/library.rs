@@ -24,7 +24,6 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::cache;
-use crate::trace;
 
 const MUSIC_EXTENSIONS: &[&str] = &["mp3", "flac", "ogg", "opus", "m4a", "wav", "aac", "wma"];
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "webm", "avi", "mov", "m4v", "ts"];
@@ -291,9 +290,9 @@ pub fn spawn_scan(paths: Vec<String>, tx: mpsc::Sender<ScanBatch>) -> ScanReport
     let report = ScanReport::default();
     let mine = report.clone();
     thread::spawn(move || {
-        trace::mark("library scan: started");
+        crate::trace_mark!("library scan: started");
         scan_into(&paths, &tx, &mine);
-        trace::mark("library scan: finished");
+        crate::trace_mark!("library scan: finished");
     });
     report
 }
@@ -480,14 +479,14 @@ fn scan_into(paths: &[String], tx: &mpsc::Sender<ScanBatch>, report: &ScanReport
         let found = walk_media(paths);
         (found, index.join().unwrap_or_default())
     });
-    trace::mark("library scan: walked");
+    crate::trace_mark!("library scan: walked");
     let Resolved {
         known,
         to_read,
         hits,
         dropped,
     } = resolve_known(found, &mut index);
-    trace::mark("library scan: index resolved");
+    crate::trace_mark!("library scan: index resolved");
 
     // a warm start that read nothing new and dropped nothing has an
     // identical index already on disk; rewriting it would be the only
@@ -507,7 +506,7 @@ fn scan_into(paths: &[String], tx: &mpsc::Sender<ScanBatch>, report: &ScanReport
     }
     if !fresh.is_empty() || dropped {
         save_or_warn(&index, report);
-        trace::mark("library scan: index saved");
+        crate::trace_mark!("library scan: index saved");
     }
 }
 

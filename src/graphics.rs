@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use ratatui_image::picker::{Picker, ProtocolType};
 
-use crate::{browse, config, trace};
+use crate::{browse, config};
 
 /// Whether the config asks for a real graphics protocol outright, so
 /// the host owes an explanation when the terminal has none; `auto`
@@ -435,7 +435,7 @@ impl ArtProbe {
         if graphics_plausible() {
             std::thread::spawn(move || {
                 let _ = tx.send(Picker::from_query_stdio().ok());
-                trace::mark("graphics probe answered");
+                crate::trace_mark!("graphics probe answered");
             });
         } else {
             // skipped, not backgrounded: the probe reads stdin waiting
@@ -445,7 +445,7 @@ impl ArtProbe {
             // included. not asking at all is both faster and the only
             // way the event loop is the single reader of stdin.
             let _ = tx.send(None);
-            trace::mark("graphics probe skipped (terminal has no protocol)");
+            crate::trace_mark!("graphics probe skipped (terminal has no protocol)");
         }
         Self::waiting(asked, rx)
     }

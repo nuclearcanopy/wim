@@ -212,7 +212,7 @@ view(playlists), view(index) and view(help) print here, and
 view(now) and view(lyrics) print instead of opening a pane.
 
   config   ~/.config/wim/config.toml, shared with wim
-  trace    WIM_STARTUP_TRACE=1 shellswim 2>trace.log"
+  trace    WIM_STARTUP_TRACE=1 cargo run -F dev-telemetry --bin shellswim"
     )
 }
 
@@ -248,7 +248,7 @@ in the app:
   tab      move focus between the panes
 
   config   ~/.config/wim/config.toml, shared with shellswim
-  trace    WIM_STARTUP_TRACE=1 wim 2>trace.log"
+  trace    WIM_STARTUP_TRACE=1 cargo run -F dev-telemetry --bin wim"
     )
 }
 
@@ -453,7 +453,7 @@ mod tests {
             "wim --version",
             "shellswim",
             "url",
-            "WIM_STARTUP_TRACE",
+            "dev-telemetry",
         ] {
             assert!(h.contains(needed), "wim --help must mention {needed:?}");
         }
@@ -464,7 +464,7 @@ mod tests {
         // the help is where someone looks first when `view(eq)` is
         // refused, so the refusal has to be documented there.
         let h = help();
-        for needed in ["view(eq)", "wim", "?", "dry(", "WIM_STARTUP_TRACE"] {
+        for needed in ["view(eq)", "wim", "?", "dry(", "dev-telemetry"] {
             assert!(h.contains(needed), "help must mention {needed}");
         }
     }

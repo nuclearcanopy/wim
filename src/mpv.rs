@@ -605,7 +605,7 @@ fn read_replies(
                     });
                 }
             }
-            Some(name) => {
+            Some(_name) => {
                 // event names only ("end-file", "file-loaded", …), and
                 // never the payload: payloads can carry paths, and the
                 // names alone already show the load/pause/eof sequence
@@ -615,7 +615,8 @@ fn read_replies(
                 // to it here rather than passed through: anything not
                 // in the list is "other", which still shows the
                 // sequence without inventing a text channel.
-                if name != "tick" {
+                #[cfg(feature = "dev-telemetry")]
+                if _name != "tick" {
                     const LOGGED_EVENTS: &[&str] = &[
                         "file-loaded",
                         "end-file",
@@ -626,12 +627,13 @@ fn read_replies(
                         "seek",
                         "playback-restart",
                     ];
+                    #[cfg(feature = "dev-telemetry")]
                     let label = LOGGED_EVENTS
                         .iter()
-                        .find(|logged| **logged == name)
+                        .find(|logged| **logged == _name)
                         .copied()
                         .unwrap_or("other");
-                    crate::trace::diag(
+                    crate::trace_diag!(
                         "mpv",
                         "event",
                         &[("event", crate::trace::Value::Label(label))],

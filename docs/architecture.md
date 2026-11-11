@@ -221,8 +221,12 @@ results into the main loop, or waits until the first frame is up.
 an empty corpus therefore means "still loading" for the first moment of
 a session, which the results pane says outright
 (`main::loading_message`) instead of claiming an empty library.
-`WIM_STARTUP_TRACE=1` (`src/trace.rs`) prints every milestone's elapsed
-time to stderr for measuring any of this.
+Startup and runtime diagnostics are compiled out unless the explicit
+`dev-telemetry` Cargo feature is enabled. During development,
+`cargo run --features dev-telemetry --bin wim` enables the trace module;
+`WIM_STARTUP_TRACE=1` prints startup marks and `WIM_DIAGNOSTICS_FILE`
+enables redacted runtime events. Default builds do not inspect either
+environment variable, write a diagnostics file, or construct event fields.
 
 ## search: two signals, not one
 
