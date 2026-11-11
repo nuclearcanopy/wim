@@ -164,7 +164,7 @@ pub fn spawn_probe() -> Receiver<FrameBudget> {
     thread::spawn(move || {
         let hz = detect_hz().unwrap_or(FALLBACK_HZ);
         let _ = tx.send(FrameBudget::new(hz));
-        crate::trace::mark("refresh rate probed");
+        crate::trace_mark!("refresh rate probed");
     });
     rx
 }

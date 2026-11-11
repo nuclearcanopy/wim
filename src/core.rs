@@ -18,6 +18,7 @@ use crate::playqueue::PlayQueue;
 use crate::search::SearchItem;
 use crate::shellsong::{self, Console, GoTarget, Op, Program, Target, ViewTarget};
 use crate::shellsong_host::{Ramp, SearchSettle};
+#[cfg(feature = "dev-telemetry")]
 use crate::trace;
 use crate::ui::controlsbar::Field;
 use crate::ui::results_list::label;
@@ -575,7 +576,7 @@ impl TrackResolver {
         });
         let (items, tx, shared) = (items, self.tx.clone(), Arc::clone(&self.epoch));
         let sent = label.clone();
-        trace::diag(
+        crate::trace_diag!(
             "resolve",
             "start",
             &[
@@ -591,6 +592,7 @@ impl TrackResolver {
                 ("items", trace::Value::Num(items.len() as f64)),
             ],
         );
+        #[cfg(feature = "dev-telemetry")]
         let started = Instant::now();
         thread::spawn(move || {
             let tracks = items.into_iter().try_fold(Vec::new(), |mut acc, item| {
@@ -605,6 +607,7 @@ impl TrackResolver {
                         ..
                     } = track
                     {
+                        #[cfg(feature = "dev-telemetry")]
                         let started_at = Instant::now();
                         let response = client
                             .download_url(*service, *item_id, *file_id)
@@ -616,7 +619,7 @@ impl TrackResolver {
                         match outcome {
                             Ok(url) => {
                                 *resolved_url = Some(url);
-                                trace::diag(
+                                crate::trace_diag!(
                                     "resolve",
                                     "link-ok",
                                     &[
@@ -630,7 +633,7 @@ impl TrackResolver {
                                 // text goes to the user's notification,
                                 // not the log, where it would be the
                                 // one free-form string in the file.
-                                trace::diag(
+                                crate::trace_diag!(
                                     "resolve",
                                     "item-failed",
                                     &[("service", trace::Value::Label(service.as_str()))],
@@ -644,14 +647,17 @@ impl TrackResolver {
                 Ok::<_, String>(acc)
             });
             if into.queue_bound() && shared.load(Ordering::SeqCst) != epoch {
-                trace::diag("resolve", "stale-dropped", &[]);
+                crate::trace_diag!("resolve", "stale-dropped", &[]);
                 return;
             }
-            trace::diag(
+            crate::trace_diag!(
                 "resolve",
                 "done",
                 &[
-                    ("ms", trace::Value::Num(started.elapsed().as_secs_f64() * 1000.0)),
+                    (
+                        "ms",
+                        trace::Value::Num(started.elapsed().as_secs_f64() * 1000.0)
+                    ),
                     (
                         "outcome",
                         trace::Value::Label(if tracks.is_ok() { "ok" } else { "fail" }),

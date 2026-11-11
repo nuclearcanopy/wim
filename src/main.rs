@@ -8,9 +8,11 @@ use wim::playback_status;
 use wim::ui::settings_menu::Field as SettingsField;
 use wim::{
     anim, app, browse, cache, config, coverart, eq, favorites, hit, keymap, library, listenbrainz,
-    lyrics, mpv, persistence, queues, search, shellsong, shellsong_host, suggest, term, trace, ui,
+    lyrics, mpv, persistence, queues, search, shellsong, shellsong_host, suggest, term, ui,
     video,
 };
+#[cfg(feature = "dev-telemetry")]
+use wim::trace;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -94,6 +96,7 @@ fn open_browse(
     view: &mut Option<browse::BrowseView>,
     browse_art: &mut ProtocolCache,
     focus: &mut Focus,
+    player_minimized: &mut bool,
 ) {
     let Some(opened) = loader.open(item) else {
         return;
@@ -102,6 +105,15 @@ fn open_browse(
     // new one is built when `Loader::poll` hands the image over.
     browse_art.clear();
     *view = Some(opened);
+    // The player renderer has priority over the browse view while it is
+    // maximized. Without minimizing here, a running video keeps covering
+    // the very browse view we just focused, so Enter appears to do
+    // nothing and its inline frames stay stuck over the workspace.
+    focus_open_browse(focus, player_minimized);
+}
+
+fn focus_open_browse(focus: &mut Focus, player_minimized: &mut bool) {
+    *player_minimized = true;
     // opening something to browse and then still needing a separate
     // keypress just to be able to scroll it read as "enter doesn't do
     // anything"; land with it already focused instead.
@@ -233,6 +245,7 @@ impl Surface for WimSurface<'_> {
             self.browse_view,
             self.browse_art,
             self.focus,
+            self.player_minimized,
         );
         op_done()
     }
@@ -736,14 +749,19 @@ fn main() -> anyhow::Result<()> {
             }
         },
     };
+    #[cfg(feature = "dev-telemetry")]
     trace::init();
-    // runtime diagnostics: opt-in via WIM_DIAGNOSTICS_FILE. when the
-    // file cannot be opened the run proceeds without it, but the user
-    // asked for a trace and must not silently lose it.
-    if std::env::var_os("WIM_DIAGNOSTICS_FILE").is_some_and(|p| !p.is_empty())
-        && !trace::init_diagnostics()
+    #[cfg(feature = "dev-telemetry")]
     {
-        eprintln!("[wim] WIM_DIAGNOSTICS_FILE could not be opened; running without diagnostics");
+        // File diagnostics are available only in explicitly opted-in
+        // development builds. Normal builds contain no diagnostic calls.
+        if std::env::var_os("WIM_DIAGNOSTICS_FILE").is_some_and(|p| !p.is_empty())
+            && !trace::init_diagnostics()
+        {
+            eprintln!(
+                "[wim] WIM_DIAGNOSTICS_FILE could not be opened; running without diagnostics"
+            );
+        }
     }
     let is_first_run = !config::config_path()?.exists();
     // held until the notification area exists (the terminal is not up
@@ -753,7 +771,7 @@ fn main() -> anyhow::Result<()> {
         mut cfg,
         warnings: mut config_warnings,
     } = config::load_reporting()?;
-    trace::mark("config loaded");
+    wim::trace_mark!("config loaded");
     // the local scan is the biggest single startup cost (a blocking tag
     // read per music file); it streams into the corpus from its own
     // thread while the ui is already up, drained next to `sync_rx` in
@@ -773,7 +791,7 @@ fn main() -> anyhow::Result<()> {
     let warming_corpus = search::spawn_warm_from_cache(&cfg.navidrome_servers);
 
     let player = mpv::Mpv::spawn()?;
-    trace::mark("mpv spawned");
+    wim::trace_mark!("mpv spawned");
     // the preload-while-paused knob, before anything can play: mpv's
     // own default readahead is 1s (measured), so without this a pause
     // buffers almost nothing and "pause it and let it load" silently
@@ -1213,7 +1231,7 @@ fn main() -> anyhow::Result<()> {
             let _ = player.set_volume(vol);
         }
     }
-    trace::mark("playback state restored (queue deferred)");
+    wim::trace_mark!("playback state restored (queue deferred)");
 
     // only now that any restored track is already loaded: registering
     // an observer makes mpv report the property's *current* value
@@ -1293,7 +1311,7 @@ fn main() -> anyhow::Result<()> {
     // termios state it finds, so raw mode has to be on first.
     let mut art = ArtProbe::spawn(cfg.album_art);
     let mut last_drawn_art_mode = art.mode();
-    trace::mark("terminal ready");
+    wim::trace_mark!("terminal ready");
     // rebuilt (not re-encoded every frame) whenever the open view's
     // art or the art mode changes; `ratatui-image` owns the actual
     // resize/encode caching per protocol instance. the key inside it
@@ -1319,7 +1337,7 @@ fn main() -> anyhow::Result<()> {
         let gap_ms = loop_top.duration_since(last_loop_top).as_secs_f64() * 1000.0;
         last_loop_top = loop_top;
         if gap_ms > 250.0 {
-            trace::diag(
+            wim::trace_diag!(
                 "loop",
                 "slow-iteration",
                 &[
@@ -1514,7 +1532,7 @@ fn main() -> anyhow::Result<()> {
         // than a trace of transitions.
         if prev_status.as_deref() != Some(playback_status.diag_label()) {
             prev_status = Some(playback_status.diag_label());
-            trace::diag(
+            wim::trace_diag!(
                 "playback",
                 "status",
                 &[
@@ -1530,9 +1548,9 @@ fn main() -> anyhow::Result<()> {
                     ),
                     (
                         "ahead",
-                        playback.cache_ahead_secs.map_or(trace::Value::Flag(false), |a| {
-                            trace::Value::Num(a)
-                        }),
+                        playback
+                            .cache_ahead_secs
+                            .map_or(trace::Value::Flag(false), |a| { trace::Value::Num(a) }),
                     ),
                 ],
             );
@@ -1641,6 +1659,7 @@ fn main() -> anyhow::Result<()> {
         // the video, which is exactly "couldn't move around the menus,
         // then it was just a video".
         let overlay = tiers.covers_screen() || torbox_open || watch_open;
+        #[cfg(feature = "dev-telemetry")]
         if trace::diag_enabled() {
             // state-change only: these are per-frame locals.
             thread_local! {
@@ -1650,7 +1669,7 @@ fn main() -> anyhow::Result<()> {
             let state = (torbox_open, watch_open, overlay);
             if PREV_OVERLAY.get() != Some(state) {
                 PREV_OVERLAY.set(Some(state));
-                trace::diag(
+                wim::trace_diag!(
                     "overlay",
                     "change",
                     &[
@@ -1703,7 +1722,7 @@ fn main() -> anyhow::Result<()> {
                     Ok(()) => {
                         video_vo = Some(vo);
                         video_geometry = size;
-                        trace::diag(
+                        wim::trace_diag!(
                             "video",
                             "arm",
                             &[
@@ -1718,7 +1737,7 @@ fn main() -> anyhow::Result<()> {
                         // than retrying the handover every frame.
                         video_fullscreen = false;
                         notifications.push(Severity::Alert, "video: mpv refused the video output");
-                        trace::diag("video", "arm-failed", &[]);
+                        wim::trace_diag!("video", "arm-failed", &[]);
                     }
                 }
             }
@@ -1726,14 +1745,14 @@ fn main() -> anyhow::Result<()> {
                 let _ = player.set_video_output(video::Vo::Null.mpv_name());
                 video_vo = None;
                 let _ = guard.reclaim();
-                trace::diag("video", "disarm", &[]);
+                wim::trace_diag!("video", "disarm", &[]);
             }
             video::Move::Rebounce { vo, size } => {
                 let _ = player.set_video_output(video::Vo::Null.mpv_name());
                 let _ = player.set_video_geometry(size.0, size.1);
                 let _ = player.set_video_output(vo.mpv_name());
                 video_geometry = size;
-                trace::diag(
+                wim::trace_diag!(
                     "video",
                     "rebounce",
                     &[
@@ -2684,7 +2703,7 @@ fn main() -> anyhow::Result<()> {
         // frame. one-shot, not per-frame work.
         if !first_frame_drawn {
             first_frame_drawn = true;
-            trace::mark("first frame drawn");
+            wim::trace_mark!("first frame drawn");
             // counted rather than discarded: a saved queue whose
             // files mpv refuses would otherwise come back short with
             // no word, the same way `append_resolved` used to report
@@ -2738,7 +2757,7 @@ fn main() -> anyhow::Result<()> {
                     format!("{lost} of the saved queue could not be restored"),
                 );
             }
-            trace::mark("mpv playlist refilled");
+            wim::trace_mark!("mpv playlist refilled");
         }
 
         // mpv is the source of truth for which track is playing, and
@@ -3677,6 +3696,7 @@ fn main() -> anyhow::Result<()> {
                     // logged — the routing bug this trace exists for
                     // ("keys went to the invisible menu") is answered by
                     // the category, page and cursor, not the glyph.
+                    #[cfg(feature = "dev-telemetry")]
                     let diag_key = match key.code {
                         KeyCode::Enter => "enter",
                         KeyCode::Esc => "esc",
@@ -3686,15 +3706,25 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Char(_) => "char",
                         _ => "other",
                     };
-                    trace::diag(
+                    #[cfg(feature = "dev-telemetry")]
+                    wim::trace_diag!(
                         "input",
                         "key",
                         &[
                             ("key", trace::Value::Label(diag_key)),
                             ("page", trace::Value::Label(torbox_workspace.page.label())),
-                            ("editing", trace::Value::Flag(torbox_workspace.search_editing)),
-                            ("selected", trace::Value::Num(torbox_workspace.selected as f64)),
-                            ("items", trace::Value::Num(torbox_workspace.item_count() as f64)),
+                            (
+                                "editing",
+                                trace::Value::Flag(torbox_workspace.search_editing)
+                            ),
+                            (
+                                "selected",
+                                trace::Value::Num(torbox_workspace.selected as f64)
+                            ),
+                            (
+                                "items",
+                                trace::Value::Num(torbox_workspace.item_count() as f64)
+                            ),
                         ],
                     );
                     if torbox_workspace.link_input.is_some() {
@@ -3842,14 +3872,17 @@ fn main() -> anyhow::Result<()> {
                         }
                         KeyCode::Enter if torbox_workspace.page == Page::Files => {
                             if let Some(item) = torbox_workspace.selected_playable() {
+                                #[cfg(feature = "dev-telemetry")]
                                 if let crate::search::SearchItem::TorBoxFile {
-                                    service, video, ..
+                                    service,
+                                    video,
+                                    ..
                                 } = &item
                                 {
                                     // service and whether it is a video,
                                     // never the account's item/file ids:
                                     // those name the user's library.
-                                    trace::diag(
+                                    wim::trace_diag!(
                                         "torbox",
                                         "play-dispatch",
                                         &[
@@ -3866,11 +3899,14 @@ fn main() -> anyhow::Result<()> {
                         }
                         KeyCode::Char('q') if torbox_workspace.page == Page::Files => {
                             if let Some(item) = torbox_workspace.selected_playable() {
+                                #[cfg(feature = "dev-telemetry")]
                                 if let crate::search::SearchItem::TorBoxFile {
-                                    service, video, ..
+                                    service,
+                                    video,
+                                    ..
                                 } = &item
                                 {
-                                    trace::diag(
+                                    wim::trace_diag!(
                                         "torbox",
                                         "queue-dispatch",
                                         &[
@@ -5333,6 +5369,7 @@ fn main() -> anyhow::Result<()> {
                         &mut browse_view,
                         &mut browse_art,
                         &mut focus,
+                        &mut player_minimized,
                     );
                     continue;
                 }
@@ -6816,5 +6853,19 @@ mod saved_queue_tests {
             block.contains("if result.is_ok()") && block.contains("play_queue.append(item, false)"),
             "the mirrored queue must only accept successful mpv appends:\n{block}"
         );
+    }
+}
+
+#[cfg(test)]
+mod browse_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn opening_a_browse_result_reveals_and_focuses_it_over_active_playback() {
+        let mut focus = Focus::Sidebar;
+        let mut player_minimized = false;
+        focus_open_browse(&mut focus, &mut player_minimized);
+        assert_eq!(focus, Focus::Workspace);
+        assert!(player_minimized);
     }
 }

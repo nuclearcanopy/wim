@@ -1,20 +1,30 @@
-//! Startup timing, off unless `WIM_STARTUP_TRACE` is set to anything
-//! but `0`/empty: every `mark` prints elapsed-since-`init` to stderr,
+//! Development-only startup timing, off unless the `dev-telemetry` feature
+//! and `WIM_STARTUP_TRACE` is set to a value other than `0` or empty:
+//! every `mark` prints elapsed-since-`init` to stderr,
 //! so time-to-first-frame is a measured number rather than a guess.
 //! Lines go to stderr while the alternate screen is up, so redirect it
 //! (`wim 2>/tmp/wim-trace.log`) to read them.
 
+#[cfg(any(feature = "dev-telemetry", test))]
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "dev-telemetry")]
+use std::sync::atomic::AtomicBool;
+#[cfg(any(feature = "dev-telemetry", test))]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "dev-telemetry")]
 use std::sync::OnceLock;
+#[cfg(any(feature = "dev-telemetry", test))]
 use std::time::Instant;
 
+#[cfg(feature = "dev-telemetry")]
 static ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "dev-telemetry")]
 static ORIGIN: OnceLock<Instant> = OnceLock::new();
 
 /// Called as the first statement in `main`; everything `mark` reports
 /// is measured from here, which is as close to process start as this
 /// process can observe.
+#[cfg(feature = "dev-telemetry")]
 pub fn init() {
     let on = std::env::var("WIM_STARTUP_TRACE")
         .map(|v| !v.is_empty() && v != "0")
@@ -25,6 +35,7 @@ pub fn init() {
 
 /// Milliseconds since `init`, or 0 if it was never called (unit tests,
 /// which don't go through `main`).
+#[cfg(feature = "dev-telemetry")]
 fn elapsed_ms() -> f64 {
     ORIGIN
         .get()
@@ -33,8 +44,9 @@ fn elapsed_ms() -> f64 {
 }
 
 /// One startup milestone. Safe from any thread (the background scan and
-/// sync threads both mark), and a single relaxed load when tracing is
-/// off, so call sites don't need their own guard.
+/// sync threads both mark). Ordinary builds use the no-op implementation;
+/// instrumented call sites are compiled out by `trace_mark!`.
+#[cfg(feature = "dev-telemetry")]
 pub fn mark(label: &str) {
     if !ENABLED.load(Ordering::Relaxed) {
         return;
@@ -45,6 +57,7 @@ pub fn mark(label: &str) {
 /// Fixed-width elapsed column so a run's marks line up when read as a
 /// block; milliseconds (not micros) because everything measured here is
 /// a terminal, filesystem, or network operation.
+#[cfg(any(feature = "dev-telemetry", test))]
 fn format_mark(ms: f64, label: &str) -> String {
     format!("[wim startup] {ms:>9.3}ms  {label}")
 }
@@ -64,12 +77,35 @@ mod tests {
         );
         assert!(long.ends_with("1234.568ms  b"), "got {long:?}");
     }
+
+    #[cfg(not(feature = "dev-telemetry"))]
+    #[test]
+    fn default_build_compiles_trace_calls_out_without_evaluating_fields() {
+        let calls = std::cell::Cell::new(0);
+        crate::trace_mark!({
+            calls.set(calls.get() + 1);
+            "startup"
+        });
+        crate::trace_diag!(
+            {
+                calls.set(calls.get() + 1);
+                "component"
+            },
+            "event",
+            {
+                calls.set(calls.get() + 1);
+                &[]
+            }
+        );
+        assert_eq!(calls.get(), 0);
+    }
 }
 
 // --- runtime diagnostics ---
 //
-// Opt-in runtime diagnostics, off unless `WIM_DIAGNOSTICS_FILE` names a
-// writable file. Every event is one line: elapsed milliseconds, a
+// Development-only runtime diagnostics, compiled out unless the feature
+// is enabled and `WIM_DIAGNOSTICS_FILE` names a writable file. Every event
+// is one line: elapsed milliseconds, a
 // sequence number, `component/event`, then key=value fields. Written
 // straight to the file (never the terminal, which mpv may own) and
 // flushed per event, so a hung run still leaves everything up to the
@@ -81,11 +117,16 @@ mod tests {
 // file — passing one is a type error, not a code-review find. Fields
 // are categories, counts, durations and indices only.
 
+#[cfg(any(feature = "dev-telemetry", test))]
 use std::fs::{File, OpenOptions};
+#[cfg(any(feature = "dev-telemetry", test))]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(any(feature = "dev-telemetry", test))]
 use std::sync::Mutex;
 
+#[cfg(any(feature = "dev-telemetry", test))]
 static DIAG_FILE: Mutex<Option<(File, Instant)>> = Mutex::new(None);
+#[cfg(any(feature = "dev-telemetry", test))]
 static DIAG_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A field value a diagnostic event may carry. The whole privacy
@@ -93,6 +134,7 @@ static DIAG_SEQ: AtomicU64 = AtomicU64::new(0);
 /// a leak could be made of (strings, ids, urls, user input) has to be
 /// summarized into one of these before it can be logged.
 #[derive(Debug, Clone, Copy)]
+#[cfg(any(feature = "dev-telemetry", test))]
 pub enum Value {
     /// A count, index, duration or size. Units belong in the field
     /// name (`ms=`, `-len=`), not the value.
@@ -104,6 +146,7 @@ pub enum Value {
     Label(&'static str),
 }
 
+#[cfg(any(feature = "dev-telemetry", test))]
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -120,54 +163,62 @@ impl std::fmt::Display for Value {
 /// `WIM_DIAGNOSTICS_FILE` names a path. Returns whether tracing is on,
 /// so the caller can tell the user when the file could not be opened.
 pub fn init_diagnostics() -> bool {
-    let Ok(path) = std::env::var("WIM_DIAGNOSTICS_FILE") else {
-        return false;
-    };
-    // a previous init's file never survives a new init: an unwritable
-    // path means tracing is off, not "keep whatever was open".
-    if let Ok(mut guard) = DIAG_FILE.lock() {
-        *guard = None;
-    }
-    if path.is_empty() {
-        return false;
-    }
-    match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&path)
+    #[cfg(any(feature = "dev-telemetry", test))]
     {
-        Ok(file) => {
-            // `mode` applies only to files this call creates. A file
-            // that already exists keeps whatever it was made with, so
-            // tighten it rather than trust it — the log is owner-only
-            // by contract, not just by default.
-            if let Ok(meta) = file.metadata() {
-                let mut perms = meta.permissions();
-                if perms.mode() & 0o777 != 0o600 {
-                    perms.set_mode(0o600);
-                    let _ = std::fs::set_permissions(&path, perms);
-                }
-            }
-            if let Ok(mut guard) = DIAG_FILE.lock() {
-                *guard = Some((file, Instant::now()));
-            }
-            true
+        let Ok(path) = std::env::var("WIM_DIAGNOSTICS_FILE") else {
+            return false;
+        };
+        // a previous init's file never survives a new init: an unwritable
+        // path means tracing is off, not "keep whatever was open".
+        if let Ok(mut guard) = DIAG_FILE.lock() {
+            *guard = None;
         }
-        Err(_) => false,
+        if path.is_empty() {
+            return false;
+        }
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => {
+                // `mode` applies only to files this call creates. A file
+                // that already exists keeps whatever it was made with, so
+                // tighten it rather than trust it — the log is owner-only
+                // by contract, not just by default.
+                if let Ok(meta) = file.metadata() {
+                    let mut perms = meta.permissions();
+                    if perms.mode() & 0o777 != 0o600 {
+                        perms.set_mode(0o600);
+                        let _ = std::fs::set_permissions(&path, perms);
+                    }
+                }
+                if let Ok(mut guard) = DIAG_FILE.lock() {
+                    *guard = Some((file, Instant::now()));
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(any(feature = "dev-telemetry", test)))]
+    {
+        true
     }
 }
 
+#[cfg(any(feature = "dev-telemetry", test))]
 pub fn diag_enabled() -> bool {
     DIAG_FILE
         .lock()
         .map(|guard| guard.is_some())
         .unwrap_or(false)
 }
-
 /// One runtime diagnostic event. Uses `try_lock` so a contended file can
 /// never block the render loop — diagnostics losing an event is
 /// acceptable, the ui freezing is not.
+#[cfg(any(feature = "dev-telemetry", test))]
 pub fn diag(component: &str, event: &str, fields: &[(&str, Value)]) {
     let Ok(mut guard) = DIAG_FILE.try_lock() else {
         return;
@@ -183,6 +234,29 @@ pub fn diag(component: &str, event: &str, fields: &[(&str, Value)]) {
     }
     let _ = writeln!(file, "{line}");
     let _ = file.flush();
+}
+
+/// Emits startup timings only in explicit development-telemetry builds.
+/// The macro (rather than a no-op function) also avoids evaluating labels,
+/// including dynamically formatted ones, in ordinary builds.
+#[macro_export]
+macro_rules! trace_mark {
+    ($label:expr) => {{
+        #[cfg(feature = "dev-telemetry")]
+        {
+            $crate::trace::mark($label);
+        }
+    }};
+}
+
+/// Emits a diagnostic event only in explicit development-telemetry builds;
+/// field construction and formatting are compiled out otherwise.
+#[macro_export]
+macro_rules! trace_diag {
+    ($($arg:tt)*) => {{
+        #[cfg(feature = "dev-telemetry")]
+        { $crate::trace::diag($($arg)*); }
+    }};
 }
 
 #[cfg(test)]
@@ -212,10 +286,7 @@ mod diag_tests {
         diag(
             "resolve",
             "done",
-            &[
-                ("ms", Value::Num(12.5)),
-                ("outcome", Value::Label("ok")),
-            ],
+            &[("ms", Value::Num(12.5)), ("outcome", Value::Label("ok"))],
         );
         diag("video", "arm", &[("vo", Value::Label("tct"))]);
         let contents = std::fs::read_to_string(&path).unwrap();

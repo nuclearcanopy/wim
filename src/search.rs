@@ -27,7 +27,6 @@ use crate::library::{LocalTrack, MediaKind};
 use crate::subsonic::{
     Album, Artist, Client, Playlist, SearchResult as SubsonicSearchResult, Song,
 };
-use crate::trace;
 
 /// An in-memory media URL that must never be written into debug logs.
 #[derive(Clone)]
@@ -856,7 +855,7 @@ impl Corpus {
             corpus.add_catalog(catalog, &Arc::new(client));
         }
         cache::sweep_foreign_catalogs(servers);
-        trace::mark(&format!(
+        crate::trace_mark!(&format!(
             "navidrome: {} cached catalog rows loaded",
             corpus.items.len()
         ));

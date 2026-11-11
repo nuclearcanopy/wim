@@ -2,8 +2,8 @@
 //! off-thread; frontends poll this state and render their own presentation.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 
 use crate::torbox::{AccountItem, Client, LibrarySearch, Service};
@@ -63,6 +63,9 @@ pub struct Workspace {
     pub service: Service,
     pub account: Vec<AccountItem>,
     pub account_selected: Option<AccountItem>,
+    /// For an episode source, constrain the file step to the exact episode
+    /// that matched. Ordinary account/movie browsing leaves this unset.
+    focused_file_index: Option<usize>,
     confirm_delete: Option<(Service, u64)>,
     pub link_input: Option<String>,
     pub token_path_input: String,
@@ -113,6 +116,7 @@ impl Workspace {
             service: Service::Torrent,
             account: Vec::new(),
             account_selected: None,
+            focused_file_index: None,
             confirm_delete: None,
             link_input: None,
             token_path_input: String::new(),
@@ -220,7 +224,13 @@ impl Workspace {
             Page::Sources => self.sources.len(),
             Page::Account => self.account.len(),
             Page::Files => match (&self.account_selected, &self.client) {
-                (Some(item), Some(client)) => item.playable_items(client.clone()).len(),
+                (Some(item), Some(client)) => {
+                    if self.focused_file_index.is_some() {
+                        usize::from(self.selected_playable().is_some())
+                    } else {
+                        item.playable_items(client.clone()).len()
+                    }
+                }
                 _ => 0,
             },
         }
@@ -276,7 +286,7 @@ impl Workspace {
         let (generation, tx) = (self.generation, self.tx.clone());
         self.loading = true;
         self.message = Some(format!("searching your TorBox library for {query:?}…"));
-        crate::trace::diag(
+        crate::trace_diag!(
             "torbox",
             "search-start",
             &[
@@ -290,8 +300,9 @@ impl Workspace {
             let result = client
                 .search_library(&query)
                 .map_err(|error| format!("TorBox library search failed: {error:#}"));
+            #[cfg(feature = "dev-telemetry")]
             if let Ok(search) = &result {
-                crate::trace::diag(
+                crate::trace_diag!(
                     "torbox",
                     "search-done",
                     &[
@@ -414,6 +425,7 @@ impl Workspace {
 
     pub fn open_account_item(&mut self) {
         self.episode_show = None;
+        self.focused_file_index = None;
         self.account_selected = self.account.get(self.selected).cloned();
         if self.account_selected.is_some() {
             self.page = Page::Files;
@@ -425,9 +437,21 @@ impl Workspace {
     pub fn selected_playable(&self) -> Option<crate::search::SearchItem> {
         let client = self.client.as_ref()?;
         let item = self.account_selected.as_ref()?;
+        let index = self.focused_file_index.unwrap_or(self.selected);
         item.playable_items(Arc::clone(client))
             .into_iter()
-            .nth(self.selected)
+            .nth(index)
+    }
+
+    pub fn selected_files_for_display(&self) -> Vec<(&str, u64, bool)> {
+        let Some(item) = self.account_selected.as_ref() else {
+            return Vec::new();
+        };
+        let files = item.playable_files_for_display();
+        match self.focused_file_index {
+            Some(index) => files.get(index).copied().into_iter().collect(),
+            None => files,
+        }
     }
 
     pub fn control_selected(&mut self, operation: &str) {
@@ -522,15 +546,17 @@ impl Workspace {
         let Some(item) = self.hits.get(index).cloned() else {
             return;
         };
-        let playable = item.playable_files_for_display().len();
-        crate::trace::diag(
+        crate::trace_diag!(
             "torbox",
             "open-hit",
             &[
                 ("index", crate::trace::Value::Num(self.selected as f64)),
                 ("hits", crate::trace::Value::Num(self.hits.len() as f64)),
                 ("service", crate::trace::Value::Label(item.service.as_str())),
-                ("playable", crate::trace::Value::Num(playable as f64)),
+                (
+                    "playable",
+                    crate::trace::Value::Num(item.playable_files_for_display().len() as f64),
+                ),
             ],
         );
         if item.playable_files_for_display().is_empty() {
@@ -541,6 +567,7 @@ impl Workspace {
             return;
         }
         self.account_selected = Some(item);
+        self.focused_file_index = None;
         self.page = Page::Files;
         self.selected = 0;
         self.message = None;
@@ -613,8 +640,9 @@ impl Workspace {
             return;
         };
         self.account_selected = Some(item);
+        self.focused_file_index = Some(source.file_index);
         self.page = Page::Files;
-        self.selected = source.file_index;
+        self.selected = 0;
         self.message = None;
     }
 }
@@ -853,19 +881,45 @@ mod tests {
             name: name.into(),
             status: "cached".into(),
             progress: Some(1.0),
-            files: vec![AccountFile {
-                id: 0,
-                name: name.into(),
-                size: 4000,
-            }],
+            files: if i == 0 {
+                vec![
+                    AccountFile {
+                        id: 0,
+                        name: name.into(),
+                        size: 4000,
+                    },
+                    AccountFile {
+                        id: 4,
+                        name: "Silo.S03E05.BluRay.mkv".into(),
+                        size: 4200,
+                    },
+                ]
+            } else {
+                vec![AccountFile {
+                    id: 0,
+                    name: name.into(),
+                    size: 4000,
+                }]
+            },
         })
         .collect();
         workspace.open_hit();
         assert_eq!(workspace.page, Page::Episodes);
-        assert_eq!(workspace.episodes.len(), 1);
+        assert_eq!(workspace.episodes.len(), 2);
         workspace.open_episode();
         assert_eq!(workspace.sources.len(), 2);
         assert_ne!(workspace.sources[0].release, workspace.sources[1].release);
+        workspace.open_source();
+        assert_eq!(workspace.page, Page::Files);
+        assert_eq!(workspace.selected_files_for_display().len(), 1);
+        assert_eq!(
+            workspace.selected_files_for_display()[0].0,
+            "Silo.2024.S03.Ep4.1080p.WEB-DL.mkv"
+        );
+        assert!(matches!(
+            workspace.selected_playable(),
+            Some(crate::search::SearchItem::TorBoxFile { file_id: 0, .. })
+        ));
         std::fs::remove_file(token_path).ok();
     }
 

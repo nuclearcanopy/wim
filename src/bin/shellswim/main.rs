@@ -24,7 +24,9 @@ use wim::theme::{shade, DIM, NEAR_WHITE};
 use wim::ui::divider::HorizontalRule;
 use wim::ui::lyrics_view::LyricsView;
 use wim::ui::results_list::label;
-use wim::{anim, config, mpv, term, trace};
+use wim::{anim, config, mpv, term};
+#[cfg(feature = "dev-telemetry")]
+use wim::trace;
 
 use wim::cli;
 mod host;
@@ -60,10 +62,12 @@ fn main() -> anyhow::Result<()> {
         // or a keybind can read it. drawing one frame and then leaving
         // the alternate screen wiped the line it had just written.
         Run::Command(_) | Run::Script(_) => {
+            #[cfg(feature = "dev-telemetry")]
             trace::init();
             oneshot(&cli)
         }
         Run::Prompt => {
+            #[cfg(feature = "dev-telemetry")]
             trace::init();
             prompt()
         }
@@ -84,7 +88,7 @@ fn oneshot(cli: &Cli) -> anyhow::Result<()> {
         _ => Vec::new(),
     };
     let mut host = Host::start()?;
-    trace::mark("host ready (no terminal)");
+    wim::trace_mark!("host ready (no terminal)");
     let failed = host.run_lines(&lines);
     for line in &host.console.lines {
         // the command is echoed by the console; a pipe wants the
@@ -121,7 +125,7 @@ fn prompt() -> anyhow::Result<()> {
     // never answer, racing the event loop for input. not running it is
     // both faster and what makes this loop the only reader of stdin.
     let mut guard = term::TerminalGuard::new(false)?;
-    trace::mark("terminal ready");
+    wim::trace_mark!("terminal ready");
 
     banner(&mut host.console, &host.cfg);
     let mut first_frame = true;
@@ -167,7 +171,7 @@ fn prompt() -> anyhow::Result<()> {
             },
         )?;
         if first_frame {
-            trace::mark("first frame drawn");
+            wim::trace_mark!("first frame drawn");
             first_frame = false;
             // the first thing that needs the socket, so it is also
             // what pays whatever is left of mpv's startup. deliberately
@@ -176,7 +180,7 @@ fn prompt() -> anyhow::Result<()> {
             if let Err(e) = host.player.observe_playback() {
                 host.console.error = Some(format!("mpv will not report playback position: {e}"));
             }
-            trace::mark("player observed");
+            wim::trace_mark!("player observed");
         }
 
         // the scrubber moves while something plays and costs nothing

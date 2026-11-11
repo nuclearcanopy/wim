@@ -68,7 +68,7 @@ use wim::search::SearchItem;
 use wim::shellsong::{Console, LineKind, Op, Program};
 use wim::shellsong_host::{CorpusCandidates, Ramp, SearchSettle};
 use wim::ui::results_list::label;
-use wim::{app, cache, config, favorites, library, lyrics, mpv, search, trace};
+use wim::{app, cache, config, favorites, library, lyrics, mpv, search};
 
 use crate::surface::SwimSurface;
 
@@ -328,7 +328,7 @@ impl Host {
     pub fn start() -> anyhow::Result<Host> {
         let first_run = !config::config_path()?.exists();
         let cfg = config::load_or_init()?;
-        trace::mark("config loaded");
+        wim::trace_mark!("config loaded");
 
         // `rescan()` replaces this channel wholesale: the scan thread
         // signs off by dropping its sender, so a finished one cannot
@@ -344,11 +344,11 @@ impl Host {
         // prompt no longer waits for it: `observe_playback` happens
         // after the first frame, in `main`.
         let player = mpv::Mpv::spawn()?;
-        trace::mark("mpv forked");
+        wim::trace_mark!("mpv forked");
 
         let mut app = app::App::new(warming.take());
         app.scanning_library = true;
-        trace::mark("corpus warmed from cache");
+        wim::trace_mark!("corpus warmed from cache");
 
         let (download_tx, download_rx) = mpsc::channel();
         let (subtitle_tx, subtitle_rx) = mpsc::channel();

@@ -9,6 +9,12 @@ description = "terminal omniplayer for music and video"
 name = "wim"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Local development diagnostics only. Normal builds never initialize or
+# emit runtime traces; opt in with `--features dev-telemetry` when profiling.
+dev-telemetry = []
+
 [[bin]]
 name = "wim"
 path = "src/main.rs"

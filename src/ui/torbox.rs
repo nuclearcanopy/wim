@@ -272,8 +272,8 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
         }
         Page::Account => rows_for_items(&workspace.account, workspace.selected, area.width),
         Page::Files => match workspace.account_selected.as_ref() {
-            Some(item) => {
-                let files = item.playable_files_for_display();
+            Some(_) => {
+                let files = workspace.selected_files_for_display();
                 let rows = files
                     .iter()
                     .enumerate()
