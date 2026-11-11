@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use crate::cache;
 use crate::core::{client_for, retain_live_clients};
-use crate::{app, config, subsonic, trace};
+use crate::{app, config, subsonic};
 
 /// How often the background thread (see `spawn_background_sync`)
 /// re-fetches every configured server, so navidrome stays "constantly
@@ -103,7 +103,7 @@ fn sync_loop(
             }
         }
         if first_pass && !servers.is_empty() {
-            trace::mark("navidrome: first sync landed");
+            crate::trace_mark!("navidrome: first sync landed");
             first_pass = false;
         }
         // the list is read *before* the answers go out, because a pass
