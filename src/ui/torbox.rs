@@ -1,10 +1,10 @@
+use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 
 use crate::torbox::AccountItem;
 use crate::torbox_workspace::{Page, Workspace};
@@ -90,6 +90,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
     let title = match workspace.page {
         Page::Setup => "connect TorBox · API token file",
         Page::Search => "your TorBox library · enter searches this account",
+        Page::Episodes => "episodes · choose a season and episode",
+        Page::Sources => "sources · choose a release",
         Page::Account => "torbox account · 1 torrents · 2 usenet · 3 web downloads",
         Page::Files => "files · enter play · q queue",
     };
@@ -147,6 +149,20 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
                 }
                 Line::from(spans)
             }
+            Page::Episodes => Line::from(Span::styled(
+                workspace
+                    .episode_show
+                    .clone()
+                    .unwrap_or_else(|| "show".into()),
+                value_style,
+            )),
+            Page::Sources => Line::from(Span::styled(
+                workspace
+                    .episode_show
+                    .clone()
+                    .unwrap_or_else(|| "episode sources".into()),
+                value_style,
+            )),
             Page::Account => Line::from(vec![
                 Span::styled("service: ", label_style),
                 Span::styled(workspace.service.as_str().to_string(), value_style),
@@ -196,7 +212,64 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
             .collect::<Vec<_>>(),
             usize::MAX,
         ),
-        Page::Search => rows_for_items(&workspace.hits, workspace.selected, area.width),
+        Page::Search => {
+            let rows = workspace
+                .search_rows()
+                .into_iter()
+                .map(|row| match row {
+                    crate::torbox_workspace::SearchRow::Show(show) => format!("{show}  · series"),
+                    crate::torbox_workspace::SearchRow::LibraryItem(i) => {
+                        workspace.hits[i].name.clone()
+                    }
+                })
+                .enumerate()
+                .map(|(i, name)| {
+                    let marker = if i == workspace.selected { "> " } else { "  " };
+                    fit_row(marker, &name, "", area.width, i == workspace.selected)
+                })
+                .collect();
+            (rows, workspace.selected)
+        }
+        Page::Episodes => {
+            let rows = workspace
+                .episodes
+                .iter()
+                .enumerate()
+                .map(|(i, ep)| {
+                    let title = format!("Season {} · Episode {:02}", ep.season, ep.episode);
+                    let details = format!(
+                        "{} source{}",
+                        ep.sources.len(),
+                        if ep.sources.len() == 1 { "" } else { "s" }
+                    );
+                    fit_row(
+                        if i == workspace.selected { "> " } else { "  " },
+                        &title,
+                        &details,
+                        area.width,
+                        i == workspace.selected,
+                    )
+                })
+                .collect();
+            (rows, workspace.selected)
+        }
+        Page::Sources => {
+            let rows = workspace
+                .sources
+                .iter()
+                .enumerate()
+                .map(|(i, source)| {
+                    fit_row(
+                        if i == workspace.selected { "> " } else { "  " },
+                        &source.release,
+                        &source.file_name,
+                        area.width,
+                        i == workspace.selected,
+                    )
+                })
+                .collect();
+            (rows, workspace.selected)
+        }
         Page::Account => rows_for_items(&workspace.account, workspace.selected, area.width),
         Page::Files => match workspace.account_selected.as_ref() {
             Some(item) => {
@@ -328,6 +401,8 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
             Page::Search if !workspace.search_editing && workspace.hits.is_empty() => {
                 "press / to type a query; results come from your own library".to_string()
             }
+            Page::Episodes => "choose an episode to see matching sources".to_string(),
+            Page::Sources => "choose a release, then choose a file before playback".to_string(),
             _ => String::new(),
         });
     let style = if workspace.loading {
@@ -351,12 +426,14 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
             if workspace.search_editing {
                 "type · enter search · esc stop editing".to_string()
             } else {
-                "j/k select · enter files · / edit query · b account · c connect · esc close"
+                "j/k select · enter show/files · / edit query · b account · c connect · esc close"
                     .to_string()
             }
         }
         Page::Account => "1/2/3 service · r refresh · n next page · s search · enter files · + add link · p pause/resume · R reannounce · d delete · esc close".to_string(),
         Page::Files => "j/k select · enter play · q queue · backspace back · esc close".to_string(),
+        Page::Episodes => "j/k select · enter episodes' sources · backspace shows · esc close".to_string(),
+        Page::Sources => "j/k select · enter choose release · backspace episodes · esc close".to_string(),
     };
     if workspace.loading {
         footer.push_str(" · working…");
@@ -385,8 +462,8 @@ fn format_size(bytes: u64) -> String {
 mod tests {
     use super::*;
     use crate::torbox::AccountFile;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn item(id: u64, name: &str, files: Vec<AccountFile>) -> AccountItem {
         AccountItem {
