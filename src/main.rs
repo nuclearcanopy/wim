@@ -4,6 +4,7 @@
 
 use wim::cli;
 use wim::framesource;
+use wim::playback_status;
 use wim::ui::settings_menu::Field as SettingsField;
 use wim::{
     anim, app, browse, cache, config, coverart, eq, favorites, hit, keymap, library, listenbrainz,
@@ -750,7 +751,7 @@ fn main() -> anyhow::Result<()> {
     // be corrected, a credential file that would not open.
     let config::Loaded {
         mut cfg,
-        warnings: config_warnings,
+        warnings: mut config_warnings,
     } = config::load_reporting()?;
     trace::mark("config loaded");
     // the local scan is the biggest single startup cost (a blocking tag
@@ -773,6 +774,15 @@ fn main() -> anyhow::Result<()> {
 
     let player = mpv::Mpv::spawn()?;
     trace::mark("mpv spawned");
+    // the preload-while-paused knob, before anything can play: mpv's
+    // own default readahead is 1s (measured), so without this a pause
+    // buffers almost nothing and "pause it and let it load" silently
+    // doesn't work. applied before the first load because mpv reads
+    // it per file; failure is said rather than swallowed, for the
+    // same reason — a silent failure here is the bug this prevents.
+    if let Err(e) = player.set_buffer_ahead(cfg.buffer_ahead_secs) {
+        config_warnings.push(format!("buffer_ahead_secs could not be applied: {e}"));
+    }
     // All mpv HTTP(S) streams use the local address-pinning relay. Only
     // explicitly configured Navidrome origins may resolve to private LAN
     // addresses; every other destination must resolve wholly public.
@@ -900,6 +910,9 @@ fn main() -> anyhow::Result<()> {
     // draw is where that rect is decided. one frame stale at most — a
     // resize repaints and the next `update` respawns at the new grid.
     let mut inline_art_rect: Option<Rect> = None;
+    // the last playback status the diagnostics file has seen, so a
+    // transition is one line rather than one per frame.
+    let mut prev_status: Option<&'static str> = None;
     // the runtime half of `video_output`: `None` follows config.toml,
     // and the ascii key is the only thing that sets it, so a restart
     // goes back to whatever is configured.
@@ -1480,6 +1493,50 @@ fn main() -> anyhow::Result<()> {
         // mpv misreports a generated silence's length, so the entry is
         // asked first; see `core::playing_duration`.
         let duration_secs = playing_duration(now_playing.as_ref(), playback.duration_secs);
+        // the one answer to "what is playback doing right now", so
+        // the bar can say why it isn't moving instead of leaving that
+        // to be guessed off a frozen track. pure mpv facts plus the
+        // configured preload target; see `playback_status`.
+        let playback_status = playback_status::status(&playback_status::Facts {
+            loaded: now_playing.is_some(),
+            opening: playback.elapsed_secs.is_none(),
+            paused: playback.paused,
+            paused_for_cache: playback.paused_for_cache,
+            buffering_pct: playback.buffering_pct,
+            seeking: playback.seeking,
+            eof_reached: playback.eof_reached,
+            cache_ahead_secs: playback.cache_ahead_secs,
+            buffer_target_secs: cfg.buffer_ahead_secs,
+        });
+        // state-change only, and on the *word* rather than the whole
+        // status: `Paused{ahead}` would log on every cache tick, which
+        // is a buffering progress bar in the diagnostics file rather
+        // than a trace of transitions.
+        if prev_status.as_deref() != Some(playback_status.diag_label()) {
+            prev_status = Some(playback_status.diag_label());
+            trace::diag(
+                "playback",
+                "status",
+                &[
+                    ("status", trace::Value::Label(playback_status.diag_label())),
+                    (
+                        "pct",
+                        match playback_status {
+                            playback_status::Status::Buffering { pct } => {
+                                trace::Value::Num(pct)
+                            }
+                            _ => trace::Value::Flag(false),
+                        },
+                    ),
+                    (
+                        "ahead",
+                        playback.cache_ahead_secs.map_or(trace::Value::Flag(false), |a| {
+                            trace::Value::Num(a)
+                        }),
+                    ),
+                ],
+            );
+        }
         // take delivery of any cover that finished, ask for the
         // playing track's if it is not already in hand, and warm the
         // next queued track's. all no-ops once an album's cover has
@@ -2140,6 +2197,21 @@ fn main() -> anyhow::Result<()> {
                     // view reserves the rect and draws no cover under
                     // them.
                     video: inline_video,
+                    // why there is no picture yet (or why there never
+                    // will be): the source takes a moment to spawn,
+                    // and a file mpv refuses is latched so this is a
+                    // stable answer, not one per frame.
+                    video_note: if inline_video {
+                        if ascii.failed() {
+                            Some("VIDEO UNAVAILABLE")
+                        } else if !ascii.ready() {
+                            Some("loading video…")
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    },
                     cell_aspect: aspect,
                     // mid-drag the screen draws the pending target,
                     // not mpv's position, same as the bottom bar.
@@ -2523,6 +2595,8 @@ fn main() -> anyhow::Result<()> {
                 paused,
                 muted,
                 gap_remaining: gap_left,
+                status: playback_status,
+                cache_ahead_secs: playback.cache_ahead_secs,
                 // mid-drag the bar draws the pending target, not
                 // mpv's position: the seek is throttled, the
                 // keypress shouldn't look like it was.

@@ -37,6 +37,11 @@ pub const GLYPH_EQ: &str = "▂▅▃"; // U+2582/2585/2583 lower block eighths
 pub const GLYPH_CROSSFADE: &str = "◢◣"; // U+25E2/25E3 black lower right/left triangle
 const TRACK_DONE: char = '━'; // U+2501 box drawings heavy horizontal
 const TRACK_LEFT: char = '─'; // U+2500 box drawings light horizontal
+/// The buffered-but-not-yet-played portion of the track: media mpv
+/// has fetched ahead of the position (see `mpv::PROP_CACHE_AHEAD`).
+/// Between the heavy played run and the light unplayed one, so the
+/// three states read at a glance: played / downloaded / neither.
+const TRACK_BUFFERED: char = '═'; // U+2550 box drawings double horizontal
 pub const TRACK_HEAD: char = '●'; // U+25CF black circle
 pub const TRACK_HEAD_DRAG: char = '◆'; // U+25C6 black diamond
 
@@ -272,6 +277,17 @@ pub struct ControlsBar<'a> {
     /// `true` while enter-on-the-scrubber has a drag open.
     pub scrubbing: bool,
     pub resize_hint: Option<&'a str>,
+    /// What playback is doing right now — the answer to "the bar
+    /// isn't moving and I don't know why". The mode line carries its
+    /// sentence while it has one (buffering, opening, seeking,
+    /// paused-and-how-full), and stays the ordinary focus label when
+    /// it doesn't; see `playback_status`.
+    pub status: crate::playback_status::Status,
+    /// Media seconds mpv reports buffered ahead of the position, for
+    /// the track's shaded portion. `None` when there is no report
+    /// (a local file may never send one), which draws the ordinary
+    /// two-tone track.
+    pub cache_ahead_secs: Option<f64>,
 }
 
 /// How the mode line advertises the shellsong console, spelled from
@@ -391,6 +407,11 @@ impl ControlsBar<'_> {
     fn mode_label(&self) -> String {
         if self.move_mode {
             format!("-- MOVE: {} --", self.focus_label)
+        } else if let Some(sentence) = self.status.mode_line() {
+            // a status that explains a motionless bar outranks the
+            // focus hint for exactly as long as it is true; the
+            // ordinary label comes back the moment it is not.
+            format!("-- {sentence} --")
         } else {
             format!("-- INTERACT: {} --", self.focus_label)
         }
@@ -513,6 +534,20 @@ impl ControlsBar<'_> {
                         (Some(e), Some(d)) if d > 0.0 => (e / d).clamp(0.0, 1.0),
                         _ => 0.0,
                     },
+                    // how far the downloaded portion reaches, for the
+                    // same reason `frac` is computed here: the fit
+                    // pass and the paint both need it and neither can
+                    // guess it from the other.
+                    buffered_frac: match (
+                        self.elapsed_secs,
+                        self.duration_secs,
+                        self.cache_ahead_secs,
+                    ) {
+                        (Some(e), Some(d), Some(a)) if d > 0.0 => {
+                            Some(((e + a.max(0.0)) / d).clamp(0.0, 1.0))
+                        }
+                        _ => None,
+                    },
                 },
             },
         ]
@@ -528,6 +563,10 @@ enum Body {
         elapsed: String,
         total: String,
         frac: f64,
+        /// Where the buffered portion reaches, or `None` when mpv
+        /// reports no cache (a local file) and the track stays
+        /// two-tone.
+        buffered_frac: Option<f64>,
     },
 }
 
@@ -590,6 +629,7 @@ fn body_text(seg: &Segment, track_cells: usize, dragging: bool) -> Cow<'_, str> 
             elapsed,
             total,
             frac,
+            buffered_frac,
         } => {
             // one string at its final size: the readouts either side
             // of a track that is already the row's longest element.
@@ -598,7 +638,7 @@ fn body_text(seg: &Segment, track_cells: usize, dragging: bool) -> Cow<'_, str> 
             );
             out.push_str(elapsed);
             out.push(' ');
-            track_into(&mut out, *frac, track_cells, dragging);
+            track_into(&mut out, *frac, track_cells, dragging, *buffered_frac);
             out.push(' ');
             out.push_str(total);
             Cow::Owned(out)
@@ -728,11 +768,11 @@ fn draw_placed(
 /// Same scrubber convention as `ui::progress::bar` (heavy track
 /// behind the head, light ahead of it); the head swaps to a diamond
 /// while dragging, so scrub mode shows in the bar itself rather than
-/// only in the plate behind it. `pub` for the maximized player, which
-/// draws the same scrubber at its own width.
+/// only in the plate behind it. `pub` for the surfaces that draw the
+/// same scrubber at their own width; they take the no-buffer form.
 pub fn track(frac: f64, cells: usize, dragging: bool) -> String {
     let mut out = String::new();
-    track_into(&mut out, frac, cells, dragging);
+    track_into(&mut out, frac, cells, dragging, None);
     out
 }
 
@@ -740,20 +780,35 @@ pub fn track(frac: f64, cells: usize, dragging: bool) -> String {
 /// side of it builds one string rather than three. Reserves what it
 /// needs: collecting the glyphs grew the string from the iterator's
 /// lower bound of one byte a cell, where each of these is three.
-pub fn track_into(out: &mut String, frac: f64, cells: usize, dragging: bool) {
+///
+/// `buffered` is where mpv's downloaded-ahead portion reaches
+/// (`None` = no report, two-tone track): those cells draw
+/// `TRACK_BUFFERED` so played, downloaded and neither read at a
+/// glance — the whole "is it loading" question answered by the
+/// track itself.
+pub fn track_into(out: &mut String, frac: f64, cells: usize, dragging: bool, buffered: Option<f64>) {
     let cells = cells.max(TRACK_MIN);
     let head = if dragging {
         TRACK_HEAD_DRAG
     } else {
         TRACK_HEAD
     };
-    let pos = ((frac.clamp(0.0, 1.0) * (cells - 1) as f64).round() as usize).min(cells - 1);
+    let frac = frac.clamp(0.0, 1.0);
+    let pos = ((frac * (cells - 1) as f64).round() as usize).min(cells - 1);
+    let buffered_end = buffered.map(|b| {
+        ((b.clamp(0.0, 1.0) * (cells - 1) as f64).round() as usize).min(cells - 1)
+    });
     out.reserve(cells * TRACK_DONE.len_utf8());
     for i in 0..cells {
         out.push(match i.cmp(&pos) {
             Ordering::Less => TRACK_DONE,
             Ordering::Equal => head,
-            Ordering::Greater => TRACK_LEFT,
+            // ahead of the head: downloaded cells say so, up to and
+            // including the buffered end; past it, plain unplayed.
+            Ordering::Greater => match buffered_end {
+                Some(end) if i <= end => TRACK_BUFFERED,
+                _ => TRACK_LEFT,
+            },
         });
     }
 }
@@ -821,6 +876,8 @@ mod tests {
             flash: None,
             selected: None,
             scrubbing: false,
+            status: crate::playback_status::Status::default(),
+            cache_ahead_secs: None,
             resize_hint: None,
         }
     }
@@ -832,6 +889,91 @@ mod tests {
         let mut buf = buffer(width, height);
         cb.render(area, &mut buf);
         buf
+    }
+
+    /// The buffered portion of the track is a third tone: played
+    /// heavy, downloaded double-line, neither light — "is it loading"
+    /// answered by the track itself, which is the whole complaint.
+    #[test]
+    fn the_track_shows_the_buffered_portion_between_played_and_neither() {
+        // a quarter in, with another quarter downloaded: cells 0..4
+        // played, 4..8 buffered, 8.. light.
+        let mut out = String::new();
+        track_into(&mut out, 0.25, 16, false, Some(0.5));
+        let cells: Vec<char> = out.chars().collect();
+        assert_eq!(cells.len(), 16, "{out:?}");
+        assert_eq!(cells[0], TRACK_DONE, "behind the head is played");
+        assert_eq!(cells[4], TRACK_HEAD, "the head at a quarter");
+        assert_eq!(cells[5], TRACK_BUFFERED, "ahead of the head, downloaded");
+        assert_eq!(cells[7], TRACK_BUFFERED, "the buffered end is inclusive");
+        assert_eq!(cells[8], TRACK_BUFFERED, "the buffered end is inclusive");
+        assert_eq!(cells[9], TRACK_LEFT, "past the buffered end, plain");
+        // no report (a local file) keeps the ordinary two tones.
+        let mut plain = String::new();
+        track_into(&mut plain, 0.25, 16, false, None);
+        assert!(!plain.contains(TRACK_BUFFERED), "{plain:?}");
+        // the buffered portion can never reach behind the head: what
+        // is played is played, and clamping keeps the head's cell the
+        // head's.
+        let mut over = String::new();
+        track_into(&mut over, 0.5, 16, false, Some(0.4));
+        let cells: Vec<char> = over.chars().collect();
+        assert_eq!(cells[8], TRACK_HEAD);
+        assert!(cells[..8].iter().all(|&c| c == TRACK_DONE), "{over:?}");
+    }
+
+    /// A status that explains a motionless bar takes the mode line
+    /// for exactly as long as it is true; the ordinary focus label
+    /// comes back the moment it is not. This is the feature's whole
+    /// surface: "buffering 42%" where a frozen track used to say
+    /// nothing at all.
+    #[test]
+    fn a_status_replaces_the_mode_line_only_while_it_has_something_to_say() {
+        let buffering = bar_at(100, 3, |cb| {
+            cb.status = crate::playback_status::Status::Buffering { pct: 42.0 };
+        });
+        let text = grid(&buffering);
+        assert!(text.contains("BUFFERING 42%"), "{text}");
+        assert!(!text.contains("INTERACT"), "the status outranks the hint: {text}");
+
+        let paused_filling = bar_at(100, 3, |cb| {
+            cb.paused = true;
+            cb.status = crate::playback_status::Status::Paused {
+                ahead: Some(12.0),
+                still_filling: true,
+            };
+        });
+        let text = grid(&paused_filling);
+        assert!(text.contains("PAUSED · BUFFERING 12s AHEAD"), "{text}");
+
+        // playing has no sentence: the bar already says it, and a
+        // permanent mode line is one the eye learns to ignore.
+        let playing = bar_at(100, 3, |cb| {
+            cb.status = crate::playback_status::Status::Playing { ahead: Some(5.0) };
+        });
+        assert!(grid(&playing).contains("INTERACT"));
+
+        // and move mode still wins: which keys do what is the one
+        // thing a status sentence must not hide.
+        let moving = bar_at(100, 3, |cb| {
+            cb.move_mode = true;
+            cb.status = crate::playback_status::Status::Buffering { pct: 42.0 };
+        });
+        assert!(grid(&moving).contains("MOVE"));
+    }
+
+    /// The scrubber's shaded portion is derived in the same fit pass
+    /// the paint uses, so a click fraction and the drawn buffer can
+    /// never disagree about where the downloaded part ends.
+    #[test]
+    fn the_bar_derives_the_buffered_fraction_from_the_same_numbers() {
+        let buf = bar_at(100, 2, |cb| {
+            cb.elapsed_secs = Some(30.0);
+            cb.duration_secs = Some(120.0);
+            cb.cache_ahead_secs = Some(30.0);
+        });
+        let text = grid(&buf);
+        assert!(text.contains(TRACK_BUFFERED), "a reported cache shades the track: {text}");
     }
 
     /// The layout the host hit-tests against, and the buffer the same
@@ -1795,6 +1937,8 @@ mod bench {
             flash: Some((Field::Shuffle, 0.4)),
             selected: Some(Field::Progress),
             scrubbing: false,
+            status: crate::playback_status::Status::default(),
+            cache_ahead_secs: None,
             resize_hint: None,
         }
     }
@@ -2022,6 +2166,8 @@ mod eyeball {
             flash: None,
             selected: None,
             scrubbing: false,
+            status: crate::playback_status::Status::default(),
+            cache_ahead_secs: None,
             resize_hint: None,
         }
     }
