@@ -252,6 +252,22 @@ pub struct Config {
     /// half the work and still watchable.
     #[serde(default)]
     pub ascii_fps: Option<f64>,
+    /// How many seconds of a stream mpv keeps buffered ahead of the
+    /// position, which is also how much a pause loads: mpv keeps
+    /// reading ahead while paused, but its default is 1s (measured on
+    /// 0.41.0), so "pause it and let it load" buffers almost nothing
+    /// unless this is raised. Applies from the next track on, not
+    /// mid-track (mpv reads the setting per file).
+    #[serde(default = "default_buffer_ahead_secs")]
+    pub buffer_ahead_secs: f64,
+}
+
+/// Enough to make a pause a real preload without making a track
+/// change wait: measured against mpv's own `demuxer-readahead-secs`
+/// default of 1, and the same order as the byte cap mpv already
+/// ships (150 MiB).
+fn default_buffer_ahead_secs() -> f64 {
+    30.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -617,6 +633,7 @@ impl Default for Config {
             torbox_token_file: None,
             album_art: AlbumArtMode::Auto,
             ascii_fps: None,
+            buffer_ahead_secs: default_buffer_ahead_secs(),
             library_paths: Vec::new(),
             crossfade_enabled: false,
             crossfade_seconds: default_crossfade_seconds(),
@@ -754,6 +771,7 @@ const KNOWN_KEYS: &[&str] = &[
     "torbox_token_file",
     "album_art",
     "ascii_fps",
+    "buffer_ahead_secs",
     "library_paths",
     "crossfade_enabled",
     "crossfade_seconds",
@@ -1186,6 +1204,7 @@ pasword = "x"
             torbox_token_file: Some("/run/agenix/torbox".into()),
             album_art: AlbumArtMode::Auto,
             ascii_fps: Some(12.0),
+            buffer_ahead_secs: 30.0,
             library_paths: vec!["/music".into()],
             crossfade_enabled: true,
             crossfade_seconds: 3.0,

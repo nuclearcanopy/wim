@@ -30,6 +30,7 @@ pub mod lyricspane;
 pub mod media;
 pub mod media_proxy;
 pub mod mpv;
+pub mod playback_status;
 pub mod namehint;
 pub mod navmanager;
 pub mod notify;

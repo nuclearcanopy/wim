@@ -147,6 +147,13 @@ pub struct PlayerView<'a> {
     /// mode) but no cover is drawn under it, because the frames land
     /// on top anyway and a cover would be one frame of flicker.
     pub video: bool,
+    /// What to say in the video rect when there is no picture yet:
+    /// `Some("loading…")` between the source spawning and its first
+    /// frame, `Some("unavailable…")` when mpv refused the file. A
+    /// blank rect with no explanation is exactly the "the bar isn't
+    /// moving and I don't know why" this whole feature exists to
+    /// end; `None` once frames are painting (they cover the note).
+    pub video_note: Option<&'a str>,
     /// `Some` while a timed silence is playing, which has no cover and
     /// never will. The cover rect goes to a countdown instead of being
     /// left blank for the length of the gap; see `ui::gap`.
@@ -203,10 +210,22 @@ impl Widget for PlayerView<'_> {
             // way means a future entry kind with both still draws
             // something deterministic. video comes next for the same
             // reason: its frames are the host's, painted after this
-            // view, so the view draws nothing in the rect at all.
+            // view, so the view draws nothing in the rect at all —
+            // except the note, which is the one thing the host cannot
+            // say for itself: why there is no picture yet.
             if let Some(gap) = self.gap {
                 GapPanel { gap }.render(rect, buf);
-            } else if !self.video && self.art_mode.is_ascii() {
+            } else if self.video {
+                if let Some(note) = self.video_note {
+                    draw_centered(
+                        buf,
+                        rect,
+                        rect.y + rect.height / 2,
+                        note,
+                        shade(NEAR_BLACK),
+                    );
+                }
+            } else if self.art_mode.is_ascii() {
                 CachedArt {
                     image: self.art,
                     cell_aspect: self.cell_aspect,
@@ -303,6 +322,7 @@ mod tests {
             art_key: "a:artist\u{1}album",
             art_mode: ArtMode::AsciiBw,
             video: false,
+            video_note: None,
             gap: None,
             cell_aspect: 2.0,
             elapsed_secs: Some(30.0),
@@ -696,5 +716,21 @@ mod tests {
         // `Off` still means off for a cover.
         assert!(!has_art(false, true, false, ArtMode::Off));
     }
-}
 
+    #[test]
+    fn video_loading_and_failure_notes_are_drawn_in_the_reserved_rect() {
+        let keymap = Keymap::default();
+        for (note, expected) in [
+            ("loading video…", "loading video…"),
+            ("VIDEO UNAVAILABLE", "VIDEO UNAVAILABLE"),
+        ] {
+            let area = Rect::new(0, 0, 60, 24);
+            let mut v = view(&keymap, None);
+            v.video = true;
+            v.video_note = Some(note);
+            let mut buf = buffer(60, 24);
+            v.render(area, &mut buf);
+            assert!(grid(&buf).contains(expected), "{}", grid(&buf));
+        }
+    }
+}

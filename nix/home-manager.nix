@@ -168,6 +168,17 @@ in
       '';
     };
 
+    bufferAheadSecs = mkOption {
+      type = types.number;
+      default = 30;
+      description = ''
+        Target number of media seconds mpv buffers ahead. This is also
+        how far a paused stream can preload; mpv's default is only one
+        second. The byte cache cap still applies, so this is a target,
+        not a guarantee that an entire stream is downloaded.
+      '';
+    };
+
     libraryPaths = mkOption {
       type = types.listOf types.str;
       default = [ ];
@@ -449,6 +460,8 @@ in
       listenbrainz_user_token_file = toString cfg.listenbrainzUserTokenFile;
     } // lib.optionalAttrs (cfg.asciiFps != null) {
       ascii_fps = cfg.asciiFps;
+    } // {
+      buffer_ahead_secs = cfg.bufferAheadSecs;
     } // lib.optionalAttrs (cfg.logoStyle != null) {
       logo_style = cfg.logoStyle;
     } // lib.optionalAttrs (cfg.keybinds != { }) {

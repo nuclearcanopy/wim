@@ -739,6 +739,29 @@ the wiring, so the pieces cannot disagree:
   ranges, and stdin-not-argv. a `TorBoxFile` whose url never
   resolved shows the title and nothing else.
 
+## streaming status and paused preloading
+
+The bottom-bar scrubber shades the portion mpv has buffered ahead;
+opening, seeking, cache starvation, and paused/preloading each get an
+explicit mode-line status. `cache-time` is mpv's cached-range end
+timestamp, so wim subtracts `time-pos` to derive the ahead duration
+(using `demuxer-cache-duration` here would incorrectly include cached
+data behind the playhead).
+
+`buffer_ahead_secs` defaults to 30 seconds (`config.toml`). mpv's own
+`demuxer-readahead-secs` default is only one second, so without raising
+it a pause barely preloads anything. This remains bounded by mpv's
+`demuxer-max-bytes` cap (150 MiB by default): it is a target, not a
+promise that all media ahead will fit or that the whole file downloads.
+Local sources with no cache report show no fabricated buffered amount.
+
+Inline video identifies the no-frame-yet interval as “loading video…”
+and a refused frame source as “video unavailable — playing audio”. The
+second frame decoder still reads the media independently from audible
+mpv; this status work does not claim to eliminate duplicate network
+requests. Synthetic range-server tests cover HTTP playback; no real
+TorBox stream is asserted as verified here.
+
 ## what is still missing for in-workspace video
 
 wim-painted inline frames are built (the section above). what is
