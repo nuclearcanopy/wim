@@ -3824,7 +3824,20 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                         KeyCode::Backspace if torbox_workspace.page == Page::Files => {
-                            torbox_workspace.page = Page::Account;
+                            if torbox_workspace.episode_show.is_some() {
+                                torbox_workspace.page = Page::Sources;
+                                torbox_workspace.selected = 0;
+                            } else {
+                                torbox_workspace.page = Page::Account;
+                                torbox_workspace.selected = 0;
+                            }
+                        }
+                        KeyCode::Backspace if torbox_workspace.page == Page::Sources => {
+                            torbox_workspace.page = Page::Episodes;
+                            torbox_workspace.selected = 0;
+                        }
+                        KeyCode::Backspace if torbox_workspace.page == Page::Episodes => {
+                            torbox_workspace.page = Page::Search;
                             torbox_workspace.selected = 0;
                         }
                         KeyCode::Enter if torbox_workspace.page == Page::Files => {
@@ -3876,6 +3889,12 @@ fn main() -> anyhow::Result<()> {
                         }
                         KeyCode::Enter if torbox_workspace.page == Page::Search => {
                             torbox_workspace.open_hit();
+                        }
+                        KeyCode::Enter if torbox_workspace.page == Page::Episodes => {
+                            torbox_workspace.open_episode();
+                        }
+                        KeyCode::Enter if torbox_workspace.page == Page::Sources => {
+                            torbox_workspace.open_source();
                         }
                         _ => {}
                     }
