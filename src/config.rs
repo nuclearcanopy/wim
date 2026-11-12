@@ -151,6 +151,10 @@ pub struct Config {
     pub opensubtitles_api_key_file: Option<String>,
     #[serde(default = "default_subtitle_language")]
     pub subtitle_language: String,
+    /// Local whisper.cpp model used only after explicit subtitle alignment.
+    /// A missing path disables speech alignment without affecting playback.
+    #[serde(default)]
+    pub whisper_model_file: Option<String>,
     /// Same plaintext-vs-file split as `NavidromeConfig::password`/
     /// `password_file`, same reason (world-readable nix store paths).
     /// Neither set (the default) means scrobbling never runs; the
@@ -642,6 +646,7 @@ impl Default for Config {
             opensubtitles_api_key: None,
             opensubtitles_api_key_file: None,
             subtitle_language: default_subtitle_language(),
+            whisper_model_file: None,
             listenbrainz_user_token: None,
             listenbrainz_user_token_file: None,
             scrobble: ScrobbleConfig::default(),
@@ -780,6 +785,7 @@ const KNOWN_KEYS: &[&str] = &[
     "opensubtitles_api_key",
     "opensubtitles_api_key_file",
     "subtitle_language",
+    "whisper_model_file",
     "listenbrainz_user_token",
     "listenbrainz_user_token_file",
     "scrobble",
@@ -1213,6 +1219,7 @@ pasword = "x"
             opensubtitles_api_key: Some("k".into()),
             opensubtitles_api_key_file: Some("/run/secret".into()),
             subtitle_language: "en".into(),
+            whisper_model_file: Some("/models/whisper.bin".into()),
             listenbrainz_user_token: Some("t".into()),
             listenbrainz_user_token_file: Some("/run/secret".into()),
             scrobble: ScrobbleConfig::default(),
