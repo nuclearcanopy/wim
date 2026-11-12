@@ -29,13 +29,14 @@ pub struct SubtitleMenu<'a> {
     pub values: [&'a str; FIELD_COUNT],
     pub selected: usize,
     pub keymap: &'a Keymap,
+    pub alignment_status: &'a str,
 }
 
-const WIDTH: u16 = 32;
+const WIDTH: u16 = 42;
 
 impl Widget for SubtitleMenu<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let height = FIELD_COUNT as u16 + 4;
+        let height = FIELD_COUNT as u16 + 7;
         if area.width < WIDTH || area.height < height {
             return;
         }
@@ -71,9 +72,22 @@ impl Widget for SubtitleMenu<'_> {
             "j/k select, h/l adjust",
             shade(DIM),
         );
+        draw_text(
+            buf,
+            rect,
+            x + 2,
+            y + 2,
+            if self.alignment_status.is_empty() {
+                "a align · c cancel · p preview"
+            } else {
+                self.alignment_status
+            },
+            shade(DIM),
+        );
+        draw_text(buf, rect, x + 2, y + 12, "y accept · d reject", shade(DIM));
 
         for (i, (label, value)) in FIELD_LABELS.iter().zip(self.values.iter()).enumerate() {
-            let row_y = y + 3 + i as u16;
+            let row_y = y + 4 + i as u16;
             let color = if i == self.selected {
                 shade(NEAR_WHITE)
             } else {
@@ -123,7 +137,7 @@ mod tests {
     /// Where the box lands inside an `area` of this size: it centres
     /// itself, so the tests have to derive the rect the same way.
     fn box_rect(w: u16, h: u16) -> Rect {
-        let height = FIELD_COUNT as u16 + 4;
+        let height = FIELD_COUNT as u16 + 7;
         Rect::new((w - WIDTH) / 2, h.saturating_sub(height) / 2, WIDTH, height)
     }
 
@@ -132,14 +146,15 @@ mod tests {
             values,
             selected: 0,
             keymap: &Keymap::default(),
+            alignment_status: "",
         }
         .render(area, buf);
     }
 
     #[test]
     fn the_box_holds_a_labelled_row_per_field_with_its_value_right_aligned() {
-        let area = Rect::new(0, 0, 32, 11);
-        let mut buf = buffer(32, 11);
+        let area = Rect::new(0, 0, 42, 14);
+        let mut buf = buffer(42, 14);
         render(
             area,
             &mut buf,
@@ -148,17 +163,20 @@ mod tests {
         assert_eq!(
             grid(&buf),
             [
-                "┌─subtitles (t to close)───────┐",
-                "│ j/k select, h/l adjust       │",
-                "│                              │",
-                "│ > delay                 0.0s │",
-                "│   font size               48 │",
-                "│   position               100 │",
-                "│   outline                  2 │",
-                "│   background             0.5 │",
-                "│   blur                   0.2 │",
-                "│   color                white │",
-                "└──────────────────────────────┘",
+                "┌─subtitles (t to close)─────────────────┐",
+                "│ n track · x toggle · h/l adjust        │",
+                "│ a align · c cancel · p preview         │",
+                "│                                        │",
+                "│ > delay                           0.0s │",
+                "│   font size                         48 │",
+                "│   position                         100 │",
+                "│   outline                            2 │",
+                "│   background                       0.5 │",
+                "│   blur                             0.2 │",
+                "│   color                          white │",
+                "│                                        │",
+                "│ y accept · d reject                    │",
+                "└────────────────────────────────────────┘",
             ]
             .join("\n")
         );
@@ -168,14 +186,14 @@ mod tests {
     /// wide value one cell per wide glyph past the box's right border.
     #[test]
     fn a_wide_value_is_right_aligned_by_cells_and_keeps_the_border() {
-        let area = Rect::new(0, 0, 32, 11);
-        let mut buf = buffer(32, 11);
+        let area = Rect::new(0, 0, 42, 14);
+        let mut buf = buffer(42, 14);
         render(area, &mut buf, ["日本", "", "", "", "", "", ""]);
-        let row: Vec<char> = grid(&buf).lines().nth(3).unwrap().chars().collect();
-        assert_eq!(row[31], '│', "value overran the border");
+        let row: Vec<char> = grid(&buf).lines().nth(4).unwrap().chars().collect();
+        assert_eq!(row[41], '│', "value overran the border");
         // four cells for two wide chars, ending one cell in from the
         // border exactly like the ascii values above.
-        assert_eq!((row[26], row[27], row[28], row[29]), ('日', ' ', '本', ' '));
+        assert_eq!((row[36], row[37], row[38], row[39]), ('日', ' ', '本', ' '));
     }
 
     /// This one always drew a border, but its interior was spaces with
@@ -183,25 +201,25 @@ mod tests {
     /// through the box as a background.
     #[test]
     fn the_box_covers_every_cell_of_its_own_footprint() {
-        let mut buf = plated_buffer(40, 16);
-        render(Rect::new(0, 0, 40, 16), &mut buf, ["0.0s"; FIELD_COUNT]);
-        assert_no_bleed_through(&buf, box_rect(40, 16));
+        let mut buf = plated_buffer(50, 20);
+        render(Rect::new(0, 0, 50, 20), &mut buf, ["0.0s"; FIELD_COUNT]);
+        assert_no_bleed_through(&buf, box_rect(50, 20));
     }
 
     #[test]
     fn nothing_is_drawn_outside_the_box() {
-        let mut buf = buffer(40, 16);
+        let mut buf = buffer(50, 20);
         let long = "日本語テスト曲日本語テスト曲日本語テスト曲";
-        render(Rect::new(0, 0, 40, 16), &mut buf, [long; FIELD_COUNT]);
+        render(Rect::new(0, 0, 50, 20), &mut buf, [long; FIELD_COUNT]);
         // the box is centred in the area; everything outside it stays
         // as the overlay found it.
-        let box_rect = box_rect(40, 16);
+        let box_rect = box_rect(50, 20);
         assert_outside_untouched(&buf, box_rect);
     }
 
     #[test]
     fn degenerate_sizes_draw_nothing_instead_of_panicking() {
-        for (w, h) in [(1, 1), (1, 40), (2, 1), (40, 0), (0, 0), (31, 11)] {
+        for (w, h) in [(1, 1), (1, 40), (2, 1), (42, 0), (0, 0), (41, 14)] {
             let mut buf = buffer(w.max(1), h.max(1));
             render(Rect::new(0, 0, w, h), &mut buf, ["日本語"; FIELD_COUNT]);
             if w > 0 && h > 0 {
@@ -217,12 +235,13 @@ mod tests {
     fn the_close_hint_follows_the_live_keymap() {
         let mut keymap = Keymap::default();
         keymap.set(KeyAction::OpenSubtitleMenu, KeyCode::Char('z'));
-        let area = Rect::new(0, 0, 60, 20);
+        let area = Rect::new(0, 0, 60, 22);
         let mut buf = Buffer::empty(area);
         SubtitleMenu {
             values: ["", "", "", "", "", "", ""],
             selected: 0,
             keymap: &keymap,
+            alignment_status: "",
         }
         .render(area, &mut buf);
         let out: String = (0..area.height)
@@ -236,6 +255,6 @@ mod tests {
         assert!(out.contains("subtitles (z to close)"), "got:\n{out}");
         assert!(!out.contains("(t to close)"), "stale default key:\n{out}");
         // h/l and j/k are reserved, not keymap entries.
-        assert!(out.contains("j/k select, h/l adjust"), "got:\n{out}");
+        assert!(out.contains("a align · c cancel"), "got:\n{out}");
     }
 }

@@ -56,6 +56,7 @@ use wim::navmanager::{NavManager, NavManagerStep};
 use wim::notify::{Notifications, Severity};
 use wim::onboarding::{Onboarding, Step};
 use wim::playqueue::{PlayQueue, PosChange};
+use wim::subtitle_align::{self, Event as AlignmentEvent, Request as AlignmentRequest, SubtitleInput};
 use wim::search::SearchItem;
 use wim::shellsong::{Console, ConsoleAction, ViewTarget};
 use wim::shellsong_host::{CorpusCandidates, Ramp, SearchSettle, SleepStep};
@@ -713,6 +714,13 @@ fn download_selected(
 /// The commit this binary was built from, stamped by build.rs.
 const BUILD: &str = env!("WIM_BUILD");
 
+fn alignment_item_key(item: Option<&SearchItem>) -> Option<String> {
+    match item {
+        Some(SearchItem::LocalVideo { path, .. }) => Some(path.to_string_lossy().into_owned()),
+        _ => None,
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // answered before anything else, so these work with no terminal,
     // no config and no server: `--version` exists specifically to
@@ -955,6 +963,13 @@ fn main() -> anyhow::Result<()> {
     // (not a full takeover like help_open), for live subtitle style
     // tweaks instead of only the ,/. delay-only adjustment.
     let mut subtitle_menu_open = false;
+    let mut alignment_worker: Option<subtitle_align::Worker> = None;
+    let mut alignment_for: Option<String> = None;
+    let mut alignment_restore_sid: Option<u64> = None;
+    let mut alignment_audio_stream: Option<u64> = None;
+    let mut alignment_preview: Option<(subtitle_align::Preview, u64)> = None;
+    let mut alignment_preview_loaded = false;
+    let mut alignment_status = String::new();
     let mut subtitle_menu_selected: usize = 0;
     // 'u': the discoverable "where are the app's own settings" home,
     // covering the whole workspace like the video pane's fullscreen
@@ -2671,6 +2686,7 @@ fn main() -> anyhow::Result<()> {
                         ],
                         selected: subtitle_menu_selected,
                         keymap: &keymap,
+                        alignment_status: &alignment_status,
                     },
                     area,
                 );
@@ -2995,6 +3011,81 @@ fn main() -> anyhow::Result<()> {
         }
         for msg in browse_loaded.errors {
             notifications.push(Severity::Error, msg);
+        }
+
+        let current_alignment_key = alignment_item_key(now_playing.as_ref());
+        if alignment_for != current_alignment_key {
+            if let Some(worker) = alignment_worker.take() {
+                worker.cancel();
+                alignment_status = "cancelled: playback changed".into();
+            }
+            if let Some((preview, _)) = alignment_preview.take() {
+                subtitle_align::discard_preview(&preview);
+                alignment_status = "preview discarded: playback changed".into();
+            }
+            alignment_preview_loaded = false;
+            alignment_restore_sid = None;
+            alignment_audio_stream = None;
+            alignment_for = None;
+        }
+        loop {
+            let event = alignment_worker
+                .as_ref()
+                .and_then(|worker| worker.events.try_recv().ok());
+            let Some(event) = event else { break };
+            match event {
+                AlignmentEvent::Progress { stage, done, total } => {
+                    alignment_status = format!("{stage} · {done}/{total}");
+                }
+                AlignmentEvent::Ready(preview) => {
+                    let subtitle_still_selected = player
+                        .selected_subtitle_track()
+                        .ok()
+                        .flatten()
+                        .is_some_and(|track| Some(track.id) == alignment_restore_sid);
+                    let audio_still_selected =
+                        player.selected_audio_ff_index().ok().flatten() == alignment_audio_stream;
+                    if alignment_for == current_alignment_key
+                        && subtitle_still_selected
+                        && audio_still_selected
+                    {
+                        alignment_status = format!(
+                            "ready {:+.1}s {:.3}x · {} matches · {:.0}% · p preview",
+                            preview.offset_secs,
+                            preview.scale,
+                            preview.matches,
+                            preview.confidence * 100.0
+                        );
+                        notifications.push(
+                            Severity::Info,
+                            format!(
+                                "alignment suggestion ready: {:+.1}s, {:.0}% confidence; open subtitles to preview",
+                                preview.offset_secs,
+                                preview.confidence * 100.0
+                            ),
+                        );
+                        alignment_preview =
+                            Some((preview, alignment_restore_sid.unwrap_or_default()));
+                        alignment_preview_loaded = false;
+                    } else {
+                        subtitle_align::discard_preview(&preview);
+                        alignment_status =
+                            "subtitle/audio selection changed; result discarded".into();
+                    }
+                    alignment_worker = None;
+                }
+                AlignmentEvent::Failed(message) => {
+                    notifications.push(Severity::Alert, message.clone());
+                    alignment_status = format!("alignment failed: {message}");
+                    alignment_worker = None;
+                    alignment_for = None;
+                }
+                AlignmentEvent::Cancelled => {
+                    alignment_status = "alignment cancelled".into();
+                    alignment_worker = None;
+                    alignment_for = None;
+                }
+            }
         }
 
         // a subtitle `fire_subtitle_fetch` landed; loading it is this
@@ -4481,6 +4572,212 @@ fn main() -> anyhow::Result<()> {
                     {
                         subtitle_menu_open = false;
                         config::save_or_warn(&cfg, &mut notifications);
+                        continue;
+                    }
+                    if key.code == KeyCode::Char('d') {
+                        if let Some((preview, restore_sid)) = alignment_preview.take() {
+                            if alignment_preview_loaded {
+                                let _ = player.select_subtitle_id(restore_sid);
+                            }
+                            subtitle_align::discard_preview(&preview);
+                            alignment_preview_loaded = false;
+                            alignment_status = "alignment suggestion rejected".into();
+                            alignment_restore_sid = None;
+                        } else {
+                            alignment_status = "no alignment suggestion to reject".into();
+                        }
+                        continue;
+                    }
+                    if key.code == KeyCode::Char('a') {
+                        if alignment_worker.is_some() || alignment_preview.is_some() {
+                            alignment_status =
+                                "finish or cancel the current alignment first".into();
+                            continue;
+                        }
+                        let Some(model) = cfg.whisper_model_file.as_deref() else {
+                            alignment_status = "set whisper_model_file to enable local ASR".into();
+                            continue;
+                        };
+                        let Some(SearchItem::LocalVideo { path, .. }) = now_playing.as_ref() else {
+                            alignment_status = "alignment currently requires a local video".into();
+                            continue;
+                        };
+                        let track = match player.selected_subtitle_track() {
+                            Ok(Some(track)) => track,
+                            Ok(None) => {
+                                alignment_status = "select a text subtitle track first".into();
+                                continue;
+                            }
+                            Err(_) => {
+                                alignment_status = "could not inspect mpv subtitle tracks".into();
+                                continue;
+                            }
+                        };
+                        let subtitle = if let Some(external) = track.external_path {
+                            match external.canonicalize() {
+                                Ok(path) if path.is_file() => SubtitleInput::External(path),
+                                _ => {
+                                    alignment_status =
+                                        "selected external subtitle file is unavailable".into();
+                                    continue;
+                                }
+                            }
+                        } else if let Some(stream) = track.ff_index {
+                            SubtitleInput::Embedded { stream }
+                        } else {
+                            alignment_status = "selected subtitle track cannot be extracted".into();
+                            continue;
+                        };
+                        let audio_stream = match player.selected_audio_ff_index() {
+                            Ok(Some(stream)) => stream,
+                            _ => {
+                                alignment_status =
+                                    "could not identify the selected audio track".into();
+                                continue;
+                            }
+                        };
+                        let Some(duration_secs) = playback.duration_secs else {
+                            alignment_status = "video duration is not available yet".into();
+                            continue;
+                        };
+                        let Some(cache_dir) = dirs::cache_dir() else {
+                            alignment_status = "could not find a cache directory".into();
+                            continue;
+                        };
+                        let video = match path.canonicalize() {
+                            Ok(path) => path,
+                            Err(_) => {
+                                alignment_status = "could not resolve local video path".into();
+                                continue;
+                            }
+                        };
+                        alignment_for = alignment_item_key(now_playing.as_ref());
+                        alignment_restore_sid = Some(track.id);
+                        alignment_audio_stream = Some(audio_stream);
+                        alignment_status = "starting local Whisper alignment…".into();
+                        let request = AlignmentRequest {
+                            video,
+                            audio_stream,
+                            subtitle,
+                            model: std::path::PathBuf::from(model),
+                            duration_secs,
+                            cache_dir,
+                            language: cfg.subtitle_language.clone(),
+                        };
+                        match subtitle_align::Worker::start(request) {
+                            Ok(worker) => alignment_worker = Some(worker),
+                            Err(error) => {
+                                alignment_for = None;
+                                alignment_restore_sid = None;
+                                alignment_audio_stream = None;
+                                alignment_status = error;
+                            }
+                        }
+                        continue;
+                    }
+                    if key.code == KeyCode::Char('c') {
+                        if let Some(worker) = &alignment_worker {
+                            worker.cancel();
+                            alignment_status = "cancelling alignment…".into();
+                        } else if let Some((preview, restore_sid)) = alignment_preview.take() {
+                            if alignment_preview_loaded {
+                                let _ = player.select_subtitle_id(restore_sid);
+                            }
+                            subtitle_align::discard_preview(&preview);
+                            alignment_preview_loaded = false;
+                            alignment_status = "alignment preview cancelled".into();
+                            alignment_restore_sid = None;
+                        } else {
+                            alignment_status = "no active alignment to cancel".into();
+                        }
+                        continue;
+                    }
+                    if key.code == KeyCode::Char('p') {
+                        if let Some((preview, _)) = alignment_preview.as_ref() {
+                            let still_matches =
+                                player.selected_audio_ff_index().ok().flatten()
+                                    == alignment_audio_stream
+                                    && player.selected_subtitle_track().ok().flatten().is_some_and(
+                                        |track| Some(track.id) == alignment_restore_sid,
+                                    );
+                            if !still_matches {
+                                alignment_status =
+                                    "selected track changed; run alignment again".into();
+                                continue;
+                            }
+                            match player.sub_add(&preview.path.to_string_lossy()) {
+                                Ok(()) => {
+                                    alignment_preview_loaded = true;
+                                    alignment_status =
+                                        "preview loaded · y accept · d reject".into();
+                                }
+                                Err(_) => {
+                                    alignment_status = "mpv could not load alignment preview".into()
+                                }
+                            }
+                        } else {
+                            alignment_status = "no alignment preview is ready".into();
+                        }
+                        continue;
+                    }
+                    if key.code == KeyCode::Char('y') {
+                        if let Some((preview, _)) = alignment_preview.take() {
+                            let selected_is_source_or_preview =
+                                player.selected_subtitle_track().ok().flatten().is_some_and(
+                                    |track| {
+                                        Some(track.id) == alignment_restore_sid
+                                            || track.external_path.as_deref()
+                                                == Some(preview.path.as_path())
+                                    },
+                                );
+                            if player.selected_audio_ff_index().ok().flatten()
+                                != alignment_audio_stream
+                                || !selected_is_source_or_preview
+                            {
+                                if alignment_preview_loaded {
+                                    if let Some(sid) = alignment_restore_sid {
+                                        let _ = player.select_subtitle_id(sid);
+                                    }
+                                }
+                                subtitle_align::discard_preview(&preview);
+                                alignment_preview_loaded = false;
+                                alignment_restore_sid = None;
+                                alignment_audio_stream = None;
+                                alignment_status =
+                                    "selected track changed; run alignment again".into();
+                                continue;
+                            }
+                            match subtitle_align::accept_preview(&preview) {
+                                Ok(path) => match player.sub_add(&path.to_string_lossy()) {
+                                    Ok(()) => {
+                                        alignment_status = "aligned subtitle accepted".into();
+                                        subtitle_align::discard_preview(&preview);
+                                        alignment_preview_loaded = false;
+                                        alignment_restore_sid = None;
+                                        alignment_audio_stream = None;
+                                    }
+                                    Err(_) => {
+                                        alignment_status =
+                                            "saved aligned subtitle, but mpv could not load it"
+                                                .into();
+                                        subtitle_align::discard_preview(&preview);
+                                        alignment_preview_loaded = false;
+                                        alignment_restore_sid = None;
+                                        alignment_audio_stream = None;
+                                    }
+                                },
+                                Err(error) => {
+                                    alignment_status = error;
+                                    subtitle_align::discard_preview(&preview);
+                                    alignment_preview_loaded = false;
+                                    alignment_restore_sid = None;
+                                    alignment_audio_stream = None;
+                                }
+                            }
+                        } else {
+                            alignment_status =
+                                "run alignment and preview it before accepting".into();
+                        }
                         continue;
                     }
                     match key.code {
