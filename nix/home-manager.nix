@@ -257,6 +257,17 @@ in
       description = "Preferred language code for opensubtitles auto-fetch.";
     };
 
+    whisperModelFile = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/home/user/.local/share/whisper/ggml-base.en.bin";
+      description = ''
+        Local whisper.cpp model for explicit subtitle alignment. No model is
+        downloaded automatically. Setting this path also installs FFmpeg and
+        whisper.cpp in the user's profile.
+      '';
+    };
+
     # same plaintext-vs-file split as opensubtitlesApiKeyFile, same
     # reason; neither set means scrobbling never runs. the token comes
     # from listenbrainz.org -> profile -> settings, not a password.
@@ -414,7 +425,8 @@ in
       }
     ];
 
-    home.packages = [ cfg.package ];
+    home.packages = [ cfg.package ]
+      ++ lib.optionals (cfg.whisperModelFile != null) [ pkgs.ffmpeg pkgs.whisper-cpp ];
 
     xdg.configFile."wim/config.toml".source = tomlFormat.generate "wim-config.toml" ({
       lyrics = {
@@ -456,6 +468,8 @@ in
       torbox_token_file = toString cfg.torboxTokenFile;
     } // lib.optionalAttrs (cfg.opensubtitlesApiKeyFile != null) {
       opensubtitles_api_key_file = toString cfg.opensubtitlesApiKeyFile;
+    } // lib.optionalAttrs (cfg.whisperModelFile != null) {
+      whisper_model_file = cfg.whisperModelFile;
     } // lib.optionalAttrs (cfg.listenbrainzUserTokenFile != null) {
       listenbrainz_user_token_file = toString cfg.listenbrainzUserTokenFile;
     } // lib.optionalAttrs (cfg.asciiFps != null) {
