@@ -44,6 +44,7 @@ pub mod shellsong;
 pub mod shellsong_host;
 pub mod stremio;
 pub mod subsonic;
+pub mod subtitle_align;
 pub mod suggest;
 pub mod swimconsole;
 pub mod term;
