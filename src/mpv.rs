@@ -148,6 +148,13 @@ pub struct Playback {
     spectrum_at: Option<Instant>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SubtitleTrackInfo {
+    pub id: u64,
+    pub ff_index: Option<u64>,
+    pub external_path: Option<PathBuf>,
+}
+
 impl Playback {
     /// Folds one observed change in, returning whether it was one of
     /// ours. mpv sends `null` for a property that currently has no
@@ -1010,6 +1017,46 @@ impl Mpv {
     pub fn sub_add(&self, path: &str) -> Result<()> {
         self.command(&[json!("sub-add"), json!(path), json!("select")])?;
         Ok(())
+    }
+
+    /// Returns the selected subtitle's mpv id and source metadata.
+    pub fn selected_subtitle_track(&self) -> Result<Option<SubtitleTrackInfo>> {
+        let tracks = self.get_property("track-list")?;
+        let sid = self.get_property("sid").ok().and_then(|value| value.as_u64());
+        Ok(tracks
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|track| {
+                track.get("type").and_then(Value::as_str) == Some("sub")
+                    && (track.get("selected").and_then(Value::as_bool) == Some(true)
+                        || sid.is_some_and(|id| track.get("id").and_then(Value::as_u64) == Some(id)))
+            })
+            .map(|track| SubtitleTrackInfo {
+                id: track.get("id").and_then(Value::as_u64).unwrap_or_default(),
+                ff_index: track.get("ff-index").and_then(Value::as_u64),
+                external_path: track
+                    .get("external-filename")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from),
+            }))
+    }
+
+    pub fn selected_audio_ff_index(&self) -> Result<Option<u64>> {
+        let tracks = self.get_property("track-list")?;
+        Ok(tracks
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|track| {
+                track.get("type").and_then(Value::as_str) == Some("audio")
+                    && track.get("selected").and_then(Value::as_bool) == Some(true)
+            })
+            .and_then(|track| track.get("ff-index").and_then(Value::as_u64)))
+    }
+
+    pub fn select_subtitle_id(&self, id: u64) -> Result<()> {
+        self.set_property("sid", json!(id))
     }
 
     pub fn seek(&self, seconds: f64, relative: bool) -> Result<()> {
