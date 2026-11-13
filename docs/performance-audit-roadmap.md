@@ -232,9 +232,6 @@ exact implementations.
   transactional/orphan recovery remain open.
 - 2026-11-13: Verification after these changes: `cargo test --all-targets`
   passed (1,655 passed, 92 ignored), `cargo clippy --all-targets -- -D warnings`,
-  `cargo fmt --all -- --check`, and `git diff --check` passed. The latest Nix
-  build is still running; record its result before handoff.
-- 2026-11-13: Nix build completed successfully once, producing
-  `/nix/store/qghynirxd39v0b8i7pxvf8fal2mnias9-wim-0.1.0`. A subsequent build
-  attempt failed while resolving `cache.nixos.org` due DNS/network failure, so
-  that attempt did not independently verify the latest source snapshot.
+  `cargo fmt --all -- --check`, `git diff --check`, and the latest Nix build
+  passed. The Nix build produced
+  `/nix/store/s8gvniqkh6bzrbzhjwg6x5hrrmis6v2g-wim-0.1.0`.
