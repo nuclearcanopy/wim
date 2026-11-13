@@ -33,6 +33,7 @@ use crate::cache::{self, CacheIndex};
 /// only while a batch is small enough to be read one toast at a time;
 /// past `PER_TRACK_TOASTS` every outcome carries the batch's first
 /// label instead, which is what collapses it into one counted box.
+#[derive(Debug)]
 pub enum DownloadEvent {
     Progress {
         id: String,
@@ -74,6 +75,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// shows one counted box: it stacks five at once, so per-track toasts
 /// beyond that only evict each other instead of being read.
 const PER_TRACK_TOASTS: usize = 5;
+static REPLACEMENT_PATH_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Where a finished download lands: `cache::track_path` in the app,
 /// a temp dir under test, so nothing ever writes to the real cache.
@@ -84,11 +86,89 @@ type DestFor<'a> = &'a (dyn Fn(&str, &str) -> anyhow::Result<PathBuf> + Send + S
 /// `~/.cache/wim`.
 struct Sink<'a> {
     cache: &'a Arc<Mutex<CacheIndex>>,
+    budget: Arc<cache::CacheBudget>,
     dest_for: DestFor<'a>,
     /// `CacheIndex::save` in the app. Called per finished track, not
     /// once per batch: the files are already on disk, and an index
     /// that forgot them would leak them past the next sweep.
-    persist: &'a (dyn Fn(&CacheIndex) + Send + Sync),
+    persist: &'a (dyn Fn(&CacheIndex) -> anyhow::Result<()> + Send + Sync),
+    max_bytes: u64,
+}
+
+struct BudgetWriter {
+    file: File,
+    budget: Arc<cache::CacheBudget>,
+    reserved: u64,
+}
+
+impl BudgetWriter {
+    fn new(file: File, budget: Arc<cache::CacheBudget>) -> Self {
+        Self {
+            file,
+            budget,
+            reserved: 0,
+        }
+    }
+
+    fn into_lease(mut self) -> BudgetLease {
+        BudgetLease {
+            budget: self.budget.clone(),
+            bytes: std::mem::take(&mut self.reserved),
+            committed: false,
+        }
+    }
+}
+
+impl Write for BudgetWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.budget.reserve(buf.len() as u64) {
+            return Err(std::io::Error::other("offline cache budget is full"));
+        }
+        self.reserved = self.reserved.saturating_add(buf.len() as u64);
+        match self.file.write(buf) {
+            Ok(written) => {
+                let excess = buf.len().saturating_sub(written) as u64;
+                self.reserved = self.reserved.saturating_sub(excess);
+                self.budget.release(excess);
+                Ok(written)
+            }
+            Err(error) => {
+                self.reserved = self.reserved.saturating_sub(buf.len() as u64);
+                self.budget.release(buf.len() as u64);
+                Err(error)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Drop for BudgetWriter {
+    fn drop(&mut self) {
+        self.budget.release(self.reserved);
+    }
+}
+
+struct BudgetLease {
+    budget: Arc<cache::CacheBudget>,
+    bytes: u64,
+    committed: bool,
+}
+
+impl BudgetLease {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for BudgetLease {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.budget.release(self.bytes);
+        }
+    }
 }
 
 /// Keeps a big batch's outcomes collapsible. The text of its first
@@ -202,11 +282,12 @@ fn batch_agent() -> ureq::Agent {
 /// decision, since that depends on how big the batch is.
 fn download_one(
     agent: &ureq::Agent,
+    budget: &Arc<cache::CacheBudget>,
     id: &str,
     url: &str,
     dest_for: DestFor,
     tx: &mpsc::Sender<DownloadEvent>,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, BudgetLease), String> {
     let resp = agent.get(url).call().map_err(transfer_failed)?;
     let total = resp
         .header("Content-Length")
@@ -215,8 +296,33 @@ fn download_one(
     if is_error_document(content_type) {
         return Err("the server sent an error document, not audio".to_string());
     }
-    let ext = ext_for_content_type(content_type);
-    let dest = dest_for(id, ext).map_err(|e| e.to_string())?;
+    let ext = format!("{}.zst", ext_for_content_type(content_type));
+    let mut dest = dest_for(id, &ext).map_err(|e| e.to_string())?;
+    // A rebuild must not overwrite the currently indexed file before its
+    // replacement has been persisted in the cache index. Keep the normal
+    // stable filename for first downloads; use a unique sibling for handoff.
+    if dest.exists() {
+        let filename = dest
+            .file_name()
+            .ok_or_else(|| "cache path has no filename".to_string())?;
+        let filename = filename.to_string_lossy();
+        let media_name = filename.strip_suffix(".zst").unwrap_or(&filename);
+        let media_path = std::path::Path::new(media_name);
+        let stem = media_path.file_stem().unwrap_or_default().to_string_lossy();
+        let media_ext = media_path
+            .extension()
+            .map(|ext| format!(".{}", ext.to_string_lossy()))
+            .unwrap_or_default();
+        let parent = dest.parent().unwrap_or_else(|| std::path::Path::new("."));
+        loop {
+            let suffix = REPLACEMENT_PATH_ID.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!("{stem}-{suffix}{media_ext}.zst"));
+            if !candidate.exists() && !candidate.with_extension("zst.part").exists() {
+                dest = candidate;
+                break;
+            }
+        }
+    }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -224,7 +330,19 @@ fn download_one(
     // transfer (app killed mid-download) never looks like a valid
     // cached file to `CacheIndex::cached_path`'s is_file() check.
     let part_path = dest.with_extension(format!("{ext}.part"));
-    let mut file = File::create(&part_path).map_err(|e| e.to_string())?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part_path)
+        .map_err(|e| e.to_string())?;
+    let writer = BudgetWriter::new(file, budget.clone());
+    let mut encoder = match zstd::Encoder::new(writer, 3) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            let _ = std::fs::remove_file(&part_path);
+            return Err(error.to_string());
+        }
+    };
 
     // every exit from here on removes the stub rather than leaving a
     // `.part` nothing will ever finish or sweep.
@@ -241,7 +359,7 @@ fn download_one(
             Ok(n) => n,
             Err(e) => return abandon(e.to_string()),
         };
-        if let Err(e) = file.write_all(&buf[..n]) {
+        if let Err(e) = encoder.write_all(&buf[..n]) {
             return abandon(e.to_string());
         }
         downloaded += n as u64;
@@ -258,7 +376,11 @@ fn download_one(
             return abandon("download channel closed".to_string());
         }
     }
-    drop(file);
+    let writer = match encoder.finish() {
+        Ok(writer) => writer,
+        Err(error) => return abandon(error.to_string()),
+    };
+    let lease = writer.into_lease();
     // a transcode that produced nothing still answers 200 with audio
     // headers; renaming that in would cache a zero-byte file that
     // `cached_path` treats as the download from then on.
@@ -268,7 +390,7 @@ fn download_one(
     if let Err(e) = std::fs::rename(&part_path, &dest) {
         return abandon(e.to_string());
     }
-    Ok(dest)
+    Ok((dest, lease))
 }
 
 /// Downloads every `(id, label, url)` triple with at most
@@ -306,20 +428,78 @@ fn download_tracks(
                 let Some((id, label, url)) = tracks.get(index) else {
                     return;
                 };
-                let event = match download_one(agent, id, url, sink.dest_for, &tx) {
-                    Ok(path) => {
-                        if let Ok(mut idx) = sink.cache.lock() {
-                            idx.mark_cached(id, path);
-                            (sink.persist)(&idx);
-                        }
-                        let label = if collapse {
-                            tally.done_label(label)
-                        } else {
-                            label.clone()
+                let event = match download_one(agent, &sink.budget, id, url, sink.dest_for, &tx) {
+                    Ok((path, mut lease)) => {
+                        let handoff = match sink.cache.lock() {
+                            Ok(mut index) => {
+                                let size = std::fs::metadata(&path)
+                                    .map(|metadata| metadata.len())
+                                    .unwrap_or(u64::MAX);
+                                if size > sink.max_bytes {
+                                    Err(format!(
+                                        "download is {size} bytes, larger than the configured cache budget"
+                                    ))
+                                } else {
+                                    let previous = index.recorded_cached_path(id);
+                                    let mut replacement = index.clone();
+                                    replacement.mark_cached(id, path.clone());
+                                    let transient = index.transient_managed_bytes();
+                                    let evicted = replacement
+                                        .plan_budget_evictions_with_extra(sink.max_bytes, id, transient);
+                                    match (sink.persist)(&replacement) {
+                                        Err(error) => Err(format!(
+                                            "could not save cache index; previous copy kept: {error}"
+                                        )),
+                                        Ok(()) => {
+                                            *index = replacement;
+                                            for old in evicted {
+                                                if old != path {
+                                                    release_after_removal(&old, &sink.budget);
+                                                }
+                                            }
+                                            if let Some(previous) = previous
+                                                .filter(|previous| previous != &path)
+                                            {
+                                                release_after_removal(&previous, &sink.budget);
+                                            }
+                                            lease.commit();
+                                            Ok(())
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => Err("cache index is unavailable".to_string()),
                         };
-                        DownloadEvent::Done {
-                            id: id.clone(),
-                            label,
+                        match handoff {
+                            Ok(()) => {
+                                let label = if collapse {
+                                    tally.done_label(label)
+                                } else {
+                                    label.clone()
+                                };
+                                DownloadEvent::Done {
+                                    id: id.clone(),
+                                    label,
+                                }
+                            }
+                            Err(error) => {
+                                if std::fs::remove_file(&path).is_err() {
+                                    // A failed unlink leaves the bytes on disk, so
+                                    // retain their reservation rather than claiming
+                                    // the space was recovered.
+                                    lease.commit();
+                                }
+                                let (label, error) = if collapse {
+                                    tally.failure_text(label, error)
+                                } else {
+                                    (label.clone(), error)
+                                };
+                                DownloadEvent::Failed {
+                                    id: id.clone(),
+                                    label,
+                                    error,
+                                }
+                            }
                         }
                     }
                     Err(error) => {
@@ -345,6 +525,13 @@ fn download_tracks(
     });
 }
 
+fn release_after_removal(path: &std::path::Path, budget: &cache::CacheBudget) {
+    let bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    if std::fs::remove_file(path).is_ok() {
+        budget.release(bytes);
+    }
+}
+
 /// Entry point every caller actually uses: hands the whole batch off
 /// to its own thread so even kicking off a whole discography's worth
 /// of downloads returns to the render loop immediately rather than
@@ -355,6 +542,7 @@ pub fn spawn_tracks(
     tracks: Vec<(String, String, String)>,
     cache: Arc<Mutex<CacheIndex>>,
     tx: mpsc::Sender<DownloadEvent>,
+    max_bytes: u64,
 ) {
     if tracks.is_empty() {
         return;
@@ -362,10 +550,10 @@ pub fn spawn_tracks(
     thread::spawn(move || {
         let sink = Sink {
             cache: &cache,
+            budget: cache::budget_for_download(max_bytes),
             dest_for: &cache::track_path,
-            persist: &|idx: &CacheIndex| {
-                let _ = idx.save();
-            },
+            persist: &|idx: &CacheIndex| idx.save(),
+            max_bytes,
         };
         download_tracks(&tracks, &sink, &tx, &batch_agent());
     });
@@ -644,13 +832,48 @@ mod tests {
         let dest = dir.dest_for();
         let sink = Sink {
             cache: &cache,
+            budget: cache::budget_for_download(u64::MAX),
             dest_for: &dest,
             // never the real index file
-            persist: &|_: &CacheIndex| {},
+            persist: &|_: &CacheIndex| Ok(()),
+            max_bytes: u64::MAX,
         };
         download_tracks(tracks, &sink, &tx, agent);
         drop(tx);
         rx.into_iter().collect()
+    }
+
+    #[test]
+    fn an_active_transfer_reserves_disk_bytes_and_cleans_up_when_full() {
+        let server = ByteServer::start(Mode::Body(8192));
+        let dir = TempDir::new("budget-full");
+        let cache = Arc::new(Mutex::new(CacheIndex::default()));
+        let dest = dir.dest_for();
+        let budget = Arc::new(cache::CacheBudget::new(1, 0));
+        let sink = Sink {
+            cache: &cache,
+            budget: budget.clone(),
+            dest_for: &dest,
+            persist: &|_: &CacheIndex| Ok(()),
+            max_bytes: 1,
+        };
+        let (tx, rx) = mpsc::channel();
+        download_tracks(&batch(&server, 1), &sink, &tx, &batch_agent());
+        drop(tx);
+        let events = rx.into_iter().collect::<Vec<_>>();
+
+        assert!(
+            events.iter().any(|event| matches!(event,
+                DownloadEvent::Failed { error, .. } if error.contains("budget is full")
+            )),
+            "unexpected events: {events:?}"
+        );
+        assert!(
+            dir.entries().is_empty(),
+            "no partial or unindexed file remains"
+        );
+        assert_eq!(budget.used_bytes(), 0, "failed reservations are released");
+        assert!(cache.lock().unwrap().entries().next().is_none());
     }
 
     /// What a refusal has to look like from the outside.
@@ -687,11 +910,14 @@ mod tests {
         let dest = dir.dest_for();
         let sink = Sink {
             cache: &cache,
+            budget: cache::budget_for_download(u64::MAX),
             dest_for: &dest,
             // counted rather than written: never the real index file
             persist: &move |_: &CacheIndex| {
                 counted.fetch_add(1, Ordering::Relaxed);
+                Ok(())
             },
+            max_bytes: u64::MAX,
         };
         let (tx, rx) = mpsc::channel();
         download_tracks(&tracks, &sink, &tx, &batch_agent());
@@ -766,7 +992,7 @@ mod tests {
         // thus doesn't later send anything) when there's nothing to do.
         let (tx, rx) = mpsc::channel();
         let cache = Arc::new(Mutex::new(CacheIndex::default()));
-        spawn_tracks(Vec::new(), cache, tx);
+        spawn_tracks(Vec::new(), cache, tx, u64::MAX);
         assert!(rx.try_recv().is_err());
     }
 
@@ -789,6 +1015,88 @@ mod tests {
             server.peak()
         );
         assert_eq!(dir.entries().len(), 40, "{:?}", dir.entries());
+    }
+
+    #[test]
+    fn every_download_is_stored_as_a_lossless_zstd_frame() {
+        let server = ByteServer::start(Mode::Body(8192));
+        let dir = TempDir::new("zstd-at-rest");
+        let events = run(&batch(&server, 1), &dir);
+        assert_eq!(outcomes(&events).0.len(), 1);
+        let stored = dir.0.join("t0.mp3.zst");
+        assert!(stored.is_file(), "downloads use compressed durable paths");
+        let decoded = zstd::stream::decode_all(File::open(stored).unwrap()).unwrap();
+        assert_eq!(
+            decoded.len(),
+            8192,
+            "the original stream bytes are preserved"
+        );
+    }
+
+    #[test]
+    fn failed_replacement_keeps_the_existing_copy_and_index_entry() {
+        let server = ByteServer::start(Mode::Body(4096));
+        let dir = TempDir::new("replacement-failure");
+        let old = dir.0.join("t0.mp3.zst");
+        std::fs::write(&old, b"old verified cached copy").unwrap();
+        let mut initial = CacheIndex::default();
+        initial.mark_cached("t0", old.clone());
+        let cache = Arc::new(Mutex::new(initial));
+        let dest = dir.dest_for();
+        let sink = Sink {
+            cache: &cache,
+            budget: cache::budget_for_download(u64::MAX),
+            dest_for: &dest,
+            persist: &|_: &CacheIndex| anyhow::bail!("injected persistence failure"),
+            max_bytes: u64::MAX,
+        };
+        let (tx, rx) = mpsc::channel();
+        download_tracks(&batch(&server, 1), &sink, &tx, &batch_agent());
+        drop(tx);
+        let events = rx.into_iter().collect::<Vec<_>>();
+        assert_eq!(outcomes(&events).1.len(), 1);
+        assert_eq!(std::fs::read(&old).unwrap(), b"old verified cached copy");
+        assert_eq!(cache.lock().unwrap().cached_path("t0"), Some(old));
+        assert_eq!(dir.entries(), ["t0.mp3.zst"]);
+    }
+
+    #[test]
+    fn successful_replacement_commits_new_path_before_retiring_old_copy() {
+        let server = ByteServer::start(Mode::Body(4096));
+        let dir = TempDir::new("replacement-success");
+        let old = dir.0.join("t0.mp3.zst");
+        std::fs::write(&old, b"old verified cached copy").unwrap();
+        let mut initial = CacheIndex::default();
+        initial.mark_cached("t0", old.clone());
+        let cache = Arc::new(Mutex::new(initial));
+        let dest = dir.dest_for();
+        let persisted = Arc::new(Mutex::new(None::<String>));
+        let persisted_copy = persisted.clone();
+        let sink = Sink {
+            cache: &cache,
+            budget: cache::budget_for_download(u64::MAX),
+            dest_for: &dest,
+            persist: &move |index: &CacheIndex| {
+                *persisted_copy.lock().unwrap() = index
+                    .cached_path("t0")
+                    .map(|path| path.to_string_lossy().into_owned());
+                Ok(())
+            },
+            max_bytes: u64::MAX,
+        };
+        let (tx, rx) = mpsc::channel();
+        download_tracks(&batch(&server, 1), &sink, &tx, &batch_agent());
+        drop(tx);
+        let events = rx.into_iter().collect::<Vec<_>>();
+        assert_eq!(outcomes(&events).0.len(), 1);
+        let current = cache.lock().unwrap().cached_path("t0").unwrap();
+        assert_ne!(current, old);
+        assert_eq!(
+            persisted.lock().unwrap().as_deref(),
+            Some(current.to_str().unwrap())
+        );
+        assert!(current.is_file());
+        assert!(!old.exists());
     }
 
     /// `ureq::get` builds a throwaway agent per call, so every track
@@ -989,7 +1297,7 @@ mod tests {
         );
         assert_eq!(
             dir.entries(),
-            ["good.mp3"],
+            ["good.mp3.zst"],
             "an error document must not be cached as the track"
         );
         assert_eq!(refused.saves, 1, "and the index must not learn about it");
@@ -1008,7 +1316,7 @@ mod tests {
         assert_eq!(refused.failed, 1, "zero bytes is not a track");
         assert_eq!(
             dir.entries(),
-            ["good.mp3"],
+            ["good.mp3.zst"],
             "an empty body must not be cached as the track"
         );
         assert_eq!(refused.saves, 1, "and the index must not learn about it");
@@ -1041,8 +1349,10 @@ mod tests {
         let dest = dir.dest_for();
         let sink = Sink {
             cache: &cache,
+            budget: cache::budget_for_download(u64::MAX),
             dest_for: &dest,
-            persist: &|_: &CacheIndex| {},
+            persist: &|_: &CacheIndex| Ok(()),
+            max_bytes: u64::MAX,
         };
         let (tx, rx) = mpsc::channel();
         drop(rx);

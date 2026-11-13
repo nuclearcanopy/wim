@@ -18,8 +18,10 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -71,6 +73,18 @@ pub struct CacheEntry {
     pub cached_path: Option<String>,
     #[serde(default)]
     pub cached_at_secs: Option<u64>,
+    /// Plaintext, credential-free source identity used to offer cache rebuilds
+    /// after changing the lossy transcode profile. Never a stream URL.
+    #[serde(default)]
+    pub download_source: Option<DownloadSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadSource {
+    pub server_url: String,
+    pub username: String,
+    pub title: String,
+    pub artist: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -276,6 +290,8 @@ struct PlayRow<'a> {
     cached_path: Option<Cow<'a, str>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cached_at_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    download_source: Option<DownloadSource>,
 }
 
 fn index_body(index: &CacheIndex) -> String {
@@ -288,6 +304,7 @@ fn index_body(index: &CacheIndex) -> String {
             last_played_secs: entry.last_played_secs,
             cached_path: entry.cached_path.as_deref().map(Cow::Borrowed),
             cached_at_secs: entry.cached_at_secs,
+            download_source: entry.download_source.clone(),
         };
         if let Ok(line) = serde_json::to_string(&row) {
             body.push_str(&line);
@@ -309,6 +326,7 @@ fn play_entry(line: &str) -> Option<(String, CacheEntry)> {
             last_played_secs: row.last_played_secs,
             cached_path: row.cached_path.map(Cow::into_owned),
             cached_at_secs: row.cached_at_secs,
+            download_source: row.download_source,
         },
     ))
 }
@@ -335,9 +353,278 @@ pub fn track_path(id: &str, ext: &str) -> Result<PathBuf> {
     Ok(tracks_dir()?.join(format!("{id}.{ext}")))
 }
 
+/// The transient, uncompressed file handed to mpv for a compressed cache
+/// entry. mpv needs a seekable ordinary media file; the durable copy remains
+/// zstd-compressed in `tracks/`. These files live in the system temp area,
+/// are scoped to this process, and are removed when the player exits.
+pub fn playback_path(compressed: &Path) -> Result<PathBuf> {
+    playback_path_with_budget(compressed, active_budget())
+}
+
+fn playback_path_with_budget(
+    compressed: &Path,
+    budget: Option<Arc<CacheBudget>>,
+) -> Result<PathBuf> {
+    if compressed.extension().is_none_or(|ext| ext != "zst") {
+        return Ok(compressed.to_path_buf());
+    }
+    static NEXT_PART: AtomicU64 = AtomicU64::new(0);
+    let file_name = compressed
+        .file_name()
+        .context("compressed cache path has no filename")?
+        .to_string_lossy();
+    let media_name = file_name
+        .strip_suffix(".zst")
+        .context("compressed cache path has an invalid suffix")?;
+    let id = format!("wim-playback-{}", std::process::id());
+    let dir = std::env::temp_dir().join(id);
+    fs::create_dir_all(&dir).context("cannot create temporary playback cache")?;
+    let dest = dir.join(media_name);
+    if dest.is_file() {
+        return Ok(dest);
+    }
+    let part = dir.join(format!(
+        ".{}.{}.part",
+        NEXT_PART.fetch_add(1, Ordering::Relaxed),
+        media_name
+    ));
+    let mut reserved = 0u64;
+    let result = (|| -> Result<bool> {
+        let input = fs::File::open(compressed).context("cannot open compressed cache file")?;
+        let mut decoder = zstd::stream::read::Decoder::new(input)
+            .context("cannot decode compressed cache file")?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
+            .context("cannot create temporary playback file")?;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = decoder
+                .read(&mut buf)
+                .context("cannot decompress cached audio for playback")?;
+            if n == 0 {
+                break;
+            }
+            if budget
+                .as_ref()
+                .is_some_and(|budget| !budget.reserve(n as u64))
+            {
+                anyhow::bail!("playback expansion exceeds the configured cache budget");
+            }
+            reserved = reserved.saturating_add(n as u64);
+            output
+                .write_all(&buf[..n])
+                .context("cannot write temporary playback file")?;
+        }
+        output
+            .flush()
+            .context("cannot flush temporary playback file")?;
+        drop(output);
+        match fs::rename(&part, &dest) {
+            Ok(()) => Ok(true),
+            Err(_error) if dest.is_file() => Ok(false),
+            Err(error) => Err(error).context("cannot finalize temporary playback file"),
+        }
+    })();
+    let retain_reservation = matches!(&result, Ok(true))
+        || fs::remove_file(&part).is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound);
+    if !retain_reservation {
+        if let Some(budget) = &budget {
+            budget.release(reserved);
+        }
+    }
+    result?;
+    Ok(dest)
+}
+
+/// Removes this process' transient, uncompressed playback copies. Called by
+/// both Wim frontends during normal shutdown; a later startup also cleans up
+/// stale process directories left by a forced termination.
+pub fn cleanup_playback_files() {
+    let dir = std::env::temp_dir().join(format!("wim-playback-{}", std::process::id()));
+    let bytes = playback_tree_bytes(&dir);
+    if fs::remove_dir_all(dir).is_ok() {
+        if let Some(budget) = active_budget() {
+            budget.release(bytes);
+        }
+    }
+}
+
+fn playback_tree_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries.flatten().fold(0u64, |sum, entry| {
+        let Ok(kind) = entry.file_type() else {
+            return sum;
+        };
+        if kind.is_dir() {
+            sum.saturating_add(playback_tree_bytes(&entry.path()))
+        } else if kind.is_file() && entry.path().extension().is_none_or(|ext| ext != "part") {
+            sum.saturating_add(entry.metadata().map(|meta| meta.len()).unwrap_or(0))
+        } else {
+            sum
+        }
+    })
+}
+
+/// RAII lifetime for transient files handed to mpv. Construct once at each
+/// frontend's entry point so early errors and normal exits both clean up.
+pub struct PlaybackFiles;
+
+impl PlaybackFiles {
+    pub fn new() -> Self {
+        cleanup_stale_playback_files();
+        cleanup_playback_files();
+        Self
+    }
+}
+
+impl Default for PlaybackFiles {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PlaybackFiles {
+    fn drop(&mut self) {
+        cleanup_playback_files();
+    }
+}
+
+fn cleanup_stale_playback_files() {
+    let root = std::env::temp_dir();
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_string_lossy()
+            .strip_prefix("wim-playback-")
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        #[cfg(unix)]
+        let alive = {
+            // A PID that answers with EPERM still exists; only ESRCH is stale.
+            let status = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            status == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        };
+        #[cfg(not(unix))]
+        let alive = pid == std::process::id();
+        if !alive {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Bumped whenever the row shapes below change; a catalog written by
 /// an older wim is dropped whole rather than half-parsed.
 const CATALOG_FORMAT: u32 = 1;
+static NEXT_INDEX_TEMP: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide accounting for bytes in Wim-owned cache and playback files.
+/// The budget is initialized once from disk at startup; writers reserve each
+/// output chunk before it reaches disk, so overlapping batches share the same
+/// headroom instead of each assuming the cache is empty.
+pub struct CacheBudget {
+    max_bytes: AtomicU64,
+    used_bytes: AtomicU64,
+}
+
+impl CacheBudget {
+    pub(crate) fn new(max_bytes: u64, used_bytes: u64) -> Self {
+        Self {
+            max_bytes: AtomicU64::new(max_bytes),
+            used_bytes: AtomicU64::new(used_bytes),
+        }
+    }
+
+    pub(crate) fn reserve(&self, bytes: u64) -> bool {
+        self.used_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|next| *next <= self.max_bytes.load(Ordering::Acquire))
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn release(&self, bytes: u64) {
+        let _ = self
+            .used_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+
+    pub(crate) fn set_limit(&self, max_bytes: u64) {
+        self.max_bytes.store(max_bytes, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn used_bytes(&self) -> u64 {
+        self.used_bytes.load(Ordering::Acquire)
+    }
+}
+
+static ACTIVE_BUDGET: OnceLock<Arc<CacheBudget>> = OnceLock::new();
+
+/// Install the configured budget after stale playback directories have been
+/// cleaned. Existing managed files count against the same limit as new writes.
+pub fn initialize_budget(max_bytes: u64) {
+    let budget =
+        ACTIVE_BUDGET.get_or_init(|| Arc::new(CacheBudget::new(max_bytes, managed_disk_bytes())));
+    budget.set_limit(max_bytes);
+}
+
+fn active_budget() -> Option<Arc<CacheBudget>> {
+    ACTIVE_BUDGET.get().cloned()
+}
+
+pub(crate) fn budget_for_download(max_bytes: u64) -> Arc<CacheBudget> {
+    if let Some(budget) = ACTIVE_BUDGET.get() {
+        budget.set_limit(max_bytes);
+        return budget.clone();
+    }
+    Arc::new(CacheBudget::new(max_bytes, managed_disk_bytes()))
+}
+
+fn managed_disk_bytes() -> u64 {
+    fn tree_bytes(path: &Path) -> u64 {
+        let Ok(entries) = fs::read_dir(path) else {
+            return 0;
+        };
+        entries.flatten().fold(0u64, |sum, entry| {
+            let Ok(meta) = entry.file_type() else {
+                return sum;
+            };
+            if meta.is_dir() {
+                sum.saturating_add(tree_bytes(&entry.path()))
+            } else if meta.is_file() {
+                sum.saturating_add(entry.metadata().map(|metadata| metadata.len()).unwrap_or(0))
+            } else {
+                sum
+            }
+        })
+    }
+
+    let mut used = tracks_dir().map(|dir| tree_bytes(&dir)).unwrap_or(0);
+    if let Ok(entries) = fs::read_dir(std::env::temp_dir()) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("wim-playback-")
+            {
+                used = used.saturating_add(tree_bytes(&entry.path()));
+            }
+        }
+    }
+    used
+}
 
 /// One server's eagerly indexed catalog, exactly what `getArtists`,
 /// `getAlbumList2` and `getPlaylists` last answered. Songs are
@@ -708,12 +995,43 @@ fn load_in(dir: &Path) -> CacheIndex {
 
 fn save_in(dir: &Path, index: &CacheIndex) -> Result<()> {
     fs::create_dir_all(dir)?;
+    restrict_dir_to_owner(dir)?;
     let path = dir.join(INDEX_FILE);
-    fs::write(&path, index_body(index)).with_context(|| format!("writing {}", path.display()))?;
+    let temp = dir.join(format!(
+        ".{INDEX_FILE}.{}.{}.tmp",
+        std::process::id(),
+        NEXT_INDEX_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> Result<()> {
+        write_new_owner_only(&temp, &index_body(index))
+            .with_context(|| format!("writing {}", temp.display()))?;
+        fs::rename(&temp, &path).with_context(|| format!("replacing {}", path.display()))?;
+        #[cfg(unix)]
+        fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result?;
     // the toml index held a second copy of the same history and is
     // dead the moment the line above lands; a failure to unlink it is
     // nothing but a stale file in a cache dir, so it is not reported.
     let _ = fs::remove_file(dir.join(LEGACY_INDEX_FILE));
+    Ok(())
+}
+
+fn write_new_owner_only(path: &Path, contents: &str) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -815,10 +1133,153 @@ impl CacheIndex {
         path.is_file().then_some(path)
     }
 
+    /// Return the durable cache path, migrating an older uncompressed cached
+    /// file to zstd atomically. If compression fails (for example because the
+    /// disk is full), the intact original remains usable and is returned.
+    pub fn compressed_cached_path(&mut self, id: &str) -> Result<Option<PathBuf>> {
+        let Some(source) = self.cached_path(id) else {
+            return Ok(None);
+        };
+        if source.extension().is_some_and(|ext| ext == "zst") {
+            return Ok(Some(source));
+        }
+        let mut dest_name = source
+            .file_name()
+            .context("cached track path has no filename")?
+            .to_os_string();
+        dest_name.push(".zst");
+        let dest = source.with_file_name(dest_name);
+        let part = dest.with_extension("zst.part");
+        let result = (|| -> Result<()> {
+            let input = fs::File::open(&source).context("cannot open cached track")?;
+            let output = fs::File::create(&part).context("cannot create compressed cache file")?;
+            let mut encoder = zstd::Encoder::new(output, 3).context("cannot start zstd encoder")?;
+            std::io::copy(&mut std::io::BufReader::new(input), &mut encoder)
+                .context("cannot compress cached track")?;
+            encoder
+                .finish()
+                .context("cannot finish compressed cache file")?;
+            fs::rename(&part, &dest).context("cannot finalize compressed cache file")?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_file(&part);
+            return Err(error);
+        }
+        // The caller durably saves the updated index before retiring the
+        // original. Keeping both files here makes migration recoverable if
+        // the subsequent index write fails.
+        self.mark_cached(id, dest.clone());
+        Ok(Some(dest))
+    }
+
     pub fn mark_cached(&mut self, id: &str, path: PathBuf) {
         let entry = self.entries.entry(id.to_string()).or_default();
         entry.cached_path = Some(path.to_string_lossy().into_owned());
         entry.cached_at_secs = Some(now_secs());
+    }
+
+    /// Like `plan_budget_evictions`, but reserve budget for transient bytes
+    /// that are managed by Wim but are not indexed cache entries (expanded
+    /// playback copies and active transfer `.part` files). These bytes are
+    /// counted, never selected for deletion.
+    pub(crate) fn plan_budget_evictions_with_extra(
+        &mut self,
+        max_bytes: u64,
+        protected: &str,
+        extra_bytes: u64,
+    ) -> Vec<PathBuf> {
+        let mut total = 0u64;
+        let mut candidates = Vec::new();
+        for (id, entry) in &self.entries {
+            if let Some(path) = entry.cached_path.as_deref() {
+                if let Ok(meta) = fs::metadata(path) {
+                    total = total.saturating_add(meta.len());
+                    if id != protected {
+                        candidates.push((
+                            entry.cached_at_secs.unwrap_or(0),
+                            id.clone(),
+                            PathBuf::from(path),
+                            meta.len(),
+                        ));
+                    }
+                }
+            }
+        }
+        total = total.saturating_add(extra_bytes);
+        candidates.sort_by_key(|(at, _, _, _)| *at);
+        let mut removed = Vec::new();
+        for (_, id, path, size) in candidates {
+            if total <= max_bytes {
+                break;
+            }
+            total = total.saturating_sub(size);
+            if let Some(entry) = self.entries.get_mut(&id) {
+                entry.cached_path = None;
+                entry.cached_at_secs = None;
+            }
+            removed.push(path);
+        }
+        removed
+    }
+
+    /// Current transient Wim-owned bytes: this process' expanded playback
+    /// files and cache transfer `.part` files. Other processes' playback
+    /// directories are intentionally not traversed or removed.
+    pub(crate) fn transient_managed_bytes(&self) -> u64 {
+        fn sum_files(dir: &Path, partial_only: bool) -> u64 {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return 0;
+            };
+            entries.flatten().fold(0u64, |total, entry| {
+                let path = entry.path();
+                let Ok(meta) = entry.metadata() else {
+                    return total;
+                };
+                if meta.is_dir() {
+                    total.saturating_add(sum_files(&path, partial_only))
+                } else if meta.is_file()
+                    && (!partial_only || path.extension().is_some_and(|ext| ext == "part"))
+                {
+                    total.saturating_add(meta.len())
+                } else {
+                    total
+                }
+            })
+        }
+        let playback = std::env::temp_dir().join(format!("wim-playback-{}", std::process::id()));
+        let cache_parts = tracks_dir().map(|dir| sum_files(&dir, true)).unwrap_or(0);
+        sum_files(&playback, false).saturating_add(cache_parts)
+    }
+
+    /// Path currently indexed for `id`, whether or not it still exists.
+    /// Used by download handoff to retire an old copy only after the new
+    /// index has been persisted successfully.
+    pub(crate) fn recorded_cached_path(&self, id: &str) -> Option<PathBuf> {
+        self.entries
+            .get(id)
+            .and_then(|entry| entry.cached_path.as_deref())
+            .map(PathBuf::from)
+    }
+
+    /// Remember how a remote song can be fetched again, without retaining
+    /// credentials, signed URLs, or transient stream links.
+    pub fn remember_download(&mut self, id: &str, source: DownloadSource) {
+        self.entries
+            .entry(id.to_string())
+            .or_default()
+            .download_source = Some(source);
+    }
+
+    /// The plaintext redownload manifest: stable IDs, server identity, and
+    /// human-readable labels. Entries survive stale-cache eviction.
+    pub fn download_manifest(&self) -> impl Iterator<Item = (&str, &DownloadSource)> {
+        self.entries.iter().filter_map(|(id, entry)| {
+            entry
+                .download_source
+                .as_ref()
+                .map(|source| (id.as_str(), source))
+        })
     }
 
     /// Deletes every cached file whose track hasn't been played in
@@ -840,10 +1301,21 @@ impl CacheIndex {
                 .map(|t| now.saturating_sub(t) > max_age_secs)
                 .unwrap_or(true);
             if stale {
-                let _ = fs::remove_file(path);
-                entry.cached_path = None;
-                entry.cached_at_secs = None;
-                evicted += 1;
+                match fs::metadata(path) {
+                    Ok(meta) if fs::remove_file(path).is_ok() => {
+                        if let Some(budget) = active_budget() {
+                            budget.release(meta.len());
+                        }
+                        entry.cached_path = None;
+                        entry.cached_at_secs = None;
+                        evicted += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        entry.cached_path = None;
+                        entry.cached_at_secs = None;
+                    }
+                    _ => {}
+                }
             }
         }
         evicted
@@ -980,6 +1452,36 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn index_replacement_uses_private_temp_and_leaves_no_partial_file() {
+        let dir = scratch_dir("playindex-atomic");
+        let mut index = CacheIndex::default();
+        index.record_play("song", "2026-01-01");
+        save_in(&dir, &index).unwrap();
+        index.record_play("song", "2026-01-02");
+        save_in(&dir, &index).unwrap();
+
+        assert_eq!(load_in(&dir).days_played("song"), 2);
+        let files = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(files, [std::ffi::OsString::from(INDEX_FILE)]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(dir.join(INDEX_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// The whole point of the migration: someone who has been using
     /// wim already has their play history in `index.toml`, and the
     /// auto-download threshold is counted off it. Losing it would
@@ -1100,6 +1602,106 @@ mod tests {
     }
 
     #[test]
+    fn legacy_cached_tracks_migrate_atomically_and_remain_playable() {
+        let dir = scratch_dir("cache-migrate");
+        let source = dir.join("legacy.mp3");
+        let bytes = b"lossless cache migration fixture".repeat(4096);
+        fs::write(&source, &bytes).unwrap();
+        let mut index = CacheIndex::default();
+        index.mark_cached("migrate", source.clone());
+
+        let compressed = index.compressed_cached_path("migrate").unwrap().unwrap();
+        assert_eq!(
+            compressed.extension().and_then(|ext| ext.to_str()),
+            Some("zst")
+        );
+        assert!(source.exists(), "migration leaves deletion to its caller");
+        assert_eq!(index.cached_path("migrate"), Some(compressed.clone()));
+
+        save_in(&dir, &index).unwrap();
+        let restored = load_in(&dir);
+        assert_eq!(restored.cached_path("migrate"), Some(compressed.clone()));
+        fs::remove_file(&source).unwrap();
+
+        let expanded = playback_path(&compressed).unwrap();
+        assert_eq!(fs::read(&expanded).unwrap(), bytes);
+        assert_eq!(playback_path(&compressed).unwrap(), expanded);
+        fs::remove_file(compressed).unwrap();
+        cleanup_playback_files();
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn playback_expansion_reserves_budget_and_releases_it_on_refusal() {
+        let dir = scratch_dir("playback-budget");
+        let tag = dir.file_name().unwrap().to_string_lossy().into_owned();
+        let compressed = dir.join(format!("{tag}.mp3.zst"));
+        let bytes = b"audio payload".repeat(4096);
+        let file = fs::File::create(&compressed).unwrap();
+        let mut encoder = zstd::Encoder::new(file, 3).unwrap();
+        encoder.write_all(&bytes).unwrap();
+        encoder.finish().unwrap();
+        let budget = Arc::new(CacheBudget::new(8, 0));
+
+        let result = playback_path_with_budget(&compressed, Some(budget.clone()));
+
+        assert!(result.is_err());
+        assert_eq!(
+            budget.used_bytes(),
+            0,
+            "partial expansion reservation released"
+        );
+        let playback_dir =
+            std::env::temp_dir().join(format!("wim-playback-{}", std::process::id()));
+        if let Ok(entries) = fs::read_dir(playback_dir) {
+            assert!(entries
+                .flatten()
+                .all(|entry| { !entry.file_name().to_string_lossy().contains(&tag) }));
+        }
+        fs::remove_file(compressed).unwrap();
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn plaintext_redownload_manifest_round_trips_with_safe_server_identity() {
+        let mut index = CacheIndex::default();
+        index.remember_download(
+            "song-17",
+            DownloadSource {
+                server_url: subsonic::safe_server_identity(
+                    "https://listener:pw@music.example/base/?token=secret&key=credential#private",
+                ),
+                username: "listener".into(),
+                title: "A song".into(),
+                artist: "An artist".into(),
+            },
+        );
+        let body = index_body(&index);
+        assert!(body.contains("A song"));
+        assert!(body.contains("https://music.example/base"));
+        assert!(!body.contains("listener:pw"));
+        assert!(!body.contains("token"));
+        assert!(!body.contains("secret"));
+        assert!(!body.contains("private"));
+        assert!(!body.contains("password"));
+        assert!(!body.contains("token"));
+        assert!(!body.contains("salt"));
+
+        let restored = parse_index_body(&body);
+        let (id, source) = restored.download_manifest().next().unwrap();
+        assert_eq!(id, "song-17");
+        assert_eq!(source.username, "listener");
+        assert_eq!(source.title, "A song");
+        assert_eq!(source.server_url, "https://music.example/base");
+    }
+
+    #[test]
+    fn uncompressed_paths_remain_directly_playable() {
+        let path = PathBuf::from("/music/already-local.mp3");
+        assert_eq!(playback_path(&path).unwrap(), path);
+    }
+
+    #[test]
     fn sweep_stale_evicts_old_plays_but_keeps_play_count() {
         let mut idx = CacheIndex::default();
         let nanos = SystemTime::now()
@@ -1124,6 +1726,71 @@ mod tests {
             2,
             "play history must survive eviction, only the file goes"
         );
+    }
+
+    #[test]
+    fn manifest_survives_disk_roundtrip_and_cache_eviction() {
+        let dir = scratch_dir("manifest-eviction");
+        let path = dir.join("song.zst");
+        fs::write(&path, b"cached").unwrap();
+        let mut idx = CacheIndex::default();
+        idx.mark_cached("song", path.clone());
+        idx.remember_download(
+            "song",
+            DownloadSource {
+                server_url: "https://music.example/base".into(),
+                username: "listener".into(),
+                title: "A song".into(),
+                artist: "An artist".into(),
+            },
+        );
+        idx.entries.get_mut("song").unwrap().last_played_secs = Some(0);
+        save_in(&dir, &idx).unwrap();
+        let mut loaded = load_in(&dir);
+        assert_eq!(loaded.sweep_stale(1), 1);
+        save_in(&dir, &loaded).unwrap();
+        let loaded = load_in(&dir);
+        assert!(loaded.cached_path("song").is_none());
+        assert_eq!(loaded.download_manifest().next().unwrap().0, "song");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn budget_plan_evicts_oldest_compressed_cache_and_preserves_protected_file() {
+        let dir = scratch_dir("budget");
+        let old = dir.join("old.opus.zst");
+        let new = dir.join("new.opus.zst");
+        fs::write(&old, [1u8; 12]).unwrap();
+        fs::write(&new, [2u8; 8]).unwrap();
+        let mut idx = CacheIndex::default();
+        idx.mark_cached("old", old.clone());
+        idx.mark_cached("new", new.clone());
+        idx.entries.get_mut("old").unwrap().cached_at_secs = Some(1);
+        idx.entries.get_mut("new").unwrap().cached_at_secs = Some(2);
+        let evicted = idx.plan_budget_evictions_with_extra(8, "new", 0);
+        assert_eq!(evicted.as_slice(), std::slice::from_ref(&old));
+        assert!(idx.cached_path("old").is_none());
+        assert_eq!(idx.cached_path("new"), Some(new));
+        assert!(old.is_file(), "planning never unlinks before persistence");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn budget_plan_reserves_transient_bytes_without_deleting_them() {
+        let dir = scratch_dir("budget-transient");
+        let old = dir.join("old.zst");
+        let current = dir.join("current.zst");
+        fs::write(&old, b"1234").unwrap();
+        fs::write(&current, b"5678").unwrap();
+        let mut idx = CacheIndex::default();
+        idx.mark_cached("old", old.clone());
+        idx.entries.get_mut("old").unwrap().cached_at_secs = Some(1);
+        idx.mark_cached("current", current.clone());
+        let evicted = idx.plan_budget_evictions_with_extra(5, "current", 2);
+        assert_eq!(evicted, vec![old.clone()]);
+        assert!(old.exists(), "planner must not unlink files itself");
+        assert!(current.exists());
+        fs::remove_dir_all(dir).ok();
     }
 
     /// Its own temp dir per test, so nothing here ever reads or
@@ -1557,7 +2224,7 @@ mod tests {
 
     /// Alternating batches in one process, best of each, in
     /// microseconds. Same helper and the same reason as
-    /// `framesource::frame_budget::best_each`: sequential runs on this
+    /// the alternating-batch benchmark harness: sequential runs on this
     /// box differ 1.6-1.8x under load, so two numbers from two runs
     /// are not comparable and this is the only shape that is.
     fn best_each(
@@ -1783,6 +2450,7 @@ mod tests {
                     last_played_secs: row.last_played_secs,
                     cached_path: row.cached_path.map(Cow::into_owned),
                     cached_at_secs: row.cached_at_secs,
+                    download_source: row.download_source,
                 },
             );
         }
@@ -1990,6 +2658,7 @@ mod tests {
                     cached_path: (t % 10 == 0)
                         .then(|| format!("/home/u/.cache/wim/tracks/track-id-{t:08}.mp3")),
                     cached_at_secs: (t % 10 == 0).then_some(1_700_000_000),
+                    download_source: None,
                 },
             );
         }
