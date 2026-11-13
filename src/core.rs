@@ -395,29 +395,8 @@ pub fn silence_url(secs: u64) -> String {
 /// never a candidate for caching to begin with.
 pub fn resolve_playable(item: &SearchItem, cache: &Arc<Mutex<CacheIndex>>) -> Option<String> {
     if let SearchItem::Song { id, client, .. } = item {
-        if let Some(path) = cache.lock().ok().and_then(|mut idx| {
-            let before = idx.clone();
-            let previous = idx.cached_path(id);
-            let path = idx
-                .compressed_cached_path(id)
-                .unwrap_or_else(|_| previous.clone());
-            let path = path?;
-            if previous.as_ref().is_some_and(|old| old != &path) {
-                if idx.save().is_ok() {
-                    if let Some(old) = previous {
-                        let _ = std::fs::remove_file(old);
-                    }
-                } else {
-                    *idx = before;
-                    let _ = std::fs::remove_file(&path);
-                    return previous;
-                }
-            }
-            Some(path)
-        }) {
-            if let Ok(playable) = cache::playback_path(&path) {
-                return Some(playable.to_string_lossy().into_owned());
-            }
+        if let Some(path) = cache.lock().ok().and_then(|idx| idx.cached_path(id)) {
+            return Some(path.to_string_lossy().into_owned());
         }
         return Some(client.stream_url(id));
     }
@@ -1747,9 +1726,6 @@ pub struct DownloadCtx<'a> {
     /// and the already-downloaded files under `tracks/` stopped being
     /// referenced. `cache_dir` refuses a non-temp path under
     /// `cfg(test)` now, but that is a tripwire; this removes the
-    pub offline_download_bitrate_kbps: u32,
-    pub offline_download_format: &'a str,
-    pub offline_cache_max_bytes: u64,
     /// reach, so a caller cannot write anywhere it did not name.
     pub persist: fn(&CacheIndex) -> anyhow::Result<()>,
 }
@@ -1984,30 +1960,12 @@ pub fn note_playback_started(
     let track_label = format!("{title} · {artist}");
     notifications.push_progress(id.clone(), track_label.clone());
     download::spawn_tracks(
-        vec![(
-            id.clone(),
-            track_label,
-            client.stream_url_with_quality(
-                id,
-                (dctx.offline_download_format != "flac")
-                    .then_some(dctx.offline_download_bitrate_kbps),
-                Some(dctx.offline_download_format),
-            ),
-        )],
+        vec![(id.clone(), track_label, client.stream_url(id))],
         dctx.cache.clone(),
         dctx.download_tx.clone(),
     );
 }
 /// Backs the manual download keybind (`KeyAction::DownloadSelected`)
-    if dctx.offline_download_format != "flac" && dctx.offline_download_bitrate_kbps <= 96 {
-        notifications.push(
-            Severity::Alert,
-            format!(
-                "low offline audio quality: downloads will use {} kbps",
-                dctx.offline_download_bitrate_kbps
-            ),
-        );
-    }
 /// once its tracks are in hand: downloads every remote song in
 /// `tracks` concurrently (one thread each, see
 /// `download::spawn_tracks`), skipping anything already cached,
@@ -2030,7 +1988,6 @@ pub fn download_tracks(
     let mut in_flight = 0;
     for t in tracks {
         let SearchItem::Song {
-        dctx.offline_cache_max_bytes,
             id,
             title,
             artist,
@@ -2056,35 +2013,11 @@ pub fn download_tracks(
         dctx.downloading.insert(id.clone());
         let track_label = format!("{title} · {artist}");
         notifications.push_progress(id.clone(), track_label.clone());
-        batch.push((
-            id.clone(),
-            track_label,
-            client.stream_url_with_quality(
-                id,
-                (dctx.offline_download_format != "flac")
-                    .then_some(dctx.offline_download_bitrate_kbps),
-                Some(dctx.offline_download_format),
-            ),
-        ));
-    }
-    if manifest_changed {
-        if let Ok(index) = dctx.cache.lock() {
-            if let Err(error) = (dctx.persist)(&index) {
-                notifications.push(
-                    Severity::Error,
-                    format!("couldn't save the download manifest: {error}"),
-                );
-            }
-        }
+        batch.push((id.clone(), track_label, client.stream_url(id)));
     }
     let started = batch.len();
     if started > 0 {
-        download::spawn_tracks(
-            batch,
-            dctx.cache.clone(),
-            dctx.download_tx.clone(),
-            dctx.offline_cache_max_bytes,
-        );
+        download::spawn_tracks(batch, dctx.cache.clone(), dctx.download_tx.clone());
     }
     let status = if started > 0 {
         format!("downloading {started} track(s)")
@@ -2161,94 +2094,10 @@ pub fn suggestion_starred_keys(
 pub fn eq_preset_names(saved: &eq::CustomPresets) -> Vec<String> {
     saved.iter().map(|p| p.name.clone()).collect()
 }
-        offline_download_bitrate_kbps: core.cfg.effective_offline_download_bitrate_kbps(),
-        offline_download_format: &core.cfg.offline_download_format,
-        offline_cache_max_bytes: core.cfg.offline_cache_max_bytes,
 pub fn apply_eq_row(
     app: &mut app::App,
     player: &mpv::Mpv,
     notifications: &mut Notifications,
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CacheRebuild {
-    pub started: usize,
-    pub unavailable_servers: usize,
-    pub already_running: usize,
-}
-
-/// Re-fetch every manifest entry through the server's *current* configured
-/// transcode profile. The low-level downloader keeps the old verified file in
-/// place until its replacement has fully arrived and passed validation.
-pub fn rebuild_cached_downloads(
-    cache: &Arc<Mutex<CacheIndex>>,
-    cfg: &config::Config,
-    downloading: &mut HashSet<String>,
-    download_tx: &mpsc::Sender<DownloadEvent>,
-    notifications: &mut Notifications,
-) -> Result<CacheRebuild, String> {
-    let manifest = cache
-        .lock()
-        .map_err(|_| "download manifest is unavailable".to_string())?
-        .download_manifest()
-        .map(|(id, source)| (id.to_string(), source.clone()))
-        .collect::<Vec<_>>();
-    if manifest.is_empty() {
-        return Ok(CacheRebuild {
-            started: 0,
-            unavailable_servers: 0,
-            already_running: 0,
-        });
-    }
-    let clients = cfg
-        .navidrome_servers
-        .iter()
-        .filter_map(|server| crate::subsonic::Client::new(server).ok())
-        .collect::<Vec<_>>();
-    let mut batch = Vec::new();
-    let mut unavailable_servers = 0;
-    let mut already_running = 0;
-    for (id, source) in manifest {
-        if downloading.contains(&id) {
-            already_running += 1;
-            continue;
-        }
-        let Some(client) = clients.iter().find(|client| {
-            crate::subsonic::safe_server_identity(client.base_url()) == source.server_url
-                && client.username() == source.username
-        }) else {
-            unavailable_servers += 1;
-            continue;
-        };
-        let label = format!("{} · {}", source.title, source.artist);
-        downloading.insert(id.clone());
-        notifications.push_progress(id.clone(), label.clone());
-        batch.push((
-            id.clone(),
-            label,
-            client.stream_url_with_quality(
-                &id,
-                (cfg.offline_download_format != "flac")
-                    .then_some(cfg.effective_offline_download_bitrate_kbps()),
-                Some(&cfg.offline_download_format),
-            ),
-        ));
-    }
-    let started = batch.len();
-    if started > 0 {
-        crate::download::spawn_tracks(
-            batch,
-            cache.clone(),
-            download_tx.clone(),
-            cfg.offline_cache_max_bytes,
-        );
-    }
-    Ok(CacheRebuild {
-        started,
-        unavailable_servers,
-        already_running,
-    })
-}
-
     saved: &eq::CustomPresets,
     row: usize,
     enabled: bool,
@@ -3889,9 +3738,6 @@ pub enum Drained {
 /// Takes its four pieces rather than a `CoreCtx`, for two reasons:
 /// wim's call site sits above where its `core_ctx!` is defined, and
 /// the whole decision is testable this way without spawning mpv for
-        offline_download_bitrate_kbps: core.cfg.effective_offline_download_bitrate_kbps(),
-        offline_download_format: &core.cfg.offline_download_format,
-        offline_cache_max_bytes: core.cfg.offline_cache_max_bytes,
 /// the half of it that never touches the socket.
 pub fn drained(
     player: &mpv::Mpv,
@@ -7520,9 +7366,6 @@ mod auto_download_wiring_tests {
     /// so nothing is cached. Swapping the two arguments makes the
     /// threshold the thing compared against 1, and the first play
     /// downloads.
-                offline_download_bitrate_kbps: 192,
-                offline_download_format: "opus",
-                offline_cache_max_bytes: u64::MAX,
     #[test]
     fn four_plays_in_one_sitting_are_still_one_day() {
         let mut hooks = Hooks::new();
@@ -7582,9 +7425,6 @@ mod auto_download_wiring_tests {
         );
     }
 
-                offline_download_bitrate_kbps: bitrate_kbps,
-                offline_download_format: format,
-                offline_cache_max_bytes: u64::MAX,
     #[test]
     fn signed_watch_urls_are_never_path_resume_values() {
         let item = SearchItem::WatchSource {
@@ -7605,22 +7445,3 @@ mod auto_download_wiring_tests {
         assert_eq!(persistent_playable_path(&item), None);
     }
 }
-    #[test]
-    fn an_automatic_low_quality_download_warns_in_both_frontends() {
-        let mut hooks = Hooks::new();
-        let track = song("auto-low-quality");
-        {
-            let mut idx = hooks.cache.lock().unwrap();
-            idx.record_play("auto-low-quality", "2026-10-01");
-            idx.record_play("auto-low-quality", "2026-10-02");
-        }
-
-        hooks.play_with_profile(&track, 3, 96, "opus");
-
-        let messages = hooks.notifications.drain_text().join(" | ");
-        assert!(
-            messages.contains("low offline audio quality"),
-            "{messages:?}"
-        );
-        assert!(messages.contains("downloading"), "{messages:?}");
-    }
