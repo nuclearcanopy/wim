@@ -383,20 +383,6 @@ impl Host {
             download_tx,
             download_rx,
             downloading: HashSet::new(),
-        let mut notifications = Notifications::default();
-        if cfg.offline_download_format != "flac"
-            && cfg.effective_offline_download_bitrate_kbps() <= 96
-        {
-            notifications.push(
-                Severity::Alert,
-                format!(
-                    "low offline audio quality: downloads will use {} kbps",
-                    cfg.effective_offline_download_bitrate_kbps()
-                ),
-            );
-        }
-        let cache_index = Arc::new(Mutex::new(cache::CacheIndex::load()));
-        cache::initialize_budget(cfg.offline_cache_max_bytes);
             subtitle_tx,
             subtitle_rx,
             remote_search_tx,
@@ -541,17 +527,6 @@ impl Host {
         // the server refused a star, so the optimistic flip goes back.
         while let Ok(failed) = self.star_rx.try_recv() {
             if failed.wanted {
-                        if core.cfg.offline_download_format != "flac"
-                            && core.cfg.effective_offline_download_bitrate_kbps() <= 96
-                        {
-                            core.notifications.push(
-                                Severity::Alert,
-                                format!(
-                                    "low offline audio quality: downloads will use {} kbps",
-                                    core.cfg.effective_offline_download_bitrate_kbps()
-                                ),
-                            );
-                        }
                 self.remote_starred.remove(&failed.id);
             } else {
                 self.remote_starred.insert(failed.id.clone());
