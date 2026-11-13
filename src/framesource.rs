@@ -1249,7 +1249,12 @@ mod tests {
     /// without ranges mpv dies with "Cannot seek backward in linear
     /// streams" (measured; `python -m http.server` has no ranges and
     /// cannot stand in for a cdn).
-    fn range_server(bytes: Vec<u8>) -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    fn range_server(
+        bytes: Vec<u8>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
         use std::io::Write as _;
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
@@ -1333,7 +1338,11 @@ mod tests {
         let mut src = FrameSource::spawn(Path::new(&url), grid, 0.0, FPS)
             .expect("mpv must be on PATH and the server up");
         assert_eq!(wait_frame(&mut src), Pull::Frame, "no frame over http");
-        assert_eq!(src.frame_bytes(), &local[..], "http is not the local decode");
+        assert_eq!(
+            src.frame_bytes(),
+            &local[..],
+            "http is not the local decode"
+        );
         // the privacy pin: the url is on stdin, never in argv.
         let pid = src.child.as_ref().expect("spawned").id();
         let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))

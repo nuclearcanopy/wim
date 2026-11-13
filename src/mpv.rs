@@ -1022,7 +1022,10 @@ impl Mpv {
     /// Returns the selected subtitle's mpv id and source metadata.
     pub fn selected_subtitle_track(&self) -> Result<Option<SubtitleTrackInfo>> {
         let tracks = self.get_property("track-list")?;
-        let sid = self.get_property("sid").ok().and_then(|value| value.as_u64());
+        let sid = self
+            .get_property("sid")
+            .ok()
+            .and_then(|value| value.as_u64());
         Ok(tracks
             .as_array()
             .into_iter()
@@ -1030,7 +1033,8 @@ impl Mpv {
             .find(|track| {
                 track.get("type").and_then(Value::as_str) == Some("sub")
                     && (track.get("selected").and_then(Value::as_bool) == Some(true)
-                        || sid.is_some_and(|id| track.get("id").and_then(Value::as_u64) == Some(id)))
+                        || sid
+                            .is_some_and(|id| track.get("id").and_then(Value::as_u64) == Some(id)))
             })
             .map(|track| SubtitleTrackInfo {
                 id: track.get("id").and_then(Value::as_u64).unwrap_or_default(),
@@ -1191,7 +1195,8 @@ mod bench {
     #[ignore]
     fn playlist_append_batch_reaches_mpv_and_preserves_entry_count() {
         let mpv = Mpv::spawn().expect("mpv on PATH");
-        mpv.set_property("ao", json!("null")).expect("silent output");
+        mpv.set_property("ao", json!("null"))
+            .expect("silent output");
         let paths = [
             "av://lavfi:sine=frequency=440:duration=600".to_string(),
             "av://lavfi:sine=frequency=550:duration=600".to_string(),

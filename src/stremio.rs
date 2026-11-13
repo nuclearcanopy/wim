@@ -432,7 +432,7 @@ impl Manifest {
             } => {
                 name == resource
                     && (types.is_empty() || types.iter().any(|t| t == media_type))
-                    && id.map_or(true, |id| {
+                    && id.is_none_or(|id| {
                         id_prefixes.is_empty()
                             || id_prefixes.iter().any(|prefix| id.starts_with(prefix))
                     })

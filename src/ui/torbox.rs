@@ -1,10 +1,10 @@
-use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::Frame;
 
 use crate::torbox::AccountItem;
 use crate::torbox_workspace::{Page, Workspace};
@@ -462,8 +462,8 @@ fn format_size(bytes: u64) -> String {
 mod tests {
     use super::*;
     use crate::torbox::AccountFile;
-    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     fn item(id: u64, name: &str, files: Vec<AccountFile>) -> AccountItem {
         AccountItem {

@@ -71,14 +71,14 @@ impl Episode {
         }
     }
 
-    pub fn display_overview<'a>(&'a self, policy: SpoilerPolicy) -> Option<&'a str> {
+    pub fn display_overview(&self, policy: SpoilerPolicy) -> Option<&str> {
         policy
             .reveal_episode_details
             .then_some(self.overview.as_deref())
             .flatten()
     }
 
-    pub fn display_thumbnail<'a>(&'a self, policy: SpoilerPolicy) -> Option<&'a str> {
+    pub fn display_thumbnail(&self, policy: SpoilerPolicy) -> Option<&str> {
         policy
             .reveal_episode_details
             .then_some(self.thumbnail.as_deref())
