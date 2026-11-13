@@ -711,13 +711,19 @@ fn download_selected(
     }
 }
 
-/// The commit this binary was built from, stamped by build.rs.
-const BUILD: &str = env!("WIM_BUILD");
+fn low_quality_download_warning(format: &str, bitrate_kbps: u32) -> Option<String> {
+    (format != "flac" && bitrate_kbps <= 96)
+        .then(|| format!("low offline audio quality: downloads will use {bitrate_kbps} kbps"))
+}
+    warn_low_quality_download(
+        dctx.offline_download_format,
+        dctx.offline_download_bitrate_kbps,
+        notifications,
+    );
 
-fn alignment_item_key(item: Option<&SearchItem>) -> Option<String> {
-    match item {
-        Some(SearchItem::LocalVideo { path, .. }) => Some(path.to_string_lossy().into_owned()),
-        _ => None,
+fn warn_low_quality_download(format: &str, bitrate_kbps: u32, notifications: &mut Notifications) {
+    if let Some(warning) = low_quality_download_warning(format, bitrate_kbps) {
+        notifications.push(Severity::Alert, warning);
     }
 }
 
@@ -780,6 +786,7 @@ fn main() -> anyhow::Result<()> {
         warnings: mut config_warnings,
     } = config::load_reporting()?;
     wim::trace_mark!("config loaded");
+    let _playback_files = wim::cache::PlaybackFiles::new();
     // the local scan is the biggest single startup cost (a blocking tag
     // read per music file); it streams into the corpus from its own
     // thread while the ui is already up, drained next to `sync_rx` in
@@ -998,11 +1005,17 @@ fn main() -> anyhow::Result<()> {
     let mut logo_index = ui::banner::logo_index_for_name(cfg.logo_style.as_deref());
     // Per-band attack/release state for the maximized-player spectrum.
     let mut spectrum_smoother = SpectrumSmoother::default();
+    warn_low_quality_download(
+        &cfg.offline_download_format,
+        cfg.effective_offline_download_bitrate_kbps(),
+        &mut notifications,
+    );
     let mut notifications = Notifications::default();
     for warning in config_warnings.into_iter().chain(keybind_warnings) {
         notifications.push(Severity::Alert, warning);
     }
     // track play counts/last-played/on-disk cache state (cache.rs);
+    cache::initialize_budget(cfg.offline_cache_max_bytes);
     // shared with background download threads, so it's behind a
     // mutex rather than owned outright the way `app`/`player` are.
     let cache_index = Arc::new(Mutex::new(cache::CacheIndex::load()));
@@ -1224,6 +1237,9 @@ fn main() -> anyhow::Result<()> {
                 if let Some(pos) = resume.as_ref().and_then(|s| s.position_secs) {
                     let _ = player.seek(pos, false);
                 }
+                    offline_download_bitrate_kbps: cfg.effective_offline_download_bitrate_kbps(),
+                    offline_download_format: &cfg.offline_download_format,
+                    offline_cache_max_bytes: cfg.offline_cache_max_bytes,
                 fire_subtitle_fetch(&cfg, &subtitle_tx, &item);
                 let mut dctx = DownloadCtx {
                     cache: &cache_index,
@@ -2323,6 +2339,38 @@ fn main() -> anyhow::Result<()> {
                         bv.is_artist,
                         aspect,
                     );
+                    SettingsField::OfflineCacheBudget => {
+                        format!("{} GB", cfg.offline_cache_max_bytes / 1_000_000_000)
+                    }
+                    SettingsField::OfflineDownloadBitrate => {
+                        let effective = cfg.effective_offline_download_bitrate_kbps();
+                        if effective == cfg.offline_download_bitrate_kbps {
+                            format!("{effective} kbps")
+                        } else {
+                            format!("{effective} kbps (budget cap)")
+                        }
+                    }
+                    SettingsField::OfflineDownloadFormat => format!(
+                        "{} ({})",
+                        cfg.offline_download_format,
+                        if cfg.offline_download_format == "flac" {
+                            "lossless"
+                        } else {
+                            "lossy"
+                        }
+                    ),
+                    SettingsField::RebuildDownloads => {
+                        let count = cache_index
+                            .lock()
+                            .ok()
+                            .map(|index| index.download_manifest().count())
+                            .unwrap_or(0);
+                        if settings_rebuild_pending {
+                            format!("confirm · {count} songs · enter again")
+                        } else {
+                            format!("{count} songs · enter to rebuild")
+                        }
+                    }
                     hits.boxes.push((
                         hit::TextBox::BrowseFilter,
                         ui::browse::artist_columns(list_area).filter,
@@ -4930,6 +4978,52 @@ fn main() -> anyhow::Result<()> {
                                 cfg.visualizer_bands = bands;
                                 config::save_or_warn(&cfg, &mut notifications);
                             }
+                        KeyCode::Enter if settings_field() == SettingsField::RebuildDownloads => {
+                            if settings_rebuild_pending {
+                                settings_rebuild_pending = false;
+                                match wim::core::rebuild_cached_downloads(
+                                    &cache_index,
+                                    &cfg,
+                                    &mut downloading,
+                                    &download_tx,
+                                    &mut notifications,
+                                ) {
+                                    Ok(result) => {
+                                        warn_low_quality_download(
+                                            &cfg.offline_download_format,
+                                            cfg.effective_offline_download_bitrate_kbps(),
+                                            &mut notifications,
+                                        );
+                                        notifications.push(
+                                            if result.unavailable_servers > 0 {
+                                                Severity::Error
+                                            } else {
+                                                Severity::Alert
+                                            },
+                                            rebuild_status(
+                                                result.started,
+                                                result.unavailable_servers,
+                                                result.already_running,
+                                            ),
+                                        );
+                                    }
+                                    Err(error) => notifications.push(Severity::Error, error),
+                                }
+                            } else {
+                                settings_rebuild_pending = true;
+                                let count = cache_index
+                                    .lock()
+                                    .ok()
+                                    .map(|index| index.download_manifest().count())
+                                    .unwrap_or(0);
+                                notifications.push(
+                                    Severity::Alert,
+                                    format!(
+                                        "this will re-download up to {count} saved song(s) with current server quality; existing copies remain until replacements succeed. enter again to confirm"
+                                    ),
+                                );
+                            }
+                        }
                         }
                         KeyCode::Char('l') | KeyCode::Right
                             if settings_field() == SettingsField::VisualizerBands =>
@@ -5052,6 +5146,139 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     // the hint line reads these same constants, so it
+                        KeyCode::Char('h') | KeyCode::Left
+                            if settings_field() == SettingsField::OfflineCacheBudget =>
+                        {
+                            cfg.offline_cache_max_bytes = cfg
+                                .offline_cache_max_bytes
+                                .saturating_sub(1_000_000_000)
+                                .max(1_000_000_000);
+                            cache::initialize_budget(cfg.offline_cache_max_bytes);
+                            if cfg.offline_download_format != "flac"
+                                && cfg.effective_offline_download_bitrate_kbps() <= 96
+                            {
+                                notifications.push(
+                                    Severity::Alert,
+                                    format!(
+                                        "low-storage quality warning: this cache budget caps lossy offline downloads at {} kbps; dismiss this alert or raise the budget",
+                                        cfg.effective_offline_download_bitrate_kbps()
+                                    ),
+                                );
+                            }
+                        }
+                        KeyCode::Char('l') | KeyCode::Right
+                            if settings_field() == SettingsField::OfflineCacheBudget =>
+                        {
+                            cfg.offline_cache_max_bytes =
+                                (cfg.offline_cache_max_bytes + 1_000_000_000).min(100_000_000_000);
+                            cache::initialize_budget(cfg.offline_cache_max_bytes);
+                            if cfg.offline_download_format != "flac"
+                                && cfg.effective_offline_download_bitrate_kbps() <= 96
+                            {
+                                notifications.push(
+                                    Severity::Alert,
+                                    format!(
+                                        "low-storage quality warning: this cache budget caps lossy offline downloads at {} kbps; dismiss this alert or raise the budget",
+                                        cfg.effective_offline_download_bitrate_kbps()
+                                    ),
+                                );
+                            }
+                        }
+                        KeyCode::Char('h') | KeyCode::Left
+                            if settings_field() == SettingsField::OfflineDownloadBitrate =>
+                        {
+                            cfg.offline_download_bitrate_kbps =
+                                match cfg.offline_download_bitrate_kbps {
+                                    320 => 256,
+                                    256 => 192,
+                                    192 => 128,
+                                    128 => 96,
+                                    96 => 64,
+                                    _ => 64,
+                                };
+                            if cfg.offline_download_format != "flac"
+                                && cfg.offline_download_bitrate_kbps <= 96
+                            {
+                                notifications.push(
+                                    Severity::Alert,
+                                    format!(
+                                        "low audio quality: offline downloads at {} kbps",
+                                        cfg.offline_download_bitrate_kbps
+                                    ),
+                                );
+                            }
+                        }
+                        KeyCode::Char('l') | KeyCode::Right
+                            if settings_field() == SettingsField::OfflineDownloadBitrate =>
+                        {
+                            cfg.offline_download_bitrate_kbps =
+                                match cfg.offline_download_bitrate_kbps {
+                                    64 => 96,
+                                    96 => 128,
+                                    128 => 192,
+                                    192 => 256,
+                                    _ => 320,
+                                };
+                            if cfg.offline_download_format != "flac"
+                                && cfg.offline_download_bitrate_kbps <= 96
+                            {
+                                notifications.push(
+                                    Severity::Alert,
+                                    format!(
+                                        "low audio quality: offline downloads at {} kbps",
+                                        cfg.offline_download_bitrate_kbps
+                                    ),
+                                );
+                            }
+                        }
+                        KeyCode::Char('h') | KeyCode::Left
+                            if settings_field() == SettingsField::OfflineDownloadFormat =>
+                        {
+                            cfg.offline_download_format =
+                                match cfg.offline_download_format.as_str() {
+                                    "opus" => "flac",
+                                    "aac" => "opus",
+                                    "mp3" => "aac",
+                                    _ => "mp3",
+                                }
+                                .into();
+                            if cfg.offline_download_format != "flac"
+                                && cfg.offline_download_bitrate_kbps <= 96
+                            {
+                                notifications.push(
+                                    Severity::Alert,
+                                    format!(
+                                        "low audio quality: {} offline downloads at {} kbps",
+                                        cfg.offline_download_format,
+                                        cfg.offline_download_bitrate_kbps
+                                    ),
+                                );
+                            }
+                        }
+                        KeyCode::Char('l') | KeyCode::Right
+                            if settings_field() == SettingsField::OfflineDownloadFormat =>
+                        {
+                            cfg.offline_download_format =
+                                match cfg.offline_download_format.as_str() {
+                                    "opus" => "aac",
+                                    "aac" => "mp3",
+                                    "mp3" => "flac",
+                                    _ => "opus",
+                                }
+                                .into();
+                            if cfg.offline_download_format != "flac"
+                                && cfg.offline_download_bitrate_kbps <= 96
+                            {
+                                notifications.push(
+                                    Severity::Alert,
+                                    format!(
+                                        "low audio quality: {} offline downloads at {} kbps",
+                                        cfg.offline_download_format,
+                                        cfg.offline_download_bitrate_kbps
+                                    ),
+                                );
+                            }
+                        }
                     // cannot advertise a key this match does not act
                     // on; k/j and the arrows are undocumented
                     // synonyms, which is fine for a direction nobody
@@ -5703,6 +5930,10 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
+                                        offline_download_bitrate_kbps: cfg
+                                            .effective_offline_download_bitrate_kbps(),
+                                        offline_download_format: &cfg.offline_download_format,
+                                        offline_cache_max_bytes: cfg.offline_cache_max_bytes,
                             lyrics.set_scroll(lyrics.scroll().saturating_sub(1))
                         }
                         KeyCode::Esc | KeyCode::Char('q') => {
@@ -5751,6 +5982,10 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                                    offline_download_bitrate_kbps: cfg
+                                        .effective_offline_download_bitrate_kbps(),
+                                    offline_download_format: &cfg.offline_download_format,
+                                    offline_cache_max_bytes: cfg.offline_cache_max_bytes,
                 if let (Some(sug), Focus::Workspace) = (&suggestions, focus) {
                     let total = ui::suggestions::count(sug);
                     let mut handled = true;
@@ -6187,6 +6422,10 @@ fn main() -> anyhow::Result<()> {
     // so `Mpv`'s drop running after the guard's puts that ?1049l on the
     // user's shell, where it restores a cursor position the shell never
     // saved.
+                            offline_download_bitrate_kbps: cfg
+                                .effective_offline_download_bitrate_kbps(),
+                            offline_download_format: &cfg.offline_download_format,
+                            offline_cache_max_bytes: cfg.offline_cache_max_bytes,
     if video_vo.take().is_some() {
         let _ = player.set_video_output(video::Vo::Null.mpv_name());
         drop(player);
