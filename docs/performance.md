@@ -1,4 +1,145 @@
-# performance: product budgets and measured work
+# Performance
+
+Performance numbers are only useful with the workload and environment attached.
+The automated process harness measures starting Wim with an empty local
+library and no servers, then sitting idle without playback. A separate,
+operator-assisted suite compares client resource use with a shared Navidrome
+library. Neither measures end-to-end search or time to audible playback.
+
+## Run the process benchmark
+
+Requires Linux with `/proc`, Python 3, mpv on `PATH`, and a built Wim binary.
+Build the same release profile for each comparison; use the actual binary, not
+a shell wrapper. Run on an otherwise quiet machine with a fixed power profile:
+
+```sh
+nix develop --command cargo build --release --locked --bin wim
+python3 benchmarks/bench.py run --binary target/release/wim --runs 10 --seconds 5 --output /tmp/wim-results.json
+python3 benchmarks/bench.py report /tmp/wim-results.json
+```
+
+Each run has a fresh temporary home, configuration, empty library, and PTY.
+It inherits the machine's environment and system settings; it does not clear
+the operating-system page cache. The output includes individual samples, the
+binary hash and version, Git state, CPU, kernel, mpv version, and parameters.
+Record the build command, power profile and other relevant machine details
+alongside any published results. A dirty Git tree means the commit alone does
+not identify the build. Never publish results from a different binary as if
+they came from that commit.
+
+* **First terminal output** is elapsed time from process spawn to the first
+  bytes read from the PTY. It is not time to a complete or interactive frame.
+* After a two-second settling period, **idle RSS** is the median of sampled,
+  summed resident set sizes for Wim and its live descendants (including mpv).
+  RSS can double-count shared pages; it is not private memory or system-wide
+  memory. It excludes the terminal and audio server.
+* **Idle CPU** is the change in live process-tree CPU ticks over the measurement
+  interval, expressed as a percentage of one core. Very short-lived child
+  processes may be missed. No audio is playing.
+
+The table reports the nearest-rank median and p95 across independent runs;
+the p95 of ten runs is the maximum. These numbers vary with hardware, load,
+configuration and cache state. The PTY is drained but does not render text, so
+it excludes the cost of a real terminal emulator. Keep raw JSON with any
+published table and re-run after relevant changes; do not compare samples
+collected under different conditions as if they were controlled experiments.
+
+## Comparing Navidrome clients
+
+`benchmarks/compare.py` measures idle or steady-state playback process-tree
+RSS and CPU for Wim, Feishin desktop, and Supersonic. It generates a 180-second
+PCM tone and keeps separate, persistent client profiles. It randomizes the run
+order and stores individual samples and a Markdown report. Each run requires
+the operator to navigate the UI and confirm the requested state; it does not
+automate or independently verify playback. These are not startup or latency
+measurements, and results should be labeled **operator-verified**, not fully
+automated. The client workload excludes the Navidrome server, which must stay
+the same throughout the comparison.
+
+Use an isolated machine/session, not your personal server or profiles. This
+example starts a fresh Navidrome instance bound only to loopback; use a free
+port and a disposable account. Its data and the client profiles may contain
+credentials: keep the workspace private and do not publish it.
+
+```sh
+python3 benchmarks/compare.py init /tmp/wim-comparison
+mkdir -p /tmp/wim-comparison/server
+ND_ENABLEEXTERNALSERVICES=false navidrome --address 127.0.0.1 --port 4533 \
+  --musicfolder /tmp/wim-comparison/music \
+  --datafolder /tmp/wim-comparison/server
+```
+
+Create a disposable admin account at `http://127.0.0.1:4533`, wait for the
+library scan, and leave the server running. In a separate terminal, start the
+comparison. The programs and `xterm` must be on `PATH`; build Wim first. Pass
+the actual versions of the clients and server being tested:
+
+```sh
+python3 benchmarks/compare.py run /tmp/wim-comparison \
+  --wim "$PWD/target/release/wim" --scenario playback \
+  --server-version VERSION --feishin-version VERSION --supersonic-version VERSION \
+  --runs 5 --seconds 10 --output /tmp/wim-comparison-playback.json
+python3 benchmarks/compare.py report /tmp/wim-comparison-playback.json
+```
+
+At each prompt, connect the client to the fixture server (profiles persist
+between runs), select the generated track from that server and start playback.
+For `--scenario idle`, stop playback and leave the library open. Confirm only
+after the same state is reached; any nonempty response aborts without writing
+results. Use the same audio device, codec, volume, server, power profile and
+network conditions; disable optional features consistently where possible and
+record settings that cannot be made equivalent. Feishin's mpv backend is the
+intended comparison. Do not use the local file in Wim for the playback scenario.
+
+RSS sums live processes and double-counts shared pages. Wim's total includes
+the xterm process and mpv; Feishin's includes its Electron and mpv children;
+Supersonic uses libmpv in-process. The display server and audio server are not
+included. CPU is percent of one core. Record machine, client configuration,
+audio output, terminal, server version and library details with any published
+results; the version arguments are supplied by the operator and not verified
+by the harness. A GUI smoke test is available separately:
+
+```sh
+xvfb-run -a env WIM_REAL_GUI_SMOKE=1 WIM_BINARY="$PWD/target/release/wim" \
+  python3 -m unittest discover -s benchmarks -p test_compare.py -v
+```
+
+That smoke test checks that all three clients start in isolated profiles; it
+does not test connectivity or playback. The comparison runner does not yet
+measure the built-in Navidrome web client.
+
+## Search and future comparisons
+
+The existing ignored search benchmarks exercise the in-memory search algorithm,
+not end-to-end typing or a Navidrome server. See
+[search-performance.md](search-performance.md) for the corpus, commands and
+correctness guards.
+
+A meaningful Navidrome web-client comparison needs a pinned server and client,
+the same generated media and catalog, controlled network and cache conditions,
+automated equivalent actions, and a defined observable endpoint for each task.
+Browser and terminal processes, mpv, and audio services must be accounted for
+consistently. Measure search latency and playback-to-audible-output separately;
+standalone mpv can provide a playback baseline. Include absolute values and
+unfavorable results, not just a best-case ratio. Those latency comparisons are
+not implemented yet.
+
+The intended comparison set is Navidrome's bundled web client in a dedicated
+browser profile, [Feishin desktop](https://github.com/jeffvli/feishin) with
+its mpv backend, and [Supersonic](https://github.com/supersonic-app/supersonic),
+which uses libmpv. These represent a browser, an Electron desktop client and
+a native desktop client respectively; they have different features and are
+not interchangeable. Pin exact versions and browser/backend settings. Report
+server cost separately, use a dedicated browser instance, and include each
+client's complete process tree. Standalone mpv is a decoder baseline, not a
+full Navidrome-client comparison.
+
+## Earlier performance record
+
+The following is the previous performance design record. Its observations are
+historical and scoped to the operations described, not the new process benchmark.
+
+### Product budgets and measured work
 
 Wim's performance goal is not "a fast tui" in isolation. It is a player
 that feels immediate, keeps audio reliable, and spends CPU, memory, and
@@ -6,7 +147,7 @@ network only where the feature warrants it. Compare complete process
 trees against mpv on identical media and conditions; a fast widget
 benchmark is not evidence that playback is efficient.
 
-## measurement rules
+#### Measurement rules
 
 - Use a release build and record machine, mpv version, terminal, media,
   configuration, and cold/warm state.
@@ -21,10 +162,10 @@ benchmark is not evidence that playback is efficient.
   repeat, and compare the best of each; wall timings across unrelated
   runs on this host vary substantially (`docs/testing.md`).
 
-## first baseline observations
+#### First baseline observations
 
 These are useful signals, **not yet a complete end-to-end comparison**.
-Measured in this worktree on mpv v0.41.0 with a release build:
+Measured in an earlier worktree on mpv v0.41.0 with a release build:
 
 | Operation | Observation |
 | --- | ---: |
@@ -45,7 +186,7 @@ Prior measured work is recorded in `docs/startup-cache.md`,
 operations; they should not be mistaken for aggregate CPU, input latency,
 or a complete user-experience comparison.
 
-## workload and metrics to keep
+#### Workload and metrics to keep
 
 Run the same generated media and isolated XDG state for:
 
@@ -54,7 +195,7 @@ Run the same generated media and isolated XDG state for:
    playing;
 3. play-to-first-audio, pause/resume, seek, and queue advance;
 4. audio-only local and throttled remote playback;
-5. inline/fullscreen local and remote video, including seek and resize;
+5. local and remote video, including seek and resize;
 6. paused/idle CPU, active CPU, process-tree RSS, redraw rate, terminal
    bytes, and network bytes per stream.
 
@@ -63,7 +204,7 @@ baseline. Keep startup, steady-state, and feature incremental costs
 separate. After repeated runs establish numeric budgets from the actual
 hardware rather than choosing attractive but unverified targets.
 
-## work completed in the first performance pass
+#### Work completed in the first performance pass
 
 Startup queue restoration used one synchronous mpv IPC command per
 saved item after the first screen had already appeared. Unshuffled
@@ -79,7 +220,7 @@ silently desynchronize mpv's playlist and Wim's queue. Further work must
 measure the end-to-end startup and input benefit, then cover the async
 and shuffle paths without weakening that invariant.
 
-## next investigations, ordered by risk and impact
+#### Next investigations, ordered by risk and impact
 
 1. **UI-thread stalls:** instrument loop gaps and attribute them to
    synchronous IPC, filesystem, config writes, drawing, or event drains;
@@ -88,9 +229,7 @@ and shuffle paths without weakening that invariant.
 2. **Idle work:** measure wakeups/redraws and make static or paused
    screens event-driven while preserving animation and playback updates.
 3. **Streaming duplication:** quantify requests, bytes, CPU, and RSS from
-   audible mpv, inline frame mpv, and the relay. Prototype coordinated
-   two-process behavior against a libmpv single-engine alternative before
-   choosing an architecture.
+   playback and the relay. Compare architectures before choosing one.
 4. **Library and search scale:** reuse the existing corpus/cache
    benchmarks, then test realistic full startup and interaction under
    large-library background work.
