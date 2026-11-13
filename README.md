@@ -1,156 +1,122 @@
 # wim
 
-terminal omniplayer for music and video.
+[![CI](https://github.com/nuclearcanopy/wim/actions/workflows/ci.yml/badge.svg)](https://github.com/nuclearcanopy/wim/actions/workflows/ci.yml)
+[![Weekly commit activity](https://img.shields.io/github/commit-activity/w/nuclearcanopy/wim?label=commit%20activity)](https://github.com/nuclearcanopy/wim/graphs/commit-activity)
+[![Rust](https://img.shields.io/badge/written%20in-Rust-dea584?logo=rust)](https://www.rust-lang.org/)
+[![Nix flake](https://img.shields.io/badge/Nix-flake-5277c3?logo=nixos)](flake.nix)
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
 
-- navidrome/subsonic + local files in one unified, fuzzy-matched search
-  (artists, albums, songs, playlists, local tracks, local video)
-- playback via mpv (json ipc): loop, loop-one, shuffle, speed, 10-band eq,
-  replaygain, transcoding
-- auto lyrics lookup, auto opensubtitles lookup for local video
-- full subtitle control: delay, language, size, color, outline, background
-  opacity/blur/radius, position
-- album art in four modes: pixelated unicode blocks or real inline images
-  (sixel/kitty/iterm2, auto-detected), each in greyscale or colour
-- strictly monochrome ui (grayscale only, album art aside), vim-like
-  navigation
-- config is a plain toml file, or generate it declaratively from a nix
-  flake via the home-manager module (see `nix/`)
+Wim is a terminal player for local media and Navidrome/Subsonic libraries.
+Search spans local files and configured servers; mpv handles playback. Video
+opens in an mpv window rather than being rendered in the terminal.
 
-## status
+The project is in early development and is not yet considered usable. Expect
+rough edges and changes to configuration and behavior.
 
-early development, not usable yet.
+## What it does
 
-## build
+- Searches artists, albums, songs, playlists, local music and video together.
+- Plays and queues files, with shuffle, repeat, speed, ReplayGain and a 10-band EQ.
+- Shows album art using terminal graphics protocols or Unicode blocks, with a
+  fallback for terminals without image support.
+- Looks up and follows lyrics; supports local sidecars and server lyrics as well
+  as optional online providers. See [lyrics](docs/lyrics.md).
+- Provides subtitle controls for video and a separate TorBox workspace. See
+  [video](docs/video.md) and [TorBox](docs/torbox.md).
+- Offers keyboard and mouse navigation, configurable keybindings, and a
+  Home Manager module. `shellswim` provides a command-oriented interface; see
+  [shellsong](docs/shellsong.md).
 
+Wim is written in Rust. It controls a separate mpv process over JSON IPC.
+
+## Install and run
+
+With Nix, build from a clone:
+
+```sh
+nix build .#wim
+./result/bin/wim
 ```
+
+The packaged `wim` has mpv on its `PATH`. To build from source instead:
+
+```sh
 nix develop
-cargo build
+cargo build --release
+./target/release/wim
 ```
 
-or build the packaged binary directly: `nix build .#wim` (mpv is
-wrapped onto its `PATH` automatically, no system-wide install needed).
+Outside the Nix development shell, install Rust and mpv and ensure `mpv` is on
+`PATH`. The source build also produces `shellswim`.
 
-## usage
-
-```
-wim                 the panes, resuming what was playing
-wim song.flac       play that instead
-wim a.mp3 b.mp3     play the first, queue the rest
-wim --help          every option
-shellswim           the same player, shellsong prompt only
+```sh
+wim                    # open the player
+wim --resume           # resume the saved session
+wim album/*.flac       # play the first file and queue the rest
+wim --help
+shellswim --help
 ```
 
-a file argument plays instead of resuming, and the rest queue behind
-it; an unplayable path is refused rather than starting empty.
+On first run, Wim creates a config at `$XDG_CONFIG_HOME/wim/config.toml` (or the
+platform equivalent) and offers setup in the app. Local library paths default
+to `~/Music` and `~/Videos` when present. Use the in-app profile manager (`n`)
+to configure servers, or use the Home Manager module below.
 
-## nix
+## Controls
 
-packaged as `packages.<system>.wim` (and `.default`). a home-manager
-module is exposed as `homeManagerModules.default`:
+Press `?` in Wim for the full, current keymap; `K` opens keybinding settings.
+
+| Key | Action |
+| --- | --- |
+| `Tab` | Switch to pane-movement mode |
+| `w` `a` `s` `d` or arrows | Focus a pane in movement mode |
+| `Enter` or `Esc` | Return to interaction mode |
+| `/` | Search |
+| `j` / `k`, `gg` / `G` | Move through a list |
+| `Enter` | Play or open the selection |
+| `L` | Open lyrics |
+
+Mouse capture is on by default; set `mouse = false` in the config to disable
+it. With capture enabled, holding Shift while dragging usually restores the
+terminal's text selection.
+
+## Home Manager
+
+The flake exports `homeManagerModules.default`. With the flake available as
+`wim`, for example:
 
 ```nix
-{
+{ config, wim, ... }: {
   imports = [ wim.homeManagerModules.default ];
+
   programs.wim = {
     enable = true;
-    # a list; every configured server feeds the same unified search,
-    # no "active server" to switch between. the in-app 'n' profile
-    # manager can add more on top of whatever's declared here.
-    navidromeServers = [
-      {
-        url = "https://navidrome.example.com";
-        username = "me";
-        passwordFile = config.age.secrets.navidrome-password.path; # or any path
-      }
-    ];
-    # Separate TorBox workspace; token file can be an agenix secret path.
-    torboxTokenFile = config.age.secrets.torbox-token.path;
-    albumArt = "auto"; # auto | ascii-bw | ascii-color | full-bw | full-color | off
-    libraryPaths = [ ]; # defaults to ~/Music, ~/Videos when empty
+    navidromeServers = [{
+      url = "https://navidrome.example.com";
+      username = "me";
+      passwordFile = config.age.secrets.navidrome-password.path;
+    }];
+    # libraryPaths = [ "/home/me/Music" ];
   };
 }
 ```
 
-there's deliberately no plaintext `navidrome.password` option; nix
-store paths are world-readable, so `passwordFile` (composes with
-agenix/sops-nix) is the only way to set credentials declaratively.
+Pass `wim` through your Home Manager module arguments. The example assumes an
+existing agenix secret; any suitably protected password file can be used. Do
+not put passwords in Nix values: the Nix store is world-readable. Multiple
+servers feed the same search. See [`nix/home-manager.nix`](nix/home-manager.nix)
+for the available options.
 
-## config
+## Performance
 
-on first run, writes a template to `$XDG_CONFIG_HOME/wim/config.toml` (or
-the platform equivalent). fill in your navidrome url/credentials and
-library paths, or manage the same file declaratively via the
-home-manager module instead. `library_paths` defaults to `~/Music` and
-`~/Videos` (whichever exist) when left empty.
+The repository includes existing search benchmarks, a Linux process benchmark,
+and an operator-assisted resource comparison with Feishin and Supersonic.
+There are **no published comparative results yet**; the suite does not measure
+end-to-end search, time to audible playback, or the Navidrome web client. See
+[performance methodology](docs/performance.md) for commands, limitations, and
+how to regenerate a results table. No speed or memory figure is a substitute
+for the workload and machine it was measured on.
 
-`mouse = true` (the default) captures the mouse: click a pane to focus
-it, click a row to select it, click a control on the bottom bar, drag
-the scrubber to seek, wheel over any list to scroll it. capture takes
-the terminal's own click-drag text selection away from the terminal;
-hold `shift` while dragging to get it back (works in most terminals),
-or set `mouse = false` to give it back for good.
+## License
 
-`video_output = "auto"` (the default) picks how `v` draws a local
-video. mpv draws it itself, filling the terminal, while wim stops
-drawing: `tct` is true-color half-blocks and works in any terminal,
-`kitty` is the kitty graphics protocol and needs a terminal that speaks
-it. `auto` uses kitty only when the terminal actually answered the
-graphics probe with it, `tct` otherwise. `off` disables the key. music
-playback is never affected.
-
-`ascii` is the fallback for a terminal with no image protocol at all:
-wim decodes the video itself and paints it as monochrome text cells, so
-it works over ssh and in any terminal that can show text. `auto` never
-picks it (a real protocol beats a cell grid wherever one exists), so it
-is either `video_output = "ascii"` in config.toml or shift-`v` at
-runtime, which also switches to fullscreen.
-
-`ascii_fps` caps the rate ascii video decodes and paints at; unset
-means the file's own rate. it only ever lowers it, since asking for
-more frames than the file has just makes mpv duplicate them. a large
-cell grid on a slow machine is the case for halving it.
-
-The maximized player shows a smoothed, logarithmic frequency visualizer
-as a right-edge rail with one terminal column per band;
-`visualizer_bands` defaults to 10 and can be set from 4 to 32. In the
-settings menu (`u`), `h`/`l` adjusts the band count and toggles the
-equalizer off/on. EQ is enabled by default with the flat preset; turning
-it off preserves the selected curve for when it is enabled again.
-
-## keybindings
-
-press `?` in the app for the full list. it resolves every key from the
-live keymap, so it stays correct after rebinding with `K`; a static
-list here would go stale the moment anything moved. what follows is
-only the fixed conventions, which are not rebindable.
-
-two modes, named at the left of the bottom bar:
-
-- `tab`; enter move mode
-- move mode: `wasd` or arrows focus a pane (sidebar / workspace /
-  bottom bar), `enter` or `esc` returns to interact mode. nothing else
-  responds while it's active, by design.
-- interact mode: everything else, acting on the focused pane.
-
-within a pane:
-
-- `/`; start/edit the live search query
-- `j` / `k` (or down/up); move selection
-- `gg` / `G`; jump to first/last
-- `enter`; play or open the selection
-- `esc`; close whatever's open
-- `left` / `right`; switch column in the artist profile
-- `h` / `l`; adjust a value inside a menu
-
-the queue auto-advances when the current track ends; nothing plays next
-if the queue is empty.
-
-## lyrics
-
-Press `L` while a local or Navidrome song is playing. WIM prefers
-timestamped lyrics and follows the current playback position; manual
-scrolling pauses following briefly, then it resumes automatically.
-Local `.lrc` sidecars and embedded lyrics, OpenSubsonic server lyrics,
-LRCLIB, Musixmatch (with your own API key), and lyrics.ovh can be ordered
-or disabled in `config.toml`; details and credential-file configuration
-are in [`docs/lyrics.md`](docs/lyrics.md).
+[AGPL-3.0-or-later](LICENSE).
