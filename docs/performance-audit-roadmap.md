@@ -1,6 +1,7 @@
 # Wim performance and reliability audit
 
-**Status:** active. Last updated 2026-11-13.
+**Status:** active; Phase 0 implementation reverted pending a complete, isolated
+reimplementation. Last updated 2026-11-13.
 
 This is the implementation checklist for making Wim start and transition quickly,
 recover reliably from network problems, and run efficiently on the ThinkPad T480.
@@ -35,19 +36,19 @@ exact implementations.
 
 ## Phase 0 — Finish and harden offline cache work
 
-- [x] Count managed compressed cache files, playback expansions, and active
+- [ ] Count managed compressed cache files, playback expansions, and active
   download reservations in one documented budget model. The shared process-wide
   counter is seeded from managed files; new transfer and expansion bytes reserve
   capacity before writes and release it on cleanup.
-- [x] Enforce the budget while transfers grow, not only at completed-download
+- [ ] Enforce the budget while transfers grow, not only at completed-download
   handoff; concurrent batches share reservations and a verified old copy stays
   until replacement-index persistence succeeds. (The worker cap remains per
   batch; global concurrency is tracked separately below.)
-- [x] Bound decompression output and account for temporary playback files before
+- [ ] Bound decompression output and account for temporary playback files before
   expansion; partial outputs are removed and their reservations released.
 - [ ] Make cache handoff transactional: durable index first, then unlink files;
   retain references when deletion fails and recover orphaned files.
-- [x] Make cache-index writes atomic and private (write/sync a mode-0600 sibling,
+- [ ] Make cache-index writes atomic and private (write/sync a mode-0600 sibling,
   rename, sync parent); the isolated replacement test passes.
 - [ ] Define and implement behavior for concurrent Wim processes; atomic rename
   alone can still lose updates between processes.
@@ -66,7 +67,7 @@ exact implementations.
 - [ ] Warn at startup and before every download path when the effective lossy
   profile is very low; make the warning dismissible and truthful about whether
   confirmation is required.
-- [x] Cover automatic downloads through the shared core handoff and settings,
+- [ ] Cover automatic downloads through the shared core handoff and settings,
   browse, and rebuild paths. Shellsong startup/explicit-download warning exists;
   noninteractive command presentation still needs review.
 - [ ] Test disk-full, persist failure, corrupt frames, interrupted transfers and
@@ -235,3 +236,7 @@ exact implementations.
   `cargo fmt --all -- --check`, `git diff --check`, and the latest Nix build
   passed. The Nix build produced
   `/nix/store/aswzqbgf7rslnhmmgqj1sq27f6p8kwfv-wim-0.1.0`.
+- 2026-11-13: The Phase 0 implementation commit was reverted after CI exposed
+  malformed source hunks and an incomplete dependency/config integration. The
+  earlier test/build results describe the uncommitted working snapshot, not the
+  current branch. Re-implement Phase 0 as a complete, separately verified change.
