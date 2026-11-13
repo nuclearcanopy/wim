@@ -21,12 +21,12 @@ use wim::search::SearchItem;
 use wim::shellsong::{Console, ConsoleAction, LineKind};
 use wim::swimconsole::{SwimBar, SwimConsole};
 use wim::theme::{shade, DIM, NEAR_WHITE};
+#[cfg(feature = "dev-telemetry")]
+use wim::trace;
 use wim::ui::divider::HorizontalRule;
 use wim::ui::lyrics_view::LyricsView;
 use wim::ui::results_list::label;
 use wim::{anim, config, mpv, term};
-#[cfg(feature = "dev-telemetry")]
-use wim::trace;
 
 use wim::cli;
 mod host;

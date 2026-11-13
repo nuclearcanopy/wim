@@ -656,7 +656,10 @@ mod tests {
             len: 5,
         }];
         assert_eq!(act(&m, down(5, 1), false), Act::Edit(TextBox::Query));
-        assert_eq!(act(&m, down(40, 3), false), Act::Edit(TextBox::BrowseFilter));
+        assert_eq!(
+            act(&m, down(40, 3), false),
+            Act::Edit(TextBox::BrowseFilter)
+        );
         // one row below the box is the list again, not the box.
         assert_eq!(
             act(&m, down(5, 4), false),
@@ -1087,7 +1090,10 @@ mod tests {
             field: Field::Shuffle,
             rect: Rect::new(30, 9, 12, 1),
         }];
-        assert_eq!(act(&m, down(33, 9), false), Act::Press(Field::Shuffle, None));
+        assert_eq!(
+            act(&m, down(33, 9), false),
+            Act::Press(Field::Shuffle, None)
+        );
         // one row off it is the workspace the control was drawn in.
         assert_eq!(act(&m, down(33, 10), false), Act::Focus(Focus::Workspace));
     }

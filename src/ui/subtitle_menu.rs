@@ -69,7 +69,7 @@ impl Widget for SubtitleMenu<'_> {
             rect,
             x + 2,
             y + 1,
-            "j/k select, h/l adjust",
+            "n track · x toggle · h/l adjust",
             shade(DIM),
         );
         draw_text(

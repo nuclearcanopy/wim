@@ -67,7 +67,10 @@ pub enum Status {
     /// `still_filling` whether the cache is still growing toward the
     /// configured target — pausing a stream is also how you preload
     /// it, and the bar says which of the two states that is.
-    Paused { ahead: Option<f64>, still_filling: bool },
+    Paused {
+        ahead: Option<f64>,
+        still_filling: bool,
+    },
     /// Holding at the end of the track (the between-track gap or a
     /// finished queue).
     Ended,
@@ -99,7 +102,10 @@ pub fn status(f: &Facts) -> Status {
         // paused), which is exactly the preload-the-user-asked-for
         // state and reads as one only if the bar says so.
         let still_filling = ahead.is_some_and(|a| a < f.buffer_target_secs);
-        return Status::Paused { ahead, still_filling };
+        return Status::Paused {
+            ahead,
+            still_filling,
+        };
     }
     if f.opening {
         return Status::Opening;
@@ -133,7 +139,10 @@ impl Status {
             Status::Opening => Some("OPENING".into()),
             Status::Buffering { pct } => Some(format!("BUFFERING {:.0}%", pct)),
             Status::Seeking => Some("SEEKING".into()),
-            Status::Paused { ahead, still_filling } => Some(match (ahead, still_filling) {
+            Status::Paused {
+                ahead,
+                still_filling,
+            } => Some(match (ahead, still_filling) {
                 // the one the whole preload feature turns on: paused,
                 // and the cache is still growing toward the target.
                 (Some(secs), true) => {
@@ -291,10 +300,7 @@ mod tests {
     fn playing_and_idle_stay_silent() {
         let mut f = facts();
         f.cache_ahead_secs = Some(5.0);
-        assert_eq!(
-            status(&f),
-            Status::Playing { ahead: Some(5.0) }
-        );
+        assert_eq!(status(&f), Status::Playing { ahead: Some(5.0) });
         assert_eq!(status(&f).mode_line(), None);
         f.loaded = false;
         assert_eq!(status(&f).mode_line(), None);

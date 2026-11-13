@@ -5,14 +5,13 @@
 use wim::cli;
 use wim::framesource;
 use wim::playback_status;
+#[cfg(feature = "dev-telemetry")]
+use wim::trace;
 use wim::ui::settings_menu::Field as SettingsField;
 use wim::{
     anim, app, browse, cache, config, coverart, eq, favorites, hit, keymap, library, listenbrainz,
-    lyrics, mpv, persistence, queues, search, shellsong, shellsong_host, suggest, term, ui,
-    video,
+    lyrics, mpv, persistence, queues, search, shellsong, shellsong_host, suggest, term, ui, video,
 };
-#[cfg(feature = "dev-telemetry")]
-use wim::trace;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -56,10 +55,12 @@ use wim::navmanager::{NavManager, NavManagerStep};
 use wim::notify::{Notifications, Severity};
 use wim::onboarding::{Onboarding, Step};
 use wim::playqueue::{PlayQueue, PosChange};
-use wim::subtitle_align::{self, Event as AlignmentEvent, Request as AlignmentRequest, SubtitleInput};
 use wim::search::SearchItem;
 use wim::shellsong::{Console, ConsoleAction, ViewTarget};
 use wim::shellsong_host::{CorpusCandidates, Ramp, SearchSettle, SleepStep};
+use wim::subtitle_align::{
+    self, Event as AlignmentEvent, Request as AlignmentRequest, SubtitleInput,
+};
 use wim::theme::{shade, NEAR_BLACK};
 use wim::transport::{
     activate_transport, commit_scrub, now_playing_is_video, ScrubAt, TransportCtx,
@@ -1545,7 +1546,7 @@ fn main() -> anyhow::Result<()> {
         // status: `Paused{ahead}` would log on every cache tick, which
         // is a buffering progress bar in the diagnostics file rather
         // than a trace of transitions.
-        if prev_status.as_deref() != Some(playback_status.diag_label()) {
+        if prev_status != Some(playback_status.diag_label()) {
             prev_status = Some(playback_status.diag_label());
             wim::trace_diag!(
                 "playback",
@@ -1819,7 +1820,10 @@ fn main() -> anyhow::Result<()> {
         } else {
             (false, framesource::Grid::new(0, 0, aspect))
         };
-        if let Err(e) = ascii.update(want_frames, ascii_media, frame_grid,            // an unknown position is the start of the file, which is
+        if let Err(e) = ascii.update(
+            want_frames,
+            ascii_media,
+            frame_grid, // an unknown position is the start of the file, which is
             // what a just-loaded track is anyway.
             elapsed_secs.unwrap_or(0.0),
             // one ipc round trip per spawn, never per frame.
@@ -2733,8 +2737,7 @@ fn main() -> anyhow::Result<()> {
                 // Shuffling requires individual playlist moves to keep
                 // mpv and PlayQueue in the same order; retain that path.
                 for item in pending_enqueue.drain(..) {
-                    let done =
-                        enqueue_track(&player, &item, &cache_index, &mut play_queue, true);
+                    let done = enqueue_track(&player, &item, &cache_index, &mut play_queue, true);
                     if !done.is_queued() {
                         lost += 1;
                     }
@@ -3853,10 +3856,11 @@ fn main() -> anyhow::Result<()> {
                         KeyCode::Char(c) if torbox_workspace.page == Page::Setup => {
                             torbox_workspace.token_path_input.push(c);
                         }
-                        KeyCode::Enter if torbox_workspace.page == Page::Setup => {
-                            if !torbox_workspace.setup_busy {
-                                torbox_workspace.commit_setup();
-                            }
+                        KeyCode::Enter
+                            if torbox_workspace.page == Page::Setup
+                                && !torbox_workspace.setup_busy =>
+                        {
+                            torbox_workspace.commit_setup();
                         }
                         KeyCode::Char(c)
                             if torbox_workspace.page == Page::Search
@@ -3939,10 +3943,11 @@ fn main() -> anyhow::Result<()> {
                                     Some("this service only supports resume or delete here".into());
                             }
                         }
-                        KeyCode::Char('R') if torbox_workspace.page == Page::Account => {
-                            if torbox_workspace.service == wim::torbox::Service::Torrent {
-                                torbox_workspace.control_selected("reannounce");
-                            }
+                        KeyCode::Char('R')
+                            if torbox_workspace.page == Page::Account
+                                && torbox_workspace.service == wim::torbox::Service::Torrent =>
+                        {
+                            torbox_workspace.control_selected("reannounce");
                         }
                         KeyCode::Backspace if torbox_workspace.page == Page::Files => {
                             if torbox_workspace.episode_show.is_some() {
@@ -7141,7 +7146,10 @@ mod saved_queue_tests {
             .find("first_frame_drawn = true;")
             .expect("the first-frame block moved");
         let block = &code[at..(at + 2400).min(code.len())];
-        assert!(block.contains("if app.shuffle"), "shuffle handling changed:\n{block}");
+        assert!(
+            block.contains("if app.shuffle"),
+            "shuffle handling changed:\n{block}"
+        );
         assert!(
             block.contains("playlist_append_batch(&paths)"),
             "unshuffled queue restoration no longer batches IPC:\n{block}"

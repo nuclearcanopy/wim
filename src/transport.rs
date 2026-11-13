@@ -142,9 +142,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let token_path = dir.join("token");
         std::fs::write(&token_path, "unit-test-token").unwrap();
-        let client = std::sync::Arc::new(
-            crate::torbox::Client::from_token_file(&token_path).unwrap(),
-        );
+        let client =
+            std::sync::Arc::new(crate::torbox::Client::from_token_file(&token_path).unwrap());
         let torbox = |video: bool| SearchItem::TorBoxFile {
             service: crate::torbox::Service::Torrent,
             item_id: 1,

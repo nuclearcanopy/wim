@@ -786,7 +786,13 @@ pub fn track(frac: f64, cells: usize, dragging: bool) -> String {
 /// `TRACK_BUFFERED` so played, downloaded and neither read at a
 /// glance — the whole "is it loading" question answered by the
 /// track itself.
-pub fn track_into(out: &mut String, frac: f64, cells: usize, dragging: bool, buffered: Option<f64>) {
+pub fn track_into(
+    out: &mut String,
+    frac: f64,
+    cells: usize,
+    dragging: bool,
+    buffered: Option<f64>,
+) {
     let cells = cells.max(TRACK_MIN);
     let head = if dragging {
         TRACK_HEAD_DRAG
@@ -795,9 +801,8 @@ pub fn track_into(out: &mut String, frac: f64, cells: usize, dragging: bool, buf
     };
     let frac = frac.clamp(0.0, 1.0);
     let pos = ((frac * (cells - 1) as f64).round() as usize).min(cells - 1);
-    let buffered_end = buffered.map(|b| {
-        ((b.clamp(0.0, 1.0) * (cells - 1) as f64).round() as usize).min(cells - 1)
-    });
+    let buffered_end = buffered
+        .map(|b| ((b.clamp(0.0, 1.0) * (cells - 1) as f64).round() as usize).min(cells - 1));
     out.reserve(cells * TRACK_DONE.len_utf8());
     for i in 0..cells {
         out.push(match i.cmp(&pos) {
@@ -934,7 +939,10 @@ mod tests {
         });
         let text = grid(&buffering);
         assert!(text.contains("BUFFERING 42%"), "{text}");
-        assert!(!text.contains("INTERACT"), "the status outranks the hint: {text}");
+        assert!(
+            !text.contains("INTERACT"),
+            "the status outranks the hint: {text}"
+        );
 
         let paused_filling = bar_at(100, 3, |cb| {
             cb.paused = true;
@@ -973,7 +981,10 @@ mod tests {
             cb.cache_ahead_secs = Some(30.0);
         });
         let text = grid(&buf);
-        assert!(text.contains(TRACK_BUFFERED), "a reported cache shades the track: {text}");
+        assert!(
+            text.contains(TRACK_BUFFERED),
+            "a reported cache shades the track: {text}"
+        );
     }
 
     /// The layout the host hit-tests against, and the buffer the same
