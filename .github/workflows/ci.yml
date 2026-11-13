@@ -23,5 +23,8 @@ jobs:
       - name: cargo test
         run: nix develop --command cargo test --locked
 
+      - name: benchmark harness tests
+        run: python3 -m unittest discover -s benchmarks -p 'test_*.py'
+
       - name: nix build (packages.default)
         run: nix build .#default --print-build-logs
