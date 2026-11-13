@@ -234,4 +234,4 @@ exact implementations.
   passed (1,655 passed, 92 ignored), `cargo clippy --all-targets -- -D warnings`,
   `cargo fmt --all -- --check`, `git diff --check`, and the latest Nix build
   passed. The Nix build produced
-  `/nix/store/s8gvniqkh6bzrbzhjwg6x5hrrmis6v2g-wim-0.1.0`.
+  `/nix/store/aswzqbgf7rslnhmmgqj1sq27f6p8kwfv-wim-0.1.0`.
