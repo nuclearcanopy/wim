@@ -1,4 +1,3 @@
-
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
@@ -217,13 +216,7 @@ impl Widget for PlayerView<'_> {
                 GapPanel { gap }.render(rect, buf);
             } else if self.video {
                 if let Some(note) = self.video_note {
-                    draw_centered(
-                        buf,
-                        rect,
-                        rect.y + rect.height / 2,
-                        note,
-                        shade(NEAR_BLACK),
-                    );
+                    draw_centered(buf, rect, rect.y + rect.height / 2, note, shade(NEAR_BLACK));
                 }
             } else if self.art_mode.is_ascii() {
                 CachedArt {
@@ -596,26 +589,26 @@ mod tests {
                     tinted += u32::from(!grey);
                 }
             }
-            assert_eq!(tinted > 0, want_tint, "{mode:?} painted {tinted} tinted cells");
+            assert_eq!(
+                tinted > 0,
+                want_tint,
+                "{mode:?} painted {tinted} tinted cells"
+            );
         }
     }
 
     #[test]
     fn art_is_dropped_below_the_size_it_stops_being_readable_at() {
         // too few rows: the title is worth more than a 2-row thumbnail.
-        assert!(
-            layout(Rect::new(0, 0, 80, 12), true, false, 2.0)
-                .unwrap()
-                .art
-                .is_none()
-        );
+        assert!(layout(Rect::new(0, 0, 80, 12), true, false, 2.0)
+            .unwrap()
+            .art
+            .is_none());
         // and too narrow, even with rows to spare.
-        assert!(
-            layout(Rect::new(0, 0, 13, 40), true, false, 2.0)
-                .unwrap()
-                .art
-                .is_none()
-        );
+        assert!(layout(Rect::new(0, 0, 13, 40), true, false, 2.0)
+            .unwrap()
+            .art
+            .is_none());
         // the pane that does get art keeps the title and context too.
         let l = layout(Rect::new(0, 0, 80, 30), true, true, 2.0).unwrap();
         assert!(l.art.is_some() && l.context_y.is_some());
@@ -637,7 +630,10 @@ mod tests {
             // there is a meter at all.
             let last = if h > METER_ROWS { h - METER_ROWS } else { h };
             for row in [Some(l.title_y), l.context_y].into_iter().flatten() {
-                assert!(row < last, "row {row} of {l:?} is outside 0..{last} (h={h})");
+                assert!(
+                    row < last,
+                    "row {row} of {l:?} is outside 0..{last} (h={h})"
+                );
             }
             if let Some(art) = l.art {
                 assert!(art.y + art.height < last, "{art:?} under the meter (h={h})");
@@ -685,14 +681,7 @@ mod tests {
             v.render(area, &mut buf);
 
             let want = has_art(true, true, false, mode);
-            let got = layout(
-                area,
-                want,
-                false,
-                2.0,
-            )
-            .unwrap()
-            .art;
+            let got = layout(area, want, false, 2.0).unwrap().art;
             let text = grid(&buf);
             if let Some(rect) = got {
                 // the rect the host will paint on is the one the view

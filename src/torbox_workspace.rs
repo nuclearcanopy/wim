@@ -534,7 +534,6 @@ impl Workspace {
                 self.page = Page::Episodes;
                 self.selected = 0;
                 self.message = None;
-                return;
             }
             Some(SearchRow::LibraryItem(index)) => self.open_library_item(index),
             None => {}
@@ -766,13 +765,11 @@ mod tests {
             files: Vec::new(),
         });
         workspace.control_selected("delete");
-        assert!(
-            workspace
-                .message
-                .as_deref()
-                .unwrap()
-                .contains("press d again")
-        );
+        assert!(workspace
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("press d again"));
         assert!(!workspace.loading);
         std::fs::remove_file(token_path).ok();
     }

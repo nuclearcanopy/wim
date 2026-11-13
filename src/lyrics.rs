@@ -831,6 +831,7 @@ impl Loader {
         self.request_with_path(client, label, artist, title, album, duration_secs, None);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn request_local(
         &mut self,
         client: &Client,
@@ -852,6 +853,7 @@ impl Loader {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn request_with_path(
         &mut self,
         client: &Client,
@@ -876,6 +878,7 @@ impl Loader {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn request_subsonic(
         &mut self,
         client: &Client,

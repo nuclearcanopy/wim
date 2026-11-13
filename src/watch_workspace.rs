@@ -277,21 +277,20 @@ impl Workspace {
                     continue;
                 }
                 had_catalog = true;
-                match client.search(&manifest, &catalog.media_type, &catalog.id, &query) {
-                    Ok(response) => {
-                        successful_catalogs += 1;
-                        for preview in response.metas {
-                            if let Some(item) = preview.media_item() {
-                                if seen.insert(item.id.clone()) {
-                                    results.push(item);
-                                    if results.len() >= SEARCH_RESULT_LIMIT {
-                                        break;
-                                    }
+                if let Ok(response) =
+                    client.search(&manifest, &catalog.media_type, &catalog.id, &query)
+                {
+                    successful_catalogs += 1;
+                    for preview in response.metas {
+                        if let Some(item) = preview.media_item() {
+                            if seen.insert(item.id.clone()) {
+                                results.push(item);
+                                if results.len() >= SEARCH_RESULT_LIMIT {
+                                    break;
                                 }
                             }
                         }
                     }
-                    Err(_) => {}
                 }
                 if results.len() >= SEARCH_RESULT_LIMIT {
                     break;
