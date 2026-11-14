@@ -89,6 +89,11 @@ prompt, open them as a list: `j`/`k` move, `enter` plays the row, `a`
 queues it, `esc` or `q` closes.
 At the prompt `view(undo)` also opens the undo tree: `u`/`k` undo,
 `r`/`j` redo, `h`/`l` cross a fork, `esc` closes.
+Shellswim routes network streams through the same address-pinning media
+relay as wim and warns if it cannot start. Press `W` on an empty prompt
+for Watch (needs `WIM_STREMIO_ADDON_URL`, as in wim): `/` search, `enter`
+opens/advances, `[`/`]` seasons, `a` adds a torrent after confirmation,
+`backspace` goes back, `esc` closes; sources play only through the relay.
 Press `U` (default `u`, uppercased like the subtitle key) or run
 `view(settings)` for the settings editor: `j`/`k` select, `h`/`l`
 adjust, `enter` edits the ListenBrainz token or confirms an offline
