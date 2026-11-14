@@ -23,6 +23,9 @@ pub struct SwimSurface {
     /// Whether the last `view(now)` asked for the full readout, so a
     /// second one does not repeat itself. Purely cosmetic.
     pub verbose_now: bool,
+    /// The Shellswim host turns this request into its optional keybinds
+    /// workspace after the current Shellsong step has returned.
+    pub keybinds_requested: bool,
     /// Interactive prompt requested a live lyrics display. One-shot
     /// commands still print lyrics to stdout after the same lookup.
     pub lyrics_requested: bool,
@@ -92,7 +95,18 @@ impl Surface for Borrowed<'_> {
             // say it once, themselves.
             ViewTarget::Eq => op_fail(no_pane("equaliser", "wim's 'e'")),
             ViewTarget::Settings => op_fail(no_pane("settings", "wim's ','")),
-            ViewTarget::Keybinds => op_fail(no_pane("keybinds", "wim's 'K'")),
+            ViewTarget::Keybinds => {
+                self.state.keybinds_requested = true;
+                let keymap = wim::keymap::Keymap::from_overrides(&core.cfg.keybinds);
+                for action in wim::keymap::ALL_ACTIONS {
+                    core.console.note(format!(
+                        "{:>24}  {}",
+                        action.label(),
+                        wim::keymap::key_label(keymap.get(*action))
+                    ));
+                }
+                op_note("keybinds · K opens the editor".to_owned())
+            }
             ViewTarget::Suggestions => op_fail(no_pane("suggestions", "wim's 'g'")),
             ViewTarget::Starred => op_fail(format!(
                 "{}, but star(...) and view(queue) work here",

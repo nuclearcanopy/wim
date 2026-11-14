@@ -154,6 +154,11 @@ fn prompt() -> anyhow::Result<()> {
         if host.step() == Drive::Quit {
             break;
         }
+        if std::mem::take(&mut host.swim.keybinds_requested) && host.interactive_prompt {
+            keybinds_open = true;
+            keybinds_selected = 0;
+            keybinds_refused = None;
+        }
 
         let now_playing = host.now_playing();
         draw(
