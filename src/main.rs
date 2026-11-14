@@ -2107,7 +2107,7 @@ fn main() -> anyhow::Result<()> {
             // under it, so it is part of the pane a click there means;
             // without it those rows belong to nothing at all.
             hits.workspace = Some(Rect {
-                height: main_content.height + mini_bar_height,
+                height: main_content.height + mini_bar_row.height,
                 ..main_content
             });
             hits.bottom = Some(bottom);
@@ -2699,9 +2699,13 @@ fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let resize_hint = panels
-                .resize_mode
-                .then_some("resize mode: a=sidebar s=bottom bar, arrows stretch, r/esc exit");
+            let resize_hint_text = panels.resize_mode.then(|| {
+                format!(
+                    "resize mode: a/w=sidebar s/d=bottom bar, arrows stretch, {}/esc exit",
+                    keymap::key_label(keymap.get(KeyAction::ToggleResizeMode))
+                )
+            });
+            let resize_hint = resize_hint_text.as_deref();
             let flash_level =
                 flash.map(|(field, at)| (field, anim::decay(at.elapsed(), FLASH_DURATION)));
             let controls_rect = Rect {
@@ -4107,6 +4111,12 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 match act {
+                    // the help reference is read-only, so a click is as good
+                    // a way out as esc; the menus that hold a selection
+                    // keep swallowing it
+                    hit::Act::Swallowed(hit::Modal::Help) if click.kind == hit::Kind::Down => {
+                        help_open = false;
+                    }
                     hit::Act::Nothing | hit::Act::Swallowed(_) => {}
                     hit::Act::OpenSubtitleMenu => {
                         subtitle_menu_open = true;

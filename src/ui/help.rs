@@ -146,6 +146,16 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
         ],
     ),
     (
+        "modes",
+        &[
+            (Key::Fixed("h / l"), "scrub: seek back / forward"),
+            (Key::Fixed("shift+h / l"), "scrub: bigger steps"),
+            (Key::Fixed("enter / esc"), "scrub: commit the seek"),
+            (Key::Fixed("a w / s d"), "resize: pick sidebar / bar"),
+            (Key::Fixed("arrows"), "resize: stretch the panel"),
+        ],
+    ),
+    (
         "mouse",
         &[
             (Key::Fixed("click"), "focus pane / row"),
