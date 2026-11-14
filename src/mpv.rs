@@ -326,7 +326,7 @@ impl Drop for BackgroundCommand {
 /// linking libmpv directly; keeps the build free of C FFI/pkg-config and
 /// matches how mpv is normally driven by external controllers.
 pub struct Mpv {
-    child: Child,
+    child: Mutex<Child>,
     sock_path: PathBuf,
     /// Resolved on the first command rather than at spawn.
     ///
@@ -494,7 +494,7 @@ impl Mpv {
         });
 
         Ok(Mpv {
-            child,
+            child: Mutex::new(child),
             sock_path,
             sock: Arc::new(Mutex::new(Link::Pending(link_rx))),
             next_id: Arc::new(AtomicU64::new(FIRST_COMMAND_ID)),
@@ -765,6 +765,20 @@ fn command_batch_on(
 }
 
 impl Mpv {
+    /// Whether mpv has exited on its own (crashed, was killed, or quit).
+    /// Takes `&self`: the child handle lives behind a mutex so the
+    /// per-frame check needs no exclusive access to the player.
+    pub fn exited(&self) -> Option<String> {
+        let mut child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match child.try_wait() {
+            Ok(Some(status)) => Some(status.to_string()),
+            _ => None,
+        }
+    }
+
     pub fn events(&self) -> &Receiver<Event> {
         &self.events
     }
@@ -1246,17 +1260,23 @@ impl Drop for Mpv {
             .sock
             .try_lock()
             .is_ok_and(|link| matches!(*link, Link::Live(_)));
-        if connected && self.background_commands.load(Ordering::SeqCst) == 0 {
+        let quit_sent = connected && self.background_commands.load(Ordering::SeqCst) == 0;
+        if quit_sent {
             let _ = self.command(&[json!("quit")]);
-        } else {
-            let _ = self.child.kill();
+        }
+        let child = self
+            .child
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !quit_sent {
+            let _ = child.kill();
         }
         // A wedged mpv must not hang exit: give it a moment, then kill.
         let deadline = Instant::now() + Duration::from_secs(1);
-        while matches!(self.child.try_wait(), Ok(None)) {
+        while matches!(child.try_wait(), Ok(None)) {
             if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                let _ = child.kill();
+                let _ = child.wait();
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));

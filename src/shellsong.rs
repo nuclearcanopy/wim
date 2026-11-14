@@ -375,6 +375,8 @@ pub enum ViewTarget {
     Starred,
     Index,
     History,
+    /// Every notification so far, including the ones that left the screen.
+    Messages,
     Playlists,
     /// The defined variables, listed as `let` lines.
     Vars,
@@ -402,6 +404,7 @@ impl ViewTarget {
             ViewTarget::Queue
                 | ViewTarget::Index
                 | ViewTarget::History
+                | ViewTarget::Messages
                 | ViewTarget::Playlists
                 | ViewTarget::Vars
                 | ViewTarget::Bindings
@@ -447,6 +450,7 @@ const VIEW_NAMES: &[ViewName] = &[
     view("favorites", ViewTarget::Starred, false),
     view("index", ViewTarget::Index, true),
     view("history", ViewTarget::History, true),
+    view("messages", ViewTarget::Messages, true),
     view("playlists", ViewTarget::Playlists, true),
     view("vars", ViewTarget::Vars, true),
     view("variables", ViewTarget::Vars, false),
@@ -5668,6 +5672,7 @@ mod tests {
             ViewTarget::Starred,
             ViewTarget::Index,
             ViewTarget::History,
+            ViewTarget::Messages,
             ViewTarget::Playlists,
             ViewTarget::Vars,
             ViewTarget::Bindings,
@@ -5686,6 +5691,7 @@ mod tests {
                 ViewTarget::Starred => "starred",
                 ViewTarget::Index => "index",
                 ViewTarget::History => "history",
+                ViewTarget::Messages => "messages",
                 ViewTarget::Playlists => "playlists",
                 ViewTarget::Vars => "vars",
                 ViewTarget::Bindings => "bindings",

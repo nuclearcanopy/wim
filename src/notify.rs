@@ -137,14 +137,23 @@ impl Notification {
 }
 
 const MIN_LIFETIME: Duration = Duration::from_secs(2);
-const MAX_LIFETIME: Duration = Duration::from_secs(6);
 /// Keep transient feedback brief while allowing longer messages a little
-/// more time: two seconds minimum, one extra second per 30 characters,
-/// capped at six. Persistent download progress is unaffected.
-fn lifetime_for(message: &str) -> Duration {
+/// more time: one extra second per 30 characters. Info stays 2-6s; an
+/// alert or an error says something the user has to act on, so it gets
+/// longer (4-10s, 10-25s) and `view(messages)` keeps the history either
+/// way. Persistent download progress is unaffected.
+fn lifetime_for(severity: Severity, message: &str) -> Duration {
     let extra = Duration::from_secs((message.chars().count() / 30) as u64);
-    (MIN_LIFETIME + extra).min(MAX_LIFETIME)
+    let (base, cap) = match severity {
+        Severity::Info => (2, 6),
+        Severity::Alert => (4, 10),
+        Severity::Error => (10, 25),
+    };
+    (Duration::from_secs(base) + extra).min(Duration::from_secs(cap))
 }
+
+/// How many past messages `view(messages)` can show.
+const HISTORY_LEN: usize = 100;
 
 /// Caps how many stack up at once; a burst of failures (e.g. every
 /// configured server down at once) shouldn't paper over the whole
@@ -161,6 +170,7 @@ fn same_outcome(n: &Notification, severity: Severity, message: &str) -> bool {
 #[derive(Default)]
 pub struct Notifications {
     items: Vec<Notification>,
+    history: std::collections::VecDeque<(Severity, String)>,
 }
 
 impl Notifications {
@@ -179,8 +189,22 @@ impl Notifications {
         self.items.clear();
     }
 
+    /// Everything pushed so far, oldest first (bounded), including what
+    /// has already left the screen.
+    pub fn history(&self) -> impl Iterator<Item = &(Severity, String)> {
+        self.history.iter()
+    }
+
+    fn remember(&mut self, severity: Severity, message: &str) {
+        self.history.push_back((severity, message.to_owned()));
+        if self.history.len() > HISTORY_LEN {
+            self.history.pop_front();
+        }
+    }
+
     pub fn push(&mut self, severity: Severity, message: impl Into<String>) {
         let message = message.into();
+        self.remember(severity, &message);
         // a failure that re-fires every frame (a dead mpv ipc socket
         // being the one that actually happened) would otherwise stack
         // five identical boxes and then keep shoving the rest of the
@@ -193,10 +217,10 @@ impl Notifications {
         {
             existing.repeats += 1;
             existing.shown_at = Instant::now();
-            existing.lifetime = lifetime_for(&existing.text());
+            existing.lifetime = lifetime_for(severity, &existing.text());
             return;
         }
-        let lifetime = lifetime_for(&message);
+        let lifetime = lifetime_for(severity, &message);
         self.items.push(Notification {
             severity,
             label: message.clone(),
@@ -273,6 +297,7 @@ impl Notifications {
             self.push(severity, message);
             return;
         }
+        self.remember(severity, &message);
         let n = &mut self.items[at];
         n.severity = severity;
         n.label = message.clone();
@@ -281,7 +306,7 @@ impl Notifications {
         n.repeats = 1;
         n.progress = None;
         n.shown_at = Instant::now();
-        n.lifetime = lifetime_for(&n.message);
+        n.lifetime = lifetime_for(severity, &n.message);
     }
 
     /// Drops anything past its lifetime; called once per render frame
@@ -349,8 +374,31 @@ mod tests {
 
     #[test]
     fn ordinary_notification_lifetime_is_short_and_bounded() {
-        assert_eq!(lifetime_for("ok"), Duration::from_secs(2));
-        assert_eq!(lifetime_for(&"x".repeat(180)), Duration::from_secs(6));
+        assert_eq!(lifetime_for(Severity::Info, "ok"), Duration::from_secs(2));
+        assert_eq!(
+            lifetime_for(Severity::Info, &"x".repeat(180)),
+            Duration::from_secs(6)
+        );
+        // what must be acted on outlasts what is merely reported
+        assert!(lifetime_for(Severity::Error, "ok") > lifetime_for(Severity::Alert, "ok"));
+        assert!(lifetime_for(Severity::Alert, "ok") > lifetime_for(Severity::Info, "ok"));
+        assert_eq!(
+            lifetime_for(Severity::Error, &"x".repeat(900)),
+            Duration::from_secs(25)
+        );
+    }
+
+    #[test]
+    fn history_keeps_what_the_screen_dropped_and_is_bounded() {
+        let mut n = Notifications::default();
+        for i in 0..(HISTORY_LEN + 5) {
+            n.push(Severity::Error, format!("failure {i}"));
+        }
+        assert_eq!(n.history().count(), HISTORY_LEN);
+        assert_eq!(
+            n.history().last().unwrap().1,
+            format!("failure {}", HISTORY_LEN + 4)
+        );
     }
 
     #[test]

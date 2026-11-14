@@ -307,6 +307,7 @@ pub struct Host {
     pub notifications: Notifications,
     /// A server being added or reconnected, answering off the ui thread.
     pub pending_connect: Option<crate::nav_ui::PendingConnect>,
+    mpv_exit_reported: bool,
     pub play_queue: PlayQueue,
     pub previous_track: Option<SearchItem>,
     pub cache_index: Arc<Mutex<cache::CacheIndex>>,
@@ -527,6 +528,7 @@ impl Host {
             download_rx,
             downloading: HashSet::new(),
             pending_connect: None,
+            mpv_exit_reported: false,
             subtitle_tx,
             subtitle_rx,
             remote_search_tx,
@@ -814,6 +816,17 @@ impl Host {
     /// Each one is a `try_recv`, so this is the whole reason nothing
     /// in shellswim blocks.
     pub fn pump(&mut self) {
+        if !self.mpv_exit_reported {
+            if let Some(status) = self.player.exited() {
+                self.mpv_exit_reported = true;
+                self.notifications.push(
+                    Severity::Error,
+                    format!(
+                        "mpv exited ({status}); playback is unavailable until shellswim restarts"
+                    ),
+                );
+            }
+        }
         while let Ok(reply) = self.torbox_rx.try_recv() {
             self.torbox_pending = false;
             let now = self.start.elapsed();
