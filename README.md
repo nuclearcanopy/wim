@@ -80,6 +80,13 @@ Mouse capture is on by default; set `mouse = false` in the config to disable
 it. With capture enabled, holding Shift while dragging usually restores the
 terminal's text selection.
 
+Environment switches: `NO_COLOR=1` forces greyscale (including album art left
+on `auto`), `WIM_COLOR=semantic` adds state colours, `WIM_REDUCED_MOTION=1` (or
+`reduced_motion = true` in the config) stills the banner sweep and selection
+pulse, `WIM_BACKGROUND=light|dark` overrides light-terminal detection
+(`COLORFGBG`), and `WIM_TRUECOLOR=1` skips the 256-colour fallback chosen from
+`COLORTERM`/`TERM`.
+
 ## Home Manager
 
 The flake exports `homeManagerModules.default`. With the flake available as

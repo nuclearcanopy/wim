@@ -238,3 +238,21 @@ but these specifically have not been seen working:
 - the scrubber actually moving, and the idle poll costing nothing
 - `?` on an empty line
 - ctrl+c and ctrl+d leaving cleanly, and the terminal being restored
+
+## what wim has that shellswim does not
+
+intentional, so it stays a decision and not drift:
+
+| wim | shellswim |
+| --- | --- |
+| panes, banner, album art | one console and the scrubber |
+| mouse (click, drag the scrubber, wheel) | keyboard only |
+| resize mode, fullscreen keys (`F`, F11) | none; `video()` hands off to mpv |
+| help overlay with every key (`?`) | `help()` and `?` list commands |
+| onboarding for TorBox, ListenBrainz and library paths | first run offers lyrics and the server form; the rest are settings or config |
+| `K` keybinding editor, `u` settings, EQ and undo as panes | `view(keybinds)`, `view(settings)`, `view(eq)`, `view(undo)` open the same editors |
+| notifications as toasts, `view(messages)` for the history | notifications are printed into the scrollback; `view(messages)` lists the history |
+
+shellswim's subtitle, navidrome and settings keys (`T`, `N`, `U`) differ
+from wim's single-letter keys on purpose: the prompt owns the plain
+letters.
