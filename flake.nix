@@ -29,8 +29,11 @@
             # json ipc socket, see docs/architecture.md), not a linked
             # library: wrap the binary so it's on PATH without needing
             # it installed system-wide.
+            # shellswim drives the same mpv layer, so it needs it too.
             postInstall = ''
-              wrapProgram $out/bin/wim --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.mpv ]}
+              for bin in wim shellswim; do
+                wrapProgram $out/bin/$bin --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.mpv ]}
+              done
             '';
 
             meta = {
