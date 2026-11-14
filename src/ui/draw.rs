@@ -265,8 +265,13 @@ pub fn scrim(buf: &mut Buffer, area: Rect) {
 fn level_of(c: Color) -> f32 {
     match c {
         Color::Rgb(r, g, b) => (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0,
-        Color::Reset | Color::Black => 0.0,
-        // nothing in this app sets a named colour; treat an unknown one
+        Color::Reset | Color::Black | Color::Indexed(16) => 0.0,
+        // the 256-colour grey ramp `theme::shade` falls back to
+        Color::Indexed(231) | Color::White => 1.0,
+        Color::Indexed(n @ 232..=255) => f32::from(n - 231) / 25.0,
+        Color::DarkGray => 0.25,
+        Color::Gray => 0.6,
+        // nothing else in this app sets a named colour; treat an unknown one
         // as mid rather than guessing it dark and losing the shape.
         _ => 0.5,
     }

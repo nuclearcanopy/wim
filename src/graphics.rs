@@ -60,7 +60,14 @@ pub fn art_mode_for_picker(mode: config::AlbumArtMode, protocol_detected: bool) 
         config::AlbumArtMode::AsciiBw => browse::ArtMode::AsciiBw,
         config::AlbumArtMode::AsciiColor => browse::ArtMode::AsciiColor,
         config::AlbumArtMode::FullBw => browse::ArtMode::FullBw,
-        config::AlbumArtMode::FullColor | config::AlbumArtMode::Auto => browse::ArtMode::FullColor,
+        config::AlbumArtMode::FullColor => browse::ArtMode::FullColor,
+        // NO_COLOR is a request for no colour at all: when the config left
+        // the choice to us, art is greyscale too. An explicit full-color
+        // setting still wins.
+        config::AlbumArtMode::Auto if !cfg!(test) && std::env::var_os("NO_COLOR").is_some() => {
+            browse::ArtMode::FullBw
+        }
+        config::AlbumArtMode::Auto => browse::ArtMode::FullColor,
     };
     if protocol_detected {
         asked
