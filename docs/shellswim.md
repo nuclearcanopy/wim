@@ -66,6 +66,11 @@ First launch offers the same provider choices and optional Musixmatch
 key-file path as wim's setup. `shellswim -c 'view(lyrics)'` remains a
 plain-text, non-interactive command suitable for scripts.
 
+When a video starts, Shellswim starts the configured OpenSubtitles
+lookup in the background; downloaded subtitles are added only if that
+same video is still playing. Audio and setups without an OpenSubtitles
+key do not trigger a lookup.
+
 The prompt also has an optional queue workspace: press the default `Q`
 key on an empty prompt to open it. `j`/`k` or arrows select tracks,
 `enter` jumps playback to the selected track, `d` removes it, and `J`/`K`

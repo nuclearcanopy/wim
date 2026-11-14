@@ -729,10 +729,11 @@ impl Host {
         }
 
         // a track started, by advancing or by a loop-all restart.
-        // shellswim fired *none* of these before: no subtitle fetch,
-        // no scrobble tracking, and no per-identity eq, so a binding
-        // that worked in wim silently did nothing here.
         if let Some(track) = advanced {
+            // Keep video subtitle discovery aligned with Wim. The
+            // lookup is dispatched to its worker thread and is a no-op
+            // for audio or when no OpenSubtitles key is configured.
+            core::fire_subtitle_fetch(&self.cfg, &self.subtitle_tx, &track);
             if self.play_queue.current().is_some() {
                 self.console.note(format!("now playing: {}", label(&track)));
             }
