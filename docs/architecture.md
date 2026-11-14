@@ -132,13 +132,14 @@ the full modes there rather than cycling into a blank pane.
 pre-rename config values still parse as aliases: `blocks` is `ascii-bw`,
 and `sixel`/`kitty`/`iterm2` are `full-color`.
 
-## startup: nothing blocks the first frame
+## startup: render while the backend starts
 
-the app has to be on screen immediately, so the only work between
-process start and the first `terminal.draw` is work that cannot be
-deferred: reading config, spawning mpv, setting up the terminal. every
-other startup cost either runs on a background thread and streams its
-results into the main loop, or waits until the first frame is up.
+The first screen does not wait for mpv's socket, play-history parsing,
+cache accounting, or the persisted server catalog. Those tasks overlap
+the UI; cached rows and scan results are merged in bounded batches. Search
+editing remains responsive, while playback commands are retained until the
+player and the data they require are ready. The cache budget is initialized
+before playback or downloads can use it.
 
 - **local library scan** (`library::spawn_scan`): a tag read
   (`Probe::read`) per music file, the biggest cost of all; runs on its
@@ -154,12 +155,9 @@ results into the main loop, or waits until the first frame is up.
   ping + catalog + starred-songs fetch per server before the first
   frame, so a stalled server held the ui at a black screen for as long
   as it stalled.
-- **restored queue**: handing mpv a saved queue costs one blocking ipc
-  round-trip per track, so the appends happen on the first pass through
-  the main loop, right after the first `draw`. the index map is filled
-  by the same call that does each append (see "the queue is mpv's
-  playlist" below), so the ui never disagrees with what's actually
-  queued.
+- **restored queue**: path resolution, ordered mpv appends, and observer
+  registration run on a worker. The UI installs the mirrored queue only
+  after individual replies arrive, retaining only successful appends.
 - **subtitle auto-fetch** (`fire_subtitle_fetch`): two network
   round-trips, on a thread that reports the written file back over a
   channel; the main thread calls `sub_add`, since the `Mpv` handle

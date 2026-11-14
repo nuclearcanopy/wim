@@ -120,6 +120,39 @@ pub fn graphics_plausible() -> bool {
     graphics_plausible_in(&term, &program)
 }
 
+/// The protocol a terminal is known to speak from how it names itself, so
+/// no query needs to read stdin. Deliberately narrow: only identifiers the
+/// terminal sets for itself (`KITTY_WINDOW_ID` is inherited by children and
+/// is not used), and never inside tmux, whose passthrough needs the query.
+pub fn known_protocol_in(term: &str, program: &str) -> Option<ProtocolType> {
+    let (term, program) = (term.to_lowercase(), program.to_lowercase());
+    if term.starts_with("tmux") || term.starts_with("screen") || program == "tmux" {
+        return None;
+    }
+    if term == "xterm-kitty" || term == "xterm-ghostty" || program == "ghostty" {
+        Some(ProtocolType::Kitty)
+    } else if program.contains("wezterm") {
+        Some(ProtocolType::Iterm2)
+    } else {
+        None
+    }
+}
+
+/// A picker built without asking the terminal, when it names a known
+/// protocol and reports its cell size in pixels; otherwise the query runs.
+fn known_picker() -> Option<Picker> {
+    let term = std::env::var("TERM").unwrap_or_default();
+    let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    let protocol = known_protocol_in(&term, &program)?;
+    let ws = crossterm::terminal::window_size().ok()?;
+    if ws.width == 0 || ws.height == 0 || ws.columns == 0 || ws.rows == 0 {
+        return None;
+    }
+    let mut picker = Picker::from_fontsize((ws.width / ws.columns, ws.height / ws.rows));
+    picker.set_protocol_type(protocol);
+    Some(picker)
+}
+
 /// The decision itself, split from reading the environment so it is
 /// testable without mutating process-wide state.
 pub fn graphics_plausible_in(term: &str, program: &str) -> bool {
@@ -139,6 +172,27 @@ mod graphics_probe_tests {
     fn a_terminal_with_no_graphics_protocol_is_not_probed() {
         assert!(!graphics_plausible_in("alacritty", ""));
         assert!(!graphics_plausible_in("xterm-256color", "Alacritty"));
+    }
+
+    #[test]
+    fn only_self_identified_terminals_skip_the_query() {
+        assert_eq!(
+            known_protocol_in("xterm-kitty", ""),
+            Some(ProtocolType::Kitty)
+        );
+        assert_eq!(
+            known_protocol_in("xterm-256color", "ghostty"),
+            Some(ProtocolType::Kitty)
+        );
+        assert_eq!(
+            known_protocol_in("xterm-256color", "WezTerm"),
+            Some(ProtocolType::Iterm2)
+        );
+        // inside tmux the outer terminal's name is not the answer
+        assert_eq!(known_protocol_in("tmux-256color", "ghostty"), None);
+        assert_eq!(known_protocol_in("xterm-256color", "tmux"), None);
+        assert_eq!(known_protocol_in("xterm-256color", ""), None);
+        assert_eq!(known_protocol_in("foot", ""), None);
     }
 
     /// Everything else is asked, including terminals this code has
@@ -421,18 +475,48 @@ pub struct ArtProbe {
     /// Dropped the moment the answer lands, so applying it twice is
     /// not representable rather than guarded by a separate flag.
     answer: Option<Receiver<Option<Picker>>>,
+    started: bool,
     warned: bool,
 }
 
 impl ArtProbe {
+    /// Defer the stdio query until there is artwork to display. The query
+    /// reads stdin, so starting it on the empty home screen can eat the
+    /// user's very first keystrokes on a terminal that does not answer.
+    pub fn deferred(asked: config::AlbumArtMode) -> Self {
+        let pending = art_mode_for_picker(asked, false);
+        Self {
+            asked,
+            mode: pending,
+            pending,
+            picker: None,
+            answer: None,
+            started: false,
+            warned: false,
+        }
+    }
+
     /// Asks the terminal on its own thread: it may simply never
     /// answer, and `ratatui-image` then waits out a full second, which
     /// was the single largest thing the first frame sat behind. Call
     /// once raw mode is on, since the query saves and restores
     /// whatever termios state it finds.
     pub fn spawn(asked: config::AlbumArtMode) -> Self {
+        let mut probe = Self::deferred(asked);
+        probe.start();
+        probe
+    }
+
+    pub fn start(&mut self) {
+        if self.started {
+            return;
+        }
+        self.started = true;
         let (tx, rx) = mpsc::channel();
-        if graphics_plausible() {
+        if let Some(picker) = known_picker() {
+            let _ = tx.send(Some(picker));
+            crate::trace_mark!("graphics probe skipped (terminal identified itself)");
+        } else if graphics_plausible() {
             std::thread::spawn(move || {
                 let _ = tx.send(Picker::from_query_stdio().ok());
                 crate::trace_mark!("graphics probe answered");
@@ -447,12 +531,13 @@ impl ArtProbe {
             let _ = tx.send(None);
             crate::trace_mark!("graphics probe skipped (terminal has no protocol)");
         }
-        Self::waiting(asked, rx)
+        self.answer = Some(rx);
     }
 
     /// Pre-answer state: the config's mode as if no protocol existed,
     /// since a full mode with nothing to draw it is a blank pane and
     /// the first frames happen before the terminal has replied.
+    #[cfg(test)]
     fn waiting(asked: config::AlbumArtMode, answer: Receiver<Option<Picker>>) -> Self {
         let pending = art_mode_for_picker(asked, false);
         Self {
@@ -461,6 +546,7 @@ impl ArtProbe {
             pending,
             picker: None,
             answer: Some(answer),
+            started: true,
             warned: false,
         }
     }
@@ -476,6 +562,11 @@ impl ArtProbe {
         self.picker.as_mut()
     }
 
+    /// Whether a query is running that owns stdin until it answers.
+    pub fn in_flight(&self) -> bool {
+        self.started && self.answer.is_some()
+    }
+
     /// What the terminal answered, for the video output's own decision.
     pub fn protocol_type(&self) -> Option<ProtocolType> {
         self.picker.map(|p| p.protocol_type())
@@ -486,7 +577,7 @@ impl ArtProbe {
     /// on terminals skipped by the denylist, so callers must not use it
     /// alone to report "still detecting".
     pub fn probe_pending(&self) -> bool {
-        self.answer.is_some()
+        !self.started || self.answer.is_some()
     }
 
     /// The capability test, asked of the protocol and never of the
@@ -530,6 +621,7 @@ impl ArtProbe {
     /// row), stepping past the full modes this terminal cannot draw.
     /// Returns the alert for that, at most once per session.
     pub fn cycle(&mut self) -> Option<&'static str> {
+        self.start();
         let (next, skipped) = self.mode.cycle(self.real_graphics());
         self.mode = next;
         if !skipped || self.warned {
@@ -550,6 +642,22 @@ mod art_probe_tests {
         let mut p = Picker::from_fontsize((10, 20));
         p.set_protocol_type(ProtocolType::Kitty);
         p
+    }
+
+    /// The event loop stands aside only while a query is actually out:
+    /// never before it starts, and not after its answer is taken.
+    #[test]
+    fn the_query_owns_stdin_only_while_it_is_outstanding() {
+        let idle = ArtProbe::deferred(config::AlbumArtMode::Auto);
+        assert!(!idle.in_flight(), "nothing asked yet");
+        let (tx, rx) = mpsc::channel();
+        let mut art = ArtProbe::waiting(config::AlbumArtMode::Auto, rx);
+        assert!(art.in_flight());
+        assert!(art.poll().is_none(), "no answer yet");
+        assert!(art.in_flight());
+        tx.send(None).unwrap();
+        art.poll();
+        assert!(!art.in_flight(), "answer taken, stdin is the loop's again");
     }
 
     /// What `from_query_stdio` hands back when nothing answered at

@@ -258,9 +258,8 @@ pub fn tracks_dir() -> Result<PathBuf> {
 }
 
 /// One json line per tracked track. Same reasoning as `CatalogRow`
-/// and the same measurement behind it: this read is on the **main
-/// thread before the first frame** (main.rs builds the shared index
-/// there), and the write happens on every track change. At the size a
+/// and the same measurement behind it: the write happens on every track
+/// change, while startup reads it on a worker. At the size a
 /// long-running install reaches, toml was ~5x slower to parse and
 /// ~20x slower to render than this; see docs/startup-cache.md. One
 /// corrupt line also costs one track rather than the whole history,
@@ -333,8 +332,7 @@ fn play_entry(line: &str) -> Option<(String, CacheEntry)> {
 
 /// The map is pre-sized off the line count rather than grown: a map
 /// grown from empty rehashes every id it already holds a dozen times
-/// on the way up, and this is the one startup read still on the main
-/// thread, with nothing overlapping it, so it is first-frame time.
+/// on the way up. Startup parses it on a worker.
 /// Worth 1.07-1.16x of the parse, measured by `play_index_parse_legs`.
 ///
 /// Serial on purpose. Chunking the rows over a pool was measured and
@@ -469,14 +467,13 @@ fn playback_tree_bytes(dir: &Path) -> u64 {
     })
 }
 
-/// RAII lifetime for transient files handed to mpv. Construct once at each
-/// frontend's entry point so early errors and normal exits both clean up.
+/// RAII lifetime for transient files handed to mpv. Startup cleanup runs
+/// alongside the other cache work in `spawn_startup`; drop still handles this
+/// process's files even when initialization or playback fails.
 pub struct PlaybackFiles;
 
 impl PlaybackFiles {
     pub fn new() -> Self {
-        cleanup_stale_playback_files();
-        cleanup_playback_files();
         Self
     }
 }
@@ -519,6 +516,27 @@ fn cleanup_stale_playback_files() {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// Load history and account for disk usage off the terminal thread. Callers
+/// must wait for this result before playback or downloads: cleanup, eviction,
+/// and the budget snapshot have to finish before any writer can reserve space.
+pub fn spawn_startup(
+    max_bytes: u64,
+    eviction_days: Option<u64>,
+) -> std::sync::mpsc::Receiver<CacheIndex> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        cleanup_stale_playback_files();
+        cleanup_playback_files();
+        let mut index = CacheIndex::load();
+        if eviction_days.is_some_and(|days| index.sweep_stale(days.saturating_mul(24 * 3600)) > 0) {
+            let _ = index.save();
+        }
+        initialize_budget(max_bytes);
+        let _ = tx.send(index);
+    });
+    rx
 }
 
 /// Bumped whenever the row shapes below change; a catalog written by

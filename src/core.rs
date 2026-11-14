@@ -1479,19 +1479,21 @@ pub fn try_play(
 /// popping up for ordinary music playback. Properly embedding actual
 /// video in the workspace is separate, larger work; this is the
 /// narrow fix for audio never deserving a window at all.
-pub fn set_vid_for_item(player: &mpv::Mpv, item: &SearchItem) {
-    let is_video = matches!(
+pub fn video_track_mode(item: &SearchItem) -> &'static str {
+    if matches!(
         item,
         SearchItem::LocalVideo { .. }
             | SearchItem::TorBoxFile { video: true, .. }
             | SearchItem::WatchSource { .. }
-    );
-    let vid = if is_video {
-        serde_json::json!("auto")
+    ) {
+        "auto"
     } else {
-        serde_json::json!("no")
-    };
-    let _ = player.set_property("vid", vid);
+        "no"
+    }
+}
+
+pub fn set_vid_for_item(player: &mpv::Mpv, item: &SearchItem) {
+    let _ = player.set_property("vid", serde_json::json!(video_track_mode(item)));
     // Give mpv's native window and window-manager task switcher the same
     // user-facing name Wim shows; never expose a torrent release filename.
     let _ = player.set_property("force-media-title", serde_json::json!(label(item)));
