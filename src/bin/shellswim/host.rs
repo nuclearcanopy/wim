@@ -5,7 +5,7 @@
 //! locals); `CoreCtx` is still built per use, because the borrow of
 //! the core and the borrow of the surface have to stay disjoint.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -271,6 +271,20 @@ fn launch_torbox_op(op: Op, cfg: config::Config, tx: Sender<TorBoxReply>) {
     });
 }
 
+fn place_submitted_program(
+    active: bool,
+    core_waiting: bool,
+    waiting: &mut VecDeque<Box<Program>>,
+    program: Box<Program>,
+) -> Option<Box<Program>> {
+    if active || core_waiting || !waiting.is_empty() {
+        waiting.push_back(program);
+        None
+    } else {
+        Some(program)
+    }
+}
+
 pub struct Host {
     pub cfg: config::Config,
     pub player: mpv::Mpv,
@@ -330,6 +344,7 @@ pub struct Host {
     pub playback: mpv::Playback,
     pub console: Console,
     pub program: Option<Box<Program>>,
+    queued_programs: VecDeque<Box<Program>>,
     pub swim: SwimSurface,
     pub start: Instant,
     torbox_tx: Sender<TorBoxReply>,
@@ -485,6 +500,7 @@ impl Host {
             playback: mpv::Playback::default(),
             console: Console::new(),
             program: None,
+            queued_programs: VecDeque::new(),
             swim: SwimSurface::default(),
             start: Instant::now(),
             torbox_tx,
@@ -958,7 +974,11 @@ impl Host {
         // starts only once nothing else is running, so bound settings
         // cannot interrupt something the user typed.
         if self.program.is_none() {
-            self.program = self.swim.queued.take();
+            self.program = self
+                .swim
+                .queued
+                .take()
+                .or_else(|| self.queued_programs.pop_front());
         }
         let Some(program) = self.program.as_mut() else {
             return Drive::Done;
@@ -994,6 +1014,28 @@ impl Host {
         outcome
     }
 
+    /// Retain every submitted program. Shellsong programs may await a
+    /// search or remote operation for several frames, so replacing the
+    /// active slot would silently discard the user's earlier command.
+    pub fn submit_program(&mut self, program: Box<Program>) {
+        match place_submitted_program(
+            self.program.is_some(),
+            self.swim.queued.is_some(),
+            &mut self.queued_programs,
+            program,
+        ) {
+            Some(program) => self.program = Some(program),
+            None => self.console.note(format!(
+                "queued command ({} waiting)",
+                self.queued_programs.len()
+            )),
+        }
+    }
+
+    pub fn has_program_work(&self) -> bool {
+        self.program.is_some() || !self.queued_programs.is_empty() || self.swim.queued.is_some()
+    }
+
     /// Parses a line against the live bindings and script directory,
     /// the same environment used by interactive submission.
     pub fn begin(&mut self, line: &str) {
@@ -1004,7 +1046,7 @@ impl Host {
             read: Some(&read),
         };
         match Program::parse_in(line, &world) {
-            Ok(p) => self.program = Some(Box::new(p)),
+            Ok(p) => self.submit_program(Box::new(p)),
             Err(e) => self.console.fail(e.to_string()),
         }
     }
@@ -1016,16 +1058,18 @@ impl Host {
         let deadline = Instant::now() + ONESHOT_CAP;
         for line in lines {
             self.begin(line);
-            while self.program.is_some() {
+            while self.has_program_work() {
                 self.pump();
                 if self.step() == Drive::Quit {
                     self.program = None;
                     break;
                 }
-                if self.program.is_some() {
+                if self.has_program_work() {
                     if Instant::now() >= deadline {
                         self.console.fail(format!("gave up waiting on '{line}'"));
                         self.program = None;
+                        self.queued_programs.clear();
+                        self.swim.queued = None;
                         break;
                     }
                     std::thread::sleep(ONESHOT_TICK);
@@ -1072,5 +1116,55 @@ impl Host {
             self.lyrics_loader
                 .request(&self.lyrics_client, name, &artist, &title, &album, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod program_queue_tests {
+    use super::*;
+
+    #[test]
+    fn a_submission_waits_behind_the_active_program_without_replacing_it() {
+        let mut waiting = VecDeque::new();
+        let submitted = Box::new(Program::of(vec![Op::ClearConsole]));
+        let submitted_ptr = (&*submitted) as *const Program;
+        let active = place_submitted_program(true, false, &mut waiting, submitted);
+
+        assert!(active.is_none());
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(
+            (&*waiting.pop_front().unwrap()) as *const Program,
+            submitted_ptr
+        );
+    }
+
+    #[test]
+    fn a_submission_waits_behind_a_track_binding_even_when_idle() {
+        let mut waiting = VecDeque::new();
+        let submitted = Box::new(Program::of(vec![Op::ClearConsole]));
+
+        assert!(place_submitted_program(false, true, &mut waiting, submitted).is_none());
+        assert_eq!(waiting.len(), 1);
+    }
+
+    #[test]
+    fn later_submissions_keep_fifo_order_behind_core_work() {
+        let mut waiting = VecDeque::new();
+        let first = Box::new(Program::of(vec![Op::ClearConsole]));
+        let second = Box::new(Program::of(vec![Op::ClearQueue]));
+        let first_ptr = (&*first) as *const Program;
+        let second_ptr = (&*second) as *const Program;
+
+        assert!(place_submitted_program(false, true, &mut waiting, first).is_none());
+        assert!(place_submitted_program(false, false, &mut waiting, second).is_none());
+        assert_eq!(waiting.len(), 2);
+        assert_eq!(
+            (&*waiting.pop_front().unwrap()) as *const Program,
+            first_ptr
+        );
+        assert_eq!(
+            (&*waiting.pop_front().unwrap()) as *const Program,
+            second_ptr
+        );
     }
 }

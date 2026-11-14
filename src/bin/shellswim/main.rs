@@ -141,7 +141,7 @@ fn prompt() -> anyhow::Result<()> {
         // never blocks: a command that searches suspends on
         // `AwaitResults` and resumes on a later frame, once the
         // results for its query have settled.
-        if host.program.is_some() && host.step() == Drive::Quit {
+        if host.step() == Drive::Quit {
             break;
         }
 
@@ -189,7 +189,7 @@ fn prompt() -> anyhow::Result<()> {
         // when nothing does.
         let animating = lyrics_setup.is_some()
             || host.lyrics_pane.is_open()
-            || host.program.is_some()
+            || host.has_program_work()
             || host.console.cycle().is_some()
             || (now_playing.is_some() && !host.playback.paused);
         let timeout = if animating {
@@ -290,7 +290,7 @@ fn prompt() -> anyhow::Result<()> {
                 match action {
                     ConsoleAction::Run(p) => {
                         host.settle.notified("", false, host.now());
-                        host.program = Some(p);
+                        host.submit_program(p);
                     }
                     // nothing to close: the console *is* the screen.
                     ConsoleAction::Close | ConsoleAction::None => {}
