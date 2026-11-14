@@ -862,7 +862,7 @@ fn apply_connectivity(
     notifications: &mut Notifications,
 ) {
     use wim::navmanager::ConnectionStatus;
-    for (url, status) in &report {
+    for (url, _, status) in &report {
         match status {
             Some(ConnectionStatus::Unreachable) => {
                 notifications.push(Severity::Alert, format!("{url} is unreachable"))
@@ -876,8 +876,11 @@ fn apply_connectivity(
     }
     let Some(nm) = manager else { return };
     nm.connection_status.resize(servers.len(), None);
-    for (url, status) in report {
-        if let Some(index) = servers.iter().position(|server| server.url == url) {
+    for (url, user, status) in report {
+        if let Some(index) = servers
+            .iter()
+            .position(|server| server.url == url && server.username == user)
+        {
             nm.connection_status[index] = status;
         }
     }
@@ -8143,11 +8146,48 @@ mod connectivity_report_tests {
     }
 
     #[test]
+    fn two_profiles_on_one_url_each_get_their_own_status() {
+        let mut other = server("http://same");
+        other.username = "second".into();
+        let servers = [server("http://same"), other];
+        let report = vec![
+            (
+                "http://same".to_string(),
+                "u".to_string(),
+                Some(ConnectionStatus::Online),
+            ),
+            (
+                "http://same".to_string(),
+                "second".to_string(),
+                Some(ConnectionStatus::ConfigurationIssue),
+            ),
+        ];
+        let mut nm = NavManager::new();
+        let mut notifications = Notifications::default();
+        apply_connectivity(report, &servers, Some(&mut nm), &mut notifications);
+        assert_eq!(
+            nm.connection_status,
+            vec![
+                Some(ConnectionStatus::Online),
+                Some(ConnectionStatus::ConfigurationIssue)
+            ]
+        );
+    }
+
+    #[test]
     fn statuses_follow_the_url_not_the_position_when_the_list_changed() {
         // checked as [a, b], but a was removed while the checks ran
         let report = vec![
-            ("http://a".to_string(), Some(ConnectionStatus::Online)),
-            ("http://b".to_string(), Some(ConnectionStatus::Unreachable)),
+            (
+                "http://a".to_string(),
+                "u".to_string(),
+                Some(ConnectionStatus::Online),
+            ),
+            (
+                "http://b".to_string(),
+                "u".to_string(),
+                Some(ConnectionStatus::Unreachable),
+            ),
         ];
         let servers = [server("http://b")];
         let mut nm = NavManager::new();

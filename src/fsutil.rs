@@ -148,6 +148,14 @@ pub fn keep_newer_copy(path: &Path, found: u32) {
     }
 }
 
+/// A file on disk that this wim cannot parse, about to be replaced by a
+/// save: keep it as `<name>.corrupt` first (best effort).
+pub fn keep_unreadable_copy(path: &Path) {
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(".corrupt");
+    let _ = fs::copy(path, PathBuf::from(backup));
+}
+
 /// Moves an unreadable file aside as `<name>.corrupt` so the next save
 /// does not overwrite the only copy of what the user had. Best effort.
 pub fn quarantine(path: &Path) {

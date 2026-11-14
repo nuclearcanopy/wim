@@ -141,6 +141,9 @@ fn merge_index(
             None => mine.clone(),
             Some(other) => {
                 let before = base.get(id);
+                // no "both ended up identical" shortcut: two wims that each
+                // played the track in the same second end up identical and
+                // each really did play it, so the deltas must both count
                 if Some(mine) == before {
                     other
                 } else if Some(&other) == before {
@@ -1214,7 +1217,15 @@ fn save_in(dir: &Path, index: &CacheIndex) -> Result<()> {
     // that and this process's changes; see `merge_index`
     crate::fsutil::locked_update(&path, |current| {
         let theirs = current
-            .map(|bytes| parse_index_entries(&String::from_utf8_lossy(&bytes)).0)
+            .map(|bytes| {
+                let (entries, version) = parse_index_entries(&String::from_utf8_lossy(&bytes));
+                if version > INDEX_FORMAT {
+                    // a newer wim rewrote it while this one ran: this save
+                    // writes the older shape over it, so keep a copy
+                    crate::fsutil::keep_newer_copy(&path, version);
+                }
+                entries
+            })
             .unwrap_or_default();
         let base = index
             .baseline
@@ -3148,5 +3159,32 @@ mod two_wims_tests {
         assert_eq!(plays(&idx, "song"), 3);
         assert!(dir.join("index.ndjson.v7.bak").exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod merge_edge_tests {
+    use super::*;
+
+    fn dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wim-merge-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_save_over_a_newer_format_keeps_a_copy_of_what_it_replaces() {
+        let d = dir("newer-save");
+        let mut idx = CacheIndex::default();
+        idx.record_play("song", "2026-08-03");
+        fs::write(
+            d.join(INDEX_FILE),
+            "{\"wim_index\":9}\n{\"id\":\"x\",\"play_count\":5,\"future_field\":1}\n",
+        )
+        .unwrap();
+        save_in(&d, &idx).unwrap();
+        assert!(d.join("index.ndjson.v9.bak").exists());
+        let _ = fs::remove_dir_all(&d);
     }
 }

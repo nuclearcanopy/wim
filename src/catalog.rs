@@ -431,9 +431,9 @@ pub fn test_navidrome_connectivity(
 }
 
 /// What `spawn_connectivity_check` answers: the status of each server,
-/// keyed by url so the answer still lines up if the profile list changed
+/// keyed by url and user so the answer still lines up if the profile list changed
 /// while the checks ran.
-pub type ConnectivityReport = Vec<(String, Option<crate::navmanager::ConnectionStatus>)>;
+pub type ConnectivityReport = Vec<(String, String, Option<crate::navmanager::ConnectionStatus>)>;
 
 /// `test_navidrome_connectivity` off the caller's thread, for opening the
 /// profile manager without waiting out a dead server's connect timeout.
@@ -447,8 +447,8 @@ pub fn spawn_connectivity_check(
         let _ = tx.send(
             servers
                 .into_iter()
-                .map(|server| server.url)
                 .zip(statuses)
+                .map(|(server, status)| (server.url, server.username, status))
                 .collect(),
         );
     });

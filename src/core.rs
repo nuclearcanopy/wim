@@ -1701,12 +1701,16 @@ pub fn enqueue_track(
 /// comparing lengths. Returns what it did.
 pub fn reconcile_queue_after_timeout(player: &mpv::Mpv, queue: &mut PlayQueue) -> Option<String> {
     let playlist = player.get_property("playlist").ok()?;
-    let mpv_ids: Vec<Option<u64>> = playlist
-        .as_array()?
+    let entries = playlist.as_array()?;
+    let mpv_ids: Vec<Option<u64>> = entries
         .iter()
         .map(|entry| entry.get("id").and_then(serde_json::Value::as_u64))
         .collect();
-    reconcile_by_ids(queue, &mpv_ids, |index| {
+    let current = entries
+        .iter()
+        .find(|entry| entry.get("current").and_then(serde_json::Value::as_bool) == Some(true))
+        .and_then(|entry| entry.get("id").and_then(serde_json::Value::as_u64));
+    reconcile_by_ids(queue, &mpv_ids, current, |index| {
         let _ = player.playlist_remove(index);
     })
 }
@@ -1716,9 +1720,17 @@ pub fn reconcile_queue_after_timeout(player: &mpv::Mpv, queue: &mut PlayQueue) -
 fn reconcile_by_ids(
     queue: &mut PlayQueue,
     mpv_ids: &[Option<u64>],
+    current: Option<u64>,
     mut remove_from_mpv: impl FnMut(usize),
 ) -> Option<String> {
     let recorded = queue.entry_ids().to_vec();
+    // what mpv is playing is never reconciled away: if it is an entry this
+    // queue has not heard of (a load whose reply never came), the queue is
+    // the stale side, and deleting the track the user just asked for would
+    // be worse than the disagreement
+    if current.is_some_and(|id| !recorded.contains(&Some(id))) && !queue.entries().is_empty() {
+        return None;
+    }
     if recorded.iter().chain(mpv_ids).any(Option::is_none) {
         // some entry has no id: all that can be compared is the length
         return match mpv_ids.len().cmp(&recorded.len()) {
@@ -1746,7 +1758,7 @@ fn reconcile_by_ids(
     let extras: Vec<usize> = mpv_ids
         .iter()
         .enumerate()
-        .filter(|(_, id)| id.is_some_and(|id| !mine.contains(&id)))
+        .filter(|(_, id)| id.is_some_and(|id| !mine.contains(&id) && Some(id) != current))
         .map(|(index, _)| index)
         .collect();
     let missing: Vec<usize> = recorded
@@ -7861,16 +7873,24 @@ mod reconcile_by_id_tests {
     #[test]
     fn matching_lists_change_nothing() {
         let mut q = queue(&[Some(1), Some(2)]);
-        assert!(reconcile_by_ids(&mut q, &[Some(1), Some(2)], |_| panic!("no removal")).is_none());
+        assert!(
+            reconcile_by_ids(&mut q, &[Some(1), Some(2)], Some(1), |_| panic!(
+                "no removal"
+            ))
+            .is_none()
+        );
     }
 
     #[test]
     fn entries_mpv_took_behind_our_back_are_removed_from_mpv_by_index() {
         let mut q = queue(&[Some(1), Some(2)]);
         let mut removed = Vec::new();
-        let note = reconcile_by_ids(&mut q, &[Some(1), Some(7), Some(2), Some(8)], |i| {
-            removed.push(i)
-        });
+        let note = reconcile_by_ids(
+            &mut q,
+            &[Some(1), Some(7), Some(2), Some(8)],
+            Some(1),
+            |i| removed.push(i),
+        );
         assert!(note.is_some());
         // back to front, and the middle one too: the *position* is where
         // mpv holds it, not where it would have been appended
@@ -7881,18 +7901,32 @@ mod reconcile_by_id_tests {
     #[test]
     fn recorded_entries_mpv_never_took_are_forgotten_wherever_they_are() {
         let mut q = queue(&[Some(1), Some(2), Some(3)]);
-        let note = reconcile_by_ids(&mut q, &[Some(1), Some(3)], |_| panic!("nothing extra"));
+        let note = reconcile_by_ids(&mut q, &[Some(1), Some(3)], Some(1), |_| {
+            panic!("nothing extra")
+        });
         assert!(note.is_some());
         assert_eq!(q.entry_ids(), &[Some(1), Some(3)]);
+    }
+
+    #[test]
+    fn the_entry_mpv_is_playing_is_never_reconciled_away() {
+        // a `loadfile replace` whose reply never came: mpv plays id 9, which
+        // the queue never recorded, and every recorded entry is gone
+        let mut q = queue(&[Some(1), Some(2)]);
+        let note = reconcile_by_ids(&mut q, &[Some(9)], Some(9), |_| panic!("must not remove"));
+        assert!(note.is_none());
+        assert_eq!(q.entry_ids(), &[Some(1), Some(2)]);
     }
 
     #[test]
     fn without_ids_only_the_length_can_be_compared() {
         let mut q = queue(&[None, None, None]);
         let mut removed = Vec::new();
-        reconcile_by_ids(&mut q, &[None, None, None, None, None], |i| removed.push(i));
+        reconcile_by_ids(&mut q, &[None, None, None, None, None], None, |i| {
+            removed.push(i)
+        });
         assert_eq!(removed, vec![4, 3]);
-        reconcile_by_ids(&mut q, &[None], |_| {});
+        reconcile_by_ids(&mut q, &[None], None, |_| {});
         assert_eq!(q.entries().len(), 1);
     }
 }

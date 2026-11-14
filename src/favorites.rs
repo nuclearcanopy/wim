@@ -142,11 +142,25 @@ fn load_from(path: &Path) -> Favorites {
 
 fn save_to(path: &Path, favorites: &Favorites) -> Result<()> {
     crate::fsutil::locked_update(path, |current| {
-        let theirs = current
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .and_then(|raw| toml::from_str::<Favorites>(&raw).ok())
-            .map(|other| other.paths)
-            .unwrap_or_default();
+        let theirs = match current {
+            None => HashSet::new(),
+            Some(bytes) => match String::from_utf8(bytes)
+                .ok()
+                .and_then(|raw| toml::from_str::<Favorites>(&raw).ok())
+            {
+                Some(other) => {
+                    if other.version > FORMAT {
+                        crate::fsutil::keep_newer_copy(path, other.version);
+                    }
+                    other.paths
+                }
+                None => {
+                    // not ours to understand and about to be replaced
+                    crate::fsutil::keep_unreadable_copy(path);
+                    HashSet::new()
+                }
+            },
+        };
         let base = favorites
             .baseline
             .lock()
@@ -297,6 +311,20 @@ mod on_disk_format {
         let loaded = load_from(&path);
         assert!(loaded.is_starred("/x"));
         assert!(dir.join("favorites.toml.v5.bak").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_save_over_an_unreadable_file_keeps_a_copy_of_it() {
+        let dir = scratch_dir("unreadable-save");
+        let path = dir.join("favorites.toml");
+        fs::write(&path, "this is [[[ not toml").unwrap();
+        save_to(&path, &two_stars()).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("favorites.toml.corrupt")).unwrap(),
+            "this is [[[ not toml"
+        );
+        assert_eq!(load_from(&path), two_stars());
         fs::remove_dir_all(&dir).ok();
     }
 
