@@ -50,8 +50,9 @@ answers, and only one of them is true.
 | printed in the core, identically in both | `view(queue)`, `view(index)`, `view(history)`, `view(playlists)`, `view(help)` |
 | dedicated interactive view / printed by one-shot | `view(lyrics)` |
 | printed by shellswim / opens its editor interactively | `view(keybinds)` |
+| printed settings snapshot | `view(settings)` |
 | printed by shellswim | `view(now)` |
-| declined, naming wim | `view(eq)`, `view(settings)`, `view(starred)`, `view(suggestions)` |
+| declined, naming wim | `view(eq)`, `view(starred)`, `view(suggestions)` |
 | declined, naming a command that works | `up()`/`down()`/`top()`/`bottom()`, `go()` on a browse row, opening an album's page |
 
 the first row is not a shellswim decision: `ViewTarget::is_screen()`
