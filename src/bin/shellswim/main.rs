@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::Style;
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use wim::core::{self, Drive};
@@ -146,6 +147,7 @@ fn prompt() -> anyhow::Result<()> {
     let mut keybinds_refused: Option<String> = None;
     let mut eq_menu = eqm::EqMenuPane::default();
     let mut settings_state = settings::SettingsState::default();
+    let mut list_view: Option<(surface::ListWorkspace, usize)> = None;
 
     loop {
         host.pump();
@@ -168,6 +170,11 @@ fn prompt() -> anyhow::Result<()> {
             eq_menu.open(host.app.eq_source, host.cfg.eq_custom_presets.len());
         }
 
+        if let Some(list) = host.swim.list_requested.take() {
+            if host.interactive_prompt && !list.rows.is_empty() {
+                list_view = Some((list, 0));
+            }
+        }
         if std::mem::take(&mut host.swim.settings_requested) && host.interactive_prompt {
             settings_state.open = true;
         }
@@ -210,6 +217,7 @@ fn prompt() -> anyhow::Result<()> {
                 keybinds_selected,
                 keybinds_capturing,
                 keybinds_refused: keybinds_refused.as_deref(),
+                list: list_view.as_ref().map(|(list, selected)| (list, *selected)),
                 settings: settings_values
                     .as_deref()
                     .map(|values| (values, settings_state.selected)),
@@ -244,6 +252,7 @@ fn prompt() -> anyhow::Result<()> {
             || keybinds_open
             || eq_menu.is_open()
             || settings_state.open
+            || list_view.is_some()
             || host.lyrics_pane.is_open()
             || host.has_program_work()
             || host.console.cycle().is_some()
@@ -393,6 +402,20 @@ fn prompt() -> anyhow::Result<()> {
                             }
                             _ => {}
                         }
+                    }
+                    continue;
+                }
+                if let Some((list, selected)) = &mut list_view {
+                    let last = list.rows.len().saturating_sub(1);
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => list_view = None,
+                        KeyCode::Char('j') | KeyCode::Down => *selected = (*selected + 1).min(last),
+                        KeyCode::Char('k') | KeyCode::Up => *selected = selected.saturating_sub(1),
+                        KeyCode::Enter | KeyCode::Char('a') => {
+                            let item = list.rows[*selected].0.clone();
+                            host.act_on_item(item, key.code == KeyCode::Char('a'));
+                        }
+                        _ => {}
                     }
                     continue;
                 }
@@ -759,6 +782,7 @@ struct Screen<'a> {
     keybinds_refused: Option<&'a str>,
     eq: Option<EqScreen<'a>>,
     settings: Option<(&'a [String], usize)>,
+    list: Option<(&'a surface::ListWorkspace, usize)>,
 }
 
 struct EqScreen<'a> {
@@ -940,6 +964,21 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
                     },
                     body,
                 );
+            } else if let Some((list, selected)) = s.list {
+                let height = body.height.saturating_sub(3) as usize;
+                let offset = selected.saturating_sub(height.saturating_sub(1));
+                let mut lines = vec![Line::from(format!(
+                    "{} · enter play · a queue · esc close",
+                    list.title
+                ))];
+                lines.push(Line::from(""));
+                lines.extend(list.rows.iter().enumerate().skip(offset).take(height).map(
+                    |(index, (_, text))| {
+                        let marker = if index == selected { "> " } else { "  " };
+                        Line::from(format!("{marker}{text}"))
+                    },
+                ));
+                f.render_widget(Paragraph::new(lines), body);
             } else if let Some((values, selected)) = s.settings {
                 let shown: Vec<&str> = values.iter().map(String::as_str).collect();
                 f.render_widget(

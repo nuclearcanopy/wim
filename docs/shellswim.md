@@ -84,6 +84,9 @@ Press `K` for the keybind editor: `j`/`k` select an action, `r` captures
 a replacement, `0` resets one action, and `R` resets all bindings.
 Reserved or already-used keys are refused rather than saved as dead
 bindings.
+`view(starred)` and `view(suggestions)` print their rows and, at the
+prompt, open them as a list: `j`/`k` move, `enter` plays the row, `a`
+queues it, `esc` or `q` closes.
 Press `U` (default `u`, uppercased like the subtitle key) or run
 `view(settings)` for the settings editor: `j`/`k` select, `h`/`l`
 adjust, `enter` edits the ListenBrainz token or confirms an offline
