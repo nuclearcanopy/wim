@@ -3693,6 +3693,17 @@ fn main() -> anyhow::Result<()> {
         };
         if let Some(ev) = ev {
             last_input = Instant::now();
+            // only the resize notice is on screen below the minimum size,
+            // so input must not act on an interface nobody can see
+            if matches!(ev, Event::Key(_) | Event::Mouse(_) | Event::Paste(_))
+                && !matches!(&ev, Event::Key(key) if key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL))
+                && crossterm::terminal::size().is_ok_and(|(cols, rows)| {
+                    cols < ui::draw::MIN_COLS || rows < ui::draw::MIN_ROWS
+                })
+            {
+                continue;
+            }
             if !input_ready {
                 if matches!(&ev, Event::Key(key) if key.code == KeyCode::Char('c')
                     && key.modifiers.contains(KeyModifiers::CONTROL))
@@ -3763,28 +3774,30 @@ fn main() -> anyhow::Result<()> {
                 if crossfade_open {
                     continue;
                 }
-                let cleaned = clean_paste(text);
-                let text = &cleaned;
+                // single-line credential/path fields only; the search box
+                // and console keep what was pasted
+                let field = clean_paste(text);
+                let field = field.as_str();
                 if let Some(ob) = &mut onboarding {
                     match ob.step {
-                        Step::Navidrome => ob.login.current_mut().push_str(text),
-                        Step::TorBox => ob.torbox_token_file_input.push_str(text),
-                        Step::ListenBrainz => ob.listenbrainz_token_input.push_str(text),
-                        Step::Lyrics => ob.musixmatch_key_file_input.push_str(text),
-                        Step::LibraryPaths => ob.path_input.push_str(text),
+                        Step::Navidrome => ob.login.current_mut().push_str(field),
+                        Step::TorBox => ob.torbox_token_file_input.push_str(field),
+                        Step::ListenBrainz => ob.listenbrainz_token_input.push_str(field),
+                        Step::Lyrics => ob.musixmatch_key_file_input.push_str(field),
+                        Step::LibraryPaths => ob.path_input.push_str(field),
                         _ => {}
                     }
                 } else if let Some(nm) = &mut nav_manager {
                     if let NavManagerStep::Add(form) = &mut nm.step {
-                        form.current_mut().push_str(text);
+                        form.current_mut().push_str(field);
                     }
                 } else if torbox_open && torbox_workspace.link_input.is_some() {
                     if let Some(input) = &mut torbox_workspace.link_input {
-                        input.push_str(text);
+                        input.push_str(field);
                     }
                 } else if torbox_open && torbox_workspace.page == wim::torbox_workspace::Page::Setup
                 {
-                    torbox_workspace.token_path_input.push_str(text);
+                    torbox_workspace.token_path_input.push_str(field);
                 } else if torbox_open
                     && torbox_workspace.page == wim::torbox_workspace::Page::Search
                     && torbox_workspace.search_editing
@@ -3793,7 +3806,7 @@ fn main() -> anyhow::Result<()> {
                 } else if settings_menu_open && settings_token_editing {
                     // long random tokens are exactly the kind of thing
                     // worth pasting rather than typing by hand.
-                    settings_token_input.push_str(text);
+                    settings_token_input.push_str(field);
                 } else if console_open {
                     // a bracketed paste goes into the console line
                     // literally, with no auto-pairing; same claim over
@@ -7810,5 +7823,17 @@ mod browse_visibility_tests {
         focus_open_browse(&mut focus, &mut player_minimized);
         assert_eq!(focus, Focus::Workspace);
         assert!(player_minimized);
+    }
+}
+
+#[cfg(test)]
+mod clean_paste_tests {
+    use super::clean_paste;
+
+    #[test]
+    fn field_paste_loses_newlines_controls_and_edge_space() {
+        assert_eq!(clean_paste("  hunter2\r\n"), "hunter2");
+        assert_eq!(clean_paste("a\x1bb"), "ab");
+        assert_eq!(clean_paste("my pass word"), "my pass word");
     }
 }

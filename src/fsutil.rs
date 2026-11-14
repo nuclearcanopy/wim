@@ -45,8 +45,12 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         file.write_all(contents)?;
         file.sync_all()?;
         fs::rename(&temp, &target).with_context(|| format!("replacing {}", target.display()))?;
+        // the new file is already in place; a filesystem that cannot
+        // fsync a directory must not turn that into a reported failure
         #[cfg(unix)]
-        fs::File::open(&dir)?.sync_all()?;
+        if let Ok(handle) = fs::File::open(&dir) {
+            let _ = handle.sync_all();
+        }
         Ok(())
     })();
     if result.is_err() {
