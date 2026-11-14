@@ -178,6 +178,7 @@ fn prompt() -> anyhow::Result<()> {
             break;
         }
         nav_ui::poll(&mut host, nav.as_mut());
+        nav_ui::poll_connectivity(&mut host, nav.as_mut());
         if first_frame {
             // Nothing, including the host pump, may touch mpv before draw.
         } else if let Some(rx) = &observing {

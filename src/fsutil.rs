@@ -18,6 +18,19 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 /// a regular file.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    write_replacing(&target, contents, 0o600)
+}
+
+/// For a file the user is meant to read from outside wim (a subtitle
+/// sidecar beside a video): mode 0644, and a symlink already sitting at
+/// `path` is *replaced* by the new regular file rather than written
+/// through, so a link planted in a shared media directory cannot aim the
+/// write at another file.
+pub fn atomic_write_beside(path: &Path, contents: &[u8]) -> Result<()> {
+    write_replacing(path, contents, 0o644)
+}
+
+fn write_replacing(target: &Path, contents: &[u8], mode: u32) -> Result<()> {
     let dir = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -37,14 +50,16 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options.mode(mode);
         }
+        #[cfg(not(unix))]
+        let _ = mode;
         let mut file = options
             .open(&temp)
             .with_context(|| format!("writing {}", target.display()))?;
         file.write_all(contents)?;
         file.sync_all()?;
-        fs::rename(&temp, &target).with_context(|| format!("replacing {}", target.display()))?;
+        fs::rename(&temp, target).with_context(|| format!("replacing {}", target.display()))?;
         // the new file is already in place; a filesystem that cannot
         // fsync a directory must not turn that into a reported failure
         #[cfg(unix)]
@@ -108,6 +123,28 @@ mod atomic_write_tests {
         assert_eq!(
             fs::metadata(&real).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn beside_replaces_a_planted_symlink_instead_of_writing_through_it() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = scratch("beside");
+        let victim = dir.join("victim.txt");
+        fs::write(&victim, "precious").unwrap();
+        let sidecar = dir.join("movie.srt");
+        symlink(&victim, &sidecar).unwrap();
+        atomic_write_beside(&sidecar, b"1\n00:00:01,000 --> 00:00:02,000\nhi\n").unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        assert!(!fs::symlink_metadata(&sidecar)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777,
+            0o644
         );
         let _ = fs::remove_dir_all(&dir);
     }

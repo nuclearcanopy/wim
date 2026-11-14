@@ -69,7 +69,7 @@ fn write_state(path: &Path, body: &str) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
-    std::fs::write(path, body).map_err(|e| format!("writing {}: {e}", path.display()))
+    crate::fsutil::atomic_write(path, body.as_bytes()).map_err(|e| e.to_string())
 }
 
 // ------------------------------------------------- bound settings

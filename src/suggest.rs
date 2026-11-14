@@ -24,7 +24,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::cache::{self, CacheIndex};
@@ -359,7 +359,7 @@ impl EnrichmentCache {
             fs::create_dir_all(parent)?;
         }
         let toml = toml::to_string_pretty(self)?;
-        fs::write(&path, toml).with_context(|| format!("writing {}", path.display()))?;
+        crate::fsutil::atomic_write(&path, toml.as_bytes())?;
         Ok(())
     }
 
