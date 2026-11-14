@@ -33,17 +33,21 @@ would run: play(crest)
   played the best song/album match for 'crest'
 
 $ shellswim -c 'view(eq)'; echo $?
-shellswim has no equaliser pane; wim's 'e' has it
-1
+equalizer: on · flat
+   31 Hz  +0.0 dB
+   ...
+presets: flat, bass boost, vocal boost, treble boost, rock, classical
+choose a curve with eq(name) · E opens the editor
+0
 ```
 
-## what it will not do, and how it says so
+## what each view does here
 
-shellswim has no general pane system, so most `view(...)` targets have
-nowhere to go. it declines them, by name, pointing at the key in wim that opens
-them. It has dedicated live views for lyrics and now-playing. It does not no-op and it does not pretend: `view(eq)` doing
-nothing and `view(eq)` saying where the eq lives are different
-answers, and only one of them is true.
+shellswim has no general pane system, so every `view(...)` target prints
+its content as lines (scripts and `-c` get exactly that). At the
+interactive prompt the targets that have a workspace also open it. A
+target that can do neither declines by name rather than no-op, because
+"did nothing" and "says why" are different answers.
 
 | | |
 | --- | --- |
