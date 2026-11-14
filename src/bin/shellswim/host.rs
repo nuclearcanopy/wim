@@ -1013,8 +1013,17 @@ impl Host {
         let mut drained = false;
         let mut advanced: Option<SearchItem> = None;
         while let Ok(ev) = self.player.events().try_recv() {
-            let mpv::Event::PropertyChange { name, value } = ev else {
-                continue;
+            let (name, value) = match ev {
+                mpv::Event::PropertyChange { name, value } => (name, value),
+                mpv::Event::StartFile {
+                    entry_id: Some(entry_id),
+                } => {
+                    if let PosChange::Advanced(_) = self.play_queue.set_playing_entry(entry_id) {
+                        advanced = self.play_queue.current().cloned();
+                    }
+                    continue;
+                }
+                mpv::Event::StartFile { entry_id: None } => continue,
             };
             if self.playback.apply(&name, &value) {
                 continue;

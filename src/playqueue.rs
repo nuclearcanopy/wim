@@ -56,6 +56,14 @@ pub struct Appended {
 #[derive(Debug, Default)]
 pub struct PlayQueue {
     entries: Vec<SearchItem>,
+    /// mpv's own id for each entry, parallel to `entries`. Ids are never
+    /// reused within an mpv run, so "which entry started" can be answered
+    /// by id: an event that was in flight when the playlist was rewritten
+    /// names an id that is no longer here and is ignored, where the same
+    /// event read as a *position* would land on whatever now sits there.
+    /// `None` for an entry mpv gave no id for (an old mpv, or a path that
+    /// predates ids); those fall back to position.
+    ids: Vec<Option<u64>>,
     pos: Option<usize>,
     /// Everything played or queued this session, kept purely so "loop
     /// all" has something to restart from. Deliberately *not*
@@ -69,16 +77,29 @@ impl PlayQueue {
     /// A brand new play session: `items` is mpv's whole playlist, index
     /// 0 is what's playing now, and loop-all restarts from this list.
     pub fn reset(&mut self, items: Vec<SearchItem>) {
+        let ids = vec![None; items.len()];
+        self.reset_with_ids(items, ids);
+    }
+
+    /// `reset` with the entry id mpv answered each `loadfile` with.
+    pub fn reset_with_ids(&mut self, items: Vec<SearchItem>, ids: Vec<Option<u64>>) {
         self.session = items.clone();
-        self.rebuild(items);
+        self.rebuild_with_ids(items, ids);
     }
 
     /// The same session re-laid-out (back/previous, a loop-all
     /// restart): index 0 is what's playing now, but the loop-all
     /// restart point is left alone.
     pub fn rebuild(&mut self, items: Vec<SearchItem>) {
+        let ids = vec![None; items.len()];
+        self.rebuild_with_ids(items, ids);
+    }
+
+    pub fn rebuild_with_ids(&mut self, items: Vec<SearchItem>, mut ids: Vec<Option<u64>>) {
+        ids.resize(items.len(), None);
         self.pos = (!items.is_empty()).then_some(0);
         self.entries = items;
+        self.ids = ids;
     }
 
     /// Appends one track. With `shuffle` on it then moves the new entry
@@ -87,8 +108,13 @@ impl PlayQueue {
     /// `App::enqueue` used to do to its own copy of the queue only,
     /// desyncing it from mpv's append-only playlist on the spot).
     pub fn append(&mut self, item: SearchItem, shuffle: bool) -> Appended {
+        self.append_with_id(item, None, shuffle)
+    }
+
+    pub fn append_with_id(&mut self, item: SearchItem, id: Option<u64>, shuffle: bool) -> Appended {
         self.session.push(item.clone());
         self.entries.push(item);
+        self.ids.push(id);
         let appended_at = self.entries.len() - 1;
         // the first upcoming slot and the appended slot being the same
         // means there's nowhere else for it to go.
@@ -102,6 +128,8 @@ impl PlayQueue {
         let to = rand::thread_rng().gen_range(first_upcoming..appended_at);
         let item = self.entries.remove(appended_at);
         self.entries.insert(to, item);
+        let id = self.ids.remove(appended_at);
+        self.ids.insert(to, id);
         Appended {
             appended_at,
             moved_to: Some(to),
@@ -113,12 +141,20 @@ impl PlayQueue {
     /// `[current] + items` at position 0. The already-played prefix
     /// goes from mpv, so it goes from the index map too.
     pub fn replace_upcoming(&mut self, items: Vec<SearchItem>) {
+        let ids = vec![None; items.len()];
+        self.replace_upcoming_with_ids(items, ids);
+    }
+
+    pub fn replace_upcoming_with_ids(&mut self, items: Vec<SearchItem>, ids: Vec<Option<u64>>) {
         let mut next = Vec::with_capacity(items.len() + 1);
+        let mut next_ids = Vec::with_capacity(items.len() + 1);
         if let Some(current) = self.current().cloned() {
             next.push(current);
+            next_ids.push(self.pos.and_then(|p| self.ids.get(p).copied().flatten()));
         }
         next.extend(items);
-        self.rebuild(next);
+        next_ids.extend(ids);
+        self.rebuild_with_ids(next, next_ids);
     }
 
     /// Everything upcoming goes, and *stops counting* as part of the
@@ -140,7 +176,13 @@ impl PlayQueue {
             self.forget(item);
         }
         let next: Vec<SearchItem> = self.current().cloned().into_iter().collect();
-        self.rebuild(next);
+        let next_ids: Vec<Option<u64>> = self
+            .pos
+            .map(|p| self.ids.get(p).copied().flatten())
+            .into_iter()
+            .take(next.len())
+            .collect();
+        self.rebuild_with_ids(next, next_ids);
     }
 
     /// Drops one occurrence of `item` from the session.
@@ -173,6 +215,7 @@ impl PlayQueue {
         let gone = self.entries[index].clone();
         self.forget(&gone);
         self.entries.remove(index);
+        self.ids.remove(index);
         if let Some(p) = self.pos {
             // the same *track*, not the same number, so an entry
             // removed ahead of the playing one shifts it down.
@@ -200,6 +243,8 @@ impl PlayQueue {
         }
         let item = self.entries.remove(from);
         self.entries.insert(to, item);
+        let id = self.ids.remove(from);
+        self.ids.insert(to, id);
         if let Some(p) = self.pos {
             self.pos = Some(if p == from {
                 to
@@ -237,11 +282,37 @@ impl PlayQueue {
         if idx >= self.entries.len() {
             return PosChange::Unresolved;
         }
+        // an entry with an id is resolved by `set_playing_entry`, from
+        // mpv's `start-file`; a bare position may have been overtaken by a
+        // playlist rewrite, so it only speaks for entries without one.
+        if self.ids[idx].is_some() {
+            return PosChange::Unchanged;
+        }
         if self.pos == Some(idx) {
             return PosChange::Unchanged;
         }
         self.pos = Some(idx);
         PosChange::Advanced(idx)
+    }
+
+    /// mpv started the entry with this id. Resolved by id, so an event
+    /// that was queued before the playlist was rewritten (its id no longer
+    /// exists here) is `Unresolved` instead of pointing at a different
+    /// track that now has the same position.
+    pub fn set_playing_entry(&mut self, id: u64) -> PosChange {
+        let Some(idx) = self.ids.iter().position(|slot| *slot == Some(id)) else {
+            return PosChange::Unresolved;
+        };
+        if self.pos == Some(idx) {
+            return PosChange::Unchanged;
+        }
+        self.pos = Some(idx);
+        PosChange::Advanced(idx)
+    }
+
+    /// The ids mpv reported for each entry, parallel to `entries`.
+    pub fn entry_ids(&self) -> &[Option<u64>] {
+        &self.ids
     }
 
     pub fn current(&self) -> Option<&SearchItem> {
@@ -265,6 +336,7 @@ impl PlayQueue {
     /// entries than were recorded (an append it never accepted).
     pub fn truncate(&mut self, len: usize) {
         self.entries.truncate(len);
+        self.ids.truncate(len);
         if self.pos.is_some_and(|p| p >= len) {
             self.pos = len.checked_sub(1);
         }
@@ -296,6 +368,7 @@ impl PlayQueue {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.ids.clear();
         self.session.clear();
         self.pos = None;
     }
@@ -557,6 +630,78 @@ mod tests {
     /// every later remove, move and jump address the wrong track, with
     /// no message. the recovery is this move, so it has to be exact
     /// including the play position.
+    fn queue_with_ids(names: &[&str]) -> PlayQueue {
+        let mut q = PlayQueue::default();
+        q.reset_with_ids(
+            names.iter().map(|n| song(n)).collect(),
+            (1..=names.len() as u64).map(Some).collect(),
+        );
+        q
+    }
+
+    #[test]
+    fn an_entry_started_event_resolves_by_id() {
+        let mut q = queue_with_ids(&["a", "b", "c"]);
+        assert_eq!(q.set_playing_entry(2), PosChange::Advanced(1));
+        assert_eq!(q.current().map(|i| i.primary_name()), Some("b"));
+        assert_eq!(q.set_playing_entry(2), PosChange::Unchanged);
+    }
+
+    /// The race this exists for: mpv reports "entry 2 started", the user
+    /// replaces the queue before that is read, and the id no longer names
+    /// anything. Read as a position it would have been entry index 1 of the
+    /// *new* list, i.e. the wrong track.
+    #[test]
+    fn an_id_from_a_replaced_playlist_resolves_to_nothing() {
+        let mut q = queue_with_ids(&["a", "b", "c"]);
+        q.reset_with_ids(
+            vec![song("x"), song("y"), song("z")],
+            vec![Some(10), Some(11), Some(12)],
+        );
+        assert_eq!(q.set_playing_entry(2), PosChange::Unresolved);
+        assert_eq!(q.current().map(|i| i.primary_name()), Some("x"));
+        // and a bare stale position cannot move an entry that has an id
+        assert_eq!(q.set_pos(1), PosChange::Unchanged);
+        assert_eq!(q.current().map(|i| i.primary_name()), Some("x"));
+    }
+
+    #[test]
+    fn entries_without_ids_still_resolve_by_position() {
+        let mut q = queue_of(&["a", "b"]);
+        assert_eq!(q.set_pos(1), PosChange::Advanced(1));
+    }
+
+    #[test]
+    fn ids_travel_with_their_entries_through_every_edit() {
+        let mut q = queue_with_ids(&["a", "b", "c", "d"]);
+        assert!(q.move_entry(3, 1));
+        assert_eq!(q.entry_ids(), &[Some(1), Some(4), Some(2), Some(3)]);
+        assert!(q.remove(0));
+        assert_eq!(q.entry_ids(), &[Some(4), Some(2), Some(3)]);
+        let appended = q.append_with_id(song("e"), Some(9), false);
+        assert_eq!(appended.appended_at, 3);
+        assert_eq!(q.entry_ids().len(), q.entries().len());
+        q.truncate(2);
+        assert_eq!(q.entry_ids(), &[Some(4), Some(2)]);
+        q.replace_upcoming_with_ids(vec![song("n")], vec![Some(20)]);
+        assert_eq!(q.entry_ids(), &[Some(4), Some(20)]);
+        q.clear_upcoming();
+        assert_eq!(q.entry_ids(), &[Some(4)]);
+        q.clear();
+        assert!(q.entry_ids().is_empty());
+    }
+
+    #[test]
+    fn a_shuffled_append_moves_its_id_with_it() {
+        for _ in 0..20 {
+            let mut q = queue_with_ids(&["a", "b", "c", "d"]);
+            let appended = q.append_with_id(song("new"), Some(99), true);
+            let at = appended.moved_to.unwrap_or(appended.appended_at);
+            assert_eq!(q.entries()[at].primary_name(), "new");
+            assert_eq!(q.entry_ids()[at], Some(99));
+        }
+    }
+
     #[test]
     fn truncate_forgets_a_tail_mpv_never_took_and_keeps_pos_valid() {
         let mut q = queue_of(&["a", "b", "c", "d"]);
