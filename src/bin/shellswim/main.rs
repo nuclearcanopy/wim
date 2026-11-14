@@ -907,7 +907,10 @@ fn prompt() -> anyhow::Result<()> {
 /// like any other line, which is the only kind of banner worth having.
 fn banner(console: &mut Console, cfg: &config::Config, keymap: &Keymap) {
     let where_from = match (cfg.library_paths.len(), cfg.navidrome_servers.len()) {
-        (0, 0) => "no library yet; run wim once to set one up".to_string(),
+        (0, 0) => format!(
+            "no library yet; press {} to add a Navidrome server, or set library_paths in config",
+            key_label(prompt_key(keymap, KeyAction::OpenNavManager))
+        ),
         (paths, 0) => format!("{paths} local path(s)"),
         (0, n) => format!("{n} server(s)"),
         (paths, n) => format!("{paths} local path(s), {n} server(s)"),
