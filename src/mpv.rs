@@ -578,6 +578,9 @@ fn write_setup(sock: &mut UnixStream) -> Result<(), String> {
             Ok(line) => line,
             Err(e) => return Err(format!("encoding mpv setup: {e}")),
         };
+        // leading newline: a write that timed out midway leaves a fragment
+        // in mpv's buffer, which this makes its own (dropped) line
+        line.insert(0, b'\n');
         line.push(b'\n');
         if let Err(e) = sock.write_all(&line) {
             return Err(format!("writing mpv setup: {}", e.kind()));
@@ -729,6 +732,9 @@ fn command_batch_on(
             rxs.push(rx);
             let payload = json!({ "command": args, "request_id": id });
             let mut line = serde_json::to_vec(&payload).unwrap_or_default();
+            // leading newline: a write that timed out midway leaves a fragment
+            // in mpv's buffer, which this makes its own (dropped) line
+            line.insert(0, b'\n');
             line.push(b'\n');
             wire.extend_from_slice(&line);
         }
@@ -776,6 +782,9 @@ impl Mpv {
         let sent = serde_json::to_vec(&payload)
             .map_err(anyhow::Error::from)
             .and_then(|mut line| {
+                // leading newline: a write that timed out midway leaves a fragment
+                // in mpv's buffer, which this makes its own (dropped) line
+                line.insert(0, b'\n');
                 line.push(b'\n');
                 self.with_sock(|sock| sock.write_all(&line).context("writing to mpv ipc socket"))
             });
@@ -807,6 +816,9 @@ impl Mpv {
         let sent = serde_json::to_vec(&payload)
             .map_err(anyhow::Error::from)
             .and_then(|mut line| {
+                // leading newline: a write that timed out midway leaves a fragment
+                // in mpv's buffer, which this makes its own (dropped) line
+                line.insert(0, b'\n');
                 line.push(b'\n');
                 self.with_sock(|sock| sock.write_all(&line).context("writing to mpv ipc socket"))
             });
@@ -1541,5 +1553,43 @@ mod tests {
         assert!(pb
             .level_as_of(landed + LEVEL_FRESH_FOR + Duration::from_millis(1))
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod reader_survives_garbage_tests {
+    use super::*;
+
+    #[test]
+    fn a_non_utf8_line_does_not_end_the_reader_or_lose_the_next_reply() {
+        let (mut mpv_side, wim_side) = UnixStream::pair().unwrap();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel();
+        pending.lock().unwrap().insert(7, Pending { reply_tx: tx });
+        let (event_tx, _event_rx) = mpsc::channel();
+        let reader = {
+            let pending = pending.clone();
+            thread::spawn(move || read_replies(wim_side, pending, event_tx))
+        };
+        mpv_side.write_all(b"\xff\xfe not json\n").unwrap();
+        mpv_side
+            .write_all(b"{\"request_id\":7,\"error\":\"success\",\"data\":42}\n")
+            .unwrap();
+        let reply = rx.recv_timeout(Duration::from_secs(2)).expect("reply");
+        assert_eq!(reply.unwrap(), json!(42));
+        drop(mpv_side);
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn eof_fails_every_waiter_immediately() {
+        let (mpv_side, wim_side) = UnixStream::pair().unwrap();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel();
+        pending.lock().unwrap().insert(1, Pending { reply_tx: tx });
+        let (event_tx, _event_rx) = mpsc::channel();
+        drop(mpv_side);
+        read_replies(wim_side, pending, event_tx);
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
     }
 }
