@@ -27,7 +27,11 @@ impl TerminalGuard {
     pub fn new(mouse: bool) -> io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+        // Failing after raw mode is on must not leave the terminal raw.
+        if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+            restore(mouse);
+            return Err(e);
+        }
         if mouse {
             execute!(stdout, EnableMouseCapture)?;
             // crossterm's EnableMouseCapture also turns on any-event
@@ -51,8 +55,13 @@ impl TerminalGuard {
         }
 
         let default_hook = std::panic::take_hook();
+        let main_thread = std::thread::current().id();
         std::panic::set_hook(Box::new(move |info| {
-            restore(mouse);
+            // A worker panic must not tear the screen down under a UI
+            // that is still running.
+            if std::thread::current().id() == main_thread {
+                restore(mouse);
+            }
             default_hook(info);
         }));
 

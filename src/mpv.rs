@@ -471,6 +471,9 @@ impl Mpv {
                 let _ = link_tx.send(Err("cloning mpv ipc socket".to_string()));
                 return;
             };
+            // A stalled mpv must not block a writer (holding the link lock)
+            // forever. SO_SNDTIMEO only affects writes, not the reader.
+            let _ = sock.set_write_timeout(Some(Duration::from_secs(2)));
             thread::spawn(move || read_replies(reader_sock, reader_pending, event_tx));
             // the setup goes down the socket *before* it is published,
             // so a command the user typed in the first 70ms cannot
@@ -609,8 +612,17 @@ fn read_replies(
     reader_pending: Arc<Mutex<HashMap<u64, Pending>>>,
     event_tx: Sender<Event>,
 ) {
-    let mut lines = BufReader::new(reader_sock).lines();
-    while let Some(Ok(line)) = lines.next() {
+    let mut reader = BufReader::new(reader_sock);
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        // Bytes, not `lines()`: one non-UTF-8 line must not end the reader
+        // (and fail every pending request) while mpv is still alive.
+        match reader.read_until(b'\n', &mut raw) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let line = String::from_utf8_lossy(&raw).into_owned();
         if line.trim().is_empty() {
             continue;
         }
@@ -1205,7 +1217,16 @@ impl Drop for Mpv {
         } else {
             let _ = self.child.kill();
         }
-        let _ = self.child.wait();
+        // A wedged mpv must not hang exit: give it a moment, then kill.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while matches!(self.child.try_wait(), Ok(None)) {
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         // mpv does not unlink it on exit, so every run left one behind.
         let _ = std::fs::remove_file(&self.sock_path);
     }
