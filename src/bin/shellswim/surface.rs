@@ -94,7 +94,7 @@ impl Surface for Borrowed<'_> {
             // after a message that already named the key, so these
             // say it once, themselves.
             ViewTarget::Eq => op_fail(no_pane("equaliser", "wim's 'e'")),
-            ViewTarget::Settings => op_fail(no_pane("settings", "wim's ','")),
+            ViewTarget::Settings => self.print_settings(core),
             ViewTarget::Keybinds => {
                 self.state.keybinds_requested = true;
                 let keymap = wim::keymap::Keymap::from_overrides(&core.cfg.keybinds);
@@ -135,6 +135,26 @@ impl Surface for Borrowed<'_> {
 }
 
 impl Borrowed<'_> {
+    fn print_settings(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
+        let cfg = core.cfg;
+        let lines = [
+            format!("equalizer: {} · {} visualizer bands", on_off(cfg.eq_enabled), cfg.visualizer_bands),
+            format!("crossfade: {} · {:.1}s", on_off(*core.crossfade_enabled), cfg.crossfade_seconds),
+            format!("between tracks: {:.1}s", cfg.gap_seconds),
+            format!("offline cache: {} bytes · download after {} distinct days", cfg.offline_cache_max_bytes, cfg.cache_days_threshold),
+            format!("cache eviction: {} days", cfg.cache_eviction_days),
+            format!("download quality: {} · {} kbps", cfg.offline_download_format, cfg.effective_offline_download_bitrate_kbps()),
+            format!("scrobble: {:.0}% or {:.0}s", cfg.scrobble.threshold_percent, cfg.scrobble.threshold_seconds),
+            format!("lyrics sources: {}", cfg.lyrics.providers.join(", ")),
+            format!("subtitle style: {}px · position {} · delay {:+.1}s", cfg.subtitles.font_size, cfg.subtitles.position, cfg.subtitles.delay_secs),
+            "change playback with volume(...), gap(...), crossfade(), eq(...); see help() for the full command list".to_owned(),
+        ];
+        for line in lines {
+            core.console.note(line);
+        }
+        op_note("current settings".to_owned())
+    }
+
     /// `view(now)`: what is playing, what is behind it, and where in
     /// the track we are. One line, or three on a repeat, because the
     /// bar is already showing the short version.
@@ -165,6 +185,14 @@ impl Borrowed<'_> {
                 .note(format!("{here:>7}  {}. {}", i + 1, label(entry)));
         }
         op_note(now_line(&label(&item), upcoming))
+    }
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "on"
+    } else {
+        "off"
     }
 }
 
