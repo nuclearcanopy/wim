@@ -29,6 +29,14 @@ pub struct PlaybackState {
     pub volume: Option<f64>,
 }
 
+/// The directory holding wim's state files (and its instance lock).
+pub fn state_dir() -> Result<PathBuf> {
+    state_path()?
+        .parent()
+        .map(PathBuf::from)
+        .context("state path has no parent")
+}
+
 fn state_path() -> Result<PathBuf> {
     // state_dir() is Linux-only (XDG_STATE_HOME) per the dirs crate;
     // data_dir() is the next best cross-platform fit for "not config,

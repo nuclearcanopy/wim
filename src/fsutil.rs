@@ -123,3 +123,67 @@ mod atomic_write_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+/// Result of `claim_instance_lock`.
+pub enum InstanceLock {
+    /// We hold it for as long as the file lives.
+    Held(fs::File),
+    /// Another wim already holds it.
+    Contended,
+    /// Locking is unavailable here; carry on without a guarantee.
+    Unavailable,
+}
+
+/// Takes an advisory exclusive lock on `<dir>/wim.lock`, released when the
+/// returned file is dropped (or the process dies). Two wims writing the
+/// same state files lose each other's updates; this cannot make that safe,
+/// but it lets the second one say so instead of failing silently.
+pub fn claim_instance_lock(dir: &Path) -> InstanceLock {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if fs::create_dir_all(dir).is_err() {
+            return InstanceLock::Unavailable;
+        }
+        let Ok(file) = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("wim.lock"))
+        else {
+            return InstanceLock::Unavailable;
+        };
+        // SAFETY: flock on a file descriptor we own.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return InstanceLock::Held(file);
+        }
+        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+            InstanceLock::Contended
+        } else {
+            InstanceLock::Unavailable
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        InstanceLock::Unavailable
+    }
+}
+
+#[cfg(all(test, unix))]
+mod instance_lock_tests {
+    use super::*;
+
+    #[test]
+    fn a_second_claim_is_contended_until_the_first_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("wim-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let first = claim_instance_lock(&dir);
+        assert!(matches!(first, InstanceLock::Held(_)));
+        assert!(matches!(claim_instance_lock(&dir), InstanceLock::Contended));
+        drop(first);
+        assert!(matches!(claim_instance_lock(&dir), InstanceLock::Held(_)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

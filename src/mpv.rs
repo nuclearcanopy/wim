@@ -32,6 +32,15 @@ const OBS_SEEKING: u64 = 13;
 /// How long any one blocking command waits for mpv's reply.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Commands whose reply never came. A timed-out `loadfile` may still run
+/// in mpv later, so the app's queue mirror can no longer be trusted until
+/// it compares itself with mpv; the main loops watch this counter.
+static REPLY_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn reply_timeouts() -> u64 {
+    REPLY_TIMEOUTS.load(Ordering::Relaxed)
+}
+
 /// Current index into mpv's own playlist, or -1 when nothing is
 /// loaded; the single source of truth for which track is playing.
 pub const PROP_PLAYLIST_POS: &str = "playlist-pos";
@@ -757,6 +766,7 @@ fn command_batch_on(
                 Ok(Err(e)) => Err(anyhow::anyhow!("mpv command error: {e}")),
                 Err(_) => {
                     pending.lock().unwrap().remove(&id);
+                    REPLY_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                     Err(anyhow::anyhow!("timed out waiting for mpv reply"))
                 }
             },
@@ -813,6 +823,7 @@ impl Mpv {
             Ok(Err(e)) => bail!("mpv command error: {e}"),
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
+                REPLY_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                 bail!("timed out waiting for mpv reply")
             }
         }
