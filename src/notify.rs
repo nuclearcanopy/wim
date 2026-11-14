@@ -204,7 +204,6 @@ impl Notifications {
 
     pub fn push(&mut self, severity: Severity, message: impl Into<String>) {
         let message = message.into();
-        self.remember(severity, &message);
         // a failure that re-fires every frame (a dead mpv ipc socket
         // being the one that actually happened) would otherwise stack
         // five identical boxes and then keep shoving the rest of the
@@ -218,8 +217,11 @@ impl Notifications {
             existing.repeats += 1;
             existing.shown_at = Instant::now();
             existing.lifetime = lifetime_for(severity, &existing.text());
+            // a repeat is the same history entry, or one failing every
+            // frame would push everything useful out of it
             return;
         }
+        self.remember(severity, &message);
         let lifetime = lifetime_for(severity, &message);
         self.items.push(Notification {
             severity,
@@ -386,6 +388,16 @@ mod tests {
             lifetime_for(Severity::Error, &"x".repeat(900)),
             Duration::from_secs(25)
         );
+    }
+
+    #[test]
+    fn a_message_firing_every_frame_is_one_history_entry() {
+        let mut n = Notifications::default();
+        for _ in 0..500 {
+            n.push(Severity::Error, "mpv is not answering");
+        }
+        n.push(Severity::Info, "something else");
+        assert_eq!(n.history().count(), 2);
     }
 
     #[test]

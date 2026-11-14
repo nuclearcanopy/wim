@@ -354,6 +354,10 @@ fn trusted_may_use(ip: IpAddr) -> bool {
             !(ip.is_link_local() || ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast())
         }
         IpAddr::V6(ip) => {
+            // ::ffff:169.254.x.x is the v4 address wearing a v6 coat
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return trusted_may_use(IpAddr::V4(v4));
+            }
             let link_local = (ip.segments()[0] & 0xffc0) == 0xfe80;
             !(link_local || ip.is_unspecified() || ip.is_multicast())
         }
@@ -442,6 +446,11 @@ mod tests {
         }
         assert!(validate_addresses(
             &["192.168.1.5:4533".parse().unwrap()],
+            true
+        ));
+        // a v4 address in a v6 coat is still that v4 address
+        assert!(!validate_addresses(
+            &["[::ffff:169.254.169.254]:80".parse().unwrap()],
             true
         ));
     }

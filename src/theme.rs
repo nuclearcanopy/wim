@@ -59,7 +59,10 @@ pub fn detect_palette(env: impl Fn(&str) -> Option<String>) -> Palette {
         || colorterm.contains("24bit")
     {
         Depth::TrueColor
-    } else if term == "linux" || term == "dumb" || term.starts_with("vt") || term == "ansi" {
+    } else if matches!(
+        term.as_str(),
+        "linux" | "dumb" | "ansi" | "vt52" | "vt100" | "vt102" | "vt220" | "vt320"
+    ) {
         Depth::Ansi16
     } else if term.contains("256color") {
         Depth::Ansi256
@@ -173,6 +176,11 @@ mod palette_tests {
         assert_eq!(
             detect_palette(env(&[("TERM", "linux")])).depth,
             Depth::Ansi16
+        );
+        // vte-based terminals are not vt100s
+        assert_eq!(
+            detect_palette(env(&[("TERM", "vte-256color")])).depth,
+            Depth::Ansi256
         );
     }
 
