@@ -70,6 +70,8 @@ pub struct Workspace {
     pub link_input: Option<String>,
     pub token_path_input: String,
     pub setup_busy: bool,
+    /// Shared spoiler display preference, initialized from application config.
+    pub spoilers_revealed: bool,
     configured_path: Option<String>,
     pub account_offset: usize,
     pub account_has_more: bool,
@@ -121,6 +123,7 @@ impl Workspace {
             link_input: None,
             token_path_input: String::new(),
             setup_busy: false,
+            spoilers_revealed: false,
             configured_path: None,
             account_offset: 0,
             account_has_more: false,
@@ -438,9 +441,20 @@ impl Workspace {
         let client = self.client.as_ref()?;
         let item = self.account_selected.as_ref()?;
         let index = self.focused_file_index.unwrap_or(self.selected);
-        item.playable_items(Arc::clone(client))
+        let mut playable = item
+            .playable_items(Arc::clone(client))
             .into_iter()
-            .nth(index)
+            .nth(index)?;
+        if let (Some(show), Some(source_index)) = (&self.episode_show, self.focused_file_index) {
+            if let Some(source) = self.sources.get(source_index) {
+                if let Some((_, season, episode)) = parse_episode_name(&source.file_name) {
+                    if let crate::search::SearchItem::TorBoxFile { title, .. } = &mut playable {
+                        *title = format!("{show} Episode {episode} Season {season}");
+                    }
+                }
+            }
+        }
+        Some(playable)
     }
 
     pub fn selected_files_for_display(&self) -> Vec<(&str, u64, bool)> {
@@ -697,6 +711,18 @@ fn parse_episode_name(name: &str) -> Option<(String, u32, u32)> {
     None
 }
 
+/// Mask episode release titles in account-oriented output unless the user has
+/// explicitly enabled spoiler display. Numbering is only shown when parsed.
+pub fn safe_display_name(name: &str, reveal_spoilers: bool) -> String {
+    if reveal_spoilers {
+        return name.to_owned();
+    }
+    match parse_episode_name(name) {
+        Some((_, season, episode)) => format!("S{season:02}E{episode:02} · Episode {episode}"),
+        None => name.to_owned(),
+    }
+}
+
 fn digits(bytes: &[u8], mut at: usize) -> Option<(u32, usize)> {
     let start = at;
     while at < bytes.len() && bytes[at].is_ascii_digit() {
@@ -861,6 +887,19 @@ mod tests {
             Some(("The Show".into(), 1, 2))
         );
         assert_eq!(parse_episode_name("A Movie (2024).mkv"), None);
+    }
+
+    #[test]
+    fn account_filename_display_masks_episode_release_titles_by_default() {
+        let name = "Silo.S03E04.The.Quiet.World.1080p.mkv";
+        let safe = safe_display_name(name, false);
+        assert_eq!(safe, "S03E04 · Episode 4");
+        assert!(!safe.contains("Quiet"));
+        assert_eq!(safe_display_name(name, true), name);
+        assert_eq!(
+            safe_display_name("Arrival.2016.mkv", false),
+            "Arrival.2016.mkv"
+        );
     }
 
     #[test]

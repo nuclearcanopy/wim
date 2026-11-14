@@ -395,8 +395,29 @@ pub fn silence_url(secs: u64) -> String {
 /// never a candidate for caching to begin with.
 pub fn resolve_playable(item: &SearchItem, cache: &Arc<Mutex<CacheIndex>>) -> Option<String> {
     if let SearchItem::Song { id, client, .. } = item {
-        if let Some(path) = cache.lock().ok().and_then(|idx| idx.cached_path(id)) {
-            return Some(path.to_string_lossy().into_owned());
+        if let Some(path) = cache.lock().ok().and_then(|mut idx| {
+            let before = idx.clone();
+            let previous = idx.cached_path(id);
+            let path = idx
+                .compressed_cached_path(id)
+                .unwrap_or_else(|_| previous.clone());
+            let path = path?;
+            if previous.as_ref().is_some_and(|old| old != &path) {
+                if idx.save().is_ok() {
+                    if let Some(old) = previous {
+                        let _ = std::fs::remove_file(old);
+                    }
+                } else {
+                    *idx = before;
+                    let _ = std::fs::remove_file(&path);
+                    return previous;
+                }
+            }
+            Some(path)
+        }) {
+            if let Ok(playable) = cache::playback_path(&path) {
+                return Some(playable.to_string_lossy().into_owned());
+            }
         }
         return Some(client.stream_url(id));
     }
@@ -1453,17 +1474,21 @@ pub fn try_play(
 /// video in the workspace is separate, larger work; this is the
 /// narrow fix for audio never deserving a window at all.
 pub fn set_vid_for_item(player: &mpv::Mpv, item: &SearchItem) {
-    let vid = if matches!(
+    let is_video = matches!(
         item,
         SearchItem::LocalVideo { .. }
             | SearchItem::TorBoxFile { video: true, .. }
             | SearchItem::WatchSource { .. }
-    ) {
+    );
+    let vid = if is_video {
         serde_json::json!("auto")
     } else {
         serde_json::json!("no")
     };
     let _ = player.set_property("vid", vid);
+    // Give mpv's native window and window-manager task switcher the same
+    // user-facing name Wim shows; never expose a torrent release filename.
+    let _ = player.set_property("force-media-title", serde_json::json!(label(item)));
 }
 /// Whether a playlist rewrite starts a fresh session (so "loop all"
 /// restarts from it) or just re-lays-out the session already running.
@@ -1674,6 +1699,12 @@ pub fn resync_upcoming(
 /// resume. Best-effort: a failed save just means nothing to resume
 /// next time, not worth surfacing since we're already quitting.
 pub fn save_playback_state(player: &mpv::Mpv, queue: &PlayQueue) {
+    // Launching to the title screen must not erase the previous session
+    // when the user quits without starting playback. Keep the saved state
+    // available for an explicit `wim --resume`.
+    if queue.current().is_none() && queue.upcoming().is_empty() {
+        return;
+    }
     let state = persistence::PlaybackState {
         // Online Watch URLs may be signed credentials; never copy them to
         // the plaintext resume state. Stable media progress is tracked
@@ -1716,6 +1747,9 @@ pub struct DownloadCtx<'a> {
     /// Distinct play days a track needs before it auto-downloads; see
     /// `config::Config::cache_days_threshold`.
     pub day_threshold: u32,
+    pub offline_download_bitrate_kbps: u32,
+    pub offline_download_format: &'a str,
+    pub offline_cache_max_bytes: u64,
     /// How the play index reaches disk, **injected rather than reached
     /// for**.
     ///
@@ -1956,13 +1990,47 @@ pub fn note_playback_started(
     ) {
         return;
     }
+    if dctx.offline_download_format != "flac" && dctx.offline_download_bitrate_kbps <= 96 {
+        notifications.push(
+            Severity::Alert,
+            format!(
+                "low offline audio quality: downloads will use {} kbps",
+                dctx.offline_download_bitrate_kbps
+            ),
+        );
+    }
     dctx.downloading.insert(id.clone());
+    let source = cache::DownloadSource {
+        server_url: crate::subsonic::safe_server_identity(client.base_url()),
+        username: client.username().to_string(),
+        title: title.clone(),
+        artist: artist.clone(),
+    };
+    if let Ok(mut index) = dctx.cache.lock() {
+        index.remember_download(id, source);
+        if let Err(error) = (dctx.persist)(&index) {
+            notifications.push(
+                Severity::Error,
+                format!("couldn't save the download manifest: {error}"),
+            );
+        }
+    }
     let track_label = format!("{title} · {artist}");
     notifications.push_progress(id.clone(), track_label.clone());
     download::spawn_tracks(
-        vec![(id.clone(), track_label, client.stream_url(id))],
+        vec![(
+            id.clone(),
+            track_label,
+            client.stream_url_with_quality(
+                id,
+                (dctx.offline_download_format != "flac")
+                    .then_some(dctx.offline_download_bitrate_kbps),
+                Some(dctx.offline_download_format),
+            ),
+        )],
         dctx.cache.clone(),
         dctx.download_tx.clone(),
+        dctx.offline_cache_max_bytes,
     );
 }
 /// Backs the manual download keybind (`KeyAction::DownloadSelected`)
@@ -1986,6 +2054,7 @@ pub fn download_tracks(
     let mut batch = Vec::new();
     let mut already_cached = 0;
     let mut in_flight = 0;
+    let mut manifest_changed = false;
     for t in tracks {
         let SearchItem::Song {
             id,
@@ -1997,6 +2066,18 @@ pub fn download_tracks(
         else {
             continue;
         };
+        if let Ok(mut index) = dctx.cache.lock() {
+            index.remember_download(
+                id,
+                cache::DownloadSource {
+                    server_url: crate::subsonic::safe_server_identity(client.base_url()),
+                    username: client.username().to_string(),
+                    title: title.clone(),
+                    artist: artist.clone(),
+                },
+            );
+            manifest_changed = true;
+        }
         let cached = dctx
             .cache
             .lock()
@@ -2013,11 +2094,35 @@ pub fn download_tracks(
         dctx.downloading.insert(id.clone());
         let track_label = format!("{title} · {artist}");
         notifications.push_progress(id.clone(), track_label.clone());
-        batch.push((id.clone(), track_label, client.stream_url(id)));
+        batch.push((
+            id.clone(),
+            track_label,
+            client.stream_url_with_quality(
+                id,
+                (dctx.offline_download_format != "flac")
+                    .then_some(dctx.offline_download_bitrate_kbps),
+                Some(dctx.offline_download_format),
+            ),
+        ));
+    }
+    if manifest_changed {
+        if let Ok(index) = dctx.cache.lock() {
+            if let Err(error) = (dctx.persist)(&index) {
+                notifications.push(
+                    Severity::Error,
+                    format!("couldn't save the download manifest: {error}"),
+                );
+            }
+        }
     }
     let started = batch.len();
     if started > 0 {
-        download::spawn_tracks(batch, dctx.cache.clone(), dctx.download_tx.clone());
+        download::spawn_tracks(
+            batch,
+            dctx.cache.clone(),
+            dctx.download_tx.clone(),
+            dctx.offline_cache_max_bytes,
+        );
     }
     let status = if started > 0 {
         format!("downloading {started} track(s)")
@@ -2056,10 +2161,94 @@ pub fn download_resolved(tracks: &[SearchItem], core: &mut CoreCtx) -> Downloade
         download_tx: core.download_tx,
         downloading: core.downloading,
         day_threshold: core.cfg.cache_days_threshold,
+        offline_download_bitrate_kbps: core.cfg.effective_offline_download_bitrate_kbps(),
+        offline_download_format: &core.cfg.offline_download_format,
+        offline_cache_max_bytes: core.cfg.offline_cache_max_bytes,
         persist: CacheIndex::save,
     };
     download_tracks(tracks, &mut dctx, core.notifications)
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheRebuild {
+    pub started: usize,
+    pub unavailable_servers: usize,
+    pub already_running: usize,
+}
+
+/// Re-fetch every manifest entry through the server's *current* configured
+/// transcode profile. The low-level downloader keeps the old verified file in
+/// place until its replacement has fully arrived and passed validation.
+pub fn rebuild_cached_downloads(
+    cache: &Arc<Mutex<CacheIndex>>,
+    cfg: &config::Config,
+    downloading: &mut HashSet<String>,
+    download_tx: &mpsc::Sender<DownloadEvent>,
+    notifications: &mut Notifications,
+) -> Result<CacheRebuild, String> {
+    let manifest = cache
+        .lock()
+        .map_err(|_| "download manifest is unavailable".to_string())?
+        .download_manifest()
+        .map(|(id, source)| (id.to_string(), source.clone()))
+        .collect::<Vec<_>>();
+    if manifest.is_empty() {
+        return Ok(CacheRebuild {
+            started: 0,
+            unavailable_servers: 0,
+            already_running: 0,
+        });
+    }
+    let clients = cfg
+        .navidrome_servers
+        .iter()
+        .filter_map(|server| crate::subsonic::Client::new(server).ok())
+        .collect::<Vec<_>>();
+    let mut batch = Vec::new();
+    let mut unavailable_servers = 0;
+    let mut already_running = 0;
+    for (id, source) in manifest {
+        if downloading.contains(&id) {
+            already_running += 1;
+            continue;
+        }
+        let Some(client) = clients.iter().find(|client| {
+            crate::subsonic::safe_server_identity(client.base_url()) == source.server_url
+                && client.username() == source.username
+        }) else {
+            unavailable_servers += 1;
+            continue;
+        };
+        let label = format!("{} · {}", source.title, source.artist);
+        downloading.insert(id.clone());
+        notifications.push_progress(id.clone(), label.clone());
+        batch.push((
+            id.clone(),
+            label,
+            client.stream_url_with_quality(
+                &id,
+                (cfg.offline_download_format != "flac")
+                    .then_some(cfg.effective_offline_download_bitrate_kbps()),
+                Some(&cfg.offline_download_format),
+            ),
+        ));
+    }
+    let started = batch.len();
+    if started > 0 {
+        crate::download::spawn_tracks(
+            batch,
+            cache.clone(),
+            download_tx.clone(),
+            cfg.offline_cache_max_bytes,
+        );
+    }
+    Ok(CacheRebuild {
+        started,
+        unavailable_servers,
+        already_running,
+    })
+}
+
 /// Deletes every cached file past `cfg.cache_eviction_days` unplayed;
 /// best-effort, same as every other cache operation (a failed save
 /// just means the eviction is re-attempted next sweep).
@@ -2590,8 +2779,8 @@ pub fn apply_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> Dispatch 
     }
     dispatch
 }
-/// The op a bottom-bar control presses, or `None` for the scrubber,
-/// which is a drag rather than a one-shot.
+/// The op a bottom-bar control presses, or `None` for the scrubber and
+/// crossfade popover, which are handled by the front-end.
 ///
 /// **One table, two callers**, which is the whole point: `Op::Go(
 /// BottomBarField)` reads it for enter-on-the-bar, and main.rs's
@@ -2605,13 +2794,14 @@ pub fn apply_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> Dispatch 
 /// is where recording happens.
 pub fn op_for_field(field: Field) -> Option<Op> {
     Some(match field {
+        Field::Previous => Op::SkipBack,
         Field::Pause => Op::TogglePause,
+        Field::Next => Op::SkipNext(1),
         Field::Loop => Op::CycleLoop,
         Field::Shuffle => Op::ToggleShuffle,
         Field::Speed => Op::SpeedUp,
         Field::Eq => Op::View(ViewTarget::Eq),
-        Field::Crossfade => Op::ToggleCrossfade,
-        Field::Progress => return None,
+        Field::Crossfade | Field::Progress => return None,
     })
 }
 
@@ -2793,7 +2983,30 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 _ => op_note("no gap between tracks".to_string()),
             }
         }
-        Op::SetVideoOutput(mode) => surf.set_video_output(mode, core),
+        Op::OpenVideoPlayer => {
+            let is_video = core.now_playing.as_ref().is_some_and(|item| {
+                matches!(
+                    item,
+                    SearchItem::LocalVideo { .. }
+                        | SearchItem::TorBoxFile { video: true, .. }
+                        | SearchItem::WatchSource { .. }
+                )
+            });
+            if !is_video {
+                op_fail("no video is currently playing".to_string())
+            } else {
+                match core
+                    .player
+                    .set_property("force-window", serde_json::json!(true))
+                {
+                    Ok(()) => op_note(
+                        "mpv video window requested; use the window switcher if it is not raised"
+                            .to_string(),
+                    ),
+                    Err(error) => op_fail(format!("could not open mpv window: {error}")),
+                }
+            }
+        }
         Op::ToggleCrossfade => {
             *core.crossfade_enabled = !*core.crossfade_enabled;
             if !*core.crossfade_enabled {
@@ -3001,6 +3214,13 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             let Some(field) = surf.bar_field() else {
                 return surf.decline("bar control to press");
             };
+            if field == Field::Crossfade {
+                let result = surf.open_crossfade();
+                if !matches!(result.1, Report::Failed(_)) {
+                    surf.close_console();
+                }
+                return result;
+            }
             let Some(field_op) = op_for_field(field) else {
                 // enter on the scrubber opens a keyboard drag, which
                 // the open console would swallow every key of; the
@@ -3669,6 +3889,9 @@ pub fn track_started(track: &SearchItem, core: &mut CoreCtx) -> Started {
         download_tx: core.download_tx,
         downloading: core.downloading,
         day_threshold: core.cfg.cache_days_threshold,
+        offline_download_bitrate_kbps: core.cfg.effective_offline_download_bitrate_kbps(),
+        offline_download_format: &core.cfg.offline_download_format,
+        offline_cache_max_bytes: core.cfg.offline_cache_max_bytes,
         persist: CacheIndex::save,
     };
     note_playback_started(track, &mut dctx, core.notifications);
@@ -4523,6 +4746,10 @@ pub trait Surface {
         None
     }
 
+    fn open_crossfade(&mut self) -> (Dispatch, Report) {
+        self.decline("crossfade menu")
+    }
+
     /// Light a bar control for a moment. Pure feedback; a front-end
     /// with no such affordance ignores it rather than declining,
     /// because the op itself did happen.
@@ -4533,20 +4760,6 @@ pub trait Surface {
     /// Whether a standalone play takes over the full player pane.
     fn minimize_player(&mut self, minimize: bool) {
         let _ = minimize;
-    }
-
-    /// `video(...)`. The host owns this rather than `CoreCtx` because
-    /// setting the mode has to clear the runtime override shift-`v`
-    /// sets, which is a frame-loop local: without that the mode would
-    /// be set and the screen would not change, which is the trap the
-    /// settings menu's own row already had to avoid.
-    fn set_video_output(
-        &mut self,
-        mode: crate::config::VideoOutput,
-        core: &mut CoreCtx,
-    ) -> (Dispatch, Report) {
-        let _ = (mode, core);
-        self.decline("video()")
     }
 
     /// The queue view's cursor, for the two ops that have to reclamp
@@ -5592,19 +5805,30 @@ mod seam_tests {
     /// the two cannot drift the way they had: `activate_transport`
     /// used to reimplement six of these against mpv directly.
     #[test]
-    fn every_bar_control_but_the_scrubber_is_an_op() {
+    fn bar_controls_are_ops_or_frontend_interactions() {
         use crate::ui::controlsbar::FIELDS;
         for field in FIELDS {
             let op = op_for_field(field);
-            if field == Field::Progress {
+            if matches!(field, Field::Progress | Field::Crossfade) {
                 assert!(
                     op.is_none(),
-                    "the scrubber is a drag, not a one-shot: {op:?}"
+                    "the scrubber and crossfade menu are front-end interactions: {op:?}"
                 );
             } else {
                 assert!(op.is_some(), "{field:?} has no command behind it");
             }
         }
+    }
+
+    #[test]
+    fn transport_buttons_and_equalizer_map_to_their_real_actions() {
+        assert!(matches!(op_for_field(Field::Previous), Some(Op::SkipBack)));
+        assert!(matches!(op_for_field(Field::Next), Some(Op::SkipNext(1))));
+        assert!(matches!(
+            op_for_field(Field::Eq),
+            Some(Op::View(ViewTarget::Eq))
+        ));
+        assert!(op_for_field(Field::Crossfade).is_none());
     }
 
     /// Pressing a bar control has to land in the undo tree, which is
@@ -7296,6 +7520,9 @@ mod auto_download_wiring_tests {
                 download_tx: &h.tx,
                 downloading: &mut h.downloading,
                 day_threshold: 3,
+                offline_download_bitrate_kbps: 192,
+                offline_download_format: "opus",
+                offline_cache_max_bytes: u64::MAX,
                 persist: refuse,
             };
             note_playback_started(&song("s1"), &mut dctx, &mut h.notifications);
@@ -7340,11 +7567,24 @@ mod auto_download_wiring_tests {
         }
 
         fn play(&mut self, item: &SearchItem, day_threshold: u32) {
+            self.play_with_profile(item, day_threshold, 192, "opus");
+        }
+
+        fn play_with_profile(
+            &mut self,
+            item: &SearchItem,
+            day_threshold: u32,
+            bitrate_kbps: u32,
+            format: &'static str,
+        ) {
             let mut dctx = DownloadCtx {
                 cache: &self.cache,
                 download_tx: &self.tx,
                 downloading: &mut self.downloading,
                 day_threshold,
+                offline_download_bitrate_kbps: bitrate_kbps,
+                offline_download_format: format,
+                offline_cache_max_bytes: u64::MAX,
                 persist: persist_nowhere,
             };
             note_playback_started(item, &mut dctx, &mut self.notifications);
@@ -7401,6 +7641,26 @@ mod auto_download_wiring_tests {
             hooks.said_downloading(),
             "and a download in flight is on screen"
         );
+    }
+
+    #[test]
+    fn an_automatic_low_quality_download_warns_in_both_frontends() {
+        let mut hooks = Hooks::new();
+        let track = song("auto-low-quality");
+        {
+            let mut idx = hooks.cache.lock().unwrap();
+            idx.record_play("auto-low-quality", "2026-10-01");
+            idx.record_play("auto-low-quality", "2026-10-02");
+        }
+
+        hooks.play_with_profile(&track, 3, 96, "opus");
+
+        let messages = hooks.notifications.drain_text().join(" | ");
+        assert!(
+            messages.contains("low offline audio quality"),
+            "{messages:?}"
+        );
+        assert!(messages.contains("downloading"), "{messages:?}");
     }
 
     /// One in-flight download per track, however many times it is

@@ -48,6 +48,7 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     };
+    let _playback_files = wim::cache::PlaybackFiles::new();
     match &cli.run {
         Run::Version => {
             println!("shellswim {} ({BUILD})", env!("CARGO_PKG_VERSION"));
@@ -101,6 +102,7 @@ fn oneshot(cli: &Cli) -> anyhow::Result<()> {
     }
     core::save_playback_state(&host.player, &host.play_queue);
     if failed {
+        wim::cache::cleanup_playback_files();
         std::process::exit(1);
     }
     Ok(())
@@ -397,110 +399,113 @@ impl LyricsSetup {
 fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
     let cursor_visible = anim::blink(s.now, anim::CURSOR_BLINK);
     let title = s.now_playing.as_ref().map(label);
-    guard.draw_unless_video(false, |f| {
-        // the console takes everything; the bar keeps two rows, the
-        // track name over the transport strip. that is all the chrome
-        // there is.
-        // a rule, then space / bar / space, so the bar is delimited
-        // rather than jammed against the console's last line.
-        let [body, rule, _, bar, _] = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .areas(f.area());
-        if let Some(setup) = s.setup {
-            let widget = Paragraph::new(setup.text())
-                .alignment(Alignment::Center)
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(shade(NEAR_WHITE)))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("shellswim · first-run setup")
-                        .border_style(Style::default().fg(shade(DIM))),
+    guard
+        .terminal
+        .draw(|f| {
+            // the console takes everything; the bar keeps two rows, the
+            // track name over the transport strip. that is all the chrome
+            // there is.
+            // a rule, then space / bar / space, so the bar is delimited
+            // rather than jammed against the console's last line.
+            let [body, rule, _, bar, _] = Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .areas(f.area());
+            if let Some(setup) = s.setup {
+                let widget = Paragraph::new(setup.text())
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(shade(NEAR_WHITE)))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("shellswim · first-run setup")
+                            .border_style(Style::default().fg(shade(DIM))),
+                    );
+                f.render_widget(widget, f.area());
+                return;
+            }
+            if let Some((pane, active_line)) = s.lyrics {
+                let [console_area, lyrics_area] =
+                    Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                        .areas(body);
+                let divider_x = console_area.x + console_area.width.saturating_sub(1);
+                let console_area = ratatui::layout::Rect {
+                    width: console_area.width.saturating_sub(1),
+                    ..console_area
+                };
+                let lines: Vec<&str> = pane
+                    .lines()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                f.render_widget(
+                    LyricsView {
+                        lines: &lines,
+                        scroll: pane.scroll(),
+                        active_line,
+                        track: pane.track(),
+                        source: pane.source(),
+                        synced: pane.is_synced(),
+                        following: pane.following(),
+                        attribution: pane.attribution(),
+                    },
+                    lyrics_area,
                 );
-            f.render_widget(widget, f.area());
-            return;
-        }
-        if let Some((pane, active_line)) = s.lyrics {
-            let [console_area, lyrics_area] =
-                Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-                    .areas(body);
-            let divider_x = console_area.x + console_area.width.saturating_sub(1);
-            let console_area = ratatui::layout::Rect {
-                width: console_area.width.saturating_sub(1),
-                ..console_area
-            };
-            let lines: Vec<&str> = pane
-                .lines()
-                .unwrap_or_default()
-                .iter()
-                .map(String::as_str)
-                .collect();
+                f.render_widget(
+                    wim::ui::divider::VerticalRule {
+                        highlighted: false,
+                        junction_rows: Vec::new(),
+                    },
+                    ratatui::layout::Rect {
+                        x: divider_x,
+                        width: 1,
+                        ..body
+                    },
+                );
+                f.render_widget(
+                    SwimConsole {
+                        console: s.console,
+                        cursor_visible,
+                    },
+                    console_area,
+                );
+            } else {
+                f.render_widget(
+                    SwimConsole {
+                        console: s.console,
+                        cursor_visible,
+                    },
+                    body,
+                );
+            }
             f.render_widget(
-                LyricsView {
-                    lines: &lines,
-                    scroll: pane.scroll(),
-                    active_line,
-                    track: pane.track(),
-                    source: pane.source(),
-                    synced: pane.is_synced(),
-                    following: pane.following(),
-                    attribution: pane.attribution(),
-                },
-                lyrics_area,
-            );
-            f.render_widget(
-                wim::ui::divider::VerticalRule {
+                HorizontalRule {
                     highlighted: false,
-                    junction_rows: Vec::new(),
+                    junctions: Vec::new(),
                 },
-                ratatui::layout::Rect {
-                    x: divider_x,
-                    width: 1,
-                    ..body
-                },
+                rule,
             );
             f.render_widget(
-                SwimConsole {
-                    console: s.console,
-                    cursor_visible,
+                SwimBar {
+                    title: title.as_deref(),
+                    elapsed_secs: s.playback.elapsed_secs,
+                    // the entry's own length where it knows better than
+                    // mpv, which is a generated silence; see
+                    // `core::playing_duration`.
+                    duration_secs: wim::core::playing_duration(
+                        s.queue.current(),
+                        s.playback.duration_secs,
+                    ),
+                    gap_remaining: s.gap_remaining,
                 },
-                console_area,
+                bar,
             );
-        } else {
-            f.render_widget(
-                SwimConsole {
-                    console: s.console,
-                    cursor_visible,
-                },
-                body,
-            );
-        }
-        f.render_widget(
-            HorizontalRule {
-                highlighted: false,
-                junctions: Vec::new(),
-            },
-            rule,
-        );
-        f.render_widget(
-            SwimBar {
-                title: title.as_deref(),
-                elapsed_secs: s.playback.elapsed_secs,
-                // the entry's own length where it knows better than
-                // mpv, which is a generated silence; see
-                // `core::playing_duration`.
-                duration_secs: wim::core::playing_duration(
-                    s.queue.current(),
-                    s.playback.duration_secs,
-                ),
-                gap_remaining: s.gap_remaining,
-            },
-            bar,
-        );
-    })
+        })
+        .map(|_| ())
 }

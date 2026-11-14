@@ -136,37 +136,6 @@ in
       '';
     };
 
-    videoOutput = mkOption {
-      type = types.enum [ "auto" "tct" "kitty" "ascii" "off" ];
-      default = "auto";
-      description = ''
-        How 'v' draws a local video. For "tct" and "kitty", mpv draws
-        it itself, filling the terminal, while wim stops drawing:
-        "tct" is true-color half-blocks and works in any terminal;
-        "kitty" is the kitty graphics protocol and needs a terminal
-        that speaks it. "auto" uses kitty only when the terminal
-        answered the graphics probe with it, "tct" otherwise.
-        "ascii" is different: wim decodes the video itself and paints
-        it as monochrome text cells, for a terminal with no image
-        protocol at all. "auto" never picks it, since a real protocol
-        beats a cell grid wherever one exists; shift-'v' switches to it
-        at runtime. "off" disables the key. Music playback is never
-        affected.
-      '';
-    };
-
-    asciiFps = mkOption {
-      type = types.nullOr types.number;
-      default = null;
-      description = ''
-        Caps the rate the "ascii" video output decodes and paints at.
-        null means the file's own rate. Only ever lowers it: asking for
-        more frames than the file has makes mpv duplicate them, and
-        each duplicate costs a full paint to show the same picture. For
-        a large cell grid on a slow machine, half the file's rate is
-        half the work and still watchable.
-      '';
-    };
 
     bufferAheadSecs = mkOption {
       type = types.number;
@@ -266,6 +235,12 @@ in
         downloaded automatically. Setting this path also installs FFmpeg and
         whisper.cpp in the user's profile.
       '';
+    };
+
+    watchRevealSpoilers = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Show episode titles and descriptions by default in Watch. Safe spoiler masking is the default; temporary reveal remains available in the workspace.";
     };
 
     # same plaintext-vs-file split as opensubtitlesApiKeyFile, same
@@ -434,7 +409,6 @@ in
         api_key_files = lib.mapAttrs (_: toString) cfg.lyrics.apiKeyFiles;
       };
       album_art = cfg.albumArt;
-      video_output = cfg.videoOutput;
       library_paths = cfg.libraryPaths;
       crossfade_enabled = cfg.crossfadeEnabled;
       crossfade_seconds = cfg.crossfadeSeconds;
@@ -448,6 +422,7 @@ in
         color_level = cfg.subtitles.colorLevel;
       };
       subtitle_language = cfg.subtitleLanguage;
+      watch_reveal_spoilers = cfg.watchRevealSpoilers;
       sidebar_width = cfg.sidebarWidth;
       bottom_bar_height = cfg.bottomBarHeight;
       cache_days_threshold = cfg.cacheDaysThreshold;
@@ -472,8 +447,6 @@ in
       whisper_model_file = cfg.whisperModelFile;
     } // lib.optionalAttrs (cfg.listenbrainzUserTokenFile != null) {
       listenbrainz_user_token_file = toString cfg.listenbrainzUserTokenFile;
-    } // lib.optionalAttrs (cfg.asciiFps != null) {
-      ascii_fps = cfg.asciiFps;
     } // {
       buffer_ahead_secs = cfg.bufferAheadSecs;
     } // lib.optionalAttrs (cfg.logoStyle != null) {

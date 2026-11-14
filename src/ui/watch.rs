@@ -1,5 +1,5 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -23,7 +23,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
     let spoiler = if workspace.spoilers_revealed {
         "spoilers revealed"
     } else {
-        "spoilers hidden · press r to reveal"
+        "spoilers hidden · r reveal · R set default"
     };
     let title = match workspace.page {
         Page::Search => "watch · online search (separate from your music library)",
@@ -162,16 +162,25 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
                 {
                     "direct HTTP(S)"
                 } else if stream.info_hash.is_some() {
-                    "torrent · not yet playable here"
+                    "torrent · add to TorBox with a"
                 } else if stream.yt_id.is_some() {
                     "YouTube · not yet playable here"
                 } else {
                     "unsupported transport"
                 };
-                Line::from(format!(
-                    "{cursor} {} · {transport}",
-                    workspace.source_label(index)
-                ))
+                let color = if crate::theme::color_mode() == crate::theme::ColorMode::Semantic {
+                    match transport {
+                        "direct HTTP(S)" => crate::theme::SUCCESS,
+                        "torrent · add to TorBox with a" => crate::theme::WARNING,
+                        _ => crate::theme::ERROR,
+                    }
+                } else {
+                    Color::Reset
+                };
+                Line::from(vec![
+                    Span::raw(format!("{cursor} {} · ", workspace.source_label(index))),
+                    Span::styled(transport, Style::default().fg(color)),
+                ])
             })
             .collect(),
     };
@@ -201,11 +210,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
                 .as_ref()
                 .is_some_and(|item| item.kind == MediaKind::Series) =>
         {
-            "enter seasons · backspace results · r reveal/hide"
+            "enter seasons · backspace results · r reveal · R default"
         }
-        Page::Detail => "enter sources · backspace results · r reveal/hide",
-        Page::Episodes => "enter sources · [/] season · backspace details · r reveal/hide",
-        Page::Sources => "enter checks source, then plays · backspace episodes/details",
+        Page::Detail => "enter sources · backspace results · r reveal · R default",
+        Page::Episodes => "enter sources · [/] season · backspace details · r reveal · R default",
+        Page::Sources if workspace.confirm_torrent_add => "y add to TorBox · n cancel",
+        Page::Sources => "enter checks direct source, then plays · a add torrent to TorBox",
     };
     let message = workspace
         .message

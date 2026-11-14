@@ -81,13 +81,22 @@ pub fn boxes(items: &[Notification], area: Rect) -> Vec<Rect> {
 impl Widget for NotificationOverlay<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         for (rect, text, n) in placed(self.items, area) {
-            // brightness carries severity, not color (monochrome
-            // rule): error is the most prominent, info the least.
-            let color = shade(match n.severity {
+            // Meaning stays in severity-specific copy/icons; color is an
+            // optional secondary cue for terminals where it is enabled.
+            let level = match n.severity {
                 Severity::Info => MID,
                 Severity::Alert => BRIGHT,
                 Severity::Error => WHITE,
-            });
+            };
+            let color = if crate::theme::color_mode() == crate::theme::ColorMode::Semantic {
+                match n.severity {
+                    Severity::Info => crate::theme::ACCENT,
+                    Severity::Alert => crate::theme::WARNING,
+                    Severity::Error => crate::theme::ERROR,
+                }
+            } else {
+                shade(level)
+            };
             draw_box(buf, rect.x, rect.y, rect.width, &text, &n.footer(), color);
         }
     }
@@ -118,6 +127,11 @@ fn draw_box(
     put(buf, right, y, '┐', color);
     for col in 1..width - 1 {
         put(buf, x + col, y, '─', color);
+    }
+    // A visible close affordance; any click in the toast dismisses it,
+    // and this marks the intended target without sacrificing the corner.
+    if width >= 4 {
+        put(buf, right - 1, y, 'x', color);
     }
 
     put(buf, x, y + 1, '│', color);
@@ -184,6 +198,10 @@ mod tests {
         assert!(g.contains('┌') && g.contains('┐'), "{g}");
         assert!(g.contains('└') && g.contains('┘'), "{g}");
         assert!(g.contains("queued 3 tracks"), "{g}");
+        assert!(
+            g.lines().next().unwrap().contains('x'),
+            "close affordance missing:\n{g}"
+        );
     }
 
     #[test]

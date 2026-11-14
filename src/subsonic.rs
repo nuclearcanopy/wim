@@ -456,9 +456,12 @@ impl Client {
             let msg = body
                 .subsonic_response
                 .error
-                .map(|e| e.message)
+                .map(|e| match e.code {
+                    Some(code) => format!("subsonic error {code}: {}", e.message),
+                    None => format!("subsonic error: {}", e.message),
+                })
                 .unwrap_or_else(|| "unknown subsonic error".into());
-            anyhow::bail!("subsonic error: {msg}");
+            anyhow::bail!("{msg}");
         }
         Ok(serde_json::to_value(body.subsonic_response)?)
     }
@@ -783,6 +786,21 @@ impl Client {
     /// whatever profile the server happens to have on this player; see
     /// docs/audio-quality.md.
     pub fn stream_url(&self, song_id: &str) -> String {
+        self.stream_url_with_quality(
+            song_id,
+            self.max_bitrate_kbps,
+            self.transcode_format.as_deref(),
+        )
+    }
+
+    /// Per-request override for offline downloads; ordinary playback keeps
+    /// using the profile configured on this client.
+    pub fn stream_url_with_quality(
+        &self,
+        song_id: &str,
+        bitrate_kbps: Option<u32>,
+        format: Option<&str>,
+    ) -> String {
         let salt: String = {
             let mut rng = rand::thread_rng();
             (0..12)
@@ -794,21 +812,29 @@ impl Client {
         hasher.update(salt.as_bytes());
         let token = format!("{:x}", hasher.finalize());
 
-        let mut url = format!(
-            "{}/rest/stream?id={}&u={}&t={}&s={}&v={}&c={}",
-            self.base_url, song_id, self.username, token, salt, API_VERSION, CLIENT_NAME
-        );
-        if let Some(kbps) = self.max_bitrate_kbps {
-            url.push_str(&format!("&maxBitRate={kbps}"));
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query
+            .append_pair("id", song_id)
+            .append_pair("u", &self.username)
+            .append_pair("t", &token)
+            .append_pair("s", &salt)
+            .append_pair("v", API_VERSION)
+            .append_pair("c", CLIENT_NAME);
+        if let Some(kbps) = bitrate_kbps {
+            query.append_pair("maxBitRate", &kbps.to_string());
         }
-        match &self.transcode_format {
-            Some(format) => url.push_str(&format!("&format={format}")),
+        match format {
+            Some(format) => {
+                query.append_pair("format", format);
+            }
             // a bitrate cap only means anything if the server may
             // re-encode, so raw is only safe to force without one.
-            None if self.max_bitrate_kbps.is_none() => url.push_str("&format=raw"),
+            None if bitrate_kbps.is_none() => {
+                query.append_pair("format", "raw");
+            }
             None => {}
         }
-        url
+        format!("{}/rest/stream?{}", self.base_url, query.finish())
     }
 
     /// Live, on-demand search via Subsonic's `search3` (ID3-based):
@@ -1025,6 +1051,8 @@ struct SubsonicResponse {
 
 #[derive(Debug, Deserialize)]
 struct SubsonicError {
+    #[serde(default)]
+    code: Option<u32>,
     message: String,
 }
 
@@ -1064,6 +1092,21 @@ pub(crate) fn normalize_url(url: &str) -> String {
     } else {
         format!("https://{trimmed}")
     }
+}
+
+/// Stable, credential-free server identity suitable for plaintext cache
+/// metadata. Keep the configured base path, but never persist URL credentials,
+/// query parameters, or fragments (which commonly contain access tokens).
+pub(crate) fn safe_server_identity(url: &str) -> String {
+    let normalized = normalize_url(url);
+    let Ok(mut parsed) = url::Url::parse(&normalized) else {
+        return String::new();
+    };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.as_str().trim_end_matches('/').to_string()
 }
 
 /// Pure parsing, pulled out of `all_artists()` so it's testable against
@@ -1760,6 +1803,59 @@ mod tests {
         let url = overridden.stream_url("song-1");
         assert!(url.contains("maxBitRate=128"));
         assert!(url.contains("format=opus"));
+    }
+
+    #[test]
+    fn offline_quality_override_does_not_change_playback_profile() {
+        let client = Client::new(&NavidromeConfig {
+            url: "https://example.invalid".into(),
+            username: "u".into(),
+            password: Some("p".into()),
+            password_file: None,
+            max_bitrate_kbps: None,
+            transcode_format: None,
+        })
+        .unwrap();
+        let playback = url::Url::parse(&client.stream_url("song")).unwrap();
+        let offline =
+            url::Url::parse(&client.stream_url_with_quality("song", Some(192), Some("opus")))
+                .unwrap();
+        let pairs = |url: &url::Url| {
+            url.query_pairs()
+                .into_owned()
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        assert_eq!(
+            pairs(&playback).get("format").map(String::as_str),
+            Some("raw")
+        );
+        assert!(!pairs(&playback).contains_key("maxBitRate"));
+        assert_eq!(
+            pairs(&offline).get("format").map(String::as_str),
+            Some("opus")
+        );
+        assert_eq!(
+            pairs(&offline).get("maxBitRate").map(String::as_str),
+            Some("192")
+        );
+    }
+
+    #[test]
+    fn stream_url_percent_encodes_user_controlled_query_values() {
+        let client = Client::new(&NavidromeConfig {
+            url: "https://example.invalid".into(),
+            username: "user name&x".into(),
+            password: Some("pw".into()),
+            password_file: None,
+            max_bitrate_kbps: None,
+            transcode_format: None,
+        })
+        .unwrap();
+        let url = url::Url::parse(&client.stream_url("song & id")).unwrap();
+        let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(query.get("id").map(String::as_str), Some("song & id"));
+        assert_eq!(query.get("u").map(String::as_str), Some("user name&x"));
+        assert_eq!(query.get("format").map(String::as_str), Some("raw"));
     }
 
     #[test]

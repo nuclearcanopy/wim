@@ -2,7 +2,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
-use crate::theme::{lerp, shade, DIM, MID, NEAR_BLACK, NEAR_WHITE};
+use crate::theme::{lerp, shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::textfit::tail_fit;
 
 /// A hand-drawn box around a search input: "search..." as a dim
@@ -40,7 +40,7 @@ impl Widget for SearchBox<'_> {
         // the whole frame brightens while this box owns the keyboard.
         // the blinking cursor used to be the only signal, which meant
         // half of every blink cycle showed no indicator at all.
-        let border_color = shade(if self.editing { MID } else { NEAR_BLACK });
+        let border_color = shade(if self.editing { NEAR_WHITE } else { NEAR_BLACK });
         let w = area.width;
         let h = area.height;
 
@@ -297,6 +297,25 @@ mod tests {
             render("", true),
             ["┌────────┐", "│........│", "└────────┘"].join("\n")
         );
+    }
+
+    #[test]
+    fn focused_box_highlights_its_complete_right_wall() {
+        let mut buf = buffer(10, 3);
+        SearchBox {
+            query: "",
+            editing: true,
+            label: "search",
+            cursor_visible: false,
+            right_border: true,
+        }
+        .render(Rect::new(0, 0, 10, 3), &mut buf);
+
+        for y in 0..3 {
+            let cell = buf.cell((9, y)).unwrap();
+            assert_eq!(cell.symbol(), ["┐", "│", "┘"][y as usize]);
+            assert_eq!(cell.fg, shade(NEAR_WHITE), "right wall row {y}");
+        }
     }
 
     /// A cell of breathing room each side, so the tail of the query

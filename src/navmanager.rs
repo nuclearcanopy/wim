@@ -10,6 +10,13 @@ pub enum NavManagerStep {
     Add(LoginForm),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionStatus {
+    Online,
+    Unreachable,
+    ConfigurationIssue,
+}
+
 pub struct NavManager {
     pub step: NavManagerStep,
     pub selected: usize,
@@ -18,7 +25,7 @@ pub struct NavManager {
     /// `cfg.navidrome_servers`; `None` = not tested this session yet.
     /// Tested all at once right when the manager opens, not lazily per
     /// row, so you see where every profile stands immediately.
-    pub connection_status: Vec<Option<bool>>,
+    pub connection_status: Vec<Option<ConnectionStatus>>,
     /// Row index a first 'd' press armed for removal. Removing a
     /// profile rewrites config.toml immediately and can't be undone,
     /// so it takes a second press on the same row; anything else
@@ -31,7 +38,7 @@ impl NavManager {
         NavManager {
             step: NavManagerStep::List,
             selected: 0,
-            message: String::new(),
+            message: "✓ online · ✗ unreachable · ! credentials/config".into(),
             connection_status: Vec::new(),
             pending_delete: None,
         }
@@ -63,25 +70,41 @@ mod tests {
     #[test]
     fn removing_a_row_keeps_later_badges_on_their_own_rows() {
         let mut nm = NavManager::new();
-        nm.connection_status = vec![Some(true), Some(false), None];
+        nm.connection_status = vec![
+            Some(ConnectionStatus::Online),
+            Some(ConnectionStatus::Unreachable),
+            None,
+        ];
         nm.forget_status_at(0);
-        assert_eq!(nm.connection_status, vec![Some(false), None]);
+        assert_eq!(
+            nm.connection_status,
+            vec![Some(ConnectionStatus::Unreachable), None]
+        );
     }
 
     #[test]
     fn removing_past_a_lazily_grown_status_vec_truncates_instead_of_misaligning() {
         let mut nm = NavManager::new();
         // only the first two of four servers have been tested.
-        nm.connection_status = vec![Some(true), Some(false)];
+        nm.connection_status = vec![
+            Some(ConnectionStatus::Online),
+            Some(ConnectionStatus::ConfigurationIssue),
+        ];
         nm.forget_status_at(3);
         assert_eq!(
             nm.connection_status,
-            vec![Some(true), Some(false)],
+            vec![
+                Some(ConnectionStatus::Online),
+                Some(ConnectionStatus::ConfigurationIssue)
+            ],
             "entries before the removal are still correctly aligned"
         );
-        nm.connection_status = vec![Some(true), Some(false)];
+        nm.connection_status = vec![
+            Some(ConnectionStatus::Online),
+            Some(ConnectionStatus::ConfigurationIssue),
+        ];
         nm.forget_status_at(1);
-        assert_eq!(nm.connection_status, vec![Some(true)]);
+        assert_eq!(nm.connection_status, vec![Some(ConnectionStatus::Online)]);
     }
 
     #[test]

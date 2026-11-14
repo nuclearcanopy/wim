@@ -34,15 +34,10 @@ pub const BOTTOM_BAR_DEFAULT: u16 = 4;
 /// ordinary band and wrong at both ends. Narrow: `Constraint::Length`
 /// hands the whole width to the first constraint and zero to the rest,
 /// so a 32-cell sidebar on a 24-cell terminal leaves **no content pane
-/// at all**. Wide: ascii video is only watchable at a font small enough
-/// to give a few hundred cells, and a fixed 32 cells is then a
-/// physically thin strip, which is the "unreadable sliver" the roadmap
-/// item names.
-/// The floors are deliberately gentle. At 1/8 the sidebar grew to 40
-/// cells at 320 columns, which is ascii-video territory and still an
-/// ordinary window: that overrode a user who had chosen a narrow
-/// sidebar, in the band where their choice is exactly what they meant.
-/// At 1/10 the stored 32 survives to 320 and only widens past it.
+/// at all**. Wide terminals also need proportional chrome so a fixed
+/// sidebar does not become a physically thin strip.
+/// The floors are deliberately gentle. At 1/10 the stored 32 survives
+/// to 320 columns and only widens past it.
 const SIDEBAR_SHARE_MAX: (u16, u16) = (2, 5);
 const SIDEBAR_SHARE_MIN: (u16, u16) = (1, 10);
 const BOTTOM_SHARE_MAX: (u16, u16) = (1, 3);
@@ -205,7 +200,7 @@ mod eyeball {
             (80, 24, "the classic terminal"),
             (120, 30, "an ordinary wim window"),
             (200, 50, "a big monitor"),
-            (320, 90, "ascii video territory"),
+            (320, 90, "very wide terminal"),
             (480, 140, "absurd zoom-out"),
             (1, 1, "degenerate"),
         ] {

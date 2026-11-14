@@ -108,6 +108,10 @@ mode, `auto` picks the best the terminal can actually do. built
 for the protocol detection and why `Halfblocks` does not count as real
 art.
 
+UI state hues are opt-in with `WIM_COLOR=semantic`; `WIM_COLOR=mono` or
+`NO_COLOR` keeps the grayscale palette. Labels, severity icons, and distinct
+progress glyphs remain meaningful in either mode.
+
 ## subtitles (video)
 
 auto-fetch from opensubtitles on local video playback (behind

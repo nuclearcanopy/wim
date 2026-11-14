@@ -245,13 +245,8 @@ sits, and pressing play during one skips the rest of it.
 `gap` is a session setting, like `crossfade`: `gap_seconds` in the
 config is the value it starts at.
 
-`video(mode)` is the other half of shift-`v`, and it writes
-`video_output` to config.toml rather than overriding it for the run:
-the key is the quick toggle, the command is the setting. It clears the
-key's override as it goes, because that override wins over config and
-would otherwise swallow the change. `ascii` is wim painting the video
-itself as text cells, for a terminal with no image protocol; `auto`
-never picks it, so naming it is the only way in.
+`video()` opens or focuses the native mpv window for the current video.
+It accepts no renderer modes: mpv owns video rendering and fullscreen.
 
 `silence` is its own command rather than something nestable inside
 `queue(...)`: `queue`'s parameter is `terms`, which means "names of
@@ -478,7 +473,7 @@ shuffle_queue()         reorder the queue now, without touching shuffle mode
 speed(speed)            1.5, or up / down / reset             [tempo]
 eq(preset)              apply a preset; view(eq) opens the menu  [equalizer]
 crossfade()             toggle crossfade                      [xfade]
-video(mode)             how a local video draws: auto/tct/kitty/ascii/off
+video()                 open or focus the current video's mpv window
 ```
 
 `shuffle()` and `shuffle_queue()` are deliberately separate names: one

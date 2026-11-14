@@ -136,13 +136,13 @@ impl Notification {
     }
 }
 
-const MIN_LIFETIME: Duration = Duration::from_secs(3);
-const MAX_LIFETIME: Duration = Duration::from_secs(10);
-/// Longer messages get more time to actually read, not a fixed
-/// duration regardless of length; scales from the 3s floor by roughly
-/// a second per 15 characters, capped at the 10s ceiling.
+const MIN_LIFETIME: Duration = Duration::from_secs(2);
+const MAX_LIFETIME: Duration = Duration::from_secs(6);
+/// Keep transient feedback brief while allowing longer messages a little
+/// more time: two seconds minimum, one extra second per 30 characters,
+/// capped at six. Persistent download progress is unaffected.
 fn lifetime_for(message: &str) -> Duration {
-    let extra = Duration::from_secs((message.chars().count() / 15) as u64);
+    let extra = Duration::from_secs((message.chars().count() / 30) as u64);
     (MIN_LIFETIME + extra).min(MAX_LIFETIME)
 }
 
@@ -164,6 +164,21 @@ pub struct Notifications {
 }
 
 impl Notifications {
+    /// Dismiss one notification by its visible stack position. The
+    /// overlay is newest-first while storage is oldest-first.
+    pub fn dismiss_visible(&mut self, index: usize) -> bool {
+        if index >= self.items.len() {
+            return false;
+        }
+        self.items.remove(self.items.len() - 1 - index);
+        true
+    }
+
+    /// Clear every visible notification, including in-flight progress.
+    pub fn dismiss_all(&mut self) {
+        self.items.clear();
+    }
+
     pub fn push(&mut self, severity: Severity, message: impl Into<String>) {
         let message = message.into();
         // a failure that re-fires every frame (a dead mpv ipc socket
@@ -317,6 +332,25 @@ mod tests {
             1,
             "an in-flight download must not expire"
         );
+    }
+
+    #[test]
+    fn dismissing_uses_newest_first_visible_order() {
+        let mut n = Notifications::default();
+        n.push(Severity::Info, "older");
+        n.push(Severity::Error, "newer");
+        assert!(n.dismiss_visible(0));
+        assert_eq!(n.visible().len(), 1);
+        assert_eq!(n.visible()[0].message, "older");
+        assert!(!n.dismiss_visible(1));
+        n.dismiss_all();
+        assert!(n.visible().is_empty());
+    }
+
+    #[test]
+    fn ordinary_notification_lifetime_is_short_and_bounded() {
+        assert_eq!(lifetime_for("ok"), Duration::from_secs(2));
+        assert_eq!(lifetime_for(&"x".repeat(180)), Duration::from_secs(6));
     }
 
     #[test]

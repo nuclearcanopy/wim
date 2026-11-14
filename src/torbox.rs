@@ -534,7 +534,11 @@ impl AccountItem {
                     service: self.service,
                     item_id: self.id,
                     file_id: file.id,
-                    title: file.name.clone(),
+                    title: if video {
+                        spoiler_safe_video_label(&file.name)
+                    } else {
+                        file.name.clone()
+                    },
                     video,
                     client: client.clone(),
                     resolved_url: None,
@@ -570,6 +574,109 @@ impl AccountItem {
     /// Total size of every file TorBox reports for this item.
     pub fn total_size(&self) -> u64 {
         self.files.iter().map(|file| file.size).sum()
+    }
+}
+
+/// Convert common release-name numbering (`S03E05`, `S03.EP05`, etc.) to
+/// a neutral label. The original filename remains available in the TorBox
+/// file picker, but is never carried into now-playing, queues, or mpv's title.
+fn spoiler_safe_video_label(filename: &str) -> String {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(filename);
+    // Scan the original stem instead of splitting first: the common compact
+    // spelling `S03E05` is one token and used to evade the episode matcher.
+    let bytes = stem.as_bytes();
+    for i in 0..bytes.len().saturating_sub(2) {
+        if !matches!(bytes[i], b's' | b'S') {
+            continue;
+        }
+        let Some((season, after_season)) = label_digits(bytes, i + 1) else {
+            continue;
+        };
+        let mut e = after_season;
+        while e < bytes.len() && matches!(bytes[e], b'.' | b' ' | b'_' | b'-') {
+            e += 1;
+        }
+        if e >= bytes.len() || !matches!(bytes[e], b'e' | b'E') {
+            continue;
+        }
+        e += 1;
+        if e < bytes.len() && matches!(bytes[e], b'p' | b'P') {
+            e += 1;
+        }
+        while e < bytes.len() && matches!(bytes[e], b'.' | b' ' | b'_' | b'-') {
+            e += 1;
+        }
+        let Some((episode, _)) = label_digits(bytes, e) else {
+            continue;
+        };
+        let show =
+            stem[..i].trim_matches(|c: char| c == '.' || c == '_' || c == '-' || c.is_whitespace());
+        let show = show
+            .rsplit_once('.')
+            .map_or(show, |(prefix, year)| {
+                if year.len() == 4 && year.parse::<u16>().is_ok() {
+                    prefix
+                } else {
+                    show
+                }
+            })
+            .replace(['.', '_'], " ");
+        return if show.is_empty() {
+            format!("Episode {episode} Season {season}")
+        } else {
+            format!("{show} Episode {episode} Season {season}")
+        };
+    }
+    let tokens: Vec<&str> = stem
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    // A movie has no episode metadata; use a modestly cleaned stem rather
+    // than leaking extension/container details.
+    tokens.join(" ")
+}
+
+fn label_digits(bytes: &[u8], mut at: usize) -> Option<(u32, usize)> {
+    let start = at;
+    while at < bytes.len() && bytes[at].is_ascii_digit() {
+        at += 1;
+    }
+    (at > start)
+        .then(|| {
+            std::str::from_utf8(&bytes[start..at])
+                .ok()?
+                .parse()
+                .ok()
+                .map(|n| (n, at))
+        })
+        .flatten()
+}
+
+#[cfg(test)]
+mod spoiler_safe_label_tests {
+    use super::spoiler_safe_video_label;
+
+    #[test]
+    fn episode_release_names_hide_release_suffixes_and_episode_titles() {
+        assert_eq!(
+            spoiler_safe_video_label("Silo.S03.EP05.THE.MEMORY.2160p.mkv"),
+            "Silo Episode 5 Season 3"
+        );
+        assert_eq!(
+            spoiler_safe_video_label("Silo.S03E05.The.Memory.2160p.mkv"),
+            "Silo Episode 5 Season 3"
+        );
+    }
+
+    #[test]
+    fn movie_labels_drop_the_extension_and_release_punctuation() {
+        assert_eq!(
+            spoiler_safe_video_label("Arrival.2016.1080p.mkv"),
+            "Arrival 2016 1080p"
+        );
     }
 }
 
