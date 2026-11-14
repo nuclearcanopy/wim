@@ -9075,6 +9075,7 @@ queue(morning)
                 "starred",
                 "index",
                 "history",
+                "messages",
                 "playlists",
                 "vars",
                 "bindings",

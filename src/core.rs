@@ -622,7 +622,10 @@ impl TrackResolver {
         #[cfg(feature = "dev-telemetry")]
         let started = Instant::now();
         thread::spawn(move || {
-            let tracks = items.into_iter().try_fold(Vec::new(), |mut acc, item| {
+            // a panic here would drop this ticket without sending, and the
+            // in-order delivery would then hold every later batch forever
+            let tracks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                items.into_iter().try_fold(Vec::new(), |mut acc, item| {
                 let mut resolved = resolve_tracks(&item)?;
                 for track in &mut resolved {
                     if let SearchItem::TorBoxFile {
@@ -672,7 +675,9 @@ impl TrackResolver {
                 }
                 acc.append(&mut resolved);
                 Ok::<_, String>(acc)
-            });
+                })
+            }))
+            .unwrap_or_else(|_| Err("resolving the queue crashed; try again".to_string()));
             if into.queue_bound() && shared.load(Ordering::SeqCst) != epoch {
                 crate::trace_diag!("resolve", "stale-dropped", &[]);
                 return;
@@ -1667,6 +1672,38 @@ pub fn enqueue_track(
         note: format!("queued: {}", label(item)),
     }
 }
+/// After an mpv reply timed out, a queue mutation may or may not have
+/// run. Compares the lengths and makes the two sides agree again without
+/// touching what is playing: extra tail entries mpv took are removed, and
+/// a recorded tail mpv never took is forgotten. Returns what it did.
+pub fn reconcile_queue_after_timeout(player: &mpv::Mpv, queue: &mut PlayQueue) -> Option<String> {
+    let count = player
+        .get_property("playlist-count")
+        .ok()?
+        .as_u64()
+        .map(|n| n as usize)?;
+    let recorded = queue.entries().len();
+    match count.cmp(&recorded) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => {
+            for index in (recorded..count).rev() {
+                let _ = player.playlist_remove(index);
+            }
+            Some(format!(
+                "mpv answered late; dropped {} entries it queued behind wim's back",
+                count - recorded
+            ))
+        }
+        std::cmp::Ordering::Less => {
+            queue.truncate(count);
+            Some(format!(
+                "mpv never accepted the last {} queued entries; the queue was shortened to match",
+                recorded - count
+            ))
+        }
+    }
+}
+
 /// Resyncs mpv's upcoming playlist to `items` (after a shuffle)
 /// without disturbing whatever's currently playing; mpv's own
 /// `playlist-clear` keeps the current file and drops the rest, so both

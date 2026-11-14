@@ -261,6 +261,15 @@ impl PlayQueue {
     /// The whole mpv playlist, played prefix included, so a queue view
     /// can show where you are inside it rather than only what's left.
     /// Index into this is the same index mpv reports as `playlist-pos`.
+    /// Drops everything past `len`, for when mpv turns out to hold fewer
+    /// entries than were recorded (an append it never accepted).
+    pub fn truncate(&mut self, len: usize) {
+        self.entries.truncate(len);
+        if self.pos.is_some_and(|p| p >= len) {
+            self.pos = len.checked_sub(1);
+        }
+    }
+
     pub fn entries(&self) -> &[SearchItem] {
         &self.entries
     }
@@ -548,6 +557,15 @@ mod tests {
     /// every later remove, move and jump address the wrong track, with
     /// no message. the recovery is this move, so it has to be exact
     /// including the play position.
+    #[test]
+    fn truncate_forgets_a_tail_mpv_never_took_and_keeps_pos_valid() {
+        let mut q = queue_of(&["a", "b", "c", "d"]);
+        q.truncate(2);
+        assert_eq!(q.entries().len(), 2);
+        q.truncate(0);
+        assert!(q.current().is_none());
+    }
+
     #[test]
     fn reversing_a_shuffle_insert_restores_the_queue() {
         for pos in [0i64, 1, 2] {
