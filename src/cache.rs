@@ -136,6 +136,10 @@ pub fn day_number(ymd: &str) -> Option<i64> {
     if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
+    // the arithmetic below overflows for absurd years from a hand-edited index
+    if !(0..=9999).contains(&year) {
+        return None;
+    }
     let year = if month <= 2 { year - 1 } else { year };
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let yoe = year - era * 400;
@@ -2858,5 +2862,18 @@ mod safe_file_stem_tests {
             assert!(!stem.contains(['/', '\\', '\0']));
         }
         assert_ne!(safe_file_stem("a/b"), safe_file_stem("a/c"));
+    }
+}
+
+#[cfg(test)]
+mod day_number_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn absurd_years_are_unparseable_not_an_overflow() {
+        assert_eq!(day_number("99999999999999999-01-01"), None);
+        assert_eq!(day_number("-5-01-01"), None);
+        assert!(day_number("2026-11-14").is_some());
+        assert_eq!(day_number("1970-01-01"), Some(0));
     }
 }
