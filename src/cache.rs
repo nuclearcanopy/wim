@@ -348,7 +348,22 @@ fn parse_index_body(raw: &str) -> CacheIndex {
 /// Where a given track id would land on disk once downloaded, with the
 /// given extension (no leading dot).
 pub fn track_path(id: &str, ext: &str) -> Result<PathBuf> {
-    Ok(tracks_dir()?.join(format!("{id}.{ext}")))
+    Ok(tracks_dir()?.join(format!("{}.{ext}", safe_file_stem(id))))
+}
+
+/// A server-supplied id is a file name here, so one holding a path
+/// separator, NUL or a dot-only name must not be able to leave
+/// `tracks/`. Ordinary ids pass through unchanged, so existing cache
+/// files keep their names.
+fn safe_file_stem(id: &str) -> String {
+    let plain = !id.is_empty() && !id.chars().all(|c| c == '.') && !id.contains(['/', '\\', '\0']);
+    if plain {
+        return id.to_string();
+    }
+    use md5::{Digest, Md5};
+    let digest = Md5::digest(id.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("id-{hex}")
 }
 
 /// The transient, uncompressed file handed to mpv for a compressed cache
@@ -507,7 +522,14 @@ fn cleanup_stale_playback_files() {
         #[cfg(unix)]
         let alive = {
             // A PID that answers with EPERM still exists; only ESRCH is stale.
-            let status = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            let Ok(pid) = libc::pid_t::try_from(pid) else {
+                continue;
+            };
+            if pid <= 0 {
+                continue;
+            }
+            // SAFETY: signal 0 only checks that the pid exists; a positive pid.
+            let status = unsafe { libc::kill(pid, 0) };
             status == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
         };
         #[cfg(not(unix))]
@@ -2793,5 +2815,26 @@ mod tests {
         assert_eq!(evicted, 0);
         assert!(path.exists());
         fs::remove_file(&path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod safe_file_stem_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_ids_keep_their_names() {
+        assert_eq!(safe_file_stem("abc123"), "abc123");
+        assert_eq!(safe_file_stem("a.b-c_d"), "a.b-c_d");
+    }
+
+    #[test]
+    fn ids_that_could_leave_the_tracks_dir_are_hashed() {
+        for id in ["../../x", "a/b", "a\\b", "..", ".", "", "x\0y"] {
+            let stem = safe_file_stem(id);
+            assert!(stem.starts_with("id-"), "{id:?} -> {stem}");
+            assert!(!stem.contains(['/', '\\', '\0']));
+        }
+        assert_ne!(safe_file_stem("a/b"), safe_file_stem("a/c"));
     }
 }

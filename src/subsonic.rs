@@ -33,6 +33,10 @@ const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 16;
 pub(crate) const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A real cover is well under this; a hostile server must not be able to
+/// make decode allocate without bound.
+const MAX_COVER_BYTES: u64 = 32 << 20;
+
 /// How many `getAlbum` requests an artist fetch runs at once. Subsonic
 /// has no single call for every song by an artist (see
 /// `stream_artist_tracks`), so it is one request per album; 8 hides
@@ -267,7 +271,7 @@ impl std::fmt::Debug for Client {
     /// Hand-written so the password never ends up in a `{:?}` log line.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
-            .field("base_url", &self.base_url)
+            .field("base_url", &safe_server_identity(&self.base_url))
             .field("username", &self.username)
             .finish()
     }
@@ -885,7 +889,13 @@ impl Client {
         req.call()
             .map_err(|e| request_failed("getCoverArt", e))?
             .into_reader()
+            .take(MAX_COVER_BYTES + 1)
             .read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_COVER_BYTES,
+            "getCoverArt: cover larger than {} MiB",
+            MAX_COVER_BYTES >> 20
+        );
         Ok(bytes)
     }
 
@@ -1073,7 +1083,7 @@ struct SubsonicError {
 /// are user-visible (`catalog::fetched` wraps them and the event loop
 /// toasts them), so the url is dropped and the status or transport
 /// cause kept. Mirrors ureq's own kind/message/source wording.
-fn request_failed(endpoint: &str, e: ureq::Error) -> anyhow::Error {
+pub(crate) fn request_failed(endpoint: &str, e: ureq::Error) -> anyhow::Error {
     match e {
         ureq::Error::Status(code, _) => anyhow::anyhow!("{endpoint}: http {code}"),
         ureq::Error::Transport(t) => {
