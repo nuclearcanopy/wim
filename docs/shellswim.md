@@ -54,8 +54,9 @@ answers, and only one of them is true.
 | printed equalizer snapshot | `view(eq)` |
 | printed undo history | `view(undo)` |
 | printed, personalized recommendations | `view(suggestions)` |
+| printed starred items from the loaded library | `view(starred)` |
 | printed by shellswim | `view(now)` |
-| declined, naming wim | `view(starred)` |
+| declined, naming wim | — |
 | declined, naming a command that works | `up()`/`down()`/`top()`/`bottom()`, `go()` on a browse row, opening an album's page |
 
 the first row is not a shellswim decision: `ViewTarget::is_screen()`
