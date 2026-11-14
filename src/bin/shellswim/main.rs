@@ -36,6 +36,7 @@ use wim::cli;
 mod host;
 mod settings;
 mod surface;
+mod torbox_ui;
 
 use cli::{Cli, Run};
 use host::Host;
@@ -151,6 +152,12 @@ fn prompt() -> anyhow::Result<()> {
     let mut watch = wim::watch_workspace::Workspace::new();
     watch.spoilers_revealed = host.cfg.watch_reveal_spoilers;
     let mut watch_open = false;
+    let mut torbox = wim::torbox_workspace::Workspace::new(
+        wim::torbox::Client::from_config(&host.cfg)
+            .map_err(|_| "TorBox is not configured".to_string()),
+    );
+    torbox.spoilers_revealed = host.cfg.watch_reveal_spoilers;
+    let mut torbox_open = false;
     let mut list_view: Option<(surface::ListWorkspace, usize)> = None;
 
     loop {
@@ -183,6 +190,7 @@ fn prompt() -> anyhow::Result<()> {
             undo_open = true;
         }
         watch.poll();
+        torbox_ui::poll(&mut host, &mut torbox);
         let undo_now = host.now();
         let undo_rows = undo_open.then(|| host.undo.rows(undo_now));
         if std::mem::take(&mut host.swim.settings_requested) && host.interactive_prompt {
@@ -229,6 +237,7 @@ fn prompt() -> anyhow::Result<()> {
                 keybinds_refused: keybinds_refused.as_deref(),
                 undo: undo_rows.as_deref(),
                 watch: watch_open.then_some(&watch),
+                torbox: torbox_open.then_some(&torbox),
                 list: list_view.as_ref().map(|(list, selected)| (list, *selected)),
                 settings: settings_values
                     .as_deref()
@@ -267,6 +276,7 @@ fn prompt() -> anyhow::Result<()> {
             || list_view.is_some()
             || undo_open
             || watch_open
+            || torbox_open
             || host.lyrics_pane.is_open()
             || host.has_program_work()
             || host.console.cycle().is_some()
@@ -281,6 +291,16 @@ fn prompt() -> anyhow::Result<()> {
         }
         match event::read()? {
             Event::Paste(text) => {
+                if torbox_open && torbox_ui::paste(&mut torbox, &text) {
+                    continue;
+                }
+                if watch_open
+                    && watch.page == wim::watch_workspace::Page::Search
+                    && watch.search_editing
+                {
+                    watch.query.push_str(&text);
+                    continue;
+                }
                 if let Some(setup) = &mut lyrics_setup {
                     setup.key_file.push_str(&text);
                     continue;
@@ -417,6 +437,10 @@ fn prompt() -> anyhow::Result<()> {
                             _ => {}
                         }
                     }
+                    continue;
+                }
+                if torbox_open {
+                    torbox_ui::key(&mut host, &mut torbox, &mut torbox_open, key.code);
                     continue;
                 }
                 if watch_open {
@@ -792,6 +816,12 @@ fn prompt() -> anyhow::Result<()> {
                     settings_state.open = true;
                     continue;
                 }
+                if key.code == KeyCode::Char('T') && host.console.input.is_empty() {
+                    torbox_open = true;
+                    torbox.spoilers_revealed = host.cfg.watch_reveal_spoilers;
+                    torbox_ui::open(&host, &mut torbox);
+                    continue;
+                }
                 if key.code == KeyCode::Char('W') && host.console.input.is_empty() {
                     watch_open = true;
                     watch.spoilers_revealed = host.cfg.watch_reveal_spoilers;
@@ -865,7 +895,7 @@ fn banner(console: &mut Console, cfg: &config::Config, keymap: &Keymap) {
         env!("CARGO_PKG_VERSION")
     ));
     console.note(format!(
-        "? commands · {} queue · {} subtitles · K keys · E eq · W watch · {} settings · tab complete · dry(...) preview",
+        "? commands · {} queue · {} subtitles · K keys · E eq · W watch · T torbox · {} settings · tab complete · dry(...) preview",
         key_label(keymap.get(KeyAction::OpenQueueView)),
         key_label(prompt_key(keymap, KeyAction::OpenSubtitleMenu)),
         key_label(prompt_key(keymap, KeyAction::OpenSettingsMenu))
@@ -924,6 +954,7 @@ struct Screen<'a> {
     list: Option<(&'a surface::ListWorkspace, usize)>,
     undo: Option<&'a [wim::undo::Row<'a>]>,
     watch: Option<&'a wim::watch_workspace::Workspace>,
+    torbox: Option<&'a wim::torbox_workspace::Workspace>,
 }
 
 struct EqScreen<'a> {
@@ -1105,6 +1136,8 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
                     },
                     body,
                 );
+            } else if let Some(workspace) = s.torbox {
+                wim::ui::torbox::render(f, body, workspace);
             } else if let Some(workspace) = s.watch {
                 wim::ui::watch::render(f, body, workspace);
             } else if let Some(rows) = s.undo {
