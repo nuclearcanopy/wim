@@ -1870,6 +1870,9 @@ fn main() -> anyhow::Result<()> {
         };
         guard.terminal.draw(|f| {
             let area = f.area();
+            if ui::draw::too_small(f.buffer_mut(), area) {
+                return;
+            }
 
             // onboarding takes the whole screen; no divider/status bar
             // competing with a guided first-run sequence.

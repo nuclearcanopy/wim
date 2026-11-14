@@ -20,7 +20,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
-use crate::theme::{shade, NEAR_BLACK};
+use crate::theme::{shade, MID, NEAR_BLACK};
 use crate::ui::textfit::{
     cluster_cells, clusters, one_cell_chars, plain_ascii, truncate_to_width, width,
 };
@@ -125,6 +125,31 @@ pub fn line(buf: &mut Buffer, area: Rect, y: u16, text: &str, color: Color) {
         return;
     }
     at(buf, area.x, y, text, color, area.width as usize);
+}
+
+/// Smallest terminal the panes lay out sensibly in; below it the chrome
+/// overlaps itself (a banner clipped over the sidebar, controls gone).
+pub const MIN_COLS: u16 = 30;
+pub const MIN_ROWS: u16 = 8;
+
+/// Draws a one-line "resize" notice instead of the interface when
+/// `area` is below the minimum. Returns whether it did, so the caller
+/// skips the real frame.
+pub fn too_small(buf: &mut Buffer, area: Rect) -> bool {
+    if area.width >= MIN_COLS && area.height >= MIN_ROWS {
+        return false;
+    }
+    clear(buf, area);
+    let text = if area.width >= 28 {
+        format!("terminal too small: need {MIN_COLS}x{MIN_ROWS}")
+    } else if area.width >= 14 {
+        "too small".to_string()
+    } else {
+        "...".to_string()
+    };
+    let y = area.y + area.height / 2;
+    line(buf, area, y, &text, shade(MID));
+    true
 }
 
 /// Blanks every cell of `area`: a space, and the style reset. An
@@ -528,5 +553,35 @@ mod tests {
         let mut buf = plated_buffer(10, 4);
         overlay(&mut buf, Rect::new(0, 0, 10, 4));
         assert_no_bleed_through(&buf, Rect::new(0, 0, 10, 4));
+    }
+}
+
+#[cfg(test)]
+mod too_small_tests {
+    use super::*;
+
+    fn text_of(buf: &Buffer, area: Rect) -> String {
+        (area.y..area.y + area.height)
+            .flat_map(|y| (area.x..area.x + area.width).map(move |x| (x, y)))
+            .map(|pos| buf.cell(pos).unwrap().symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_big_enough_terminal_is_left_alone() {
+        let area = Rect::new(0, 0, MIN_COLS, MIN_ROWS);
+        let mut buf = Buffer::empty(area);
+        assert!(!too_small(&mut buf, area));
+        assert_eq!(text_of(&buf, area).trim(), "");
+    }
+
+    #[test]
+    fn a_small_one_gets_only_the_notice_and_never_overflows() {
+        for (w, h) in [(1, 1), (2, 10), (13, 3), (20, 5), (29, 40), (80, 7)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            assert!(too_small(&mut buf, area), "{w}x{h}");
+            assert!(!text_of(&buf, area).trim().is_empty(), "{w}x{h}");
+        }
     }
 }
