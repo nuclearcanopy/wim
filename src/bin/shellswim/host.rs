@@ -537,6 +537,31 @@ impl Host {
         let _ = core::dispatch_action(action, &mut core, &mut surf);
     }
 
+    /// Runs one op through the same path the prompt uses, so undo and
+    /// redo from the tree record, refuse at barriers and report alike.
+    pub fn apply_one(&mut self, op: wim::shellsong::Op) {
+        let now = self.start.elapsed();
+        let now_playing = self.play_queue.current().cloned();
+        let mut surf = self.swim.borrowed();
+        let mut core = core_ctx!(self, now, now_playing);
+        let _ = core::apply_op(op, &mut core, &mut surf);
+    }
+
+    /// Crosses to a sibling branch of the undo tree and restores it.
+    pub fn switch_undo_branch(&mut self, delta: isize) {
+        let now = self.start.elapsed();
+        let now_playing = self.play_queue.current().cloned();
+        let mut core = core_ctx!(self, now, now_playing);
+        match core.undo.switch_branch(delta) {
+            Some(snapshot) => {
+                if let Err(why) = snapshot.restore(&mut core) {
+                    core.console.fail(why);
+                }
+            }
+            None => core.console.note("no other branch here"),
+        }
+    }
+
     pub fn now_playing(&self) -> Option<SearchItem> {
         self.play_queue.current().cloned()
     }
