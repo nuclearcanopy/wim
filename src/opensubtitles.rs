@@ -6,7 +6,6 @@
 //! general knowledge, not verified against live docs in this sandbox
 //! (no network access here beyond what's already configured).
 
-
 use serde::Deserialize;
 
 const BASE_URL: &str = "https://api.opensubtitles.com/api/v1";
