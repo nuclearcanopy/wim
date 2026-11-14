@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::UNIX_EPOCH;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::prelude::*;
 use lofty::probe::Probe;
@@ -190,7 +190,7 @@ impl TagIndex {
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_vec(self)?;
-        fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
+        crate::fsutil::atomic_write(path, &json)?;
         Ok(())
     }
 
