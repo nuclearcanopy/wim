@@ -3390,6 +3390,8 @@ fn main() -> anyhow::Result<()> {
                         let done = download_resolved(&tracks, &mut core);
                         core.notifications.push(Severity::Info, done.status);
                     }
+                    // wim opens a page instead; nothing requests this here.
+                    Intent::Browse => {}
                 },
                 Err(why) => core.notifications.push(Severity::Error, why),
             }

@@ -57,7 +57,8 @@ answers, and only one of them is true.
 | printed starred items from the loaded library | `view(starred)` |
 | printed by shellswim | `view(now)` |
 | declined, naming wim | — |
-| declined, naming a command that works | `up()`/`down()`/`top()`/`bottom()`, `go()` on a browse row, opening an album's page |
+| opens the tracks as a playable list | opening an album, artist or playlist page |
+| declined, naming a command that works | `up()`/`down()`/`top()`/`bottom()`, `go()` on a browse row |
 
 the first row is not a shellswim decision: `ViewTarget::is_screen()`
 already partitioned the language exactly that way, and the seam just
