@@ -13,6 +13,7 @@ use wim::{
 };
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write as _;
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -819,19 +820,28 @@ fn empty_suggestions_reason(app: &app::App) -> String {
 /// What the results list should say instead of rendering nothing when
 /// there's nothing to show; a blank screen with no explanation is a
 /// dead end, never the right default.
+/// Pasted text goes into single-line fields (passwords, paths, urls): a
+/// trailing newline or stray control byte there turns into an
+/// unexplained auth or path failure.
+fn clean_paste(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 fn empty_results_message(app: &app::App) -> String {
     if app.corpus.is_empty() {
         loading_message(
             app.scanning_library,
             app.syncing_servers || app.loading_cached_catalog,
         )
-        .unwrap_or(
-            "no local music/video found: check library_paths in config, or set up navidrome (n)",
-        )
+        .unwrap_or("no library · n: add a server")
         .to_string()
     } else if app.loading_cached_catalog {
         "loading cached library...".to_string()
-    } else if app.editing_query && !app.query.is_empty() {
+    } else if !app.query.is_empty() {
         format!("no matches for \"{}\"", app.query)
     } else {
         "press / to search".to_string()
@@ -925,7 +935,8 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         cli::WimRun::Help => {
-            println!("{}", cli::wim_help());
+            // not println!: `wim --help | head` closes the pipe early
+            let _ = writeln!(std::io::stdout(), "{}", cli::wim_help());
             return Ok(());
         }
         cli::WimRun::Panes => (Vec::new(), false),
@@ -3732,6 +3743,8 @@ fn main() -> anyhow::Result<()> {
                 if crossfade_open {
                     continue;
                 }
+                let cleaned = clean_paste(text);
+                let text = &cleaned;
                 if let Some(ob) = &mut onboarding {
                     match ob.step {
                         Step::Navidrome => ob.login.current_mut().push_str(text),
@@ -4535,7 +4548,13 @@ fn main() -> anyhow::Result<()> {
                         Step::Welcome | Step::Controls => ob.advance(),
                         Step::Navidrome => match key.code {
                             KeyCode::Esc => ob.advance(),
-                            KeyCode::Char(c) => ob.login.current_mut().push(c),
+                            KeyCode::Char(c)
+                                if !key
+                                    .modifiers
+                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                            {
+                                ob.login.current_mut().push(c)
+                            }
                             KeyCode::Backspace => {
                                 if ob.login.current_mut().is_empty() {
                                     ob.login.prev_field();
@@ -4569,7 +4588,13 @@ fn main() -> anyhow::Result<()> {
                                 torbox_workspace.cancel_setup();
                                 ob.advance();
                             }
-                            KeyCode::Char(c) => ob.torbox_token_file_input.push(c),
+                            KeyCode::Char(c)
+                                if !key
+                                    .modifiers
+                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                            {
+                                ob.torbox_token_file_input.push(c)
+                            }
                             KeyCode::Backspace => {
                                 ob.torbox_token_file_input.pop();
                             }
@@ -4588,7 +4613,13 @@ fn main() -> anyhow::Result<()> {
                         },
                         Step::ListenBrainz => match key.code {
                             KeyCode::Esc => ob.advance(),
-                            KeyCode::Char(c) => ob.listenbrainz_token_input.push(c),
+                            KeyCode::Char(c)
+                                if !key
+                                    .modifiers
+                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                            {
+                                ob.listenbrainz_token_input.push(c)
+                            }
                             KeyCode::Backspace => {
                                 ob.listenbrainz_token_input.pop();
                             }
@@ -4628,7 +4659,13 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Backspace => {
                                 ob.musixmatch_key_file_input.pop();
                             }
-                            KeyCode::Char(c) => ob.musixmatch_key_file_input.push(c),
+                            KeyCode::Char(c)
+                                if !key
+                                    .modifiers
+                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                            {
+                                ob.musixmatch_key_file_input.push(c)
+                            }
                             KeyCode::Enter => {
                                 cfg.lyrics.providers = ob.lyrics_providers.clone();
                                 let key_file = ob.musixmatch_key_file_input.trim();
@@ -4647,7 +4684,13 @@ fn main() -> anyhow::Result<()> {
                             _ => {}
                         },
                         Step::LibraryPaths => match key.code {
-                            KeyCode::Char(c) => ob.path_input.push(c),
+                            KeyCode::Char(c)
+                                if !key
+                                    .modifiers
+                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                            {
+                                ob.path_input.push(c)
+                            }
                             KeyCode::Backspace => {
                                 ob.path_input.pop();
                             }
@@ -4771,7 +4814,13 @@ fn main() -> anyhow::Result<()> {
                                 nm.step = NavManagerStep::List;
                                 nm.message.clear();
                             }
-                            KeyCode::Char(c) => form.current_mut().push(c),
+                            KeyCode::Char(c)
+                                if !key
+                                    .modifiers
+                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                            {
+                                form.current_mut().push(c)
+                            }
                             KeyCode::Backspace => {
                                 if form.current_mut().is_empty() {
                                     form.prev_field();
@@ -5274,7 +5323,13 @@ fn main() -> anyhow::Result<()> {
                     // esc here only cancels the edit, not the whole menu.
                     if settings_token_editing {
                         match key.code {
-                            KeyCode::Char(c) => settings_token_input.push(c),
+                            KeyCode::Char(c)
+                                if !key
+                                    .modifiers
+                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                            {
+                                settings_token_input.push(c)
+                            }
                             KeyCode::Backspace => {
                                 settings_token_input.pop();
                             }

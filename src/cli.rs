@@ -196,7 +196,7 @@ pub fn script_lines(text: &str) -> Vec<String> {
 
 const BOTH: &str = "give either -c or a script, not both";
 
-pub const USAGE: &str = "usage: shellswim [-c COMMAND | SCRIPT.shg] [--version] [--help]";
+pub const USAGE: &str = "usage: shellswim [-c|--command COMMAND | SCRIPT.shg] [--version] [--help]";
 
 pub fn help() -> String {
     format!(
@@ -262,7 +262,8 @@ in the app:
   :        the shellsong console
   tab      move focus between the panes
 
-  config   ~/.config/wim/config.toml, shared with shellswim
+  config   ~/.config/wim/config.toml ($XDG_CONFIG_HOME), shared with shellswim
+  color    WIM_COLOR=semantic adds colour; NO_COLOR=1 forces it off
   trace    WIM_STARTUP_TRACE=1 cargo run -F dev-telemetry --bin wim"
     )
 }

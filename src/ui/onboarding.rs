@@ -1,4 +1,4 @@
-//! The five onboarding screens. Rendering only; `crate::onboarding`
+//! The onboarding screens. Rendering only; `crate::onboarding`
 //! owns the step state.
 //!
 //! Every screen shares one chrome (frame, vertically centred content,
@@ -65,7 +65,7 @@ const CONTROLS: &[(Key, &str)] = &[
 ];
 
 /// Welcome, controls, navidrome, TorBox, listenbrainz, lyrics, paths, done. The rail
-/// counts all seven including the bookends, since "step 1 of 7" on the
+/// counts all eight including the bookends, since "step 1 of 8" on the
 /// welcome screen is what tells the user the flow is short and finite
 /// before they commit to it.
 pub const TOTAL_STEPS: usize = 8;
@@ -230,7 +230,7 @@ pub(crate) fn chrome(buf: &mut Buffer, area: Rect, step: usize) -> Rect {
     }
 }
 
-/// "● ● ○ ○ ○ ○ ○   step 2 of 7". Position, not just a count: the dots
+/// "● ● ○ ○ ○ ○ ○ ○   step 2 of 8". Position, not just a count: the dots
 /// make the remaining distance visible at a glance, the words make it
 /// unambiguous. Current step is brightest, completed ones mid, the rest
 /// dim, so the eye lands on where it is now.
