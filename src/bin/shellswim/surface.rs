@@ -12,6 +12,13 @@ use wim::search::SearchItem;
 use wim::shellsong::{Op, Program, ViewTarget};
 use wim::ui::results_list::label;
 
+/// A printed list that the prompt can also open as a workspace, where
+/// enter plays and `a` queues the selected row.
+pub struct ListWorkspace {
+    pub title: String,
+    pub rows: Vec<(SearchItem, String)>,
+}
+
 /// What shellswim keeps that the core does not. Almost nothing, which
 /// is the point: the list below is the entire difference between the
 /// two front-ends' state.
@@ -30,6 +37,8 @@ pub struct SwimSurface {
     pub eq_requested: bool,
     /// Same hand-off for the settings editor.
     pub settings_requested: bool,
+    /// Starred items or suggestions the prompt should open as a list.
+    pub list_requested: Option<ListWorkspace>,
     /// Interactive prompt requested a live lyrics display. One-shot
     /// commands still print lyrics to stdout after the same lookup.
     pub lyrics_requested: bool,
@@ -150,6 +159,13 @@ impl Borrowed<'_> {
         for item in &starred {
             core.console.note(label(item));
         }
+        self.state.list_requested = Some(ListWorkspace {
+            title: "starred".to_owned(),
+            rows: starred
+                .iter()
+                .map(|item| ((*item).clone(), label(item)))
+                .collect(),
+        });
         op_note(format!(
             "{} starred items · use unstar(item) to remove",
             starred.len()
@@ -180,13 +196,22 @@ impl Borrowed<'_> {
             };
             return op_fail(reason);
         }
+        let mut rows = Vec::new();
         for section in &suggestions.sections {
             core.console.note(section.reason.title().to_string());
             for item in &section.items {
                 core.console
                     .note(format!("  {} — {}", label(&item.item), item.reason_text));
+                rows.push((
+                    item.item.clone(),
+                    format!("{} — {}", label(&item.item), item.reason_text),
+                ));
             }
         }
+        self.state.list_requested = Some(ListWorkspace {
+            title: "suggestions".to_owned(),
+            rows,
+        });
         op_note(format!("{count} suggestions"))
     }
 
