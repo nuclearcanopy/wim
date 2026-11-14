@@ -73,6 +73,10 @@ key do not trigger a lookup.
 Press the configured subtitle-menu key (default `t`) to cycle tracks,
 toggle visibility, and adjust the seven subtitle-style fields. Changes
 apply immediately and save automatically.
+Press `K` for the keybind editor: `j`/`k` select an action, `r` captures
+a replacement, `0` resets one action, and `R` resets all bindings.
+Reserved or already-used keys are refused rather than saved as dead
+bindings.
 
 The prompt also has an optional queue workspace: press the default `Q`
 key on an empty prompt to open it. `j`/`k` or arrows select tracks,
