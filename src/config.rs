@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::eq;
 use crate::notify::{Notifications, Severity};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NavidromeConfig {
     pub url: String,
     pub username: String,
@@ -30,6 +30,29 @@ pub struct NavidromeConfig {
     pub max_bitrate_kbps: Option<u32>,
     #[serde(default)]
     pub transcode_format: Option<String>,
+}
+
+/// Hand-written so a `{:?}` of a config (an `unwrap` message, a debug log)
+/// can never print the password.
+impl std::fmt::Debug for NavidromeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NavidromeConfig")
+            .field("url", &crate::subsonic::safe_server_identity(&self.url))
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[redacted]"))
+            .field("password_file", &self.password_file)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The whole config holds tokens and keys; a `{:?}` says only that it
+/// exists. Fields are read individually where they matter.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("navidrome_servers", &self.navidrome_servers.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl NavidromeConfig {
@@ -71,7 +94,7 @@ pub enum AlbumArtMode {
     Off,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Ordered lyrics sources; API keys are referenced by secret files.
     #[serde(default)]
@@ -1434,5 +1457,31 @@ name = "night bus"
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "config holds cleartext credentials");
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_never_contains_a_secret() {
+        let nav = NavidromeConfig {
+            url: "https://user:urlsecret@music.example".into(),
+            username: "me".into(),
+            password: Some("hunter2-secret".into()),
+            password_file: None,
+            max_bitrate_kbps: None,
+            transcode_format: None,
+        };
+        let shown = format!("{nav:?}");
+        assert!(!shown.contains("hunter2-secret"), "{shown}");
+        assert!(!shown.contains("urlsecret"), "{shown}");
+        let cfg = Config {
+            opensubtitles_api_key: Some("os-key-secret".into()),
+            navidrome_servers: vec![nav],
+            ..Config::default()
+        };
+        assert!(!format!("{cfg:?}").contains("secret"));
     }
 }
