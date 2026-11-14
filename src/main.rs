@@ -1028,7 +1028,11 @@ fn main() -> anyhow::Result<()> {
         .iter()
         .map(|server| server.url.clone())
         .collect::<Vec<_>>();
-    let media_proxy = wim::media_proxy::MediaProxy::start(&trusted_stream_origins).ok();
+    let (media_proxy, media_proxy_error) =
+        match wim::media_proxy::MediaProxy::start(&trusted_stream_origins) {
+            Ok(proxy) => (Some(proxy), None),
+            Err(error) => (None, Some(error.kind())),
+        };
     let mut watch_proxy_ready = false;
     let mut subtitle_delay = cfg.subtitles.delay_secs;
     // every global, single-purpose command key, remappable via 'K';
@@ -1171,6 +1175,14 @@ fn main() -> anyhow::Result<()> {
     // Per-band attack/release state for the maximized-player spectrum.
     let mut spectrum_smoother = SpectrumSmoother::default();
     let mut notifications = Notifications::default();
+    if let Some(kind) = media_proxy_error {
+        notifications.push(
+            Severity::Alert,
+            format!(
+                "media relay failed to start ({kind}); streams are not address-checked and Watch playback is off"
+            ),
+        );
+    }
     for warning in config_warnings.into_iter().chain(keybind_warnings) {
         notifications.push(Severity::Alert, warning);
     }
