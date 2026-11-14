@@ -8,7 +8,7 @@ use ratatui::style::Color;
 use ratatui::widgets::Widget;
 
 use crate::app::LoopMode;
-use crate::theme::{lerp, shade, BRIGHT, DIM, MID, NEAR_BLACK, NEAR_WHITE, WHITE};
+use crate::theme::{lerp, shade, BRIGHT, DIM, MID, NEAR_WHITE, WHITE};
 use crate::ui::draw;
 use crate::ui::progress::readouts;
 use crate::ui::textfit::{truncate_with_ellipsis, width};
@@ -360,15 +360,7 @@ impl Widget for ControlsBar<'_> {
                 None,
             );
             draw_chars(buf, x, area.x + area.width, y, "  ", shade(DIM), None);
-            draw_chars(
-                buf,
-                x + 2,
-                area.x + area.width,
-                y,
-                &hint,
-                shade(NEAR_BLACK),
-                None,
-            );
+            draw_chars(buf, x + 2, area.x + area.width, y, &hint, shade(DIM), None);
         }
         if y >= area.y + area.height {
             return;
@@ -2177,7 +2169,7 @@ mod bench {
                         );
                         let x = draw_chars(&mut buf, area.x, w, 0, &label, shade(DIM), None);
                         draw_chars(&mut buf, x, w, 0, "  ", shade(DIM), None);
-                        draw_chars(&mut buf, x + 2, w, 0, &hint, shade(NEAR_BLACK), None);
+                        draw_chars(&mut buf, x + 2, w, 0, &hint, shade(DIM), None);
                     }
                 });
             println!(
