@@ -119,7 +119,7 @@ fn put(cell: &mut Cell, mask: usize, fg: Color, bg: Color) {
     // naming the latter, so this stands up to ratatui's
     // `underline-color` feature being off.
     next.set_style(cell.style());
-    next.skip = cell.skip;
+    next.diff_option = cell.diff_option;
     next.fg = fg;
     next.bg = bg;
     *cell = next;
@@ -1643,7 +1643,7 @@ mod tests {
             assert_eq!(cell.fg, Color::Reset, "cell {mask} carries a colour");
             assert_eq!(cell.bg, Color::Reset, "cell {mask} carries a colour");
             assert_eq!(cell.modifier, ratatui::style::Modifier::empty());
-            assert!(!cell.skip);
+            assert_eq!(cell.diff_option, ratatui::buffer::CellDiffOption::None);
         }
     }
 
@@ -1663,7 +1663,11 @@ mod tests {
                 } else {
                     Modifier::DIM
                 };
-                cell.skip = i % 2 == 0;
+                cell.set_diff_option(if i % 2 == 0 {
+                    ratatui::buffer::CellDiffOption::Skip
+                } else {
+                    ratatui::buffer::CellDiffOption::None
+                });
                 cell.underline_color = Color::Indexed(5);
             }
         };
