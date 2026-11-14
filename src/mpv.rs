@@ -390,12 +390,18 @@ const FIRST_COMMAND_ID: u64 = 1000;
 #[cfg(target_os = "linux")]
 fn reap_with_parent(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
+    let parent = std::process::id() as libc::pid_t;
     // safety: `pre_exec` runs between fork and exec, so the closure
-    // must be async-signal-safe. one `prctl` syscall and nothing else
-    // qualifies; it allocates nothing and takes no locks.
+    // must be async-signal-safe. `prctl`, `getppid` and `_exit` are
+    // syscalls; nothing allocates or takes a lock.
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            // the parent may have died before the prctl took effect, in
+            // which case the death signal will never come
+            if libc::getppid() != parent {
+                libc::_exit(1);
+            }
             Ok(())
         });
     }
@@ -403,6 +409,37 @@ fn reap_with_parent(cmd: &mut Command) {
 
 #[cfg(not(target_os = "linux"))]
 fn reap_with_parent(_cmd: &mut Command) {}
+
+/// A wim killed with SIGKILL (or a crash) cannot unlink its mpv socket;
+/// clear the ones whose owning pid is gone so they do not pile up.
+fn sweep_stale_sockets(dir: &Path) {
+    #[cfg(unix)]
+    {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(pid) = name
+                .strip_prefix("wim-mpv-")
+                .and_then(|rest| rest.split('-').next())
+                .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+                .filter(|pid| *pid > 0)
+            else {
+                continue;
+            };
+            // SAFETY: signal 0 only checks that the pid exists.
+            let gone = unsafe { libc::kill(pid, 0) } != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            if gone && name.ends_with(".sock") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
 
 /// Distinguishes two `Mpv`s spawned by the same process. The app only
 /// ever spawns one, but naming the socket by pid alone meant a second
@@ -424,6 +461,7 @@ impl Mpv {
             std::process::id(),
             SPAWN_SEQ.fetch_add(1, Ordering::SeqCst)
         ));
+        sweep_stale_sockets(&sock_dir);
         let _ = std::fs::remove_file(&sock_path);
 
         let mut cmd = Command::new("mpv");
@@ -712,7 +750,10 @@ fn read_replies(
                         &[("event", crate::trace::Value::Label(label))],
                     );
                 }
-                let _ = event_tx.send(Event::Other(v));
+                // no consumer reads `Event::Other`, and `level-rms`-style
+                // events arrive at a high rate: forwarding them only grew
+                // an unbounded queue that the ui drained every frame
+                drop(v);
             }
             None => {}
         }
@@ -1628,5 +1669,28 @@ mod reader_survives_garbage_tests {
         drop(mpv_side);
         read_replies(wim_side, pending, event_tx);
         assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stale_socket_sweep_tests {
+    use super::*;
+
+    #[test]
+    fn sockets_of_dead_pids_go_and_live_ones_stay() {
+        let dir = std::env::temp_dir().join(format!("wim-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // pid_max is 2^22 at most on Linux, so this pid cannot exist
+        let dead = dir.join("wim-mpv-2147483646-0.sock");
+        let alive = dir.join(format!("wim-mpv-{}-0.sock", std::process::id()));
+        let other = dir.join("unrelated.sock");
+        for p in [&dead, &alive, &other] {
+            std::fs::write(p, b"").unwrap();
+        }
+        sweep_stale_sockets(&dir);
+        assert!(!dead.exists());
+        assert!(alive.exists() && other.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

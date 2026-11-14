@@ -1099,6 +1099,36 @@ pub(crate) fn request_failed(endpoint: &str, e: ureq::Error) -> anyhow::Error {
     }
 }
 
+/// A server reached over plain http outside the local network sends its
+/// salted login token (and the stream urls carrying it) in the clear.
+/// `None` for https, loopback, private/LAN addresses and `.local`-style
+/// names, where that is the user's own network.
+pub fn insecure_transport_warning(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(&normalize_url(url)).ok()?;
+    if parsed.scheme() != "http" {
+        return None;
+    }
+    let host = parsed
+        .host_str()?
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    let local = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !crate::stremio::is_public_address(ip),
+        Err(_) => {
+            !host.contains('.')
+                || ["local", "lan", "home", "internal", "localdomain"]
+                    .iter()
+                    .any(|tld| host.ends_with(&format!(".{tld}")))
+        }
+    };
+    (!local).then(|| {
+        format!(
+            "{} is plain http outside your network; use https so the login token is not sent in the clear",
+            safe_server_identity(url)
+        )
+    })
+}
+
 /// So typing a bare `myserver.com` (no scheme) in the login prompt
 /// actually works instead of silently failing to connect; defaults to
 /// https, since that's the sane assumption for anything reachable from
@@ -2587,5 +2617,29 @@ mod tests {
         let mut retranscoded = base.clone();
         retranscoded.transcode_format = Some("opus".into());
         assert!(!built.matches(&retranscoded));
+    }
+}
+
+#[cfg(test)]
+mod insecure_transport_tests {
+    use super::*;
+
+    #[test]
+    fn only_remote_plain_http_is_flagged() {
+        for fine in [
+            "https://music.example.com",
+            "http://localhost:4533",
+            "http://127.0.0.1:4533",
+            "http://192.168.1.20:4533",
+            "http://nas:4533",
+            "http://nas.local:4533",
+            "http://[::1]:4533",
+        ] {
+            assert!(insecure_transport_warning(fine).is_none(), "{fine}");
+        }
+        let warning = insecure_transport_warning("http://user:pw@music.example.com:4533").unwrap();
+        assert!(warning.contains("plain http"));
+        assert!(!warning.contains("pw"), "{warning}");
+        assert!(insecure_transport_warning("http://8.8.8.8").is_some());
     }
 }
