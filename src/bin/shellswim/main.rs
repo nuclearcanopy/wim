@@ -34,6 +34,7 @@ use wim::{anim, config, mpv, term};
 
 use wim::cli;
 mod host;
+mod nav_ui;
 mod settings;
 mod surface;
 mod torbox_ui;
@@ -158,6 +159,7 @@ fn prompt() -> anyhow::Result<()> {
     );
     torbox.spoilers_revealed = host.cfg.watch_reveal_spoilers;
     let mut torbox_open = false;
+    let mut nav: Option<wim::navmanager::NavManager> = None;
     let mut list_view: Option<(surface::ListWorkspace, usize)> = None;
 
     loop {
@@ -238,6 +240,9 @@ fn prompt() -> anyhow::Result<()> {
                 undo: undo_rows.as_deref(),
                 watch: watch_open.then_some(&watch),
                 torbox: torbox_open.then_some(&torbox),
+                nav: nav
+                    .as_ref()
+                    .map(|nm| (nm, host.cfg.navidrome_servers.as_slice())),
                 list: list_view.as_ref().map(|(list, selected)| (list, *selected)),
                 settings: settings_values
                     .as_deref()
@@ -277,6 +282,7 @@ fn prompt() -> anyhow::Result<()> {
             || undo_open
             || watch_open
             || torbox_open
+            || nav.is_some()
             || host.lyrics_pane.is_open()
             || host.has_program_work()
             || host.console.cycle().is_some()
@@ -291,6 +297,10 @@ fn prompt() -> anyhow::Result<()> {
         }
         match event::read()? {
             Event::Paste(text) => {
+                if let Some(manager) = &mut nav {
+                    nav_ui::paste(manager, &text);
+                    continue;
+                }
                 if torbox_open && torbox_ui::paste(&mut torbox, &text) {
                     continue;
                 }
@@ -436,6 +446,12 @@ fn prompt() -> anyhow::Result<()> {
                             }
                             _ => {}
                         }
+                    }
+                    continue;
+                }
+                if let Some(manager) = &mut nav {
+                    if !nav_ui::key(&mut host, manager, key.code) {
+                        nav = None;
                     }
                     continue;
                 }
@@ -816,6 +832,12 @@ fn prompt() -> anyhow::Result<()> {
                     settings_state.open = true;
                     continue;
                 }
+                if key.code == prompt_key(&keymap, KeyAction::OpenNavManager)
+                    && host.console.input.is_empty()
+                {
+                    nav = Some(nav_ui::open(&mut host));
+                    continue;
+                }
                 if key.code == KeyCode::Char('T') && host.console.input.is_empty() {
                     torbox_open = true;
                     torbox.spoilers_revealed = host.cfg.watch_reveal_spoilers;
@@ -895,10 +917,11 @@ fn banner(console: &mut Console, cfg: &config::Config, keymap: &Keymap) {
         env!("CARGO_PKG_VERSION")
     ));
     console.note(format!(
-        "? commands · {} queue · {} subtitles · K keys · E eq · W watch · T torbox · {} settings · tab complete · dry(...) preview",
+        "? commands · {} queue · {} subtitles · K keys · E eq · W watch · T torbox · {} settings · {} servers · tab complete · dry(...) preview",
         key_label(keymap.get(KeyAction::OpenQueueView)),
         key_label(prompt_key(keymap, KeyAction::OpenSubtitleMenu)),
-        key_label(prompt_key(keymap, KeyAction::OpenSettingsMenu))
+        key_label(prompt_key(keymap, KeyAction::OpenSettingsMenu)),
+        key_label(prompt_key(keymap, KeyAction::OpenNavManager))
     ));
 }
 
@@ -955,6 +978,10 @@ struct Screen<'a> {
     undo: Option<&'a [wim::undo::Row<'a>]>,
     watch: Option<&'a wim::watch_workspace::Workspace>,
     torbox: Option<&'a wim::torbox_workspace::Workspace>,
+    nav: Option<(
+        &'a wim::navmanager::NavManager,
+        &'a [config::NavidromeConfig],
+    )>,
 }
 
 struct EqScreen<'a> {
@@ -1136,6 +1163,26 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
                     },
                     body,
                 );
+            } else if let Some((nm, servers)) = s.nav {
+                match &nm.step {
+                    wim::navmanager::NavManagerStep::List => f.render_widget(
+                        wim::ui::nav_manager::NavManagerListView {
+                            servers,
+                            selected: nm.selected,
+                            message: &nm.message,
+                            connection_status: &nm.connection_status,
+                        },
+                        body,
+                    ),
+                    wim::navmanager::NavManagerStep::Add(form) => f.render_widget(
+                        wim::ui::login::LoginView {
+                            form,
+                            message: &nm.message,
+                            step: None,
+                        },
+                        body,
+                    ),
+                }
             } else if let Some(workspace) = s.torbox {
                 wim::ui::torbox::render(f, body, workspace);
             } else if let Some(workspace) = s.watch {
