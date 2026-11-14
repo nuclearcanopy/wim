@@ -81,6 +81,9 @@ so `search(x)` then `play()` means the same thing in both.
   usable before it answers; a command that has to resolve a name
   suspends on `AwaitResults` and resumes on a later frame. the whole
   of `Host::pump` is `try_recv`.
+- **submitted commands are never replaced by a running command.** New
+  input waits FIFO behind the active program and track-bound settings;
+  the host continues driving those settings even when the prompt is idle.
 - **the prompt is the last row, always.** an overlay grows downward
   from a centred origin; a shell grows upward from the prompt. output
   arriving must not move the thing you are typing into.
