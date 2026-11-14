@@ -23,8 +23,8 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui_image::StatefulImage;
 
 use wim::catalog::{
-    edit_servers, index_navidrome_server, merge_catalog_into_app, spawn_background_sync,
-    test_navidrome_connectivity, BackgroundSyncResult,
+    edit_servers, merge_catalog_into_app, spawn_background_sync, test_navidrome_connectivity,
+    BackgroundSyncResult,
 };
 use wim::core::{
     append_resolved, apply_eq_row, apply_op, browse_session, dispatch_action, download_resolved,
@@ -823,6 +823,19 @@ fn empty_suggestions_reason(app: &app::App) -> String {
 /// What the results list should say instead of rendering nothing when
 /// there's nothing to show; a blank screen with no explanation is a
 /// dead end, never the right default.
+/// An add/reconnect of a Navidrome server running off the ui thread.
+struct PendingConnect {
+    rx: mpsc::Receiver<Result<wim::catalog::FetchedCatalog, String>>,
+    nav: wim::config::NavidromeConfig,
+    kind: ConnectKind,
+}
+
+enum ConnectKind {
+    Onboarding,
+    NavAdd,
+    NavReconnect(usize),
+}
+
 /// Pasted text goes into single-line fields (passwords, paths, urls): a
 /// trailing newline or stray control byte there turns into an
 /// unexplained auth or path failure.
@@ -1489,6 +1502,7 @@ fn main() -> anyhow::Result<()> {
     // Startup playback and queue restoration complete asynchronously.
     let mut first_frame_drawn = false;
     let mut queue_restored = false;
+    let mut pending_connect: Option<PendingConnect> = None;
     let mut last_input = Instant::now();
     let mut last_loop_top = Instant::now();
     loop {
@@ -3634,6 +3648,91 @@ fn main() -> anyhow::Result<()> {
             core.undo.plant(root, now);
         }
 
+        // a server being added/reconnected answers off the ui thread
+        if let Some(pending) = &pending_connect {
+            match pending.rx.try_recv() {
+                Err(TryRecvError::Empty) => {}
+                outcome => {
+                    let PendingConnect { nav, kind, .. } = pending_connect.take().expect("set");
+                    let result = outcome
+                        .unwrap_or_else(|_| Err("connection attempt stopped unexpectedly".into()))
+                        .map(|catalog| wim::catalog::finish_navidrome_index(&mut app, catalog));
+                    match kind {
+                        ConnectKind::Onboarding => match result {
+                            Ok(msg) => {
+                                edit_servers(&mut cfg, &servers_tx, |s| s.push(nav));
+                                config::save_or_warn(&cfg, &mut notifications);
+                                notifications
+                                    .push(Severity::Info, format!("navidrome connected: {msg}"));
+                                // skipped while it connected: the server is
+                                // still added, but the step is not ours to move
+                                if let Some(ob) = onboarding
+                                    .as_mut()
+                                    .filter(|ob| matches!(ob.step, Step::Navidrome))
+                                {
+                                    ob.advance();
+                                }
+                            }
+                            Err(msg) => {
+                                if let Some(ob) = onboarding
+                                    .as_mut()
+                                    .filter(|ob| matches!(ob.step, Step::Navidrome))
+                                {
+                                    ob.login_message = format!("{msg} (esc to skip)");
+                                }
+                            }
+                        },
+                        ConnectKind::NavAdd => match result {
+                            Ok(msg) => {
+                                notifications
+                                    .push(Severity::Info, format!("connected: {}", nav.url));
+                                edit_servers(&mut cfg, &servers_tx, |s| s.push(nav));
+                                config::save_or_warn(&cfg, &mut notifications);
+                                warn_plaintext_password(&cfg, &mut notifications);
+                                if let Some(nm) = &mut nav_manager {
+                                    nm.connection_status
+                                        .push(Some(wim::navmanager::ConnectionStatus::Online));
+                                    nm.selected = cfg.navidrome_servers.len() - 1;
+                                    nm.step = NavManagerStep::List;
+                                    nm.message = format!("connected: {msg}");
+                                }
+                            }
+                            Err(msg) => {
+                                notifications.push(Severity::Error, format!("{}: {msg}", nav.url));
+                                if let Some(nm) = &mut nav_manager {
+                                    nm.message = format!("{msg} (esc to go back)");
+                                }
+                            }
+                        },
+                        ConnectKind::NavReconnect(index) => {
+                            if let Some(nm) = &mut nav_manager {
+                                if index >= nm.connection_status.len() {
+                                    nm.connection_status.resize(index + 1, None);
+                                }
+                                nm.connection_status[index] = Some(match &result {
+                                    Ok(_) => wim::navmanager::ConnectionStatus::Online,
+                                    Err(message)
+                                        if wim::catalog::is_authentication_message(message) =>
+                                    {
+                                        wim::navmanager::ConnectionStatus::ConfigurationIssue
+                                    }
+                                    Err(_) => wim::navmanager::ConnectionStatus::Unreachable,
+                                });
+                                nm.message = match result {
+                                    Ok(msg) => format!("reconnected: {msg}"),
+                                    Err(msg) => {
+                                        notifications
+                                            .push(Severity::Error, format!("{}: {msg}", nav.url));
+                                        msg
+                                    }
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         while let Some((into, label, tracks)) = track_resolver.poll() {
             let mut surf = wim_surface!();
             let mut core = core_ctx!();
@@ -4599,20 +4698,14 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Down => ob.login.next_field_clamped(),
                             KeyCode::Tab => ob.login.next_field(),
                             KeyCode::Enter if !ob.login.is_last_field() => ob.login.next_field(),
-                            KeyCode::Enter => {
+                            KeyCode::Enter if pending_connect.is_none() => {
                                 let nav = navidrome_config_from_form(&ob.login);
-                                match index_navidrome_server(&mut app, &nav) {
-                                    Ok(msg) => {
-                                        edit_servers(&mut cfg, &servers_tx, |s| s.push(nav));
-                                        config::save_or_warn(&cfg, &mut notifications);
-                                        notifications.push(
-                                            Severity::Info,
-                                            format!("navidrome connected: {msg}"),
-                                        );
-                                        ob.advance();
-                                    }
-                                    Err(msg) => ob.login_message = format!("{msg} (esc to skip)"),
-                                }
+                                ob.login_message = "connecting… (esc to skip)".into();
+                                pending_connect = Some(PendingConnect {
+                                    rx: wim::catalog::spawn_navidrome_index(nav.clone()),
+                                    nav,
+                                    kind: ConnectKind::Onboarding,
+                                });
                             }
                             _ => {}
                         },
@@ -4813,31 +4906,14 @@ fn main() -> anyhow::Result<()> {
                                 KeyCode::Enter if nm.selected == cfg.navidrome_servers.len() => {
                                     nm.step = NavManagerStep::Add(LoginForm::new());
                                 }
-                                KeyCode::Enter => {
+                                KeyCode::Enter if pending_connect.is_none() => {
                                     let nav = cfg.navidrome_servers[nm.selected].clone();
-                                    let result = index_navidrome_server(&mut app, &nav);
-                                    if nm.selected >= nm.connection_status.len() {
-                                        nm.connection_status.resize(nm.selected + 1, None);
-                                    }
-                                    nm.connection_status[nm.selected] = Some(match &result {
-                                        Ok(_) => wim::navmanager::ConnectionStatus::Online,
-                                        Err(message)
-                                            if wim::catalog::is_authentication_message(message) =>
-                                        {
-                                            wim::navmanager::ConnectionStatus::ConfigurationIssue
-                                        }
-                                        Err(_) => wim::navmanager::ConnectionStatus::Unreachable,
+                                    nm.message = "connecting…".into();
+                                    pending_connect = Some(PendingConnect {
+                                        rx: wim::catalog::spawn_navidrome_index(nav.clone()),
+                                        nav,
+                                        kind: ConnectKind::NavReconnect(nm.selected),
                                     });
-                                    nm.message = match result {
-                                        Ok(msg) => format!("reconnected: {msg}"),
-                                        Err(msg) => {
-                                            notifications.push(
-                                                Severity::Error,
-                                                format!("{}: {msg}", nav.url),
-                                            );
-                                            msg
-                                        }
-                                    };
                                 }
                                 _ => {}
                             }
@@ -4865,29 +4941,14 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Down => form.next_field_clamped(),
                             KeyCode::Tab => form.next_field(),
                             KeyCode::Enter if !form.is_last_field() => form.next_field(),
-                            KeyCode::Enter => {
+                            KeyCode::Enter if pending_connect.is_none() => {
                                 let nav = navidrome_config_from_form(form);
-                                match index_navidrome_server(&mut app, &nav) {
-                                    Ok(msg) => {
-                                        notifications.push(
-                                            Severity::Info,
-                                            format!("connected: {}", nav.url),
-                                        );
-                                        edit_servers(&mut cfg, &servers_tx, |s| s.push(nav));
-                                        config::save_or_warn(&cfg, &mut notifications);
-                                        warn_plaintext_password(&cfg, &mut notifications);
-                                        nm.connection_status
-                                            .push(Some(wim::navmanager::ConnectionStatus::Online));
-                                        nm.selected = cfg.navidrome_servers.len() - 1;
-                                        nm.step = NavManagerStep::List;
-                                        nm.message = format!("connected: {msg}");
-                                    }
-                                    Err(msg) => {
-                                        notifications
-                                            .push(Severity::Error, format!("{}: {msg}", nav.url));
-                                        nm.message = format!("{msg} (esc to go back)");
-                                    }
-                                }
+                                nm.message = "connecting… (esc to go back)".into();
+                                pending_connect = Some(PendingConnect {
+                                    rx: wim::catalog::spawn_navidrome_index(nav.clone()),
+                                    nav,
+                                    kind: ConnectKind::NavAdd,
+                                });
                             }
                             _ => {}
                         },
@@ -6041,6 +6102,7 @@ fn main() -> anyhow::Result<()> {
                     && keymap::is_fullscreen_video_key(
                         key.code,
                         keymap.get(KeyAction::ToggleFullscreenVideo),
+                        &keymap,
                     )
                 {
                     let fullscreen = player

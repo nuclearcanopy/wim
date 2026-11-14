@@ -2,9 +2,11 @@
 //! (armed by a second `d`) and add, using the same catalog helpers as
 //! wim's manager so credentials and sync behave identically.
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use wim::catalog::{
-    edit_servers, index_navidrome_server, is_authentication_message, test_navidrome_connectivity,
+    edit_servers, finish_navidrome_index, is_authentication_message, spawn_navidrome_index,
+    test_navidrome_connectivity, FetchedCatalog,
 };
 use wim::config;
 use wim::navmanager::{ConnectionStatus, NavManager, NavManagerStep};
@@ -12,6 +14,75 @@ use wim::notify::Severity;
 use wim::ui::login::LoginForm;
 
 use crate::host::Host;
+
+/// An add/reconnect running off the ui thread; see `poll`.
+pub struct PendingConnect {
+    rx: Receiver<Result<FetchedCatalog, String>>,
+    nav: config::NavidromeConfig,
+    reconnect: Option<usize>,
+}
+
+/// Applies a finished add/reconnect, if one is done. Called every frame.
+pub fn poll(host: &mut Host, nm: &mut NavManager) {
+    let Some(pending) = &host.pending_connect else {
+        return;
+    };
+    let outcome = match pending.rx.try_recv() {
+        Err(TryRecvError::Empty) => return,
+        outcome => outcome,
+    };
+    let PendingConnect { nav, reconnect, .. } = host.pending_connect.take().expect("set");
+    let result = outcome
+        .unwrap_or_else(|_| Err("connection attempt stopped unexpectedly".into()))
+        .map(|catalog| finish_navidrome_index(&mut host.app, catalog));
+    if let Some(index) = reconnect {
+        if index >= nm.connection_status.len() {
+            nm.connection_status.resize(index + 1, None);
+        }
+        nm.connection_status[index] = Some(match &result {
+            Ok(_) => ConnectionStatus::Online,
+            Err(message) if is_authentication_message(message) => {
+                ConnectionStatus::ConfigurationIssue
+            }
+            Err(_) => ConnectionStatus::Unreachable,
+        });
+        nm.message = match result {
+            Ok(message) => format!("reconnected: {message}"),
+            Err(message) => {
+                host.notifications
+                    .push(Severity::Error, format!("{}: {message}", nav.url));
+                message
+            }
+        };
+        return;
+    }
+    match result {
+        Ok(message) => {
+            host.notifications
+                .push(Severity::Info, format!("connected: {}", nav.url));
+            edit_servers(&mut host.cfg, &host.servers_tx, |servers| servers.push(nav));
+            config::save_or_warn(&host.cfg, &mut host.notifications);
+            let path = config::config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "config.toml".to_string());
+            host.notifications.push(
+                Severity::Alert,
+                format!(
+                    "password saved in cleartext (0600) at {path}; use password_file for a secret manager"
+                ),
+            );
+            nm.connection_status.push(Some(ConnectionStatus::Online));
+            nm.selected = host.cfg.navidrome_servers.len() - 1;
+            nm.step = NavManagerStep::List;
+            nm.message = format!("connected: {message}");
+        }
+        Err(message) => {
+            host.notifications
+                .push(Severity::Error, format!("{}: {message}", nav.url));
+            nm.message = format!("{message} (esc to go back)");
+        }
+    }
+}
 
 pub fn open(host: &mut Host) -> NavManager {
     let mut nm = NavManager::new();
@@ -44,7 +115,7 @@ pub fn paste(nm: &mut NavManager, text: &str) -> bool {
 }
 
 /// Returns `false` once the manager should close.
-pub fn key(host: &mut Host, nm: &mut NavManager, code: KeyCode) -> bool {
+pub fn key(host: &mut Host, nm: &mut NavManager, code: KeyCode, modifiers: KeyModifiers) -> bool {
     match &mut nm.step {
         NavManagerStep::List => {
             let count = host.cfg.navidrome_servers.len();
@@ -79,27 +150,14 @@ pub fn key(host: &mut Host, nm: &mut NavManager, code: KeyCode) -> bool {
                 KeyCode::Enter if nm.selected == count => {
                     nm.step = NavManagerStep::Add(LoginForm::new());
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter if host.pending_connect.is_none() => {
                     let nav = host.cfg.navidrome_servers[nm.selected].clone();
-                    let result = index_navidrome_server(&mut host.app, &nav);
-                    if nm.selected >= nm.connection_status.len() {
-                        nm.connection_status.resize(nm.selected + 1, None);
-                    }
-                    nm.connection_status[nm.selected] = Some(match &result {
-                        Ok(_) => ConnectionStatus::Online,
-                        Err(message) if is_authentication_message(message) => {
-                            ConnectionStatus::ConfigurationIssue
-                        }
-                        Err(_) => ConnectionStatus::Unreachable,
+                    nm.message = "connecting…".into();
+                    host.pending_connect = Some(PendingConnect {
+                        rx: spawn_navidrome_index(nav.clone()),
+                        nav,
+                        reconnect: Some(nm.selected),
                     });
-                    nm.message = match result {
-                        Ok(message) => format!("reconnected: {message}"),
-                        Err(message) => {
-                            host.notifications
-                                .push(Severity::Error, format!("{}: {message}", nav.url));
-                            message
-                        }
-                    };
                 }
                 _ => {}
             }
@@ -109,7 +167,11 @@ pub fn key(host: &mut Host, nm: &mut NavManager, code: KeyCode) -> bool {
                 nm.step = NavManagerStep::List;
                 nm.message.clear();
             }
-            KeyCode::Char(c) => form.current_mut().push(c),
+            KeyCode::Char(c)
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                form.current_mut().push(c)
+            }
             KeyCode::Backspace => {
                 if form.current_mut().is_empty() {
                     form.prev_field();
@@ -121,7 +183,7 @@ pub fn key(host: &mut Host, nm: &mut NavManager, code: KeyCode) -> bool {
             KeyCode::Down => form.next_field_clamped(),
             KeyCode::Tab => form.next_field(),
             KeyCode::Enter if !form.is_last_field() => form.next_field(),
-            KeyCode::Enter => {
+            KeyCode::Enter if host.pending_connect.is_none() => {
                 let nav = config::NavidromeConfig {
                     url: form.url.clone(),
                     username: form.username.clone(),
@@ -130,32 +192,12 @@ pub fn key(host: &mut Host, nm: &mut NavManager, code: KeyCode) -> bool {
                     max_bitrate_kbps: None,
                     transcode_format: None,
                 };
-                match index_navidrome_server(&mut host.app, &nav) {
-                    Ok(message) => {
-                        host.notifications
-                            .push(Severity::Info, format!("connected: {}", nav.url));
-                        edit_servers(&mut host.cfg, &host.servers_tx, |servers| servers.push(nav));
-                        config::save_or_warn(&host.cfg, &mut host.notifications);
-                        let path = config::config_path()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|_| "config.toml".to_string());
-                        host.notifications.push(
-                            Severity::Alert,
-                            format!(
-                                "password saved in cleartext (0600) at {path}; use password_file for a secret manager"
-                            ),
-                        );
-                        nm.connection_status.push(Some(ConnectionStatus::Online));
-                        nm.selected = host.cfg.navidrome_servers.len() - 1;
-                        nm.step = NavManagerStep::List;
-                        nm.message = format!("connected: {message}");
-                    }
-                    Err(message) => {
-                        host.notifications
-                            .push(Severity::Error, format!("{}: {message}", nav.url));
-                        nm.message = format!("{message} (esc to go back)");
-                    }
-                }
+                nm.message = "connecting… (esc to go back)".into();
+                host.pending_connect = Some(PendingConnect {
+                    rx: spawn_navidrome_index(nav.clone()),
+                    nav,
+                    reconnect: None,
+                });
             }
             _ => {}
         },
