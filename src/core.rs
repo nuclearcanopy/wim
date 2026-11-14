@@ -1471,18 +1471,19 @@ pub fn try_play(
     player: &mpv::Mpv,
     item: &SearchItem,
     cache: &Arc<Mutex<CacheIndex>>,
-) -> (String, bool) {
+) -> (String, bool, Option<u64>) {
     match resolve_playable(item, cache) {
         Some(path) => match player.load_file(&path) {
-            Ok(()) => {
+            Ok(entry_id) => {
                 set_vid_for_item(player, item);
-                (format!("playing: {}", label(item)), true)
+                (format!("playing: {}", label(item)), true, entry_id)
             }
-            Err(e) => (format!("error loading file: {e}"), false),
+            Err(e) => (format!("error loading file: {e}"), false, None),
         },
         None => (
             "not directly playable (expand via resolve_tracks first)".to_string(),
             false,
+            None,
         ),
     }
 }
@@ -1546,25 +1547,34 @@ pub fn load_playlist(
             false,
         );
     };
-    let (status, played) = try_play(player, first, cache);
+    let (status, played, first_id) = try_play(player, first, cache);
     if !played {
         return (status, false);
     }
     // only what mpv actually took is stored, which is the whole point:
     // storing an item mpv refused puts every later index off by one.
+    // each kept entry carries the id mpv answered its `loadfile` with.
     let mut kept = Vec::with_capacity(playable.len());
+    let mut ids = Vec::with_capacity(playable.len());
     let mut refused = 0;
     for (i, (item, path)) in playable.into_iter().enumerate() {
         // index 0 is already loaded, by `try_play` above.
-        if i == 0 || player.playlist_append(&path).is_ok() {
+        if i == 0 {
             kept.push(item);
+            ids.push(first_id);
         } else {
-            refused += 1;
+            match player.playlist_append(&path) {
+                Ok(id) => {
+                    kept.push(item);
+                    ids.push(id);
+                }
+                Err(_) => refused += 1,
+            }
         }
     }
     match session {
-        SessionStart::New => queue.reset(kept),
-        SessionStart::Keep => queue.rebuild(kept),
+        SessionStart::New => queue.reset_with_ids(kept, ids),
+        SessionStart::Keep => queue.rebuild_with_ids(kept, ids),
     }
     (
         format!("{status}{}", lost_note(dropped.len() + refused)),
@@ -1660,10 +1670,11 @@ pub fn enqueue_track(
     let Some(path) = resolve_playable(item, cache) else {
         return Enqueued::NotPlayable;
     };
-    if let Err(e) = player.playlist_append(&path) {
-        return Enqueued::Failed(format!("error queuing file: {e}"));
-    }
-    let appended = queue.append(item.clone(), shuffle);
+    let id = match player.playlist_append(&path) {
+        Ok(id) => id,
+        Err(e) => return Enqueued::Failed(format!("error queuing file: {e}")),
+    };
+    let appended = queue.append_with_id(item.clone(), id, shuffle);
     if let Some(to) = appended.moved_to {
         // the shuffle slot was already taken locally, so a refused
         // move has to be put back: `entries` and mpv's playlist agree
@@ -1682,35 +1693,83 @@ pub fn enqueue_track(
     }
 }
 /// After an mpv reply timed out, a queue mutation may or may not have
-/// run. Compares the lengths and makes the two sides agree again without
-/// touching what is playing: extra tail entries mpv took are removed, and
-/// a recorded tail mpv never took is forgotten. Returns what it did.
+/// run. Compares the queue with mpv's own playlist and makes the two agree
+/// again without touching what is playing. Entries are matched by the id
+/// mpv gave them, so this says exactly *which* entries disagree: ones mpv
+/// holds that were never recorded are removed from mpv, and recorded ones
+/// mpv never took are forgotten. Entries without an id fall back to
+/// comparing lengths. Returns what it did.
 pub fn reconcile_queue_after_timeout(player: &mpv::Mpv, queue: &mut PlayQueue) -> Option<String> {
-    let count = player
-        .get_property("playlist-count")
-        .ok()?
-        .as_u64()
-        .map(|n| n as usize)?;
-    let recorded = queue.entries().len();
-    match count.cmp(&recorded) {
-        std::cmp::Ordering::Equal => None,
-        std::cmp::Ordering::Greater => {
-            for index in (recorded..count).rev() {
-                let _ = player.playlist_remove(index);
+    let playlist = player.get_property("playlist").ok()?;
+    let mpv_ids: Vec<Option<u64>> = playlist
+        .as_array()?
+        .iter()
+        .map(|entry| entry.get("id").and_then(serde_json::Value::as_u64))
+        .collect();
+    reconcile_by_ids(queue, &mpv_ids, |index| {
+        let _ = player.playlist_remove(index);
+    })
+}
+
+/// The decision behind `reconcile_queue_after_timeout`, with mpv's side
+/// handed in and its removal injected so it can be tested without mpv.
+fn reconcile_by_ids(
+    queue: &mut PlayQueue,
+    mpv_ids: &[Option<u64>],
+    mut remove_from_mpv: impl FnMut(usize),
+) -> Option<String> {
+    let recorded = queue.entry_ids().to_vec();
+    if recorded.iter().chain(mpv_ids).any(Option::is_none) {
+        // some entry has no id: all that can be compared is the length
+        return match mpv_ids.len().cmp(&recorded.len()) {
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => {
+                for index in (recorded.len()..mpv_ids.len()).rev() {
+                    remove_from_mpv(index);
+                }
+                Some(format!(
+                    "mpv answered late; dropped {} entries it queued behind wim's back",
+                    mpv_ids.len() - recorded.len()
+                ))
             }
-            Some(format!(
-                "mpv answered late; dropped {} entries it queued behind wim's back",
-                count - recorded
-            ))
-        }
-        std::cmp::Ordering::Less => {
-            queue.truncate(count);
-            Some(format!(
-                "mpv never accepted the last {} queued entries; the queue was shortened to match",
-                recorded - count
-            ))
-        }
+            std::cmp::Ordering::Less => {
+                queue.truncate(mpv_ids.len());
+                Some(format!(
+                    "mpv never accepted the last {} queued entries; the queue was shortened to match",
+                    recorded.len() - mpv_ids.len()
+                ))
+            }
+        };
     }
+    let mine: std::collections::HashSet<u64> = recorded.iter().flatten().copied().collect();
+    let theirs: std::collections::HashSet<u64> = mpv_ids.iter().flatten().copied().collect();
+    let extras: Vec<usize> = mpv_ids
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| id.is_some_and(|id| !mine.contains(&id)))
+        .map(|(index, _)| index)
+        .collect();
+    let missing: Vec<usize> = recorded
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| id.is_some_and(|id| !theirs.contains(&id)))
+        .map(|(index, _)| index)
+        .collect();
+    if extras.is_empty() && missing.is_empty() {
+        return None;
+    }
+    // back to front, so each removal leaves the earlier indices valid
+    for &index in extras.iter().rev() {
+        remove_from_mpv(index);
+    }
+    for &index in missing.iter().rev() {
+        queue.remove(index);
+    }
+    Some(format!(
+        "mpv and wim disagreed after a late reply: removed {} entries mpv queued on its own, forgot {} it never took",
+        extras.len(),
+        missing.len()
+    ))
 }
 
 /// Resyncs mpv's upcoming playlist to `items` (after a shuffle)
@@ -1728,10 +1787,14 @@ pub fn resync_upcoming(
     }
     let (playable, dropped) = resolve_all(items, cache);
     let mut kept = Vec::with_capacity(playable.len());
+    let mut ids = Vec::with_capacity(playable.len());
     let mut failure = None;
     for (item, path) in playable {
         match player.playlist_append(&path) {
-            Ok(()) => kept.push(item),
+            Ok(id) => {
+                kept.push(item);
+                ids.push(id);
+            }
             Err(e) => {
                 failure = Some(e.to_string());
                 break;
@@ -1743,7 +1806,7 @@ pub fn resync_upcoming(
     // it was would be exactly the desync this function exists to
     // prevent, and a worse one than the skip bug (every index wrong,
     // not just the ones after a gap).
-    queue.replace_upcoming(kept);
+    queue.replace_upcoming_with_ids(kept, ids);
     match failure {
         Some(e) => format!("error resyncing queue: {e}"),
         None => format!("shuffled{}", lost_note(dropped.len())),
@@ -7772,5 +7835,64 @@ mod auto_download_wiring_tests {
             Some("https://cdn.invalid/film?signature=do-not-persist")
         );
         assert_eq!(persistent_playable_path(&item), None);
+    }
+}
+
+#[cfg(test)]
+mod reconcile_by_id_tests {
+    use super::*;
+
+    fn song(title: &str) -> SearchItem {
+        SearchItem::LocalMusic {
+            path: std::path::PathBuf::from(format!("/music/{title}.flac")),
+            title: title.to_string(),
+            artist: None,
+            album: None,
+        }
+    }
+
+    fn queue(ids: &[Option<u64>]) -> PlayQueue {
+        let mut q = PlayQueue::default();
+        let items = (0..ids.len()).map(|i| song(&format!("t{i}"))).collect();
+        q.reset_with_ids(items, ids.to_vec());
+        q
+    }
+
+    #[test]
+    fn matching_lists_change_nothing() {
+        let mut q = queue(&[Some(1), Some(2)]);
+        assert!(reconcile_by_ids(&mut q, &[Some(1), Some(2)], |_| panic!("no removal")).is_none());
+    }
+
+    #[test]
+    fn entries_mpv_took_behind_our_back_are_removed_from_mpv_by_index() {
+        let mut q = queue(&[Some(1), Some(2)]);
+        let mut removed = Vec::new();
+        let note = reconcile_by_ids(&mut q, &[Some(1), Some(7), Some(2), Some(8)], |i| {
+            removed.push(i)
+        });
+        assert!(note.is_some());
+        // back to front, and the middle one too: the *position* is where
+        // mpv holds it, not where it would have been appended
+        assert_eq!(removed, vec![3, 1]);
+        assert_eq!(q.entry_ids(), &[Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn recorded_entries_mpv_never_took_are_forgotten_wherever_they_are() {
+        let mut q = queue(&[Some(1), Some(2), Some(3)]);
+        let note = reconcile_by_ids(&mut q, &[Some(1), Some(3)], |_| panic!("nothing extra"));
+        assert!(note.is_some());
+        assert_eq!(q.entry_ids(), &[Some(1), Some(3)]);
+    }
+
+    #[test]
+    fn without_ids_only_the_length_can_be_compared() {
+        let mut q = queue(&[None, None, None]);
+        let mut removed = Vec::new();
+        reconcile_by_ids(&mut q, &[None, None, None, None, None], |i| removed.push(i));
+        assert_eq!(removed, vec![4, 3]);
+        reconcile_by_ids(&mut q, &[None], |_| {});
+        assert_eq!(q.entries().len(), 1);
     }
 }

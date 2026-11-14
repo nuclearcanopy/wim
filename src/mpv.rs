@@ -116,8 +116,18 @@ pub enum Event {
         name: String,
         value: Value,
     },
-    #[allow(dead_code)]
-    Other(Value),
+    /// mpv began playing a playlist entry. Carries the entry's id, which
+    /// is what the queue mirror resolves "what is playing" by: unlike
+    /// `playlist-pos` it cannot be misread against a playlist that was
+    /// rewritten while the event was in flight.
+    StartFile {
+        entry_id: Option<u64>,
+    },
+}
+
+/// The `playlist_entry_id` mpv answers `loadfile` with, when it gives one.
+pub fn entry_id(reply: &Value) -> Option<u64> {
+    reply.get("playlist_entry_id").and_then(Value::as_u64)
 }
 
 /// Last known playback position, folded from observed property
@@ -716,6 +726,11 @@ fn read_replies(
                     });
                 }
             }
+            Some("start-file") => {
+                let _ = event_tx.send(Event::StartFile {
+                    entry_id: v.get("playlist_entry_id").and_then(Value::as_u64),
+                });
+            }
             Some(_name) => {
                 // event names only ("end-file", "file-loaded", …), and
                 // never the payload: payloads can carry paths, and the
@@ -975,9 +990,9 @@ impl Mpv {
 
     /// Replaces mpv's entire playlist and plays `path_or_url`
     /// immediately; for "play this now" (enter), not queuing.
-    pub fn load_file(&self, path_or_url: &str) -> Result<()> {
-        self.command(&[json!("loadfile"), json!(path_or_url), json!("replace")])?;
-        Ok(())
+    pub fn load_file(&self, path_or_url: &str) -> Result<Option<u64>> {
+        let reply = self.command(&[json!("loadfile"), json!(path_or_url), json!("replace")])?;
+        Ok(entry_id(&reply))
     }
 
     /// Appends to mpv's own playlist (playing immediately if nothing is
@@ -985,23 +1000,23 @@ impl Mpv {
     /// its playlist natively on end-of-file, with none of the IPC
     /// round-trip gap that reactively reloading on our end introduces;
     /// this is what actually makes queue playback gapless.
-    pub fn playlist_append(&self, path_or_url: &str) -> Result<()> {
-        self.command(&[json!("loadfile"), json!(path_or_url), json!("append-play")])?;
-        Ok(())
+    pub fn playlist_append(&self, path_or_url: &str) -> Result<Option<u64>> {
+        let reply = self.command(&[json!("loadfile"), json!(path_or_url), json!("append-play")])?;
+        Ok(entry_id(&reply))
     }
 
     /// Appends several entries in playlist order with one socket write
     /// and one IPC wait, retaining one result per media item. This is
     /// for bulk restoration, not interactive enqueue: the caller must
     /// update its mirrored queue only for successful replies.
-    pub fn playlist_append_batch(&self, paths: &[String]) -> Vec<Result<()>> {
+    pub fn playlist_append_batch(&self, paths: &[String]) -> Vec<Result<Option<u64>>> {
         let commands = paths
             .iter()
             .map(|path| vec![json!("loadfile"), json!(path), json!("append-play")])
             .collect::<Vec<_>>();
         self.command_batch(&commands)
             .into_iter()
-            .map(|result| result.map(|_| ()))
+            .map(|result| result.map(|reply| entry_id(&reply)))
             .collect()
     }
 
@@ -1474,6 +1489,54 @@ mod bench {
             .command(&[json!("get_property"), json!("playlist-count")])
             .expect("read playlist count");
         assert_eq!(count.as_u64(), Some(paths.len() as u64));
+    }
+
+    /// The ids `loadfile` answers with are the ids `start-file` and the
+    /// `playlist` property carry, which is the whole premise of resolving
+    /// "what is playing" by id. Explicit because it spawns a real child.
+    #[test]
+    #[ignore]
+    fn loadfile_ids_match_start_file_events_and_the_playlist_property() {
+        let mpv = Mpv::spawn().expect("mpv on PATH");
+        mpv.set_property("ao", json!("null"))
+            .expect("silent output");
+        let first = mpv
+            .load_file("av://lavfi:sine=frequency=440:duration=600")
+            .expect("load")
+            .expect("mpv answers loadfile with an entry id");
+        let second = mpv
+            .playlist_append("av://lavfi:sine=frequency=550:duration=600")
+            .expect("append")
+            .expect("append id");
+        assert_ne!(first, second);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut started = None;
+        while started.is_none() && Instant::now() < deadline {
+            if let Ok(Event::StartFile { entry_id }) =
+                mpv.events().recv_timeout(Duration::from_millis(200))
+            {
+                started = entry_id;
+            }
+        }
+        assert_eq!(
+            started,
+            Some(first),
+            "start-file names the entry loadfile did"
+        );
+        let playlist = mpv.get_property("playlist").expect("playlist");
+        let ids: Vec<u64> = playlist
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(Value::as_u64))
+            .collect();
+        assert_eq!(ids, vec![first, second]);
+        // a replaced playlist never reuses an id
+        let replaced = mpv
+            .load_file("av://lavfi:sine=frequency=660:duration=600")
+            .expect("replace")
+            .expect("replace id");
+        assert!(replaced != first && replaced != second);
     }
 }
 

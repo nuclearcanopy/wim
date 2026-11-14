@@ -126,8 +126,31 @@ fn update_playlist_position(
     shuffle: bool,
     position: i64,
 ) -> Option<SearchItem> {
+    advance_queue(queue, view, shuffle, |queue| queue.set_pos(position))
+}
+
+/// mpv started the entry with this id (its `start-file` event). Resolved by
+/// id, so an event that was in flight when the playlist was rewritten
+/// resolves to nothing instead of to whatever now sits at its position.
+fn update_playing_entry(
+    queue: &mut PlayQueue,
+    view: Option<&mut browse::BrowseView>,
+    shuffle: bool,
+    entry_id: u64,
+) -> Option<SearchItem> {
+    advance_queue(queue, view, shuffle, |queue| {
+        queue.set_playing_entry(entry_id)
+    })
+}
+
+fn advance_queue(
+    queue: &mut PlayQueue,
+    view: Option<&mut browse::BrowseView>,
+    shuffle: bool,
+    resolve: impl FnOnce(&mut PlayQueue) -> PosChange,
+) -> Option<SearchItem> {
     let previous = queue.current().cloned();
-    if !matches!(queue.set_pos(position), PosChange::Advanced(_)) {
+    if !matches!(resolve(queue), PosChange::Advanced(_)) {
         return None;
     }
     let next = queue.current().cloned();
@@ -704,7 +727,7 @@ fn restore_startup(
     if let Some(item) = item {
         if let Some(path) = wim::core::resolve_playable(&item, &startup.cache) {
             match player.command(&[json!("loadfile"), json!(path), json!("replace")]) {
-                Ok(_) => {
+                Ok(reply) => {
                     let _ = player.command_batch(&[
                         vec![
                             json!("set_property"),
@@ -721,7 +744,7 @@ fn restore_startup(
                         let _ =
                             player.command(&[json!("seek"), json!(position), json!("absolute")]);
                     }
-                    queue.reset(vec![item.clone()]);
+                    queue.reset_with_ids(vec![item.clone()], vec![mpv::entry_id(&reply)]);
                     first = Some(item);
                 }
                 Err(error) => load_error = Some(format!("error loading startup file: {error}")),
@@ -741,14 +764,14 @@ fn restore_startup(
     }
     if startup.shuffle {
         for (item, path) in playable {
-            if player
-                .command(&[json!("loadfile"), json!(path), json!("append-play")])
-                .is_err()
-            {
-                lost += 1;
-                continue;
-            }
-            let appended = queue.append(item, true);
+            let id = match player.command(&[json!("loadfile"), json!(path), json!("append-play")]) {
+                Ok(reply) => mpv::entry_id(&reply),
+                Err(_) => {
+                    lost += 1;
+                    continue;
+                }
+            };
+            let appended = queue.append_with_id(item, id, true);
             if let Some(to) = appended.moved_to {
                 if player
                     .command(&[
@@ -768,10 +791,11 @@ fn restore_startup(
             .map(|(_, path)| vec![json!("loadfile"), json!(path), json!("append-play")])
             .collect();
         for ((item, _), result) in playable.into_iter().zip(player.command_batch(&commands)) {
-            if result.is_ok() {
-                queue.append(item, false);
-            } else {
-                lost += 1;
+            match result {
+                Ok(reply) => {
+                    queue.append_with_id(item, mpv::entry_id(&reply), false);
+                }
+                Err(_) => lost += 1,
             }
         }
     }
@@ -3022,8 +3046,22 @@ fn main() -> anyhow::Result<()> {
             .then(|| player.events().try_recv().ok())
             .flatten()
         {
-            let mpv::Event::PropertyChange { name, value } = ev else {
-                continue;
+            let (name, value) = match ev {
+                mpv::Event::PropertyChange { name, value } => (name, value),
+                mpv::Event::StartFile {
+                    entry_id: Some(entry_id),
+                } => {
+                    if let Some(next) = update_playing_entry(
+                        &mut play_queue,
+                        browse_view.as_mut(),
+                        app.shuffle,
+                        entry_id,
+                    ) {
+                        advanced_to = Some(next);
+                    }
+                    continue;
+                }
+                mpv::Event::StartFile { entry_id: None } => continue,
             };
             if playback.apply(&name, &value) {
                 continue;
