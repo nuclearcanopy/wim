@@ -148,6 +148,9 @@ fn prompt() -> anyhow::Result<()> {
     let mut eq_menu = eqm::EqMenuPane::default();
     let mut settings_state = settings::SettingsState::default();
     let mut undo_open = false;
+    let mut watch = wim::watch_workspace::Workspace::new();
+    watch.spoilers_revealed = host.cfg.watch_reveal_spoilers;
+    let mut watch_open = false;
     let mut list_view: Option<(surface::ListWorkspace, usize)> = None;
 
     loop {
@@ -179,6 +182,7 @@ fn prompt() -> anyhow::Result<()> {
         if std::mem::take(&mut host.swim.undo_requested) && host.interactive_prompt {
             undo_open = true;
         }
+        watch.poll();
         let undo_now = host.now();
         let undo_rows = undo_open.then(|| host.undo.rows(undo_now));
         if std::mem::take(&mut host.swim.settings_requested) && host.interactive_prompt {
@@ -224,6 +228,7 @@ fn prompt() -> anyhow::Result<()> {
                 keybinds_capturing,
                 keybinds_refused: keybinds_refused.as_deref(),
                 undo: undo_rows.as_deref(),
+                watch: watch_open.then_some(&watch),
                 list: list_view.as_ref().map(|(list, selected)| (list, *selected)),
                 settings: settings_values
                     .as_deref()
@@ -261,6 +266,7 @@ fn prompt() -> anyhow::Result<()> {
             || settings_state.open
             || list_view.is_some()
             || undo_open
+            || watch_open
             || host.lyrics_pane.is_open()
             || host.has_program_work()
             || host.console.cycle().is_some()
@@ -410,6 +416,97 @@ fn prompt() -> anyhow::Result<()> {
                             }
                             _ => {}
                         }
+                    }
+                    continue;
+                }
+                if watch_open {
+                    use wim::watch_workspace::Page;
+                    if watch.confirm_torrent_add {
+                        match key.code {
+                            KeyCode::Char('y' | 'Y') => {
+                                let client =
+                                    wim::torbox::Client::from_config(&host.cfg).map_err(|_| {
+                                        "configure torbox_token_file before adding a torrent"
+                                            .to_owned()
+                                    });
+                                watch.confirm_torrent_add(client);
+                            }
+                            KeyCode::Char('n' | 'N') | KeyCode::Esc => watch.cancel_torrent_add(),
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    let editing = watch.page == Page::Search && watch.search_editing;
+                    let is_series = watch
+                        .detail
+                        .as_ref()
+                        .is_some_and(|item| item.kind == wim::media::MediaKind::Series);
+                    match key.code {
+                        KeyCode::Esc if editing => watch.search_editing = false,
+                        KeyCode::Esc => watch_open = false,
+                        KeyCode::Char(c) if editing => watch.query.push(c),
+                        KeyCode::Backspace if editing => {
+                            watch.query.pop();
+                        }
+                        KeyCode::Char('/') if watch.page == Page::Search => {
+                            watch.search_editing = true
+                        }
+                        KeyCode::Char('r') if watch.page != Page::Search => {
+                            watch.spoilers_revealed = !watch.spoilers_revealed
+                        }
+                        KeyCode::Char('R') if watch.page != Page::Search => {
+                            host.cfg.watch_reveal_spoilers = !host.cfg.watch_reveal_spoilers;
+                            watch.spoilers_revealed = host.cfg.watch_reveal_spoilers;
+                            config::save_or_warn(&host.cfg, &mut host.notifications);
+                            watch.message = Some(if host.cfg.watch_reveal_spoilers {
+                                "episode spoilers will be shown by default".into()
+                            } else {
+                                "episode spoilers are hidden by default".into()
+                            });
+                        }
+                        KeyCode::Char('[') if watch.page == Page::Episodes => watch.move_season(-1),
+                        KeyCode::Char(']') if watch.page == Page::Episodes => watch.move_season(1),
+                        KeyCode::Up | KeyCode::Char('k') => watch.move_selection(-1),
+                        KeyCode::Down | KeyCode::Char('j') => watch.move_selection(1),
+                        KeyCode::Enter if editing => watch.search(),
+                        KeyCode::Enter if watch.page == Page::Search => watch.open_selected(),
+                        KeyCode::Enter if watch.page == Page::Detail && is_series => {
+                            watch.enter_episodes()
+                        }
+                        KeyCode::Enter if matches!(watch.page, Page::Detail | Page::Episodes) => {
+                            watch.load_selected_sources()
+                        }
+                        KeyCode::Enter if watch.page == Page::Sources => {
+                            if !host.proxy_ready {
+                                watch.message = Some(
+                                    "secure media relay is unavailable; source playback is disabled"
+                                        .into(),
+                                );
+                            } else if let Some(prepared) = watch.prepared_source.take() {
+                                host.act_on_item(prepared.into_search_item(), false);
+                                watch_open = false;
+                            } else {
+                                watch.prepare_selected_source();
+                            }
+                        }
+                        KeyCode::Char('a') if watch.page == Page::Sources => {
+                            watch.arm_torrent_add()
+                        }
+                        KeyCode::Backspace if watch.page == Page::Detail => watch.enter_search(),
+                        KeyCode::Backspace if watch.page == Page::Episodes => {
+                            watch.page = Page::Detail;
+                            watch.selected = 0;
+                        }
+                        KeyCode::Backspace if watch.page == Page::Sources => {
+                            watch.page = if is_series {
+                                Page::Episodes
+                            } else {
+                                Page::Detail
+                            };
+                            watch.selected = 0;
+                        }
+                        KeyCode::Char('s') if watch.page != Page::Search => watch.enter_search(),
+                        _ => {}
                     }
                     continue;
                 }
@@ -695,6 +792,24 @@ fn prompt() -> anyhow::Result<()> {
                     settings_state.open = true;
                     continue;
                 }
+                if key.code == KeyCode::Char('W') && host.console.input.is_empty() {
+                    watch_open = true;
+                    watch.spoilers_revealed = host.cfg.watch_reveal_spoilers;
+                    if !watch.is_configured() && !watch.loading {
+                        match std::env::var("WIM_STREMIO_ADDON_URL") {
+                            Ok(url) if !url.trim().is_empty() => watch.configure(url),
+                            _ => {
+                                watch.message = Some(
+                                    "set WIM_STREMIO_ADDON_URL to an add-on HTTPS URL; no provider is enabled by default"
+                                        .into(),
+                                )
+                            }
+                        }
+                    } else if watch.page == wim::watch_workspace::Page::Search {
+                        watch.search_editing = true;
+                    }
+                    continue;
+                }
                 if key.code == KeyCode::Char('E') && host.console.input.is_empty() {
                     eq_menu.open(host.app.eq_source, host.cfg.eq_custom_presets.len());
                     continue;
@@ -750,7 +865,7 @@ fn banner(console: &mut Console, cfg: &config::Config, keymap: &Keymap) {
         env!("CARGO_PKG_VERSION")
     ));
     console.note(format!(
-        "? commands · {} queue · {} subtitles · K keys · E eq · {} settings · tab complete · dry(...) preview",
+        "? commands · {} queue · {} subtitles · K keys · E eq · W watch · {} settings · tab complete · dry(...) preview",
         key_label(keymap.get(KeyAction::OpenQueueView)),
         key_label(prompt_key(keymap, KeyAction::OpenSubtitleMenu)),
         key_label(prompt_key(keymap, KeyAction::OpenSettingsMenu))
@@ -808,6 +923,7 @@ struct Screen<'a> {
     settings: Option<(&'a [String], usize)>,
     list: Option<(&'a surface::ListWorkspace, usize)>,
     undo: Option<&'a [wim::undo::Row<'a>]>,
+    watch: Option<&'a wim::watch_workspace::Workspace>,
 }
 
 struct EqScreen<'a> {
@@ -989,6 +1105,8 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
                     },
                     body,
                 );
+            } else if let Some(workspace) = s.watch {
+                wim::ui::watch::render(f, body, workspace);
             } else if let Some(rows) = s.undo {
                 f.render_widget(
                     wim::ui::undo_tree::UndoTreeView {
