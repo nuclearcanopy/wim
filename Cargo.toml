@@ -41,7 +41,7 @@ rand = "0.8"
 walkdir = "2"
 unicode-width = "0.2"
 unicode-segmentation = "1"
-lofty = "0.22"
+lofty = "0.25"
 strsim = "0.11"
 base64 = "0.22"
 zeroize = { version = "1.9.1", features = ["derive"] }

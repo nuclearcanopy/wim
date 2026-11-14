@@ -661,7 +661,7 @@ fn local_lyrics(path: &Path) -> Option<Lyrics> {
     let text = tagged
         .primary_tag()
         .or_else(|| tagged.first_tag())?
-        .get_string(&ItemKey::Lyrics)?
+        .get_string(ItemKey::Lyrics)?
         .to_owned();
     let synced = (!parse_synced(&text).is_empty()).then_some(text.clone());
     let plain = if synced.is_some() {
