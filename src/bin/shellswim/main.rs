@@ -179,6 +179,9 @@ fn prompt() -> anyhow::Result<()> {
         if wim::term::termination_requested() {
             break;
         }
+        if let Some(manager) = &mut nav {
+            nav_ui::poll(&mut host, manager);
+        }
         if first_frame {
             // Nothing, including the host pump, may touch mpv before draw.
         } else if let Some(rx) = &observing {
@@ -503,7 +506,7 @@ fn prompt() -> anyhow::Result<()> {
                     continue;
                 }
                 if let Some(manager) = &mut nav {
-                    if !nav_ui::key(&mut host, manager, key.code) {
+                    if !nav_ui::key(&mut host, manager, key.code, key.modifiers) {
                         nav = None;
                     }
                     continue;
