@@ -152,6 +152,112 @@ pub fn too_small(buf: &mut Buffer, area: Rect) -> bool {
     true
 }
 
+/// A cleared, framed panel with `title` set into its top border; returns
+/// the content rect. What the stock `Block::bordered().title()` did, but
+/// drawn in the repo's own grey frame and measured in `textfit` cells.
+pub fn titled_frame(buf: &mut Buffer, area: Rect, title: &str) -> Rect {
+    clear(buf, area);
+    frame(buf, area, shade(NEAR_BLACK));
+    if area.width > 6 {
+        let text = format!(" {title} ");
+        at(
+            buf,
+            area.x + 2,
+            area.y,
+            &text,
+            shade(MID),
+            usize::from(area.width - 4),
+        );
+    }
+    framed_inner(area)
+}
+
+/// A styled `Line` at `area`'s row `y`, clipped to the area's width by
+/// grapheme clusters (never half a wide glyph), with each span's colour,
+/// background and modifiers. The cluster-correct stand-in for the stock
+/// `Paragraph`, whose width model disagrees with `textfit` on CJK and
+/// emoji (see docs/text-measurement.md).
+pub fn styled_line(buf: &mut Buffer, area: Rect, y: u16, line: &ratatui::text::Line) {
+    if y < area.y || y >= area.y + area.height {
+        return;
+    }
+    let end = area.x + area.width;
+    let mut x = area.x;
+    for span in &line.spans {
+        if x >= end {
+            break;
+        }
+        let start = x;
+        let fg = span
+            .style
+            .fg
+            .unwrap_or(line.style.fg.unwrap_or(Color::Reset));
+        x = at_styled(
+            buf,
+            x,
+            y,
+            &span.content,
+            fg,
+            span.style.bg,
+            usize::from(end - x),
+        );
+        let modifiers = span.style.add_modifier | line.style.add_modifier;
+        if !modifiers.is_empty() {
+            for cx in start..x {
+                if let Some(cell) = buf.cell_mut((cx, y)) {
+                    cell.modifier |= modifiers;
+                }
+            }
+        }
+    }
+}
+
+/// `text` broken into rows of at most `width` cells: at a space when one
+/// fits, mid-word only when a single word is wider than the row. Widths
+/// are `textfit` cells, so wide glyphs wrap where they actually overflow.
+pub fn wrap_rows(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut row = String::new();
+        let mut row_width = 0usize;
+        for word in paragraph.split(' ').filter(|w| !w.is_empty()) {
+            let word_width = crate::ui::textfit::width(word);
+            let gap = usize::from(!row.is_empty());
+            if row_width + gap + word_width <= width {
+                if gap == 1 {
+                    row.push(' ');
+                }
+                row.push_str(word);
+                row_width += gap + word_width;
+                continue;
+            }
+            if !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+            }
+            // a word wider than the whole row is cut by clusters
+            let mut rest = word;
+            while crate::ui::textfit::width(rest) > width {
+                let head = crate::ui::textfit::truncate_to_width(rest, width);
+                if head.is_empty() {
+                    // a single cluster wider than the row: drop it
+                    let first = crate::ui::textfit::clusters(rest).next().unwrap_or(rest);
+                    rest = &rest[first.len()..];
+                    continue;
+                }
+                rows.push(head.clone());
+                rest = &rest[head.len()..];
+            }
+            row_width = crate::ui::textfit::width(rest);
+            row.push_str(rest);
+        }
+        rows.push(row);
+    }
+    rows
+}
+
 /// Blanks every cell of `area`: a space, and the style reset. An
 /// overlay that owns a rect owns all of it; none of the full-screen
 /// menus cleared theirs, so a sidebar's results, a track list and a
@@ -588,5 +694,60 @@ mod too_small_tests {
             assert!(too_small(&mut buf, area), "{w}x{h}");
             assert!(!text_of(&buf, area).trim().is_empty(), "{w}x{h}");
         }
+    }
+}
+
+#[cfg(test)]
+mod wrap_and_line_tests {
+    use super::*;
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+
+    #[test]
+    fn rows_never_exceed_the_width_in_cells() {
+        for text in [
+            "plain words wrapping around a narrow column",
+            "日本語のとても長いタイトル 漢字 かな",
+            "emoji 👨‍👩‍👧 family and 🎵 notes",
+            "supercalifragilisticexpialidocious",
+        ] {
+            for width in [1usize, 2, 3, 8, 11, 40] {
+                for row in wrap_rows(text, width) {
+                    assert!(
+                        crate::ui::textfit::width(&row) <= width,
+                        "{row:?} is wider than {width}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrapping_keeps_every_word_when_it_fits() {
+        let rows = wrap_rows("one two three four", 9);
+        assert_eq!(rows, vec!["one two", "three", "four"]);
+    }
+
+    #[test]
+    fn a_styled_line_paints_spans_clipped_and_with_modifiers() {
+        let area = Rect::new(2, 1, 8, 3);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
+        let line = Line::from(vec![
+            Span::styled(
+                "ab",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("日本語日本語"),
+        ]);
+        styled_line(&mut buf, area, 1, &line);
+        assert_eq!(buf.cell((2, 1)).unwrap().symbol(), "a");
+        assert!(buf.cell((2, 1)).unwrap().modifier.contains(Modifier::BOLD));
+        // nothing past the area's right edge, and no half glyph at it
+        for x in 10..20 {
+            assert_eq!(buf.cell((x, 1)).unwrap().symbol(), " ", "x={x}");
+        }
+        // other rows untouched
+        assert_eq!(buf.cell((2, 0)).unwrap().symbol(), " ");
+        styled_line(&mut buf, area, 9, &line);
     }
 }

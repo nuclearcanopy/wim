@@ -2,8 +2,8 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Clear;
 use ratatui::widgets::Widget;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::torbox::AccountItem;
@@ -95,9 +95,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
         Page::Account => "torbox account · 1 torrents · 2 usenet · 3 web downloads",
         Page::Files => "files · enter play · q queue",
     };
-    let inner = Block::default().borders(Borders::ALL).title(title);
-    let content = inner.inner(panel);
-    frame.render_widget(inner, panel);
+    let content = crate::ui::draw::titled_frame(frame.buffer_mut(), panel, title);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -190,7 +188,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
             }
         }
     };
-    frame.render_widget(Paragraph::new(line), area);
+    crate::ui::draw::styled_line(frame.buffer_mut(), area, area.y, &line);
 }
 
 fn render_list(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
@@ -335,7 +333,10 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
         let _ = selected;
         lines.into_iter().skip(offset).take(visible).collect()
     };
-    frame.render_widget(Paragraph::new(list), area);
+    for (row, line) in list.iter().enumerate() {
+        let Ok(row) = u16::try_from(row) else { break };
+        crate::ui::draw::styled_line(frame.buffer_mut(), area, area.y.saturating_add(row), line);
+    }
 }
 
 /// One bounded row per account item: full-width plate on the selected row,
@@ -445,12 +446,11 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
     } else {
         Style::default().fg(crate::theme::shade(crate::theme::DIM))
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            crate::ui::textfit::truncate_to_width(&text, area.width as usize),
-            style,
-        ))),
+    crate::ui::draw::styled_line(
+        frame.buffer_mut(),
         area,
+        area.y,
+        &Line::from(Span::styled(text, style)),
     );
 }
 
@@ -473,12 +473,14 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
     if workspace.loading {
         footer.push_str(" · working…");
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            crate::ui::textfit::truncate_to_width(&footer, area.width as usize),
-            Style::default().fg(crate::theme::shade(crate::theme::DIM)),
-        ))),
+    crate::ui::draw::styled_line(
+        frame.buffer_mut(),
         area,
+        area.y,
+        &Line::from(Span::styled(
+            footer,
+            Style::default().fg(crate::theme::shade(crate::theme::DIM)),
+        )),
     );
 }
 
