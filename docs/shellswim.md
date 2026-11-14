@@ -98,6 +98,8 @@ opens/advances, `[`/`]` seasons, `a` adds a torrent after confirmation,
 The Navidrome profile key (default `n`, shown as `N`) opens the server
 manager: `enter` reconnects or adds, `d` twice removes, and new
 profiles are verified before they are saved.
+On a first launch with no library and no server, the server form opens
+right after the lyrics choice.
 Press `T` for TorBox (setup, search, account lists for torrents, usenet
 and web downloads, file playback with `enter`, queueing with `q`; keys
 match wim's workspace).
