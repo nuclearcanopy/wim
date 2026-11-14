@@ -1176,6 +1176,19 @@ fn main() -> anyhow::Result<()> {
     // Per-band attack/release state for the maximized-player spectrum.
     let mut spectrum_smoother = SpectrumSmoother::default();
     let mut notifications = Notifications::default();
+    // held for the whole run; dropping it releases the lock
+    let (_instance_lock, second_instance) =
+        match wim::persistence::state_dir().map(|dir| wim::fsutil::claim_instance_lock(&dir)) {
+            Ok(wim::fsutil::InstanceLock::Held(file)) => (Some(file), false),
+            Ok(wim::fsutil::InstanceLock::Contended) => (None, true),
+            _ => (None, false),
+        };
+    if second_instance {
+        notifications.push(
+            Severity::Alert,
+            "another wim is running; the queue, favorites and play history it saves can overwrite this one's",
+        );
+    }
     if let Some(kind) = media_proxy_error {
         notifications.push(
             Severity::Alert,
@@ -1517,6 +1530,7 @@ fn main() -> anyhow::Result<()> {
     let mut queue_restored = false;
     let mut pending_connect: Option<PendingConnect> = None;
     let mut mpv_exit_reported = false;
+    let mut seen_reply_timeouts = mpv::reply_timeouts();
     let mut last_input = Instant::now();
     let mut last_loop_top = Instant::now();
     loop {
@@ -1525,6 +1539,12 @@ fn main() -> anyhow::Result<()> {
                 save_playback_state(&player, &play_queue);
             }
             break;
+        }
+        if mpv::reply_timeouts() != seen_reply_timeouts && !mpv_exit_reported {
+            seen_reply_timeouts = mpv::reply_timeouts();
+            if let Some(note) = wim::core::reconcile_queue_after_timeout(&player, &mut play_queue) {
+                notifications.push(Severity::Alert, note);
+            }
         }
         if !mpv_exit_reported {
             if let Some(status) = player.exited() {

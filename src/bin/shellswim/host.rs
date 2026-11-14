@@ -308,6 +308,8 @@ pub struct Host {
     /// A server being added or reconnected, answering off the ui thread.
     pub pending_connect: Option<crate::nav_ui::PendingConnect>,
     mpv_exit_reported: bool,
+    _instance_lock: Option<std::fs::File>,
+    seen_reply_timeouts: u64,
     pub play_queue: PlayQueue,
     pub previous_track: Option<SearchItem>,
     pub cache_index: Arc<Mutex<cache::CacheIndex>>,
@@ -512,8 +514,22 @@ impl Host {
         if let Some(warning) = proxy_unavailable {
             notifications.push(Severity::Alert, warning);
         }
+        let instance_lock = match wim::persistence::state_dir()
+            .map(|dir| wim::fsutil::claim_instance_lock(&dir))
+        {
+            Ok(wim::fsutil::InstanceLock::Held(file)) => Some(file),
+            Ok(wim::fsutil::InstanceLock::Contended) => {
+                notifications.push(
+                    Severity::Alert,
+                    "another wim is running; the queue, favorites and play history it saves can overwrite this one's",
+                );
+                None
+            }
+            _ => None,
+        };
         let cache_index = Arc::new(Mutex::new(cache::CacheIndex::default()));
         Ok(Host {
+            _instance_lock: instance_lock,
             cfg,
             player,
             app,
@@ -529,6 +545,7 @@ impl Host {
             downloading: HashSet::new(),
             pending_connect: None,
             mpv_exit_reported: false,
+            seen_reply_timeouts: wim::mpv::reply_timeouts(),
             subtitle_tx,
             subtitle_rx,
             remote_search_tx,
@@ -816,6 +833,14 @@ impl Host {
     /// Each one is a `try_recv`, so this is the whole reason nothing
     /// in shellswim blocks.
     pub fn pump(&mut self) {
+        if wim::mpv::reply_timeouts() != self.seen_reply_timeouts && !self.mpv_exit_reported {
+            self.seen_reply_timeouts = wim::mpv::reply_timeouts();
+            if let Some(note) =
+                wim::core::reconcile_queue_after_timeout(&self.player, &mut self.play_queue)
+            {
+                self.notifications.push(Severity::Alert, note);
+            }
+        }
         if !self.mpv_exit_reported {
             if let Some(status) = self.player.exited() {
                 self.mpv_exit_reported = true;
