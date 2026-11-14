@@ -55,9 +55,30 @@ fn save_to(path: &Path, state: &PlaybackState) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let toml = toml::to_string_pretty(state)?;
+    // the format number sits beside the fields rather than in the struct,
+    // so building a `PlaybackState` stays four values
+    let mut table = toml::Table::try_from(state)?;
+    table.insert("version".into(), toml::Value::Integer(i64::from(FORMAT)));
+    let toml = toml::to_string_pretty(&table)?;
     crate::fsutil::atomic_write(path, toml.as_bytes())?;
     Ok(())
+}
+
+/// Written as `version` in `state.toml`. A file with a higher number came
+/// from a newer wim: it is read as far as it parses, and a copy is kept
+/// before this wim's own save replaces it.
+const FORMAT: u32 = 1;
+
+fn note_if_newer(path: &Path, raw: &str) {
+    let version = raw
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|table| table.get("version").and_then(toml::Value::as_integer))
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0);
+    if version > FORMAT {
+        crate::fsutil::keep_newer_copy(path, version);
+    }
 }
 
 /// Best-effort load; a missing state file just means nothing to
@@ -93,7 +114,10 @@ fn load_from(path: &Path) -> (Option<PlaybackState>, Option<String>) {
         Err(e) => return (None, Some(format!("couldn't read {}: {e}", path.display()))),
     };
     match toml::from_str(&raw) {
-        Ok(state) => (Some(state), None),
+        Ok(state) => {
+            note_if_newer(path, &raw);
+            (Some(state), None)
+        }
         Err(e) => (
             None,
             Some(format!(
@@ -486,5 +510,47 @@ mod tests {
             "and which file to look at: {warning}"
         );
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod format_version_tests {
+    use super::*;
+
+    fn dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wim-state-v-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_saved_state_names_its_format_and_still_loads() {
+        let dir = dir("save");
+        let path = dir.join("state.toml");
+        let state = PlaybackState {
+            now_playing_path: Some("/m/a.flac".into()),
+            queue_paths: vec!["/m/b.flac".into()],
+            position_secs: Some(12.5),
+            volume: Some(70.0),
+        };
+        save_to(&path, &state).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("version = 1"));
+        assert_eq!(load_from(&path).0, Some(state));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_state_from_a_newer_wim_loads_and_is_copied_aside_before_being_replaced() {
+        let dir = dir("newer");
+        let path = dir.join("state.toml");
+        fs::write(
+            &path,
+            "version = 4\nnow_playing_path = \"/m/a.flac\"\nqueue_paths = []\n",
+        )
+        .unwrap();
+        assert!(load_from(&path).0.is_some());
+        assert!(dir.join("state.toml.v4.bak").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

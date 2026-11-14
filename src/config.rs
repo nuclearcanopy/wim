@@ -753,6 +753,7 @@ pub fn load_reporting() -> Result<Loaded> {
         });
     }
     let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    remember_seen(raw.as_bytes());
     let mut loaded = validate(&raw).with_context(|| format!("parsing {}", path.display()))?;
     loaded.warnings.extend(loaded.cfg.credential_warnings());
     Ok(loaded)
@@ -933,9 +934,46 @@ pub fn save(cfg: &Config) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let toml = toml::to_string_pretty(cfg)?;
+    // the config is whole-file, last writer wins (a merge cannot know which
+    // of two edits to one setting is meant). What can be done is to not
+    // destroy the other writer's copy without a trace.
+    if let Ok(on_disk) = fs::read(&path) {
+        if config_changed_elsewhere(&on_disk) {
+            let mut backup = path.as_os_str().to_owned();
+            backup.push(".other.bak");
+            // 0600: it holds the same plaintext credentials the config does
+            let _ = crate::fsutil::atomic_write(&PathBuf::from(backup), &on_disk);
+        }
+    }
     crate::fsutil::atomic_write(&path, toml.as_bytes())?;
+    remember_seen(toml.as_bytes());
     restrict_to_owner(&path)?;
     Ok(())
+}
+
+/// Hash of the config bytes this process last read or wrote.
+static CONFIG_SEEN: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn remember_seen(bytes: &[u8]) {
+    *CONFIG_SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hash_bytes(bytes));
+}
+
+/// Whether the file on disk is not what this process last read or wrote,
+/// i.e. another wim (or the user's editor) changed it since.
+fn config_changed_elsewhere(on_disk: &[u8]) -> bool {
+    CONFIG_SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some_and(|seen| seen != hash_bytes(on_disk))
 }
 
 /// 0600 on the config file: it holds navidrome passwords and a
@@ -1483,5 +1521,17 @@ mod debug_redaction_tests {
             ..Config::default()
         };
         assert!(!format!("{cfg:?}").contains("secret"));
+    }
+}
+
+#[cfg(test)]
+mod changed_elsewhere_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_this_process_did_not_write_is_noticed() {
+        remember_seen(b"a = 1\n");
+        assert!(!config_changed_elsewhere(b"a = 1\n"));
+        assert!(config_changed_elsewhere(b"a = 2\n"));
     }
 }

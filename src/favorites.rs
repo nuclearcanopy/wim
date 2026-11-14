@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -16,9 +17,48 @@ use serde::{Deserialize, Serialize};
 /// install with nothing said; pinned by
 /// `a_favorites_file_written_by_an_older_wim_still_loads` against a
 /// literal fixture, the same way `persistence::PlaybackState` is.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Favorites {
     paths: HashSet<String>,
+    /// Format number of the file this was read from (0 before the field
+    /// existed). Only read, to notice a file from a newer wim; `save`
+    /// always writes `FORMAT`.
+    #[serde(default)]
+    version: u32,
+    /// What this process last read or wrote, so a save can apply only this
+    /// process's stars and unstars to whatever another wim saved meanwhile.
+    #[serde(skip)]
+    baseline: Mutex<HashSet<String>>,
+}
+
+const FORMAT: u32 = 1;
+
+impl Clone for Favorites {
+    fn clone(&self) -> Self {
+        Favorites {
+            paths: self.paths.clone(),
+            version: self.version,
+            baseline: Mutex::new(
+                self.baseline
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+        }
+    }
+}
+
+/// Equal when they star the same paths; the baseline is bookkeeping.
+impl PartialEq for Favorites {
+    fn eq(&self, other: &Self) -> bool {
+        self.paths == other.paths
+    }
+}
+
+#[derive(Serialize)]
+struct OnDisk<'a> {
+    version: u32,
+    paths: &'a HashSet<String>,
 }
 
 impl Favorites {
@@ -39,6 +79,22 @@ impl Favorites {
     pub fn paths(&self) -> impl Iterator<Item = &String> {
         self.paths.iter()
     }
+}
+
+/// The stars another wim saved, plus the ones this one added since it last
+/// touched the file, minus the ones it removed. Applies only *this* side's
+/// changes, so neither copy's stars are lost to the other's save.
+fn merge_stars(
+    base: &HashSet<String>,
+    ours: &HashSet<String>,
+    theirs: HashSet<String>,
+) -> HashSet<String> {
+    let mut merged = theirs;
+    merged.extend(ours.difference(base).cloned());
+    for removed in base.difference(ours) {
+        merged.remove(removed);
+    }
+    merged
 }
 
 fn favorites_path() -> Result<PathBuf> {
@@ -65,19 +121,47 @@ fn load_from(path: &Path) -> Favorites {
     let Ok(raw) = fs::read_to_string(path) else {
         return Favorites::default();
     };
-    toml::from_str(&raw).unwrap_or_else(|_| {
-        // the next save would overwrite the only copy
-        crate::fsutil::quarantine(path);
-        Favorites::default()
-    })
+    match toml::from_str::<Favorites>(&raw) {
+        Ok(loaded) => {
+            if loaded.version > FORMAT {
+                crate::fsutil::keep_newer_copy(path, loaded.version);
+            }
+            *loaded
+                .baseline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = loaded.paths.clone();
+            loaded
+        }
+        Err(_) => {
+            // the next save would overwrite the only copy
+            crate::fsutil::quarantine(path);
+            Favorites::default()
+        }
+    }
 }
 
 fn save_to(path: &Path, favorites: &Favorites) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let toml = toml::to_string_pretty(favorites)?;
-    crate::fsutil::atomic_write(path, toml.as_bytes())?;
+    crate::fsutil::locked_update(path, |current| {
+        let theirs = current
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|raw| toml::from_str::<Favorites>(&raw).ok())
+            .map(|other| other.paths)
+            .unwrap_or_default();
+        let base = favorites
+            .baseline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let merged = merge_stars(&base, &favorites.paths, theirs);
+        let toml = toml::to_string_pretty(&OnDisk {
+            version: FORMAT,
+            paths: &merged,
+        })?;
+        Ok(toml.into_bytes())
+    })?;
+    *favorites
+        .baseline
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = favorites.paths.clone();
     Ok(())
 }
 
@@ -156,6 +240,63 @@ mod on_disk_format {
             two_stars(),
             "the saved shape must still load"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn two_copies_each_starring_something_keep_both_stars() {
+        let dir = scratch_dir("two-wims");
+        let path = dir.join("favorites.toml");
+        let mut seed = Favorites::default();
+        seed.toggle("/music/seed.flac");
+        save_to(&path, &seed).unwrap();
+        let mut a = load_from(&path);
+        let mut b = load_from(&path);
+        a.toggle("/music/from-a.flac");
+        b.toggle("/music/from-b.flac");
+        save_to(&path, &a).unwrap();
+        save_to(&path, &b).unwrap();
+        let end = load_from(&path);
+        for star in [
+            "/music/seed.flac",
+            "/music/from-a.flac",
+            "/music/from-b.flac",
+        ] {
+            assert!(end.is_starred(star), "{star} was lost");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unstar_here_removes_it_even_though_the_disk_still_has_it() {
+        let dir = scratch_dir("unstar");
+        let path = dir.join("favorites.toml");
+        let mut seed = Favorites::default();
+        seed.toggle("/music/a.flac");
+        seed.toggle("/music/b.flac");
+        save_to(&path, &seed).unwrap();
+        let mut here = load_from(&path);
+        let mut there = load_from(&path);
+        here.toggle("/music/a.flac"); // unstar
+        there.toggle("/music/c.flac");
+        save_to(&path, &here).unwrap();
+        save_to(&path, &there).unwrap();
+        let end = load_from(&path);
+        assert!(!end.is_starred("/music/a.flac"), "the unstar was undone");
+        assert!(end.is_starred("/music/b.flac") && end.is_starred("/music/c.flac"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_file_is_versioned_and_a_newer_one_is_copied_aside() {
+        let dir = scratch_dir("version");
+        let path = dir.join("favorites.toml");
+        save_to(&path, &two_stars()).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("version = 1"));
+        fs::write(&path, "version = 5\npaths = [\"/x\"]\n").unwrap();
+        let loaded = load_from(&path);
+        assert!(loaded.is_starred("/x"));
+        assert!(dir.join("favorites.toml.v5.bak").exists());
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -21,7 +21,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -87,10 +87,101 @@ pub struct DownloadSource {
     pub artist: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CacheIndex {
     #[serde(default)]
     entries: HashMap<String, CacheEntry>,
+    /// What this process last read from, or wrote to, disk. A save is a
+    /// three-way merge of this, `entries` (ours) and whatever is on disk
+    /// now (theirs, written by another wim), which is how two running
+    /// copies combine their play counts instead of the later save erasing
+    /// the earlier. Behind a mutex because `save` takes `&self`.
+    #[serde(skip)]
+    baseline: Mutex<HashMap<String, CacheEntry>>,
+}
+
+impl Clone for CacheIndex {
+    fn clone(&self) -> Self {
+        CacheIndex {
+            entries: self.entries.clone(),
+            baseline: Mutex::new(
+                self.baseline
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+        }
+    }
+}
+
+impl CacheIndex {
+    /// An index as read from disk: what was read is also the baseline the
+    /// next save diffs against.
+    fn from_disk(entries: HashMap<String, CacheEntry>) -> Self {
+        CacheIndex {
+            baseline: Mutex::new(entries.clone()),
+            entries,
+        }
+    }
+}
+
+/// Folds what another wim wrote (`theirs`) together with this one's
+/// changes since it last touched the file. Per track: whichever side did
+/// not change it takes the other's version; when both did, the play counts
+/// add their deltas, the play days union, the newest play wins, and the
+/// cache fields follow this side if it changed them (it is the one that
+/// just downloaded or evicted) and the other side otherwise.
+fn merge_index(
+    base: &HashMap<String, CacheEntry>,
+    ours: &HashMap<String, CacheEntry>,
+    mut theirs: HashMap<String, CacheEntry>,
+) -> HashMap<String, CacheEntry> {
+    for (id, mine) in ours {
+        let merged = match theirs.remove(id) {
+            None => mine.clone(),
+            Some(other) => {
+                let before = base.get(id);
+                if Some(mine) == before {
+                    other
+                } else if Some(&other) == before {
+                    mine.clone()
+                } else {
+                    merge_entry(&before.cloned().unwrap_or_default(), mine, &other)
+                }
+            }
+        };
+        theirs.insert(id.clone(), merged);
+    }
+    theirs
+}
+
+fn merge_entry(base: &CacheEntry, ours: &CacheEntry, theirs: &CacheEntry) -> CacheEntry {
+    let mut days: Vec<i32> = ours
+        .play_days
+        .iter()
+        .chain(&theirs.play_days)
+        .copied()
+        .collect();
+    days.sort_unstable();
+    days.dedup();
+    if days.len() > MAX_TRACKED_DAYS {
+        days.drain(..days.len() - MAX_TRACKED_DAYS);
+    }
+    let cache_changed_here = ours.cached_path != base.cached_path
+        || ours.cached_at_secs != base.cached_at_secs
+        || ours.download_source != base.download_source;
+    let cache_side = if cache_changed_here { ours } else { theirs };
+    CacheEntry {
+        play_count: base
+            .play_count
+            .saturating_add(ours.play_count.saturating_sub(base.play_count))
+            .saturating_add(theirs.play_count.saturating_sub(base.play_count)),
+        play_days: days,
+        last_played_secs: ours.last_played_secs.max(theirs.last_played_secs),
+        cached_path: cache_side.cached_path.clone(),
+        cached_at_secs: cache_side.cached_at_secs,
+        download_source: cache_side.download_source.clone(),
+    }
 }
 
 /// Wall clock in unix seconds. The one clock read in the crate;
@@ -275,6 +366,10 @@ const INDEX_FILE: &str = "index.ndjson";
 /// written.
 const LEGACY_INDEX_FILE: &str = "index.toml";
 
+/// Bumped whenever the row shapes below change; a catalog written by
+/// an older wim is dropped whole rather than half-parsed.
+const CATALOG_FORMAT: u32 = 1;
+
 /// One `CacheEntry` as a row. Flat, with `Cow` fields, so a line with
 /// no escapes borrows straight out of it and only the strings actually
 /// kept are allocated.
@@ -297,9 +392,27 @@ struct PlayRow<'a> {
     download_source: Option<DownloadSource>,
 }
 
+#[cfg(test)]
 fn index_body(index: &CacheIndex) -> String {
-    let mut body = String::new();
-    for (id, entry) in &index.entries {
+    index_body_of(&index.entries)
+}
+
+/// First row of `index.ndjson`. Older wims skip it (it is not a play row),
+/// and a newer wim's higher number is how this one knows to keep a copy.
+const INDEX_FORMAT: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct IndexHeader {
+    wim_index: u32,
+}
+
+fn index_body_of(entries: &HashMap<String, CacheEntry>) -> String {
+    let mut body = serde_json::to_string(&IndexHeader {
+        wim_index: INDEX_FORMAT,
+    })
+    .unwrap_or_default();
+    body.push('\n');
+    for (id, entry) in entries {
         let row = PlayRow {
             id: Cow::Borrowed(id),
             play_count: entry.play_count,
@@ -342,11 +455,21 @@ fn play_entry(line: &str) -> Option<(String, CacheEntry)> {
 /// Serial on purpose. Chunking the rows over a pool was measured and
 /// rejected; `play_index_parse_legs` holds the candidate and the
 /// numbers.
+#[cfg(test)]
 fn parse_index_body(raw: &str) -> CacheIndex {
+    CacheIndex::from_disk(parse_index_entries(raw).0)
+}
+
+/// The rows, and the format number of the header row (0 when there is none).
+fn parse_index_entries(raw: &str) -> (HashMap<String, CacheEntry>, u32) {
     let lines: Vec<&str> = raw.lines().collect();
+    let version = lines
+        .first()
+        .and_then(|line| serde_json::from_str::<IndexHeader>(line).ok())
+        .map_or(0, |header| header.wim_index);
     let mut entries = HashMap::with_capacity(lines.len());
     entries.extend(lines.into_iter().filter_map(play_entry));
-    CacheIndex { entries }
+    (entries, version)
 }
 
 /// Where a given track id would land on disk once downloaded, with the
@@ -586,11 +709,6 @@ pub fn spawn_startup(
     });
     rx
 }
-
-/// Bumped whenever the row shapes below change; a catalog written by
-/// an older wim is dropped whole rather than half-parsed.
-const CATALOG_FORMAT: u32 = 1;
-static NEXT_INDEX_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide accounting for bytes in Wim-owned cache and playback files.
 /// The budget is initialized once from disk at startup; writers reserve each
@@ -1071,10 +1189,19 @@ fn restrict_dir_to_owner(_dir: &Path) -> Result<()> {
 /// wins when both exist, since it is the only one `save_in` writes.
 fn load_in(dir: &Path) -> CacheIndex {
     match fs::read_to_string(dir.join(INDEX_FILE)) {
-        Ok(raw) => parse_index_body(&raw),
+        Ok(raw) => {
+            let (entries, version) = parse_index_entries(&raw);
+            if version > INDEX_FORMAT {
+                // written by a newer wim: read what parses, and keep a copy
+                // before this one's save writes its own format over it
+                crate::fsutil::keep_newer_copy(&dir.join(INDEX_FILE), version);
+            }
+            CacheIndex::from_disk(entries)
+        }
         Err(_) => fs::read_to_string(dir.join(LEGACY_INDEX_FILE))
             .ok()
-            .and_then(|raw| toml::from_str(&raw).ok())
+            .and_then(|raw| toml::from_str::<CacheIndex>(&raw).ok())
+            .map(|legacy| CacheIndex::from_disk(legacy.entries))
             .unwrap_or_default(),
     }
 }
@@ -1083,41 +1210,29 @@ fn save_in(dir: &Path, index: &CacheIndex) -> Result<()> {
     fs::create_dir_all(dir)?;
     restrict_dir_to_owner(dir)?;
     let path = dir.join(INDEX_FILE);
-    let temp = dir.join(format!(
-        ".{INDEX_FILE}.{}.{}.tmp",
-        std::process::id(),
-        NEXT_INDEX_TEMP.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = (|| -> Result<()> {
-        write_new_owner_only(&temp, &index_body(index))
-            .with_context(|| format!("writing {}", temp.display()))?;
-        fs::rename(&temp, &path).with_context(|| format!("replacing {}", path.display()))?;
-        #[cfg(unix)]
-        fs::File::open(dir)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result?;
+    // read what is on disk now, under a lock, and write back the union of
+    // that and this process's changes; see `merge_index`
+    crate::fsutil::locked_update(&path, |current| {
+        let theirs = current
+            .map(|bytes| parse_index_entries(&String::from_utf8_lossy(&bytes)).0)
+            .unwrap_or_default();
+        let base = index
+            .baseline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let merged = merge_index(&base, &index.entries, theirs);
+        Ok(index_body_of(&merged).into_bytes())
+    })
+    .with_context(|| format!("writing {}", path.display()))?;
+    // what was just persisted is what the next save diffs against
+    *index
+        .baseline
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = index.entries.clone();
     // the toml index held a second copy of the same history and is
     // dead the moment the line above lands; a failure to unlink it is
     // nothing but a stale file in a cache dir, so it is not reported.
     let _ = fs::remove_file(dir.join(LEGACY_INDEX_FILE));
-    Ok(())
-}
-
-fn write_new_owner_only(path: &Path, contents: &str) -> Result<()> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
     Ok(())
 }
 
@@ -1548,9 +1663,11 @@ mod tests {
         save_in(&dir, &index).unwrap();
 
         assert_eq!(load_in(&dir).days_played("song"), 2);
+        // the lock file stays by design; no temp or partial file may
         let files = fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy() != format!("{INDEX_FILE}.lock"))
             .collect::<Vec<_>>();
         assert_eq!(files, [std::ffi::OsString::from(INDEX_FILE)]);
         #[cfg(unix)]
@@ -2408,7 +2525,7 @@ mod tests {
         });
         let mut entries = HashMap::with_capacity(lines.len());
         entries.extend(parts.into_iter().flatten());
-        CacheIndex { entries }
+        CacheIndex::from_disk(entries)
     }
 
     /// `index_body` as it was before the days were packed: the day
@@ -2644,7 +2761,8 @@ mod tests {
         idx.record_play("t-odd", "2026-01-09");
         idx.mark_cached("t-odd", PathBuf::from("/c/wim/tracks/t-odd.mp3"));
         let raw = index_body(&idx);
-        assert_eq!(raw.lines().count(), 301, "precondition");
+        // 301 rows and the format header
+        assert_eq!(raw.lines().count(), 302, "precondition");
 
         let sized = parse_index_body(&raw);
         assert_eq!(sized.entries, idx.entries, "the parse round-trips");
@@ -2875,5 +2993,160 @@ mod day_number_bounds_tests {
         assert_eq!(day_number("-5-01-01"), None);
         assert!(day_number("2026-11-14").is_some());
         assert_eq!(day_number("1970-01-01"), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod two_wims_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wim-two-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn plays(index: &CacheIndex, id: &str) -> u32 {
+        index.entry(id).map_or(0, |e| e.play_count)
+    }
+
+    #[test]
+    fn two_copies_that_each_played_a_track_add_their_plays() {
+        let dir = scratch("plays");
+        let mut seed = CacheIndex::default();
+        seed.record_play("song", "2026-01-01");
+        save_in(&dir, &seed).unwrap();
+        let mut a = load_in(&dir);
+        let mut b = load_in(&dir);
+        a.record_play("song", "2026-01-02");
+        b.record_play("song", "2026-01-03");
+        b.record_play("song", "2026-01-03");
+        save_in(&dir, &a).unwrap();
+        save_in(&dir, &b).unwrap();
+        let end = load_in(&dir);
+        // 1 seeded + 1 from a + 2 from b; the later save did not erase a's
+        assert_eq!(plays(&end, "song"), 4);
+        assert_eq!(end.entry("song").unwrap().play_days.len(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tracks_only_one_copy_knows_about_survive_both_orders() {
+        for a_first in [true, false] {
+            let dir = scratch(&format!("new-{a_first}"));
+            let mut a = load_in(&dir);
+            let mut b = load_in(&dir);
+            a.record_play("only-a", "2026-02-01");
+            b.record_play("only-b", "2026-02-01");
+            if a_first {
+                save_in(&dir, &a).unwrap();
+                save_in(&dir, &b).unwrap();
+            } else {
+                save_in(&dir, &b).unwrap();
+                save_in(&dir, &a).unwrap();
+            }
+            let end = load_in(&dir);
+            assert_eq!(plays(&end, "only-a"), 1);
+            assert_eq!(plays(&end, "only-b"), 1);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_default_index_saved_over_existing_history_does_not_wipe_it() {
+        let dir = scratch("default");
+        let mut seed = CacheIndex::default();
+        seed.record_play("old", "2026-03-01");
+        save_in(&dir, &seed).unwrap();
+        let mut fresh = CacheIndex::default();
+        fresh.record_play("new", "2026-03-02");
+        save_in(&dir, &fresh).unwrap();
+        let end = load_in(&dir);
+        assert_eq!(plays(&end, "old"), 1);
+        assert_eq!(plays(&end, "new"), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deliberate_eviction_here_beats_the_stale_path_on_disk() {
+        let dir = scratch("evict");
+        let mut seed = CacheIndex::default();
+        seed.record_play("song", "2026-04-01");
+        seed.mark_cached("song", dir.join("song.mp3"));
+        save_in(&dir, &seed).unwrap();
+        let mut a = load_in(&dir);
+        a.entries.get_mut("song").unwrap().cached_path = None;
+        save_in(&dir, &a).unwrap();
+        assert!(load_in(&dir).entry("song").unwrap().cached_path.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_download_elsewhere_survives_a_save_that_only_played_the_track() {
+        let dir = scratch("dl");
+        let mut seed = CacheIndex::default();
+        seed.record_play("song", "2026-05-01");
+        save_in(&dir, &seed).unwrap();
+        let mut downloader = load_in(&dir);
+        let mut player = load_in(&dir);
+        downloader.mark_cached("song", dir.join("song.mp3"));
+        save_in(&dir, &downloader).unwrap();
+        player.record_play("song", "2026-05-02");
+        save_in(&dir, &player).unwrap();
+        let end = load_in(&dir);
+        assert!(end.entry("song").unwrap().cached_path.is_some());
+        assert_eq!(plays(&end, "song"), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn many_copies_saving_at_once_lose_no_play() {
+        let dir = scratch("race");
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        let mut copy = load_in(&dir);
+                        copy.record_play("song", "2026-07-01");
+                        save_in(&dir, &copy).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(plays(&load_in(&dir), "song"), 40);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_file_carries_a_format_header_that_old_readers_skip() {
+        let dir = scratch("header");
+        let mut idx = CacheIndex::default();
+        idx.record_play("song", "2026-06-01");
+        save_in(&dir, &idx).unwrap();
+        let raw = fs::read_to_string(dir.join(INDEX_FILE)).unwrap();
+        assert!(raw.starts_with("{\"wim_index\":1}\n"));
+        // a reader that predates the header sees a row it cannot parse as a play
+        assert!(play_entry(raw.lines().next().unwrap()).is_none());
+        assert_eq!(plays(&load_in(&dir), "song"), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_newer_format_is_read_and_a_copy_kept_before_it_is_replaced() {
+        let dir = scratch("newer");
+        fs::write(
+            dir.join(INDEX_FILE),
+            "{\"wim_index\":7}\n{\"id\":\"song\",\"play_count\":3}\n",
+        )
+        .unwrap();
+        let idx = load_in(&dir);
+        assert_eq!(plays(&idx, "song"), 3);
+        assert!(dir.join("index.ndjson.v7.bak").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

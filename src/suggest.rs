@@ -318,6 +318,9 @@ impl Enrichment for NoEnrichment {}
 /// every launch would be latency for nothing.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct EnrichmentCache {
+    /// Format number of the file this was read from; see `ENRICHMENT_FORMAT`.
+    #[serde(default, skip_serializing)]
+    version: u32,
     /// Artist id to similar artist names, most similar first.
     #[serde(default)]
     similar: HashMap<String, Vec<String>>,
@@ -334,6 +337,10 @@ fn enrichment_path() -> Result<PathBuf> {
     Ok(cache::cache_dir()?.join("enrichment.toml"))
 }
 
+/// Written as `version`; a rebuildable cache, so a newer wim's file is
+/// not used rather than backed up.
+const ENRICHMENT_FORMAT: u32 = 1;
+
 impl EnrichmentCache {
     // the host loads rather than constructs; `new` is what this
     // module's own tests build their fixtures with.
@@ -349,7 +356,8 @@ impl EnrichmentCache {
         enrichment_path()
             .ok()
             .and_then(|path| fs::read_to_string(path).ok())
-            .and_then(|raw| toml::from_str(&raw).ok())
+            .and_then(|raw| toml::from_str::<EnrichmentCache>(&raw).ok())
+            .filter(|cache| cache.version <= ENRICHMENT_FORMAT)
             .unwrap_or_default()
     }
 
@@ -358,7 +366,12 @@ impl EnrichmentCache {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let toml = toml::to_string_pretty(self)?;
+        let mut table = toml::Table::try_from(self)?;
+        table.insert(
+            "version".into(),
+            toml::Value::Integer(i64::from(ENRICHMENT_FORMAT)),
+        );
+        let toml = toml::to_string_pretty(&table)?;
         crate::fsutil::atomic_write(&path, toml.as_bytes())?;
         Ok(())
     }

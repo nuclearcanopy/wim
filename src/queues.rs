@@ -216,6 +216,10 @@ impl Entry {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SavedQueue {
+    /// Format number of the file (0 before the field existed); only read,
+    /// to notice a file from a newer wim. `save` writes `FORMAT`.
+    #[serde(default)]
+    pub version: u32,
     /// The name as typed, kept so two names that fold to the same file
     /// (`Rock!` and `rock?`) are noticed instead of one overwriting the other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +227,9 @@ pub struct SavedQueue {
     #[serde(default)]
     pub entries: Vec<Entry>,
 }
+
+/// Written into every saved queue; see `SavedQueue::version`.
+const FORMAT: u32 = 1;
 
 fn dir() -> Result<PathBuf> {
     // same dir choice and reasoning as `persistence::state_path`.
@@ -293,6 +300,7 @@ pub fn save(name: &str, items: &[SearchItem]) -> Result<usize> {
     let saved = SavedQueue {
         entries: items.iter().filter_map(entry_of).collect(),
         name: Some(name.trim().to_string()),
+        version: FORMAT,
     };
     let saved_count = saved.entries.len();
     let toml = toml::to_string_pretty(&saved)?;
@@ -322,8 +330,11 @@ pub fn load_report_with_torbox(
     torbox: Option<Arc<crate::torbox::Client>>,
 ) -> Option<Loaded> {
     let path = dir().ok()?.join(format!("{}.toml", slug(name)));
-    let raw = fs::read_to_string(path).ok()?;
+    let raw = fs::read_to_string(&path).ok()?;
     let saved: SavedQueue = toml::from_str(&raw).ok()?;
+    if saved.version > FORMAT {
+        crate::fsutil::keep_newer_copy(&path, saved.version);
+    }
     Some(rebuild_with_torbox(&saved, clients, torbox.as_ref()))
 }
 
@@ -868,5 +879,23 @@ path = "{}"
     #[test]
     fn nothing_lost_summarises_to_nothing() {
         assert_eq!(summarise(&[]), "");
+    }
+}
+
+#[cfg(test)]
+mod saved_queue_format_tests {
+    use super::*;
+
+    #[test]
+    fn a_saved_queue_names_its_format_and_an_old_one_still_parses() {
+        let saved = SavedQueue {
+            version: FORMAT,
+            ..Default::default()
+        };
+        assert!(toml::to_string_pretty(&saved)
+            .unwrap()
+            .contains("version = 1"));
+        let old: SavedQueue = toml::from_str("entries = []\n").unwrap();
+        assert_eq!(old.version, 0);
     }
 }
