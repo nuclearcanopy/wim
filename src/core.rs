@@ -3718,6 +3718,21 @@ pub fn print_listing(target: ViewTarget, core: &mut CoreCtx) -> (Dispatch, Repor
             }
             op_note(format!("{count} past commands"))
         }
+        ViewTarget::Messages => {
+            let lines: Vec<String> = core
+                .notifications
+                .history()
+                .map(|(severity, message)| format!("[{}] {message}", severity.icon()))
+                .collect();
+            if lines.is_empty() {
+                return op_note("no messages yet");
+            }
+            let count = lines.len();
+            for line in lines {
+                core.console.note(line);
+            }
+            op_note(format!("{count} messages"))
+        }
         ViewTarget::Playlists => {
             *core.saved_queues = queues::list();
             if core.saved_queues.is_empty() {

@@ -452,6 +452,7 @@ fn open_wim_screen(
         ViewTarget::Queue
         | ViewTarget::Index
         | ViewTarget::History
+        | ViewTarget::Messages
         | ViewTarget::Playlists
         | ViewTarget::Vars
         | ViewTarget::Bindings
@@ -1515,6 +1516,7 @@ fn main() -> anyhow::Result<()> {
     let mut first_frame_drawn = false;
     let mut queue_restored = false;
     let mut pending_connect: Option<PendingConnect> = None;
+    let mut mpv_exit_reported = false;
     let mut last_input = Instant::now();
     let mut last_loop_top = Instant::now();
     loop {
@@ -1523,6 +1525,15 @@ fn main() -> anyhow::Result<()> {
                 save_playback_state(&player, &play_queue);
             }
             break;
+        }
+        if !mpv_exit_reported {
+            if let Some(status) = player.exited() {
+                mpv_exit_reported = true;
+                notifications.push(
+                    Severity::Error,
+                    format!("mpv exited ({status}); playback is unavailable until wim restarts"),
+                );
+            }
         }
         // iteration gap: the event poll at the bottom of the body waits
         // at most one frame interval (or IDLE_POLL when idle), so a gap
