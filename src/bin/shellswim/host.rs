@@ -522,6 +522,21 @@ impl Host {
         self.start.elapsed()
     }
 
+    /// Plays or queues one chosen item exactly as `play(...)` /
+    /// `queue(...)` would for that item.
+    pub fn act_on_item(&mut self, item: SearchItem, queue: bool) {
+        let now = self.start.elapsed();
+        let now_playing = self.play_queue.current().cloned();
+        let mut surf = self.swim.borrowed();
+        let mut core = core_ctx!(self, now, now_playing);
+        let action = if queue {
+            app::Action::Queued(item)
+        } else {
+            app::Action::Play(item)
+        };
+        let _ = core::dispatch_action(action, &mut core, &mut surf);
+    }
+
     pub fn now_playing(&self) -> Option<SearchItem> {
         self.play_queue.current().cloned()
     }
