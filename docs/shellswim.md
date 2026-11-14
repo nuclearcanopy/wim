@@ -95,6 +95,9 @@ relay as wim and warns if it cannot start. Press `W` on an empty prompt
 for Watch (needs `WIM_STREMIO_ADDON_URL`, as in wim): `/` search, `enter`
 opens/advances, `[`/`]` seasons, `a` adds a torrent after confirmation,
 `backspace` goes back, `esc` closes; sources play only through the relay.
+The Navidrome profile key (default `n`, shown as `N`) opens the server
+manager: `enter` reconnects or adds, `d` twice removes, and new
+profiles are verified before they are saved.
 Press `T` for TorBox (setup, search, account lists for torrents, usenet
 and web downloads, file playback with `enter`, queueing with `q`; keys
 match wim's workspace).

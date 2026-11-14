@@ -302,7 +302,7 @@ pub struct Host {
     pub remote_search_result_rx: Receiver<RemoteSearchOutcome>,
     pub scan_rx: Receiver<library::ScanBatch>,
     sync_rx: Receiver<BackgroundSyncResult>,
-    _servers_tx: Sender<Vec<config::NavidromeConfig>>,
+    pub servers_tx: Sender<Vec<config::NavidromeConfig>>,
     server_reachable: HashMap<String, bool>,
     pub scrobble: ScrobbleState,
     scrobble_failed_rx: Receiver<core::ScrobbleFailed>,
@@ -490,7 +490,7 @@ impl Host {
             remote_search_result_rx,
             scan_rx,
             sync_rx,
-            _servers_tx: servers_tx,
+            servers_tx,
             server_reachable: HashMap::new(),
             scrobble: ScrobbleState {
                 failed_tx: Some(scrobble_failed_tx),
