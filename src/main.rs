@@ -3866,6 +3866,10 @@ fn main() -> anyhow::Result<()> {
             None
         };
         if let Some(ev) = ev {
+            // a terminal that reports key releases must not double-fire
+            if matches!(&ev, Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Release) {
+                continue;
+            }
             last_input = Instant::now();
             // only the resize notice is on screen below the minimum size,
             // so input must not act on an interface nobody can see
