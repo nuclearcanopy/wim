@@ -70,6 +70,9 @@ When a video starts, Shellswim starts the configured OpenSubtitles
 lookup in the background; downloaded subtitles are added only if that
 same video is still playing. Audio and setups without an OpenSubtitles
 key do not trigger a lookup.
+Press the configured subtitle-menu key (default `t`) to cycle tracks,
+toggle visibility, and adjust the seven subtitle-style fields. Changes
+apply immediately and save automatically.
 
 The prompt also has an optional queue workspace: press the default `Q`
 key on an empty prompt to open it. `j`/`k` or arrows select tracks,
