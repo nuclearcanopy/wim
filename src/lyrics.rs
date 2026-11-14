@@ -13,6 +13,8 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 
 const BASE_URL: &str = "https://lrclib.net/api";
+const USER_AGENT: &str = "wim/0.1 (+https://github.com/nuclearcanopy/wim)";
+const JSON_LIMIT: u64 = 2 << 20;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Lyrics {
@@ -176,7 +178,7 @@ impl Client {
             .collect();
         Client {
             agent: ureq::AgentBuilder::new()
-                .user_agent("wim/0.1 (+https://github.com/nuclearcanopy/wim)")
+                .user_agent(USER_AGENT)
                 .timeout_connect(std::time::Duration::from_secs(10))
                 .timeout_read(std::time::Duration::from_secs(20))
                 .build(),
@@ -207,7 +209,7 @@ impl Client {
 
         match resp {
             Ok(r) => {
-                let mut lyrics: Lyrics = r.into_json()?;
+                let mut lyrics: Lyrics = crate::safenet::json_capped(r, JSON_LIMIT)?;
                 lyrics.source = "lrclib".into();
                 Ok(Some(lyrics))
             }
@@ -221,13 +223,13 @@ impl Client {
     /// nothing; never dead-end on a missing duration tag the way an
     /// exact-match-only lookup would. Returns the first match, if any.
     pub fn search(&self, artist: &str, track: &str) -> anyhow::Result<Option<Lyrics>> {
-        let results: Vec<Lyrics> = self
+        let response = self
             .agent
             .get(&format!("{BASE_URL}/search"))
             .query("artist_name", artist)
             .query("track_name", track)
-            .call()?
-            .into_json()?;
+            .call()?;
+        let results: Vec<Lyrics> = crate::safenet::json_capped(response, JSON_LIMIT)?;
         Ok(results
             .into_iter()
             .filter_map(|mut lyrics| {
@@ -444,7 +446,7 @@ impl Client {
         }
         match request.call() {
             Ok(response) => {
-                let mut lyrics: Lyrics = response.into_json()?;
+                let mut lyrics: Lyrics = crate::safenet::json_capped(response, JSON_LIMIT)?;
                 if lyrics
                     .synced
                     .as_deref()
@@ -476,7 +478,7 @@ impl Client {
                 struct Response {
                     lyrics: String,
                 }
-                let body: Response = response.into_json()?;
+                let body: Response = crate::safenet::json_capped(response, JSON_LIMIT)?;
                 Ok((!body.lyrics.trim().is_empty()).then_some(Lyrics {
                     plain: Some(body.lyrics),
                     source: "lyrics.ovh".into(),
@@ -508,7 +510,7 @@ impl Client {
             request = request.query("q_duration", &duration.to_string());
         }
         let matched: serde_json::Value = match request.call() {
-            Ok(response) => response.into_json()?,
+            Ok(response) => crate::safenet::json_capped(response, JSON_LIMIT)?,
             Err(ureq::Error::Status(404, _)) => return Ok(None),
             // ureq's own error text starts with the request URL, which
             // carries the apikey query parameter.
@@ -543,7 +545,7 @@ impl Client {
             .query("apikey", api_key)
             .call()
             .map_err(|error| crate::subsonic::request_failed("musixmatch", error))?;
-        let body: serde_json::Value = response.into_json()?;
+        let body: serde_json::Value = crate::safenet::json_capped(response, JSON_LIMIT)?;
         let Some(subtitle) = body.pointer("/message/body/subtitle") else {
             return Ok(None);
         };
@@ -586,7 +588,8 @@ impl Client {
         let Some(url) = lyrics.tracking_url.clone() else {
             return;
         };
-        let agent = self.agent.clone();
+        // the url came out of a response body: https and public hosts only
+        let agent = crate::safenet::public_https_agent(USER_AGENT);
         thread::spawn(move || {
             let _ = agent.get(&url).call();
         });

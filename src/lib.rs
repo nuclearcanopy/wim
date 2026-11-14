@@ -39,6 +39,7 @@ pub mod persistence;
 pub mod playback_status;
 pub mod playqueue;
 pub mod queues;
+pub mod safenet;
 pub mod search;
 pub mod shellsong;
 pub mod shellsong_host;
