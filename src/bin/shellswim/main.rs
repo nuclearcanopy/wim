@@ -33,6 +33,7 @@ use wim::{anim, config, mpv, term};
 
 use wim::cli;
 mod host;
+mod settings;
 mod surface;
 
 use cli::{Cli, Run};
@@ -144,6 +145,7 @@ fn prompt() -> anyhow::Result<()> {
     let mut keybinds_capturing = false;
     let mut keybinds_refused: Option<String> = None;
     let mut eq_menu = eqm::EqMenuPane::default();
+    let mut settings_state = settings::SettingsState::default();
 
     loop {
         host.pump();
@@ -165,6 +167,13 @@ fn prompt() -> anyhow::Result<()> {
         if std::mem::take(&mut host.swim.eq_requested) && host.interactive_prompt {
             eq_menu.open(host.app.eq_source, host.cfg.eq_custom_presets.len());
         }
+
+        if std::mem::take(&mut host.swim.settings_requested) && host.interactive_prompt {
+            settings_state.open = true;
+        }
+        let settings_values = settings_state
+            .open
+            .then(|| settings::values(&host, &settings_state));
 
         let now_playing = host.now_playing();
         draw(
@@ -201,6 +210,9 @@ fn prompt() -> anyhow::Result<()> {
                 keybinds_selected,
                 keybinds_capturing,
                 keybinds_refused: keybinds_refused.as_deref(),
+                settings: settings_values
+                    .as_deref()
+                    .map(|values| (values, settings_state.selected)),
                 eq: eq_menu.is_open().then(|| EqScreen {
                     gains: &host.app.eq_gains,
                     saved: &host.cfg.eq_custom_presets,
@@ -231,6 +243,7 @@ fn prompt() -> anyhow::Result<()> {
             || subtitle_menu_open
             || keybinds_open
             || eq_menu.is_open()
+            || settings_state.open
             || host.lyrics_pane.is_open()
             || host.has_program_work()
             || host.console.cycle().is_some()
@@ -319,7 +332,9 @@ fn prompt() -> anyhow::Result<()> {
                     continue;
                 }
                 if subtitle_menu_open {
-                    if key.code == KeyCode::Esc || key.code == subtitle_key(&keymap) {
+                    if key.code == KeyCode::Esc
+                        || key.code == prompt_key(&keymap, KeyAction::OpenSubtitleMenu)
+                    {
                         subtitle_menu_open = false;
                         if let Err(error) = config::save(&host.cfg) {
                             host.console
@@ -379,6 +394,15 @@ fn prompt() -> anyhow::Result<()> {
                             _ => {}
                         }
                     }
+                    continue;
+                }
+                if settings_state.open {
+                    settings::key(
+                        &mut host,
+                        &mut settings_state,
+                        key.code,
+                        prompt_key(&keymap, KeyAction::OpenSettingsMenu),
+                    );
                     continue;
                 }
                 if eq_menu.is_open() {
@@ -612,8 +636,16 @@ fn prompt() -> anyhow::Result<()> {
                     queue_selected = host.play_queue.pos().unwrap_or(0);
                     continue;
                 }
-                if key.code == subtitle_key(&keymap) && host.console.input.is_empty() {
+                if key.code == prompt_key(&keymap, KeyAction::OpenSubtitleMenu)
+                    && host.console.input.is_empty()
+                {
                     subtitle_menu_open = true;
+                    continue;
+                }
+                if key.code == prompt_key(&keymap, KeyAction::OpenSettingsMenu)
+                    && host.console.input.is_empty()
+                {
+                    settings_state.open = true;
                     continue;
                 }
                 if key.code == KeyCode::Char('E') && host.console.input.is_empty() {
@@ -671,16 +703,17 @@ fn banner(console: &mut Console, cfg: &config::Config, keymap: &Keymap) {
         env!("CARGO_PKG_VERSION")
     ));
     console.note(format!(
-        "? commands · {} queue · {} subtitles · K keys · E eq · tab complete · dry(...) preview",
+        "? commands · {} queue · {} subtitles · K keys · E eq · {} settings · tab complete · dry(...) preview",
         key_label(keymap.get(KeyAction::OpenQueueView)),
-        key_label(subtitle_key(keymap))
+        key_label(prompt_key(keymap, KeyAction::OpenSubtitleMenu)),
+        key_label(prompt_key(keymap, KeyAction::OpenSettingsMenu))
     ));
 }
 
 /// A lowercase letter on an empty prompt starts a command (`top`,
 /// `toggle`), so the default `t` becomes `T` here.
-fn subtitle_key(keymap: &Keymap) -> KeyCode {
-    match keymap.get(KeyAction::OpenSubtitleMenu) {
+fn prompt_key(keymap: &Keymap, action: KeyAction) -> KeyCode {
+    match keymap.get(action) {
         KeyCode::Char(c) if c.is_ascii_lowercase() => KeyCode::Char(c.to_ascii_uppercase()),
         other => other,
     }
@@ -725,6 +758,7 @@ struct Screen<'a> {
     keybinds_capturing: bool,
     keybinds_refused: Option<&'a str>,
     eq: Option<EqScreen<'a>>,
+    settings: Option<(&'a [String], usize)>,
 }
 
 struct EqScreen<'a> {
@@ -903,6 +937,16 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
                         keymap: s.keymap,
                         alignment_status: "",
                         alignment_controls: false,
+                    },
+                    body,
+                );
+            } else if let Some((values, selected)) = s.settings {
+                let shown: Vec<&str> = values.iter().map(String::as_str).collect();
+                f.render_widget(
+                    wim::ui::settings_menu::SettingsMenu {
+                        values: &shown,
+                        selected,
+                        keymap: s.keymap,
                     },
                     body,
                 );
