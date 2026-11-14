@@ -3576,9 +3576,8 @@ fn main() -> anyhow::Result<()> {
             Focus::BottomBar => false,
         };
         let banner_showing = now_playing.is_none() && browse_view.is_none() && !lyrics.is_open();
-        let animating = !tiers.static_modal()
+        let animating_beyond_banner = !tiers.static_modal()
             && (selection_pulsing
-                || banner_showing
                 || app.editing_query
                 || console_open
                 // a program resumes a frame at a time, so dropping to
@@ -3596,6 +3595,7 @@ fn main() -> anyhow::Result<()> {
                 || between_tracks.holding()
                 || input_mode == InputMode::Move
                 || flash.is_some_and(|(_, at)| at.elapsed() < FLASH_DURATION));
+        let animating = animating_beyond_banner || (!tiers.static_modal() && banner_showing);
         let input_ready = player_initialized && !app.loading_cached_catalog;
         let timeout = if cached_entries.is_some() {
             // More cached rows are already in memory. Poll for input without
@@ -3603,8 +3603,12 @@ fn main() -> anyhow::Result<()> {
             Duration::from_micros(1)
         } else if !input_ready {
             Duration::from_millis(5)
-        } else if animating {
+        } else if animating_beyond_banner {
             frame.interval()
+        } else if animating {
+            // the banner's motions have 4s+ periods; presenting them at
+            // the display rate only burns cpu and terminal bytes
+            frame.interval().max(anim::BANNER_FRAME_INTERVAL)
         } else {
             anim::IDLE_POLL
         };
