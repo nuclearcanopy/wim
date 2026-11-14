@@ -12,10 +12,8 @@ use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Alignment, Constraint, Layout};
-use ratatui::style::Style;
+use ratatui::layout::{Constraint, Layout};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use wim::core::{self, Drive};
 use wim::eq_menu_keys::{adjust_eq_band, eq_menu_editor_key, eq_saved_row_hint, persist_eq};
@@ -24,7 +22,7 @@ use wim::playqueue::PlayQueue;
 use wim::search::SearchItem;
 use wim::shellsong::{Console, ConsoleAction, LineKind};
 use wim::swimconsole::{SwimBar, SwimConsole};
-use wim::theme::{shade, DIM, NEAR_WHITE};
+use wim::theme::{shade, NEAR_WHITE};
 #[cfg(feature = "dev-telemetry")]
 use wim::trace;
 use wim::ui::divider::HorizontalRule;
@@ -1133,17 +1131,22 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
             ])
             .areas(f.area());
             if let Some(setup) = s.setup {
-                let widget = Paragraph::new(setup.text())
-                    .alignment(Alignment::Center)
-                    .wrap(Wrap { trim: false })
-                    .style(Style::default().fg(shade(NEAR_WHITE)))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title("shellswim · first-run setup")
-                            .border_style(Style::default().fg(shade(DIM))),
+                let area = f.area();
+                let inner = wim::ui::draw::titled_frame(
+                    f.buffer_mut(),
+                    area,
+                    "shellswim · first-run setup",
+                );
+                let rows = wim::ui::draw::wrap_rows(&setup.text(), usize::from(inner.width));
+                for (i, row) in rows.iter().take(usize::from(inner.height)).enumerate() {
+                    wim::ui::draw::centered(
+                        f.buffer_mut(),
+                        inner,
+                        inner.y.saturating_add(i as u16),
+                        row,
+                        shade(NEAR_WHITE),
                     );
-                f.render_widget(widget, f.area());
+                }
                 return;
             }
             if let Some((pane, active_line)) = s.lyrics {
@@ -1271,7 +1274,14 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
                         Line::from(format!("{marker}{text}"))
                     },
                 ));
-                f.render_widget(Paragraph::new(lines), body);
+                for (row, line) in lines.iter().enumerate() {
+                    wim::ui::draw::styled_line(
+                        f.buffer_mut(),
+                        body,
+                        body.y.saturating_add(row as u16),
+                        line,
+                    );
+                }
             } else if let Some((values, selected)) = s.settings {
                 let shown: Vec<&str> = values.iter().map(String::as_str).collect();
                 f.render_widget(

@@ -3,7 +3,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::widgets::{Block, Borders, Clear, Widget};
+use ratatui::widgets::{Clear, Widget};
 
 use crate::config::{crossfade_seconds, CROSSFADE_MAX, CROSSFADE_MIN};
 use crate::theme::{shade, BRIGHT, DIM, NEAR_BLACK};
@@ -88,11 +88,25 @@ impl Widget for CrossfadePopup {
             return;
         }
         Clear.render(popup, buf);
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" crossfade ")
-            .style(Style::default().fg(shade(BRIGHT)).bg(shade(NEAR_BLACK)))
-            .render(popup, buf);
+        for y in popup.y..popup.y + popup.height {
+            for x in popup.x..popup.x + popup.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_bg(shade(NEAR_BLACK));
+                }
+            }
+        }
+        crate::ui::draw::frame(buf, popup, shade(BRIGHT));
+        if popup.width > 14 {
+            crate::ui::draw::at_styled(
+                buf,
+                popup.x + 2,
+                popup.y,
+                " crossfade ",
+                shade(BRIGHT),
+                Some(shade(NEAR_BLACK)),
+                usize::from(popup.width - 4),
+            );
+        }
         if let Some(row) = self.layout.toggle {
             let label = format!(
                 "{}  ·  {:.1}s  (space: toggle)",

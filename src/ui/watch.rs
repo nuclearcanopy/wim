@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::Clear;
 use ratatui::Frame;
 
 use crate::media::MediaKind;
@@ -31,9 +31,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
         Page::Episodes => "watch · episodes",
         Page::Sources => "watch · sources",
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let content = block.inner(panel);
-    frame.render_widget(block, panel);
+    let content = crate::ui::draw::titled_frame(frame.buffer_mut(), panel, title);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -72,7 +70,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
     let privacy = Line::from(
         "Configured provider receives your query/media IDs and can see your IP address.",
     );
-    frame.render_widget(Paragraph::new(vec![query, privacy]), chunks[0]);
+    for (row, line) in [query, privacy].iter().enumerate() {
+        crate::ui::draw::styled_line(
+            frame.buffer_mut(),
+            chunks[0],
+            chunks[0].y.saturating_add(row as u16),
+            line,
+        );
+    }
 
     let rows: Vec<Line<'_>> = match workspace.page {
         Page::Search => workspace
@@ -184,23 +189,30 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
             })
             .collect(),
     };
-    let body = if rows.is_empty() {
-        Paragraph::new(
-            workspace
-                .message
-                .as_deref()
-                .unwrap_or(if workspace.loading {
-                    "Loading…"
-                } else {
-                    "No results"
-                })
-                .to_owned(),
-        )
+    let rows: Vec<Line<'_>> = if rows.is_empty() {
+        let message = workspace
+            .message
+            .as_deref()
+            .unwrap_or(if workspace.loading {
+                "Loading…"
+            } else {
+                "No results"
+            });
+        crate::ui::draw::wrap_rows(message, usize::from(chunks[1].width))
+            .into_iter()
+            .map(Line::from)
+            .collect()
     } else {
-        Paragraph::new(rows)
+        rows
+    };
+    for (row, line) in rows.iter().take(usize::from(chunks[1].height)).enumerate() {
+        crate::ui::draw::styled_line(
+            frame.buffer_mut(),
+            chunks[1],
+            chunks[1].y.saturating_add(row as u16),
+            line,
+        );
     }
-    .wrap(Wrap { trim: true });
-    frame.render_widget(body, chunks[1]);
 
     let navigation = match workspace.page {
         Page::Search => "enter search/open · / edit · j/k move · esc close",
@@ -221,14 +233,20 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
         .message
         .as_deref()
         .unwrap_or(if workspace.loading { "Working…" } else { "" });
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(navigation),
-            Line::from(format!("{spoiler} · {message}")),
-        ])
-        .wrap(Wrap { trim: true }),
-        chunks[2],
-    );
+    for (row, line) in [
+        Line::from(navigation),
+        Line::from(format!("{spoiler} · {message}")),
+    ]
+    .iter()
+    .enumerate()
+    {
+        crate::ui::draw::styled_line(
+            frame.buffer_mut(),
+            chunks[2],
+            chunks[2].y.saturating_add(row as u16),
+            line,
+        );
+    }
 }
 
 #[cfg(test)]
