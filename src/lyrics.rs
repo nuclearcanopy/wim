@@ -510,7 +510,9 @@ impl Client {
         let matched: serde_json::Value = match request.call() {
             Ok(response) => response.into_json()?,
             Err(ureq::Error::Status(404, _)) => return Ok(None),
-            Err(error) => return Err(error.into()),
+            // ureq's own error text starts with the request URL, which
+            // carries the apikey query parameter.
+            Err(error) => return Err(crate::subsonic::request_failed("musixmatch", error)),
         };
         let Some(track_data) = matched.pointer("/message/body/track") else {
             return Ok(None);
@@ -539,7 +541,8 @@ impl Client {
             .query("subtitle_format", "lrc")
             .query("commontrack_id", &commontrack_id.to_string())
             .query("apikey", api_key)
-            .call()?;
+            .call()
+            .map_err(|error| crate::subsonic::request_failed("musixmatch", error))?;
         let body: serde_json::Value = response.into_json()?;
         let Some(subtitle) = body.pointer("/message/body/subtitle") else {
             return Ok(None);
