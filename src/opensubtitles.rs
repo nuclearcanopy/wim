@@ -56,7 +56,12 @@ impl Client {
     pub fn new(api_key: String) -> Self {
         Client {
             api_key,
-            agent: ureq::AgentBuilder::new().user_agent(USER_AGENT).build(),
+            agent: ureq::AgentBuilder::new()
+                .user_agent(USER_AGENT)
+                .timeout_connect(crate::subsonic::HTTP_CONNECT_TIMEOUT)
+                .timeout_read(crate::subsonic::HTTP_IO_TIMEOUT)
+                .timeout_write(crate::subsonic::HTTP_IO_TIMEOUT)
+                .build(),
         }
     }
 
