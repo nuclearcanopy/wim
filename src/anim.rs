@@ -120,6 +120,11 @@ pub const FALLBACK_HZ: f32 = 60.0;
 pub const MAX_HZ: f32 = 144.0;
 pub const MIN_HZ: f32 = 24.0;
 
+/// Floor on the redraw interval for ordinary animation (about 30 fps). Every
+/// frame diffs the whole screen, which dwarfs the cost of drawing it; only
+/// direct manipulation (a scrub, move mode) is worth the display's rate.
+pub const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
 /// Slowest-needed redraw interval for the idle banner (about 30 fps).
 pub const BANNER_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 

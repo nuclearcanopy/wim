@@ -848,6 +848,8 @@ fn empty_suggestions_reason(app: &app::App) -> String {
 /// there's nothing to show; a blank screen with no explanation is a
 /// dead end, never the right default.
 const AUTOSAVE_EVERY: Duration = Duration::from_secs(60);
+/// Redraws that continue after a pause so the level meter can fall to rest.
+const PAUSE_SETTLE: Duration = Duration::from_millis(800);
 const CHECKING_SERVERS: &str = "checking servers…";
 
 /// Folds a finished connectivity check into the open manager (matched by
@@ -1603,6 +1605,7 @@ fn main() -> anyhow::Result<()> {
     let mut mpv_exit_reported = false;
     let mut last_autosave = Instant::now();
     let mut last_reconcile = Instant::now();
+    let mut paused_since: Option<Instant> = None;
     let mut seen_reply_timeouts = mpv::reply_timeouts();
     let mut last_input = Instant::now();
     let mut last_loop_top = Instant::now();
@@ -3752,6 +3755,13 @@ fn main() -> anyhow::Result<()> {
             && browse_view.is_none()
             && !lyrics.is_open()
             && !wim::anim::reduced_motion();
+        // how long ago playback paused; `None` while it is not paused
+        match (paused, paused_since) {
+            (true, None) => paused_since = Some(Instant::now()),
+            (false, Some(_)) => paused_since = None,
+            _ => {}
+        }
+        let pause_settling = paused_since.is_some_and(|at| at.elapsed() < PAUSE_SETTLE);
         let animating_beyond_banner = !tiers.static_modal()
             && (selection_pulsing
                 || app.editing_query
@@ -3763,7 +3773,10 @@ fn main() -> anyhow::Result<()> {
                 // an open still filling in has to redraw as its rows
                 // land, whichever pane holds focus.
                 || browse_view.as_ref().is_some_and(|bv| bv.loading)
-                || (now_playing.is_some() && !player_minimized)
+                // moving things (the level meter, the clock) only while audio
+                // is, plus a moment for the bars to fall after a pause: a
+                // paused player was redrawing at the display rate for nothing
+                || (now_playing.is_some() && !player_minimized && (!paused || pause_settling))
                 || scrub.is_some()
                 // a gap counts down on screen, and mpv is paused
                 // through it, so none of the playback-driven
@@ -3780,7 +3793,14 @@ fn main() -> anyhow::Result<()> {
         } else if !input_ready {
             Duration::from_millis(5)
         } else if animating_beyond_banner {
-            frame.interval()
+            // direct manipulation gets the display's rate; everything else
+            // that moves (meters, pulses) is smooth at 30 and a diff of the
+            // whole screen per frame is the single biggest cost there is
+            if scrub.is_some() || input_mode == InputMode::Move {
+                frame.interval()
+            } else {
+                frame.interval().max(anim::ANIMATION_FRAME_INTERVAL)
+            }
         } else if animating {
             // the banner's motions have 4s+ periods; presenting them at
             // the display rate only burns cpu and terminal bytes
