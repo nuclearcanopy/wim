@@ -8,6 +8,33 @@ use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+static TERMINATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn on_terminate(_: libc::c_int) {
+    TERMINATE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// SIGTERM/SIGHUP (a `kill`, a service stop, the terminal closing) only
+/// set a flag the main loop polls, so quitting runs the normal path: the
+/// terminal is restored, resume state saved and mpv reaped, none of which
+/// a default-disposition signal death does.
+pub fn install_terminate_handlers() {
+    #[cfg(unix)]
+    for signal in [libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: the handler only stores to an atomic, which is
+        // async-signal-safe; `signal` is called with valid arguments.
+        unsafe {
+            libc::signal(signal, on_terminate as extern "C" fn(libc::c_int) as usize);
+        }
+    }
+}
+
+/// Whether a terminate signal arrived since startup.
+pub fn termination_requested() -> bool {
+    TERMINATE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Enables raw mode + alternate screen + bracketed paste (+ mouse
 /// capture, when asked for) on construction and restores all of them on
 /// drop, including on panic via a hook installed here, so a crash never
@@ -25,6 +52,7 @@ pub struct TerminalGuard {
 
 impl TerminalGuard {
     pub fn new(mouse: bool) -> io::Result<Self> {
+        install_terminate_handlers();
         crossterm::terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
         // Failing after raw mode is on must not leave the terminal raw.
@@ -98,4 +126,17 @@ fn restore(mouse: bool) {
         let _ = out.flush();
     }
     let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+}
+
+#[cfg(all(test, unix))]
+mod terminate_signal_tests {
+    use super::*;
+
+    #[test]
+    fn sigterm_sets_the_flag_instead_of_killing_the_process() {
+        install_terminate_handlers();
+        // SAFETY: raising a signal whose handler we just installed.
+        unsafe { libc::raise(libc::SIGTERM) };
+        assert!(termination_requested());
+    }
 }

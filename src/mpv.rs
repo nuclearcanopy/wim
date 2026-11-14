@@ -767,9 +767,17 @@ impl Mpv {
             .insert(id, Pending { reply_tx: tx });
 
         let payload = json!({ "command": args, "request_id": id });
-        let mut line = serde_json::to_vec(&payload)?;
-        line.push(b'\n');
-        self.with_sock(|sock| sock.write_all(&line).context("writing to mpv ipc socket"))?;
+        let sent = serde_json::to_vec(&payload)
+            .map_err(anyhow::Error::from)
+            .and_then(|mut line| {
+                line.push(b'\n');
+                self.with_sock(|sock| sock.write_all(&line).context("writing to mpv ipc socket"))
+            });
+        if let Err(e) = sent {
+            // nothing will ever answer this id; do not leave it queued
+            self.pending.lock().unwrap().remove(&id);
+            return Err(e);
+        }
 
         match rx.recv_timeout(REPLY_TIMEOUT) {
             Ok(Ok(v)) => Ok(v),
@@ -790,9 +798,17 @@ impl Mpv {
     pub fn command_nowait(&self, args: &[Value]) -> Result<()> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let payload = json!({ "command": args, "request_id": id });
-        let mut line = serde_json::to_vec(&payload)?;
-        line.push(b'\n');
-        self.with_sock(|sock| sock.write_all(&line).context("writing to mpv ipc socket"))?;
+        let sent = serde_json::to_vec(&payload)
+            .map_err(anyhow::Error::from)
+            .and_then(|mut line| {
+                line.push(b'\n');
+                self.with_sock(|sock| sock.write_all(&line).context("writing to mpv ipc socket"))
+            });
+        if let Err(e) = sent {
+            // nothing will ever answer this id; do not leave it queued
+            self.pending.lock().unwrap().remove(&id);
+            return Err(e);
+        }
         Ok(())
     }
 

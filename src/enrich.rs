@@ -271,7 +271,9 @@ pub fn recompute_suggestions(
     enrichment: &suggest::EnrichmentCache,
 ) -> suggest::Suggestions {
     catalog.ingest_corpus(corpus);
-    let guard = cache.lock().expect("cache mutex poisoned");
+    let guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let request = suggest::Request {
         enrichment,
         ..suggest::Request::new(catalog, &guard, starred, cache::now_secs())
