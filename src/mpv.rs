@@ -436,6 +436,12 @@ impl Mpv {
             // in wim. a "why does this sound wrong" investigation
             // already burned hours ruling that out, so pin it.
             .arg("--no-config")
+            // `--no-config` leaves ~/.config/mpv/scripts loading; a script
+            // there runs with the full IPC socket's reach. Same for
+            // yt-dlp: stream urls here come from servers and providers,
+            // and none of them should be handed to an external extractor.
+            .arg("--load-scripts=no")
+            .arg("--ytdl=no")
             // mpv owns video playback and opens its normal native window
             // when `vid=auto`; music items explicitly use `vid=no`.
             // Keep the window optional while idle so audio-only playback

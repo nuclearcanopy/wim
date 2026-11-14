@@ -201,7 +201,14 @@ fn run(
             let extracted = work.path.join("source.srt");
             let mut status = Command::new("ffmpeg");
             status
-                .args(["-v", "error", "-y", "-i"])
+                .args([
+                    "-v",
+                    "error",
+                    "-y",
+                    "-protocol_whitelist",
+                    "file,pipe",
+                    "-i",
+                ])
                 .arg(&request.video)
                 .arg("-map")
                 .arg(format!("0:{stream}"))
@@ -221,7 +228,14 @@ fn run(
         let converted = work.path.join("converted.srt");
         let mut command = Command::new("ffmpeg");
         command
-            .args(["-v", "error", "-y", "-i"])
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-protocol_whitelist",
+                "file,pipe",
+                "-i",
+            ])
             .arg(&subtitle_path)
             .args(["-f", "srt"])
             .arg(&converted)
@@ -253,7 +267,14 @@ fn run(
         let wav = work.path.join(format!("sample-{index}.wav"));
         let mut extract = Command::new("ffmpeg");
         extract
-            .args(["-v", "error", "-y", "-ss"])
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-protocol_whitelist",
+                "file,pipe",
+                "-ss",
+            ])
             .arg(format!("{start:.3}"))
             .arg("-i")
             .arg(&request.video)
