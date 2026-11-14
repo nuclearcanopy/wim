@@ -8,6 +8,7 @@
 //! what a shell cannot show. See docs/library-seam.md and
 //! docs/shellswim.md.
 
+use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -62,7 +63,8 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Run::Help => {
-            println!("{}", cli::help());
+            // not println!: `shellswim --help | head` closes the pipe early
+            let _ = writeln!(std::io::stdout(), "{}", cli::help());
             Ok(())
         }
         // a one-shot never touches raw mode or the alternate screen:
