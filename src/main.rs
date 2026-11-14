@@ -12,7 +12,7 @@ use wim::{
     lyrics, mpv, persistence, queues, search, shellsong, shellsong_host, suggest, term, ui,
 };
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,14 +27,14 @@ use wim::catalog::{
 };
 use wim::core::{
     append_resolved, apply_eq_row, apply_op, browse_session, dispatch_action, download_resolved,
-    download_tracks, drained, drive, enqueue_track, eq_preset_names, fire_scrobble,
-    fire_subtitle_fetch, front_resolved, go_to_previous, load_playlist, lyrics_path, lyrics_query,
-    lyrics_remote, note_playback_started, notify_query_changed, op_done, op_fail, op_note,
-    open_starred, playing_duration, print_listing, save_playback_state, set_vid_for_item,
-    shellsong_focus, spawn_background_search, start_session, start_tracking_playback,
-    suggestion_starred_keys, sweep_cache, toggle_star, track_started, BetweenTracks, CoreCtx,
-    Dispatch, DownloadCtx, Drained, Drive, Intent, RemoteSearchOutcome, RemoteSearchQuery, Report,
-    Resolution, ScrobbleState, SelectStep, SessionStart, StarFailed, Surface, TrackResolver,
+    download_tracks, drained, drive, eq_preset_names, fire_scrobble, fire_subtitle_fetch,
+    front_resolved, go_to_previous, load_playlist, lyrics_path, lyrics_query, lyrics_remote,
+    note_playback_started, notify_query_changed, op_done, op_fail, op_note, open_starred,
+    playing_duration, print_listing, save_playback_state, set_vid_for_item, shellsong_focus,
+    spawn_background_search, start_session, start_tracking_playback, suggestion_starred_keys,
+    sweep_cache, toggle_star, track_started, BetweenTracks, CoreCtx, Dispatch, DownloadCtx,
+    Drained, Drive, Intent, RemoteSearchOutcome, RemoteSearchQuery, Report, Resolution,
+    ScrobbleState, SelectStep, SessionStart, StarFailed, Surface, TrackResolver,
 };
 use wim::download::DownloadEvent;
 use wim::enrich::{
@@ -637,6 +637,153 @@ fn resolve_saved_paths(
     (items, lost)
 }
 
+struct StartupPlayback {
+    first: Option<SearchItem>,
+    first_path: Option<String>,
+    position: Option<f64>,
+    items: Vec<SearchItem>,
+    paths: Vec<String>,
+    cache: Arc<Mutex<cache::CacheIndex>>,
+    shuffle: bool,
+}
+
+struct StartupPlaybackResult {
+    queue: PlayQueue,
+    first: Option<SearchItem>,
+    lost: usize,
+    load_error: Option<String>,
+    observe_error: Option<String>,
+}
+
+trait StartupPlayer {
+    fn command(&self, args: &[serde_json::Value]) -> anyhow::Result<serde_json::Value>;
+    fn command_batch(
+        &self,
+        cmds: &[Vec<serde_json::Value>],
+    ) -> Vec<anyhow::Result<serde_json::Value>>;
+    fn observe_playback(&self) -> anyhow::Result<()>;
+}
+
+impl StartupPlayer for mpv::CommandClient {
+    fn command(&self, args: &[serde_json::Value]) -> anyhow::Result<serde_json::Value> {
+        mpv::CommandClient::command(self, args)
+    }
+
+    fn command_batch(
+        &self,
+        cmds: &[Vec<serde_json::Value>],
+    ) -> Vec<anyhow::Result<serde_json::Value>> {
+        mpv::CommandClient::command_batch(self, cmds)
+    }
+
+    fn observe_playback(&self) -> anyhow::Result<()> {
+        mpv::CommandClient::observe_playback(self)
+    }
+}
+
+/// Restore on a worker and publish the queue only after mpv has answered.
+fn restore_startup(
+    player: &impl StartupPlayer,
+    mut startup: StartupPlayback,
+) -> StartupPlaybackResult {
+    use serde_json::json;
+
+    let mut queue = PlayQueue::default();
+    let mut first = None;
+    let mut load_error = None;
+    let item = startup.first.take().or_else(|| {
+        startup
+            .first_path
+            .as_deref()
+            .and_then(persistence::item_from_path)
+    });
+    if let Some(item) = item {
+        if let Some(path) = wim::core::resolve_playable(&item, &startup.cache) {
+            match player.command(&[json!("loadfile"), json!(path), json!("replace")]) {
+                Ok(_) => {
+                    let _ = player.command_batch(&[
+                        vec![
+                            json!("set_property"),
+                            json!("vid"),
+                            json!(wim::core::video_track_mode(&item)),
+                        ],
+                        vec![
+                            json!("set_property"),
+                            json!("force-media-title"),
+                            json!(label(&item)),
+                        ],
+                    ]);
+                    if let Some(position) = startup.position {
+                        let _ =
+                            player.command(&[json!("seek"), json!(position), json!("absolute")]);
+                    }
+                    queue.reset(vec![item.clone()]);
+                    first = Some(item);
+                }
+                Err(error) => load_error = Some(format!("error loading startup file: {error}")),
+            }
+        }
+    }
+
+    let (restored, mut lost) =
+        resolve_saved_paths(startup.paths.into_iter(), persistence::item_from_path);
+    startup.items.extend(restored);
+    let mut playable = Vec::with_capacity(startup.items.len());
+    for item in startup.items {
+        match wim::core::resolve_playable(&item, &startup.cache) {
+            Some(path) => playable.push((item, path)),
+            None => lost += 1,
+        }
+    }
+    if startup.shuffle {
+        for (item, path) in playable {
+            if player
+                .command(&[json!("loadfile"), json!(path), json!("append-play")])
+                .is_err()
+            {
+                lost += 1;
+                continue;
+            }
+            let appended = queue.append(item, true);
+            if let Some(to) = appended.moved_to {
+                if player
+                    .command(&[
+                        json!("playlist-move"),
+                        json!(appended.appended_at),
+                        json!(to),
+                    ])
+                    .is_err()
+                {
+                    queue.move_entry(to, appended.appended_at);
+                }
+            }
+        }
+    } else if !playable.is_empty() {
+        let commands: Vec<_> = playable
+            .iter()
+            .map(|(_, path)| vec![json!("loadfile"), json!(path), json!("append-play")])
+            .collect();
+        for ((item, _), result) in playable.into_iter().zip(player.command_batch(&commands)) {
+            if result.is_ok() {
+                queue.append(item, false);
+            } else {
+                lost += 1;
+            }
+        }
+    }
+    let observe_error = player
+        .observe_playback()
+        .err()
+        .map(|error| error.to_string());
+    StartupPlaybackResult {
+        queue,
+        first,
+        lost,
+        load_error,
+        observe_error,
+    }
+}
+
 /// A built suggestion set, or why it is not worth opening.
 ///
 /// The rule is one function because the two entry points disagreed: the
@@ -656,9 +803,12 @@ fn suggestions_or_reason(
 
 fn empty_suggestions_reason(app: &app::App) -> String {
     if app.corpus.is_empty() {
-        return loading_message(app.scanning_library, app.syncing_servers)
-            .unwrap_or("no library yet: check library_paths in config, or set up navidrome (n)")
-            .to_string();
+        return loading_message(
+            app.scanning_library,
+            app.syncing_servers || app.loading_cached_catalog,
+        )
+        .unwrap_or("no library yet: check library_paths in config, or set up navidrome (n)")
+        .to_string();
     }
     // kept short on purpose: `ui::notify` sizes a box to its text and
     // caps it at the pane width, so a 92-cell sentence is simply cut
@@ -671,11 +821,16 @@ fn empty_suggestions_reason(app: &app::App) -> String {
 /// dead end, never the right default.
 fn empty_results_message(app: &app::App) -> String {
     if app.corpus.is_empty() {
-        loading_message(app.scanning_library, app.syncing_servers)
-            .unwrap_or(
-                "no local music/video found: check library_paths in config, or set up navidrome (n)",
-            )
-            .to_string()
+        loading_message(
+            app.scanning_library,
+            app.syncing_servers || app.loading_cached_catalog,
+        )
+        .unwrap_or(
+            "no local music/video found: check library_paths in config, or set up navidrome (n)",
+        )
+        .to_string()
+    } else if app.loading_cached_catalog {
+        "loading cached library...".to_string()
     } else if app.editing_query && !app.query.is_empty() {
         format!("no matches for \"{}\"", app.query)
     } else {
@@ -807,9 +962,15 @@ fn main() -> anyhow::Result<()> {
     // be corrected, a credential file that would not open.
     let config::Loaded {
         mut cfg,
-        warnings: mut config_warnings,
+        warnings: config_warnings,
     } = config::load_reporting()?;
     wim::trace_mark!("config loaded");
+    let cache_index = Arc::new(Mutex::new(cache::CacheIndex::default()));
+    let mut startup_cache = Some(cache::spawn_startup(
+        cfg.offline_cache_max_bytes,
+        Some(cfg.cache_eviction_days),
+    ));
+    let mut cache_ready = false;
     // the local scan is the biggest single startup cost (a blocking tag
     // read per music file); it streams into the corpus from its own
     // thread while the ui is already up, drained next to `sync_rx` in
@@ -826,19 +987,12 @@ fn main() -> anyhow::Result<()> {
     // read overlaps mpv's spawn below, taken where `app` is built.
     // the background sync reconciles it against what each server
     // really has. see `search::spawn_warm_from_cache`.
-    let warming_corpus = search::spawn_warm_from_cache(&cfg.navidrome_servers);
+    let mut warming_corpus = Some(search::spawn_warm_from_cache(&cfg.navidrome_servers));
+    let mut cached_entries = None;
+    let mut last_cached_resync = Instant::now();
 
     let player = mpv::Mpv::spawn()?;
     wim::trace_mark!("mpv spawned");
-    // the preload-while-paused knob, before anything can play: mpv's
-    // own default readahead is 1s (measured), so without this a pause
-    // buffers almost nothing and "pause it and let it load" silently
-    // doesn't work. applied before the first load because mpv reads
-    // it per file; failure is said rather than swallowed, for the
-    // same reason — a silent failure here is the bug this prevents.
-    if let Err(e) = player.set_buffer_ahead(cfg.buffer_ahead_secs) {
-        config_warnings.push(format!("buffer_ahead_secs could not be applied: {e}"));
-    }
     // All mpv HTTP(S) streams use the local address-pinning relay. Only
     // explicitly configured Navidrome origins may resolve to private LAN
     // addresses; every other destination must resolve wholly public.
@@ -848,24 +1002,15 @@ fn main() -> anyhow::Result<()> {
         .map(|server| server.url.clone())
         .collect::<Vec<_>>();
     let media_proxy = wim::media_proxy::MediaProxy::start(&trusted_stream_origins).ok();
-    let watch_proxy_ready = media_proxy.as_ref().is_some_and(|proxy| {
-        player
-            .set_property("http-proxy", serde_json::json!(proxy.proxy_url()))
-            .is_ok()
-    });
-    // per-track normalization is the sensible default; mpv reads the
-    // gain from each file's own embedded tags as it plays.
-    player.set_replaygain("track")?;
-    // harmless to set before any video/subtitle is even loaded; mpv
-    // just holds onto it for whenever one shows up.
-    player.set_subtitle_style(&cfg.subtitles);
+    let mut watch_proxy_ready = false;
     let mut subtitle_delay = cfg.subtitles.delay_secs;
     // every global, single-purpose command key, remappable via 'K';
     // see keymap.rs for which keys deliberately aren't covered
     // (universal navigation primitives, applied the same way
     // everywhere rather than individually named commands).
     let (mut keymap, keybind_warnings) = Keymap::from_overrides_reporting(&cfg.keybinds);
-    let mut app = app::App::new(warming_corpus.take());
+    let mut app = app::App::new(search::Corpus::new());
+    app.loading_cached_catalog = !cfg.navidrome_servers.is_empty();
     let mut torbox_workspace = wim::torbox_workspace::Workspace::new(
         wim::torbox::Client::from_config(&cfg).map_err(|_| "TorBox is not configured".to_string()),
     );
@@ -897,11 +1042,8 @@ fn main() -> anyhow::Result<()> {
     if let Some(eq::Source::Builtin(i)) = restored.source {
         app.eq_preset = i;
     }
-    let _ = player.set_af(&eq::build_player_af_filter(
-        &app.eq_gains,
-        cfg.eq_enabled,
-        cfg.visualizer_bands as usize,
-    ));
+    let player_filter =
+        eq::build_player_af_filter(&app.eq_gains, cfg.eq_enabled, cfg.visualizer_bands as usize);
     // which pane j/k/arrows/enter navigate: the sidebar's own results
     // list, the workspace (whatever's actually open there), or the
     // bottom bar's own controls. only ever changed from
@@ -1010,12 +1152,6 @@ fn main() -> anyhow::Result<()> {
         cfg.effective_offline_download_bitrate_kbps(),
         &mut notifications,
     );
-    // track play counts/last-played/on-disk cache state (cache.rs);
-    // shared with background download threads, so it's behind a
-    // mutex rather than owned outright the way `app`/`player` are.
-    let cache_index = Arc::new(Mutex::new(cache::CacheIndex::load()));
-    sweep_cache(&cache_index, cfg.cache_eviction_days);
-    cache::initialize_budget(cfg.offline_cache_max_bytes);
     let mut last_cache_sweep = Instant::now();
     // per-track download progress, reported back from whichever
     // thread `download::spawn_tracks` spawned (see
@@ -1064,6 +1200,7 @@ fn main() -> anyhow::Result<()> {
     // go through `apply_shellsong_op` like everything else. One slot:
     // a newer track change supersedes an older pending settle.
     let mut shellsong_queued: Option<Box<shellsong::Program>> = None;
+    let mut typed_programs: VecDeque<Box<shellsong::Program>> = VecDeque::new();
     // `~/.config/wim/init.shg`, if there is one, as the first program
     // the step loop drives. Spelled as the language rather than wired
     // specially: it is one `run(init)` line through the same parse and
@@ -1103,7 +1240,8 @@ fn main() -> anyhow::Result<()> {
     let mut suggest_catalog = suggest::Catalog::new();
     // getArtistInfo2/getTopSongs answers from previous sessions as
     // well as this one, negative answers included.
-    let mut enrichment = suggest::EnrichmentCache::load();
+    let mut enrichment = suggest::EnrichmentCache::new();
+    let mut warming_enrichment = Some(std::thread::spawn(suggest::EnrichmentCache::load));
     // album ids already asked about this session; see
     // `next_enrichment_job` for why this is not persisted.
     let mut warmup = Warmup::default();
@@ -1189,10 +1327,7 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    // a restored queue goes into mpv's own playlist one blocking ipc
-    // round-trip per track, so the appends wait until the first frame
-    // is up (see the drain right after the first `draw`); `app.queue`
-    // itself is filled here, since that's pure in-memory work.
+    // Paths and mpv appends are restored on a worker after the first frame.
     let mut pending_enqueue: Vec<SearchItem> = Vec::new();
     // saved queue paths, still unresolved: `item_from_path` stats each
     // one, and that belongs after the first frame with the appends it
@@ -1212,73 +1347,59 @@ fn main() -> anyhow::Result<()> {
     // volume is a setting rather than a session, so it restores either way.
     let saved_volume = saved.as_ref().and_then(|s| s.volume);
     let resume = saved.filter(|_| resume_requested && from_cli.is_empty());
-    {
-        let first = from_cli.first().cloned().or_else(|| {
-            resume
-                .as_ref()
-                .and_then(|s| s.now_playing_path.as_deref())
-                .and_then(persistence::item_from_path)
-        });
-        if let Some(item) = first {
-            let (_, played) = load_playlist(
-                &player,
-                &cache_index,
-                &mut play_queue,
-                vec![item.clone()],
-                SessionStart::New,
-            );
-            if played {
-                if let Some(pos) = resume.as_ref().and_then(|s| s.position_secs) {
-                    let _ = player.seek(pos, false);
-                }
-                fire_subtitle_fetch(&cfg, &subtitle_tx, &item);
-                let mut dctx = DownloadCtx {
-                    cache: &cache_index,
-                    download_tx: &download_tx,
-                    downloading: &mut downloading,
-                    day_threshold: cfg.cache_days_threshold,
-                    offline_download_bitrate_kbps: cfg.effective_offline_download_bitrate_kbps(),
-                    offline_download_format: &cfg.offline_download_format,
-                    offline_cache_max_bytes: cfg.offline_cache_max_bytes,
-                    persist: cache::CacheIndex::save,
-                };
-                note_playback_started(&item, &mut dctx, &mut notifications);
-                start_tracking_playback(&cfg, &item, &mut scrobble);
-            }
-        }
-        // the rest of the files queue behind the first; `pending_enqueue`
-        // drains after the first frame, so extra paths cost no ipc here.
-        pending_enqueue.extend(from_cli.iter().skip(1).cloned());
-        if let Some(saved) = &resume {
-            pending_paths.extend(saved.queue_paths.iter().cloned());
-        }
-        if let Some(vol) = saved_volume {
-            let _ = player.set_volume(vol);
-        }
-    }
-    wim::trace_mark!("playback state restored (queue deferred)");
-
-    // only now that any restored track is already loaded: registering
-    // an observer makes mpv report the property's *current* value
-    // immediately, and doing it before the restore would have the first
-    // `idle-active` describe an mpv that hadn't started playing yet.
-    if let Err(e) = player.observe_playback() {
-        notifications.push(
-            Severity::Error,
-            format!("mpv won't report playback position: {e}"),
-        );
+    let mut pending_first = from_cli.first().cloned();
+    let mut pending_first_path = resume.as_ref().and_then(|s| s.now_playing_path.clone());
+    pending_enqueue.extend(from_cli.iter().skip(1).cloned());
+    if let Some(saved) = &resume {
+        pending_paths.extend(saved.queue_paths.iter().cloned());
     }
 
-    // the ceiling crossfade's fade-out/fade-in ramps scale against;
-    // read back rather than assuming 100, since persistence may have
-    // just restored something else above. `mut` because shellsong's
-    // `volume(...)` moves the ceiling itself, or the next fade-in
-    // would snap back to whatever it was at startup.
-    let mut base_volume = player
-        .get_property("volume")
-        .ok()
-        .and_then(|v| v.as_f64())
-        .unwrap_or(100.0);
+    // Configuration must precede playback, but neither the socket nor its
+    // replies belong on the terminal thread. Preserve the individual results
+    // for the settings whose failure changes user-visible behavior.
+    let mut startup_commands = vec![vec![
+        serde_json::json!("set_property"),
+        serde_json::json!("demuxer-readahead-secs"),
+        serde_json::json!(cfg.buffer_ahead_secs.max(1.0)),
+    ]];
+    let proxy_index = media_proxy.as_ref().map(|proxy| {
+        let index = startup_commands.len();
+        startup_commands.push(vec![
+            serde_json::json!("set_property"),
+            serde_json::json!("http-proxy"),
+            serde_json::json!(proxy.proxy_url()),
+        ]);
+        index
+    });
+    let replaygain_index = startup_commands.len();
+    startup_commands.push(vec![
+        serde_json::json!("set_property"),
+        serde_json::json!("replaygain"),
+        serde_json::json!("track"),
+    ]);
+    startup_commands.extend(mpv::Mpv::subtitle_style_commands(&cfg.subtitles));
+    startup_commands.push(vec![
+        serde_json::json!("set_property"),
+        serde_json::json!("af"),
+        serde_json::json!(player_filter),
+    ]);
+    if let Some(volume) = saved_volume {
+        startup_commands.push(vec![
+            serde_json::json!("set_property"),
+            serde_json::json!("volume"),
+            serde_json::json!(volume),
+        ]);
+    }
+    let volume_index = startup_commands.len();
+    startup_commands.push(vec![
+        serde_json::json!("get_property"),
+        serde_json::json!("volume"),
+    ]);
+    let mut preparing = Some(player.command_batch_background(startup_commands));
+    let mut restoring = None;
+    let mut player_initialized = false;
+    let mut queued_input = VecDeque::new();
+    let mut base_volume = saved_volume.unwrap_or(100.0);
     let mut crossfade_enabled = cfg.crossfade_enabled;
     // Some(when the current track started) while fading in; mpv has
     // no notion of this, so it's tracked entirely on our side and
@@ -1335,9 +1456,9 @@ fn main() -> anyhow::Result<()> {
     // follows from the answer ('i' cycles it from the config's
     // starting point). best-effort: a terminal that answers nothing
     // just leaves the full-* modes unavailable rather than erroring.
-    // spawned here because the query saves and restores whatever
-    // termios state it finds, so raw mode has to be on first.
-    let mut art = ArtProbe::spawn(cfg.album_art);
+    // Do not query stdin until there is art to show: a non-answering
+    // terminal otherwise races the event loop for the first keystrokes.
+    let mut art = ArtProbe::deferred(cfg.album_art);
     let mut last_drawn_art_mode = art.mode();
     wim::trace_mark!("terminal ready");
     // rebuilt (not re-encoded every frame) whenever the open view's
@@ -1351,10 +1472,10 @@ fn main() -> anyhow::Result<()> {
     // waits on a compositor. 60hz until then.
     let frame_rx = anim::spawn_probe();
     let mut frame = anim::FrameBudget::default();
-    // everything that costs an ipc round-trip per track runs on the
-    // first pass through the loop instead of before it; see the drain
-    // right after `draw`.
+    // Startup playback and queue restoration complete asynchronously.
     let mut first_frame_drawn = false;
+    let mut queue_restored = false;
+    let mut last_input = Instant::now();
     let mut last_loop_top = Instant::now();
     loop {
         // iteration gap: the event poll at the bottom of the body waits
@@ -1601,6 +1722,14 @@ fn main() -> anyhow::Result<()> {
                 .and_then(|bv| bv.art.as_ref())
                 .or_else(|| cover_art.get(item))
         });
+        if playing_art.is_some() || browse_view.as_ref().is_some_and(|view| view.art.is_some()) {
+            // the terminal query reads stdin, so it only starts once the
+            // user has been idle for a moment, and the event loop stands
+            // aside while it runs (below)
+            if last_input.elapsed() >= Duration::from_millis(300) {
+                art.start();
+            }
+        }
         // read once for the whole frame: every write to it (the probe
         // landing, 'i', the settings menu's art row) happens after the
         // draw, so one snapshot is what this frame renders with.
@@ -1688,6 +1817,7 @@ fn main() -> anyhow::Result<()> {
         // then it was just a video".
         #[cfg(feature = "dev-telemetry")]
         if trace::diag_enabled() {
+            let overlay = tiers.covers_screen() || torbox_open || watch_open;
             // state-change only: these are per-frame locals.
             thread_local! {
                 static PREV_OVERLAY: std::cell::Cell<Option<(bool, bool, bool)>> =
@@ -2598,66 +2728,126 @@ fn main() -> anyhow::Result<()> {
             }
         })?;
 
-        // the ui is on screen; now hand mpv the restored queue, which
-        // is one blocking ipc round-trip per track (200 of them on a
-        // real saved queue) and has no business delaying the first
-        // frame. one-shot, not per-frame work.
         if !first_frame_drawn {
             first_frame_drawn = true;
             wim::trace_mark!("first frame drawn");
-            // counted rather than discarded: a saved queue whose
-            // files mpv refuses would otherwise come back short with
-            // no word, the same way `append_resolved` used to report
-            // the requested count instead of the appended one.
-            // resolved here rather than before the frame: this is the
-            // stat per saved path, and nothing on screen needs it.
-            let (restored, mut lost) =
-                resolve_saved_paths(pending_paths.drain(..), persistence::item_from_path);
-            pending_enqueue.extend(restored);
-            if app.shuffle {
-                // Shuffling requires individual playlist moves to keep
-                // mpv and PlayQueue in the same order; retain that path.
-                for item in pending_enqueue.drain(..) {
-                    let done = enqueue_track(&player, &item, &cache_index, &mut play_queue, true);
-                    if !done.is_queued() {
-                        lost += 1;
-                    }
-                }
-            } else {
-                // Resolving the saved paths is local work; send all
-                // playable entries as one ordered IPC batch instead of
-                // blocking the newly-running UI for one round trip per
-                // track. Keep the queue mirror aligned with each
-                // individual mpv result if one entry is rejected.
-                let mut playable = Vec::with_capacity(pending_enqueue.len());
-                for item in pending_enqueue.drain(..) {
-                    match wim::core::resolve_playable(&item, &cache_index) {
-                        Some(path) => playable.push((item, path)),
-                        None => lost += 1,
-                    }
-                }
-                let paths = playable
-                    .iter()
-                    .map(|(_, path)| path.clone())
-                    .collect::<Vec<_>>();
-                for ((item, _), result) in playable
-                    .into_iter()
-                    .zip(player.playlist_append_batch(&paths))
-                {
-                    if result.is_ok() {
-                        play_queue.append(item, false);
-                    } else {
-                        lost += 1;
-                    }
-                }
+        }
+
+        match startup_cache.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(index)) => {
+                startup_cache = None;
+                *cache_index.lock().expect("cache mutex poisoned") = index;
+                cache_ready = true;
+                wim::trace_mark!("playback cache ready");
             }
-            if lost > 0 {
-                notifications.push(
-                    Severity::Alert,
-                    format!("{lost} of the saved queue could not be restored"),
-                );
+            Some(Err(TryRecvError::Disconnected)) => {
+                startup_cache = None;
+                // degrade rather than leave input blocked forever
+                cache_ready = true;
+                notifications.push(Severity::Error, "playback cache startup failed");
             }
-            wim::trace_mark!("mpv playlist refilled");
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+
+        // A socket that has not appeared yet must not hold the first frame
+        // or input. Startup items are local files, so neither mpv setup nor
+        // restoration needs the play-history scan; only publishing the
+        // restored state waits for it (below).
+        {
+            match preparing.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(results)) => {
+                    preparing = None;
+                    if let Some(Err(error)) = results.first() {
+                        notifications.push(
+                            Severity::Alert,
+                            format!("buffer_ahead_secs could not be applied: {error}"),
+                        );
+                    }
+                    watch_proxy_ready = proxy_index
+                        .and_then(|index| results.get(index))
+                        .is_some_and(Result::is_ok);
+                    if let Some(Err(error)) = results.get(replaygain_index) {
+                        notifications.push(Severity::Error, format!("mpv setup failed: {error}"));
+                    }
+                    base_volume = results
+                        .get(volume_index)
+                        .and_then(|result| result.as_ref().ok())
+                        .and_then(|value| value.as_f64())
+                        .unwrap_or(base_volume);
+
+                    let startup = StartupPlayback {
+                        first: pending_first.take(),
+                        first_path: pending_first_path.take(),
+                        position: resume.as_ref().and_then(|s| s.position_secs),
+                        items: std::mem::take(&mut pending_enqueue),
+                        paths: std::mem::take(&mut pending_paths),
+                        cache: Arc::clone(&cache_index),
+                        shuffle: app.shuffle,
+                    };
+                    restoring = Some(
+                        player.run_background(move |client| restore_startup(&client, startup)),
+                    );
+                }
+                Some(Err(TryRecvError::Disconnected)) => {
+                    preparing = None;
+                    notifications.push(Severity::Error, "mpv startup worker stopped");
+                    player_initialized = true;
+                    queue_restored = true;
+                }
+                Some(Err(TryRecvError::Empty)) | None => {}
+            }
+        }
+        match restoring
+            .as_ref()
+            .filter(|_| cache_ready)
+            .map(|rx| rx.try_recv())
+        {
+            Some(Ok(result)) => {
+                restoring = None;
+                play_queue = result.queue;
+                if let Some(item) = result.first {
+                    fire_subtitle_fetch(&cfg, &subtitle_tx, &item);
+                    let mut dctx = DownloadCtx {
+                        cache: &cache_index,
+                        download_tx: &download_tx,
+                        downloading: &mut downloading,
+                        day_threshold: cfg.cache_days_threshold,
+                        offline_download_bitrate_kbps: cfg
+                            .effective_offline_download_bitrate_kbps(),
+                        offline_download_format: &cfg.offline_download_format,
+                        offline_cache_max_bytes: cfg.offline_cache_max_bytes,
+                        persist: cache::CacheIndex::save,
+                    };
+                    note_playback_started(&item, &mut dctx, &mut notifications);
+                    start_tracking_playback(&cfg, &item, &mut scrobble);
+                }
+                if let Some(error) = result.load_error {
+                    notifications.push(Severity::Error, error);
+                }
+                if let Some(error) = result.observe_error {
+                    notifications.push(
+                        Severity::Error,
+                        format!("mpv won't report playback position: {error}"),
+                    );
+                }
+                if result.lost > 0 {
+                    notifications.push(
+                        Severity::Alert,
+                        format!("{} of the saved queue could not be restored", result.lost),
+                    );
+                }
+                player_initialized = true;
+                queue_restored = true;
+                wim::trace_mark!("player observed");
+                wim::trace_mark!("mpv playlist refilled");
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                restoring = None;
+                notifications.push(Severity::Error, "playback restoration stopped; restart wim");
+                player_initialized = true;
+                queue_restored = true;
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
         }
 
         // mpv is the source of truth for which track is playing, and
@@ -2674,7 +2864,10 @@ fn main() -> anyhow::Result<()> {
         // track ahead of mpv for the rest of the session.
         let mut advanced_to: Option<SearchItem> = None;
         let mut playlist_drained = false;
-        while let Ok(ev) = player.events().try_recv() {
+        while let Some(ev) = player_initialized
+            .then(|| player.events().try_recv().ok())
+            .flatten()
+        {
             let mpv::Event::PropertyChange { name, value } = ev else {
                 continue;
             };
@@ -2770,14 +2963,16 @@ fn main() -> anyhow::Result<()> {
         // quiet would take the end-of-playlist and loop-all handling
         // above with it. so it is only on while a gap is wanted *and*
         // something is queued after this track.
-        between_tracks.step(
-            &player,
-            playback.eof_reached,
-            play_queue.upcoming_len() > 0,
-            Instant::now(),
-        );
+        if player_initialized {
+            between_tracks.step(
+                &player,
+                playback.eof_reached,
+                play_queue.upcoming_len() > 0,
+                Instant::now(),
+            );
+        }
 
-        if crossfade_enabled && now_playing.is_some() {
+        if player_initialized && crossfade_enabled && now_playing.is_some() {
             if let Some(started) = fade_in_started_at {
                 let t = (started.elapsed().as_secs_f64() / cfg.crossfade_seconds).clamp(0.0, 1.0);
                 // a ramp step per frame, so it is sent without waiting
@@ -2829,12 +3024,44 @@ fn main() -> anyhow::Result<()> {
             notifications.push(Severity::Alert, alert);
         }
 
+        if warming_corpus
+            .as_ref()
+            .is_some_and(|warm| warm.is_finished())
+        {
+            cached_entries = warming_corpus
+                .take()
+                .map(|warm| warm.take().into_cached_entries());
+        }
+        let mut corpus_changed = false;
+        if let Some(cached) = &mut cached_entries {
+            let added =
+                app.corpus
+                    .merge_cached_batch(cached, search::CACHED_ROWS_PER_FRAME, |client| {
+                        cfg.navidrome_servers.iter().any(|nav| {
+                            client.matches(nav) && server_reachable.get(&nav.url) != Some(&true)
+                        })
+                    });
+            if added > 0 {
+                // a full re-rank per batch is costly with a query typed, so
+                // it is paced, and always done when the last batch lands
+                if cached.is_empty() || last_cached_resync.elapsed() >= Duration::from_millis(50) {
+                    corpus_changed = true;
+                    last_cached_resync = Instant::now();
+                }
+                warmup.poke();
+            }
+            if cached.is_empty() {
+                cached_entries = None;
+                app.loading_cached_catalog = false;
+            }
+        }
+
         // drain whatever the library scan thread read since the last
         // frame, in batches rather than per file; the channel
         // disconnecting is the scan thread signing off (it drops its
         // sender), which is what clears the "scanning" message.
         let mut scanned_batches = 0;
-        loop {
+        for _ in 0..8 {
             match scan_rx.try_recv() {
                 Ok(batch) => {
                     app.corpus.add_local_tracks(batch);
@@ -2847,7 +3074,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        if scanned_batches > 0 {
+        if scanned_batches > 0 || corpus_changed {
             app.resync_results();
         }
         // the tag index the scan writes is what makes the *next* launch
@@ -3089,6 +3316,18 @@ fn main() -> anyhow::Result<()> {
             settle.answered(&outcome.query);
         }
 
+        if warming_enrichment
+            .as_ref()
+            .is_some_and(|warm| warm.is_finished())
+        {
+            enrichment = warming_enrichment
+                .take()
+                .and_then(|warm| warm.join().ok())
+                .unwrap_or_default();
+            warmup.answered();
+            warmup.poke();
+        }
+
         // drain whatever the background enrichment fetcher answered
         // since the last frame. nothing here touches the network: it
         // folds the answers into the engine's inputs and marks the
@@ -3160,7 +3399,7 @@ fn main() -> anyhow::Result<()> {
         // for one feature, nobody should pay for them unprompted, and
         // the next batch is only picked once the last one finished.
         // all of that rule lives in `Warmup::should_fetch`.
-        if warmup.should_fetch(suggestions.is_some()) {
+        if warming_enrichment.is_none() && warmup.should_fetch(suggestions.is_some()) {
             let starred = suggestion_starred_keys(&remote_starred, &favorites);
             let guard = cache_index.lock().expect("cache mutex poisoned");
             let job = next_enrichment_job(&suggest_catalog, &guard, &starred, &enrichment);
@@ -3273,21 +3512,25 @@ fn main() -> anyhow::Result<()> {
         // shellswim cannot diverge on await handling, on when a
         // finished program is dropped, or on where a failure lands.
         let mut shellsong_quit = false;
-        if shellsong_program.is_none() {
-            shellsong_program = shellsong_queued.take();
-        }
-        if let Some(program) = shellsong_program.as_mut() {
-            let mut surf = wim_surface!();
-            let mut core = core_ctx!();
-            match drive(program, &mut core, &mut surf, |c| c.settle.settled(c.now)) {
-                Drive::Quit => {
-                    shellsong_quit = true;
-                    shellsong_program = None;
+        if player_initialized && !app.loading_cached_catalog {
+            if shellsong_program.is_none() {
+                shellsong_program = typed_programs
+                    .pop_front()
+                    .or_else(|| shellsong_queued.take());
+            }
+            if let Some(program) = shellsong_program.as_mut() {
+                let mut surf = wim_surface!();
+                let mut core = core_ctx!();
+                match drive(program, &mut core, &mut surf, |c| c.settle.settled(c.now)) {
+                    Drive::Quit => {
+                        shellsong_quit = true;
+                        shellsong_program = None;
+                    }
+                    Drive::Done => shellsong_program = None,
+                    // the results a `Resolve` wants are not in yet; resume
+                    // next frame rather than spinning or blocking.
+                    Drive::Await => {}
                 }
-                Drive::Done => shellsong_program = None,
-                // the results a `Resolve` wants are not in yet; resume
-                // next frame rather than spinning or blocking.
-                Drive::Await => {}
             }
         }
         if shellsong_quit {
@@ -3329,7 +3572,14 @@ fn main() -> anyhow::Result<()> {
                 || between_tracks.holding()
                 || input_mode == InputMode::Move
                 || flash.is_some_and(|(_, at)| at.elapsed() < FLASH_DURATION));
-        let timeout = if animating {
+        let input_ready = player_initialized && !app.loading_cached_catalog;
+        let timeout = if cached_entries.is_some() {
+            // More cached rows are already in memory. Poll for input without
+            // sleeping before consuming the next bounded batch.
+            Duration::from_micros(1)
+        } else if !input_ready {
+            Duration::from_millis(5)
+        } else if animating {
             frame.interval()
         } else {
             anim::IDLE_POLL
@@ -3346,7 +3596,7 @@ fn main() -> anyhow::Result<()> {
         // "before" captured there is really an "after", and undoing
         // the first keypress of a session would restore what it had
         // just left.
-        if undo_tree.is_unrooted() {
+        if player_initialized && queue_restored && undo_tree.is_unrooted() {
             let core = core_ctx!();
             let root = wim::undo::Snapshot::capture(&core);
             let now = core.now;
@@ -3398,8 +3648,79 @@ fn main() -> anyhow::Result<()> {
             let _ = &mut surf;
         }
 
-        if event::poll(timeout)? {
-            let ev = event::read()?;
+        let ev = if input_ready && !queued_input.is_empty() {
+            queued_input.pop_front()
+        } else if art.in_flight() {
+            // not reading events while the graphics query owns stdin: two
+            // readers would split the terminal's reply between them
+            std::thread::sleep(timeout.min(Duration::from_millis(5)));
+            None
+        } else if event::poll(timeout)? {
+            Some(event::read()?)
+        } else {
+            None
+        };
+        if let Some(ev) = ev {
+            last_input = Instant::now();
+            if !input_ready {
+                if matches!(&ev, Event::Key(key) if key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL))
+                {
+                    // Do not overwrite saved playback with an empty queue.
+                    if player_initialized {
+                        save_playback_state(&player, &play_queue);
+                    }
+                    break;
+                }
+                // Search editing is entirely local. Other events keep their
+                // original order until startup playback and observers are ready.
+                let plain_screen = onboarding.is_none()
+                    && nav_manager.is_none()
+                    && !help_open
+                    && !console_open
+                    && !torbox_open
+                    && !watch_open
+                    && !settings_menu_open
+                    && !subtitle_menu_open
+                    && !keybinds_menu_open
+                    && !undo_menu_open
+                    && !eq_menu.is_open()
+                    && !crossfade_open
+                    && browse_view.is_none();
+                // Help and the console only edit local UI state: a submitted
+                // console line is held in `shellsong_program`, which is not
+                // driven until the player is ready. They stay in order
+                // behind anything already queued.
+                let local_overlay = (help_open || console_open)
+                    && onboarding.is_none()
+                    && nav_manager.is_none()
+                    && !torbox_open
+                    && !watch_open
+                    && matches!(&ev, Event::Key(_) | Event::Paste(_) | Event::Resize(..));
+                let safe = queued_input.is_empty()
+                    && (local_overlay
+                        || (plain_screen
+                            && match &ev {
+                                Event::Key(key) if app.editing_query => key.code != KeyCode::Enter,
+                                Event::Key(key) => {
+                                    key.code == keymap.get(KeyAction::StartSearch)
+                                        || key.code == keymap.get(KeyAction::OpenHelp)
+                                        || key.code == shellsong::OPEN_KEY
+                                }
+                                Event::Paste(_) => app.editing_query,
+                                Event::Resize(..) => true,
+                                _ => false,
+                            }));
+                // a click replayed after the layout shifted would hit a
+                // different row, so pointer events before ready are dropped
+                if matches!(ev, Event::Mouse(_)) {
+                    continue;
+                }
+                if !safe {
+                    queued_input.push_back(ev);
+                    continue;
+                }
+            }
 
             // bracketed paste delivers the whole pasted string as one
             // event, not synthesized keystrokes; enabling bracketed
@@ -4540,7 +4861,19 @@ fn main() -> anyhow::Result<()> {
                         // a submitted line is held and stepped from the
                         // loop body, not run here: a command that
                         // searches cannot finish in one pass.
-                        ConsoleAction::Run(program) => shellsong_program = Some(program),
+                        ConsoleAction::Run(program) => {
+                            // Lines submitted before the player is ready (or
+                            // while another is running) wait their turn
+                            // rather than replacing it.
+                            if shellsong_program.is_some()
+                                || !player_initialized
+                                || !typed_programs.is_empty()
+                            {
+                                typed_programs.push_back(program);
+                            } else {
+                                shellsong_program = Some(program);
+                            }
+                        }
                     }
                     continue;
                 }
@@ -7276,57 +7609,118 @@ mod saved_queue_tests {
         assert_eq!(lost, 0);
     }
 
-    /// The stats belong after the first frame. Reads the source: the
-    /// startup arm and the first-frame block both need a terminal and
-    /// a player to reach.
+    #[derive(Default)]
+    struct FakePlayer {
+        playlist: std::cell::RefCell<Vec<String>>,
+        calls: std::cell::RefCell<Vec<String>>,
+        batches: std::cell::RefCell<Vec<usize>>,
+        fail_move: bool,
+    }
+
+    impl StartupPlayer for FakePlayer {
+        fn command(&self, args: &[serde_json::Value]) -> anyhow::Result<serde_json::Value> {
+            let name = args[0].as_str().unwrap();
+            self.calls.borrow_mut().push(name.to_string());
+            if name == "loadfile" {
+                let path = args[1].as_str().unwrap();
+                if path.contains("rejected") {
+                    anyhow::bail!("rejected fixture");
+                }
+                if args[2] == "replace" {
+                    self.playlist.borrow_mut().clear();
+                }
+                self.playlist.borrow_mut().push(path.to_string());
+            } else if name == "playlist-move" {
+                if self.fail_move {
+                    anyhow::bail!("move refused");
+                }
+                let from = args[1].as_u64().unwrap() as usize;
+                let to = args[2].as_u64().unwrap() as usize;
+                let mut playlist = self.playlist.borrow_mut();
+                let item = playlist.remove(from);
+                playlist.insert(to, item);
+            }
+            Ok(serde_json::Value::Null)
+        }
+
+        fn command_batch(
+            &self,
+            cmds: &[Vec<serde_json::Value>],
+        ) -> Vec<anyhow::Result<serde_json::Value>> {
+            self.batches.borrow_mut().push(cmds.len());
+            cmds.iter().map(|cmd| self.command(cmd)).collect()
+        }
+
+        fn observe_playback(&self) -> anyhow::Result<()> {
+            self.calls.borrow_mut().push("observe".into());
+            Ok(())
+        }
+    }
+
+    fn restore_request(shuffle: bool, items: &[&str]) -> StartupPlayback {
+        StartupPlayback {
+            first: Some(music("/first.flac")),
+            first_path: None,
+            position: Some(12.0),
+            items: items.iter().map(|path| music(path)).collect(),
+            paths: Vec::new(),
+            cache: Arc::new(Mutex::new(cache::CacheIndex::default())),
+            shuffle,
+        }
+    }
+
+    fn queue_paths(queue: &PlayQueue) -> Vec<String> {
+        queue
+            .entries()
+            .iter()
+            .map(|item| match item {
+                SearchItem::LocalMusic { path, .. } => path.to_string_lossy().into_owned(),
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
     #[test]
-    fn the_saved_queue_is_resolved_after_the_first_frame_not_before() {
-        let src = include_str!("main.rs");
-        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
-
-        let at = code
-            .find("pending_paths.extend(")
-            .expect("the saved queue is no longer deferred at all");
-        let arm = &code[at..(at + 200).min(code.len())];
-        assert!(
-            !arm.contains("item_from_path"),
-            "the startup arm stats every saved path before the frame:\n{arm}"
+    fn restoration_batches_appends_and_keeps_only_successful_replies() {
+        let player = FakePlayer::default();
+        let result = restore_startup(
+            &player,
+            restore_request(false, &["/three.flac", "/rejected.flac", "/one.flac"]),
         );
-
-        let at = code
-            .find("first_frame_drawn = true;")
-            .expect("the first-frame block moved");
-        let block = &code[at..(at + 700).min(code.len())];
+        assert_eq!(result.lost, 1);
+        assert!(result.first.is_some());
+        assert_eq!(
+            queue_paths(&result.queue),
+            vec!["/first.flac", "/three.flac", "/one.flac"]
+        );
+        assert_eq!(queue_paths(&result.queue), *player.playlist.borrow());
+        assert_eq!(*player.batches.borrow(), vec![2, 3]);
+        let calls = player.calls.borrow();
+        assert_eq!(calls.last().unwrap(), "observe");
         assert!(
-            block.contains("resolve_saved_paths(") && block.contains("item_from_path"),
-            "nothing resolves the saved paths after the frame, so the queue is lost:\n{block}"
+            calls.iter().position(|call| call == "seek").unwrap()
+                < calls.iter().rposition(|call| call == "loadfile").unwrap()
         );
     }
 
-    /// Bulk startup enqueue must stay batched when shuffle is off, and
-    /// the queue mirror only accepts entries whose mpv append reply
-    /// succeeded. Shuffle keeps the per-item path because it must mirror
-    /// each random playlist move.
     #[test]
-    fn unshuffled_saved_queue_restoration_uses_ordered_batch_ipc() {
-        let src = include_str!("main.rs");
-        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
-        let at = code
-            .find("first_frame_drawn = true;")
-            .expect("the first-frame block moved");
-        let block = &code[at..(at + 2400).min(code.len())];
-        assert!(
-            block.contains("if app.shuffle"),
-            "shuffle handling changed:\n{block}"
+    fn refused_shuffle_move_restores_the_mirrored_order() {
+        let player = FakePlayer {
+            fail_move: true,
+            ..FakePlayer::default()
+        };
+        let result = restore_startup(&player, restore_request(true, &["/a.flac", "/b.flac"]));
+        assert_eq!(result.lost, 0);
+        assert_eq!(
+            queue_paths(&result.queue),
+            vec!["/first.flac", "/a.flac", "/b.flac"]
         );
-        assert!(
-            block.contains("playlist_append_batch(&paths)"),
-            "unshuffled queue restoration no longer batches IPC:\n{block}"
-        );
-        assert!(
-            block.contains("if result.is_ok()") && block.contains("play_queue.append(item, false)"),
-            "the mirrored queue must only accept successful mpv appends:\n{block}"
-        );
+        assert_eq!(queue_paths(&result.queue), *player.playlist.borrow());
+        assert!(player
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call == "playlist-move"));
     }
 }
 

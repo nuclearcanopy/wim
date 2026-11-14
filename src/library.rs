@@ -460,7 +460,7 @@ fn fill_mtimes(found: &mut [FoundMedia], follows: &[bool]) {
 
 /// The one real scan path, shared by `scan` and `spawn_scan`: walk,
 /// answer everything the mtime index already knows plus every video
-/// (never tagged) in one immediate batch, then read the rest in
+/// (never tagged) in bounded batches, then read the rest in
 /// parallel and write the index back.
 fn scan_into(paths: &[String], tx: &mpsc::Sender<ScanBatch>, report: &ScanReport) {
     let owned_defaults;
@@ -496,7 +496,7 @@ fn scan_into(paths: &[String], tx: &mpsc::Sender<ScanBatch>, report: &ScanReport
         rerecord_hits(&mut index, &known, &hits);
     }
 
-    if !known.is_empty() && tx.send(known).is_err() {
+    if !send_known_batches(known, tx) {
         return; // main thread is gone (shutting down)
     }
 
@@ -507,6 +507,68 @@ fn scan_into(paths: &[String], tx: &mpsc::Sender<ScanBatch>, report: &ScanReport
     if !fresh.is_empty() || dropped {
         save_or_warn(&index, report);
         crate::trace_mark!("library scan: index saved");
+    }
+}
+
+fn send_known_batches(known: Vec<LocalTrack>, tx: &mpsc::Sender<ScanBatch>) -> bool {
+    let mut tracks = known.into_iter();
+    loop {
+        let batch: ScanBatch = tracks.by_ref().take(SCAN_BATCH).collect();
+        if batch.is_empty() {
+            return true;
+        }
+        if tx.send(batch).is_err() {
+            return false;
+        }
+    }
+}
+
+#[cfg(test)]
+mod startup_batch_tests {
+    use super::*;
+
+    fn track(n: usize) -> LocalTrack {
+        LocalTrack {
+            path: PathBuf::from(format!("/fixture/{n}.flac")),
+            title: n.to_string(),
+            artist: None,
+            album: None,
+            duration_secs: None,
+            kind: MediaKind::Music,
+        }
+    }
+
+    #[test]
+    fn warm_scan_batches_are_bounded_and_keep_order() {
+        let (tx, rx) = mpsc::channel();
+        assert!(send_known_batches(
+            (0..SCAN_BATCH * 2 + 3).map(track).collect(),
+            &tx
+        ));
+        drop(tx);
+        let batches: Vec<_> = rx.into_iter().collect();
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![SCAN_BATCH, SCAN_BATCH, 3]
+        );
+        let titles: Vec<_> = batches
+            .into_iter()
+            .flatten()
+            .map(|track| track.title)
+            .collect();
+        assert_eq!(
+            titles,
+            (0..SCAN_BATCH * 2 + 3)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_disconnected_consumer_stops_the_scan() {
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        assert!(!send_known_batches(vec![track(1)], &tx));
     }
 }
 

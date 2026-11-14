@@ -1,5 +1,9 @@
 # startup cache
 
+The timings and first-frame design below are historical. Cached catalogs and
+the play index now load off-thread and are merged after the first frame; see
+`docs/performance.md` and `docs/architecture.md` for the current startup path.
+
 why the library is on screen at the first frame, what is cached where,
 and exactly how stale each of those caches can get. read this before
 touching `cache.rs`'s catalog half, `Corpus::reconcile_server`, or

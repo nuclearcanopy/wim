@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -287,6 +287,41 @@ struct Pending {
     reply_tx: Sender<Result<Value, String>>,
 }
 
+/// Cloneable IPC side of the player. The child and event receiver remain on
+/// the main thread; only bounded startup work uses this handle on a worker.
+pub struct CommandClient {
+    sock: Arc<Mutex<Link>>,
+    next_id: Arc<AtomicU64>,
+    pending: Arc<Mutex<HashMap<u64, Pending>>>,
+}
+
+impl CommandClient {
+    pub fn command(&self, args: &[Value]) -> Result<Value> {
+        self.command_batch(&[args.to_vec()])
+            .pop()
+            .expect("one reply per command")
+    }
+
+    pub fn command_batch(&self, cmds: &[Vec<Value>]) -> Vec<Result<Value>> {
+        command_batch_on(&self.sock, &self.next_id, &self.pending, cmds)
+    }
+
+    pub fn observe_playback(&self) -> Result<()> {
+        for result in self.command_batch(&observe_commands()) {
+            result?;
+        }
+        Ok(())
+    }
+}
+
+struct BackgroundCommand(Arc<AtomicUsize>);
+
+impl Drop for BackgroundCommand {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// A running mpv instance controlled over its JSON IPC socket, rather than
 /// linking libmpv directly; keeps the build free of C FFI/pkg-config and
 /// matches how mpv is normally driven by external controllers.
@@ -300,10 +335,11 @@ pub struct Mpv {
     /// it spent waiting. fork and exec cost 0.4ms, so the wait is the
     /// only expensive part and it does not have to be on the critical
     /// path: nothing can be played until the user asks for something.
-    sock: Mutex<Link>,
-    next_id: AtomicU64,
+    sock: Arc<Mutex<Link>>,
+    next_id: Arc<AtomicU64>,
     pending: Arc<Mutex<HashMap<u64, Pending>>>,
     events: Receiver<Event>,
+    background_commands: Arc<AtomicUsize>,
 }
 
 /// The ipc socket, before and after the connector thread finds it.
@@ -451,10 +487,11 @@ impl Mpv {
         Ok(Mpv {
             child,
             sock_path,
-            sock: Mutex::new(Link::Pending(link_rx)),
-            next_id: AtomicU64::new(FIRST_COMMAND_ID),
+            sock: Arc::new(Mutex::new(Link::Pending(link_rx))),
+            next_id: Arc::new(AtomicU64::new(FIRST_COMMAND_ID)),
             pending,
             events: event_rx,
+            background_commands: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -462,21 +499,23 @@ impl Mpv {
     /// on it. The first caller pays whatever is left of mpv's startup;
     /// every one after it pays a mutex.
     fn with_sock<R>(&self, f: impl FnOnce(&mut UnixStream) -> Result<R>) -> Result<R> {
-        let mut guard = self.sock.lock().unwrap();
-        if let Link::Pending(rx) = &*guard {
-            // one yield, so a `recv` here either gets the socket or
-            // learns the connector gave up.
-            *guard = match rx.recv() {
-                Ok(Ok(sock)) => Link::Live(sock),
-                Ok(Err(why)) => Link::Dead(why),
-                Err(_) => Link::Dead("the mpv connector thread died".to_string()),
-            };
-        }
-        match &mut *guard {
-            Link::Live(sock) => f(sock),
-            Link::Dead(why) => bail!("{why}"),
-            Link::Pending(_) => unreachable!("resolved just above"),
-        }
+        with_sock(&self.sock, f)
+    }
+}
+
+fn with_sock<R>(link: &Mutex<Link>, f: impl FnOnce(&mut UnixStream) -> Result<R>) -> Result<R> {
+    let mut guard = link.lock().unwrap();
+    if let Link::Pending(rx) = &*guard {
+        *guard = match rx.recv() {
+            Ok(Ok(sock)) => Link::Live(sock),
+            Ok(Err(why)) => Link::Dead(why),
+            Err(_) => Link::Dead("the mpv connector thread died".to_string()),
+        };
+    }
+    match &mut *guard {
+        Link::Live(sock) => f(sock),
+        Link::Dead(why) => bail!("{why}"),
+        Link::Pending(_) => unreachable!("resolved just above"),
     }
 }
 
@@ -642,6 +681,63 @@ fn read_replies(
             None => {}
         }
     }
+    // A dead player cannot answer any outstanding requests. Wake every
+    // waiter immediately rather than spending a timeout per startup batch.
+    if let Ok(mut pending) = reader_pending.lock() {
+        for (_, request) in pending.drain() {
+            let _ = request
+                .reply_tx
+                .send(Err("mpv ipc disconnected".to_string()));
+        }
+    }
+}
+
+fn command_batch_on(
+    sock: &Mutex<Link>,
+    next_id: &AtomicU64,
+    pending: &Mutex<HashMap<u64, Pending>>,
+    cmds: &[Vec<Value>],
+) -> Vec<Result<Value>> {
+    let mut ids = Vec::with_capacity(cmds.len());
+    let mut rxs = Vec::with_capacity(cmds.len());
+    let mut wire = Vec::new();
+    {
+        let mut pending = pending.lock().unwrap();
+        for args in cmds {
+            let id = next_id.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = mpsc::channel();
+            pending.insert(id, Pending { reply_tx: tx });
+            ids.push(id);
+            rxs.push(rx);
+            let payload = json!({ "command": args, "request_id": id });
+            let mut line = serde_json::to_vec(&payload).unwrap_or_default();
+            line.push(b'\n');
+            wire.extend_from_slice(&line);
+        }
+    }
+    if let Err(e) = with_sock(sock, |sock| Ok(sock.write_all(&wire)?)) {
+        let mut pending = pending.lock().unwrap();
+        for id in &ids {
+            pending.remove(id);
+        }
+        return (0..cmds.len())
+            .map(|_| Err(anyhow::anyhow!("writing to mpv ipc socket: {e}")))
+            .collect();
+    }
+    let deadline = Instant::now() + REPLY_TIMEOUT;
+    ids.into_iter()
+        .zip(rxs)
+        .map(
+            |(id, rx)| match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Ok(v)) => Ok(v),
+                Ok(Err(e)) => Err(anyhow::anyhow!("mpv command error: {e}")),
+                Err(_) => {
+                    pending.lock().unwrap().remove(&id);
+                    Err(anyhow::anyhow!("timed out waiting for mpv reply"))
+                }
+            },
+        )
+        .collect()
 }
 
 impl Mpv {
@@ -694,45 +790,35 @@ impl Mpv {
     /// order. One result per input, in the same order; a failure in
     /// one says nothing about the others.
     pub fn command_batch(&self, cmds: &[Vec<Value>]) -> Vec<Result<Value>> {
-        let mut ids = Vec::with_capacity(cmds.len());
-        let mut rxs = Vec::with_capacity(cmds.len());
-        let mut wire = Vec::new();
-        {
-            let mut pending = self.pending.lock().unwrap();
-            for args in cmds {
-                let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-                let (tx, rx) = mpsc::channel();
-                pending.insert(id, Pending { reply_tx: tx });
-                ids.push(id);
-                rxs.push(rx);
-                let payload = json!({ "command": args, "request_id": id });
-                let mut line = serde_json::to_vec(&payload).unwrap_or_default();
-                line.push(b'\n');
-                wire.extend_from_slice(&line);
-            }
-        }
+        command_batch_on(&self.sock, &self.next_id, &self.pending, cmds)
+    }
 
-        if let Err(e) = self.with_sock(|sock| Ok(sock.write_all(&wire)?)) {
-            let mut pending = self.pending.lock().unwrap();
-            for id in &ids {
-                pending.remove(id);
-            }
-            return (0..cmds.len())
-                .map(|_| Err(anyhow::anyhow!("writing to mpv ipc socket: {e}")))
-                .collect();
-        }
+    /// Run ordered setup commands without making the terminal thread wait for
+    /// either the socket or mpv's replies. The child itself is still spawned
+    /// on the main thread, as required by Linux's parent-death signal.
+    pub fn command_batch_background(&self, cmds: Vec<Vec<Value>>) -> Receiver<Vec<Result<Value>>> {
+        self.run_background(move |client| client.command_batch(&cmds))
+    }
 
-        ids.into_iter()
-            .zip(rxs)
-            .map(|(id, rx)| match rx.recv_timeout(REPLY_TIMEOUT) {
-                Ok(Ok(v)) => Ok(v),
-                Ok(Err(e)) => Err(anyhow::anyhow!("mpv command error: {e}")),
-                Err(_) => {
-                    self.pending.lock().unwrap().remove(&id);
-                    Err(anyhow::anyhow!("timed out waiting for mpv reply"))
-                }
-            })
-            .collect()
+    pub fn run_background<T: Send + 'static>(
+        &self,
+        run: impl FnOnce(CommandClient) -> T + Send + 'static,
+    ) -> Receiver<T> {
+        let client = CommandClient {
+            sock: Arc::clone(&self.sock),
+            next_id: Arc::clone(&self.next_id),
+            pending: Arc::clone(&self.pending),
+        };
+        let active = Arc::clone(&self.background_commands);
+        let (tx, rx) = mpsc::channel();
+        active.fetch_add(1, Ordering::SeqCst);
+        thread::spawn(move || {
+            let guard = BackgroundCommand(active);
+            let result = run(client);
+            drop(guard);
+            let _ = tx.send(result);
+        });
+        rx
     }
 
     pub fn get_property(&self, name: &str) -> Result<Value> {
@@ -756,6 +842,10 @@ impl Mpv {
             result?;
         }
         Ok(())
+    }
+
+    pub fn observe_playback_background(&self) -> Receiver<Vec<Result<Value>>> {
+        self.command_batch_background(observe_commands())
     }
 
     /// Replaces mpv's entire playlist and plays `path_or_url`
@@ -925,7 +1015,12 @@ impl Mpv {
     /// Pipelined, because the subtitle menu calls this on every single
     /// keypress and seven sequential round trips was the whole cost.
     pub fn set_subtitle_style(&self, cfg: &crate::config::SubtitleConfig) {
-        let cmds = vec![
+        let _ = self.command_batch(&Self::subtitle_style_commands(cfg));
+    }
+
+    /// The same ordered commands can be included in asynchronous startup.
+    pub fn subtitle_style_commands(cfg: &crate::config::SubtitleConfig) -> Vec<Vec<Value>> {
+        vec![
             vec![
                 json!("set_property"),
                 json!("sub-delay"),
@@ -958,8 +1053,7 @@ impl Mpv {
                 json!("sub-back-color"),
                 json!(gray_color(0.0, cfg.background_opacity as f32)),
             ],
-        ];
-        let _ = self.command_batch(&cmds);
+        ]
     }
 
     /// Loads an external subtitle file onto the currently playing
@@ -1100,7 +1194,17 @@ fn gray_color(level: f32, alpha: f32) -> String {
 
 impl Drop for Mpv {
     fn drop(&mut self) {
-        let _ = self.command(&[json!("quit")]);
+        // Quitting during startup must not wait for the connector or a
+        // setup reply. The child is ours, so terminate it directly then.
+        let connected = self
+            .sock
+            .try_lock()
+            .is_ok_and(|link| matches!(*link, Link::Live(_)));
+        if connected && self.background_commands.load(Ordering::SeqCst) == 0 {
+            let _ = self.command(&[json!("quit")]);
+        } else {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
         // mpv does not unlink it on exit, so every run left one behind.
         let _ = std::fs::remove_file(&self.sock_path);

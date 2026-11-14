@@ -639,10 +639,26 @@ struct Scratch {
 pub struct WarmingCorpus(thread::JoinHandle<Corpus>);
 
 impl WarmingCorpus {
+    pub fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
+
     /// Blocks until the load finishes; an empty corpus if its thread
     /// panicked, same best-effort stance as every other cache read.
     pub fn take(self) -> Corpus {
         self.0.join().unwrap_or_default()
+    }
+}
+
+/// Pre-indexed cached rows, consumed in bounded batches on the UI thread.
+pub struct CachedEntries(std::vec::IntoIter<Entry>);
+
+/// Limits how much pre-indexed catalog work can land between input polls.
+pub const CACHED_ROWS_PER_FRAME: usize = 1024;
+
+impl CachedEntries {
+    pub fn is_empty(&self) -> bool {
+        self.0.len() == 0
     }
 }
 
@@ -814,6 +830,44 @@ impl Corpus {
             rev: next_revision(),
             ..Default::default()
         }
+    }
+
+    pub fn into_cached_entries(self) -> CachedEntries {
+        CachedEntries(self.items.into_iter())
+    }
+
+    /// Merge cached rows without replacing local scans, live searches, or a
+    /// newer server sync. The caller can change `accept` between batches as
+    /// profiles and fresh sync results arrive.
+    pub fn merge_cached_batch(
+        &mut self,
+        cached: &mut CachedEntries,
+        limit: usize,
+        accept: impl Fn(&Client) -> bool,
+    ) -> usize {
+        let mut added = 0;
+        for entry in cached.0.by_ref().take(limit) {
+            let Some(client) = entry.item.client() else {
+                continue;
+            };
+            if !accept(client) {
+                continue;
+            }
+            let Some((kind, id)) = entry.item.remote_key() else {
+                continue;
+            };
+            let Some(keys) = self.remote_keys.get_mut(kind as usize) else {
+                continue;
+            };
+            if keys.insert(id.to_owned()) {
+                self.items.push(entry);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.rev = next_revision();
+        }
+        added
     }
 
     /// A corpus already holding every configured server's catalog as

@@ -166,6 +166,10 @@ event loop the only reader of stdin.
 
 ## measured startup
 
+The measurements below are historical. Startup now observes mpv and loads
+the playback cache in the background, with the prompt accepting input while
+both are pending. See `docs/performance.md` for the newer PTY measurements.
+
 `WIM_STARTUP_TRACE=1`, warm cache, one local path, isolated XDG dirs,
 on a machine under load from three other builds.
 

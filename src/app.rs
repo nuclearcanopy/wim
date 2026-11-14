@@ -149,6 +149,7 @@ pub struct App {
     /// until main.rs has actually spawned the work.
     pub scanning_library: bool,
     pub syncing_servers: bool,
+    pub loading_cached_catalog: bool,
     /// vim-style pending leader key, currently only used for `gg`.
     pending: Option<char>,
 }
@@ -176,6 +177,7 @@ impl App {
             eq_gains: eq::PRESETS[0].gains,
             scanning_library: false,
             syncing_servers: false,
+            loading_cached_catalog: false,
             pending: None,
         }
     }

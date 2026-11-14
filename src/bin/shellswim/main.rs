@@ -96,6 +96,9 @@ fn oneshot(cli: &Cli) -> anyhow::Result<()> {
         _ => Vec::new(),
     };
     let mut host = Host::start()?;
+    host.wait_startup_cache()?;
+    host.apply_player_setup_blocking();
+    host.wait_startup_catalog();
     wim::trace_mark!("host ready (no terminal)");
     let failed = host.run_lines(&lines);
     for line in &host.console.lines {
@@ -165,9 +168,46 @@ fn prompt() -> anyhow::Result<()> {
     let mut torbox_open = false;
     let mut nav: Option<wim::navmanager::NavManager> = None;
     let mut list_view: Option<(surface::ListWorkspace, usize)> = None;
+    let mut observing = Some(host.begin_player_setup());
+    let mut player_observed = false;
+    let mut cache_ready = false;
+    let mut cache_failed = false;
 
     loop {
-        host.pump();
+        if first_frame {
+            // Nothing, including the host pump, may touch mpv before draw.
+        } else if let Some(rx) = &observing {
+            match rx.try_recv() {
+                Ok(outcome) => {
+                    host.finish_player_setup(outcome);
+                    observing = None;
+                    player_observed = true;
+                    wim::trace_mark!("player observed");
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    host.console.error = Some("mpv startup worker stopped".to_owned());
+                    observing = None;
+                    player_observed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if !first_frame && !cache_ready && !cache_failed {
+            match host.poll_startup_cache() {
+                Ok(ready) => cache_ready = ready,
+                Err(error) => {
+                    host.console.error = Some(error.to_string());
+                    cache_failed = true;
+                    cache_ready = true;
+                }
+            }
+        }
+        let player_ready = player_observed && cache_ready;
+        if player_ready {
+            host.pump();
+        } else if !first_frame {
+            host.pump_library();
+        }
         if let Ok(budget) = frame_rx.try_recv() {
             frame = budget;
         }
@@ -175,7 +215,7 @@ fn prompt() -> anyhow::Result<()> {
         // never blocks: a command that searches suspends on
         // `AwaitResults` and resumes on a later frame, once the
         // results for its query have settled.
-        if host.step() == Drive::Quit {
+        if player_ready && !host.app.loading_cached_catalog && host.step() == Drive::Quit {
             break;
         }
         if std::mem::take(&mut host.swim.keybinds_requested) && host.interactive_prompt {
@@ -272,14 +312,6 @@ fn prompt() -> anyhow::Result<()> {
         if first_frame {
             wim::trace_mark!("first frame drawn");
             first_frame = false;
-            // the first thing that needs the socket, so it is also
-            // what pays whatever is left of mpv's startup. deliberately
-            // after the draw: the prompt is on screen first, and a
-            // human cannot type inside the ~70ms this waits.
-            if let Err(e) = host.player.observe_playback() {
-                host.console.error = Some(format!("mpv will not report playback position: {e}"));
-            }
-            wim::trace_mark!("player observed");
         }
 
         // the scrubber moves while something plays and costs nothing
@@ -299,7 +331,11 @@ fn prompt() -> anyhow::Result<()> {
             || host.has_program_work()
             || host.console.cycle().is_some()
             || (now_playing.is_some() && !host.playback.paused);
-        let timeout = if animating {
+        let timeout = if host.has_cached_rows_pending() {
+            Duration::from_micros(1)
+        } else if !player_ready || host.app.loading_cached_catalog {
+            Duration::from_millis(5)
+        } else if animating {
             frame.interval()
         } else {
             anim::IDLE_POLL
@@ -909,7 +945,9 @@ fn prompt() -> anyhow::Result<()> {
         }
     }
 
-    core::save_playback_state(&host.player, &host.play_queue);
+    if player_observed && cache_ready {
+        core::save_playback_state(&host.player, &host.play_queue);
+    }
     drop(guard);
     Ok(())
 }

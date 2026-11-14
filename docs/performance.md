@@ -1,5 +1,46 @@
 # Performance
 
+## Startup responsiveness
+
+`benchmarks/startup.py` measures recognizable screen content and the visible
+echo of an input character, not just alternate-screen escape sequences. It
+uses isolated XDG directories, an empty local library, a 120x40 PTY, and a
+synthetic Alacritty terminal. `--history-rows` and `--catalog-rows` generate
+larger cache fixtures; the latter uses an unresponsive loopback-only mock, not
+a real server. `--wait-catalog` additionally waits for a known cached result.
+
+```sh
+python3 benchmarks/startup.py --binary target/release/wim --frontend wim --runs 12
+python3 benchmarks/startup.py --binary target/release/shellswim --frontend shellswim --runs 12
+```
+
+On this machine, in one session with release binaries and an empty library,
+12 launches produced median first screens of 75.82 ms before and 3.10 ms after
+for Wim, and 74.05 ms before and 2.74 ms after for Shellswim. These are PTY
+measurements, not real-terminal rendering or time to playback. Cache fixtures,
+hardware load, terminal capability detection, and actual playback can change
+the result. The graphics probe is deferred until artwork is needed; it can
+still race terminal input while it runs.
+
+Second pass (same machine, release binaries, PTY; `--catalog-rows 40000
+--wait-catalog` measures a search typed at startup finding a cached row; the
+resume figure is time until mpv receives the first `loadfile` with a
+300,000-row play history, against a fake mpv):
+
+| | before | after |
+| --- | ---: | ---: |
+| Wim cached search result | 324 ms | 130 ms |
+| Shellswim cached search result | 1314 ms | 203 ms |
+| Wim `--resume` first `loadfile`, 300k history | 772 ms | 57 ms |
+
+Help and the console open immediately while mpv is still starting; commands
+submitted meanwhile run in order once it is ready. Terminals that identify
+themselves as Kitty, Ghostty or WezTerm skip the graphics query entirely. A
+Shellswim search prints local and cached matches as soon as they are loaded,
+and server matches follow in the "...and from the servers" lines. Lighter mpv
+flags (no ytdl, stats, console or auto-profiles) were measured and changed
+socket-ready time by about 2 ms, within noise, so they are not used.
+
 Performance numbers are only useful with the workload and environment attached.
 The automated process harness measures starting Wim with an empty local
 library and no servers, then sitting idle without playback. A separate,
