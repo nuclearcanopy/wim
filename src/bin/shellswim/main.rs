@@ -176,6 +176,9 @@ fn prompt() -> anyhow::Result<()> {
     let mut cache_failed = false;
 
     loop {
+        if wim::term::termination_requested() {
+            break;
+        }
         if first_frame {
             // Nothing, including the host pump, may touch mpv before draw.
         } else if let Some(rx) = &observing {

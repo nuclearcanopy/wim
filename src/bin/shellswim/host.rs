@@ -643,7 +643,10 @@ impl Host {
         };
         match rx.try_recv() {
             Ok(index) => {
-                *self.cache_index.lock().expect("cache mutex poisoned") = index;
+                *self
+                    .cache_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = index;
                 self.startup_cache = None;
                 wim::trace_mark!("playback cache ready");
                 Ok(true)
@@ -658,7 +661,10 @@ impl Host {
             let index = rx
                 .recv()
                 .map_err(|_| anyhow::anyhow!("playback cache startup failed"))?;
-            *self.cache_index.lock().expect("cache mutex poisoned") = index;
+            *self
+                .cache_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = index;
         }
         Ok(())
     }
