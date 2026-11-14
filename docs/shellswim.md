@@ -66,6 +66,13 @@ First launch offers the same provider choices and optional Musixmatch
 key-file path as wim's setup. `shellswim -c 'view(lyrics)'` remains a
 plain-text, non-interactive command suitable for scripts.
 
+The prompt also has an optional queue workspace: press the default `Q`
+key on an empty prompt to open it. `j`/`k` or arrows select tracks,
+`enter` jumps playback to the selected track, `d` removes it, and `J`/`K`
+reorders upcoming tracks. `esc` or `q` returns to the prompt. The
+`view(queue)` command remains a printable listing for scripts and
+scrollback.
+
 `dry(...)` still describes **every** op here, including the ones
 shellswim would refuse, because `dry` lowers to notes and never
 reaches the op table at all. that is the intended reading: `dry`
