@@ -544,20 +544,40 @@ impl CacheBudget {
     }
 
     pub(crate) fn reserve(&self, bytes: u64) -> bool {
-        self.used_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes)
-                    .filter(|next| *next <= self.max_bytes.load(Ordering::Acquire))
-            })
-            .is_ok()
+        let mut used = self.used_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = used
+                .checked_add(bytes)
+                .filter(|next| *next <= self.max_bytes.load(Ordering::Acquire))
+            else {
+                return false;
+            };
+            match self.used_bytes.compare_exchange_weak(
+                used,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => used = actual,
+            }
+        }
     }
 
     pub(crate) fn release(&self, bytes: u64) {
-        let _ = self
-            .used_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                Some(used.saturating_sub(bytes))
-            });
+        let mut used = self.used_bytes.load(Ordering::Acquire);
+        loop {
+            let next = used.saturating_sub(bytes);
+            match self.used_bytes.compare_exchange_weak(
+                used,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => used = actual,
+            }
+        }
     }
 
     pub(crate) fn set_limit(&self, max_bytes: u64) {
