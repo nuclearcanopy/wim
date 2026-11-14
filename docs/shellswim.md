@@ -51,7 +51,7 @@ answers, and only one of them is true.
 | dedicated interactive view / printed by one-shot | `view(lyrics)` |
 | printed by shellswim / opens its editor interactively | `view(keybinds)` |
 | printed settings snapshot | `view(settings)` |
-| printed equalizer snapshot | `view(eq)` |
+| printed equalizer snapshot, then opens the editor interactively | `view(eq)` |
 | printed undo history | `view(undo)` |
 | printed, personalized recommendations | `view(suggestions)` |
 | printed starred items from the loaded library | `view(starred)` |
@@ -83,6 +83,10 @@ Press `K` for the keybind editor: `j`/`k` select an action, `r` captures
 a replacement, `0` resets one action, and `R` resets all bindings.
 Reserved or already-used keys are refused rather than saved as dead
 bindings.
+Press `E` (or run `view(eq)`) for the equalizer editor: `j`/`k` move,
+`enter` applies a preset, `h`/`l` nudge a band, and the same save,
+rename and delete keys as wim manage custom curves. `esc` closes it
+and persists the curve.
 
 The prompt also has an optional queue workspace: press the default `Q`
 key on an empty prompt to open it. `j`/`k` or arrows select tracks,

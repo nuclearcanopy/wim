@@ -26,6 +26,8 @@ pub struct SwimSurface {
     /// The Shellswim host turns this request into its optional keybinds
     /// workspace after the current Shellsong step has returned.
     pub keybinds_requested: bool,
+    /// Same hand-off for the equalizer editor.
+    pub eq_requested: bool,
     /// Interactive prompt requested a live lyrics display. One-shot
     /// commands still print lyrics to stdout after the same lookup.
     pub lyrics_requested: bool,
@@ -187,6 +189,7 @@ impl Borrowed<'_> {
     }
 
     fn print_eq(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
+        self.state.eq_requested = true;
         let source = core
             .app
             .eq_source
@@ -212,7 +215,7 @@ impl Borrowed<'_> {
             .collect::<Vec<_>>()
             .join(", ");
         core.console.note(format!("presets: {presets}"));
-        op_note("choose a curve with eq(name)".to_owned())
+        op_note("choose a curve with eq(name) · E opens the editor".to_owned())
     }
 
     fn print_undo(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
