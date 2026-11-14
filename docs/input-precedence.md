@@ -16,8 +16,9 @@ the agreement between them.
 6. the browse view's song filter (`bv.filtering`)
 7. subtitle menu
 8. settings menu
-9. eq menu
-10. keybinds menu
+9. undo menu
+10. eq menu
+11. keybinds menu
 
 the keyboard checks these in exactly this order, each tier ending in a
 `continue` so nothing below it ever sees the key. the two text boxes
@@ -95,9 +96,13 @@ the notification toasts are painted last, over panes whose lists and
 controls the same frame already recorded, and each owns every cell of
 its own box (`notify::draw_box` clears first). a click on one is
 therefore a click on something the user cannot see, the same as under
-a covering tier, and resolves to `Act::Nothing` instead of reaching
-the row or control underneath. without this a toast over a song list
-selected whichever song it was hiding.
+a covering tier, so it never reaches the row or control underneath
+(without this a toast over a song list selected whichever song it was
+hiding). `main` handles it before `hit::act` is asked: the click
+dismisses that toast.
+
+a click on the help overlay closes it (it is read-only); the menus that
+hold a selection still swallow the click.
 
 the wheel still passes through, by the same split the help overlay
 uses: a notch acts on no particular row, so a toast appearing
