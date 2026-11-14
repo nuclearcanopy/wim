@@ -51,9 +51,10 @@ answers, and only one of them is true.
 | dedicated interactive view / printed by one-shot | `view(lyrics)` |
 | printed by shellswim / opens its editor interactively | `view(keybinds)` |
 | printed settings snapshot | `view(settings)` |
+| printed equalizer snapshot | `view(eq)` |
 | printed undo history | `view(undo)` |
 | printed by shellswim | `view(now)` |
-| declined, naming wim | `view(eq)`, `view(starred)`, `view(suggestions)` |
+| declined, naming wim | `view(starred)`, `view(suggestions)` |
 | declined, naming a command that works | `up()`/`down()`/`top()`/`bottom()`, `go()` on a browse row, opening an album's page |
 
 the first row is not a shellswim decision: `ViewTarget::is_screen()`
