@@ -430,6 +430,31 @@ pub fn test_navidrome_connectivity(
     })
 }
 
+/// What `spawn_connectivity_check` answers: the status of each server,
+/// keyed by url so the answer still lines up if the profile list changed
+/// while the checks ran.
+pub type ConnectivityReport = Vec<(String, Option<crate::navmanager::ConnectionStatus>)>;
+
+/// `test_navidrome_connectivity` off the caller's thread, for opening the
+/// profile manager without waiting out a dead server's connect timeout.
+pub fn spawn_connectivity_check(
+    servers: Vec<config::NavidromeConfig>,
+    live: Vec<Arc<subsonic::Client>>,
+) -> std::sync::mpsc::Receiver<ConnectivityReport> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let statuses = test_navidrome_connectivity(&servers, &live);
+        let _ = tx.send(
+            servers
+                .into_iter()
+                .map(|server| server.url)
+                .zip(statuses)
+                .collect(),
+        );
+    });
+    rx
+}
+
 fn is_authentication_failure(error: &anyhow::Error) -> bool {
     is_authentication_message(&error.to_string())
 }

@@ -5,8 +5,8 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use wim::catalog::{
-    edit_servers, finish_navidrome_index, is_authentication_message, spawn_navidrome_index,
-    test_navidrome_connectivity, FetchedCatalog,
+    edit_servers, finish_navidrome_index, is_authentication_message, spawn_connectivity_check,
+    spawn_navidrome_index, FetchedCatalog,
 };
 use wim::config;
 use wim::navmanager::{ConnectionStatus, NavManager, NavManagerStep};
@@ -105,25 +105,62 @@ pub fn poll(host: &mut Host, mut nm: Option<&mut NavManager>) {
     }
 }
 
+const CHECKING_SERVERS: &str = "checking servers…";
+
+/// Opens at once; each server's status arrives from `poll_connectivity`,
+/// so a dead server cannot hold the prompt for its connect timeout.
 pub fn open(host: &mut Host) -> NavManager {
     let mut nm = NavManager::new();
-    nm.connection_status = test_navidrome_connectivity(
-        &host.cfg.navidrome_servers,
-        &host.app.corpus.remote_clients(),
-    );
-    for (nav, status) in host.cfg.navidrome_servers.iter().zip(&nm.connection_status) {
+    nm.connection_status = vec![None; host.cfg.navidrome_servers.len()];
+    if !host.cfg.navidrome_servers.is_empty() {
+        nm.message = CHECKING_SERVERS.into();
+        host.pending_connectivity = Some(spawn_connectivity_check(
+            host.cfg.navidrome_servers.clone(),
+            host.app.corpus.remote_clients(),
+        ));
+    }
+    nm
+}
+
+/// Folds a finished connectivity check into the manager, if one is open.
+pub fn poll_connectivity(host: &mut Host, nm: Option<&mut NavManager>) {
+    let Some(rx) = &host.pending_connectivity else {
+        return;
+    };
+    let outcome = match rx.try_recv() {
+        Err(TryRecvError::Empty) => return,
+        outcome => outcome,
+    };
+    host.pending_connectivity = None;
+    let Ok(report) = outcome else { return };
+    for (url, status) in &report {
         match status {
             Some(ConnectionStatus::Unreachable) => host
                 .notifications
-                .push(Severity::Alert, format!("{} is unreachable", nav.url)),
+                .push(Severity::Alert, format!("{url} is unreachable")),
             Some(ConnectionStatus::ConfigurationIssue) => host.notifications.push(
                 Severity::Alert,
-                format!("{} has a configuration/credential problem", nav.url),
+                format!("{url} has a configuration/credential problem"),
             ),
             Some(ConnectionStatus::Online) | None => {}
         }
     }
-    nm
+    let Some(nm) = nm else { return };
+    nm.connection_status
+        .resize(host.cfg.navidrome_servers.len(), None);
+    for (url, status) in report {
+        if let Some(index) = host
+            .cfg
+            .navidrome_servers
+            .iter()
+            .position(|server| server.url == url)
+        {
+            nm.connection_status[index] = status;
+        }
+    }
+    if nm.message == CHECKING_SERVERS {
+        nm.message.clear();
+    }
 }
 
 pub fn paste(nm: &mut NavManager, text: &str) -> bool {

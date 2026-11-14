@@ -307,6 +307,7 @@ pub struct Host {
     pub notifications: Notifications,
     /// A server being added or reconnected, answering off the ui thread.
     pub pending_connect: Option<crate::nav_ui::PendingConnect>,
+    pub pending_connectivity: Option<std::sync::mpsc::Receiver<wim::catalog::ConnectivityReport>>,
     mpv_exit_reported: bool,
     _instance_lock: Option<std::fs::File>,
     seen_reply_timeouts: u64,
@@ -550,6 +551,7 @@ impl Host {
             download_rx,
             downloading: HashSet::new(),
             pending_connect: None,
+            pending_connectivity: None,
             mpv_exit_reported: false,
             seen_reply_timeouts: wim::mpv::reply_timeouts(),
             last_reconcile: Instant::now(),

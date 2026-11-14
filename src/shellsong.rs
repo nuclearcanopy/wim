@@ -4714,7 +4714,7 @@ impl Ranker {
             .map(|(name, s)| format!("{}\t{}\t{}", s.uses, s.last, name))
             .collect::<Vec<_>>()
             .join("\n");
-        let _ = fs::write(path, body);
+        let _ = crate::fsutil::atomic_write(&path, body.as_bytes());
     }
 }
 
@@ -4861,7 +4861,7 @@ fn save_history(history: &[String]) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(path, history.join("\n"));
+    let _ = crate::fsutil::atomic_write(&path, history.join("\n").as_bytes());
 }
 
 /// Console text includes lyrics, tags and server messages, and one-shot

@@ -23,8 +23,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui_image::StatefulImage;
 
 use wim::catalog::{
-    edit_servers, merge_catalog_into_app, spawn_background_sync, test_navidrome_connectivity,
-    BackgroundSyncResult,
+    edit_servers, merge_catalog_into_app, spawn_background_sync, BackgroundSyncResult,
 };
 use wim::core::{
     append_resolved, apply_eq_row, apply_op, browse_session, dispatch_action, download_resolved,
@@ -825,6 +824,41 @@ fn empty_suggestions_reason(app: &app::App) -> String {
 /// there's nothing to show; a blank screen with no explanation is a
 /// dead end, never the right default.
 const AUTOSAVE_EVERY: Duration = Duration::from_secs(60);
+const CHECKING_SERVERS: &str = "checking servers…";
+
+/// Folds a finished connectivity check into the open manager (matched by
+/// url, so a profile added or removed meanwhile cannot shift the rows) and
+/// says which servers are unhealthy.
+fn apply_connectivity(
+    report: wim::catalog::ConnectivityReport,
+    servers: &[wim::config::NavidromeConfig],
+    manager: Option<&mut NavManager>,
+    notifications: &mut Notifications,
+) {
+    use wim::navmanager::ConnectionStatus;
+    for (url, status) in &report {
+        match status {
+            Some(ConnectionStatus::Unreachable) => {
+                notifications.push(Severity::Alert, format!("{url} is unreachable"))
+            }
+            Some(ConnectionStatus::ConfigurationIssue) => notifications.push(
+                Severity::Alert,
+                format!("{url} has a configuration/credential problem"),
+            ),
+            Some(ConnectionStatus::Online) | None => {}
+        }
+    }
+    let Some(nm) = manager else { return };
+    nm.connection_status.resize(servers.len(), None);
+    for (url, status) in report {
+        if let Some(index) = servers.iter().position(|server| server.url == url) {
+            nm.connection_status[index] = status;
+        }
+    }
+    if nm.message == CHECKING_SERVERS {
+        nm.message.clear();
+    }
+}
 
 /// An add/reconnect of a Navidrome server running off the ui thread.
 struct PendingConnect {
@@ -1541,6 +1575,7 @@ fn main() -> anyhow::Result<()> {
     let mut first_frame_drawn = false;
     let mut queue_restored = false;
     let mut pending_connect: Option<PendingConnect> = None;
+    let mut connectivity_rx: Option<mpsc::Receiver<wim::catalog::ConnectivityReport>> = None;
     let mut mpv_exit_reported = false;
     let mut last_autosave = Instant::now();
     let mut last_reconcile = Instant::now();
@@ -3734,6 +3769,22 @@ fn main() -> anyhow::Result<()> {
             core.undo.plant(root, now);
         }
 
+        if let Some(rx) = &connectivity_rx {
+            match rx.try_recv() {
+                Err(TryRecvError::Empty) => {}
+                outcome => {
+                    connectivity_rx = None;
+                    if let Ok(report) = outcome {
+                        apply_connectivity(
+                            report,
+                            &cfg.navidrome_servers,
+                            nav_manager.as_mut(),
+                            &mut notifications,
+                        );
+                    }
+                }
+            }
+        }
         // a server being added/reconnected answers off the ui thread
         if let Some(pending) = &pending_connect {
             match pending.rx.try_recv() {
@@ -6695,23 +6746,16 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if key.code == keymap.get(KeyAction::OpenNavManager) {
+                    // opens at once; each server's status fills in when its
+                    // check answers, so a dead server cannot hold the ui
                     let mut nm = NavManager::new();
-                    nm.connection_status = test_navidrome_connectivity(
-                        &cfg.navidrome_servers,
-                        &app.corpus.remote_clients(),
-                    );
-                    for (nav, result) in cfg.navidrome_servers.iter().zip(&nm.connection_status) {
-                        match result {
-                            Some(wim::navmanager::ConnectionStatus::Unreachable) => notifications
-                                .push(Severity::Alert, format!("{} is unreachable", nav.url)),
-                            Some(wim::navmanager::ConnectionStatus::ConfigurationIssue) => {
-                                notifications.push(
-                                    Severity::Alert,
-                                    format!("{} has a configuration/credential problem", nav.url),
-                                )
-                            }
-                            Some(wim::navmanager::ConnectionStatus::Online) | None => {}
-                        }
+                    nm.connection_status = vec![None; cfg.navidrome_servers.len()];
+                    if !cfg.navidrome_servers.is_empty() {
+                        nm.message = CHECKING_SERVERS.into();
+                        connectivity_rx = Some(wim::catalog::spawn_connectivity_check(
+                            cfg.navidrome_servers.clone(),
+                            app.corpus.remote_clients(),
+                        ));
                     }
                     nav_manager = Some(nm);
                     continue;
@@ -8020,5 +8064,43 @@ mod clean_paste_tests {
         assert_eq!(clean_paste("  hunter2\r\n"), "hunter2");
         assert_eq!(clean_paste("a\x1bb"), "ab");
         assert_eq!(clean_paste("my pass word"), "my pass word");
+    }
+}
+
+#[cfg(test)]
+mod connectivity_report_tests {
+    use super::*;
+    use wim::config::NavidromeConfig;
+    use wim::navmanager::ConnectionStatus;
+
+    fn server(url: &str) -> NavidromeConfig {
+        NavidromeConfig {
+            url: url.into(),
+            username: "u".into(),
+            password: Some("p".into()),
+            password_file: None,
+            max_bitrate_kbps: None,
+            transcode_format: None,
+        }
+    }
+
+    #[test]
+    fn statuses_follow_the_url_not_the_position_when_the_list_changed() {
+        // checked as [a, b], but a was removed while the checks ran
+        let report = vec![
+            ("http://a".to_string(), Some(ConnectionStatus::Online)),
+            ("http://b".to_string(), Some(ConnectionStatus::Unreachable)),
+        ];
+        let servers = [server("http://b")];
+        let mut nm = NavManager::new();
+        nm.message = CHECKING_SERVERS.into();
+        let mut notifications = Notifications::default();
+        apply_connectivity(report, &servers, Some(&mut nm), &mut notifications);
+        assert_eq!(
+            nm.connection_status,
+            vec![Some(ConnectionStatus::Unreachable)]
+        );
+        assert!(nm.message.is_empty());
+        assert_eq!(notifications.history().count(), 1);
     }
 }

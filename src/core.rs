@@ -1247,7 +1247,7 @@ pub fn fire_subtitle_fetch(
             }
         };
         let sidecar = SubtitleReady::sidecar(&video);
-        if let Err(e) = std::fs::write(&sidecar, bytes) {
+        if let Err(e) = crate::fsutil::atomic_write_beside(&sidecar, &bytes) {
             let _ = subtitle_tx.send(failed(format!("couldn't write {}: {e}", sidecar.display())));
             return;
         }
