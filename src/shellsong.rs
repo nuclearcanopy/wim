@@ -3942,7 +3942,7 @@ impl Console {
         }
         self.lines.push(Line {
             kind,
-            text: text.into(),
+            text: strip_control(text.into()),
         });
         if self.lines.len() > MAX_SCROLLBACK {
             let overflow = self.lines.len() - MAX_SCROLLBACK;
@@ -4858,6 +4858,39 @@ fn save_history(history: &[String]) {
         let _ = fs::create_dir_all(parent);
     }
     let _ = fs::write(path, history.join("\n"));
+}
+
+/// Console text includes lyrics, tags and server messages, and one-shot
+/// mode prints it raw to the user's terminal; an embedded ESC would run
+/// as an escape sequence (title, clipboard, cursor). Keeps newline and
+/// tab, drops every other control character.
+fn strip_control(text: String) -> String {
+    if !text
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return text;
+    }
+    text.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect()
+}
+
+#[cfg(test)]
+mod strip_control_tests {
+    use super::*;
+
+    #[test]
+    fn escape_sequences_lose_their_escape_byte() {
+        let mut console = Console::default();
+        console.note("a\x1b]52;c;ZXZpbA==\x07b\u{9b}31m");
+        assert!(!console.lines[0].text.contains(['\x1b', '\x07', '\u{9b}']));
+    }
+
+    #[test]
+    fn ordinary_text_is_untouched() {
+        assert_eq!(strip_control("héllo\tworld ✓".into()), "héllo\tworld ✓");
+    }
 }
 
 #[cfg(test)]
