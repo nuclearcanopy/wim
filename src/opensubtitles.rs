@@ -6,12 +6,13 @@
 //! general knowledge, not verified against live docs in this sandbox
 //! (no network access here beyond what's already configured).
 
-use std::io::Read;
 
 use serde::Deserialize;
 
 const BASE_URL: &str = "https://api.opensubtitles.com/api/v1";
 const USER_AGENT: &str = "wim v0.1.0";
+const JSON_LIMIT: u64 = 2 << 20;
+const SUBTITLE_LIMIT: u64 = 5 << 20;
 
 pub struct Client {
     api_key: String,
@@ -69,14 +70,14 @@ impl Client {
     /// one) plus a preferred language code (e.g. "en"). Best match is
     /// whichever the api sorts first; not re-ranked locally.
     pub fn search(&self, title: &str, language: &str) -> anyhow::Result<Vec<SubtitleResult>> {
-        let resp: SearchResponse = self
+        let resp = self
             .agent
             .get(&format!("{BASE_URL}/subtitles"))
             .set("Api-Key", &self.api_key)
             .query("query", title)
             .query("languages", language)
-            .call()?
-            .into_json()?;
+            .call()?;
+        let resp: SearchResponse = crate::safenet::json_capped(resp, JSON_LIMIT)?;
         Ok(resp
             .data
             .into_iter()
@@ -95,18 +96,17 @@ impl Client {
     /// against the account the api key belongs to) and fetches the
     /// subtitle file's raw bytes from it.
     pub fn download(&self, file_id: u64) -> anyhow::Result<Vec<u8>> {
-        let resp: DownloadResponse = self
+        let resp = self
             .agent
             .post(&format!("{BASE_URL}/download"))
             .set("Api-Key", &self.api_key)
-            .send_json(ureq::json!({ "file_id": file_id }))?
-            .into_json()?;
-        let mut bytes = Vec::new();
-        self.agent
+            .send_json(ureq::json!({ "file_id": file_id }))?;
+        let resp: DownloadResponse = crate::safenet::json_capped(resp, JSON_LIMIT)?;
+        // the link is server-supplied: https, public addresses, capped
+        let file = crate::safenet::public_https_agent(USER_AGENT)
             .get(&resp.link)
-            .call()?
-            .into_reader()
-            .read_to_end(&mut bytes)?;
-        Ok(bytes)
+            .call()
+            .map_err(|e| crate::subsonic::request_failed("subtitle download", e))?;
+        crate::safenet::bytes_capped(file, SUBTITLE_LIMIT)
     }
 }

@@ -462,10 +462,8 @@ impl Client {
         for (k, v) in extra {
             req = req.query(k, v);
         }
-        let body: SubsonicEnvelope = req
-            .call()
-            .map_err(|e| request_failed(endpoint, e))?
-            .into_json()?;
+        let response = req.call().map_err(|e| request_failed(endpoint, e))?;
+        let body: SubsonicEnvelope = crate::safenet::json_capped(response, 256 << 20)?;
         if body.subsonic_response.status != "ok" {
             let msg = body
                 .subsonic_response

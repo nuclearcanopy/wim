@@ -131,7 +131,7 @@ impl Client {
             request = request.query(key, value);
         }
         let response = request.call().map_err(|e| api_error(endpoint, e))?;
-        Ok(response.into_json()?)
+        crate::safenet::json_capped(response, 16 << 20)
     }
 
     fn post<T: DeserializeOwned>(&self, endpoint: &str, body: &serde_json::Value) -> Result<T> {
@@ -142,7 +142,7 @@ impl Client {
             .set("Authorization", &format!("Bearer {}", self.token.0))
             .send_json(body)
             .map_err(|e| api_error(endpoint, e))?;
-        Ok(response.into_json()?)
+        crate::safenet::json_capped(response, 16 << 20)
     }
 
     fn post_form<T: DeserializeOwned>(&self, endpoint: &str, fields: &[(&str, &str)]) -> Result<T> {
@@ -163,7 +163,7 @@ impl Client {
             )
             .send_bytes(&body)
             .map_err(|e| api_error(endpoint, e))?;
-        Ok(response.into_json()?)
+        crate::safenet::json_capped(response, 16 << 20)
     }
 
     /// Fetch the user's torrent list. TorBox caches this response, so callers
