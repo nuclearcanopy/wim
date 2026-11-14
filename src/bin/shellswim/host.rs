@@ -285,6 +285,21 @@ fn place_submitted_program(
     }
 }
 
+/// The mpv configuration `Host::start` collects instead of applying,
+/// so the prompt never waits for mpv's socket.
+struct PlayerSetup {
+    commands: Vec<Vec<serde_json::Value>>,
+    proxy_index: Option<usize>,
+    replaygain_index: usize,
+}
+
+/// What the background setup learned, as plain data for the UI thread.
+pub struct PlayerSetupResult {
+    pub warnings: Vec<String>,
+    pub proxy_ready: bool,
+    pub observe_error: Option<String>,
+}
+
 pub struct Host {
     pub cfg: config::Config,
     pub player: mpv::Mpv,
@@ -293,6 +308,9 @@ pub struct Host {
     pub play_queue: PlayQueue,
     pub previous_track: Option<SearchItem>,
     pub cache_index: Arc<Mutex<cache::CacheIndex>>,
+    startup_cache: Option<Receiver<cache::CacheIndex>>,
+    warming_corpus: Option<search::WarmingCorpus>,
+    cached_entries: Option<search::CachedEntries>,
     pub download_tx: Sender<DownloadEvent>,
     pub download_rx: Receiver<DownloadEvent>,
     pub downloading: HashSet<String>,
@@ -319,6 +337,7 @@ pub struct Host {
     /// Kept alive for the player's lifetime; dropping it stops the relay.
     pub _media_proxy: Option<wim::media_proxy::MediaProxy>,
     pub proxy_ready: bool,
+    player_setup: Option<PlayerSetup>,
     pub base_volume: f64,
     pub crossfade_enabled: bool,
     pub between_tracks: BetweenTracks,
@@ -363,6 +382,10 @@ impl Host {
         let first_run = !config::config_path()?.exists();
         let cfg = config::load_or_init()?;
         wim::trace_mark!("config loaded");
+        let startup_cache = Some(cache::spawn_startup(
+            cfg.offline_cache_max_bytes,
+            Some(cfg.cache_eviction_days),
+        ));
 
         // `rescan()` replaces this channel wholesale: the scan thread
         // signs off by dropping its sender, so a finished one cannot
@@ -371,7 +394,7 @@ impl Host {
         library::spawn_scan(cfg.library_paths.clone(), scan_tx);
         // last session's catalog, off disk, so the first prompt can
         // already complete track names.
-        let warming = search::spawn_warm_from_cache(&cfg.navidrome_servers);
+        let warming_corpus = Some(search::spawn_warm_from_cache(&cfg.navidrome_servers));
         let (sync_tx, sync_rx) = mpsc::channel::<BackgroundSyncResult>();
         let (servers_tx, servers_rx) = mpsc::channel();
         catalog::spawn_background_sync(cfg.navidrome_servers.clone(), sync_tx, servers_rx);
@@ -381,10 +404,13 @@ impl Host {
         // prompt no longer waits for it: `observe_playback` happens
         // after the first frame, in `main`.
         let player = mpv::Mpv::spawn()?;
-        let buffer_warning = player
-            .set_buffer_ahead(cfg.buffer_ahead_secs)
-            .err()
-            .map(|error| format!("buffer_ahead_secs could not be applied: {error}"));
+        // Everything below is sent to mpv as one ordered batch after the
+        // first frame (`begin_player_setup`), never waited on here.
+        let mut setup_commands = vec![vec![
+            serde_json::json!("set_property"),
+            serde_json::json!("demuxer-readahead-secs"),
+            serde_json::json!(cfg.buffer_ahead_secs.max(1.0)),
+        ]];
         // every network stream goes through the same address-pinning
         // relay wim uses; only configured Navidrome origins may resolve
         // to private addresses. Failing closed beats streaming unpinned.
@@ -394,22 +420,35 @@ impl Host {
             .map(|server| server.url.clone())
             .collect::<Vec<_>>();
         let media_proxy = wim::media_proxy::MediaProxy::start(&trusted_origins).ok();
-        let proxy_error = match &media_proxy {
-            Some(proxy) => player
-                .set_property("http-proxy", serde_json::json!(proxy.proxy_url()))
-                .err()
-                .map(|error| format!("secure media relay could not be applied: {error}")),
-            None => {
-                Some("secure media relay is unavailable; online Watch sources are disabled".into())
+        let (proxy_index, proxy_unavailable) = match &media_proxy {
+            Some(proxy) => {
+                setup_commands.push(vec![
+                    serde_json::json!("set_property"),
+                    serde_json::json!("http-proxy"),
+                    serde_json::json!(proxy.proxy_url()),
+                ]);
+                (Some(setup_commands.len() - 1), None)
             }
+            None => (
+                None,
+                Some(String::from(
+                    "secure media relay is unavailable; online Watch sources are disabled",
+                )),
+            ),
         };
-        player.set_replaygain("track")?;
-        player.set_subtitle_style(&cfg.subtitles);
+        let replaygain_index = setup_commands.len();
+        setup_commands.push(vec![
+            serde_json::json!("set_property"),
+            serde_json::json!("replaygain"),
+            serde_json::json!("track"),
+        ]);
+        setup_commands.extend(mpv::Mpv::subtitle_style_commands(&cfg.subtitles));
         wim::trace_mark!("mpv forked");
 
-        let mut app = app::App::new(warming.take());
+        let mut app = app::App::new(search::Corpus::new());
         app.scanning_library = true;
         app.syncing_servers = !cfg.navidrome_servers.is_empty();
+        app.loading_cached_catalog = !cfg.navidrome_servers.is_empty();
         let restored_eq = wim::eq::restore(
             cfg.eq_preset.as_deref(),
             cfg.eq_gains,
@@ -421,12 +460,16 @@ impl Host {
         if let Some(wim::eq::Source::Builtin(index)) = restored_eq.source {
             app.eq_preset = index;
         }
-        let _ = player.set_af(&wim::eq::build_player_af_filter(
-            &app.eq_gains,
-            cfg.eq_enabled,
-            cfg.visualizer_bands as usize,
-        ));
-        wim::trace_mark!("corpus warmed from cache");
+        // applied with the rest of the player setup, off the first frame
+        setup_commands.push(vec![
+            serde_json::json!("set_property"),
+            serde_json::json!("af"),
+            serde_json::json!(wim::eq::build_player_af_filter(
+                &app.eq_gains,
+                cfg.eq_enabled,
+                cfg.visualizer_bands as usize,
+            )),
+        ]);
 
         let (download_tx, download_rx) = mpsc::channel();
         let (subtitle_tx, subtitle_rx) = mpsc::channel();
@@ -463,16 +506,10 @@ impl Host {
                 ),
             );
         }
-        if let Some(warning) = buffer_warning {
+        if let Some(warning) = proxy_unavailable {
             notifications.push(Severity::Alert, warning);
         }
-        if let Some(warning) = proxy_error.as_ref() {
-            notifications.push(Severity::Alert, warning.clone());
-        }
-        let proxy_ready = media_proxy.is_some() && proxy_error.is_none();
-        let cache_index = Arc::new(Mutex::new(cache::CacheIndex::load()));
-        core::sweep_cache(&cache_index, cfg.cache_eviction_days);
-        cache::initialize_budget(cfg.offline_cache_max_bytes);
+        let cache_index = Arc::new(Mutex::new(cache::CacheIndex::default()));
         Ok(Host {
             cfg,
             player,
@@ -481,6 +518,9 @@ impl Host {
             play_queue: PlayQueue::default(),
             previous_track: None,
             cache_index,
+            startup_cache,
+            warming_corpus,
+            cached_entries: None,
             download_tx,
             download_rx,
             downloading: HashSet::new(),
@@ -508,7 +548,12 @@ impl Host {
             star_tx,
             star_rx,
             _media_proxy: media_proxy,
-            proxy_ready,
+            proxy_ready: false,
+            player_setup: Some(PlayerSetup {
+                commands: setup_commands,
+                proxy_index,
+                replaygain_index,
+            }),
             base_volume,
             crossfade_enabled,
             between_tracks: BetweenTracks::new(gap_at_start),
@@ -534,6 +579,157 @@ impl Host {
             torbox_rx,
             torbox_pending: false,
         })
+    }
+
+    fn setup_outcome(
+        plan: &PlayerSetup,
+        results: &[anyhow::Result<serde_json::Value>],
+    ) -> PlayerSetupResult {
+        let mut warnings = Vec::new();
+        if let Some(Err(error)) = results.first() {
+            warnings.push(format!("buffer_ahead_secs could not be applied: {error}"));
+        }
+        let proxy_ready = plan
+            .proxy_index
+            .and_then(|index| results.get(index))
+            .is_some_and(Result::is_ok);
+        if plan.proxy_index.is_some() && !proxy_ready {
+            warnings.push("secure media relay could not be applied".into());
+        }
+        if let Some(Err(error)) = results.get(plan.replaygain_index) {
+            warnings.push(format!("replaygain could not be applied: {error}"));
+        }
+        PlayerSetupResult {
+            warnings,
+            proxy_ready,
+            observe_error: None,
+        }
+    }
+
+    /// Sends the collected mpv configuration, then registers the property
+    /// observers, on a worker; the answer is `finish_player_setup`'s input.
+    pub fn begin_player_setup(&mut self) -> Receiver<PlayerSetupResult> {
+        let plan = self.player_setup.take().expect("player setup runs once");
+        self.player.run_background(move |client| {
+            let results = client.command_batch(&plan.commands);
+            let mut outcome = Self::setup_outcome(&plan, &results);
+            outcome.observe_error = client.observe_playback().err().map(|e| e.to_string());
+            outcome
+        })
+    }
+
+    pub fn finish_player_setup(&mut self, outcome: PlayerSetupResult) {
+        self.proxy_ready = outcome.proxy_ready;
+        for warning in outcome.warnings {
+            self.notifications.push(Severity::Alert, warning);
+        }
+        if let Some(error) = outcome.observe_error {
+            self.console.error = Some(format!("mpv will not report playback position: {error}"));
+        }
+    }
+
+    /// One-shots have no prompt to keep responsive: configure mpv now.
+    pub fn apply_player_setup_blocking(&mut self) {
+        if let Some(plan) = self.player_setup.take() {
+            let results = self.player.command_batch(&plan.commands);
+            let outcome = Self::setup_outcome(&plan, &results);
+            self.finish_player_setup(outcome);
+        }
+    }
+
+    pub fn poll_startup_cache(&mut self) -> anyhow::Result<bool> {
+        let Some(rx) = &self.startup_cache else {
+            return Ok(true);
+        };
+        match rx.try_recv() {
+            Ok(index) => {
+                *self.cache_index.lock().expect("cache mutex poisoned") = index;
+                self.startup_cache = None;
+                wim::trace_mark!("playback cache ready");
+                Ok(true)
+            }
+            Err(TryRecvError::Empty) => Ok(false),
+            Err(TryRecvError::Disconnected) => anyhow::bail!("playback cache startup failed"),
+        }
+    }
+
+    pub fn wait_startup_cache(&mut self) -> anyhow::Result<()> {
+        if let Some(rx) = self.startup_cache.take() {
+            let index = rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("playback cache startup failed"))?;
+            *self.cache_index.lock().expect("cache mutex poisoned") = index;
+        }
+        Ok(())
+    }
+
+    /// One-shots have no prompt to show while a catalog warms, and must
+    /// search the same cached library they did before startup was split.
+    pub fn wait_startup_catalog(&mut self) {
+        if let Some(warming) = self.warming_corpus.take() {
+            let mut cached = warming.take().into_cached_entries();
+            self.app
+                .corpus
+                .merge_cached_batch(&mut cached, usize::MAX, |client| {
+                    self.cfg
+                        .navidrome_servers
+                        .iter()
+                        .any(|nav| client.matches(nav))
+                });
+            self.app.resync_results();
+        }
+        self.app.loading_cached_catalog = false;
+    }
+
+    /// Warmed catalogs and local scans do not depend on mpv becoming ready.
+    pub fn pump_library(&mut self) {
+        if self
+            .warming_corpus
+            .as_ref()
+            .is_some_and(|warm| warm.is_finished())
+        {
+            self.cached_entries = self
+                .warming_corpus
+                .take()
+                .map(|warm| warm.take().into_cached_entries());
+        }
+        let mut changed = false;
+        if let Some(cached) = &mut self.cached_entries {
+            changed |= self.app.corpus.merge_cached_batch(
+                cached,
+                search::CACHED_ROWS_PER_FRAME,
+                |client| {
+                    self.cfg
+                        .navidrome_servers
+                        .iter()
+                        .any(|nav| client.matches(nav))
+                },
+            ) > 0;
+            if cached.is_empty() {
+                self.cached_entries = None;
+                self.app.loading_cached_catalog = false;
+            }
+        }
+        for _ in 0..8 {
+            match self.scan_rx.try_recv() {
+                Ok(batch) => {
+                    self.app.corpus.add_local_tracks(batch);
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.app.scanning_library = false;
+                    break;
+                }
+            }
+        }
+        if changed {
+            self.app.resync_results();
+        }
+    }
+
+    pub fn has_cached_rows_pending(&self) -> bool {
+        self.cached_entries.is_some()
     }
 
     /// The terminal's width, asked for when something is about to be
@@ -797,7 +993,16 @@ impl Host {
         // a settled search prints what it found. shellswim has no
         // sidebar, so `search(x)` used to answer with a count and
         // nothing else, which is no answer at all.
-        if self.swim.echo_results && self.settle.settled(self.start.elapsed()) {
+        // Local and cached results are final once loading finishes; a
+        // slow server's matches follow through the "...and from the
+        // servers" lines below rather than holding these back.
+        let local_ready = !self.app.scanning_library && !self.app.loading_cached_catalog;
+        // one-shots keep waiting for the settle window so a script's
+        // output is complete; only the interactive prompt echoes early
+        if self.swim.echo_results
+            && ((self.interactive_prompt && local_ready)
+                || self.settle.settled(self.start.elapsed()))
+        {
             self.swim.echo_results = false;
             let mut shown = HashSet::new();
             let lines = core::echo_lines(self.app.results(), &mut shown, self.console_width());
@@ -931,30 +1136,8 @@ impl Host {
             }
         }
 
-        let mut scanned = 0;
-        loop {
-            match self.scan_rx.try_recv() {
-                Ok(batch) => {
-                    self.app.corpus.add_local_tracks(batch);
-                    scanned += 1;
-                }
-                Err(TryRecvError::Empty) => break,
-                // the scan thread signing off is what clears
-                // "scanning"; it drops its sender when it is done.
-                Err(TryRecvError::Disconnected) => {
-                    self.app.scanning_library = false;
-                    break;
-                }
-            }
-        }
-        if scanned > 0 {
-            // deliberately does *not* settle: a local scan batch is
-            // not an answer to the remote query the window is waiting
-            // on, and clearing it here let a program proceed while the
-            // search was still outstanding. wim never did this, so the
-            // two front-ends now agree.
-            self.app.resync_results();
-        }
+        // A local batch does not settle a pending remote search.
+        self.pump_library();
         while let Ok(sync) = self.sync_rx.try_recv() {
             self.app.syncing_servers = false;
             match sync.result {
