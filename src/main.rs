@@ -1170,6 +1170,7 @@ fn main() -> anyhow::Result<()> {
     let mut keybinds_menu_selected: usize = 0;
     let mut capturing_key = false;
     let mut keybind_refusal: Option<String> = None;
+    let mut keybind_reset_armed = false;
     // left/right cycles through ui::banner::LOGOS while the workspace
     // has focus and the banner is what's showing; '0' resets to the
     // default (index 0, ANSI Shadow). Restored from config by name,
@@ -1526,6 +1527,10 @@ fn main() -> anyhow::Result<()> {
     // a thread, applied whenever it answers, so the first frame never
     // waits on a compositor. 60hz until then.
     let frame_rx = anim::spawn_probe();
+    wim::anim::set_reduced_motion(
+        cfg.reduced_motion
+            || std::env::var_os("WIM_REDUCED_MOTION").is_some_and(|v| !v.is_empty() && v != "0"),
+    );
     let mut frame = anim::FrameBudget::default();
     // Startup playback and queue restoration complete asynchronously.
     let mut first_frame_drawn = false;
@@ -3638,16 +3643,22 @@ fn main() -> anyhow::Result<()> {
         // moving, a long idle sleep otherwise. a static screen (no
         // selection pulse, no blinking cursor, nothing playing) must
         // not redraw at 60fps just because the display could.
-        let selection_pulsing = match focus {
-            Focus::Sidebar => app.has_results(),
-            // every list the workspace can hold, not just the browse
-            // view: the suggestions menu and the queue view both plate
-            // a selected row, and leaving them out dropped their pulse
-            // to the 100ms idle poll, a tenth of the display rate.
-            Focus::Workspace => browse_view.is_some() || suggestions.is_some() || queue_view_open,
-            Focus::BottomBar => false,
-        };
-        let banner_showing = now_playing.is_none() && browse_view.is_none() && !lyrics.is_open();
+        let selection_pulsing = !wim::anim::reduced_motion()
+            && match focus {
+                Focus::Sidebar => app.has_results(),
+                // every list the workspace can hold, not just the browse
+                // view: the suggestions menu and the queue view both plate
+                // a selected row, and leaving them out dropped their pulse
+                // to the 100ms idle poll, a tenth of the display rate.
+                Focus::Workspace => {
+                    browse_view.is_some() || suggestions.is_some() || queue_view_open
+                }
+                Focus::BottomBar => false,
+            };
+        let banner_showing = now_playing.is_none()
+            && browse_view.is_none()
+            && !lyrics.is_open()
+            && !wim::anim::reduced_motion();
         let animating_beyond_banner = !tiers.static_modal()
             && (selection_pulsing
                 || app.editing_query
@@ -6088,6 +6099,12 @@ fn main() -> anyhow::Result<()> {
                         capturing_key = false;
                         continue;
                     }
+                    // resetting everything is one slip away from `r` and `0`,
+                    // so it takes the same second press the profile delete does
+                    let reset_armed = std::mem::take(&mut keybind_reset_armed);
+                    if reset_armed && key.code != KeyCode::Char('R') {
+                        keybind_refusal = None;
+                    }
                     match key.code {
                         KeyCode::Char('K') | KeyCode::Esc => keybinds_menu_open = false,
                         KeyCode::Char('j') | KeyCode::Down => {
@@ -6110,10 +6127,16 @@ fn main() -> anyhow::Result<()> {
                             cfg.keybinds = keymap.overrides();
                             config::save_or_warn(&cfg, &mut notifications);
                         }
-                        KeyCode::Char('R') => {
+                        KeyCode::Char('R') if reset_armed => {
                             keymap.reset_all();
                             cfg.keybinds = keymap.overrides();
                             config::save_or_warn(&cfg, &mut notifications);
+                            keybind_refusal = None;
+                        }
+                        KeyCode::Char('R') => {
+                            keybind_reset_armed = true;
+                            keybind_refusal =
+                                Some("press R again to reset every binding to its default".into());
                         }
                         _ => {}
                     }

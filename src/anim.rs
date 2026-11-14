@@ -12,10 +12,25 @@ use std::time::Duration;
 
 use crate::theme::lerp;
 
+static REDUCED_MOTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns the continuous motion (breathing pulses, the banner's sweep) into
+/// still frames. The config key or `WIM_REDUCED_MOTION=1` set it.
+pub fn set_reduced_motion(on: bool) {
+    REDUCED_MOTION.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn reduced_motion() -> bool {
+    REDUCED_MOTION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 0..1 breathe: 0 at t=0, 0.5 a quarter period in, 1 at the half
 /// period, back to 0 at the full period. Cosine rather than a
 /// triangle so the turnarounds ease instead of snapping.
 pub fn pulse(elapsed: Duration, period: Duration) -> f32 {
+    if reduced_motion() {
+        return 0.5;
+    }
     let period = period.as_secs_f32();
     if period <= 0.0 {
         return 0.0;
@@ -27,6 +42,9 @@ pub fn pulse(elapsed: Duration, period: Duration) -> f32 {
 /// 0..1 sawtooth that wraps every `period`, for anything that travels
 /// one way and restarts (the banner's brightness sweep).
 pub fn phase(elapsed: Duration, period: Duration) -> f32 {
+    if reduced_motion() {
+        return 0.5;
+    }
     let period = period.as_secs_f32();
     if period <= 0.0 {
         return 0.0;

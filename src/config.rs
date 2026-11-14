@@ -227,6 +227,10 @@ pub struct Config {
     /// terminals offer (see the README's config section).
     #[serde(default = "default_mouse")]
     pub mouse: bool,
+    /// Stills the banner sweep and the selection pulse. `WIM_REDUCED_MOTION=1`
+    /// in the environment turns it on regardless of this.
+    #[serde(default)]
+    pub reduced_motion: bool,
     /// How many seconds of a stream mpv keeps buffered ahead of the
     /// position, which is also how much a pause loads: mpv keeps
     /// reading ahead while paused, but its default is 1s (measured on
@@ -686,6 +690,7 @@ impl Default for Config {
             offline_download_bitrate_kbps: default_offline_download_bitrate_kbps(),
             offline_download_format: default_offline_download_format(),
             mouse: default_mouse(),
+            reduced_motion: false,
         }
     }
 }
@@ -828,6 +833,7 @@ const KNOWN_KEYS: &[&str] = &[
     "offline_download_bitrate_kbps",
     "offline_download_format",
     "mouse",
+    "reduced_motion",
 ];
 
 #[cfg(test)]
@@ -1167,6 +1173,7 @@ pasword = "x"
             offline_download_bitrate_kbps: 192,
             offline_download_format: "opus".into(),
             mouse: true,
+            reduced_motion: false,
         };
         let text = toml::to_string_pretty(&full).expect("serializing");
         let table: toml::Table = text.parse().expect("parsing back");
