@@ -404,7 +404,13 @@ static SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 impl Mpv {
     pub fn spawn() -> Result<Self> {
-        let sock_path = std::env::temp_dir().join(format!(
+        // $XDG_RUNTIME_DIR is a private 0700 directory; a predictable name
+        // in shared /tmp lets another local user squat the path.
+        let sock_dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let sock_path = sock_dir.join(format!(
             "wim-mpv-{}-{}.sock",
             std::process::id(),
             SPAWN_SEQ.fetch_add(1, Ordering::SeqCst)

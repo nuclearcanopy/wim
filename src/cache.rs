@@ -351,6 +351,27 @@ pub fn track_path(id: &str, ext: &str) -> Result<PathBuf> {
     Ok(tracks_dir()?.join(format!("{}.{ext}", safe_file_stem(id))))
 }
 
+/// The playback directory sits in shared `/tmp` under a predictable name:
+/// refuse one another user created, and keep ours unreadable by others.
+fn secure_private_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = fs::symlink_metadata(dir).context("cannot inspect playback cache")?;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        anyhow::ensure!(
+            meta.is_dir() && meta.uid() == me,
+            "temporary playback cache is not ours"
+        );
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .context("cannot restrict temporary playback cache")?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 /// A server-supplied id is a file name here, so one holding a path
 /// separator, NUL or a dot-only name must not be able to leave
 /// `tracks/`. Ordinary ids pass through unchanged, so existing cache
@@ -392,6 +413,7 @@ fn playback_path_with_budget(
     let id = format!("wim-playback-{}", std::process::id());
     let dir = std::env::temp_dir().join(id);
     fs::create_dir_all(&dir).context("cannot create temporary playback cache")?;
+    secure_private_dir(&dir)?;
     let dest = dir.join(media_name);
     if dest.is_file() {
         return Ok(dest);
