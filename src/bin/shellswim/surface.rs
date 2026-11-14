@@ -108,7 +108,7 @@ impl Surface for Borrowed<'_> {
                 op_note("keybinds · K opens the editor".to_owned())
             }
             ViewTarget::Undo => self.print_undo(core),
-            ViewTarget::Suggestions => op_fail(no_pane("suggestions", "wim's 'g'")),
+            ViewTarget::Suggestions => self.print_suggestions(core),
             ViewTarget::Starred => op_fail(format!(
                 "{}, but star(...) and view(queue) work here",
                 no_pane("starred", "wim's 'F'")
@@ -136,6 +136,40 @@ impl Surface for Borrowed<'_> {
 }
 
 impl Borrowed<'_> {
+    fn print_suggestions(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
+        let starred = core::suggestion_starred_keys(core.remote_starred, core.favorites);
+        let catalog = wim::suggest::Catalog::from_corpus(&core.app.corpus);
+        let cache = core.cache.lock().expect("cache mutex poisoned");
+        let suggestions = wim::suggest::suggest(&wim::suggest::Request::new(
+            &catalog,
+            &cache,
+            &starred,
+            wim::cache::now_secs(),
+        ));
+        drop(cache);
+        let count = wim::ui::suggestions::count(&suggestions);
+        if count == 0 {
+            let reason = if core.app.corpus.is_empty() {
+                if core.app.scanning_library || core.app.syncing_servers {
+                    "library is still loading; try suggestions again shortly"
+                } else {
+                    "no library yet; configure library_paths or a Navidrome server"
+                }
+            } else {
+                "nothing to suggest yet; suggestions are based on what you play"
+            };
+            return op_fail(reason);
+        }
+        for section in &suggestions.sections {
+            core.console.note(section.reason.title().to_string());
+            for item in &section.items {
+                core.console
+                    .note(format!("  {} — {}", label(&item.item), item.reason_text));
+            }
+        }
+        op_note(format!("{count} suggestions"))
+    }
+
     fn print_eq(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
         let source = core
             .app
