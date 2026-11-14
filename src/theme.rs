@@ -5,6 +5,35 @@
 
 use ratatui::style::Color;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMode {
+    Mono,
+    Semantic,
+}
+
+/// `WIM_COLOR=semantic` enables state hues; `mono` (or `NO_COLOR`) keeps the
+/// original brightness-only palette. Shapes, labels, and glyphs remain the
+/// primary state cues in either mode.
+pub fn color_mode() -> ColorMode {
+    if std::env::var_os("NO_COLOR").is_some()
+        || std::env::var("WIM_COLOR").is_ok_and(|value| value.eq_ignore_ascii_case("mono"))
+    {
+        ColorMode::Mono
+    } else if std::env::var("WIM_COLOR").is_ok_and(|value| value.eq_ignore_ascii_case("semantic")) {
+        ColorMode::Semantic
+    } else {
+        ColorMode::Mono
+    }
+}
+
+pub const ACCENT: Color = Color::Rgb(100, 190, 255);
+pub const PLAYED: Color = Color::Rgb(100, 210, 170);
+pub const BUFFERED: Color = Color::Rgb(105, 165, 230);
+pub const UNPLAYED: Color = Color::Rgb(90, 100, 120);
+pub const SUCCESS: Color = Color::Rgb(105, 210, 135);
+pub const WARNING: Color = Color::Rgb(245, 190, 90);
+pub const ERROR: Color = Color::Rgb(245, 105, 105);
+
 /// `level` in `0.0..=1.0`, where 0 is black and 1 is white.
 pub fn shade(level: f32) -> Color {
     let v = (level.clamp(0.0, 1.0) * 255.0).round() as u8;

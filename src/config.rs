@@ -71,33 +71,6 @@ pub enum AlbumArtMode {
     Off,
 }
 
-/// Which video output mpv is told to draw a fullscreen video with.
-/// `tct` is true-color half-blocks and works in every terminal; `kitty`
-/// is the kitty graphics protocol and needs a terminal that speaks it.
-/// `auto` picks kitty only when the graphics probe actually reported
-/// kitty, because mpv's kitty vo does no detection of its own: pointed
-/// at a terminal that cannot decode it, it emits graphics escapes
-/// anyway. See `video::drawing_vo` and `docs/video.md`.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum VideoOutput {
-    #[default]
-    Auto,
-    Tct,
-    Kitty,
-    /// wim paints the frames itself, as cells, from
-    /// `framesource::FrameSource`; mpv keeps `vo=null` and is only the
-    /// audio clock.
-    ///
-    /// **Explicit only: `Auto` never picks this.** The maintainer
-    /// asked for it that way, and it is the right default anyway,
-    /// since a real protocol beats a cell grid wherever one exists.
-    /// It is for terminals with no image protocol at all, where the
-    /// alternative is no video.
-    Ascii,
-    Off,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Ordered lyrics sources; API keys are referenced by secret files.
@@ -155,6 +128,10 @@ pub struct Config {
     /// A missing path disables speech alignment without affecting playback.
     #[serde(default)]
     pub whisper_model_file: Option<String>,
+    /// Persist the user's default spoiler display preference for Watch.
+    /// Safe-by-default; temporary reveal remains available per session.
+    #[serde(default)]
+    pub watch_reveal_spoilers: bool,
     /// Same plaintext-vs-file split as `NavidromeConfig::password`/
     /// `password_file`, same reason (world-readable nix store paths).
     /// Neither set (the default) means scrobbling never runs; the
@@ -234,6 +211,15 @@ pub struct Config {
     /// space. Also tweakable in the settings menu.
     #[serde(default = "default_cache_eviction_days")]
     pub cache_eviction_days: u64,
+    /// Maximum disk space reserved for offline audio downloads.
+    #[serde(default = "default_offline_cache_max_bytes")]
+    pub offline_cache_max_bytes: u64,
+    /// Bitrate requested for lossy offline downloads.
+    #[serde(default = "default_offline_download_bitrate_kbps")]
+    pub offline_download_bitrate_kbps: u32,
+    /// Codec requested for offline downloads: opus, aac, mp3, or flac.
+    #[serde(default = "default_offline_download_format")]
+    pub offline_download_format: String,
     /// Click to focus a pane or press a control, drag the scrubber,
     /// wheel to scroll a list. On by default, but still a switch:
     /// capture hands the terminal's own click-drag text selection to
@@ -241,21 +227,6 @@ pub struct Config {
     /// terminals offer (see the README's config section).
     #[serde(default = "default_mouse")]
     pub mouse: bool,
-    /// How 'v' (fullscreen video) draws. mpv draws it itself, straight
-    /// to this terminal, and wim stops drawing while it does; nothing
-    /// is rasterized on wim's side. `off` disables the key entirely for
-    /// a terminal where neither output is wanted. Music is never
-    /// affected: only a `LocalVideo` item ever gets a drawing vo.
-    #[serde(default)]
-    pub video_output: VideoOutput,
-    /// Caps the rate `video_output = "ascii"` decodes and paints at.
-    /// Unset means the file's own rate. Only ever lowers it: asking
-    /// for more frames than the file has makes mpv duplicate them, and
-    /// each duplicate costs a full paint to show the same picture.
-    /// For a large cell grid on a slow box, half the file's rate is
-    /// half the work and still watchable.
-    #[serde(default)]
-    pub ascii_fps: Option<f64>,
     /// How many seconds of a stream mpv keeps buffered ahead of the
     /// position, which is also how much a pause loads: mpv keeps
     /// reading ahead while paused, but its default is 1s (measured on
@@ -340,6 +311,16 @@ fn default_cache_eviction_days() -> u64 {
     7
 }
 
+fn default_offline_cache_max_bytes() -> u64 {
+    10 * 1024 * 1024 * 1024
+}
+fn default_offline_download_bitrate_kbps() -> u32 {
+    192
+}
+fn default_offline_download_format() -> String {
+    "opus".into()
+}
+
 /// The fade span every reader agrees on: the range the settings menu
 /// steps through, with a non-finite value (toml parses `nan` and
 /// `inf`, and `Duration::from_secs_f64` aborts on both) falling back
@@ -357,6 +338,21 @@ pub const CROSSFADE_MIN: f64 = 1.0;
 pub const CROSSFADE_MAX: f64 = 15.0;
 
 impl Config {
+    /// A low storage allowance automatically lowers the offline stream cap
+    /// rather than silently evicting almost every completed download. The
+    /// user's configured bitrate remains a ceiling, never a floor.
+    pub fn effective_offline_download_bitrate_kbps(&self) -> u32 {
+        let gib = 1024 * 1024 * 1024u64;
+        let budget_ceiling = if self.offline_cache_max_bytes <= 2 * gib {
+            64
+        } else if self.offline_cache_max_bytes <= 5 * gib {
+            96
+        } else {
+            u32::MAX
+        };
+        self.offline_download_bitrate_kbps.min(budget_ceiling)
+    }
+
     pub fn resolve_lyrics_api_keys(&self) -> HashMap<String, String> {
         self.lyrics
             .api_key_files
@@ -514,6 +510,31 @@ impl Config {
             90,
             &mut w,
         );
+        fix_int(
+            "offline_cache_max_bytes",
+            &mut self.offline_cache_max_bytes,
+            1_073_741_824,
+            100 * 1_073_741_824,
+            &mut w,
+        );
+        if ![64, 96, 128, 192, 256, 320].contains(&self.offline_download_bitrate_kbps) {
+            let old = self.offline_download_bitrate_kbps;
+            self.offline_download_bitrate_kbps = [64u32, 96, 128, 192, 256, 320]
+                .into_iter()
+                .min_by_key(|v| (*v).abs_diff(old))
+                .unwrap_or(192);
+            w.push(format!(
+                "offline_download_bitrate_kbps = {old} is unsupported; using {}",
+                self.offline_download_bitrate_kbps
+            ));
+        }
+        if !["opus", "aac", "mp3", "flac"].contains(&self.offline_download_format.as_str()) {
+            w.push(format!(
+                "offline_download_format = '{}' is unsupported; using opus",
+                self.offline_download_format
+            ));
+            self.offline_download_format = default_offline_download_format();
+        }
         w
     }
 
@@ -636,7 +657,6 @@ impl Default for Config {
             navidrome_servers: Vec::new(),
             torbox_token_file: None,
             album_art: AlbumArtMode::Auto,
-            ascii_fps: None,
             buffer_ahead_secs: default_buffer_ahead_secs(),
             library_paths: Vec::new(),
             crossfade_enabled: false,
@@ -647,6 +667,7 @@ impl Default for Config {
             opensubtitles_api_key_file: None,
             subtitle_language: default_subtitle_language(),
             whisper_model_file: None,
+            watch_reveal_spoilers: false,
             listenbrainz_user_token: None,
             listenbrainz_user_token_file: None,
             scrobble: ScrobbleConfig::default(),
@@ -661,8 +682,10 @@ impl Default for Config {
             keybinds: HashMap::new(),
             cache_days_threshold: default_cache_days_threshold(),
             cache_eviction_days: default_cache_eviction_days(),
+            offline_cache_max_bytes: default_offline_cache_max_bytes(),
+            offline_download_bitrate_kbps: default_offline_download_bitrate_kbps(),
+            offline_download_format: default_offline_download_format(),
             mouse: default_mouse(),
-            video_output: VideoOutput::default(),
         }
     }
 }
@@ -775,7 +798,6 @@ const KNOWN_KEYS: &[&str] = &[
     "navidrome_servers",
     "torbox_token_file",
     "album_art",
-    "ascii_fps",
     "buffer_ahead_secs",
     "library_paths",
     "crossfade_enabled",
@@ -786,6 +808,7 @@ const KNOWN_KEYS: &[&str] = &[
     "opensubtitles_api_key_file",
     "subtitle_language",
     "whisper_model_file",
+    "watch_reveal_spoilers",
     "listenbrainz_user_token",
     "listenbrainz_user_token_file",
     "scrobble",
@@ -801,8 +824,10 @@ const KNOWN_KEYS: &[&str] = &[
     "sidebar_width",
     "bottom_bar_height",
     "cache_eviction_days",
+    "offline_cache_max_bytes",
+    "offline_download_bitrate_kbps",
+    "offline_download_format",
     "mouse",
-    "video_output",
 ];
 
 #[cfg(test)]
@@ -900,145 +925,9 @@ fn restrict_to_owner(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Persists config, surfacing a failure instead of swallowing it: a
-/// read-only config dir or a full disk used to mean every setting
-/// silently reverted on the next launch with nothing said about it.
-impl VideoOutput {
-    /// The word config.toml uses. Not `Debug`, which prints `Tct`
-    /// where the file says `tct`, and shared so the settings row and
-    /// `video()`'s report cannot drift apart.
-    pub fn word(self) -> &'static str {
-        match self {
-            VideoOutput::Auto => "auto",
-            VideoOutput::Tct => "tct",
-            VideoOutput::Kitty => "kitty",
-            VideoOutput::Ascii => "ascii",
-            VideoOutput::Off => "off",
-        }
-    }
-}
-
-/// The settings menu's video-output cycle. `ascii` is in it: `Auto`
-/// never *picks* it, because a real protocol beats a cell grid, but a
-/// user on a terminal with neither protocol has to be able to choose
-/// it, and the menu is where they would look.
-pub fn next_video_output(mode: VideoOutput) -> VideoOutput {
-    match mode {
-        VideoOutput::Auto => VideoOutput::Tct,
-        VideoOutput::Tct => VideoOutput::Kitty,
-        VideoOutput::Kitty => VideoOutput::Ascii,
-        VideoOutput::Ascii => VideoOutput::Off,
-        VideoOutput::Off => VideoOutput::Auto,
-    }
-}
-
-/// The settings menu's rate steps for `ascii_fps`, coarse on purpose:
-/// this is a "make it keep up" knob, not a precise one, and one fps at
-/// a time would be forty presses.
-pub const ASCII_FPS_STEPS: [f64; 5] = [10.0, 15.0, 20.0, 24.0, 30.0];
-
-/// Steps the cap one notch. `None` (the file's own rate) sits at the
-/// top end, so stepping down from it enters the list at the fastest
-/// cap rather than the slowest.
-pub fn step_ascii_fps(cap: Option<f64>, dir: i32) -> Option<f64> {
-    let steps = ASCII_FPS_STEPS;
-    let at = cap.and_then(|c| {
-        steps
-            .iter()
-            .position(|s| (s - c).abs() < 0.5)
-            // an out-of-list value from a hand-edited config enters at
-            // the nearest step rather than being snapped away.
-            .or_else(|| steps.iter().position(|s| *s >= c))
-    });
-    match (at, dir) {
-        (None, d) if d < 0 => Some(steps[steps.len() - 1]),
-        (None, _) => None,
-        (Some(i), d) if d < 0 => Some(steps[i.saturating_sub(1)]),
-        (Some(i), _) if i + 1 < steps.len() => Some(steps[i + 1]),
-        // off the fast end is "the file's own rate", which is the
-        // honest name for no cap at all.
-        (Some(_), _) => None,
-    }
-}
-
 pub fn save_or_warn(cfg: &Config, notifications: &mut Notifications) {
     if let Err(e) = save(cfg) {
         notifications.push(Severity::Error, format!("couldn't save settings: {e}"));
-    }
-}
-
-/// The settings menu's two video steppers, which are cycles with one
-/// end that is not a number.
-#[cfg(test)]
-mod video_setting_tests {
-    use super::*;
-
-    /// Every mode reachable, and back to where it started: a cycle
-    /// that skipped one would make that mode unselectable from the ui.
-    #[test]
-    fn the_output_cycle_reaches_every_mode_and_returns() {
-        let mut seen = vec![VideoOutput::Auto];
-        let mut at = VideoOutput::Auto;
-        for _ in 0..5 {
-            at = next_video_output(at);
-            if at == VideoOutput::Auto {
-                break;
-            }
-            seen.push(at);
-        }
-        assert_eq!(at, VideoOutput::Auto, "the cycle does not close");
-        seen.sort_unstable_by_key(|m| format!("{m:?}"));
-        assert_eq!(
-            seen,
-            vec![
-                VideoOutput::Ascii,
-                VideoOutput::Auto,
-                VideoOutput::Kitty,
-                VideoOutput::Off,
-                VideoOutput::Tct,
-            ]
-        );
-    }
-
-    /// `None` is the fast end, so stepping down from it enters at the
-    /// fastest cap. Entering at the slowest instead would drop a user
-    /// who nudged the knob once from 25fps to 10.
-    #[test]
-    fn stepping_down_from_uncapped_enters_at_the_fastest_cap() {
-        assert_eq!(step_ascii_fps(None, -1), Some(30.0));
-        assert_eq!(step_ascii_fps(None, 1), None, "already uncapped");
-    }
-
-    /// Up off the fast end is "no cap", which is the honest name for
-    /// it; it must not stop at 30 and look stuck.
-    #[test]
-    fn stepping_up_past_the_fastest_cap_removes_it() {
-        assert_eq!(step_ascii_fps(Some(30.0), 1), None);
-        assert_eq!(step_ascii_fps(Some(24.0), 1), Some(30.0));
-    }
-
-    /// Down at the slow end stays, rather than wrapping to uncapped:
-    /// a wrap there turns "as slow as it goes" into "as fast as the
-    /// file", which is the opposite of what the press asked for.
-    #[test]
-    fn stepping_down_at_the_slowest_cap_stays() {
-        assert_eq!(step_ascii_fps(Some(10.0), -1), Some(10.0));
-        assert_eq!(step_ascii_fps(Some(15.0), -1), Some(10.0));
-    }
-
-    /// A hand-edited config can hold any number. It enters at the
-    /// nearest step at or above it rather than being snapped away, so
-    /// one press from 13 goes to 20, not to 10.
-    #[test]
-    fn a_value_from_outside_the_steps_joins_the_list() {
-        assert_eq!(step_ascii_fps(Some(13.0), 1), Some(20.0));
-        assert_eq!(step_ascii_fps(Some(13.0), -1), Some(10.0));
-        assert_eq!(
-            step_ascii_fps(Some(200.0), -1),
-            Some(30.0),
-            "above every step, so it comes in at the top"
-        );
-        assert_eq!(step_ascii_fps(Some(200.0), 1), None);
     }
 }
 
@@ -1146,6 +1035,46 @@ blur = nan
             .any(|w| w.contains("visualizer_bands")));
     }
 
+    #[test]
+    fn offline_quality_defaults_and_invalid_profiles_are_sanitized() {
+        let defaults = Config::default();
+        assert_eq!(defaults.offline_cache_max_bytes, 10 * 1024 * 1024 * 1024);
+        assert_eq!(defaults.offline_download_bitrate_kbps, 192);
+        assert_eq!(defaults.offline_download_format, "opus");
+        let loaded = validate("offline_cache_max_bytes = 0\noffline_download_bitrate_kbps = 200\noffline_download_format = 'vorbis'\n").unwrap();
+        assert_eq!(loaded.cfg.offline_cache_max_bytes, 1_073_741_824);
+        assert_eq!(loaded.cfg.offline_download_bitrate_kbps, 192);
+        assert_eq!(loaded.cfg.offline_download_format, "opus");
+        assert_eq!(loaded.warnings.len(), 3, "{:?}", loaded.warnings);
+        let defaults = validate("").unwrap();
+        assert_eq!(defaults.cfg.offline_download_format, "opus");
+    }
+
+    #[test]
+    fn a_tight_storage_budget_adaptively_caps_the_lossy_download_bitrate() {
+        let gib = 1024 * 1024 * 1024u64;
+        let mut cfg = Config::default();
+        assert_eq!(cfg.effective_offline_download_bitrate_kbps(), 192);
+        cfg.offline_cache_max_bytes = 2 * gib;
+        assert_eq!(cfg.effective_offline_download_bitrate_kbps(), 64);
+        cfg.offline_cache_max_bytes = 5 * gib;
+        assert_eq!(cfg.effective_offline_download_bitrate_kbps(), 96);
+        cfg.offline_download_bitrate_kbps = 64;
+        cfg.offline_cache_max_bytes = 10 * gib;
+        assert_eq!(cfg.effective_offline_download_bitrate_kbps(), 64);
+    }
+
+    #[test]
+    fn watch_spoilers_default_to_safe_and_can_be_configured() {
+        assert!(!Config::default().watch_reveal_spoilers);
+        assert!(
+            validate("watch_reveal_spoilers = true\n")
+                .unwrap()
+                .cfg
+                .watch_reveal_spoilers
+        );
+    }
+
     /// `libary_paths` parsed clean and was read by nothing, so the
     /// library came up empty with nothing said about why. Named and
     /// ignored rather than refused: see `unknown_keys`.
@@ -1209,7 +1138,6 @@ pasword = "x"
             }],
             torbox_token_file: Some("/run/agenix/torbox".into()),
             album_art: AlbumArtMode::Auto,
-            ascii_fps: Some(12.0),
             buffer_ahead_secs: 30.0,
             library_paths: vec!["/music".into()],
             crossfade_enabled: true,
@@ -1220,6 +1148,7 @@ pasword = "x"
             opensubtitles_api_key_file: Some("/run/secret".into()),
             subtitle_language: "en".into(),
             whisper_model_file: Some("/models/whisper.bin".into()),
+            watch_reveal_spoilers: false,
             listenbrainz_user_token: Some("t".into()),
             listenbrainz_user_token_file: Some("/run/secret".into()),
             scrobble: ScrobbleConfig::default(),
@@ -1234,8 +1163,10 @@ pasword = "x"
             sidebar_width: 40,
             bottom_bar_height: 8,
             cache_eviction_days: 7,
+            offline_cache_max_bytes: 10 * 1024 * 1024 * 1024,
+            offline_download_bitrate_kbps: 192,
+            offline_download_format: "opus".into(),
             mouse: true,
-            video_output: VideoOutput::Auto,
         };
         let text = toml::to_string_pretty(&full).expect("serializing");
         let table: toml::Table = text.parse().expect("parsing back");
@@ -1391,35 +1322,6 @@ pasword = "x"
         assert_eq!(cfg.cache_days_threshold, 2);
     }
 
-    /// `video_output = "ascii"` parses, and the default is untouched.
-    ///
-    /// The variant is opt-in by design, so a config that does not name
-    /// it has to keep resolving to `Auto`; `video::auto_never_resolves_to_ascii`
-    /// pins the other half, that `Auto` will not pick it either.
-    #[test]
-    fn the_ascii_video_output_is_spelled_the_way_it_reads() {
-        let cfg: Config = toml::from_str("video_output = \"ascii\"\n").expect("ascii has to parse");
-        assert_eq!(cfg.video_output, VideoOutput::Ascii);
-
-        for (raw, want) in [
-            ("auto", VideoOutput::Auto),
-            ("tct", VideoOutput::Tct),
-            ("kitty", VideoOutput::Kitty),
-            ("off", VideoOutput::Off),
-        ] {
-            let cfg: Config = toml::from_str(&format!("video_output = \"{raw}\"\n"))
-                .unwrap_or_else(|e| panic!("{raw} stopped parsing: {e}"));
-            assert_eq!(cfg.video_output, want, "{raw}");
-        }
-
-        let cfg: Config = toml::from_str("").expect("an empty config is all defaults");
-        assert_eq!(
-            cfg.video_output,
-            VideoOutput::Auto,
-            "adding a variant must not move the default"
-        );
-    }
-
     /// A config written before the four art modes existed names a
     /// protocol or `blocks`; every one of those has to keep parsing,
     /// into the mode that means the same thing. `blocks` asked for the
@@ -1479,29 +1381,6 @@ pasword = "x"
         assert!(old.mouse);
         let off: Config = toml::from_str("mouse = false\n").expect("parsing");
         assert!(!off.mouse);
-    }
-
-    /// `auto` is the default and has to survive a config written before
-    /// the option existed, same reasoning as `mouse`: shipping it as
-    /// `off` by default is shipping a feature nobody gets.
-    #[test]
-    fn video_output_defaults_to_auto_and_round_trips() {
-        assert_eq!(Config::default().video_output, VideoOutput::Auto);
-        let old: Config = toml::from_str("album_art = \"auto\"\n").expect("parsing");
-        assert_eq!(old.video_output, VideoOutput::Auto);
-
-        for (raw, want) in [
-            ("video_output = \"tct\"\n", VideoOutput::Tct),
-            ("video_output = \"kitty\"\n", VideoOutput::Kitty),
-            ("video_output = \"off\"\n", VideoOutput::Off),
-            ("video_output = \"auto\"\n", VideoOutput::Auto),
-        ] {
-            let cfg: Config = toml::from_str(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
-            assert_eq!(cfg.video_output, want, "{raw}");
-            let back: Config =
-                toml::from_str(&toml::to_string_pretty(&cfg).expect("serializing")).expect("back");
-            assert_eq!(back.video_output, want, "{raw}");
-        }
     }
 
     /// Verbatim shape `nix/home-manager.nix` generates for a declared

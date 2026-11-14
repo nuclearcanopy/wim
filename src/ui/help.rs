@@ -131,13 +131,11 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Bound(KeyAction::ToggleMinimize), "minimize player"),
             (
                 Key::Bound(KeyAction::ToggleFullscreenVideo),
-                "fullscreen video",
+                "fullscreen video in mpv",
             ),
-            // next to the video row it modifies, not with the art
-            // modes: it is the same picture, drawn into cells.
             (
-                Key::Bound(KeyAction::ToggleAsciiVideo),
-                "video as text cells",
+                Key::Bound(KeyAction::OpenVideoPlayer),
+                "open / focus mpv video",
             ),
             (Key::Bound(KeyAction::CycleArtMode), "cycle album art"),
             (Key::Bound(KeyAction::ToggleResizeMode), "resize panes"),
@@ -883,10 +881,7 @@ mod tests {
     }
 
     /// Every remappable action is reachable from this table, which is
-    /// where a user finds out an action exists at all. `ToggleAsciiVideo`
-    /// landed in `ALL_ACTIONS`, got a default key and a label, and no
-    /// row here: the feature was findable only by pressing shift+v on
-    /// a hunch, or by opening the remap menu to look for it.
+    /// where a user finds out an action exists at all.
     #[test]
     fn every_remappable_action_has_a_row_in_the_table() {
         let listed: Vec<KeyAction> = SECTIONS

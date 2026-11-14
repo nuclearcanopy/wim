@@ -171,7 +171,12 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
                 let selected = workspace.account_selected.as_ref();
                 Line::from(vec![
                     Span::styled(
-                        selected.map_or("item".to_string(), |item| item.name.clone()),
+                        selected.map_or("item".to_string(), |item| {
+                            crate::torbox_workspace::safe_display_name(
+                                &item.name,
+                                workspace.spoilers_revealed,
+                            )
+                        }),
                         value_style,
                     ),
                     Span::styled(
@@ -219,7 +224,10 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
                 .map(|row| match row {
                     crate::torbox_workspace::SearchRow::Show(show) => format!("{show}  · series"),
                     crate::torbox_workspace::SearchRow::LibraryItem(i) => {
-                        workspace.hits[i].name.clone()
+                        crate::torbox_workspace::safe_display_name(
+                            &workspace.hits[i].name,
+                            workspace.spoilers_revealed,
+                        )
                     }
                 })
                 .enumerate()
@@ -261,8 +269,14 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
                 .map(|(i, source)| {
                     fit_row(
                         if i == workspace.selected { "> " } else { "  " },
-                        &source.release,
-                        &source.file_name,
+                        &crate::torbox_workspace::safe_display_name(
+                            &source.release,
+                            workspace.spoilers_revealed,
+                        ),
+                        &crate::torbox_workspace::safe_display_name(
+                            &source.file_name,
+                            workspace.spoilers_revealed,
+                        ),
                         area.width,
                         i == workspace.selected,
                     )
@@ -270,7 +284,12 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
                 .collect();
             (rows, workspace.selected)
         }
-        Page::Account => rows_for_items(&workspace.account, workspace.selected, area.width),
+        Page::Account => rows_for_items(
+            &workspace.account,
+            workspace.selected,
+            area.width,
+            workspace.spoilers_revealed,
+        ),
         Page::Files => match workspace.account_selected.as_ref() {
             Some(_) => {
                 let files = workspace.selected_files_for_display();
@@ -284,7 +303,16 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
                             if *video { "video" } else { "audio" },
                             format_size(*size)
                         );
-                        fit_row(marker, name, &details, area.width, i == workspace.selected)
+                        fit_row(
+                            marker,
+                            &crate::torbox_workspace::safe_display_name(
+                                name,
+                                workspace.spoilers_revealed,
+                            ),
+                            &details,
+                            area.width,
+                            i == workspace.selected,
+                        )
                     })
                     .collect();
                 (rows, workspace.selected)
@@ -316,6 +344,7 @@ fn rows_for_items(
     items: &[AccountItem],
     selected: usize,
     width: u16,
+    reveal_spoilers: bool,
 ) -> (Vec<Line<'static>>, usize) {
     let rows = items
         .iter()
@@ -332,7 +361,13 @@ fn rows_for_items(
                 format_size(item.total_size()),
                 item.files.len()
             );
-            fit_row(marker, &item.name, &details, width, i == selected)
+            fit_row(
+                marker,
+                &crate::torbox_workspace::safe_display_name(&item.name, reveal_spoilers),
+                &details,
+                width,
+                i == selected,
+            )
         })
         .collect();
     (rows, selected)
@@ -426,14 +461,14 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, workspace: &Workspace) {
             if workspace.search_editing {
                 "type · enter search · esc stop editing".to_string()
             } else {
-                "j/k select · enter show/files · / edit query · b account · c connect · esc close"
+                "j/k select · enter show/files · / edit query · b account · c connect · v reveal · V save default · esc close"
                     .to_string()
             }
         }
-        Page::Account => "1/2/3 service · r refresh · n next page · s search · enter files · + add link · p pause/resume · R reannounce · d delete · esc close".to_string(),
-        Page::Files => "j/k select · enter play · q queue · backspace back · esc close".to_string(),
-        Page::Episodes => "j/k select · enter episodes' sources · backspace shows · esc close".to_string(),
-        Page::Sources => "j/k select · enter choose release · backspace episodes · esc close".to_string(),
+        Page::Account => "1/2/3 service · r refresh · n next page · s search · enter files · + add link · p pause/resume · R reannounce · d delete · v reveal · V save default · esc close".to_string(),
+        Page::Files => "j/k select · enter play · q queue · backspace back · v reveal · V save default · esc close".to_string(),
+        Page::Episodes => "j/k select · enter episodes' sources · backspace shows · v reveal · V save default · esc close".to_string(),
+        Page::Sources => "j/k select · enter choose release · backspace episodes · v reveal · V save default · esc close".to_string(),
     };
     if workspace.loading {
         footer.push_str(" · working…");

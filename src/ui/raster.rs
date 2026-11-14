@@ -177,11 +177,7 @@ pub struct Style {
 /// softer than the picture is and the pass puts the definition back.
 ///
 /// `Off` is for a source that already is the grid's size, where there
-/// is no box average to compensate for. `framesource::Grid` asks mpv
-/// for exactly `2cols x 2rows` pixels, so its `Fit::Stretch` is a 1:1
-/// copy and the pass is pure cost there: ~6 ns per sample, which at
-/// one sample per source pixel is most of what a video frame costs
-/// (see `probe_paint_floor`'s 1:1 line). Off is not the same picture,
+/// is no box average to compensate for. Off is not the same picture,
 /// so it is the caller's call, never inferred from the geometry.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Sharpen {
@@ -718,11 +714,9 @@ fn group_rgb(mask: usize, q: [[u8; 3]; 4]) -> ([u8; 3], [u8; 3]) {
     (f, avg(bg, 4 - fg_n))
 }
 
-/// Reading the grid back without a `Buffer`: what the tests assert
-/// against, and the API an ascii video renderer wants if it ever needs
-/// the samples rather than the cells. Nothing on the render path calls
-/// these yet, hence the blanket allow (same documented gap as
-/// `cache::play_count`).
+/// Reading the sampled grid back without a `Buffer`, for tests and
+/// diagnostics. Nothing on the render path calls these yet, hence the
+/// blanket allow (same documented gap as `cache::play_count`).
 #[allow(dead_code)]
 impl Raster {
     /// Cell columns the last `sample` was sized for.
@@ -925,16 +919,10 @@ fn shades() -> &'static [Color; 256] {
     SHADES.get_or_init(|| std::array::from_fn(|i| shade(i as f32 / 255.0)))
 }
 
-/// What a sampling was keyed by, kept as two variants rather than one
-/// string for two reasons: a frame number must not have to be
-/// formatted (a video misses 25 times a second, and `framesource`'s
-/// allocation test is the one that noticed), and a number that
-/// happened to spell a cover's name would hand a frame back in place
-/// of the cover.
+/// The key used to identify a sampled image in the cover cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Keyed {
     Name(String),
-    Frame(u64),
 }
 
 /// The borrowed half of `Keyed`: what a caller passes, with no
@@ -942,15 +930,12 @@ enum Keyed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyRef<'a> {
     Name(&'a str),
-    Frame(u64),
 }
 
 impl KeyRef<'_> {
     fn same_as(self, kept: &Keyed) -> bool {
         match (self, kept) {
             (KeyRef::Name(a), Keyed::Name(b)) => a == b,
-            (KeyRef::Frame(a), Keyed::Frame(b)) => a == *b,
-            _ => false,
         }
     }
 
@@ -959,7 +944,6 @@ impl KeyRef<'_> {
     fn owned(self) -> Keyed {
         match self {
             KeyRef::Name(n) => Keyed::Name(n.to_string()),
-            KeyRef::Frame(f) => Keyed::Frame(f),
         }
     }
 }
@@ -1035,27 +1019,6 @@ impl Memo {
         buf: &mut Buffer,
     ) -> bool {
         self.render_keyed(KeyRef::Name(key), img, area, cell_aspect, style, buf)
-    }
-
-    /// `render` for a video frame, keyed by a frame number that only
-    /// ever moves forwards.
-    ///
-    /// Not a `render` with a formatted key: this path misses once per
-    /// decoded frame, so building a `String` there would put an
-    /// allocation in a steady frame rate, which `framesource`'s own
-    /// allocation test forbids. The variant also makes a collision
-    /// with a cover's name unrepresentable rather than merely
-    /// unlikely.
-    pub fn render_frame(
-        &mut self,
-        stamp: u64,
-        img: &DynamicImage,
-        area: Rect,
-        cell_aspect: f32,
-        style: Style,
-        buf: &mut Buffer,
-    ) -> bool {
-        self.render_keyed(KeyRef::Frame(stamp), img, area, cell_aspect, style, buf)
     }
 
     fn render_keyed(
@@ -2788,10 +2751,9 @@ mod tests {
             );
         }
 
-        // the video path's shape: `framesource::Grid` asks mpv for
-        // exactly `2cols x 2rows` pixels, so `Fit::Stretch` is a 1:1
-        // copy, one tap per sample and no box average to compensate
-        // for. The unsharp pass is then most of a frame's resample.
+        // A grid-sized image makes `Fit::Stretch` a 1:1 copy, one tap
+        // per sample and no box average to compensate for. The unsharp
+        // pass is then most of the resampling cost.
         let frame =
             DynamicImage::ImageRgb8(RgbImage::from_fn(w as u32 * 2, h as u32 * 2, |x, y| {
                 let v = ((x * 7 + y * 11) % 256) as u8;

@@ -584,7 +584,7 @@ mod tests {
     /// The point of the buffer: once it has held the widest row,
     /// nothing later reallocates it. Pointer identity is the
     /// assertion, since a counting allocator needs a test binary of
-    /// its own (`tests/framesource_alloc.rs` is one).
+    /// its own.
     #[test]
     fn a_kept_buffer_stops_allocating_once_it_has_held_the_widest_row() {
         let rows = [

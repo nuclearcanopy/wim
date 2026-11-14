@@ -153,6 +153,7 @@ pub struct SubtitleTrackInfo {
     pub id: u64,
     pub ff_index: Option<u64>,
     pub external_path: Option<PathBuf>,
+    pub label: String,
 }
 
 impl Playback {
@@ -384,32 +385,22 @@ impl Mpv {
             // in wim. a "why does this sound wrong" investigation
             // already burned hours ruling that out, so pin it.
             .arg("--no-config")
-            // this is the actual fix for mpv opening its own native
-            // window: `vid` (which track to decode, toggled per-item
-            // in set_vid_for_item) and `vo` (where a decoded frame
-            // gets displayed) are independent. Never setting `vo`
-            // left mpv on its own default (a real gpu/x11/wayland
-            // window) regardless of vid, so video played with a
-            // window popping up right alongside this one even though
-            // nothing ever asked for that; closing that window quits
-            // mpv's whole process, breaking the ipc socket this app
-            // depends on. `--vo=null` discards the frame instead of
-            // displaying it anywhere; `screenshot-raw` (the embedded
-            // video pane's own frame source) still works, since a
-            // screenshot is taken from the decoded/filtered frame,
-            // not from whatever vo would've shown it in. `vo` is
-            // settable at runtime over ipc, which is how fullscreen
-            // video flips to a terminal output and back; see
-            // `set_video_output` and docs/video.md.
-            .arg("--vo=null")
+            // mpv owns video playback and opens its normal native window
+            // when `vid=auto`; music items explicitly use `vid=no`.
+            // Keep the window optional while idle so audio-only playback
+            // remains a quiet backend for Wim.
+            .arg("--vo=gpu")
+            // Prefer mpv's safe hardware decoders when the system exposes
+            // them, while retaining its software fallback for unsupported
+            // codecs or broken driver paths. `vo=gpu` alone only selects a
+            // renderer; it does not enable hardware video decoding.
+            .arg("--hwdec=auto-safe")
+            .arg("--force-window=no")
             .arg(format!("--input-ipc-server={}", sock_path.display()))
             // stdin stays closed: `--no-terminal` already implies
             // `--no-input-terminal`, and mpv must never compete with the
             // tui for keystrokes. stdout is this terminal, because mpv's
-            // `tct`/`kitty` outputs draw a fullscreen video by writing
-            // escapes to it; with `--vo=null` it writes nothing at all
-            // (measured: zero bytes across a load, a seek and a volume
-            // change), so ordinary music playback is unaffected. stderr
+            // stderr
             // stays closed since `--no-terminal` implies
             // `--really-quiet` but a loader warning would still land on
             // top of the ui.
@@ -753,45 +744,6 @@ impl Mpv {
         Ok(())
     }
 
-    /// Points mpv's video output at this terminal, or back at `null`.
-    ///
-    /// Safe to call mid-playback: the switch keeps the playlist, the
-    /// position and the pause state, so there is no relaunch and
-    /// nothing to seek back to. The vo owns the screen while it draws
-    /// (it enters and leaves the alternate screen itself); see
-    /// `term::TerminalGuard::reclaim` and docs/video.md.
-    pub fn set_video_output(&self, vo: &str) -> Result<()> {
-        self.set_property("vo", json!(vo))
-    }
-
-    /// How big a drawing vo gets to be, in terminal cells. Has to be
-    /// pushed from here and cannot be left at mpv's 0 ("ask the tty"):
-    /// under `--no-terminal` mpv never queries the tty and silently
-    /// falls back to 80x25, so a video on a larger terminal drew into
-    /// the top-left 80x25 of it.
-    ///
-    /// Only takes effect when the vo next initializes, so a resize has
-    /// to bounce `vo` through `null`; both outputs' options are set
-    /// together, since neither matters until its own vo is selected.
-    pub fn set_video_geometry(&self, cols: u16, rows: u16) -> Result<()> {
-        let cmds: Vec<Vec<Value>> = [
-            ("vo-tct-width", json!(cols)),
-            ("vo-tct-height", json!(rows)),
-            ("vo-kitty-cols", json!(cols)),
-            ("vo-kitty-rows", json!(rows)),
-            // one write per frame instead of per row: a half-block vo
-            // painting a row at a time tears visibly at this size.
-            ("vo-tct-buffering", json!("frame")),
-        ]
-        .into_iter()
-        .map(|(name, value)| vec![json!("set_property"), json!(name), value])
-        .collect();
-        for result in self.command_batch(&cmds) {
-            result?;
-        }
-        Ok(())
-    }
-
     /// Asks mpv to push every property the render path reads instead of
     /// us polling for them, which is what lets the current track and
     /// the level meter be resolved from mpv's own state. Registering
@@ -1019,7 +971,63 @@ impl Mpv {
         Ok(())
     }
 
-    /// Returns the selected subtitle's mpv id and source metadata.
+    /// Cycle through the subtitle tracks reported by mpv. Uses mpv's
+    /// track metadata so embedded tracks and already-loaded sidecars share
+    /// one selection path; the final position disables subtitles.
+    pub fn cycle_subtitle_track(&self) -> Result<Option<String>> {
+        let tracks = self.get_property("track-list")?;
+        let subtitle_tracks = tracks
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|track| track.get("type").and_then(Value::as_str) == Some("sub"))
+            .collect::<Vec<_>>();
+        if subtitle_tracks.is_empty() {
+            self.set_property("sid", json!("no"))?;
+            return Ok(None);
+        }
+        let active = self
+            .get_property("sid")
+            .ok()
+            .and_then(|value| value.as_u64());
+        let next = active
+            .and_then(|id| {
+                subtitle_tracks
+                    .iter()
+                    .position(|track| track.get("id").and_then(Value::as_u64) == Some(id))
+            })
+            .map_or(0, |index| index + 1);
+        if next >= subtitle_tracks.len() {
+            self.set_property("sid", json!("no"))?;
+            return Ok(Some("subtitles off".to_owned()));
+        }
+        let track = subtitle_tracks[next];
+        let id = track
+            .get("id")
+            .and_then(Value::as_u64)
+            .context("mpv subtitle track has no id")?;
+        self.set_property("sid", json!(id))?;
+        let language = track
+            .get("lang")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let title = track
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("subtitle track");
+        Ok(Some(format!("subtitle: {language} · {title}")))
+    }
+
+    pub fn toggle_subtitle_visibility(&self) -> Result<bool> {
+        let visible = self
+            .get_property("sub-visibility")?
+            .as_bool()
+            .unwrap_or(true);
+        self.set_property("sub-visibility", json!(!visible))?;
+        Ok(!visible)
+    }
+
+    /// Returns the selected subtitle's source without exposing it in diagnostics.
     pub fn selected_subtitle_track(&self) -> Result<Option<SubtitleTrackInfo>> {
         let tracks = self.get_property("track-list")?;
         let sid = self
@@ -1036,13 +1044,24 @@ impl Mpv {
                         || sid
                             .is_some_and(|id| track.get("id").and_then(Value::as_u64) == Some(id)))
             })
-            .map(|track| SubtitleTrackInfo {
-                id: track.get("id").and_then(Value::as_u64).unwrap_or_default(),
-                ff_index: track.get("ff-index").and_then(Value::as_u64),
-                external_path: track
-                    .get("external-filename")
+            .map(|track| {
+                let lang = track
+                    .get("lang")
                     .and_then(Value::as_str)
-                    .map(PathBuf::from),
+                    .unwrap_or("unknown");
+                let title = track
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("subtitle track");
+                SubtitleTrackInfo {
+                    id: track.get("id").and_then(Value::as_u64).unwrap_or_default(),
+                    ff_index: track.get("ff-index").and_then(Value::as_u64),
+                    external_path: track
+                        .get("external-filename")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from),
+                    label: format!("{lang} · {title}"),
+                }
             }))
     }
 

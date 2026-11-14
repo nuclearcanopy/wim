@@ -533,7 +533,7 @@ mod frame_budget {
     /// Alternating batches in one process, best of each. Sequential
     /// runs on this box differ 1.6-1.8x under load, so two separate
     /// measurements are not comparable and this is the only shape that
-    /// is; same harness as `framesource::frame_budget`.
+    /// is; same alternating-batch harness used by the raster benchmarks.
     fn best_each(
         rounds: usize,
         iters: usize,

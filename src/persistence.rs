@@ -1,7 +1,7 @@
-//! Resuming playback (queue, position, volume) across restarts is
-//! standard in podcast/audiobook apps and most modern music players;
-//! not optional polish. State is saved as plain paths; resuming
-//! reconstructs minimal `SearchItem`s from them (filename-derived title,
+//! Playback state (queue, position, volume) is saved across restarts and
+//! restored only when explicitly requested with `wim --resume`. State is
+//! saved as plain paths; resuming reconstructs minimal `SearchItem`s from
+//! them (filename-derived title,
 //! no artist/album) rather than depending on a prior library scan still
 //! matching, so a moved/renamed library doesn't make resume fail outright
 //!; paths that no longer exist are just silently skipped.
@@ -337,7 +337,7 @@ mod tests {
 
     /// Alternating batches in one process, best of each, on the
     /// process cpu clock: both sides here are single-threaded. Same
-    /// shape as `framesource::frame_budget::best_each`, different
+    /// shape as the alternating-batch benchmark helper, different
     /// clock. This box's
     /// other cores are not idle during a bench run (load average 28
     /// observed, wall 6x cpu on the same work), so wall clock moves

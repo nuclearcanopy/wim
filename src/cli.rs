@@ -107,10 +107,12 @@ impl Cli {
 /// a second script is an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WimRun {
-    /// No arguments: the panes, resuming what was playing.
+    /// No arguments: the panes and title screen, without resuming playback.
     Panes,
-    /// `wim a.flac b.mp3`: play the first and queue the rest, instead
-    /// of resuming. A media player plays what it is handed; that is
+    /// Explicitly resume the saved playback session.
+    Resume,
+    /// `wim a.flac b.mp3`: play the first and queue the rest. A media
+    /// player plays what it is handed; that is
     /// what `xdg-open` and a desktop file association send, and what
     /// mpv, vlc and mplayer all do.
     Play(Vec<PathBuf>),
@@ -122,7 +124,15 @@ pub enum WimRun {
 /// which is the one place the two front-ends deliberately differ.
 pub fn parse_wim<I: IntoIterator<Item = String>>(args: I) -> Result<WimRun, String> {
     let mut files: Vec<PathBuf> = Vec::new();
+    let mut resume = false;
     for arg in args {
+        if arg == "--resume" {
+            if resume || !files.is_empty() {
+                return Err("--resume cannot be combined with file arguments".into());
+            }
+            resume = true;
+            continue;
+        }
         match classify(&arg) {
             // ahead of the files on purpose, so these answer whatever
             // else is on the line.
@@ -132,7 +142,12 @@ pub fn parse_wim<I: IntoIterator<Item = String>>(args: I) -> Result<WimRun, Stri
             Arg::Positional(other) => files.push(PathBuf::from(other)),
         }
     }
-    Ok(if files.is_empty() {
+    if resume && !files.is_empty() {
+        return Err("--resume cannot be combined with file arguments".into());
+    }
+    Ok(if resume {
+        WimRun::Resume
+    } else if files.is_empty() {
         WimRun::Panes
     } else {
         WimRun::Play(files)
@@ -216,12 +231,10 @@ view(now) and view(lyrics) print instead of opening a pane.
     )
 }
 
-pub const WIM_USAGE: &str = "usage: wim [FILE...] [--version] [--help]";
+pub const WIM_USAGE: &str = "usage: wim [--resume | FILE...] [--version] [--help]";
 
-/// What a file argument does to the resumed session, spelled once:
-/// the help says it and `main.rs` does it.
-pub const PLAY_REPLACES_RESUME: &str =
-    "a file argument plays instead of resuming; the rest are queued behind it";
+/// What a file argument does, spelled once: the help says it and `main.rs` does it.
+pub const PLAY_FILES: &str = "a file argument starts playback; the rest are queued behind it";
 
 pub fn wim_help() -> String {
     format!(
@@ -230,13 +243,15 @@ pub fn wim_help() -> String {
 wim is a terminal omniplayer: navidrome/subsonic and local files in one
 search, played through mpv.
 
-  wim                 the panes, resuming what was playing
-  wim song.flac       play that instead
+  wim                 the panes and title screen
+  wim --resume        resume the saved playback session
+  wim song.flac       play that
   wim a.mp3 b.mp3     play the first, queue the rest
   wim --version       which build this is
   wim --help          this
 
-{PLAY_REPLACES_RESUME}.
+{PLAY_FILES}.
+Use `--resume` to restore a saved session.
 
 a file has to be a local music or video file that exists; a url is not
 one yet, and neither is refused in silence. shellswim is the same
@@ -327,6 +342,13 @@ mod tests {
     #[test]
     fn wim_with_no_arguments_is_the_panes() {
         assert_eq!(wim(&[]).unwrap(), WimRun::Panes);
+    }
+
+    #[test]
+    fn saved_playback_resumes_only_when_requested() {
+        assert_eq!(wim(&["--resume"]).unwrap(), WimRun::Resume);
+        assert!(wim(&["--resume", "song.mp3"]).is_err());
+        assert!(wim(&["song.mp3", "--resume"]).is_err());
     }
 
     /// The whole defect: `wim --help` started the panes and said
@@ -449,7 +471,7 @@ mod tests {
         let h = wim_help();
         for needed in [
             WIM_USAGE,
-            PLAY_REPLACES_RESUME,
+            PLAY_FILES,
             "wim --version",
             "shellswim",
             "url",

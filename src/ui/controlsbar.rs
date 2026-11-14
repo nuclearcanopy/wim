@@ -33,8 +33,10 @@ pub const GLYPH_SPEED: char = '×'; // U+00D7 multiplication sign
 /// sound", and that is not a question to leave to a shade of grey.
 pub const GLYPH_AUDIBLE: char = '○'; // U+25CB white circle
 pub const GLYPH_MUTE: char = '⊘'; // U+2298 circled division slash
-pub const GLYPH_EQ: &str = "▂▅▃"; // U+2582/2585/2583 lower block eighths
-pub const GLYPH_CROSSFADE: &str = "◢◣"; // U+25E2/25E3 black lower right/left triangle
+pub const GLYPH_EQ: &str = "≋EQ";
+pub const GLYPH_CROSSFADE: &str = "⋈FADE";
+pub const GLYPH_PREVIOUS: &str = "|◂";
+pub const GLYPH_NEXT: &str = "▸|";
 const TRACK_DONE: char = '━'; // U+2501 box drawings heavy horizontal
 const TRACK_LEFT: char = '─'; // U+2500 box drawings light horizontal
 /// The buffered-but-not-yet-played portion of the track: media mpv
@@ -92,7 +94,9 @@ pub fn segments_that_fit(lengths: &[usize], available_width: usize, sep: usize) 
 /// you can land on and press enter against) are in it too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
+    Previous,
     Pause,
+    Next,
     Loop,
     Shuffle,
     Speed,
@@ -103,8 +107,10 @@ pub enum Field {
 
 /// Same left-to-right order the bar itself draws them in, so left and
 /// right on the selection cursor move the way the row looks.
-pub const FIELDS: [Field; 7] = [
+pub const FIELDS: [Field; 9] = [
+    Field::Previous,
     Field::Pause,
+    Field::Next,
     Field::Loop,
     Field::Shuffle,
     Field::Speed,
@@ -214,9 +220,8 @@ impl Scrub {
 /// already happened. Anything genuinely worth surfacing goes to the
 /// notification overlay instead; this bar only ever shows state that
 /// is still true.
-/// Every control is a glyph whose brightness is its state (dim off,
-/// bright on), not a `label: value` pair; see the glyph constants
-/// above for why those particular codepoints.
+/// Control brightness reflects its state (dim off, bright on). The
+/// audio-effect controls also carry short labels for discoverability.
 /// Resizable (bottom bar, vertical axis only); more rows reveal more
 /// lines gracefully, fewer rows collapse the mode indicator into the
 /// control line rather than dropping it.
@@ -454,6 +459,23 @@ impl ControlsBar<'_> {
                 body: Body::Glyph(queue),
             },
             Segment {
+                field: None,
+                lit: self.muted,
+                body: Body::Glyph(
+                    if self.muted {
+                        GLYPH_MUTE
+                    } else {
+                        GLYPH_AUDIBLE
+                    }
+                    .to_string(),
+                ),
+            },
+            Segment {
+                field: Some(Field::Previous),
+                lit: true,
+                body: Body::Glyph(GLYPH_PREVIOUS.to_string()),
+            },
+            Segment {
                 field: Some(Field::Pause),
                 // lit means "audio is moving", so the play triangle is
                 // the bright state and the pause bars the dim one. a
@@ -468,21 +490,10 @@ impl ControlsBar<'_> {
                     None => GLYPH_PLAY.to_string(),
                 }),
             },
-            // second, right behind the transport: the fit drops whole
-            // elements from the right, and "you are muted" is the one
-            // answer to "why is there no sound" that nothing else on
-            // screen gives, so it must not be what a narrow bar loses.
             Segment {
-                field: None,
-                lit: self.muted,
-                body: Body::Glyph(
-                    if self.muted {
-                        GLYPH_MUTE
-                    } else {
-                        GLYPH_AUDIBLE
-                    }
-                    .to_string(),
-                ),
+                field: Some(Field::Next),
+                lit: self.queue_len > 0,
+                body: Body::Glyph(GLYPH_NEXT.to_string()),
             },
             Segment {
                 field: Some(Field::Loop),
@@ -762,7 +773,99 @@ fn draw_placed(
         let end = placed.rect.x.saturating_add(placed.rect.width);
         fill_bg(buf, placed.rect.x.max(area.x), end.min(limit), y, bg);
     }
-    draw_chars(buf, x, limit, y, &text, shade(level), bg);
+    if let Body::Track {
+        elapsed,
+        total,
+        frac,
+        buffered_frac,
+    } = &seg.body
+    {
+        let prefix = format!("{elapsed} ");
+        let start = draw_chars(buf, x, limit, y, &prefix, shade(level), bg);
+        let track_start = start;
+        let count = placed
+            .track_cells
+            .min(limit.saturating_sub(track_start) as usize);
+        draw_track_cells(
+            buf,
+            track_start,
+            y,
+            count,
+            TrackPaint {
+                frac: *frac,
+                dragging,
+                buffered: *buffered_frac,
+                level,
+                bg,
+            },
+        );
+        let after = track_start.saturating_add(count as u16);
+        let after = draw_chars(buf, after, limit, y, " ", shade(level), bg);
+        draw_chars(buf, after, limit, y, total, shade(level), bg);
+    } else {
+        draw_chars(buf, x, limit, y, &text, shade(level), bg);
+    }
+}
+
+struct TrackPaint {
+    frac: f64,
+    dragging: bool,
+    buffered: Option<f64>,
+    level: f32,
+    bg: Option<Color>,
+}
+
+fn draw_track_cells(buf: &mut Buffer, x: u16, y: u16, cells: usize, paint: TrackPaint) {
+    let cells = cells.max(TRACK_MIN);
+    let pos = ((paint.frac.clamp(0.0, 1.0) * (cells - 1) as f64).round() as usize).min(cells - 1);
+    let buffered_end = paint
+        .buffered
+        .map(|b| ((b.clamp(0.0, 1.0) * (cells - 1) as f64).round() as usize).min(cells - 1));
+    let semantic =
+        paint.level > DIM && crate::theme::color_mode() == crate::theme::ColorMode::Semantic;
+    for i in 0..cells {
+        let (glyph, brightness) = match i.cmp(&pos) {
+            Ordering::Less => (TRACK_DONE, paint.level),
+            Ordering::Equal => (
+                if paint.dragging {
+                    TRACK_HEAD_DRAG
+                } else {
+                    TRACK_HEAD
+                },
+                if paint.dragging { WHITE } else { paint.level },
+            ),
+            Ordering::Greater => match buffered_end {
+                Some(end) if i <= end => (TRACK_BUFFERED, MID),
+                _ => (TRACK_LEFT, DIM),
+            },
+        };
+        let cell_x = x.saturating_add(i as u16);
+        if let Some(cell) = buf.cell_mut((cell_x, y)) {
+            cell.set_char(glyph);
+            let brightness = if paint.dragging && i == pos {
+                WHITE
+            } else {
+                brightness.min(paint.level)
+            };
+            let color = if semantic {
+                match i.cmp(&pos) {
+                    Ordering::Less => crate::theme::PLAYED,
+                    Ordering::Equal if paint.dragging => crate::theme::ACCENT,
+                    Ordering::Equal => crate::theme::ACCENT,
+                    Ordering::Greater if buffered_end.is_some_and(|end| i <= end) => {
+                        crate::theme::BUFFERED
+                    }
+                    Ordering::Greater => crate::theme::UNPLAYED,
+                }
+            } else {
+                shade(brightness)
+            };
+            cell.set_fg(color);
+            if let Some(bg) = paint.bg {
+                cell.set_bg(bg);
+            }
+        }
+    }
 }
 
 /// Same scrubber convention as `ui::progress::bar` (heavy track
@@ -925,6 +1028,32 @@ mod tests {
         let cells: Vec<char> = over.chars().collect();
         assert_eq!(cells[8], TRACK_HEAD);
         assert!(cells[..8].iter().all(|&c| c == TRACK_DONE), "{over:?}");
+    }
+
+    #[test]
+    fn track_cells_dim_unplayed_and_distinguish_buffered_from_played() {
+        let mut buf = buffer(16, 1);
+        draw_track_cells(
+            &mut buf,
+            0,
+            0,
+            16,
+            TrackPaint {
+                frac: 0.25,
+                dragging: false,
+                buffered: Some(0.5),
+                level: BRIGHT,
+                bg: None,
+            },
+        );
+        let played = buf.cell((0, 0)).unwrap().fg;
+        let head = buf.cell((4, 0)).unwrap().fg;
+        let buffered = buf.cell((6, 0)).unwrap().fg;
+        let unplayed = buf.cell((12, 0)).unwrap().fg;
+        assert_eq!(played, shade(BRIGHT));
+        assert_eq!(head, shade(BRIGHT));
+        assert_eq!(buffered, shade(MID));
+        assert_eq!(unplayed, shade(DIM));
     }
 
     /// A status that explains a motionless bar takes the mode line
@@ -1155,7 +1284,7 @@ mod tests {
     }
 
     #[test]
-    fn the_control_line_has_no_words_on_it() {
+    fn the_audio_effect_controls_are_labelled() {
         let buf = bar_at(100, 2, |cb| {
             cb.loop_mode = LoopMode::All;
             cb.shuffle_on = true;
@@ -1163,15 +1292,12 @@ mod tests {
             cb.eq_active = true;
         });
         let line = grid(&buf).lines().nth(1).unwrap().to_string();
-        for word in [
-            "loop",
-            "shuffle",
-            "crossfade",
-            "speed",
-            "queue",
-            "eq",
-            "off",
-        ] {
+        assert!(line.contains(GLYPH_EQ), "equalizer label missing: {line}");
+        assert!(
+            line.contains(GLYPH_CROSSFADE),
+            "crossfade label missing: {line}"
+        );
+        for word in ["loop", "shuffle", "crossfade", "speed", "queue", "off"] {
             assert!(!line.contains(word), "{word:?} still printed:\n{line}");
         }
     }
@@ -1479,11 +1605,11 @@ mod tests {
 
     #[test]
     fn selection_moves_left_and_right_and_wraps_both_ways() {
-        assert_eq!(Field::Pause.next(), Field::Loop);
-        assert_eq!(Field::Loop.prev(), Field::Pause);
+        assert_eq!(Field::Pause.next(), Field::Next);
+        assert_eq!(Field::Next.prev(), Field::Pause);
         // the ends wrap, so holding one arrow never dead-ends.
-        assert_eq!(Field::Progress.next(), Field::Pause);
-        assert_eq!(Field::Pause.prev(), Field::Progress);
+        assert_eq!(Field::Progress.next(), Field::Previous);
+        assert_eq!(Field::Previous.prev(), Field::Progress);
         // every variant is reachable from any other by next alone.
         let mut seen = vec![Field::Pause];
         let mut f = Field::Pause;
@@ -1493,6 +1619,44 @@ mod tests {
             seen.push(f);
         }
         assert_eq!(seen.len(), FIELDS.len());
+    }
+
+    #[test]
+    fn previous_and_next_are_visible_clickable_transport_controls() {
+        use crate::hit::{act, Act, Click, Control, HitMap, Kind};
+        let (buf, layout) = bar_and_layout(100, 2, |cb| cb.queue_len = 3);
+        let map = HitMap {
+            controls: layout
+                .controls
+                .iter()
+                .map(|(field, rect)| Control {
+                    field: *field,
+                    rect: *rect,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for (field, glyph) in [(Field::Previous, GLYPH_PREVIOUS), (Field::Next, GLYPH_NEXT)] {
+            let rect = layout.controls.iter().find(|(f, _)| *f == field).unwrap().1;
+            assert_eq!(
+                buf.cell((rect.x, rect.y)).unwrap().symbol(),
+                glyph.chars().next().unwrap().to_string()
+            );
+            for x in rect.x..rect.x + rect.width {
+                assert_eq!(
+                    act(
+                        &map,
+                        Click {
+                            kind: Kind::Down,
+                            col: x,
+                            row: rect.y
+                        },
+                        false
+                    ),
+                    Act::Press(field, None)
+                );
+            }
+        }
     }
 
     #[test]
@@ -1747,12 +1911,8 @@ mod tests {
     /// front now, so there is nothing left to shift.
     #[test]
     fn the_track_does_not_move_when_the_elapsed_readout_crosses_ten_minutes() {
-        // 46 cells is the narrowest bar that keeps a 30 minute song's
-        // scrubber at all (43 before the mute glyph took three of
-        // them); narrower than that the element is dropped, which the
-        // reserved width also makes a decision for the whole song
-        // rather than one the clock changes at 10:00.
-        for width_cells in [46u16, 60, 100, 160] {
+        // Leave room for the transport controls as well as the scrubber.
+        for width_cells in [60u16, 100, 160] {
             let mut rects = Vec::new();
             for secs in [0.0, 598.0, 599.0, 599.9, 600.0, 601.0, 1799.0] {
                 let (buf, layout) = bar_and_layout(width_cells, 2, |cb| {

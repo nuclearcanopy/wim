@@ -43,32 +43,6 @@ it.
 
 ---
 
-### ascii video: colour, or monochrome like everything else
-
-`framesource::FrameSource::paint` takes a `raster::Tone`, so colour
-and greyscale are the same call with a different argument and both
-work today. It defaults to `Mono`, matching what `ui/albumart.rs`
-already asserts ("the video pane stays monochrome with the rest of the
-ui").
-
-**Why this is yours and not a default I can take.** The exemption
-video already has in docs/video.md is narrower than it looks: it
-covers *mpv's own pixels*, drawn by `tct` or `kitty`, on the grounds
-that they are not wim's cells. An ascii renderer paints wim's cells,
-so allowing colour there is a second exception to the monochrome rule
-and needs the same direct authorisation `ascii-color` album art got
-from you.
-
-Nothing needs changing either way. If you allow it, it wants a config
-variant beside `AlbumArtMode`'s `ascii-bw`/`ascii-color` pair,
-following `browse::ArtMode::tone()`.
-
-One smaller related question: `raster`'s unsharp pass is unconditional
-and is pure cost on a 1:1 frame (it is inside the 8-9%
-rasterization figure). Making it optional is the only plausible win
-left on wim's side of the frame budget, and it would touch `Style` and
-therefore `Memo`'s cache key.
-
 ### your play index was overwritten by a test run, and the repair is yours
 
 While running this repo's `#[ignore]`d mpv-gated tests (which I had
@@ -231,27 +205,10 @@ handles its own aspect.
 
 ## answered by later work, kept only so the reasoning is not lost
 
-### where video frames come from: obsolete, nothing to decide
+### video rendering architecture
 
-This asked the maintainer to choose between `screenshot-to-file` plus
-read-back (2-5fps), shipping an mpv lua script, or `--vo=image`,
-because `screenshot-raw` is unusable over json ipc. It was marked
-BLOCKING.
-
-**The premise is gone: wim does not extract frames.** mpv has terminal
-video outputs of its own, `tct` (true-color text, half-blocks, works in
-any terminal including alacritty) and `kitty` (graphics protocol), and
-`video::wanted` just picks one. No frame ever crosses the ipc socket.
-The `FramePump` built for the old design is dead code that reports
-`Unsupported`; deleting it is a ROADMAP item. See `docs/video.md`.
-
-### frame downscale ceiling: obsolete
-
-`VIDEO_FRAME_MAX_EDGE` existed because `ui::albumart::sample_luma`
-box-averaged every source pixel per cell, making a 1080p frame ~2.07M
-`get_pixel` calls per frame on the render thread. `sample_luma` is
-gone, replaced by the O(output) quadrant rasterizer, and nothing feeds
-frames through wim any more regardless.
+Resolved: mpv owns video rendering in its native GPU-backed window; Wim
+does not extract or rasterize video frames. See `docs/video.md`.
 
 ### download trigger policy: shipped
 

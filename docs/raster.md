@@ -1,7 +1,7 @@
 # raster
 
 `src/ui/raster.rs` turns any image into cells. album art uses it, and
-the video pane (`src/framesource.rs`) uses the same code, which is why
+album art uses this code, which is why
 nothing in it knows what a cover is.
 
 ## quantize: the branch stays, and why
@@ -106,7 +106,7 @@ instead.
 
 the video pane uses `Stretch`, and that is not a distortion: mpv is
 asked for a frame exactly `2cols x 2rows` pixels with its own letterbox
-already baked in (`framesource::Grid`), so stretching is a 1:1 copy and
+already baked in, so stretching is a 1:1 copy and
 the rasterizer resamples nothing.
 
 ## the unsharp pass

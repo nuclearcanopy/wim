@@ -441,6 +441,45 @@ impl BrowseView {
         self.clamp_selection();
     }
 
+    /// Follow playback while the cursor is on the previous track,
+    /// skipping rows that could not be queued if necessary.
+    pub fn follow_next(&mut self, previous: &SearchItem, next: &SearchItem) {
+        if !self
+            .tracks
+            .get(self.selected)
+            .is_some_and(|item| same_track(item, previous))
+        {
+            return;
+        }
+        let visible = self.visible_track_indices();
+        if let Some(position) = visible.iter().position(|&index| index == self.selected) {
+            if let Some(index) = visible[position + 1..]
+                .iter()
+                .copied()
+                .find(|&index| same_track(&self.tracks[index], next))
+            {
+                self.selected = index;
+            }
+        }
+    }
+
+    /// Loop-all starts a fresh mpv playlist at the session's first row.
+    pub fn follow_restart(&mut self, previous: &SearchItem, first: &SearchItem) {
+        if self
+            .tracks
+            .get(self.selected)
+            .is_some_and(|item| same_track(item, previous))
+        {
+            if let Some(index) = self
+                .visible_track_indices()
+                .into_iter()
+                .find(|&index| same_track(&self.tracks[index], first))
+            {
+                self.selected = index;
+            }
+        }
+    }
+
     pub fn next(&mut self) {
         if self.albums_focused {
             if self.albums_selected + 1 < self.albums.len() {
@@ -470,6 +509,20 @@ impl BrowseView {
             Some(_) => {}
             None => self.selected = visible.first().copied().unwrap_or(0),
         }
+    }
+}
+
+fn same_track(a: &SearchItem, b: &SearchItem) -> bool {
+    match (a, b) {
+        (
+            SearchItem::Song {
+                id: a, client: ac, ..
+            },
+            SearchItem::Song {
+                id: b, client: bc, ..
+            },
+        ) => a == b && ac.base_url() == bc.base_url(),
+        _ => a.identity() == b.identity(),
     }
 }
 
@@ -1038,6 +1091,65 @@ pub(crate) mod tests {
             view.selected, 2,
             "selected must stay a valid index into tracks"
         );
+    }
+
+    #[test]
+    fn playback_follows_adjacent_rows_without_stealing_manual_selection() {
+        let tracks = test_songs(40);
+        let mut view = test_view(tracks.clone());
+        for i in 0..39 {
+            view.follow_next(&tracks[i], &tracks[i + 1]);
+            assert_eq!(view.selected, i + 1);
+        }
+        view.selected = 10;
+        view.follow_next(&tracks[20], &tracks[21]);
+        assert_eq!(view.selected, 10);
+        view.follow_next(&tracks[10], &tracks[12]);
+        assert_eq!(view.selected, 12);
+        view.follow_restart(&tracks[12], &tracks[0]);
+        assert_eq!(view.selected, 0);
+    }
+
+    #[test]
+    fn playback_follows_the_next_visible_filtered_row() {
+        let tracks = songs_named(&["match one", "other", "match two"]);
+        let mut view = test_view(tracks.clone());
+        view.is_artist = true;
+        view.filter_query = "match".into();
+        view.follow_next(&tracks[0], &tracks[2]);
+        assert_eq!(view.selected, 2);
+    }
+
+    #[test]
+    fn repeated_songs_follow_the_next_occurrence() {
+        let tracks = songs_named(&["repeat", "repeat", "last"]);
+        let mut view = test_view(tracks.clone());
+        view.follow_next(&tracks[0], &tracks[1]);
+        assert_eq!(view.selected, 1);
+        view.follow_next(&tracks[1], &tracks[2]);
+        assert_eq!(view.selected, 2);
+    }
+
+    #[test]
+    fn songs_with_equal_ids_on_different_servers_do_not_match() {
+        let tracks = test_songs(2);
+        let mut other = tracks[0].clone();
+        if let SearchItem::Song { client, .. } = &mut other {
+            *client = Arc::new(
+                Client::new(&crate::config::NavidromeConfig {
+                    url: "https://other.invalid".into(),
+                    username: "test".into(),
+                    password: Some("test".into()),
+                    password_file: None,
+                    max_bitrate_kbps: None,
+                    transcode_format: None,
+                })
+                .unwrap(),
+            );
+        }
+        let mut view = test_view(tracks.clone());
+        view.follow_next(&other, &tracks[1]);
+        assert_eq!(view.selected, 0);
     }
 
     #[test]

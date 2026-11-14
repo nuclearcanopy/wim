@@ -934,7 +934,7 @@ mod tests {
 
     /// Alternating batches in one process, best of each, in
     /// microseconds. Same helper and the same reason as
-    /// `framesource::frame_budget::best_each`: sequential runs on this
+    /// the alternating-batch benchmark harness: sequential runs on this
     /// box differ 1.6-1.8x under load, so two numbers from two runs are
     /// not comparable and this is the only shape that is.
     fn best_each(

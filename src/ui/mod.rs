@@ -2,6 +2,7 @@ pub mod albumart;
 pub mod banner;
 pub mod browse;
 pub mod controlsbar;
+pub mod crossfade;
 pub mod divider;
 pub mod draw;
 pub mod eq_menu;

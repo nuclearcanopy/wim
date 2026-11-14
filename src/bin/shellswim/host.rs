@@ -62,7 +62,7 @@ use wim::core::{
     SubtitleOutcome, TrackResolver,
 };
 use wim::download::DownloadEvent;
-use wim::notify::Notifications;
+use wim::notify::{Notifications, Severity};
 use wim::playqueue::{PlayQueue, PosChange};
 use wim::search::SearchItem;
 use wim::shellsong::{Console, LineKind, Op, Program};
@@ -130,7 +130,10 @@ fn run_torbox_op(cfg: &config::Config, op: Op) -> Result<TorBoxPayload, String> 
                     .map(|item| {
                         format!(
                             "{} · {} · id={} · {} files",
-                            item.name,
+                            wim::torbox_workspace::safe_display_name(
+                                &item.name,
+                                cfg.watch_reveal_spoilers,
+                            ),
                             item.status,
                             item.id,
                             item.files.len()
@@ -160,7 +163,10 @@ fn run_torbox_op(cfg: &config::Config, op: Op) -> Result<TorBoxPayload, String> 
                 for item in &items {
                     lines.push(format!(
                         "{} · {} · id={} · {} files",
-                        item.name,
+                        wim::torbox_workspace::safe_display_name(
+                            &item.name,
+                            cfg.watch_reveal_spoilers,
+                        ),
                         item.status,
                         item.id,
                         item.files.len()
@@ -172,7 +178,12 @@ fn run_torbox_op(cfg: &config::Config, op: Op) -> Result<TorBoxPayload, String> 
                     {
                         lines.push(format!(
                             "  {} · file_id={} · {} bytes",
-                            file.name, file.id, file.size
+                            wim::torbox_workspace::safe_display_name(
+                                &file.name,
+                                cfg.watch_reveal_spoilers,
+                            ),
+                            file.id,
+                            file.size
                         ));
                     }
                 }
@@ -372,14 +383,28 @@ impl Host {
         );
         let (star_tx, star_rx) = mpsc::channel();
         let (torbox_tx, torbox_rx) = mpsc::channel();
+        let mut notifications = Notifications::default();
+        if cfg.offline_download_format != "flac"
+            && cfg.effective_offline_download_bitrate_kbps() <= 96
+        {
+            notifications.push(
+                Severity::Alert,
+                format!(
+                    "low offline audio quality: downloads will use {} kbps",
+                    cfg.effective_offline_download_bitrate_kbps()
+                ),
+            );
+        }
+        let cache_index = Arc::new(Mutex::new(cache::CacheIndex::load()));
+        cache::initialize_budget(cfg.offline_cache_max_bytes);
         Ok(Host {
             cfg,
             player,
             app,
-            notifications: Notifications::default(),
+            notifications,
             play_queue: PlayQueue::default(),
             previous_track: None,
-            cache_index: Arc::new(Mutex::new(cache::CacheIndex::load())),
+            cache_index,
             download_tx,
             download_rx,
             downloading: HashSet::new(),
@@ -516,6 +541,17 @@ impl Host {
                         Err(why) => core.console.note(why),
                     },
                     Intent::Download => {
+                        if core.cfg.offline_download_format != "flac"
+                            && core.cfg.effective_offline_download_bitrate_kbps() <= 96
+                        {
+                            core.notifications.push(
+                                Severity::Alert,
+                                format!(
+                                    "low offline audio quality: downloads will use {} kbps",
+                                    core.cfg.effective_offline_download_bitrate_kbps()
+                                ),
+                            );
+                        }
                         let done = core::download_resolved(&tracks, &mut core);
                         core.console.note(done.status);
                     }

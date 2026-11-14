@@ -341,11 +341,7 @@ pub fn classify(op: &Op) -> Reversibility {
         // redo, and the tree would fork on every change of mind.
         | Op::Undo
         | Op::Redo
-        // a persisted display preference, not playback state: the
-        // settings menu's own row for it is not undoable either, and
-        // making it `Restorable` would mean the snapshot carrying
-        // config.toml and undo rewriting the file.
-        | Op::SetVideoOutput(_)
+        | Op::OpenVideoPlayer
         | Op::Quit => Ignored,
     }
 }
@@ -1008,10 +1004,7 @@ mod tests {
         // a persisted display preference, like the settings menu's own
         // row for it: undoing it would mean the snapshot carrying
         // config.toml and the undo rewriting the file.
-        assert_eq!(
-            classify(&Op::SetVideoOutput(crate::config::VideoOutput::Ascii)),
-            Reversibility::Ignored
-        );
+        assert_eq!(classify(&Op::OpenVideoPlayer), Reversibility::Ignored);
         assert_eq!(classify(&Op::Undo), Reversibility::Ignored);
         assert_eq!(classify(&Op::Redo), Reversibility::Ignored);
     }

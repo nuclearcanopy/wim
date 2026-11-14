@@ -94,8 +94,8 @@ impl Modal {
     ///
     /// Separate from `covers_screen` because the two questions were
     /// conflated into one `overlay` flag in main.rs, and it was wrong
-    /// for both: it fed `video::wanted` (where a tier painted over the
-    /// video must count, and the console and the subtitle menu were
+    /// for both: it fed the full-screen-video gate (where a tier painted
+    /// over the video must count, and the console and subtitle menu were
     /// missing) *and* the animation gate (where a tier with a caret
     /// must not count, because it is the reason to keep animating).
     pub fn animates(self) -> bool {
@@ -134,8 +134,8 @@ pub struct Tiers {
 impl Tiers {
     /// Whether anything is painted over the panes behind it.
     ///
-    /// This is what mpv must be told, or it keeps drawing a video
-    /// straight over the modal; `video::wanted` takes it as `overlay`.
+    /// This distinguishes overlays that cover the workspace from those
+    /// that leave panes visible beneath them.
     pub fn covers_screen(self) -> bool {
         TIERS.iter().any(|m| self.up(*m) && m.covers_screen())
     }
@@ -246,6 +246,8 @@ pub struct HitMap {
     pub bottom: Option<Rect>,
     pub lists: Vec<List>,
     pub controls: Vec<Control>,
+    /// Video workspace's lyric-sync action, recorded from the rendered player layout.
+    pub video_sync: Option<Rect>,
     /// Text boxes and the rect each was drawn in; clicking one puts
     /// the keyboard in it, the way clicking a field does anywhere
     /// else, instead of the surrounding pane taking the click and
@@ -308,6 +310,7 @@ pub enum Act {
     /// the drag opens, which is the one thing a pointer knows about a
     /// control and a key does not.
     Press(Field, Option<f64>),
+    OpenSubtitleMenu,
     ScrubTo(f64),
     ScrubCommit(f64),
     /// One notch over the list under the pointer, whether or not it has
@@ -387,6 +390,10 @@ pub fn act(map: &HitMap, click: Click, dragging: bool) -> Act {
             }
         }
         return Act::Press(control.field, None);
+    }
+
+    if map.video_sync.is_some_and(|rect| inside(rect, col, row)) {
+        return Act::OpenSubtitleMenu;
     }
 
     if let Some((which, _)) = map.boxes.iter().find(|(_, r)| inside(*r, col, row)) {
@@ -491,6 +498,14 @@ mod tests {
         // and past the frame entirely.
         assert_eq!(act(&m, down(200, 5), false), Act::Nothing);
         assert_eq!(act(&m, down(5, 90), false), Act::Nothing);
+    }
+
+    #[test]
+    fn clicking_the_video_lyric_sync_button_opens_subtitle_controls() {
+        let mut map = map();
+        map.video_sync = Some(Rect::new(30, 8, 20, 1));
+        assert_eq!(act(&map, down(35, 8), false), Act::OpenSubtitleMenu);
+        assert_eq!(act(&map, down(35, 9), false), Act::Focus(Focus::Workspace));
     }
 
     #[test]

@@ -51,7 +51,11 @@ pub fn activate_transport(
     surf: &mut dyn Surface,
     ctx: &mut TransportCtx,
 ) {
-    // every control but the scrubber *is* a command, so it goes
+    if field == Field::Crossfade {
+        let _ = surf.open_crossfade();
+        return;
+    }
+    // Every remaining control except the scrubber is a command, so it goes
     // through the command. that is not only deduplication: `apply_op`
     // is where the undo tree records, so this is what puts a clicked
     // loop or shuffle in the history alongside a typed one.

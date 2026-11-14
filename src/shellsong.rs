@@ -576,11 +576,8 @@ pub enum Op {
     /// this takes `Ty::Duration` where `silence` needed `Ty::Span`:
     /// here `off` means something.
     SetGap(Option<f64>),
-    /// How a local video draws, i.e. `config.video_output`. Applied
-    /// through the host because the runtime override shift-`v` sets
-    /// lives beside the frame loop, and a mode set here that the
-    /// override then covered would do nothing.
-    SetVideoOutput(crate::config::VideoOutput),
+    /// Open/focus the native mpv window for the current video.
+    OpenVideoPlayer,
     /// A timed silence in the queue. `front` inserts it next, matching
     /// `add_to_queue`'s position parameter rather than inventing a
     /// second way to say the same thing.
@@ -631,7 +628,7 @@ impl Op {
     pub fn describe(&self) -> String {
         match self {
             Op::TogglePause => "pause toggled".into(),
-            Op::SetVideoOutput(mode) => format!("video output: {}", mode.word()),
+            Op::OpenVideoPlayer => "opened / focused mpv video".into(),
             Op::SkipNext(1) => "skipped".into(),
             Op::SkipNext(n) => format!("skipped {n} tracks"),
             Op::PauseFor(secs) => format!("paused for {secs}s"),
@@ -814,8 +811,6 @@ pub enum Words {
     Tier,
     /// which setting a `forget` drops.
     Setting,
-    /// how a local video is drawn, i.e. `config.video_output`.
-    VideoMode,
     TorBoxService,
     TorBoxOperation,
 }
@@ -844,9 +839,6 @@ impl Words {
             Words::FadeDir => &["in", "out"],
             Words::Tier => &["track", "album", "artist"],
             Words::Setting => &["eq", "volume", "speed"],
-            // the same five `config.video_output` takes, spelled the
-            // way config.toml spells them.
-            Words::VideoMode => &["auto", "tct", "kitty", "ascii", "off"],
             Words::TorBoxService => &["torrent", "usenet", "web"],
             Words::TorBoxOperation => &["pause", "resume", "reannounce", "delete"],
         }
@@ -1263,9 +1255,9 @@ pub const COMMANDS: &[Command] = &[
     cmd(
         "video",
         &[],
-        &[req("mode", Ty::Words(Words::VideoMode))],
         &[],
-        "how a local video draws: video(ascii), video(auto)",
+        &[],
+        "open or focus the current video's mpv window",
     ),
     cmd(
         "silence",
@@ -2649,24 +2641,6 @@ impl Call {
         })
     }
 
-    /// `Words::VideoMode` validated the word, so this is the mapping
-    /// and not a second validation.
-    fn video_mode_op(&self) -> Option<Op> {
-        let mode = match self.keyword(Words::VideoMode)? {
-            "auto" => crate::config::VideoOutput::Auto,
-            "tct" => crate::config::VideoOutput::Tct,
-            "kitty" => crate::config::VideoOutput::Kitty,
-            "ascii" => crate::config::VideoOutput::Ascii,
-            "off" => crate::config::VideoOutput::Off,
-            // unreachable while `options` and this agree; a new mode
-            // added to one and not the other refuses rather than
-            // guessing, which is the same stance `simple_op`'s other
-            // `None` arms take.
-            _ => return None,
-        };
-        Some(Op::SetVideoOutput(mode))
-    }
-
     /// The op for every command whose whole behaviour is one op; the
     /// term-resolving and higher-order ones are handled in `Lowering`.
     fn simple_op(&self) -> Option<Op> {
@@ -2713,9 +2687,7 @@ impl Call {
                 Some(Arg::Duration(d)) => Op::SetGap(*d),
                 _ => return None,
             },
-            // the word is already validated against `Words::VideoMode`,
-            // so an unknown one cannot reach here.
-            "video" => self.video_mode_op()?,
+            "video" => Op::OpenVideoPlayer,
             "silence" => match first {
                 // rounded to whole seconds: the lavfi source takes an
                 // integer and nobody queues a 1.5 second gap. rounded
@@ -7474,7 +7446,6 @@ mod tests {
     #[test]
     fn every_parameter_type_offers_candidates_xor_a_hint() {
         let every: Vec<Ty> = vec![
-            Ty::Words(Words::VideoMode),
             Ty::Terms,
             Ty::Query,
             Ty::NewName,
@@ -7532,41 +7503,10 @@ mod tests {
         }
     }
 
-    /// Every mode `config.video_output` takes, spelled the way
-    /// config.toml spells it: the console doubles as documentation for
-    /// what to put in the file, so a different spelling here would
-    /// teach the wrong thing.
     #[test]
-    fn video_takes_every_mode_the_config_does() {
-        for (word, mode) in [
-            ("auto", crate::config::VideoOutput::Auto),
-            ("tct", crate::config::VideoOutput::Tct),
-            ("kitty", crate::config::VideoOutput::Kitty),
-            ("ascii", crate::config::VideoOutput::Ascii),
-            ("off", crate::config::VideoOutput::Off),
-        ] {
-            assert_eq!(
-                ops(&format!("video({word})")),
-                vec![Op::SetVideoOutput(mode)],
-                "video({word})"
-            );
-            assert_eq!(mode.word(), word, "the config spelling drifted");
-        }
-    }
-
-    /// A mode wim does not have is refused with the list, not guessed
-    /// at and not silently dropped.
-    #[test]
-    fn video_refuses_a_mode_that_is_not_one() {
-        let why = error("video(sixel)");
-        assert!(
-            why.message.contains("auto, tct, kitty, ascii, off"),
-            "{why:?}"
-        );
-        assert_eq!(why.token, "sixel");
-        // and the parameter is required, so the bare call is refused
-        // rather than defaulting to a mode the user did not name.
-        assert!(!error("video()").message.is_empty());
+    fn video_opens_the_native_player_without_renderer_arguments() {
+        assert_eq!(ops("video()"), vec![Op::OpenVideoPlayer]);
+        assert!(!error("video(ascii)").message.is_empty());
     }
 
     /// The command-name list is bounded by the table, not by the

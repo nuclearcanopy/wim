@@ -831,7 +831,7 @@ impl Loader {
         self.request_with_path(client, label, artist, title, album, duration_secs, None);
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // Mirrors `request` plus its local-file hint.
     pub fn request_local(
         &mut self,
         client: &Client,
@@ -853,7 +853,7 @@ impl Loader {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // These lookup fields are intentionally passed as one-shot inputs.
     fn request_with_path(
         &mut self,
         client: &Client,
@@ -878,7 +878,7 @@ impl Loader {
         });
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // Adds the Subsonic song identity to the shared lookup inputs.
     pub fn request_subsonic(
         &mut self,
         client: &Client,

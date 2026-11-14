@@ -21,6 +21,13 @@ be persisted or logged.
 Account item identities can be saved in named queues as service/item/file IDs;
 temporary stream URLs are excluded. Playback-link resolution runs in the
 existing background track resolver before items enter mpv's playlist.
+Episode release/file names are masked in the TorBox UI and shellswim by default;
+`programs.wim.watchRevealSpoilers` (or `watch_reveal_spoilers`) controls the
+persistent default. In the TorBox workspace, `v` temporarily reveals names and
+`V` changes the saved default. shellswim one-shot listing/search output follows
+the persisted preference. In Wim, the same `v`/`V` controls are available from
+the search and account/listing views; in shellswim, set the preference in Wim's
+config (or Home Manager) before running listing commands.
 
 Voyager's public metadata search API is gone: `search-api.torbox.app` no
 longer resolves, and the main API exposes no metadata-search route. Wim's
