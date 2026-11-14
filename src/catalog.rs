@@ -364,13 +364,32 @@ pub fn index_navidrome_server(
     // client from the credentials as they are now rather than reuse one
     // carrying the old ones.
     let catalog = fetch_navidrome_catalog(nav, &[])?;
+    Ok(finish_navidrome_index(app, catalog))
+}
+
+/// The fetch half of `index_navidrome_server` on its own thread, for
+/// callers that must not block the ui on a slow or dead server. Hand the
+/// received catalog to `finish_navidrome_index` on the ui thread.
+pub fn spawn_navidrome_index(
+    nav: config::NavidromeConfig,
+) -> std::sync::mpsc::Receiver<Result<FetchedCatalog, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(fetch_navidrome_catalog(&nav, &[]));
+    });
+    rx
+}
+
+/// The merge half: folds a fetched catalog into the app and words the
+/// outcome the way the blocking path always did.
+pub fn finish_navidrome_index(app: &mut app::App, catalog: FetchedCatalog) -> String {
     let summary = catalog.summary();
     // this path's `Ok` is shown to the user verbatim, so a failed
     // cache write is said here rather than needing a channel.
-    Ok(match merge_catalog_into_app(app, catalog) {
+    match merge_catalog_into_app(app, catalog) {
         Some(warning) => format!("{summary}; {warning}"),
         None => summary,
-    })
+    }
 }
 
 /// Plain connectivity check (ping only, no catalog fetch) for every

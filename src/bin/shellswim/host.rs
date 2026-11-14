@@ -305,6 +305,8 @@ pub struct Host {
     pub player: mpv::Mpv,
     pub app: app::App,
     pub notifications: Notifications,
+    /// A server being added or reconnected, answering off the ui thread.
+    pub pending_connect: Option<crate::nav_ui::PendingConnect>,
     pub play_queue: PlayQueue,
     pub previous_track: Option<SearchItem>,
     pub cache_index: Arc<Mutex<cache::CacheIndex>>,
@@ -524,6 +526,7 @@ impl Host {
             download_tx,
             download_rx,
             downloading: HashSet::new(),
+            pending_connect: None,
             subtitle_tx,
             subtitle_rx,
             remote_search_tx,

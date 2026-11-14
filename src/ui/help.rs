@@ -123,6 +123,9 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             ),
             (Key::Fixed("left/right"), "artist: switch column"),
             (Key::Bound(KeyAction::StartSearch), "artist: filter songs"),
+            (Key::Fixed("W"), "Watch workspace"),
+            (Key::Fixed("T"), "TorBox workspace"),
+            (Key::Fixed("J / K"), "queue: move track down / up"),
         ],
     ),
     (
@@ -137,6 +140,7 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
                 Key::Bound(KeyAction::OpenVideoPlayer),
                 "open / focus mpv video",
             ),
+            (Key::Fixed("F / f11"), "fullscreen video"),
             (Key::Bound(KeyAction::CycleArtMode), "cycle album art"),
             (Key::Bound(KeyAction::ToggleResizeMode), "resize panes"),
         ],
@@ -916,7 +920,7 @@ mod tests {
         let keymap = Keymap::default();
         // one column, tall enough that nothing scrolls, so every row
         // of the table is on screen at a known x.
-        let (w, h) = (56u16, 80u16);
+        let (w, h) = (56u16, 90u16);
         let mut buf = buffer(w, h);
         HelpOverlay {
             keymap: &keymap,
@@ -1012,7 +1016,7 @@ mod tests {
     #[test]
     fn a_row_paints_its_key_a_shade_above_its_description() {
         let keymap = Keymap::default();
-        let (w, h) = (56u16, 80u16);
+        let (w, h) = (56u16, 90u16);
         let mut buf = buffer(w, h);
         HelpOverlay {
             keymap: &keymap,

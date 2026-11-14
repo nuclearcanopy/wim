@@ -99,10 +99,14 @@ pub const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::Quit,
 ];
 
-/// F11 and `f`/`F` are universal movie-fullscreen reflexes, in addition
-/// to the user's configurable fullscreen-video key.
-pub fn is_fullscreen_video_key(code: KeyCode, configured: KeyCode) -> bool {
-    matches!(code, KeyCode::Char('f' | 'F') | KeyCode::F(11)) || code == configured
+/// F11 and `F` are universal movie-fullscreen reflexes, in addition to
+/// the user's configurable fullscreen-video key. Plain `f` is one too
+/// unless an action owns it (`skip_next` does by default): a reflex must
+/// not shadow a binding, or that action is dead for the whole video.
+pub fn is_fullscreen_video_key(code: KeyCode, configured: KeyCode, keymap: &Keymap) -> bool {
+    code == configured
+        || matches!(code, KeyCode::Char('F') | KeyCode::F(11))
+        || (code == KeyCode::Char('f') && keymap.action_bound_to(code).is_none())
 }
 
 impl KeyAction {
@@ -283,6 +287,10 @@ pub const RESERVED_KEYS: &[(KeyCode, &str)] = &[
     (KeyCode::Char('g'), "jump to top / bottom"),
     (KeyCode::Char('G'), "jump to top / bottom"),
     (KeyCode::Char('K'), "the remap menu itself"),
+    (KeyCode::Char('W'), "the Watch workspace"),
+    (KeyCode::Char('T'), "the TorBox workspace"),
+    (KeyCode::Char('F'), "fullscreen video"),
+    (KeyCode::F(11), "fullscreen video"),
     (KeyCode::Char(':'), "the shellsong console"),
     (KeyCode::Enter, "play / open"),
     (KeyCode::Esc, "back / close"),
@@ -511,16 +519,32 @@ mod tests {
 
     #[test]
     fn movie_fullscreen_recognizes_pc_reflex_keys_and_the_configured_alias() {
-        for key in [KeyCode::Char('f'), KeyCode::Char('F'), KeyCode::F(11)] {
-            assert!(is_fullscreen_video_key(key, KeyCode::Char('v')));
+        let mut map = Keymap::default();
+        // plain `f` skips by default, so it must not also be a reflex
+        assert!(!is_fullscreen_video_key(
+            KeyCode::Char('f'),
+            KeyCode::Char('v'),
+            &map
+        ));
+        for key in [KeyCode::Char('F'), KeyCode::F(11)] {
+            assert!(is_fullscreen_video_key(key, KeyCode::Char('v'), &map));
         }
         assert!(is_fullscreen_video_key(
             KeyCode::Char('v'),
-            KeyCode::Char('v')
+            KeyCode::Char('v'),
+            &map
         ));
         assert!(!is_fullscreen_video_key(
             KeyCode::Char('q'),
-            KeyCode::Char('v')
+            KeyCode::Char('v'),
+            &map
+        ));
+        // freed, it is the familiar reflex again
+        map.set(KeyAction::SkipNext, KeyCode::Char('n'));
+        assert!(is_fullscreen_video_key(
+            KeyCode::Char('f'),
+            KeyCode::Char('v'),
+            &map
         ));
     }
 
