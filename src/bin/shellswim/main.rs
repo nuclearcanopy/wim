@@ -16,7 +16,7 @@ use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use wim::core::{self, Drive};
-use wim::keymap::{key_label, KeyAction, Keymap};
+use wim::keymap::{key_label, KeyAction, Keymap, ALL_ACTIONS};
 use wim::playqueue::PlayQueue;
 use wim::search::SearchItem;
 use wim::shellsong::{Console, ConsoleAction, LineKind};
@@ -130,13 +130,17 @@ fn prompt() -> anyhow::Result<()> {
     let mut guard = term::TerminalGuard::new(false)?;
     wim::trace_mark!("terminal ready");
 
-    let keymap = Keymap::from_overrides(&host.cfg.keybinds);
+    let mut keymap = Keymap::from_overrides(&host.cfg.keybinds);
     banner(&mut host.console, &host.cfg, &keymap);
     let mut first_frame = true;
     let mut queue_open = false;
     let mut queue_selected = 0usize;
     let mut subtitle_menu_open = false;
     let mut subtitle_menu_selected = 0usize;
+    let mut keybinds_open = false;
+    let mut keybinds_selected = 0usize;
+    let mut keybinds_capturing = false;
+    let mut keybinds_refused: Option<String> = None;
 
     loop {
         host.pump();
@@ -182,6 +186,10 @@ fn prompt() -> anyhow::Result<()> {
                 keymap: &keymap,
                 subtitle_menu_open,
                 subtitle_menu_selected,
+                keybinds_open,
+                keybinds_selected,
+                keybinds_capturing,
+                keybinds_refused: keybinds_refused.as_deref(),
             },
         )?;
         if first_frame {
@@ -202,6 +210,7 @@ fn prompt() -> anyhow::Result<()> {
         let animating = lyrics_setup.is_some()
             || queue_open
             || subtitle_menu_open
+            || keybinds_open
             || host.lyrics_pane.is_open()
             || host.has_program_work()
             || host.console.cycle().is_some()
@@ -354,6 +363,57 @@ fn prompt() -> anyhow::Result<()> {
                     }
                     continue;
                 }
+                if keybinds_open {
+                    if keybinds_capturing {
+                        keybinds_capturing = false;
+                        if key.code == KeyCode::Esc {
+                            keybinds_refused = None;
+                        } else {
+                            let action = ALL_ACTIONS[keybinds_selected];
+                            keybinds_refused = keymap.refusal(action, key.code);
+                            if keybinds_refused.is_none() {
+                                keymap.set(action, key.code);
+                                host.cfg.keybinds = keymap.overrides();
+                                if let Err(error) = config::save(&host.cfg) {
+                                    host.console.fail(format!("saving keybinds: {error}"));
+                                }
+                            }
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('K') => keybinds_open = false,
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                keybinds_selected = (keybinds_selected + 1) % ALL_ACTIONS.len();
+                                keybinds_refused = None;
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                keybinds_selected =
+                                    (keybinds_selected + ALL_ACTIONS.len() - 1) % ALL_ACTIONS.len();
+                                keybinds_refused = None;
+                            }
+                            KeyCode::Char('r') => {
+                                keybinds_capturing = true;
+                                keybinds_refused = None;
+                            }
+                            KeyCode::Char('0') => {
+                                keymap.reset(ALL_ACTIONS[keybinds_selected]);
+                                host.cfg.keybinds = keymap.overrides();
+                                if let Err(error) = config::save(&host.cfg) {
+                                    host.console.fail(format!("saving keybinds: {error}"));
+                                }
+                            }
+                            KeyCode::Char('R') => {
+                                keymap.reset_all();
+                                host.cfg.keybinds = keymap.overrides();
+                                if let Err(error) = config::save(&host.cfg) {
+                                    host.console.fail(format!("saving keybinds: {error}"));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
                 if queue_open {
                     let order = wim::ui::queue::selectable(
                         host.play_queue.entries(),
@@ -431,6 +491,12 @@ fn prompt() -> anyhow::Result<()> {
                     subtitle_menu_open = true;
                     continue;
                 }
+                if key.code == KeyCode::Char('K') && host.console.input.is_empty() {
+                    keybinds_open = true;
+                    keybinds_selected = 0;
+                    keybinds_refused = None;
+                    continue;
+                }
                 // '?' on an empty line is the short command list: the
                 // one thing a new user should not need the docs for.
                 // anywhere else it is a character like any other.
@@ -476,7 +542,7 @@ fn banner(console: &mut Console, cfg: &config::Config, keymap: &Keymap) {
         env!("CARGO_PKG_VERSION")
     ));
     console.note(format!(
-        "? commands · {} queue · {} subtitles · tab complete · dry(...) preview",
+        "? commands · {} queue · {} subtitles · K keys · tab complete · dry(...) preview",
         key_label(keymap.get(KeyAction::OpenQueueView)),
         key_label(keymap.get(KeyAction::OpenSubtitleMenu))
     ));
@@ -516,6 +582,10 @@ struct Screen<'a> {
     keymap: &'a Keymap,
     subtitle_menu_open: bool,
     subtitle_menu_selected: usize,
+    keybinds_open: bool,
+    keybinds_selected: usize,
+    keybinds_capturing: bool,
+    keybinds_refused: Option<&'a str>,
 }
 
 struct LyricsSetup {
@@ -685,6 +755,20 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
                         keymap: s.keymap,
                         alignment_status: "",
                         alignment_controls: false,
+                    },
+                    body,
+                );
+            } else if s.keybinds_open {
+                let keys: Vec<String> = ALL_ACTIONS
+                    .iter()
+                    .map(|action| key_label(s.keymap.get(*action)))
+                    .collect();
+                f.render_widget(
+                    wim::ui::keybinds_menu::KeybindsMenu {
+                        keys: &keys,
+                        selected: s.keybinds_selected,
+                        capturing: s.keybinds_capturing,
+                        refused: s.keybinds_refused,
                     },
                     body,
                 );
