@@ -30,6 +30,9 @@ pub struct SubtitleMenu<'a> {
     pub selected: usize,
     pub keymap: &'a Keymap,
     pub alignment_status: &'a str,
+    /// False in frontends that don't implement local alignment; keeps
+    /// the shared menu from advertising controls they cannot honor.
+    pub alignment_controls: bool,
 }
 
 const WIDTH: u16 = 42;
@@ -77,14 +80,18 @@ impl Widget for SubtitleMenu<'_> {
             rect,
             x + 2,
             y + 2,
-            if self.alignment_status.is_empty() {
+            if self.alignment_controls && self.alignment_status.is_empty() {
                 "a align · c cancel · p preview"
-            } else {
+            } else if self.alignment_controls {
                 self.alignment_status
+            } else {
+                "changes save automatically"
             },
             shade(DIM),
         );
-        draw_text(buf, rect, x + 2, y + 12, "y accept · d reject", shade(DIM));
+        if self.alignment_controls {
+            draw_text(buf, rect, x + 2, y + 12, "y accept · d reject", shade(DIM));
+        }
 
         for (i, (label, value)) in FIELD_LABELS.iter().zip(self.values.iter()).enumerate() {
             let row_y = y + 4 + i as u16;
@@ -147,6 +154,7 @@ mod tests {
             selected: 0,
             keymap: &Keymap::default(),
             alignment_status: "",
+            alignment_controls: true,
         }
         .render(area, buf);
     }
@@ -242,6 +250,7 @@ mod tests {
             selected: 0,
             keymap: &keymap,
             alignment_status: "",
+            alignment_controls: true,
         }
         .render(area, &mut buf);
         let out: String = (0..area.height)
@@ -256,5 +265,24 @@ mod tests {
         assert!(!out.contains("(t to close)"), "stale default key:\n{out}");
         // h/l and j/k are reserved, not keymap entries.
         assert!(out.contains("a align · c cancel"), "got:\n{out}");
+    }
+
+    #[test]
+    fn a_frontend_without_alignment_does_not_advertise_its_controls() {
+        let area = Rect::new(0, 0, 50, 20);
+        let mut buf = Buffer::empty(area);
+        SubtitleMenu {
+            values: [""; FIELD_COUNT],
+            selected: 0,
+            keymap: &Keymap::default(),
+            alignment_status: "",
+            alignment_controls: false,
+        }
+        .render(area, &mut buf);
+        let out = grid(&buf);
+        assert!(out.contains("changes save automatically"));
+        assert!(!out.contains("align"));
+        assert!(!out.contains("accept"));
+        assert!(!out.contains("reject"));
     }
 }

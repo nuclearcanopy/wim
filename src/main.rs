@@ -2571,6 +2571,7 @@ fn main() -> anyhow::Result<()> {
                         selected: subtitle_menu_selected,
                         keymap: &keymap,
                         alignment_status: &alignment_status,
+                        alignment_controls: true,
                     },
                     area,
                 );

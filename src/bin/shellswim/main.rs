@@ -135,6 +135,8 @@ fn prompt() -> anyhow::Result<()> {
     let mut first_frame = true;
     let mut queue_open = false;
     let mut queue_selected = 0usize;
+    let mut subtitle_menu_open = false;
+    let mut subtitle_menu_selected = 0usize;
 
     loop {
         host.pump();
@@ -174,9 +176,12 @@ fn prompt() -> anyhow::Result<()> {
                     (&host.lyrics_pane, active)
                 }),
                 setup: lyrics_setup.as_ref(),
+                subtitles: &host.cfg.subtitles,
                 queue_open,
                 queue_selected,
                 keymap: &keymap,
+                subtitle_menu_open,
+                subtitle_menu_selected,
             },
         )?;
         if first_frame {
@@ -196,6 +201,7 @@ fn prompt() -> anyhow::Result<()> {
         // when nothing does.
         let animating = lyrics_setup.is_some()
             || queue_open
+            || subtitle_menu_open
             || host.lyrics_pane.is_open()
             || host.has_program_work()
             || host.console.cycle().is_some()
@@ -283,6 +289,71 @@ fn prompt() -> anyhow::Result<()> {
                     }
                     continue;
                 }
+                if subtitle_menu_open {
+                    if key.code == KeyCode::Esc
+                        || key.code == keymap.get(KeyAction::OpenSubtitleMenu)
+                    {
+                        subtitle_menu_open = false;
+                        if let Err(error) = config::save(&host.cfg) {
+                            host.console
+                                .fail(format!("saving subtitle settings: {error}"));
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                subtitle_menu_selected = (subtitle_menu_selected + 1)
+                                    % wim::ui::subtitle_menu::FIELD_COUNT;
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                subtitle_menu_selected = (subtitle_menu_selected
+                                    + wim::ui::subtitle_menu::FIELD_COUNT
+                                    - 1)
+                                    % wim::ui::subtitle_menu::FIELD_COUNT;
+                            }
+                            KeyCode::Char('n') => match host.player.cycle_subtitle_track() {
+                                Ok(Some(message)) => host.console.note(message),
+                                Ok(None) => host.console.note("no subtitle tracks in this video"),
+                                Err(error) => host.console.fail(format!("subtitle track: {error}")),
+                            },
+                            KeyCode::Char('x') => match host.player.toggle_subtitle_visibility() {
+                                Ok(visible) => host.console.note(if visible {
+                                    "subtitles visible"
+                                } else {
+                                    "subtitles hidden"
+                                }),
+                                Err(error) => {
+                                    host.console.fail(format!("subtitle visibility: {error}"))
+                                }
+                            },
+                            KeyCode::Char('h') | KeyCode::Left => {
+                                adjust_subtitle_field(
+                                    &mut host.cfg.subtitles,
+                                    subtitle_menu_selected,
+                                    -1.0,
+                                );
+                                host.player.set_subtitle_style(&host.cfg.subtitles);
+                                if let Err(error) = config::save(&host.cfg) {
+                                    host.console
+                                        .fail(format!("saving subtitle settings: {error}"));
+                                }
+                            }
+                            KeyCode::Char('l') | KeyCode::Right => {
+                                adjust_subtitle_field(
+                                    &mut host.cfg.subtitles,
+                                    subtitle_menu_selected,
+                                    1.0,
+                                );
+                                host.player.set_subtitle_style(&host.cfg.subtitles);
+                                if let Err(error) = config::save(&host.cfg) {
+                                    host.console
+                                        .fail(format!("saving subtitle settings: {error}"));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
                 if queue_open {
                     let order = wim::ui::queue::selectable(
                         host.play_queue.entries(),
@@ -354,6 +425,12 @@ fn prompt() -> anyhow::Result<()> {
                     queue_selected = host.play_queue.pos().unwrap_or(0);
                     continue;
                 }
+                if key.code == keymap.get(KeyAction::OpenSubtitleMenu)
+                    && host.console.input.is_empty()
+                {
+                    subtitle_menu_open = true;
+                    continue;
+                }
                 // '?' on an empty line is the short command list: the
                 // one thing a new user should not need the docs for.
                 // anywhere else it is a character like any other.
@@ -399,9 +476,25 @@ fn banner(console: &mut Console, cfg: &config::Config, keymap: &Keymap) {
         env!("CARGO_PKG_VERSION")
     ));
     console.note(format!(
-        "? commands · {} queue · tab complete · dry(...) preview",
-        key_label(keymap.get(KeyAction::OpenQueueView))
+        "? commands · {} queue · {} subtitles · tab complete · dry(...) preview",
+        key_label(keymap.get(KeyAction::OpenQueueView)),
+        key_label(keymap.get(KeyAction::OpenSubtitleMenu))
     ));
+}
+
+fn adjust_subtitle_field(sub: &mut config::SubtitleConfig, field: usize, direction: f64) {
+    match field {
+        0 => sub.delay_secs = (sub.delay_secs + direction * 0.5).clamp(-30.0, 30.0),
+        1 => {
+            sub.font_size = (sub.font_size as i64 + (direction * 2.0) as i64).clamp(10, 100) as u32
+        }
+        2 => sub.position = (sub.position as i64 + (direction * 5.0) as i64).clamp(0, 150) as u32,
+        3 => sub.outline_size = (sub.outline_size + direction * 0.5).clamp(0.0, 5.0),
+        4 => sub.background_opacity = (sub.background_opacity + direction * 0.1).clamp(0.0, 1.0),
+        5 => sub.blur = (sub.blur + direction * 0.5).clamp(0.0, 10.0),
+        6 => sub.color_level = (sub.color_level + direction as f32 * 0.05).clamp(0.0, 1.0),
+        _ => {}
+    }
 }
 
 /// Everything one frame draws, bundled to stay under clippy's argument
@@ -417,9 +510,12 @@ struct Screen<'a> {
     gap_remaining: Option<f64>,
     lyrics: Option<(&'a wim::lyricspane::LyricsPane, Option<usize>)>,
     setup: Option<&'a LyricsSetup>,
+    subtitles: &'a config::SubtitleConfig,
     queue_open: bool,
     queue_selected: usize,
     keymap: &'a Keymap,
+    subtitle_menu_open: bool,
+    subtitle_menu_selected: usize,
 }
 
 struct LyricsSetup {
@@ -572,6 +668,26 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
                     },
                     body,
                 );
+            } else if s.subtitle_menu_open {
+                let values = [
+                    format!("{:+.1}s", s.subtitles.delay_secs),
+                    s.subtitles.font_size.to_string(),
+                    s.subtitles.position.to_string(),
+                    format!("{:.1}", s.subtitles.outline_size),
+                    format!("{:.1}", s.subtitles.background_opacity),
+                    format!("{:.1}", s.subtitles.blur),
+                    format!("{:.2}", s.subtitles.color_level),
+                ];
+                f.render_widget(
+                    wim::ui::subtitle_menu::SubtitleMenu {
+                        values: values.each_ref().map(String::as_str),
+                        selected: s.subtitle_menu_selected,
+                        keymap: s.keymap,
+                        alignment_status: "",
+                        alignment_controls: false,
+                    },
+                    body,
+                );
             } else {
                 f.render_widget(
                     SwimConsole {
@@ -605,4 +721,30 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
             );
         })
         .map(|_| ())
+}
+
+#[cfg(test)]
+mod subtitle_adjust_tests {
+    use super::*;
+
+    #[test]
+    fn subtitle_adjustments_step_and_clamp_to_supported_ranges() {
+        let mut config = config::SubtitleConfig::default();
+        adjust_subtitle_field(&mut config, 0, -1.0);
+        assert_eq!(config.delay_secs, -0.5);
+        adjust_subtitle_field(&mut config, 1, 1.0);
+        assert_eq!(config.font_size, 44);
+        adjust_subtitle_field(&mut config, 2, -1.0);
+        assert_eq!(config.position, 5);
+
+        config.delay_secs = 30.0;
+        config.font_size = 100;
+        config.position = 150;
+        adjust_subtitle_field(&mut config, 0, 1.0);
+        adjust_subtitle_field(&mut config, 1, 1.0);
+        adjust_subtitle_field(&mut config, 2, 1.0);
+        assert_eq!(config.delay_secs, 30.0);
+        assert_eq!(config.font_size, 100);
+        assert_eq!(config.position, 150);
+    }
 }
