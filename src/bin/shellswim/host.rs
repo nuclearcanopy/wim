@@ -514,6 +514,11 @@ impl Host {
         if let Some(warning) = proxy_unavailable {
             notifications.push(Severity::Alert, warning);
         }
+        for server in &cfg.navidrome_servers {
+            if let Some(warning) = wim::subsonic::insecure_transport_warning(&server.url) {
+                notifications.push(Severity::Alert, warning);
+            }
+        }
         let instance_lock = match wim::persistence::state_dir()
             .map(|dir| wim::fsutil::claim_instance_lock(&dir))
         {
