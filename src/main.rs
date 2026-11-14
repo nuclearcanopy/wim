@@ -1186,6 +1186,11 @@ fn main() -> anyhow::Result<()> {
             Ok(wim::fsutil::InstanceLock::Contended) => (None, true),
             _ => (None, false),
         };
+    for server in &cfg.navidrome_servers {
+        if let Some(warning) = wim::subsonic::insecure_transport_warning(&server.url) {
+            notifications.push(Severity::Alert, warning);
+        }
+    }
     if second_instance {
         notifications.push(
             Severity::Alert,
