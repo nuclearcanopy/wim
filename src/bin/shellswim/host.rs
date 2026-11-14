@@ -5,7 +5,7 @@
 //! locals); `CoreCtx` is still built per use, because the borrow of
 //! the core and the borrow of the surface have to stay disjoint.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -57,6 +57,7 @@ macro_rules! core_ctx {
     };
 }
 
+use wim::catalog::{self, BackgroundSyncResult};
 use wim::core::{
     self, BetweenTracks, CoreCtx, Drive, Intent, RemoteSearchOutcome, ScrobbleState, StarFailed,
     SubtitleOutcome, TrackResolver,
@@ -286,6 +287,9 @@ pub struct Host {
     pub remote_search_tx: Sender<core::RemoteSearchQuery>,
     pub remote_search_result_rx: Receiver<RemoteSearchOutcome>,
     pub scan_rx: Receiver<library::ScanBatch>,
+    sync_rx: Receiver<BackgroundSyncResult>,
+    _servers_tx: Sender<Vec<config::NavidromeConfig>>,
+    server_reachable: HashMap<String, bool>,
     pub scrobble: ScrobbleState,
     scrobble_failed_rx: Receiver<core::ScrobbleFailed>,
     pub favorites: favorites::Favorites,
@@ -350,6 +354,9 @@ impl Host {
         // last session's catalog, off disk, so the first prompt can
         // already complete track names.
         let warming = search::spawn_warm_from_cache(&cfg.navidrome_servers);
+        let (sync_tx, sync_rx) = mpsc::channel::<BackgroundSyncResult>();
+        let (servers_tx, servers_rx) = mpsc::channel();
+        catalog::spawn_background_sync(cfg.navidrome_servers.clone(), sync_tx, servers_rx);
 
         // returns as soon as mpv is forked; the socket wait is on a
         // connector thread. nothing below touches the player, so the
@@ -366,6 +373,7 @@ impl Host {
 
         let mut app = app::App::new(warming.take());
         app.scanning_library = true;
+        app.syncing_servers = !cfg.navidrome_servers.is_empty();
         let restored_eq = wim::eq::restore(
             cfg.eq_preset.as_deref(),
             cfg.eq_gains,
@@ -423,6 +431,7 @@ impl Host {
             notifications.push(Severity::Alert, warning);
         }
         let cache_index = Arc::new(Mutex::new(cache::CacheIndex::load()));
+        core::sweep_cache(&cache_index, cfg.cache_eviction_days);
         cache::initialize_budget(cfg.offline_cache_max_bytes);
         Ok(Host {
             cfg,
@@ -440,6 +449,9 @@ impl Host {
             remote_search_tx,
             remote_search_result_rx,
             scan_rx,
+            sync_rx,
+            _servers_tx: servers_tx,
+            server_reachable: HashMap::new(),
             scrobble: ScrobbleState {
                 failed_tx: Some(scrobble_failed_tx),
                 ..ScrobbleState::default()
@@ -844,6 +856,31 @@ impl Host {
             // two front-ends now agree.
             self.app.resync_results();
         }
+        while let Ok(sync) = self.sync_rx.try_recv() {
+            self.app.syncing_servers = false;
+            match sync.result {
+                Ok((catalog, starred)) => {
+                    if let Some(warning) = catalog::merge_catalog_into_app(&mut self.app, catalog) {
+                        self.notifications.push(Severity::Alert, warning);
+                    }
+                    self.remote_starred.extend(starred);
+                    if self.server_reachable.insert(sync.url.clone(), true) == Some(false) {
+                        self.notifications
+                            .push(Severity::Info, format!("{} is back online", sync.url));
+                    }
+                }
+                Err(message) => match self.server_reachable.insert(sync.url.clone(), false) {
+                    None => self
+                        .notifications
+                        .push(Severity::Error, format!("{}: {message}", sync.url)),
+                    Some(true) => self.notifications.push(
+                        Severity::Alert,
+                        format!("{} went offline: {message}", sync.url),
+                    ),
+                    Some(false) => {}
+                },
+            }
+        }
         let mut answered = false;
         while let Ok(outcome) = self.remote_search_result_rx.try_recv() {
             self.app
@@ -957,12 +994,16 @@ impl Host {
         outcome
     }
 
-    /// Parses and starts a line, exactly as submitting it at the
-    /// prompt does, so nothing scripted can behave differently from
-    /// something typed.
+    /// Parses a line against the live bindings and script directory,
+    /// the same environment used by interactive submission.
     pub fn begin(&mut self, line: &str) {
         self.console.push(LineKind::Command, line.to_string());
-        match Program::parse(line) {
+        let read = |name: &str| wim::shellsong_host::read_script(name);
+        let world = wim::shellsong::World {
+            scope: &self.vars,
+            read: Some(&read),
+        };
+        match Program::parse_in(line, &world) {
             Ok(p) => self.program = Some(Box::new(p)),
             Err(e) => self.console.fail(e.to_string()),
         }
