@@ -16,6 +16,7 @@ use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use wim::core::{self, Drive};
+use wim::eq_menu_keys::{adjust_eq_band, eq_menu_editor_key, eq_saved_row_hint, persist_eq};
 use wim::keymap::{key_label, KeyAction, Keymap, ALL_ACTIONS};
 use wim::playqueue::PlayQueue;
 use wim::search::SearchItem;
@@ -25,6 +26,7 @@ use wim::theme::{shade, DIM, NEAR_WHITE};
 #[cfg(feature = "dev-telemetry")]
 use wim::trace;
 use wim::ui::divider::HorizontalRule;
+use wim::ui::eq_menu as eqm;
 use wim::ui::lyrics_view::LyricsView;
 use wim::ui::results_list::label;
 use wim::{anim, config, mpv, term};
@@ -141,6 +143,7 @@ fn prompt() -> anyhow::Result<()> {
     let mut keybinds_selected = 0usize;
     let mut keybinds_capturing = false;
     let mut keybinds_refused: Option<String> = None;
+    let mut eq_menu = eqm::EqMenuPane::default();
 
     loop {
         host.pump();
@@ -158,6 +161,9 @@ fn prompt() -> anyhow::Result<()> {
             keybinds_open = true;
             keybinds_selected = 0;
             keybinds_refused = None;
+        }
+        if std::mem::take(&mut host.swim.eq_requested) && host.interactive_prompt {
+            eq_menu.open(host.app.eq_source, host.cfg.eq_custom_presets.len());
         }
 
         let now_playing = host.now_playing();
@@ -195,6 +201,14 @@ fn prompt() -> anyhow::Result<()> {
                 keybinds_selected,
                 keybinds_capturing,
                 keybinds_refused: keybinds_refused.as_deref(),
+                eq: eq_menu.is_open().then(|| EqScreen {
+                    gains: &host.app.eq_gains,
+                    saved: &host.cfg.eq_custom_presets,
+                    source: host.app.eq_source,
+                    modified: host.app.eq_custom,
+                    selected: eq_menu.selected(),
+                    state: eq_menu.state(),
+                }),
             },
         )?;
         if first_frame {
@@ -216,6 +230,7 @@ fn prompt() -> anyhow::Result<()> {
             || queue_open
             || subtitle_menu_open
             || keybinds_open
+            || eq_menu.is_open()
             || host.lyrics_pane.is_open()
             || host.has_program_work()
             || host.console.cycle().is_some()
@@ -368,6 +383,115 @@ fn prompt() -> anyhow::Result<()> {
                     }
                     continue;
                 }
+                if eq_menu.is_open() {
+                    if eq_menu.state().editor.is_some() {
+                        if let Some(mode) = eq_menu_editor_key(
+                            key.code,
+                            eq_menu.state_mut(),
+                            &mut host.cfg.eq_custom_presets,
+                            &mut host.app,
+                        ) {
+                            persist_eq(&mut host.cfg, &host.app, &mut host.notifications);
+                            eq_menu.set_selected(match mode {
+                                eqm::EditorMode::Save => eqm::opening_selection(
+                                    host.app.eq_source,
+                                    host.cfg.eq_custom_presets.len(),
+                                ),
+                                eqm::EditorMode::Rename(i) => eqm::PRESET_COUNT + i,
+                            });
+                        }
+                        continue;
+                    }
+                    let saved_len = host.cfg.eq_custom_presets.len();
+                    let at = eq_menu.cursor(saved_len);
+                    if key.code != eqm::DELETE_KEY {
+                        eq_menu.state_mut().disarm_delete();
+                    }
+                    if key.code == KeyCode::Esc {
+                        eq_menu.close();
+                        persist_eq(&mut host.cfg, &host.app, &mut host.notifications);
+                    } else if key.code == eqm::SAVE_KEY {
+                        eq_menu.state_mut().editor = Some(eqm::NameEditor::save());
+                        eq_menu.state_mut().message.clear();
+                    } else if key.code == eqm::RENAME_KEY {
+                        if let eqm::Cursor::Saved(i) = at {
+                            let current = host.cfg.eq_custom_presets.name_at(i).unwrap_or("");
+                            eq_menu.state_mut().editor = Some(eqm::NameEditor::rename(i, current));
+                            eq_menu.state_mut().message.clear();
+                        } else {
+                            eq_menu.state_mut().message = eq_saved_row_hint(&host.cfg, "rename");
+                        }
+                    } else if key.code == eqm::DELETE_KEY {
+                        if let eqm::Cursor::Saved(i) = at {
+                            let name = host
+                                .cfg
+                                .eq_custom_presets
+                                .name_at(i)
+                                .unwrap_or_default()
+                                .to_string();
+                            if eq_menu.state_mut().delete.press(i) {
+                                host.cfg.eq_custom_presets.remove(i);
+                                host.app.eq_source =
+                                    wim::eq::source_after_removal(host.app.eq_source, i);
+                                host.app.eq_custom =
+                                    host.app.eq_source.is_some() && host.app.eq_custom;
+                                persist_eq(&mut host.cfg, &host.app, &mut host.notifications);
+                                eq_menu.set_selected(eq_menu.selected().min(
+                                    eqm::selectable_count(host.cfg.eq_custom_presets.len()) - 1,
+                                ));
+                                eq_menu.state_mut().message = format!("deleted '{name}'");
+                            } else {
+                                eq_menu.state_mut().message = format!(
+                                    "press {} again to delete '{name}'",
+                                    key_label(eqm::DELETE_KEY)
+                                );
+                            }
+                        } else {
+                            eq_menu.state_mut().message = eq_saved_row_hint(&host.cfg, "delete");
+                        }
+                    } else {
+                        let bands = host.cfg.visualizer_bands as usize;
+                        let enabled = host.cfg.eq_enabled;
+                        match key.code {
+                            KeyCode::Char('j') | KeyCode::Down => eq_menu.set_selected(
+                                (eq_menu.selected() + 1).min(eqm::selectable_count(saved_len) - 1),
+                            ),
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                eq_menu.set_selected(eq_menu.selected().saturating_sub(1))
+                            }
+                            KeyCode::Enter => core::apply_eq_row(
+                                &mut host.app,
+                                &host.player,
+                                &mut host.notifications,
+                                &host.cfg.eq_custom_presets,
+                                eq_menu.selected(),
+                                enabled,
+                                bands,
+                            ),
+                            KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right => {
+                                let dir = if matches!(key.code, KeyCode::Char('h') | KeyCode::Left)
+                                {
+                                    -1.0
+                                } else {
+                                    1.0
+                                };
+                                if let eqm::Cursor::Band(band) = at {
+                                    adjust_eq_band(
+                                        &mut host.app,
+                                        &host.player,
+                                        &mut host.notifications,
+                                        band,
+                                        dir,
+                                        enabled,
+                                        bands,
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
                 if keybinds_open {
                     if keybinds_capturing {
                         keybinds_capturing = false;
@@ -496,6 +620,10 @@ fn prompt() -> anyhow::Result<()> {
                     subtitle_menu_open = true;
                     continue;
                 }
+                if key.code == KeyCode::Char('E') && host.console.input.is_empty() {
+                    eq_menu.open(host.app.eq_source, host.cfg.eq_custom_presets.len());
+                    continue;
+                }
                 if key.code == KeyCode::Char('K') && host.console.input.is_empty() {
                     keybinds_open = true;
                     keybinds_selected = 0;
@@ -547,7 +675,7 @@ fn banner(console: &mut Console, cfg: &config::Config, keymap: &Keymap) {
         env!("CARGO_PKG_VERSION")
     ));
     console.note(format!(
-        "? commands · {} queue · {} subtitles · K keys · tab complete · dry(...) preview",
+        "? commands · {} queue · {} subtitles · K keys · E eq · tab complete · dry(...) preview",
         key_label(keymap.get(KeyAction::OpenQueueView)),
         key_label(keymap.get(KeyAction::OpenSubtitleMenu))
     ));
@@ -591,6 +719,16 @@ struct Screen<'a> {
     keybinds_selected: usize,
     keybinds_capturing: bool,
     keybinds_refused: Option<&'a str>,
+    eq: Option<EqScreen<'a>>,
+}
+
+struct EqScreen<'a> {
+    gains: &'a [f64; 10],
+    saved: &'a wim::eq::CustomPresets,
+    source: Option<wim::eq::Source>,
+    modified: bool,
+    selected: usize,
+    state: &'a eqm::EqMenuState,
 }
 
 struct LyricsSetup {
@@ -760,6 +898,19 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
                         keymap: s.keymap,
                         alignment_status: "",
                         alignment_controls: false,
+                    },
+                    body,
+                );
+            } else if let Some(eq) = &s.eq {
+                f.render_widget(
+                    eqm::EqMenu {
+                        gains: eq.gains,
+                        saved: eq.saved,
+                        source: eq.source,
+                        modified: eq.modified,
+                        selected: eq.selected,
+                        state: eq.state,
+                        elapsed: s.now,
                     },
                     body,
                 );
