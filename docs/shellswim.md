@@ -50,7 +50,7 @@ answers, and only one of them is true.
 | printed in the core, identically in both | `view(queue)`, `view(index)`, `view(history)`, `view(playlists)`, `view(help)` |
 | dedicated interactive view / printed by one-shot | `view(lyrics)` |
 | printed by shellswim / opens its editor interactively | `view(keybinds)` |
-| printed settings snapshot | `view(settings)` |
+| printed settings snapshot, then opens the editor interactively | `view(settings)` |
 | printed equalizer snapshot, then opens the editor interactively | `view(eq)` |
 | printed undo history | `view(undo)` |
 | printed, personalized recommendations | `view(suggestions)` |
@@ -84,6 +84,11 @@ Press `K` for the keybind editor: `j`/`k` select an action, `r` captures
 a replacement, `0` resets one action, and `R` resets all bindings.
 Reserved or already-used keys are refused rather than saved as dead
 bindings.
+Press `U` (default `u`, uppercased like the subtitle key) or run
+`view(settings)` for the settings editor: `j`/`k` select, `h`/`l`
+adjust, `enter` edits the ListenBrainz token or confirms an offline
+cache rebuild. Album art and TorBox setup are listed as unavailable
+here. `esc` closes it and saves.
 Press `E` (or run `view(eq)`) for the equalizer editor: `j`/`k` move,
 `enter` applies a preset, `h`/`l` nudge a band, and the same save,
 rename and delete keys as wim manage custom curves. `esc` closes it

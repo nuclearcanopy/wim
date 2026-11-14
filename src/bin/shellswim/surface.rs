@@ -28,6 +28,8 @@ pub struct SwimSurface {
     pub keybinds_requested: bool,
     /// Same hand-off for the equalizer editor.
     pub eq_requested: bool,
+    /// Same hand-off for the settings editor.
+    pub settings_requested: bool,
     /// Interactive prompt requested a live lyrics display. One-shot
     /// commands still print lyrics to stdout after the same lookup.
     pub lyrics_requested: bool,
@@ -248,6 +250,7 @@ impl Borrowed<'_> {
     }
 
     fn print_settings(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
+        self.state.settings_requested = true;
         let cfg = core.cfg;
         let lines = [
             format!("equalizer: {} · {} visualizer bands", on_off(cfg.eq_enabled), cfg.visualizer_bands),
@@ -264,7 +267,7 @@ impl Borrowed<'_> {
         for line in lines {
             core.console.note(line);
         }
-        op_note("current settings".to_owned())
+        op_note("current settings · the settings key opens the editor".to_owned())
     }
 
     /// `view(now)`: what is playing, what is behind it, and where in
