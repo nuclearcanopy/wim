@@ -1,5 +1,5 @@
 //! shellswim's half of the seam. It has no panes, so most of
-//! `Surface` is a decline; the two it honours it honours by printing,
+//! `Surface` is a decline; the views it honours it honours by printing,
 //! which is the only thing a shell can do with a screen.
 //!
 //! Why decline rather than silently no-op: `view(eq)` doing nothing
@@ -109,10 +109,7 @@ impl Surface for Borrowed<'_> {
             }
             ViewTarget::Undo => self.print_undo(core),
             ViewTarget::Suggestions => self.print_suggestions(core),
-            ViewTarget::Starred => op_fail(format!(
-                "{}, but star(...) and view(queue) work here",
-                no_pane("starred", "wim's 'F'")
-            )),
+            ViewTarget::Starred => self.print_starred(core),
             // the five listings never reach a surface; the core prints
             // them. honoured here too rather than left to panic if
             // `is_screen()` and this ever disagree.
@@ -136,6 +133,25 @@ impl Surface for Borrowed<'_> {
 }
 
 impl Borrowed<'_> {
+    fn print_starred(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
+        let starred: Vec<_> = core
+            .app
+            .corpus
+            .items()
+            .filter(|item| core::is_starred(item, core.favorites, core.remote_starred))
+            .collect();
+        if starred.is_empty() {
+            return op_fail("nothing starred in the loaded library; star(item) to add one");
+        }
+        for item in &starred {
+            core.console.note(label(item));
+        }
+        op_note(format!(
+            "{} starred items · use unstar(item) to remove",
+            starred.len()
+        ))
+    }
+
     fn print_suggestions(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
         let starred = core::suggestion_starred_keys(core.remote_starred, core.favorites);
         let catalog = wim::suggest::Catalog::from_corpus(&core.app.corpus);
@@ -294,12 +310,6 @@ fn on_off(value: bool) -> &'static str {
 const NO_SELECTION: &str = "nothing is highlighted here; name what you mean, e.g. play(crest)";
 const NO_BROWSE_ROW: &str = "no browse view here; play(album name) plays the whole thing";
 
-/// `shellswim has no X pane; <where> has it`. One shape, so every
-/// refusal of a pane reads the same and always points somewhere.
-fn no_pane(what: &str, instead: &str) -> String {
-    format!("shellswim has no {what} pane; {instead} has it")
-}
-
 fn no_page(name: &str) -> String {
     format!("no page to open '{name}' in; queue({name}) then view(queue)")
 }
@@ -378,13 +388,10 @@ mod tests {
     }
 
     #[test]
-    fn every_decline_names_where_the_thing_does_exist() {
-        // a refusal that does not say where to go is just a wall, and
-        // one that says it twice reads like a bug.
-        let line = no_pane("equaliser", "wim's 'e'");
-        assert_eq!(line, "shellswim has no equaliser pane; wim's 'e' has it");
-        assert_eq!(line.matches("has it").count(), 1, "said once: {line}");
-        assert!(!line.contains("wim does"), "no doubled pointer: {line}");
+    fn starred_snapshot_has_an_actionable_empty_state() {
+        let text = "nothing starred in the loaded library; star(item) to add one";
+        assert!(text.contains("star(item)"));
+        assert!(text.contains("loaded library"));
     }
 
     #[test]
