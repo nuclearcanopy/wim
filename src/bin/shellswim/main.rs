@@ -122,6 +122,10 @@ fn prompt() -> anyhow::Result<()> {
         providers: host.cfg.lyrics.providers.clone(),
         key_file: String::new(),
     });
+    // a brand-new install with nowhere to read music from is offered the
+    // server form as soon as the lyrics choice is out of the way.
+    let mut offer_servers =
+        host.cfg.library_paths.is_empty() && host.cfg.navidrome_servers.is_empty();
 
     // the display's refresh rate decides how often the scrubber is
     // sampled, never how fast anything runs; one subprocess on a
@@ -190,6 +194,14 @@ fn prompt() -> anyhow::Result<()> {
         }
         if std::mem::take(&mut host.swim.undo_requested) && host.interactive_prompt {
             undo_open = true;
+        }
+        if offer_servers && lyrics_setup.is_none() {
+            offer_servers = false;
+            let mut manager = wim::navmanager::NavManager::new();
+            manager.step = wim::navmanager::NavManagerStep::Add(wim::ui::login::LoginForm::new());
+            manager.message =
+                "esc to skip (twice to close); local files still work with library_paths".into();
+            nav = Some(manager);
         }
         watch.poll();
         torbox_ui::poll(&mut host, &mut torbox);
