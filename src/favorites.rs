@@ -62,10 +62,14 @@ pub fn save(favorites: &Favorites) -> Result<()> {
 /// `~/.local/state/wim/favorites.toml`; same split as
 /// `persistence::load_from` and `library::save_or_warn_to`.
 fn load_from(path: &Path) -> Favorites {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| toml::from_str(&raw).ok())
-        .unwrap_or_default()
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Favorites::default();
+    };
+    toml::from_str(&raw).unwrap_or_else(|_| {
+        // the next save would overwrite the only copy
+        crate::fsutil::quarantine(path);
+        Favorites::default()
+    })
 }
 
 fn save_to(path: &Path, favorites: &Favorites) -> Result<()> {
@@ -73,7 +77,7 @@ fn save_to(path: &Path, favorites: &Favorites) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let toml = toml::to_string_pretty(favorites)?;
-    fs::write(path, toml).with_context(|| format!("writing {}", path.display()))?;
+    crate::fsutil::atomic_write(path, toml.as_bytes())?;
     Ok(())
 }
 

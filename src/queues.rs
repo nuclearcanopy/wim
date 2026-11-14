@@ -279,7 +279,7 @@ pub fn save(name: &str, items: &[SearchItem]) -> Result<usize> {
     let saved_count = saved.entries.len();
     let path = dir.join(format!("{slug}.toml"));
     let toml = toml::to_string_pretty(&saved)?;
-    fs::write(&path, toml).with_context(|| format!("writing {}", path.display()))?;
+    crate::fsutil::atomic_write(&path, toml.as_bytes())?;
     Ok(saved_count)
 }
 

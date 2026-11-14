@@ -48,7 +48,7 @@ fn save_to(path: &Path, state: &PlaybackState) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let toml = toml::to_string_pretty(state)?;
-    fs::write(path, toml).with_context(|| format!("writing {}", path.display()))?;
+    crate::fsutil::atomic_write(path, toml.as_bytes())?;
     Ok(())
 }
 

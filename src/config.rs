@@ -904,7 +904,7 @@ pub fn save(cfg: &Config) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let toml = toml::to_string_pretty(cfg)?;
-    fs::write(&path, toml).with_context(|| format!("writing {}", path.display()))?;
+    crate::fsutil::atomic_write(&path, toml.as_bytes())?;
     restrict_to_owner(&path)?;
     Ok(())
 }
