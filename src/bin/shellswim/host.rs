@@ -316,6 +316,9 @@ pub struct Host {
     pub track_resolver: TrackResolver,
     pub star_tx: mpsc::Sender<StarFailed>,
     pub star_rx: mpsc::Receiver<StarFailed>,
+    /// Kept alive for the player's lifetime; dropping it stops the relay.
+    pub _media_proxy: Option<wim::media_proxy::MediaProxy>,
+    pub proxy_ready: bool,
     pub base_volume: f64,
     pub crossfade_enabled: bool,
     pub between_tracks: BetweenTracks,
@@ -382,6 +385,24 @@ impl Host {
             .set_buffer_ahead(cfg.buffer_ahead_secs)
             .err()
             .map(|error| format!("buffer_ahead_secs could not be applied: {error}"));
+        // every network stream goes through the same address-pinning
+        // relay wim uses; only configured Navidrome origins may resolve
+        // to private addresses. Failing closed beats streaming unpinned.
+        let trusted_origins = cfg
+            .navidrome_servers
+            .iter()
+            .map(|server| server.url.clone())
+            .collect::<Vec<_>>();
+        let media_proxy = wim::media_proxy::MediaProxy::start(&trusted_origins).ok();
+        let proxy_error = match &media_proxy {
+            Some(proxy) => player
+                .set_property("http-proxy", serde_json::json!(proxy.proxy_url()))
+                .err()
+                .map(|error| format!("secure media relay could not be applied: {error}")),
+            None => {
+                Some("secure media relay is unavailable; online Watch sources are disabled".into())
+            }
+        };
         player.set_replaygain("track")?;
         player.set_subtitle_style(&cfg.subtitles);
         wim::trace_mark!("mpv forked");
@@ -445,6 +466,10 @@ impl Host {
         if let Some(warning) = buffer_warning {
             notifications.push(Severity::Alert, warning);
         }
+        if let Some(warning) = proxy_error.as_ref() {
+            notifications.push(Severity::Alert, warning.clone());
+        }
+        let proxy_ready = media_proxy.is_some() && proxy_error.is_none();
         let cache_index = Arc::new(Mutex::new(cache::CacheIndex::load()));
         core::sweep_cache(&cache_index, cfg.cache_eviction_days);
         cache::initialize_budget(cfg.offline_cache_max_bytes);
@@ -482,6 +507,8 @@ impl Host {
             track_resolver: TrackResolver::new(),
             star_tx,
             star_rx,
+            _media_proxy: media_proxy,
+            proxy_ready,
             base_volume,
             crossfade_enabled,
             between_tracks: BetweenTracks::new(gap_at_start),
