@@ -107,6 +107,7 @@ impl Surface for Borrowed<'_> {
                 }
                 op_note("keybinds · K opens the editor".to_owned())
             }
+            ViewTarget::Undo => self.print_undo(core),
             ViewTarget::Suggestions => op_fail(no_pane("suggestions", "wim's 'g'")),
             ViewTarget::Starred => op_fail(format!(
                 "{}, but star(...) and view(queue) work here",
@@ -135,6 +136,35 @@ impl Surface for Borrowed<'_> {
 }
 
 impl Borrowed<'_> {
+    fn print_undo(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
+        let rows = core.undo.rows(core.now);
+        if rows.is_empty() {
+            return op_fail("nothing has been done yet");
+        }
+        for row in rows {
+            let branch = if row.depth == 0 {
+                String::new()
+            } else if row.last_child {
+                format!("{}└─", "  ".repeat(row.depth - 1))
+            } else {
+                format!("{}├─", "  ".repeat(row.depth - 1))
+            };
+            let current = if row.current { "●" } else { " " };
+            let fork = if row.branches > 1 {
+                format!(" ({} branches)", row.branches)
+            } else {
+                String::new()
+            };
+            let barrier = row
+                .barrier
+                .map(|why| format!(" · barrier: {why}"))
+                .unwrap_or_default();
+            core.console
+                .note(format!("{current} {branch}{}{fork}{barrier}", row.label));
+        }
+        op_note("undo history · use undo() and redo() to move".to_owned())
+    }
+
     fn print_settings(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
         let cfg = core.cfg;
         let lines = [
