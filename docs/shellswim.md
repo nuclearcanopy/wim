@@ -52,7 +52,7 @@ answers, and only one of them is true.
 | printed by shellswim / opens its editor interactively | `view(keybinds)` |
 | printed settings snapshot, then opens the editor interactively | `view(settings)` |
 | printed equalizer snapshot, then opens the editor interactively | `view(eq)` |
-| printed undo history | `view(undo)` |
+| printed undo history, then opens the tree interactively | `view(undo)` |
 | printed, personalized recommendations | `view(suggestions)` |
 | printed starred items from the loaded library | `view(starred)` |
 | printed by shellswim | `view(now)` |
@@ -87,6 +87,8 @@ bindings.
 `view(starred)` and `view(suggestions)` print their rows and, at the
 prompt, open them as a list: `j`/`k` move, `enter` plays the row, `a`
 queues it, `esc` or `q` closes.
+At the prompt `view(undo)` also opens the undo tree: `u`/`k` undo,
+`r`/`j` redo, `h`/`l` cross a fork, `esc` closes.
 Press `U` (default `u`, uppercased like the subtitle key) or run
 `view(settings)` for the settings editor: `j`/`k` select, `h`/`l`
 adjust, `enter` edits the ListenBrainz token or confirms an offline

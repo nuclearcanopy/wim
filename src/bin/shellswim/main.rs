@@ -147,6 +147,7 @@ fn prompt() -> anyhow::Result<()> {
     let mut keybinds_refused: Option<String> = None;
     let mut eq_menu = eqm::EqMenuPane::default();
     let mut settings_state = settings::SettingsState::default();
+    let mut undo_open = false;
     let mut list_view: Option<(surface::ListWorkspace, usize)> = None;
 
     loop {
@@ -175,6 +176,11 @@ fn prompt() -> anyhow::Result<()> {
                 list_view = Some((list, 0));
             }
         }
+        if std::mem::take(&mut host.swim.undo_requested) && host.interactive_prompt {
+            undo_open = true;
+        }
+        let undo_now = host.now();
+        let undo_rows = undo_open.then(|| host.undo.rows(undo_now));
         if std::mem::take(&mut host.swim.settings_requested) && host.interactive_prompt {
             settings_state.open = true;
         }
@@ -217,6 +223,7 @@ fn prompt() -> anyhow::Result<()> {
                 keybinds_selected,
                 keybinds_capturing,
                 keybinds_refused: keybinds_refused.as_deref(),
+                undo: undo_rows.as_deref(),
                 list: list_view.as_ref().map(|(list, selected)| (list, *selected)),
                 settings: settings_values
                     .as_deref()
@@ -253,6 +260,7 @@ fn prompt() -> anyhow::Result<()> {
             || eq_menu.is_open()
             || settings_state.open
             || list_view.is_some()
+            || undo_open
             || host.lyrics_pane.is_open()
             || host.has_program_work()
             || host.console.cycle().is_some()
@@ -402,6 +410,22 @@ fn prompt() -> anyhow::Result<()> {
                             }
                             _ => {}
                         }
+                    }
+                    continue;
+                }
+                if undo_open {
+                    use wim::ui::undo_tree as ut;
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => undo_open = false,
+                        KeyCode::Char(ut::UNDO_KEY) | KeyCode::Char('k') | KeyCode::Up => {
+                            host.apply_one(wim::shellsong::Op::Undo)
+                        }
+                        KeyCode::Char(ut::REDO_KEY) | KeyCode::Char('j') | KeyCode::Down => {
+                            host.apply_one(wim::shellsong::Op::Redo)
+                        }
+                        KeyCode::Char(ut::LEFT_KEY) | KeyCode::Left => host.switch_undo_branch(-1),
+                        KeyCode::Char(ut::RIGHT_KEY) | KeyCode::Right => host.switch_undo_branch(1),
+                        _ => {}
                     }
                     continue;
                 }
@@ -783,6 +807,7 @@ struct Screen<'a> {
     eq: Option<EqScreen<'a>>,
     settings: Option<(&'a [String], usize)>,
     list: Option<(&'a surface::ListWorkspace, usize)>,
+    undo: Option<&'a [wim::undo::Row<'a>]>,
 }
 
 struct EqScreen<'a> {
@@ -961,6 +986,15 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
                         keymap: s.keymap,
                         alignment_status: "",
                         alignment_controls: false,
+                    },
+                    body,
+                );
+            } else if let Some(rows) = s.undo {
+                f.render_widget(
+                    wim::ui::undo_tree::UndoTreeView {
+                        rows,
+                        elapsed: s.now,
+                        focused: true,
                     },
                     body,
                 );
