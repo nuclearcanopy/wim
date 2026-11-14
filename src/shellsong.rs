@@ -4171,12 +4171,18 @@ impl Console {
         if self.history.last() == Some(&line) {
             return;
         }
-        self.history.push(line);
-        if self.history.len() > MAX_HISTORY {
-            let overflow = self.history.len() - MAX_HISTORY;
-            self.history.drain(..overflow);
+        // appended to the file as it is now, so a second wim's lines are not
+        // erased, and the combined list becomes what up-arrow walks
+        match save_history(std::slice::from_ref(&line)) {
+            Some(combined) => self.history = combined,
+            None => {
+                self.history.push(line);
+                if self.history.len() > MAX_HISTORY {
+                    let overflow = self.history.len() - MAX_HISTORY;
+                    self.history.drain(..overflow);
+                }
+            }
         }
-        save_history(&self.history);
     }
 
     fn recall_back(&mut self) {
@@ -4610,7 +4616,7 @@ fn remainder(token: &str, candidate: &str) -> String {
 /// not what anyone is reaching for.
 const MAX_RANKS: usize = 500;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Stat {
     uses: u32,
     last: u64,
@@ -4628,6 +4634,63 @@ pub struct Ranker {
     /// tick, which is all recency needs to be, and it survives a
     /// restart without depending on the system time.
     tick: u64,
+    /// What this process last read or wrote, so a save adds only *its own*
+    /// uses to whatever another wim saved meanwhile.
+    baseline: HashMap<String, Stat>,
+}
+
+/// Reads the ranks file body: `uses \t last \t name` per line.
+fn parse_ranks(raw: &str) -> HashMap<String, Stat> {
+    let mut entries = HashMap::new();
+    for line in raw.lines() {
+        // the name goes last because it is the only field that can
+        // contain anything
+        let mut parts = line.splitn(3, '\t');
+        let (Some(uses), Some(last), Some(name)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let (Ok(uses), Ok(last)) = (uses.parse::<u32>(), last.parse::<u64>()) else {
+            continue;
+        };
+        if !name.is_empty() {
+            entries.insert(name.to_string(), Stat { uses, last });
+        }
+    }
+    entries
+}
+
+/// Three-way merge of the ranks: a name only one side touched takes that
+/// side's value; one both touched adds their use counts (each side's
+/// increase over `base`) and keeps the latest tick.
+fn merge_ranks(
+    base: &HashMap<String, Stat>,
+    ours: &HashMap<String, Stat>,
+    mut theirs: HashMap<String, Stat>,
+) -> HashMap<String, Stat> {
+    for (name, mine) in ours {
+        let merged = match theirs.remove(name) {
+            None => *mine,
+            Some(other) => {
+                let before = base.get(name).copied().unwrap_or_default();
+                if *mine == before {
+                    other
+                } else if other == before {
+                    *mine
+                } else {
+                    Stat {
+                        uses: before
+                            .uses
+                            .saturating_add(mine.uses.saturating_sub(before.uses))
+                            .saturating_add(other.uses.saturating_sub(before.uses)),
+                        last: mine.last.max(other.last),
+                    }
+                }
+            }
+        };
+        theirs.insert(name.clone(), merged);
+    }
+    theirs
 }
 
 impl Ranker {
@@ -4697,24 +4760,39 @@ impl Ranker {
             ranker.tick = ranker.tick.max(last);
             ranker.entries.insert(name.to_string(), Stat { uses, last });
         }
+        ranker.baseline = ranker.entries.clone();
         ranker
     }
 
     /// Best-effort, same leniency as every other state file here.
-    fn save(&self) {
+    fn save(&mut self) {
         let Some(path) = state_path("shellsong_ranks") else {
             return;
         };
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+        let ours = &self.entries;
+        let base = &self.baseline;
+        let saved = crate::fsutil::locked_update(&path, |current| {
+            let theirs = current
+                .map(|bytes| parse_ranks(&String::from_utf8_lossy(&bytes)))
+                .unwrap_or_default();
+            let mut merged = Ranker {
+                entries: merge_ranks(base, ours, theirs),
+                ..Ranker::default()
+            };
+            if merged.entries.len() > MAX_RANKS {
+                merged.prune();
+            }
+            let body: String = merged
+                .entries
+                .iter()
+                .map(|(name, s)| format!("{}\t{}\t{}", s.uses, s.last, name))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(body.into_bytes())
+        });
+        if saved.is_ok() {
+            self.baseline = self.entries.clone();
         }
-        let body: String = self
-            .entries
-            .iter()
-            .map(|(name, s)| format!("{}\t{}\t{}", s.uses, s.last, name))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let _ = crate::fsutil::atomic_write(&path, body.as_bytes());
     }
 }
 
@@ -4852,16 +4930,45 @@ fn load_history() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Best-effort, same leniency as every other state file here: a
-/// read-only state dir costs you history, not your session.
-fn save_history(history: &[String]) {
-    let Some(path) = state_path("shellsong_history") else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+/// Appends `fresh` to whatever history is on disk *now* (another wim may
+/// have added lines since this one loaded it), capped, and returns the
+/// combined list so the caller can recall from all of it. Best-effort, same
+/// leniency as every other state file here: a read-only state dir costs
+/// you history, not your session.
+fn save_history(fresh: &[String]) -> Option<Vec<String>> {
+    let path = state_path("shellsong_history")?;
+    let mut combined = Vec::new();
+    crate::fsutil::locked_update(&path, |current| {
+        combined = merge_history(current.as_deref(), fresh);
+        Ok(combined.join("\n").into_bytes())
+    })
+    .ok()?;
+    Some(combined)
+}
+
+/// The history file as it is now with `fresh` lines appended (a repeat of
+/// the newest line collapses, as it does within one session), capped.
+fn merge_history(current: Option<&[u8]>, fresh: &[String]) -> Vec<String> {
+    let mut lines: Vec<String> = current
+        .map(|bytes| {
+            String::from_utf8_lossy(bytes)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    for line in fresh {
+        if lines.last() != Some(line) {
+            lines.push(line.clone());
+        }
     }
-    let _ = crate::fsutil::atomic_write(&path, history.join("\n").as_bytes());
+    if lines.len() > MAX_HISTORY {
+        let overflow = lines.len() - MAX_HISTORY;
+        lines.drain(..overflow);
+    }
+    lines
 }
 
 /// Console text includes lyrics, tags and server messages, and one-shot
@@ -9907,5 +10014,63 @@ mod scrollback {
             before,
             "+1 for the new line, -1 for the dropped one"
         );
+    }
+}
+
+#[cfg(test)]
+mod two_consoles_tests {
+    use super::*;
+
+    #[test]
+    fn a_second_consoles_lines_are_kept_and_ours_land_after_them() {
+        let on_disk = b"play(a)\nplay(b)";
+        let merged = merge_history(Some(on_disk), &["pause()".to_string()]);
+        assert_eq!(merged, ["play(a)", "play(b)", "pause()"]);
+    }
+
+    #[test]
+    fn a_repeat_of_the_newest_line_collapses_and_the_list_is_capped() {
+        assert_eq!(
+            merge_history(Some(b"x"), &["x".to_string()]),
+            ["x".to_string()]
+        );
+        let many: Vec<String> = (0..MAX_HISTORY + 20).map(|i| format!("c{i}")).collect();
+        let merged = merge_history(None, &many);
+        assert_eq!(merged.len(), MAX_HISTORY);
+        assert_eq!(merged.last().unwrap(), &format!("c{}", MAX_HISTORY + 19));
+    }
+
+    fn stats(pairs: &[(&str, u32, u64)]) -> HashMap<String, Stat> {
+        pairs
+            .iter()
+            .map(|(n, u, l)| (n.to_string(), Stat { uses: *u, last: *l }))
+            .collect()
+    }
+
+    #[test]
+    fn uses_of_a_name_both_consoles_ran_add_up() {
+        let base = stats(&[("play(a)", 2, 5)]);
+        let ours = stats(&[("play(a)", 3, 8)]);
+        let theirs = stats(&[("play(a)", 4, 9), ("pause()", 1, 7)]);
+        let merged = merge_ranks(&base, &ours, theirs);
+        assert_eq!(merged["play(a)"], Stat { uses: 5, last: 9 });
+        assert_eq!(merged["pause()"], Stat { uses: 1, last: 7 });
+    }
+
+    #[test]
+    fn a_name_only_we_changed_keeps_our_value_and_vice_versa() {
+        let base = stats(&[("a", 1, 1), ("b", 1, 1)]);
+        let ours = stats(&[("a", 2, 4), ("b", 1, 1)]);
+        let theirs = stats(&[("a", 1, 1), ("b", 6, 9)]);
+        let merged = merge_ranks(&base, &ours, theirs);
+        assert_eq!(merged["a"], Stat { uses: 2, last: 4 });
+        assert_eq!(merged["b"], Stat { uses: 6, last: 9 });
+    }
+
+    #[test]
+    fn the_ranks_file_body_round_trips() {
+        let parsed = parse_ranks("3\t9\tplay(a b)\nbad line\n1\t2\tx");
+        assert_eq!(parsed["play(a b)"], Stat { uses: 3, last: 9 });
+        assert_eq!(parsed.len(), 2);
     }
 }

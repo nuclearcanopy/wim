@@ -74,6 +74,80 @@ fn write_replacing(target: &Path, contents: &[u8], mode: u32) -> Result<()> {
     result
 }
 
+/// An exclusive advisory lock on `<path>.lock`, released on drop. Taken
+/// with a bounded wait: a holder that died took its lock with it (flock
+/// goes when the process does), and one that is merely slow must not hang
+/// a save forever, so after the wait the caller proceeds unlocked.
+struct FileLock(#[allow(dead_code)] Option<fs::File>);
+
+impl FileLock {
+    fn acquire(path: &Path) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::io::AsRawFd;
+            let mut lock = path.as_os_str().to_owned();
+            lock.push(".lock");
+            let Ok(file) = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .mode(0o600)
+                .open(PathBuf::from(lock))
+            else {
+                return FileLock(None);
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                // SAFETY: flock on a descriptor we own.
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    return FileLock(Some(file));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return FileLock(None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            FileLock(None)
+        }
+    }
+}
+
+/// Read-merge-write of a shared file. Under an exclusive lock, `update` is
+/// given what is on disk *right now* (`None` when the file is absent) and
+/// returns the bytes to store, which are written atomically. Two wims that
+/// each hold a stale in-memory copy therefore combine their changes
+/// instead of the later save erasing the earlier one: `update` is where a
+/// store applies only *its own* changes to what the other one wrote.
+pub fn locked_update(
+    path: &Path,
+    update: impl FnOnce(Option<Vec<u8>>) -> Result<Vec<u8>>,
+) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let _lock = FileLock::acquire(path);
+    let current = fs::read(path).ok();
+    let next = update(current)?;
+    atomic_write(path, &next)
+}
+
+/// A file written by a *newer* wim than this one understands: keep a copy
+/// beside it (`<name>.v<N>.bak`, once) before this wim's own format
+/// replaces it, so downgrading and upgrading again loses nothing.
+pub fn keep_newer_copy(path: &Path, found: u32) {
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(format!(".v{found}.bak"));
+    let backup = PathBuf::from(backup);
+    if !backup.exists() {
+        let _ = fs::copy(path, backup);
+    }
+}
+
 /// Moves an unreadable file aside as `<name>.corrupt` so the next save
 /// does not overwrite the only copy of what the user had. Best effort.
 pub fn quarantine(path: &Path) {
@@ -145,6 +219,49 @@ mod atomic_write_tests {
         assert_eq!(
             fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777,
             0o644
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_locked_updates_lose_nothing() {
+        let dir = scratch("locked");
+        let file = dir.join("counter.txt");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        locked_update(&file, |current| {
+                            let n: u32 = current
+                                .and_then(|b| String::from_utf8(b).ok())
+                                .and_then(|s| s.trim().parse().ok())
+                                .unwrap_or(0);
+                            Ok((n + 1).to_string().into_bytes())
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(fs::read_to_string(&file).unwrap().trim(), "200");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_newer_copy_is_kept_once() {
+        let dir = scratch("newer");
+        let file = dir.join("state.toml");
+        fs::write(&file, "version = 9\n").unwrap();
+        keep_newer_copy(&file, 9);
+        fs::write(&file, "version = 1\n").unwrap();
+        keep_newer_copy(&file, 9);
+        assert_eq!(
+            fs::read_to_string(dir.join("state.toml.v9.bak")).unwrap(),
+            "version = 9\n"
         );
         let _ = fs::remove_dir_all(&dir);
     }

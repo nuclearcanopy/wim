@@ -152,6 +152,20 @@ struct IndexedTags {
 pub struct TagIndex {
     #[serde(default)]
     entries: HashMap<String, IndexedTags>,
+    /// Format number of the file this was read from; never written from
+    /// here (`save_to` writes `INDEX_FORMAT`). This is a rebuildable
+    /// cache, so one from a newer wim is simply not used.
+    #[serde(default, skip_serializing)]
+    version: u32,
+}
+
+const INDEX_FORMAT: u32 = 1;
+
+#[derive(Serialize)]
+struct IndexOnDisk<'a> {
+    version: u32,
+    #[serde(flatten)]
+    index: &'a TagIndex,
 }
 
 fn index_path() -> Result<PathBuf> {
@@ -177,7 +191,8 @@ impl TagIndex {
         index_path()
             .ok()
             .and_then(|p| fs::read(p).ok())
-            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .and_then(|raw| serde_json::from_slice::<TagIndex>(&raw).ok())
+            .filter(|index| index.version <= INDEX_FORMAT)
             .unwrap_or_default()
     }
 
@@ -189,7 +204,10 @@ impl TagIndex {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_vec(self)?;
+        let json = serde_json::to_vec(&IndexOnDisk {
+            version: INDEX_FORMAT,
+            index: self,
+        })?;
         crate::fsutil::atomic_write(path, &json)?;
         Ok(())
     }
@@ -1463,7 +1481,10 @@ mod tests {
                 },
             );
         }
-        TagIndex { entries }
+        TagIndex {
+            entries,
+            ..TagIndex::default()
+        }
     }
 
     /// The same parse with the serde half chunked over a pool; the
@@ -1505,7 +1526,10 @@ mod tests {
         });
         let mut entries = HashMap::with_capacity(lines.len());
         entries.extend(parts.into_iter().flatten());
-        TagIndex { entries }
+        TagIndex {
+            entries,
+            ..TagIndex::default()
+        }
     }
 
     /// The row shape has to read back exactly what the json map held,
@@ -1773,5 +1797,26 @@ mod restart_tests {
             old_tx.send(Vec::new()).is_err(),
             "the old sender still reaches a live receiver"
         );
+    }
+}
+
+#[cfg(test)]
+mod index_format_tests {
+    use super::*;
+
+    #[test]
+    fn the_saved_index_names_its_format_and_a_newer_one_is_not_used() {
+        let dir = std::env::temp_dir().join(format!("wim-lib-v-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library-index.json");
+        TagIndex::default().save_to(&path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"version\":1"), "{raw}");
+        let parsed: TagIndex = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.version, 1);
+        let newer: TagIndex = serde_json::from_str("{\"version\":9,\"entries\":{}}").unwrap();
+        assert!(newer.version > INDEX_FORMAT);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
