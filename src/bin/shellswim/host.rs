@@ -666,6 +666,21 @@ impl Host {
                         Ok(n) => core.console.note(format!("queued {n} tracks next")),
                         Err(why) => core.console.note(why),
                     },
+                    Intent::Browse => {
+                        for track in &tracks {
+                            core.console.note(wim::ui::results_list::label(track));
+                        }
+                        self.swim.list_requested = Some(crate::surface::ListWorkspace {
+                            title: label.clone(),
+                            rows: tracks
+                                .into_iter()
+                                .map(|t| {
+                                    let text = wim::ui::results_list::label(&t);
+                                    (t, text)
+                                })
+                                .collect(),
+                        });
+                    }
                     Intent::Download => {
                         if core.cfg.offline_download_format != "flac"
                             && core.cfg.effective_offline_download_bitrate_kbps() <= 96

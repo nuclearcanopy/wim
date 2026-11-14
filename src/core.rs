@@ -443,6 +443,10 @@ pub enum Intent {
     /// album or artist through the very same `resolve_tracks`, so it
     /// shares the resolver rather than growing a fourth one.
     Download,
+    /// Listed for the user to choose from rather than played, queued or
+    /// cached. Only shellswim asks for it (it has no browse page); like
+    /// a download it is not tied to the queue.
+    Browse,
 }
 
 impl Intent {
@@ -453,6 +457,7 @@ impl Intent {
             Intent::Back | Intent::Front => "queue",
             Intent::Play => "play",
             Intent::Download => "download",
+            Intent::Browse => "list",
         }
     }
 
@@ -467,7 +472,7 @@ impl Intent {
     pub fn queue_bound(self) -> bool {
         match self {
             Intent::Back | Intent::Front | Intent::Play => true,
-            Intent::Download => false,
+            Intent::Download | Intent::Browse => false,
         }
     }
 }
@@ -608,6 +613,7 @@ impl TrackResolver {
                         Intent::Back => "back",
                         Intent::Front => "front",
                         Intent::Download => "download",
+                        Intent::Browse => "browse",
                     }),
                 ),
                 ("items", trace::Value::Num(items.len() as f64)),

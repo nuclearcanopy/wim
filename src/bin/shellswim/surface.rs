@@ -140,14 +140,40 @@ impl Surface for Borrowed<'_> {
         op_fail(NO_BROWSE_ROW)
     }
 
-    fn open_browse(&mut self, item: &SearchItem, _core: &mut CoreCtx) -> (Dispatch, Report) {
-        // a page is a pane, but what was wanted is almost always the
-        // tracks, and `queue` plus `view(queue)` gets those.
-        op_fail(no_page(item.primary_name()))
+    fn open_browse(&mut self, item: &SearchItem, core: &mut CoreCtx) -> (Dispatch, Report) {
+        // no page here, but the tracks can be chosen from a list.
+        match core.track_resolver.request(item, core::Intent::Browse) {
+            core::Resolution::Ready(tracks) => {
+                let name = label(item);
+                self.list_of(name.clone(), tracks, core);
+                op_note(format!("opened {name}"))
+            }
+            core::Resolution::Fetching(name) => op_note(format!("resolving {name}...")),
+        }
     }
 }
 
 impl Borrowed<'_> {
+    fn list_of(&mut self, title: String, tracks: Vec<SearchItem>, core: &mut CoreCtx) {
+        if tracks.is_empty() {
+            core.console.note(format!("nothing to list in {title}"));
+            return;
+        }
+        for track in &tracks {
+            core.console.note(label(track));
+        }
+        self.state.list_requested = Some(ListWorkspace {
+            title,
+            rows: tracks
+                .into_iter()
+                .map(|t| {
+                    let l = label(&t);
+                    (t, l)
+                })
+                .collect(),
+        });
+    }
+
     fn print_starred(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
         let starred: Vec<_> = core
             .app
@@ -344,10 +370,6 @@ fn on_off(value: bool) -> &'static str {
 const NO_SELECTION: &str = "nothing is highlighted here; name what you mean, e.g. play(crest)";
 const NO_BROWSE_ROW: &str = "no browse view here; play(album name) plays the whole thing";
 
-fn no_page(name: &str) -> String {
-    format!("no page to open '{name}' in; queue({name}) then view(queue)")
-}
-
 /// `playing: X` with the queue depth behind it, so "what is playing"
 /// and "what is queued" are one legible line rather than two guesses.
 fn now_line(name: &str, upcoming: usize) -> String {
@@ -450,10 +472,6 @@ mod tests {
         // live mpv behind a `CoreCtx`.
         assert!(NO_SELECTION.contains("play("), "{NO_SELECTION}");
         assert!(NO_BROWSE_ROW.contains("play("), "{NO_BROWSE_ROW}");
-        assert!(
-            no_page("Working On Dying").contains("queue(Working On Dying)"),
-            "it must name the command that gets you the tracks"
-        );
     }
 }
 
