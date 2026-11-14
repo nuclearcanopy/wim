@@ -240,3 +240,7 @@ exact implementations.
   malformed source hunks and an incomplete dependency/config integration. The
   earlier test/build results describe the uncommitted working snapshot, not the
   current branch. Re-implement Phase 0 as a complete, separately verified change.
+- 2026-11-14: see `audit-2026-11.md`. Phase 6 status from that audit: reader EOF
+  already fails all pending requests and batches already share one deadline
+  (boxes above are stale); bounded shutdown, write timeout and the byte-safe
+  reader landed; crash detection/respawn and queue resync remain open.
