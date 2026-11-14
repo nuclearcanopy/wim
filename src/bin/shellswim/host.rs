@@ -287,6 +287,7 @@ pub struct Host {
     pub remote_search_result_rx: Receiver<RemoteSearchOutcome>,
     pub scan_rx: Receiver<library::ScanBatch>,
     pub scrobble: ScrobbleState,
+    scrobble_failed_rx: Receiver<core::ScrobbleFailed>,
     pub favorites: favorites::Favorites,
     pub remote_starred: HashSet<String>,
     pub lyrics_client: lyrics::Client,
@@ -355,10 +356,32 @@ impl Host {
         // prompt no longer waits for it: `observe_playback` happens
         // after the first frame, in `main`.
         let player = mpv::Mpv::spawn()?;
+        let buffer_warning = player
+            .set_buffer_ahead(cfg.buffer_ahead_secs)
+            .err()
+            .map(|error| format!("buffer_ahead_secs could not be applied: {error}"));
+        player.set_replaygain("track")?;
+        player.set_subtitle_style(&cfg.subtitles);
         wim::trace_mark!("mpv forked");
 
         let mut app = app::App::new(warming.take());
         app.scanning_library = true;
+        let restored_eq = wim::eq::restore(
+            cfg.eq_preset.as_deref(),
+            cfg.eq_gains,
+            &cfg.eq_custom_presets,
+        );
+        app.eq_source = restored_eq.source;
+        app.eq_custom = restored_eq.modified;
+        app.eq_gains = restored_eq.gains;
+        if let Some(wim::eq::Source::Builtin(index)) = restored_eq.source {
+            app.eq_preset = index;
+        }
+        let _ = player.set_af(&wim::eq::build_player_af_filter(
+            &app.eq_gains,
+            cfg.eq_enabled,
+            cfg.visualizer_bands as usize,
+        ));
         wim::trace_mark!("corpus warmed from cache");
 
         let (download_tx, download_rx) = mpsc::channel();
@@ -382,6 +405,7 @@ impl Host {
             cfg.resolve_lyrics_api_keys(),
         );
         let (star_tx, star_rx) = mpsc::channel();
+        let (scrobble_failed_tx, scrobble_failed_rx) = mpsc::channel();
         let (torbox_tx, torbox_rx) = mpsc::channel();
         let mut notifications = Notifications::default();
         if cfg.offline_download_format != "flac"
@@ -394,6 +418,9 @@ impl Host {
                     cfg.effective_offline_download_bitrate_kbps()
                 ),
             );
+        }
+        if let Some(warning) = buffer_warning {
+            notifications.push(Severity::Alert, warning);
         }
         let cache_index = Arc::new(Mutex::new(cache::CacheIndex::load()));
         cache::initialize_budget(cfg.offline_cache_max_bytes);
@@ -413,7 +440,11 @@ impl Host {
             remote_search_tx,
             remote_search_result_rx,
             scan_rx,
-            scrobble: ScrobbleState::default(),
+            scrobble: ScrobbleState {
+                failed_tx: Some(scrobble_failed_tx),
+                ..ScrobbleState::default()
+            },
+            scrobble_failed_rx,
             favorites: favorites::load(),
             remote_starred: HashSet::new(),
             lyrics_client,
@@ -440,7 +471,7 @@ impl Host {
             bindings: wim::shellsong_host::load_bindings(),
             scripts: wim::shellsong_host::script_names(),
             playback: mpv::Playback::default(),
-            console: Console::empty(),
+            console: Console::new(),
             program: None,
             swim: SwimSurface::default(),
             start: Instant::now(),
@@ -571,6 +602,12 @@ impl Host {
             self.console
                 .note(format!("couldn't {verb}: {}", failed.error));
         }
+        while let Ok(failed) = self.scrobble_failed_rx.try_recv() {
+            self.notifications.push(
+                Severity::Error,
+                format!("ListenBrainz {} failed: {}", failed.kind, failed.error),
+            );
+        }
 
         // a lyrics fetch landed. the loader has already dropped any
         // reply for a track the user moved past, so whatever arrives
@@ -696,16 +733,6 @@ impl Host {
             }
         }
 
-        // `pause(30s)` letting go.
-        if self
-            .resume_due
-            .is_some_and(|due| self.start.elapsed() >= due)
-        {
-            self.resume_due = None;
-            let _ = self.player.set_pause(false);
-            self.console.note("resumed".to_string());
-        }
-
         // the between-track gap, same mechanism as wim's loop: mpv
         // holds at each file's end under `keep-open` and pauses
         // itself, and this waits the gap out before advancing.
@@ -715,6 +742,83 @@ impl Host {
             self.play_queue.upcoming_len() > 0,
             Instant::now(),
         );
+
+        // Keep time-based playback behavior live even while the prompt
+        // is idle or a command is waiting for network results.
+        let now = self.start.elapsed();
+        if let Some(ramp) = self.fade {
+            let _ = self.player.set_volume_nowait(ramp.level_at(now));
+            if ramp.finished(now) {
+                self.fade = None;
+            }
+        }
+        if self.crossfade_enabled {
+            if let Some(started) = self.fade_in_started_at {
+                let span = config::crossfade_seconds(self.cfg.crossfade_seconds);
+                let t = (started.elapsed().as_secs_f64() / span).clamp(0.0, 1.0);
+                let _ = self.player.set_volume_nowait(self.base_volume * t);
+                if t >= 1.0 {
+                    self.fade_in_started_at = None;
+                }
+            } else if let (Some(elapsed), Some(duration)) = (
+                self.playback.elapsed_secs,
+                core::playing_duration(self.play_queue.current(), self.playback.duration_secs),
+            ) {
+                let span = config::crossfade_seconds(self.cfg.crossfade_seconds);
+                let remaining = duration - elapsed;
+                if remaining <= span {
+                    let _ = self
+                        .player
+                        .set_volume_nowait(self.base_volume * (remaining / span).clamp(0.0, 1.0));
+                }
+            }
+        }
+        if self.resume_due.is_some_and(|due| now >= due) {
+            self.resume_due = None;
+            let _ = self.player.set_pause(false);
+            self.console.note("resumed".to_string());
+        }
+        if let Some(due) = self.sleep_due {
+            let fade =
+                Duration::from_secs_f64(config::crossfade_seconds(self.cfg.crossfade_seconds));
+            match wim::shellsong_host::sleep_step(due, fade, self.base_volume, now) {
+                wim::shellsong_host::SleepStep::Waiting => {}
+                wim::shellsong_host::SleepStep::Fading(level) => {
+                    let _ = self.player.set_volume_nowait(level);
+                }
+                wim::shellsong_host::SleepStep::Expired => {
+                    self.sleep_due = None;
+                    if !self.playback.paused {
+                        let _ = self.player.toggle_pause();
+                    }
+                    let _ = self.player.set_volume(self.base_volume);
+                    self.notifications
+                        .push(Severity::Info, "sleep timer: paused");
+                    self.console.note("slept".to_string());
+                }
+            }
+        }
+        if !self.scrobble.scrobbled {
+            if let (Some(item), Some(elapsed), Some(duration)) = (
+                self.play_queue.current(),
+                self.playback.elapsed_secs,
+                self.playback.duration_secs,
+            ) {
+                if wim::listenbrainz::should_scrobble(&self.cfg.scrobble, elapsed, duration) {
+                    let listened_at = self
+                        .scrobble
+                        .started_unix
+                        .unwrap_or_else(wim::listenbrainz::now_unix);
+                    core::fire_scrobble(
+                        &self.cfg,
+                        item,
+                        listened_at,
+                        self.scrobble.failed_tx.as_ref(),
+                    );
+                    self.scrobble.scrobbled = true;
+                }
+            }
+        }
 
         let mut scanned = 0;
         loop {
