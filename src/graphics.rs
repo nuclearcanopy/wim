@@ -155,7 +155,10 @@ fn known_picker() -> Option<Picker> {
     if ws.width == 0 || ws.height == 0 || ws.columns == 0 || ws.rows == 0 {
         return None;
     }
-    let mut picker = Picker::from_fontsize((ws.width / ws.columns, ws.height / ws.rows));
+    // the only way to build a picker from a font size measured off the
+    // window without the stdio query this path exists to skip
+    #[allow(deprecated)]
+    let mut picker = Picker::from_fontsize((ws.width / ws.columns, ws.height / ws.rows).into());
     picker.set_protocol_type(protocol);
     Some(picker)
 }
@@ -250,7 +253,7 @@ mod art_mode_tests {
         // and the probe's own fallback picker, built the way
         // `from_query_stdio` builds it when nothing answers, must not
         // read as capable just because it exists.
-        let mut silent = Picker::from_fontsize((10, 20));
+        let mut silent = Picker::halfblocks();
         silent.set_protocol_type(ProtocolType::Halfblocks);
         assert!(
             !real_graphics(Some(silent)),
@@ -424,7 +427,7 @@ mod protocol_cache_tests {
     /// This is what the closure is for.
     #[test]
     fn a_hit_does_not_build_the_image() {
-        let mut picker = Picker::from_fontsize((10, 20));
+        let mut picker = Picker::halfblocks();
         let mut c = ProtocolCache::default();
         c.ensure(Some(&mut picker), "a".into(), || {
             image::DynamicImage::new_rgb8(2, 2)
@@ -448,7 +451,7 @@ mod protocol_cache_tests {
 
     #[test]
     fn clearing_forgets_the_key_too() {
-        let mut picker = Picker::from_fontsize((10, 20));
+        let mut picker = Picker::halfblocks();
         let mut c = ProtocolCache::default();
         c.ensure(Some(&mut picker), "a".into(), || {
             image::DynamicImage::new_rgb8(1, 1)
@@ -576,7 +579,7 @@ impl ArtProbe {
 
     /// What the terminal answered, for the video output's own decision.
     pub fn protocol_type(&self) -> Option<ProtocolType> {
-        self.picker.map(|p| p.protocol_type())
+        self.picker.as_ref().map(|p| p.protocol_type())
     }
 
     /// Whether the terminal capability query is still outstanding.
@@ -646,7 +649,7 @@ mod art_probe_tests {
     /// A picker carrying a real protocol, the way a kitty-class
     /// terminal's answer arrives.
     fn capable() -> Picker {
-        let mut p = Picker::from_fontsize((10, 20));
+        let mut p = Picker::halfblocks();
         p.set_protocol_type(ProtocolType::Kitty);
         p
     }
@@ -670,7 +673,7 @@ mod art_probe_tests {
     /// What `from_query_stdio` hands back when nothing answered at
     /// all: a picker, and not a capability.
     fn silent() -> Picker {
-        let mut p = Picker::from_fontsize((10, 20));
+        let mut p = Picker::halfblocks();
         p.set_protocol_type(ProtocolType::Halfblocks);
         p
     }
