@@ -16,6 +16,7 @@ use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use wim::core::{self, Drive};
+use wim::keymap::{key_label, KeyAction, Keymap};
 use wim::playqueue::PlayQueue;
 use wim::search::SearchItem;
 use wim::shellsong::{Console, ConsoleAction, LineKind};
@@ -129,8 +130,11 @@ fn prompt() -> anyhow::Result<()> {
     let mut guard = term::TerminalGuard::new(false)?;
     wim::trace_mark!("terminal ready");
 
-    banner(&mut host.console, &host.cfg);
+    let keymap = Keymap::from_overrides(&host.cfg.keybinds);
+    banner(&mut host.console, &host.cfg, &keymap);
     let mut first_frame = true;
+    let mut queue_open = false;
+    let mut queue_selected = 0usize;
 
     loop {
         host.pump();
@@ -170,6 +174,9 @@ fn prompt() -> anyhow::Result<()> {
                     (&host.lyrics_pane, active)
                 }),
                 setup: lyrics_setup.as_ref(),
+                queue_open,
+                queue_selected,
+                keymap: &keymap,
             },
         )?;
         if first_frame {
@@ -188,6 +195,7 @@ fn prompt() -> anyhow::Result<()> {
         // the scrubber moves while something plays and costs nothing
         // when nothing does.
         let animating = lyrics_setup.is_some()
+            || queue_open
             || host.lyrics_pane.is_open()
             || host.has_program_work()
             || host.console.cycle().is_some()
@@ -275,6 +283,77 @@ fn prompt() -> anyhow::Result<()> {
                     }
                     continue;
                 }
+                if queue_open {
+                    let order = wim::ui::queue::selectable(
+                        host.play_queue.entries(),
+                        host.play_queue.pos(),
+                    );
+                    let at = order
+                        .iter()
+                        .position(|index| *index == queue_selected)
+                        .unwrap_or(0);
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            queue_open = false;
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if let Some(next) = order.get(at + 1) {
+                                queue_selected = *next;
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            if at > 0 {
+                                queue_selected = order[at - 1];
+                            }
+                        }
+                        KeyCode::Enter if order.contains(&queue_selected) => {
+                            if let Err(error) = host
+                                .player
+                                .set_property("playlist-pos", serde_json::json!(queue_selected))
+                            {
+                                host.console.fail(format!("error jumping: {error}"));
+                            }
+                        }
+                        KeyCode::Char('d') if host.play_queue.remove(queue_selected) => {
+                            if let Err(error) = host.player.playlist_remove(queue_selected) {
+                                host.console.fail(format!("error removing: {error}"));
+                            }
+                            queue_selected = queue_selected
+                                .min(host.play_queue.entries().len().saturating_sub(1));
+                        }
+                        KeyCode::Char('J') | KeyCode::Char('K') => {
+                            let first_upcoming =
+                                host.play_queue.pos().map_or(0, |position| position + 1);
+                            let last = host.play_queue.entries().len().saturating_sub(1);
+                            let target = if key.code == KeyCode::Char('J') {
+                                queue_selected + 1
+                            } else {
+                                queue_selected.saturating_sub(1)
+                            };
+                            if queue_selected >= first_upcoming
+                                && target >= first_upcoming
+                                && target <= last
+                                && target != queue_selected
+                                && host.play_queue.move_entry(queue_selected, target)
+                            {
+                                if let Err(error) =
+                                    host.player.playlist_move(queue_selected, target)
+                                {
+                                    host.console.fail(format!("error moving: {error}"));
+                                }
+                                queue_selected = target;
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                if key.code == keymap.get(KeyAction::OpenQueueView) && host.console.input.is_empty()
+                {
+                    queue_open = true;
+                    queue_selected = host.play_queue.pos().unwrap_or(0);
+                    continue;
+                }
                 // '?' on an empty line is the short command list: the
                 // one thing a new user should not need the docs for.
                 // anywhere else it is a character like any other.
@@ -308,7 +387,7 @@ fn prompt() -> anyhow::Result<()> {
 /// Two lines, once, saying what this is and where to look next. Not a
 /// splash: it is the first two lines of scrollback and scrolls away
 /// like any other line, which is the only kind of banner worth having.
-fn banner(console: &mut Console, cfg: &config::Config) {
+fn banner(console: &mut Console, cfg: &config::Config, keymap: &Keymap) {
     let where_from = match (cfg.library_paths.len(), cfg.navidrome_servers.len()) {
         (0, 0) => "no library yet; run wim once to set one up".to_string(),
         (paths, 0) => format!("{paths} local path(s)"),
@@ -319,7 +398,10 @@ fn banner(console: &mut Console, cfg: &config::Config) {
         "shellswim {} - {where_from}",
         env!("CARGO_PKG_VERSION")
     ));
-    console.note("? for the commands, tab to complete, dry(...) to see without doing.");
+    console.note(format!(
+        "? commands · {} queue · tab complete · dry(...) preview",
+        key_label(keymap.get(KeyAction::OpenQueueView))
+    ));
 }
 
 /// Everything one frame draws, bundled to stay under clippy's argument
@@ -335,6 +417,9 @@ struct Screen<'a> {
     gap_remaining: Option<f64>,
     lyrics: Option<(&'a wim::lyricspane::LyricsPane, Option<usize>)>,
     setup: Option<&'a LyricsSetup>,
+    queue_open: bool,
+    queue_selected: usize,
+    keymap: &'a Keymap,
 }
 
 struct LyricsSetup {
@@ -474,6 +559,18 @@ fn draw(guard: &mut term::TerminalGuard, s: &Screen) -> std::io::Result<()> {
                         cursor_visible,
                     },
                     console_area,
+                );
+            } else if s.queue_open {
+                f.render_widget(
+                    wim::ui::queue::QueueView {
+                        entries: s.queue.entries(),
+                        pos: s.queue.pos(),
+                        selected: s.queue_selected,
+                        focused: true,
+                        elapsed: s.now,
+                        keymap: s.keymap,
+                    },
+                    body,
                 );
             } else {
                 f.render_widget(
