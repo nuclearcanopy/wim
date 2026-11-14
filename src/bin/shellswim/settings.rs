@@ -76,7 +76,7 @@ pub fn values(host: &Host, state: &SettingsState) -> Vec<String> {
                     "not set (enter to add)".to_string()
                 }
             }
-            Field::TorboxTokenFile => "set up in wim".to_string(),
+            Field::TorboxTokenFile => "press T at the prompt".to_string(),
         })
         .collect()
 }

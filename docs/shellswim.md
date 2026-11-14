@@ -94,6 +94,9 @@ relay as wim and warns if it cannot start. Press `W` on an empty prompt
 for Watch (needs `WIM_STREMIO_ADDON_URL`, as in wim): `/` search, `enter`
 opens/advances, `[`/`]` seasons, `a` adds a torrent after confirmation,
 `backspace` goes back, `esc` closes; sources play only through the relay.
+Press `T` for TorBox (setup, search, account lists for torrents, usenet
+and web downloads, file playback with `enter`, queueing with `q`; keys
+match wim's workspace).
 Press `U` (default `u`, uppercased like the subtitle key) or run
 `view(settings)` for the settings editor: `j`/`k` select, `h`/`l`
 adjust, `enter` edits the ListenBrainz token or confirms an offline
