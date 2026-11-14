@@ -203,7 +203,10 @@ impl Borrowed<'_> {
     fn print_suggestions(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
         let starred = core::suggestion_starred_keys(core.remote_starred, core.favorites);
         let catalog = wim::suggest::Catalog::from_corpus(&core.app.corpus);
-        let cache = core.cache.lock().expect("cache mutex poisoned");
+        let cache = core
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let suggestions = wim::suggest::suggest(&wim::suggest::Request::new(
             &catalog,
             &cache,

@@ -396,7 +396,10 @@ fn open_wim_screen(
         ViewTarget::Suggestions => {
             let starred = suggestion_starred_keys(core.remote_starred, core.favorites);
             let catalog = suggest::Catalog::from_corpus(&core.app.corpus);
-            let guard = core.cache.lock().expect("cache mutex poisoned");
+            let guard = core
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let suggestions = suggest::suggest(&suggest::Request::new(
                 &catalog,
                 &guard,
@@ -1489,6 +1492,12 @@ fn main() -> anyhow::Result<()> {
     let mut last_input = Instant::now();
     let mut last_loop_top = Instant::now();
     loop {
+        if wim::term::termination_requested() {
+            if player_initialized {
+                save_playback_state(&player, &play_queue);
+            }
+            break;
+        }
         // iteration gap: the event poll at the bottom of the body waits
         // at most one frame interval (or IDLE_POLL when idle), so a gap
         // far past that means the body itself blocked — slow ipc, a slow
@@ -2747,7 +2756,9 @@ fn main() -> anyhow::Result<()> {
         match startup_cache.as_ref().map(|rx| rx.try_recv()) {
             Some(Ok(index)) => {
                 startup_cache = None;
-                *cache_index.lock().expect("cache mutex poisoned") = index;
+                *cache_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = index;
                 cache_ready = true;
                 wim::trace_mark!("playback cache ready");
             }
@@ -3412,7 +3423,9 @@ fn main() -> anyhow::Result<()> {
         // all of that rule lives in `Warmup::should_fetch`.
         if warming_enrichment.is_none() && warmup.should_fetch(suggestions.is_some()) {
             let starred = suggestion_starred_keys(&remote_starred, &favorites);
-            let guard = cache_index.lock().expect("cache mutex poisoned");
+            let guard = cache_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let job = next_enrichment_job(&suggest_catalog, &guard, &starred, &enrichment);
             drop(guard);
             if !job.is_empty() {
