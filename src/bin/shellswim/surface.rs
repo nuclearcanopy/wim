@@ -93,7 +93,7 @@ impl Surface for Borrowed<'_> {
             // `decline`'s generic wording would read "...; wim does"
             // after a message that already named the key, so these
             // say it once, themselves.
-            ViewTarget::Eq => op_fail(no_pane("equaliser", "wim's 'e'")),
+            ViewTarget::Eq => self.print_eq(core),
             ViewTarget::Settings => self.print_settings(core),
             ViewTarget::Keybinds => {
                 self.state.keybinds_requested = true;
@@ -136,6 +136,35 @@ impl Surface for Borrowed<'_> {
 }
 
 impl Borrowed<'_> {
+    fn print_eq(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
+        let source = core
+            .app
+            .eq_source
+            .and_then(|source| wim::eq::source_name(source, &core.cfg.eq_custom_presets))
+            .unwrap_or("custom curve");
+        core.console.note(format!(
+            "equalizer: {} · {}",
+            if core.cfg.eq_enabled { "on" } else { "off" },
+            source
+        ));
+        for (hz, gain) in wim::eq::BAND_HZ.iter().zip(core.app.eq_gains) {
+            core.console.note(format!("{hz:>5.0} Hz  {gain:+.1} dB"));
+        }
+        let presets = wim::eq::PRESETS
+            .iter()
+            .map(|preset| preset.name)
+            .chain(
+                core.cfg
+                    .eq_custom_presets
+                    .iter()
+                    .map(|preset| preset.name.as_str()),
+            )
+            .collect::<Vec<_>>()
+            .join(", ");
+        core.console.note(format!("presets: {presets}"));
+        op_note("choose a curve with eq(name)".to_owned())
+    }
+
     fn print_undo(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
         let rows = core.undo.rows(core.now);
         if rows.is_empty() {
