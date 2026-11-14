@@ -126,6 +126,7 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Fixed("W"), "Watch workspace"),
             (Key::Fixed("T"), "TorBox workspace"),
             (Key::Fixed("J / K"), "queue: move track down / up"),
+            (Key::Fixed("d"), "queue: remove the track"),
         ],
     ),
     (
@@ -930,7 +931,7 @@ mod tests {
         let keymap = Keymap::default();
         // one column, tall enough that nothing scrolls, so every row
         // of the table is on screen at a known x.
-        let (w, h) = (56u16, 90u16);
+        let (w, h) = (56u16, 110u16);
         let mut buf = buffer(w, h);
         HelpOverlay {
             keymap: &keymap,
@@ -1026,7 +1027,7 @@ mod tests {
     #[test]
     fn a_row_paints_its_key_a_shade_above_its_description() {
         let keymap = Keymap::default();
-        let (w, h) = (56u16, 90u16);
+        let (w, h) = (56u16, 110u16);
         let mut buf = buffer(w, h);
         HelpOverlay {
             keymap: &keymap,
