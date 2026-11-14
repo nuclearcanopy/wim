@@ -19,11 +19,13 @@ use crate::host::Host;
 pub struct PendingConnect {
     rx: Receiver<Result<FetchedCatalog, String>>,
     nav: config::NavidromeConfig,
-    reconnect: Option<usize>,
+    reconnect: bool,
 }
 
-/// Applies a finished add/reconnect, if one is done. Called every frame.
-pub fn poll(host: &mut Host, nm: &mut NavManager) {
+/// Applies a finished add/reconnect, if one is done. Called every frame,
+/// whether or not the manager is still open: the server is added (or its
+/// status noted) either way, and the manager is only touched when present.
+pub fn poll(host: &mut Host, mut nm: Option<&mut NavManager>) {
     let Some(pending) = &host.pending_connect else {
         return;
     };
@@ -35,25 +37,40 @@ pub fn poll(host: &mut Host, nm: &mut NavManager) {
     let result = outcome
         .unwrap_or_else(|_| Err("connection attempt stopped unexpectedly".into()))
         .map(|catalog| finish_navidrome_index(&mut host.app, catalog));
-    if let Some(index) = reconnect {
-        if index >= nm.connection_status.len() {
-            nm.connection_status.resize(index + 1, None);
-        }
-        nm.connection_status[index] = Some(match &result {
+    if reconnect {
+        // found by url now: the profile may have been removed meanwhile
+        let index = host
+            .cfg
+            .navidrome_servers
+            .iter()
+            .position(|server| server.url == nav.url);
+        let status = match &result {
             Ok(_) => ConnectionStatus::Online,
             Err(message) if is_authentication_message(message) => {
                 ConnectionStatus::ConfigurationIssue
             }
             Err(_) => ConnectionStatus::Unreachable,
-        });
-        nm.message = match result {
-            Ok(message) => format!("reconnected: {message}"),
+        };
+        if let (Some(nm), Some(index)) = (nm.as_deref_mut(), index) {
+            if index >= nm.connection_status.len() {
+                nm.connection_status.resize(index + 1, None);
+            }
+            nm.connection_status[index] = Some(status);
+        }
+        match result {
+            Ok(message) => {
+                if let Some(nm) = nm.as_deref_mut() {
+                    nm.message = format!("reconnected: {message}");
+                }
+            }
             Err(message) => {
                 host.notifications
                     .push(Severity::Error, format!("{}: {message}", nav.url));
-                message
+                if let Some(nm) = nm.as_deref_mut() {
+                    nm.message = message;
+                }
             }
-        };
+        }
         return;
     }
     match result {
@@ -71,15 +88,19 @@ pub fn poll(host: &mut Host, nm: &mut NavManager) {
                     "password saved in cleartext (0600) at {path}; use password_file for a secret manager"
                 ),
             );
-            nm.connection_status.push(Some(ConnectionStatus::Online));
-            nm.selected = host.cfg.navidrome_servers.len() - 1;
-            nm.step = NavManagerStep::List;
-            nm.message = format!("connected: {message}");
+            if let Some(nm) = nm.as_deref_mut() {
+                nm.connection_status.push(Some(ConnectionStatus::Online));
+                nm.selected = host.cfg.navidrome_servers.len() - 1;
+                nm.step = NavManagerStep::List;
+                nm.message = format!("connected: {message}");
+            }
         }
         Err(message) => {
             host.notifications
                 .push(Severity::Error, format!("{}: {message}", nav.url));
-            nm.message = format!("{message} (esc to go back)");
+            if let Some(nm) = nm {
+                nm.message = format!("{message} (esc to go back)");
+            }
         }
     }
 }
@@ -156,8 +177,11 @@ pub fn key(host: &mut Host, nm: &mut NavManager, code: KeyCode, modifiers: KeyMo
                     host.pending_connect = Some(PendingConnect {
                         rx: spawn_navidrome_index(nav.clone()),
                         nav,
-                        reconnect: Some(nm.selected),
+                        reconnect: true,
                     });
+                }
+                KeyCode::Enter => {
+                    nm.message = "still connecting…".into();
                 }
                 _ => {}
             }
@@ -196,8 +220,11 @@ pub fn key(host: &mut Host, nm: &mut NavManager, code: KeyCode, modifiers: KeyMo
                 host.pending_connect = Some(PendingConnect {
                     rx: spawn_navidrome_index(nav.clone()),
                     nav,
-                    reconnect: None,
+                    reconnect: false,
                 });
+            }
+            KeyCode::Enter => {
+                nm.message = "still connecting…".into();
             }
             _ => {}
         },

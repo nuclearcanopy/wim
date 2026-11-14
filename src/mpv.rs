@@ -836,6 +836,13 @@ impl Mpv {
         }
     }
 
+    /// Whether a background command batch (startup restore, setup) is
+    /// still running. The app's queue mirror lags mpv's playlist until
+    /// that finishes, so nothing may reconcile the two meanwhile.
+    pub fn background_active(&self) -> bool {
+        self.background_commands.load(Ordering::SeqCst) > 0
+    }
+
     pub fn events(&self) -> &Receiver<Event> {
         &self.events
     }

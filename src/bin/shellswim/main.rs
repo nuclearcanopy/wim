@@ -177,9 +177,7 @@ fn prompt() -> anyhow::Result<()> {
         if wim::term::termination_requested() {
             break;
         }
-        if let Some(manager) = &mut nav {
-            nav_ui::poll(&mut host, manager);
-        }
+        nav_ui::poll(&mut host, nav.as_mut());
         if first_frame {
             // Nothing, including the host pump, may touch mpv before draw.
         } else if let Some(rx) = &observing {

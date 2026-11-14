@@ -836,7 +836,7 @@ struct PendingConnect {
 enum ConnectKind {
     Onboarding,
     NavAdd,
-    NavReconnect(usize),
+    NavReconnect,
 }
 
 /// Pasted text goes into single-line fields (passwords, paths, urls): a
@@ -1543,6 +1543,7 @@ fn main() -> anyhow::Result<()> {
     let mut pending_connect: Option<PendingConnect> = None;
     let mut mpv_exit_reported = false;
     let mut last_autosave = Instant::now();
+    let mut last_reconcile = Instant::now();
     let mut seen_reply_timeouts = mpv::reply_timeouts();
     let mut last_input = Instant::now();
     let mut last_loop_top = Instant::now();
@@ -1553,11 +1554,21 @@ fn main() -> anyhow::Result<()> {
             }
             break;
         }
-        if mpv::reply_timeouts() != seen_reply_timeouts && !mpv_exit_reported {
-            seen_reply_timeouts = mpv::reply_timeouts();
+        // only once the startup restore and every background batch are done:
+        // until then the queue mirror legitimately trails mpv's playlist.
+        // `seen` is re-read after the call so its own timeouts cannot re-arm it.
+        if mpv::reply_timeouts() != seen_reply_timeouts
+            && !mpv_exit_reported
+            && player_initialized
+            && restoring.is_none()
+            && !player.background_active()
+            && last_reconcile.elapsed() >= Duration::from_secs(5)
+        {
+            last_reconcile = Instant::now();
             if let Some(note) = wim::core::reconcile_queue_after_timeout(&player, &mut play_queue) {
                 notifications.push(Severity::Alert, note);
             }
+            seen_reply_timeouts = mpv::reply_timeouts();
         }
         // a crash or SIGKILL must not lose the queue and position
         if player_initialized
@@ -3779,8 +3790,14 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
                         },
-                        ConnectKind::NavReconnect(index) => {
-                            if let Some(nm) = &mut nav_manager {
+                        ConnectKind::NavReconnect => {
+                            // the profile may have been removed or moved
+                            // while it connected, so find it by url now
+                            let index = cfg
+                                .navidrome_servers
+                                .iter()
+                                .position(|server| server.url == nav.url);
+                            if let (Some(nm), Some(index)) = (&mut nav_manager, index) {
                                 if index >= nm.connection_status.len() {
                                     nm.connection_status.resize(index + 1, None);
                                 }
@@ -4792,6 +4809,9 @@ fn main() -> anyhow::Result<()> {
                                     kind: ConnectKind::Onboarding,
                                 });
                             }
+                            KeyCode::Enter => {
+                                ob.login_message = "still connecting…".into();
+                            }
                             _ => {}
                         },
                         Step::TorBox => match key.code {
@@ -4997,8 +5017,11 @@ fn main() -> anyhow::Result<()> {
                                     pending_connect = Some(PendingConnect {
                                         rx: wim::catalog::spawn_navidrome_index(nav.clone()),
                                         nav,
-                                        kind: ConnectKind::NavReconnect(nm.selected),
+                                        kind: ConnectKind::NavReconnect,
                                     });
+                                }
+                                KeyCode::Enter => {
+                                    nm.message = "still connecting…".into();
                                 }
                                 _ => {}
                             }
@@ -5034,6 +5057,9 @@ fn main() -> anyhow::Result<()> {
                                     nav,
                                     kind: ConnectKind::NavAdd,
                                 });
+                            }
+                            KeyCode::Enter => {
+                                nm.message = "still connecting…".into();
                             }
                             _ => {}
                         },

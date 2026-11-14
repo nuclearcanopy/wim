@@ -310,6 +310,7 @@ pub struct Host {
     mpv_exit_reported: bool,
     _instance_lock: Option<std::fs::File>,
     seen_reply_timeouts: u64,
+    last_reconcile: Instant,
     pub play_queue: PlayQueue,
     pub previous_track: Option<SearchItem>,
     pub cache_index: Arc<Mutex<cache::CacheIndex>>,
@@ -551,6 +552,7 @@ impl Host {
             pending_connect: None,
             mpv_exit_reported: false,
             seen_reply_timeouts: wim::mpv::reply_timeouts(),
+            last_reconcile: Instant::now(),
             subtitle_tx,
             subtitle_rx,
             remote_search_tx,
@@ -838,13 +840,18 @@ impl Host {
     /// Each one is a `try_recv`, so this is the whole reason nothing
     /// in shellswim blocks.
     pub fn pump(&mut self) {
-        if wim::mpv::reply_timeouts() != self.seen_reply_timeouts && !self.mpv_exit_reported {
-            self.seen_reply_timeouts = wim::mpv::reply_timeouts();
+        if wim::mpv::reply_timeouts() != self.seen_reply_timeouts
+            && !self.mpv_exit_reported
+            && !self.player.background_active()
+            && self.last_reconcile.elapsed() >= Duration::from_secs(5)
+        {
+            self.last_reconcile = Instant::now();
             if let Some(note) =
                 wim::core::reconcile_queue_after_timeout(&self.player, &mut self.play_queue)
             {
                 self.notifications.push(Severity::Alert, note);
             }
+            self.seen_reply_timeouts = wim::mpv::reply_timeouts();
         }
         if !self.mpv_exit_reported {
             if let Some(status) = self.player.exited() {
