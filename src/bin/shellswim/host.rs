@@ -528,7 +528,7 @@ impl Host {
             Ok(wim::fsutil::InstanceLock::Contended) => {
                 notifications.push(
                     Severity::Alert,
-                    "another wim is running; the queue, favorites and play history it saves can overwrite this one's",
+                    "another wim is running; play history, favorites and command history are merged, but the saved queue, resume position and settings are whichever wim saves last",
                 );
                 None
             }

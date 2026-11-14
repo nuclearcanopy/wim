@@ -23,6 +23,9 @@ jobs:
       - name: cargo test
         run: nix develop --command cargo test --locked
 
+      - name: cargo audit
+        run: nix shell nixpkgs#cargo-audit --command cargo audit --deny warnings
+
       - name: benchmark harness tests
         run: python3 -m unittest discover -s benchmarks -p 'test_*.py'
 
