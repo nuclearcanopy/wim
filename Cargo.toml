@@ -24,9 +24,9 @@ name = "shellswim"
 path = "src/bin/shellswim/main.rs"
 
 [dependencies]
-ratatui = "0.29"
-crossterm = "0.28"
-ratatui-image = "4"
+ratatui = "0.30"
+crossterm = "0.29"
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
