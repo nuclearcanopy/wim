@@ -26,6 +26,13 @@ const CLIENT_NAME: &str = "wim";
 /// fan-out (plus cover art and search) on warm, reused connections.
 const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 16;
 
+/// Stall bounds for every API client. `timeout_read` is per read, so a
+/// slow-but-moving transfer is fine; a black-holing server is not
+/// allowed to pin a worker thread (and the search worker that joins
+/// them) forever.
+pub(crate) const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How many `getAlbum` requests an artist fetch runs at once. Subsonic
 /// has no single call for every song by an artist (see
 /// `stream_artist_tracks`), so it is one request per album; 8 hides
@@ -390,6 +397,9 @@ impl Client {
             password: Zeroizing::new(cfg.resolve_password()?),
             agent: ureq::AgentBuilder::new()
                 .max_idle_connections_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
+                .timeout_connect(HTTP_CONNECT_TIMEOUT)
+                .timeout_read(HTTP_IO_TIMEOUT)
+                .timeout_write(HTTP_IO_TIMEOUT)
                 .build(),
             max_bitrate_kbps: cfg.max_bitrate_kbps,
             transcode_format: cfg.transcode_format.clone(),
