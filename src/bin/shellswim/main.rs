@@ -319,9 +319,7 @@ fn prompt() -> anyhow::Result<()> {
                     continue;
                 }
                 if subtitle_menu_open {
-                    if key.code == KeyCode::Esc
-                        || key.code == keymap.get(KeyAction::OpenSubtitleMenu)
-                    {
+                    if key.code == KeyCode::Esc || key.code == subtitle_key(&keymap) {
                         subtitle_menu_open = false;
                         if let Err(error) = config::save(&host.cfg) {
                             host.console
@@ -614,9 +612,7 @@ fn prompt() -> anyhow::Result<()> {
                     queue_selected = host.play_queue.pos().unwrap_or(0);
                     continue;
                 }
-                if key.code == keymap.get(KeyAction::OpenSubtitleMenu)
-                    && host.console.input.is_empty()
-                {
+                if key.code == subtitle_key(&keymap) && host.console.input.is_empty() {
                     subtitle_menu_open = true;
                     continue;
                 }
@@ -677,8 +673,17 @@ fn banner(console: &mut Console, cfg: &config::Config, keymap: &Keymap) {
     console.note(format!(
         "? commands · {} queue · {} subtitles · K keys · E eq · tab complete · dry(...) preview",
         key_label(keymap.get(KeyAction::OpenQueueView)),
-        key_label(keymap.get(KeyAction::OpenSubtitleMenu))
+        key_label(subtitle_key(keymap))
     ));
+}
+
+/// A lowercase letter on an empty prompt starts a command (`top`,
+/// `toggle`), so the default `t` becomes `T` here.
+fn subtitle_key(keymap: &Keymap) -> KeyCode {
+    match keymap.get(KeyAction::OpenSubtitleMenu) {
+        KeyCode::Char(c) if c.is_ascii_lowercase() => KeyCode::Char(c.to_ascii_uppercase()),
+        other => other,
+    }
 }
 
 fn adjust_subtitle_field(sub: &mut config::SubtitleConfig, field: usize, direction: f64) {
