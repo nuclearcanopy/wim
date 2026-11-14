@@ -2,12 +2,10 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
-use crate::config::VideoOutput;
 use crate::keymap::{key_label, KeyAction, Keymap};
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
 use crate::ui::results_list::scroll_cues;
-use ratatui_image::picker::ProtocolType;
 
 /// A row, named rather than numbered.
 ///
@@ -18,14 +16,16 @@ use ratatui_image::picker::ProtocolType;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     AlbumArt,
-    VideoOutput,
-    AsciiFps,
     EqEnabled,
     VisualizerBands,
     Crossfade,
     CrossfadeSeconds,
     CacheDaysThreshold,
     CacheEvictionDays,
+    OfflineCacheBudget,
+    OfflineDownloadBitrate,
+    OfflineDownloadFormat,
+    RebuildDownloads,
     ScrobblePercent,
     ScrobbleSeconds,
     ListenbrainzToken,
@@ -35,16 +35,18 @@ pub enum Field {
 /// Every row, in the order they are drawn. Display and playback settings
 /// stay near the top; the token stays last because it is the only one
 /// that opens an editor and the footer hint names it.
-pub const FIELDS: [Field; 13] = [
+pub const FIELDS: [Field; 15] = [
     Field::AlbumArt,
-    Field::VideoOutput,
-    Field::AsciiFps,
     Field::EqEnabled,
     Field::VisualizerBands,
     Field::Crossfade,
     Field::CrossfadeSeconds,
     Field::CacheDaysThreshold,
     Field::CacheEvictionDays,
+    Field::OfflineCacheBudget,
+    Field::OfflineDownloadBitrate,
+    Field::OfflineDownloadFormat,
+    Field::RebuildDownloads,
     Field::ScrobblePercent,
     Field::ScrobbleSeconds,
     Field::ListenbrainzToken,
@@ -57,70 +59,21 @@ impl Field {
     pub fn label(self) -> &'static str {
         match self {
             Field::AlbumArt => "album art",
-            Field::VideoOutput => "video output",
-            Field::AsciiFps => "text-cell video rate",
             Field::EqEnabled => "equalizer",
             Field::VisualizerBands => "visualizer bands",
             Field::Crossfade => "crossfade",
             Field::CrossfadeSeconds => "crossfade seconds",
             Field::CacheDaysThreshold => "cache after days played",
             Field::CacheEvictionDays => "cache eviction days",
+            Field::OfflineCacheBudget => "offline cache budget",
+            Field::OfflineDownloadBitrate => "offline download bitrate",
+            Field::OfflineDownloadFormat => "offline download format",
+            Field::RebuildDownloads => "rebuild offline cache",
             Field::ScrobblePercent => "scrobble % threshold",
             Field::ScrobbleSeconds => "scrobble seconds threshold",
             Field::ListenbrainzToken => "listenbrainz token",
             Field::TorboxTokenFile => "TorBox connection",
         }
-    }
-}
-
-/// What the "video output" row reads, which is the mode actually in
-/// force and not simply the config's.
-///
-/// Three things the plain config value would hide: that shift-`v` has
-/// overridden it (so the row would contradict the screen), that `auto`
-/// resolved to a particular vo (the user cannot otherwise tell whether
-/// their terminal answered the graphics probe), and that `ascii` is
-/// wim painting rather than mpv.
-pub fn video_output_value(
-    configured: VideoOutput,
-    over: Option<VideoOutput>,
-    probed: Option<ProtocolType>,
-) -> String {
-    let live = crate::video::effective(configured, over);
-    let mut said = match live {
-        // what `auto` resolved to, which is the only way to see
-        // whether the terminal answered the graphics probe.
-        VideoOutput::Auto => match crate::video::drawing_vo(VideoOutput::Auto, probed) {
-            Some(vo) => format!("auto ({})", vo.mpv_name()),
-            None => "auto (no protocol yet)".to_string(),
-        },
-        other => config_word(other).to_string(),
-    };
-    if over.is_some() {
-        // naming the config value is the point: this row is the only
-        // place the override is visible, and a restart undoes it.
-        //
-        // kept short deliberately. the first version read `ascii (wim
-        // paints it) [shift+v; config: auto]`, which is 44 cells and
-        // truncated to `... [shift` on a 62-wide pane, cutting the one
-        // fact the note exists for.
-        said.push_str(&format!(" (config: {})", config_word(configured)));
-    }
-    said
-}
-
-/// The bare config word, for the override note. Lives on
-/// `VideoOutput` now, so `video()`'s report and this row cannot drift.
-fn config_word(mode: VideoOutput) -> &'static str {
-    mode.word()
-}
-
-/// What the rate row reads. Unset is the common case and says what it
-/// means rather than "none".
-pub fn ascii_fps_value(cap: Option<f64>) -> String {
-    match cap {
-        Some(fps) => format!("at most {fps:.0} fps"),
-        None => "the file's own rate".to_string(),
     }
 }
 
@@ -231,7 +184,7 @@ impl Widget for SettingsMenu<'_> {
             buf,
             area,
             y,
-            "j/k select, h/l adjust, enter on a token row to configure it",
+            "j/k select, h/l adjust, enter on a token/rebuild row",
             shade(DIM),
         );
         y += 1;
@@ -279,14 +232,16 @@ mod tests {
             &mut buf,
             [
                 "on",
-                "auto (tct)",
-                "the file's own rate",
                 "on",
                 "10 bands",
                 "off",
                 "3",
                 "7",
                 "30",
+                "10 GB",
+                "192 kbps",
+                "opus (lossy)",
+                "3 songs · enter to rebuild",
                 "50",
                 "240",
                 "set",
@@ -304,15 +259,15 @@ mod tests {
         "│ ─────────┴────────────────────────────────────────────────────────────────── │",
         "│                                                                              │",
         "│ > album art                   on                                             │",
-        "│   video output                auto (tct)                                     │",
-        "│   text-cell video rate        the file's own rate                            │",
         "│   equalizer                   on                                             │",
         "│   visualizer bands            10 bands                                       │",
         "│   crossfade                   off                                            │",
         "│   crossfade seconds           3                                              │",
-        "│   cache after days played     7                                            ▾ │",
+        "│   cache after days played     7                                              │",
+        "│   cache eviction days         30                                             │",
+        "│   offline cache budget        10 GB                                        ▾ │",
         "│                                                                              │",
-        "│ j/k select, h/l adjust, enter on a token row to configure it                 │",
+        "│ j/k select, h/l adjust, enter on a token/rebuild row                         │",
         "│ other settings: '?' keybinds, 't' subtitles, left/right on the home screen l │",
         "│                                                                              │",
         "└──────────────────────────────────────────────────────────────────────────────┘",
@@ -324,11 +279,7 @@ mod tests {
     fn a_wide_value_does_not_shift_the_glyphs_after_it() {
         let area = Rect::new(0, 0, 60, 17);
         let mut buf = buffer(60, 17);
-        render(
-            area,
-            &mut buf,
-            ["日本x", "", "", "", "", "", "", "", "", "", "", "", ""],
-        );
+        render(area, &mut buf, ["日本x"; FIELD_COUNT]);
         let g = grid(&buf);
         let row: Vec<char> = g
             .lines()
@@ -495,7 +446,7 @@ mod eyeball {
     fn print_the_menu_with_the_token_row_selected() {
         let values = [
             "balanced ('i' also cycles this)",
-            "auto (tct)",
+            "auto (Kitty required)",
             "the file's own rate",
             "off",
             "3.0s",
@@ -529,73 +480,9 @@ mod eyeball {
         }
     }
 }
-/// The two video rows' text, and the row-naming that replaced index
-/// literals. Losing this would stop covering what the menu *says*
-/// about a mode, which is the only place an override is visible.
 #[cfg(test)]
-mod video_row_tests {
+mod field_tests {
     use super::*;
-
-    /// Every word here has to be the one config.toml uses, because the
-    /// row doubles as documentation for what to type in the file.
-    #[test]
-    fn each_mode_reads_as_its_config_word() {
-        for (mode, word) in [
-            (VideoOutput::Tct, "tct"),
-            (VideoOutput::Kitty, "kitty"),
-            (VideoOutput::Ascii, "ascii"),
-            (VideoOutput::Off, "off"),
-        ] {
-            assert_eq!(video_output_value(mode, None, None), word);
-        }
-    }
-
-    /// `auto` names what it resolved to: a user on a terminal that
-    /// failed the graphics probe otherwise has no way to tell that
-    /// from one that passed.
-    #[test]
-    fn auto_says_what_it_resolved_to() {
-        assert_eq!(
-            video_output_value(VideoOutput::Auto, None, Some(ProtocolType::Kitty)),
-            "auto (kitty)"
-        );
-        assert_eq!(
-            video_output_value(VideoOutput::Auto, None, None),
-            "auto (tct)",
-            "no protocol still gets a drawing vo, since tct needs nothing"
-        );
-    }
-
-    /// The row has to contradict neither the screen nor the file: it
-    /// shows what is in force and names what config says.
-    #[test]
-    fn an_override_names_the_config_it_is_covering() {
-        let said = video_output_value(VideoOutput::Auto, Some(VideoOutput::Ascii), None);
-        assert_eq!(said, "ascii (config: auto)");
-        // and with no override there is no note at all, so the common
-        // case stays short.
-        assert_eq!(video_output_value(VideoOutput::Ascii, None, None), "ascii");
-    }
-
-    /// Short enough to survive the narrow pane that cut the first
-    /// version: at 62 cells the value column is 25 wide, and
-    /// `ascii (wim paints it) [shift+v; config: auto]` truncated to
-    /// `[shift`, losing the one fact the note exists for.
-    #[test]
-    fn the_override_note_fits_a_narrow_pane() {
-        let longest = video_output_value(
-            VideoOutput::Kitty,
-            Some(VideoOutput::Ascii),
-            Some(ProtocolType::Kitty),
-        );
-        assert!(longest.len() <= 25, "{longest} is {} cells", longest.len());
-    }
-
-    #[test]
-    fn the_rate_row_says_what_unset_means() {
-        assert_eq!(ascii_fps_value(None), "the file's own rate");
-        assert_eq!(ascii_fps_value(Some(15.0)), "at most 15 fps");
-    }
 
     /// `values` is indexed by `FIELDS`, so a row with no value (or one
     /// too many) is a silent misalignment of every row after it.
@@ -621,65 +508,5 @@ mod video_row_tests {
         assert_eq!(field_at(FIELD_COUNT - 1), Field::TorboxTokenFile);
         assert_eq!(field_at(FIELD_COUNT), Field::AlbumArt);
         assert_eq!(field_at(usize::MAX), Field::AlbumArt);
-    }
-}
-
-/// Prints the menu as it ships, with the two video rows in it. Run
-/// with `cargo test --lib eyeball_settings -- --nocapture`.
-#[cfg(test)]
-mod eyeball_video {
-    use super::*;
-    use crate::ui::testbuf::{buffer, grid};
-    use ratatui::widgets::Widget;
-
-    fn show(label: &str, values: &[&str], width: u16) {
-        let area = Rect::new(0, 0, width, 19);
-        let mut buf = buffer(width, 19);
-        SettingsMenu {
-            values,
-            selected: 1,
-            keymap: &Keymap::default(),
-        }
-        .render(area, &mut buf);
-        println!("--- {label} ({width} wide, 'video output' selected)");
-        println!("{}", grid(&buf));
-    }
-
-    #[test]
-    fn eyeball_settings_with_the_video_rows() {
-        let probed = Some(ProtocolType::Kitty);
-        let rows: Vec<String> = FIELDS
-            .iter()
-            .map(|f| match f {
-                Field::AlbumArt => "ascii-bw ('i' also cycles this)".to_string(),
-                Field::VideoOutput => video_output_value(VideoOutput::Auto, None, probed),
-                Field::AsciiFps => ascii_fps_value(None),
-                Field::EqEnabled => "on".to_string(),
-                Field::VisualizerBands => "10 bands".to_string(),
-                Field::Crossfade => "off".to_string(),
-                Field::CrossfadeSeconds => "3.0s".to_string(),
-                Field::CacheDaysThreshold => "2 days played".to_string(),
-                Field::CacheEvictionDays => "30 days".to_string(),
-                Field::ScrobblePercent => "50%".to_string(),
-                Field::ScrobbleSeconds => "240s".to_string(),
-                Field::ListenbrainzToken => "set (enter to change)".to_string(),
-                Field::TorboxTokenFile => "not connected (enter to set up)".to_string(),
-            })
-            .collect();
-        let borrowed: Vec<&str> = rows.iter().map(String::as_str).collect();
-        show("the default, kitty terminal", &borrowed, 80);
-
-        // and the override case, which is the row that has to explain
-        // itself: the screen disagrees with config.toml.
-        let mut over = rows.clone();
-        over[1] = video_output_value(VideoOutput::Auto, Some(VideoOutput::Ascii), probed);
-        over[2] = ascii_fps_value(Some(15.0));
-        let borrowed: Vec<&str> = over.iter().map(String::as_str).collect();
-        show("shift+v override active, rate capped", &borrowed, 80);
-        show(
-            "the same at 62 wide, where the value column has to fit",
-            &borrowed,
-            62,
-        );
     }
 }

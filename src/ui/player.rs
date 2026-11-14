@@ -27,14 +27,24 @@ const ART_MIN_COLS: u16 = 14;
 const ART_SHARE: f32 = 0.6;
 
 /// Whether the layout reserves the cover panel, as `PlayerView`'s
-/// render decides it. The host needs the same answer to paint video
-/// frames on the rect the view reserved, and the two must not drift:
-/// a rect the view did not reserve is the title's rows, and a rect the
-/// host does not know is a frame painted nowhere. Video claims the
+/// render decides it. The host needs the same answer to place the
+/// status card, and the two must not drift: a rect the view did not
+/// reserve is the title's rows. Video claims the
 /// rect in every art mode — it is not a cover, and `ArtMode::Off` is
 /// the cover-panel switch, not the video one.
 pub fn has_art(video: bool, art: bool, gap: bool, art_mode: ArtMode) -> bool {
     video || ((art || gap) && art_mode != ArtMode::Off)
+}
+
+pub fn video_sync_target(layout: PlayerLayout, area: Rect, video: bool) -> Option<Rect> {
+    layout.video_sync.or_else(|| {
+        video.then_some(Rect {
+            x: area.x + area.width.saturating_sub(20) / 2,
+            y: layout.title_y,
+            width: area.width.min(20),
+            height: 1,
+        })
+    })
 }
 
 /// Where every piece of the now-playing screen goes. Returned by
@@ -46,6 +56,8 @@ pub struct PlayerLayout {
     /// Square-ish cover panel, centred horizontally; `None` when the
     /// pane cannot give it `ART_MIN_ROWS`/`ART_MIN_COLS`.
     pub art: Option<Rect>,
+    /// Click target for opening subtitle synchronization while a video plays.
+    pub video_sync: Option<Rect>,
     pub title_y: u16,
     /// Previous/next track line; the first thing a shrinking pane
     /// drops, since the queue view answers the same question.
@@ -112,8 +124,15 @@ pub fn layout(
         y += 1;
         row
     });
+    let video_sync = art.map(|rect| Rect {
+        x: rect.x + rect.width.saturating_sub(20) / 2,
+        y: rect.y + rect.height / 2 + 1,
+        width: rect.width.min(20),
+        height: 1,
+    });
     Some(PlayerLayout {
         art,
+        video_sync,
         title_y,
         context_y,
     })
@@ -141,17 +160,10 @@ pub struct PlayerView<'a> {
     /// overlay, which goes on the `PlayerLayout::art` rect this view
     /// used; same contract as `BrowseListView`.
     pub art_mode: ArtMode,
-    /// A video is playing and the host paints frames on the cover
-    /// rect after this view draws: the rect is reserved (in every art
-    /// mode) but no cover is drawn under it, because the frames land
-    /// on top anyway and a cover would be one frame of flicker.
+    /// A video is playing in mpv: reserve the cover rect for the native
+    /// player status card, independent of the album-art preference.
     pub video: bool,
-    /// What to say in the video rect when there is no picture yet:
-    /// `Some("loading…")` between the source spawning and its first
-    /// frame, `Some("unavailable…")` when mpv refused the file. A
-    /// blank rect with no explanation is exactly the "the bar isn't
-    /// moving and I don't know why" this whole feature exists to
-    /// end; `None` once frames are painting (they cover the note).
+    /// Actionable status shown in the reserved video area.
     pub video_note: Option<&'a str>,
     /// `Some` while a timed silence is playing, which has no cover and
     /// never will. The cover rect goes to a countdown instead of being
@@ -186,8 +198,8 @@ impl Widget for PlayerView<'_> {
         // the layout reserves it. `ArtMode::Off` still means off for a
         // cover: a user who turned the panel off did not ask for a big
         // clock. a video claims it too, in every mode — `has_art` is
-        // the one place that rule lives, so the host painting frames
-        // reserves the same rect this view did.
+        // the one place that rule lives, so the status card reserves
+        // the same rect this view does.
         let has_art = has_art(
             self.video,
             self.art.is_some(),
@@ -207,16 +219,30 @@ impl Widget for PlayerView<'_> {
             // checked before the cover, not after: a silence has no
             // art, so the two cannot both apply, and ordering it this
             // way means a future entry kind with both still draws
-            // something deterministic. video comes next for the same
-            // reason: its frames are the host's, painted after this
-            // view, so the view draws nothing in the rect at all —
-            // except the note, which is the one thing the host cannot
-            // say for itself: why there is no picture yet.
+            // something deterministic. Video uses the rect for its
+            // status card rather than a cover that could confuse the
+            // user about which window owns playback.
             if let Some(gap) = self.gap {
                 GapPanel { gap }.render(rect, buf);
             } else if self.video {
                 if let Some(note) = self.video_note {
-                    draw_centered(buf, rect, rect.y + rect.height / 2, note, shade(NEAR_BLACK));
+                    draw_centered(
+                        buf,
+                        rect,
+                        rect.y + rect.height / 2 - 1,
+                        note,
+                        shade(NEAR_WHITE),
+                    );
+                    if let Some(button) = video_sync_target(l, area, self.video) {
+                        let key = self.key(KeyAction::OpenSubtitleMenu);
+                        let full = format!("[ LYRIC SYNC · {key} ]");
+                        let label = if width(&full) <= button.width as usize {
+                            full
+                        } else {
+                            format!("[ SYNC · {key} ]")
+                        };
+                        draw_centered(buf, rect, button.y, &label, shade(NEAR_WHITE));
+                    }
                 }
             } else if self.art_mode.is_ascii() {
                 CachedArt {
@@ -229,7 +255,14 @@ impl Widget for PlayerView<'_> {
             }
         }
 
-        draw_centered(buf, area, l.title_y, self.title, shade(NEAR_WHITE));
+        let compact_title;
+        let title = if self.video && l.art.is_none() {
+            compact_title = format!("[ LYRIC SYNC · {} ]", self.key(KeyAction::OpenSubtitleMenu));
+            compact_title.as_str()
+        } else {
+            self.title
+        };
+        draw_centered(buf, area, l.title_y, title, shade(NEAR_WHITE));
         if let Some(y) = l.context_y {
             draw_centered(buf, area, y, &self.context_line(), shade(NEAR_BLACK));
         }
@@ -658,12 +691,9 @@ mod tests {
 
     /// Video claims the cover rect in every art mode — `ArtMode::Off`
     /// is the cover-panel switch, not the video one — and the view
-    /// draws nothing there, because the host's frames are painted on
-    /// top after this view. The host reserves the same rect through
-    /// `has_art`, so the two cannot disagree about where the picture
-    /// goes.
+    /// draws no cover beneath its status card.
     #[test]
-    fn video_claims_the_rect_in_every_art_mode_and_draws_no_cover_under_it() {
+    fn video_claims_the_rect_in_every_art_mode_for_its_status_card() {
         let keymap = Keymap::default();
         let cover = art();
         for mode in [
@@ -681,19 +711,21 @@ mod tests {
             v.render(area, &mut buf);
 
             let want = has_art(true, true, false, mode);
-            let got = layout(area, want, false, 2.0).unwrap().art;
+            let l = layout(area, want, false, 2.0).unwrap();
+            let got = l.art;
             let text = grid(&buf);
             if let Some(rect) = got {
-                // the rect the host will paint on is the one the view
-                // reserved, and the view left it empty: a cover under
-                // the frames would be one frame of flicker.
+                // the view reserved for video status, and there is no
+                // unrelated cover beneath it.
                 for y in rect.y..rect.y + rect.height {
                     for x in rect.x..rect.x + rect.width {
-                        assert_eq!(
-                            buf.cell((x, y)).unwrap().symbol(),
-                            ".",
-                            "{mode:?}: the view drew under the video at {x},{y}"
-                        );
+                        let symbol = buf.cell((x, y)).unwrap().symbol();
+                        if l.video_sync.is_some_and(|button| {
+                            x >= button.x && x < button.x + button.width && y == button.y
+                        }) {
+                            continue;
+                        }
+                        assert_eq!(symbol, ".", "{mode:?}: unexpected paint at {x},{y}");
                     }
                 }
                 assert!(text.contains("a song"), "{mode:?}: the title still draws");
@@ -707,19 +739,37 @@ mod tests {
     }
 
     #[test]
-    fn video_loading_and_failure_notes_are_drawn_in_the_reserved_rect() {
+    fn video_status_is_drawn_in_the_reserved_rect() {
         let keymap = Keymap::default();
-        for (note, expected) in [
-            ("loading video…", "loading video…"),
-            ("VIDEO UNAVAILABLE", "VIDEO UNAVAILABLE"),
-        ] {
-            let area = Rect::new(0, 0, 60, 24);
-            let mut v = view(&keymap, None);
-            v.video = true;
-            v.video_note = Some(note);
-            let mut buf = buffer(60, 24);
-            v.render(area, &mut buf);
-            assert!(grid(&buf).contains(expected), "{}", grid(&buf));
-        }
+        let area = Rect::new(0, 0, 60, 24);
+        let mut v = view(&keymap, None);
+        v.video = true;
+        v.video_note = Some("VIDEO PLAYING IN SEPARATE MPV WINDOW");
+        let mut buf = buffer(60, 24);
+        v.render(area, &mut buf);
+        let text = grid(&buf);
+        assert!(text.contains("VIDEO PLAYING"), "{text}");
+        assert!(text.contains("LYRIC SYNC"), "{text}");
+        let target =
+            video_sync_target(layout(area, true, false, 2.0).unwrap(), area, true).unwrap();
+        assert!(target.width > 0 && target.height == 1);
+        assert!(target.x >= area.x && target.x + target.width <= area.x + area.width);
+        assert!(target.y >= area.y && target.y < area.y + area.height);
+    }
+
+    #[test]
+    fn compact_video_panel_keeps_a_clickable_sync_hint() {
+        let keymap = Keymap::default();
+        let area = Rect::new(0, 0, 18, 20);
+        let mut view = view(&keymap, None);
+        view.video = true;
+        view.video_note = Some("VIDEO IN SEPARATE MPV WINDOW");
+        let mut buf = buffer(area.width, area.height);
+        view.render(area, &mut buf);
+        let layout = layout(area, true, false, 2.0).unwrap();
+        let target = video_sync_target(layout, area, true).unwrap();
+        assert_eq!(target.width, 16);
+        assert!(grid(&buf).contains("SYNC · t"), "{}", grid(&buf));
+        assert_eq!(target.height, 1);
     }
 }

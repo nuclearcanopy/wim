@@ -137,6 +137,33 @@ leading candidate, not a measured root cause. cached copies downloaded
 before this change are still whatever the server sent; clearing the
 cache dir forces a re-fetch.
 
+New Wim-managed offline track downloads are stored as zstd-compressed files
+(`*.mp3.zst`, `*.flac.zst`, etc.). This is lossless wrapping: it does not
+change the stream's codec or quality. Since MP3, Opus, AAC, and FLAC are already
+compressed formats, this may save very little space and can add a small amount
+of overhead; it is not a substitute for choosing a lower server transcode
+bitrate. Existing uncompressed cache entries are losslessly migrated on their
+next cached playback when disk space permits. mpv needs a seekable media file,
+so playback expands a compressed copy into a per-process temporary directory
+and removes it at normal shutdown; a later launch cleans directories left by a
+forced exit. Original library files are never modified.
+
+Offline downloads have a separate profile from ordinary playback. The default
+is Opus at 192 kbps; Settings can choose a different codec and bitrate, and
+rebuilds re-fetch saved tracks with that current profile. Opus/AAC/MP3 are lossy
+transcodes; FLAC is lossless and ignores the bitrate cap. Profiles at 96 kbps
+or below show a dismissible low-quality warning. The default offline cache
+budget is 10 GiB; it counts the compressed files on disk. When a completed
+download would exceed the budget, the oldest managed cache entries are evicted
+first. A replacement is indexed before its prior copy is removed, and if a
+single download is larger than the entire budget it is rejected while the
+previous cached copy remains available. These byte limits do not estimate or
+guarantee how many tracks fit: zstd gains vary by source codec and bitrate.
+For very small budgets, Wim adaptively limits lossy downloads to 64 kbps at
+2 GiB or less and 96 kbps through 5 GiB; the explicitly configured bitrate is
+still the ceiling at larger budgets. Settings warns when a budget change
+activates either low-quality limit, and that alert can be dismissed.
+
 ## ruled out
 
 - the eq chain, flat or boosted (above).

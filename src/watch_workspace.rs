@@ -28,6 +28,7 @@ enum Reply {
     Detail(u64, Result<(MediaItem, Vec<Episode>), String>),
     Sources(u64, Result<Vec<Stream>, String>),
     SourceResolved(u64, Result<PreparedSource, String>),
+    TorrentAdded(u64, Result<(), String>),
 }
 
 /// Ephemeral source credentials live here only while the selection is active.
@@ -78,6 +79,7 @@ pub struct Workspace {
     pub message: Option<String>,
     pub search_editing: bool,
     pub spoilers_revealed: bool,
+    pub confirm_torrent_add: bool,
 }
 
 impl Default for Workspace {
@@ -108,6 +110,7 @@ impl Workspace {
             message: None,
             search_editing: true,
             spoilers_revealed: false,
+            confirm_torrent_add: false,
         }
     }
 
@@ -148,7 +151,8 @@ impl Workspace {
                 | Reply::Search(generation, _)
                 | Reply::Detail(generation, _)
                 | Reply::Sources(generation, _)
-                | Reply::SourceResolved(generation, _) => *generation,
+                | Reply::SourceResolved(generation, _)
+                | Reply::TorrentAdded(generation, _) => *generation,
             };
             if reply_generation != self.generation {
                 self.loading = false;
@@ -242,6 +246,14 @@ impl Workspace {
                             self.message = Some(error);
                         }
                     }
+                }
+                Reply::TorrentAdded(generation, result) if generation == self.generation => {
+                    self.loading = false;
+                    self.confirm_torrent_add = false;
+                    self.message = Some(match result {
+                        Ok(()) => "torrent submitted to TorBox".into(),
+                        Err(error) => error,
+                    });
                 }
                 _ => {}
             }
@@ -427,9 +439,12 @@ impl Workspace {
         let kind = item.kind.clone();
         let media_id = item.id.clone();
         let media_title = item.title.clone();
-        let episode_id = (kind == crate::media::MediaKind::Series)
-            .then(|| self.selected_episode().map(|episode| episode.id.clone()))
+        let selected_episode = (kind == crate::media::MediaKind::Series)
+            .then(|| self.selected_episode())
             .flatten();
+        let episode_id = selected_episode.map(|episode| episode.id.clone());
+        let episode_label =
+            selected_episode.map(|episode| episode.display_label(self.spoiler_policy()));
         let Some(manifest) = self.manifest.as_ref() else {
             return;
         };
@@ -445,7 +460,10 @@ impl Workspace {
         } else {
             format!("Source {}", self.selected + 1)
         };
-        let label = format!("{media_title} · {source_label}");
+        let label = match episode_label {
+            Some(episode) => format!("{media_title} · {episode} · {source_label}"),
+            None => format!("{media_title} · {source_label}"),
+        };
         // Add-on stream arrays have no stable direct-stream ID. Hash only
         // descriptive metadata (never the URL/signature), and scope it to the
         // movie or episode identity.
@@ -504,6 +522,67 @@ impl Workspace {
             .unwrap_or_else(|| format!("Source {}", index + 1))
     }
 
+    /// Ask for explicit confirmation before adding a torrent source to TorBox.
+    pub fn arm_torrent_add(&mut self) {
+        let Some(hash) = self
+            .sources
+            .get(self.selected)
+            .filter(|stream| stream.url.is_none() && stream.yt_id.is_none())
+            .and_then(|stream| stream.info_hash.as_deref())
+            .and_then(magnet_info_hash)
+        else {
+            self.message = Some("selected source has no valid torrent infoHash for TorBox".into());
+            return;
+        };
+        self.confirm_torrent_add = true;
+        self.message = Some(format!(
+            "add this provider torrent to TorBox? [y] confirm · [n] cancel · hash {}…{}",
+            &hash[..6],
+            &hash[hash.len() - 4..]
+        ));
+    }
+
+    pub fn cancel_torrent_add(&mut self) {
+        self.confirm_torrent_add = false;
+        self.message = Some("TorBox add cancelled".into());
+    }
+
+    pub fn confirm_torrent_add(&mut self, client: Result<crate::torbox::Client, String>) {
+        if !self.confirm_torrent_add || self.loading {
+            return;
+        }
+        let Some(hash) = self
+            .sources
+            .get(self.selected)
+            .and_then(|stream| stream.info_hash.as_deref())
+            .and_then(magnet_info_hash)
+        else {
+            self.cancel_torrent_add();
+            return;
+        };
+        let client = match client {
+            Ok(client) => Arc::new(client),
+            Err(error) => {
+                self.message = Some(error);
+                self.confirm_torrent_add = false;
+                return;
+            }
+        };
+        let (generation, tx) = self.next_request();
+        self.loading = true;
+        self.confirm_torrent_add = false;
+        self.message = Some("submitting torrent to TorBox…".into());
+        thread::spawn(move || {
+            let result = client
+                .add_magnet(&format!("magnet:?xt=urn:btih:{hash}"))
+                .map(|_| ())
+                .map_err(|_| {
+                    "TorBox rejected the torrent add request; check account and network".into()
+                });
+            let _ = tx.send(Reply::TorrentAdded(generation, result));
+        });
+    }
+
     pub fn spoiler_policy(&self) -> SpoilerPolicy {
         SpoilerPolicy {
             reveal_episode_details: self.spoilers_revealed,
@@ -554,6 +633,11 @@ impl Workspace {
         self.generation = self.generation.wrapping_add(1);
         (self.generation, self.tx.clone())
     }
+}
+
+fn magnet_info_hash(hash: &str) -> Option<String> {
+    (hash.len() == 40 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| hash.to_ascii_lowercase())
 }
 
 fn redact_source_label(label: &str) -> String {
@@ -648,6 +732,48 @@ mod tests {
         assert_eq!(
             redact_source_label("1080p https://signed.invalid/?token=secret"),
             "1080p [URL hidden]"
+        );
+    }
+
+    #[test]
+    fn torrent_handoff_requires_a_valid_hash_and_explicit_confirmation() {
+        assert_eq!(
+            magnet_info_hash("ABCDEF0123456789ABCDEF0123456789ABCDEF01").as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef01")
+        );
+        assert_eq!(magnet_info_hash(&"a".repeat(64)), None);
+        let mut workspace = Workspace::new();
+        workspace.sources = vec![Stream {
+            name: Some("1080p release".into()),
+            title: None,
+            url: None,
+            info_hash: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            file_idx: None,
+            yt_id: None,
+        }];
+        workspace.arm_torrent_add();
+        assert!(workspace.confirm_torrent_add);
+        assert!(workspace
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("add this provider torrent"));
+        workspace.cancel_torrent_add();
+        assert!(!workspace.confirm_torrent_add);
+
+        workspace.sources[0].info_hash = Some("not-a-hash".into());
+        workspace.arm_torrent_add();
+        assert!(!workspace.confirm_torrent_add);
+        assert!(workspace
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("no valid torrent infoHash"));
+        workspace.sources[0].info_hash = Some("a".repeat(64));
+        workspace.arm_torrent_add();
+        assert!(
+            !workspace.confirm_torrent_add,
+            "BTIH accepts only 40 hex chars"
         );
     }
 

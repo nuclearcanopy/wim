@@ -75,6 +75,23 @@ pub fn vertical_divider_junctions(
         .collect()
 }
 
+/// Brighten selected vertical-divider rows without replacing the
+/// junction glyphs that describe lines continuing from either side.
+/// Missing rows are added using the supplied straight/corner fallback.
+pub fn highlight_vertical_rows(
+    junctions: &mut Vec<(u16, char, Color)>,
+    rows: &[(u16, char)],
+    color: Color,
+) {
+    for &(row, fallback) in rows {
+        if let Some(junction) = junctions.iter_mut().find(|(y, _, _)| *y == row) {
+            junction.2 = color;
+        } else {
+            junctions.push((row, fallback, color));
+        }
+    }
+}
+
 /// One frame's worth of what reaches the sidebar/main-content
 /// divider. From the left: the search box's own two border rows (it
 /// draws no right edge, this divider is its right edge) plus every
@@ -163,6 +180,15 @@ mod tests {
     fn browse_view_open_crosses_both_shared_rows() {
         let j = vertical_divider_junctions(0, 20, &[0, 2], &[0, 2], shade(NEAR_BLACK));
         assert_eq!(chars(&j), vec![(0, '┬'), (2, '┼')]);
+    }
+
+    #[test]
+    fn highlighting_a_search_wall_preserves_shared_junctions_and_adds_its_stem() {
+        let mut j = vertical_divider_junctions(0, 20, &[0, 2], &[0, 2], shade(NEAR_BLACK));
+        let white = shade(crate::theme::NEAR_WHITE);
+        highlight_vertical_rows(&mut j, &[(0, '┐'), (1, '│'), (2, '┘')], white);
+        assert_eq!(chars(&j), vec![(0, '┬'), (2, '┼'), (1, '│')]);
+        assert!(j.iter().all(|(_, _, color)| *color == white));
     }
 
     /// A rule only on the right (the mini player strip, which spans

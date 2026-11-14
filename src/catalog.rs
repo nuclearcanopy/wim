@@ -380,19 +380,78 @@ pub fn index_navidrome_server(
 pub fn test_navidrome_connectivity(
     servers: &[config::NavidromeConfig],
     live: &[Arc<subsonic::Client>],
-) -> Vec<Option<bool>> {
+) -> Vec<Option<crate::navmanager::ConnectionStatus>> {
     thread::scope(|scope| {
         servers
             .iter()
-            // pinging the client the app actually uses is a better test
-            // than pinging a throwaway: it exercises the same pool and
-            // the same resolved credentials.
-            .map(|nav| scope.spawn(|| client_for(nav, live).is_ok_and(|c| c.ping().is_ok())))
+            .map(|nav| {
+                scope.spawn(|| match client_for(nav, live) {
+                    Err(_) => crate::navmanager::ConnectionStatus::ConfigurationIssue,
+                    // Ping the client the app actually uses so this tests
+                    // the same pool and resolved credentials.
+                    Ok(client) => match client.ping() {
+                        Ok(()) => crate::navmanager::ConnectionStatus::Online,
+                        Err(error) if is_authentication_failure(&error) => {
+                            crate::navmanager::ConnectionStatus::ConfigurationIssue
+                        }
+                        Err(_) => crate::navmanager::ConnectionStatus::Unreachable,
+                    },
+                })
+            })
             .collect::<Vec<_>>()
             .into_iter()
-            .map(|handle| Some(handle.join().unwrap_or(false)))
+            .map(|handle| {
+                Some(
+                    handle
+                        .join()
+                        .unwrap_or(crate::navmanager::ConnectionStatus::Unreachable),
+                )
+            })
             .collect()
     })
+}
+
+fn is_authentication_failure(error: &anyhow::Error) -> bool {
+    is_authentication_message(&error.to_string())
+}
+
+pub fn is_authentication_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "subsonic error 40:",
+        "subsonic error 41:",
+        "subsonic error 50:",
+        "http 401",
+        "http 403",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+#[cfg(test)]
+mod connectivity_error_tests {
+    use super::is_authentication_failure;
+
+    #[test]
+    fn auth_and_permission_refusals_are_not_reported_as_network_outages() {
+        for message in [
+            "subsonic error 40: wrong username or password",
+            "subsonic error 50: user is not authorized",
+            "ping: http 401",
+            "ping: http 403",
+        ] {
+            assert!(
+                is_authentication_failure(&anyhow::anyhow!(message)),
+                "{message}"
+            );
+        }
+        assert!(!is_authentication_failure(&anyhow::anyhow!(
+            "ping: http 502"
+        )));
+        assert!(!is_authentication_failure(&anyhow::anyhow!(
+            "ping: timed out"
+        )));
+    }
 }
 
 /// What a fetch's outcome may and may not be read as. Named for what

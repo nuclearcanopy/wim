@@ -481,6 +481,14 @@ impl ArtProbe {
         self.picker.map(|p| p.protocol_type())
     }
 
+    /// Whether the terminal capability query is still outstanding.
+    /// `protocol_type() == None` also means a completed negative probe
+    /// on terminals skipped by the denylist, so callers must not use it
+    /// alone to report "still detecting".
+    pub fn probe_pending(&self) -> bool {
+        self.answer.is_some()
+    }
+
     /// The capability test, asked of the protocol and never of the
     /// picker; see `has_real_protocol`.
     pub fn real_graphics(&self) -> bool {

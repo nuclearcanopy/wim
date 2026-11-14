@@ -2,10 +2,15 @@
 
 ## Local speech-based subtitle alignment
 
-Open the subtitle menu (`t` by default), press `a` to align the selected text
-subtitle against speech in the selected audio track, then `p` to preview and
-`y` to accept. `n` rejects the suggestion; `c` cancels an active job or rejects
-its preview. The menu reports the alignment stage, proposed offset, clock-rate
+While video plays, Wim's player workspace says that playback is in a separate
+mpv window and shows a **LYRIC SYNC** action (`t` by default); click the action
+or press `t` to open subtitle controls. mpv owns the picture and playback while
+Wim remains the control surface. The subtitle menu shows model readiness and
+alignment progress. Press `a` to align the selected text subtitle against
+speech in the selected audio track, `p` to load the proposed timing into mpv,
+then `y` to accept. Acceptance is disabled until a preview has loaded
+successfully. `d` discards a suggestion; `c` cancels an active job or preview;
+`n` cycles subtitle tracks. The menu reports the alignment stage, proposed offset, clock-rate
 scale, number of matched cues, and a confidence estimate. Weak or inconsistent
 matches are refused rather than applied automatically. Manual subtitle delay
 remains available, and the source subtitle file is never overwritten. Accepted
@@ -20,7 +25,7 @@ intentionally supports local video files and readable text subtitle tracks
 and network streams are not supported yet. Temporary audio and rejected
 previews are removed after the task; if Wim is forcibly killed, its uniquely
 named temporary work directory may need manual cleanup from
-`~/.cache/wim/subtitle-align`.
+`$XDG_CACHE_HOME/wim/subtitle-align` (usually `~/.cache/wim/subtitle-align`).
 
 No model is downloaded automatically. With Home Manager, point the option at a
 local Whisper model file; this also installs the FFmpeg and whisper.cpp runtime

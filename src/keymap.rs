@@ -51,7 +51,7 @@ pub enum KeyAction {
     CycleArtMode,
     ToggleMinimize,
     ToggleFullscreenVideo,
-    ToggleAsciiVideo,
+    OpenVideoPlayer,
     ToggleResizeMode,
     OpenNavManager,
     OpenStarredView,
@@ -86,7 +86,7 @@ pub const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::CycleArtMode,
     KeyAction::ToggleMinimize,
     KeyAction::ToggleFullscreenVideo,
-    KeyAction::ToggleAsciiVideo,
+    KeyAction::OpenVideoPlayer,
     KeyAction::ToggleResizeMode,
     KeyAction::OpenNavManager,
     KeyAction::OpenStarredView,
@@ -98,6 +98,12 @@ pub const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::IndexBreakdown,
     KeyAction::Quit,
 ];
+
+/// F11 and `f`/`F` are universal movie-fullscreen reflexes, in addition
+/// to the user's configurable fullscreen-video key.
+pub fn is_fullscreen_video_key(code: KeyCode, configured: KeyCode) -> bool {
+    matches!(code, KeyCode::Char('f' | 'F') | KeyCode::F(11)) || code == configured
+}
 
 impl KeyAction {
     /// Stable, lowercase-with-underscores name: the key this action
@@ -124,7 +130,7 @@ impl KeyAction {
             KeyAction::CycleArtMode => "cycle_art_mode",
             KeyAction::ToggleMinimize => "toggle_minimize",
             KeyAction::ToggleFullscreenVideo => "toggle_fullscreen_video",
-            KeyAction::ToggleAsciiVideo => "toggle_ascii_video",
+            KeyAction::OpenVideoPlayer => "open_video_player",
             KeyAction::ToggleResizeMode => "toggle_resize_mode",
             KeyAction::OpenNavManager => "open_navidrome_profiles",
             KeyAction::OpenStarredView => "open_starred_songs",
@@ -160,7 +166,7 @@ impl KeyAction {
             KeyAction::CycleArtMode => "cycle album art mode",
             KeyAction::ToggleMinimize => "minimize / maximize player",
             KeyAction::ToggleFullscreenVideo => "fullscreen video",
-            KeyAction::ToggleAsciiVideo => "video as text cells",
+            KeyAction::OpenVideoPlayer => "open / focus mpv video window",
             KeyAction::ToggleResizeMode => "resize mode",
             KeyAction::OpenNavManager => "navidrome profiles",
             KeyAction::OpenStarredView => "starred songs",
@@ -198,9 +204,7 @@ impl KeyAction {
             KeyAction::CycleArtMode => KeyCode::Char('i'),
             KeyAction::ToggleMinimize => KeyCode::Char('m'),
             KeyAction::ToggleFullscreenVideo => KeyCode::Char('v'),
-            // shift-'v', beside 'v' for the mode it switches; the
-            // shift-letter convention S/L/I/K/Q/R already established.
-            KeyAction::ToggleAsciiVideo => KeyCode::Char('V'),
+            KeyAction::OpenVideoPlayer => KeyCode::Char('P'),
             KeyAction::ToggleResizeMode => KeyCode::Char('r'),
             KeyAction::OpenNavManager => KeyCode::Char('n'),
             KeyAction::OpenStarredView => KeyCode::Char('S'),
@@ -504,6 +508,21 @@ impl Keymap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn movie_fullscreen_recognizes_pc_reflex_keys_and_the_configured_alias() {
+        for key in [KeyCode::Char('f'), KeyCode::Char('F'), KeyCode::F(11)] {
+            assert!(is_fullscreen_video_key(key, KeyCode::Char('v')));
+        }
+        assert!(is_fullscreen_video_key(
+            KeyCode::Char('v'),
+            KeyCode::Char('v')
+        ));
+        assert!(!is_fullscreen_video_key(
+            KeyCode::Char('q'),
+            KeyCode::Char('v')
+        ));
+    }
 
     #[test]
     fn default_keymap_matches_every_action_to_its_builtin_default() {

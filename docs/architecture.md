@@ -61,68 +61,15 @@ asks for it.
   batch instead of one each. the subtitle menu fires its seven on every
   keypress.
 
-## video: mpv draws it, wim stops drawing
+## video playback
 
-fullscreen video ('v') is one of mpv's own terminal video outputs
-(`tct` half-blocks, or the `kitty` graphics protocol) writing straight
-to this terminal, while wim skips `terminal.draw` entirely for as long
-as it is up. `vo` is settable live over the existing ipc connection, so
-there is no relaunch and no position to preserve.
-
-the rest of the reasoning; why frames cannot be pulled out of mpv at
-all, why mpv's stdout had to be reconnected, why the vo's geometry has
-to be pushed from wim, why `auto` cannot guess kitty, and what still
-blocks video in a sub-rect of the ui; is in `docs/video.md`. read that
-before touching `src/video.rs`, `Mpv::set_video_output` or
-`TerminalGuard::reclaim`/`draw_unless_video`.
-
-## video frames: a pump, not a poll
-
-the frame pump below is the *old* approach and its source does not
-work; see `docs/video.md`. it is still wired up, and still reports
-`Unsupported` rather than hanging, but nothing draws from it.
-
-`mpv::FramePump` owns a second ipc connection and a thread. it captures
-on an interval, decodes, and keeps exactly the newest frame; the render
-path calls `latest()`, which is a short lock and an `Arc` clone. a
-decode slower than the interval therefore drops frames instead of
-building a backlog, and the ipc round trip, the json parse of a
-multi-megabyte payload, and the bgr0 to rgb conversion are all off the
-render thread. `Capture { interval, max_edge }` is the cost knob:
-frame rate and optional downscale are parameters, not constants.
-
-the second connection is deliberate. a frame reply is megabytes of
-json; sharing the control connection would put that parse in front of
-the `time-pos` events the render path reads.
-
-**the frame source itself does not currently work.** mpv's own manual
-says `screenshot-raw` "can be used only through the client API or from
-a script using `mp.command_native`", and that is literal: over json ipc
-mpv answers it with
-
-```
-{"data":{"w":640,"h":480,"stride":2560,"format":"bgr0","data":},...}
-```
-
-i.e. a `data` field with nothing after it, because the value is an
-`MPV_FORMAT_BYTE_ARRAY` and mpv's json writer has no encoding for one.
-the line does not parse. measured on mpv 0.41.0 for both a real h264
-file and a lavfi source, with and without `--vo=null`, for every
-`flags` value.
-
-the old code called this straight from the main loop, so the failure
-cost the full 10s reply timeout per attempt: the whole ui froze in 10s
-blocks for as long as a local video was playing. the pump recognises an
-unparseable reply as `PumpState::Unsupported`, stops asking, and says
-so once; a blank pane is bad, a frozen app is worse.
-
-what is left for a working source, none of it free: `screenshot-to-file`
-plus a read-back measures 200ms (480p) to 530ms (1080p) per frame on
-mpv's side, so ~2-5fps at best; an mpv lua script using
-`mp.command_native` and shipping frames out itself; or `--vo=image`
-writing every frame to a directory. the pump's public surface
-(`latest()` -> newest `Frame`) does not change under any of them.
-
+Wim's mpv process owns native video playback and opens a normal GPU-backed
+window for video items; music items disable the video track. Wim does not
+decode or render video frames. Both apps use mpv's playlist and IPC state,
+so queue/transport status remains coherent while mpv owns the picture.
+Fullscreen is controlled through mpv's `fullscreen` property, and the
+remappable `open_video_player` action asks mpv to show its native window.
+See `docs/video.md` for the user-facing behavior.
 ## strictly monochrome ui
 
 every color anywhere in the ui is `Color::Rgb(v, v, v)` via

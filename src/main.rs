@@ -3,18 +3,16 @@
 //! focus and menus lives in the library, not here.
 
 use wim::cli;
-use wim::framesource;
 use wim::playback_status;
 #[cfg(feature = "dev-telemetry")]
 use wim::trace;
 use wim::ui::settings_menu::Field as SettingsField;
 use wim::{
     anim, app, browse, cache, config, coverart, eq, favorites, hit, keymap, library, listenbrainz,
-    lyrics, mpv, persistence, queues, search, shellsong, shellsong_host, suggest, term, ui, video,
+    lyrics, mpv, persistence, queues, search, shellsong, shellsong_host, suggest, term, ui,
 };
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -48,7 +46,7 @@ use wim::eq_menu_keys::{
 };
 use wim::focus::{focus_direction_key, focus_in_direction, InputMode};
 use wim::graphics::{cell_aspect, protocol_image, ArtProbe, ProtocolCache};
-use wim::keymap::{KeyAction, Keymap};
+use wim::keymap::{key_label, KeyAction, Keymap};
 use wim::layout::{PanelLayout, ResizePanel};
 use wim::lyricspane::LyricsPane;
 use wim::navmanager::{NavManager, NavManagerStep};
@@ -61,7 +59,7 @@ use wim::shellsong_host::{CorpusCandidates, Ramp, SearchSettle, SleepStep};
 use wim::subtitle_align::{
     self, Event as AlignmentEvent, Request as AlignmentRequest, SubtitleInput,
 };
-use wim::theme::{shade, NEAR_BLACK};
+use wim::theme::{shade, NEAR_BLACK, NEAR_WHITE};
 use wim::transport::{
     activate_transport, commit_scrub, now_playing_is_video, ScrubAt, TransportCtx,
 };
@@ -122,6 +120,25 @@ fn focus_open_browse(focus: &mut Focus, player_minimized: &mut bool) {
     *focus = Focus::Workspace;
 }
 
+fn update_playlist_position(
+    queue: &mut PlayQueue,
+    view: Option<&mut browse::BrowseView>,
+    shuffle: bool,
+    position: i64,
+) -> Option<SearchItem> {
+    let previous = queue.current().cloned();
+    if !matches!(queue.set_pos(position), PosChange::Advanced(_)) {
+        return None;
+    }
+    let next = queue.current().cloned();
+    if !shuffle {
+        if let (Some(view), Some(previous), Some(next)) = (view, previous.as_ref(), next.as_ref()) {
+            view.follow_next(previous, next);
+        }
+    }
+    next
+}
+
 /// Crossterm's mouse event, reduced to what `hit::act` decides from.
 /// Only the left button is wired up: no other button means anything
 /// anywhere in this app, and a terminal reporting one should not be
@@ -159,6 +176,7 @@ struct WimSurface<'a> {
     keybinds_menu_open: &'a mut bool,
     keybinds_menu_selected: &'a mut usize,
     eq_menu: &'a mut ui::eq_menu::EqMenuPane,
+    crossfade_open: &'a mut bool,
     /// Reset when the menu opens, so a half-typed name editor or an
     /// armed delete cannot survive a close and reopen. The click path
     /// always did this; `view(eq)` did not, and routing the click
@@ -173,12 +191,6 @@ struct WimSurface<'a> {
     /// (docs/undo.md).
     shellsong_queued: &'a mut Option<Box<shellsong::Program>>,
     bottombar_selected: Field,
-    /// What `video()` asked for, applied by the frame loop rather than
-    /// here: `CoreCtx` holds `&cfg` for the whole frame, so the op
-    /// cannot write it. Same deferral `shellsong_queued` uses, and the
-    /// loop clears the shift-`v` override with it, since the override
-    /// wins over config and would otherwise swallow the change.
-    video_request: &'a mut Option<config::VideoOutput>,
 }
 
 impl Surface for WimSurface<'_> {
@@ -256,23 +268,18 @@ impl Surface for WimSurface<'_> {
         Some(self.bottombar_selected)
     }
 
+    fn open_crossfade(&mut self) -> (Dispatch, Report) {
+        *self.crossfade_open = true;
+        *self.focus = Focus::BottomBar;
+        op_done()
+    }
+
     fn flash(&mut self, field: Field) {
         *self.flash = Some((field, Instant::now()));
     }
 
     fn minimize_player(&mut self, minimize: bool) {
         *self.player_minimized = minimize;
-    }
-
-    fn set_video_output(
-        &mut self,
-        mode: config::VideoOutput,
-        core: &mut CoreCtx,
-    ) -> (Dispatch, Report) {
-        *self.video_request = Some(mode);
-        let said = format!("video output: {}", mode.word());
-        core.notifications.push(Severity::Info, said.clone());
-        op_note(said)
     }
 
     fn queue_cursor(&mut self) -> Option<&mut usize> {
@@ -544,6 +551,13 @@ fn adjust_subtitle_field(sub: &mut config::SubtitleConfig, field: usize, dir: f6
     }
 }
 
+fn alignment_item_key(item: Option<&SearchItem>) -> Option<String> {
+    match item {
+        Some(SearchItem::LocalVideo { path, .. }) => Some(path.to_string_lossy().into_owned()),
+        _ => None,
+    }
+}
+
 /// Warns once, right after a profile is saved, that the password it
 /// just persisted is cleartext. Typing credentials into the app is the
 /// only way it can store them (subsonic auth needs the cleartext for
@@ -699,6 +713,11 @@ fn download_selected(
     dctx: &mut DownloadCtx,
     notifications: &mut Notifications,
 ) {
+    warn_low_quality_download(
+        dctx.offline_download_format,
+        dctx.offline_download_bitrate_kbps,
+        notifications,
+    );
     match resolver.request(item, Intent::Download) {
         Resolution::Ready(tracks) => {
             let done = download_tracks(&tracks, dctx, notifications);
@@ -712,15 +731,23 @@ fn download_selected(
     }
 }
 
-/// The commit this binary was built from, stamped by build.rs.
-const BUILD: &str = env!("WIM_BUILD");
+fn low_quality_download_warning(format: &str, bitrate_kbps: u32) -> Option<String> {
+    (format != "flac" && bitrate_kbps <= 96)
+        .then(|| format!("low offline audio quality: downloads will use {bitrate_kbps} kbps"))
+}
 
-fn alignment_item_key(item: Option<&SearchItem>) -> Option<String> {
-    match item {
-        Some(SearchItem::LocalVideo { path, .. }) => Some(path.to_string_lossy().into_owned()),
-        _ => None,
+fn warn_low_quality_download(format: &str, bitrate_kbps: u32, notifications: &mut Notifications) {
+    if let Some(warning) = low_quality_download_warning(format, bitrate_kbps) {
+        notifications.push(Severity::Alert, warning);
     }
 }
+
+fn rebuild_status(started: usize, unavailable: usize, already_running: usize) -> String {
+    format!("rebuild: {started} started, {unavailable} unavailable profile(s), {already_running} already running")
+}
+
+/// The commit this binary was built from, stamped by build.rs.
+const BUILD: &str = env!("WIM_BUILD");
 
 fn main() -> anyhow::Result<()> {
     // answered before anything else, so these work with no terminal,
@@ -737,7 +764,7 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     };
-    let from_cli = match run {
+    let (from_cli, resume_requested) = match run {
         cli::WimRun::Version => {
             println!("wim {} ({BUILD})", env!("CARGO_PKG_VERSION"));
             return Ok(());
@@ -746,18 +773,20 @@ fn main() -> anyhow::Result<()> {
             println!("{}", cli::wim_help());
             return Ok(());
         }
-        cli::WimRun::Panes => Vec::new(),
+        cli::WimRun::Panes => (Vec::new(), false),
+        cli::WimRun::Resume => (Vec::new(), true),
         // refused by name rather than started empty, for the same
         // reason an unknown option above is: being handed a path and
         // then showing an empty library is the same silence.
         cli::WimRun::Play(files) => match cli::resolve_files(&files) {
-            Ok(items) => items,
+            Ok(items) => (items, false),
             Err(why) => {
                 eprintln!("wim: {why}");
                 std::process::exit(2);
             }
         },
     };
+    let _playback_files = wim::cache::PlaybackFiles::new();
     #[cfg(feature = "dev-telemetry")]
     trace::init();
     #[cfg(feature = "dev-telemetry")]
@@ -840,8 +869,10 @@ fn main() -> anyhow::Result<()> {
     let mut torbox_workspace = wim::torbox_workspace::Workspace::new(
         wim::torbox::Client::from_config(&cfg).map_err(|_| "TorBox is not configured".to_string()),
     );
+    torbox_workspace.spoilers_revealed = cfg.watch_reveal_spoilers;
     let mut torbox_open = false;
     let mut watch_workspace = wim::watch_workspace::Workspace::new();
+    watch_workspace.spoilers_revealed = cfg.watch_reveal_spoilers;
     let mut watch_open = false;
     // so the first frame says "scanning" rather than "no local music
     // found"; cleared when the scan thread drops its sender. the
@@ -918,39 +949,9 @@ fn main() -> anyhow::Result<()> {
     // the track listing stays visible rather than getting replaced.
     // 'm' toggles it by hand either way.
     let mut player_minimized = false;
-    // latest captured frame while playing a local video, rendered
-    // through the same ascii pipeline as album art instead of mpv
-    // opening its own window; `None` whenever nothing video is
-    // playing or a capture hasn't landed yet. 'v' expands its pane
-    // from main_content to the whole workspace (sidebar included),
-    // never the bottom bar.
-    // 'v': hands the whole terminal to mpv, which draws the video with
-    // a terminal video output of its own while wim stops drawing
-    // entirely. `video_vo` is the vo mpv is drawing with *right now*
-    // (`None` = mpv is back on `vo=null` and the screen is wim's), and
-    // `video_geometry` the cell size that vo was initialized at, since
-    // mpv only reads it on init. see docs/video.md.
-    let mut video_fullscreen = false;
-    let mut video_vo: Option<video::Vo> = None;
-    // the art rect the last draw reserved for inline video: the frame
-    // source decodes at the grid the picture is painted on, and the
-    // draw is where that rect is decided. one frame stale at most — a
-    // resize repaints and the next `update` respawns at the new grid.
-    let mut inline_art_rect: Option<Rect> = None;
     // the last playback status the diagnostics file has seen, so a
     // transition is one line rather than one per frame.
     let mut prev_status: Option<&'static str> = None;
-    // the runtime half of `video_output`: `None` follows config.toml,
-    // and the ascii key is the only thing that sets it, so a restart
-    // goes back to whatever is configured.
-    let mut video_over: Option<config::VideoOutput> = None;
-    // what `video()` asked for, drained below; see `WimSurface`.
-    let mut video_request: Option<config::VideoOutput> = None;
-    // the ascii pane's instance, which is nothing until a video plays
-    // with `video_output = "ascii"`. kept out here so it survives the
-    // frame: dropping it would kill the child and respawn per frame.
-    let mut ascii = framesource::Ascii::default();
-    let mut video_geometry: (u16, u16) = (0, 0);
     // full keybind reference, opened with '?'; takes over the whole
     // screen the same way onboarding/the nav manager do.
     let mut help_open = false;
@@ -964,6 +965,7 @@ fn main() -> anyhow::Result<()> {
     // (not a full takeover like help_open), for live subtitle style
     // tweaks instead of only the ,/. delay-only adjustment.
     let mut subtitle_menu_open = false;
+    let mut subtitle_menu_selected: usize = 0;
     let mut alignment_worker: Option<subtitle_align::Worker> = None;
     let mut alignment_for: Option<String> = None;
     let mut alignment_restore_sid: Option<u64> = None;
@@ -971,12 +973,12 @@ fn main() -> anyhow::Result<()> {
     let mut alignment_preview: Option<(subtitle_align::Preview, u64)> = None;
     let mut alignment_preview_loaded = false;
     let mut alignment_status = String::new();
-    let mut subtitle_menu_selected: usize = 0;
     // 'u': the discoverable "where are the app's own settings" home,
     // covering the whole workspace like the video pane's fullscreen
     // mode does, never the bottom bar.
     let mut settings_menu_open = false;
     let mut settings_menu_selected: usize = 0;
+    let mut settings_rebuild_pending = false;
     // text-entry sub-mode for the settings menu's "listenbrainz
     // token" row (the one field there that isn't h/l-adjustable
     // numeric); enter on that row starts it, enter commits, esc
@@ -1003,11 +1005,17 @@ fn main() -> anyhow::Result<()> {
     for warning in config_warnings.into_iter().chain(keybind_warnings) {
         notifications.push(Severity::Alert, warning);
     }
+    warn_low_quality_download(
+        &cfg.offline_download_format,
+        cfg.effective_offline_download_bitrate_kbps(),
+        &mut notifications,
+    );
     // track play counts/last-played/on-disk cache state (cache.rs);
     // shared with background download threads, so it's behind a
     // mutex rather than owned outright the way `app`/`player` are.
     let cache_index = Arc::new(Mutex::new(cache::CacheIndex::load()));
     sweep_cache(&cache_index, cfg.cache_eviction_days);
+    cache::initialize_budget(cfg.offline_cache_max_bytes);
     let mut last_cache_sweep = Instant::now();
     // per-track download progress, reported back from whichever
     // thread `download::spawn_tracks` spawned (see
@@ -1192,20 +1200,18 @@ fn main() -> anyhow::Result<()> {
     // 0.6ms of time-to-first-frame for work nothing on screen needed.
     let mut pending_paths: Vec<String> = Vec::new();
 
-    // resuming across restarts is standard in any serious media player;
-    // a missing/corrupt state file just means nothing to resume, not an
-    // error; see persistence.rs.
+    // Saved playback is opt-in at launch so the home/title screen is
+    // always the default; a missing/corrupt state file is still harmless
+    // when `--resume` was requested. See persistence.rs.
     let (saved, resume_warning) = persistence::load_reporting();
     if let Some(why) = resume_warning {
         notifications.push(Severity::Alert, why);
     }
-    // a file named on the command line replaces the resumed session,
-    // the saved queue with it: two things fighting over mpv's playlist
-    // gives you a queue built around a track you did not ask for,
-    // which is not a resume. the volume is a setting rather than a
-    // session, so it restores either way.
+    // playback state is opened only when the user asked `--resume`; the
+    // title screen is the default even when a session was saved. the
+    // volume is a setting rather than a session, so it restores either way.
     let saved_volume = saved.as_ref().and_then(|s| s.volume);
-    let resume = saved.filter(|_| from_cli.is_empty());
+    let resume = saved.filter(|_| resume_requested && from_cli.is_empty());
     {
         let first = from_cli.first().cloned().or_else(|| {
             resume
@@ -1231,6 +1237,9 @@ fn main() -> anyhow::Result<()> {
                     download_tx: &download_tx,
                     downloading: &mut downloading,
                     day_threshold: cfg.cache_days_threshold,
+                    offline_download_bitrate_kbps: cfg.effective_offline_download_bitrate_kbps(),
+                    offline_download_format: &cfg.offline_download_format,
+                    offline_cache_max_bytes: cfg.offline_cache_max_bytes,
                     persist: cache::CacheIndex::save,
                 };
                 note_playback_started(&item, &mut dctx, &mut notifications);
@@ -1313,6 +1322,9 @@ fn main() -> anyhow::Result<()> {
     // two openers had to remember to reset all three; `EqMenuPane`
     // makes that one call.
     let mut eq_menu = ui::eq_menu::EqMenuPane::default();
+    let mut crossfade_open = false;
+    let mut crossfade_dragging = false;
+    let mut crossfade_layout = None;
     let mut undo_menu_open = false;
 
     let mut panels = PanelLayout::from_sizes(cfg.sidebar_width, cfg.bottom_bar_height);
@@ -1510,9 +1522,9 @@ fn main() -> anyhow::Result<()> {
                     keybinds_menu_open: &mut keybinds_menu_open,
                     keybinds_menu_selected: &mut keybinds_menu_selected,
                     eq_menu: &mut eq_menu,
+                    crossfade_open: &mut crossfade_open,
                     undo_menu_open: &mut undo_menu_open,
                     shellsong_queued: &mut shellsong_queued,
-                    video_request: &mut video_request,
                     bottombar_selected,
                 }
             };
@@ -1596,7 +1608,7 @@ fn main() -> anyhow::Result<()> {
         // A protocol image can change while ratatui's cell buffer stays
         // identical (the art rectangle is blank in full-art mode). Clear
         // its diff state so the new inline image is sent immediately.
-        if video_vo.is_none() && art_mode != last_drawn_art_mode {
+        if art_mode != last_drawn_art_mode {
             guard.clear()?;
             last_drawn_art_mode = art_mode;
         }
@@ -1674,7 +1686,6 @@ fn main() -> anyhow::Result<()> {
         // kept going to the invisible menu while the screen showed only
         // the video, which is exactly "couldn't move around the menus,
         // then it was just a video".
-        let overlay = tiers.covers_screen() || torbox_open || watch_open;
         #[cfg(feature = "dev-telemetry")]
         if trace::diag_enabled() {
             // state-change only: these are per-frame locals.
@@ -1696,152 +1707,8 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        // `video()`'s request, applied before the decision it changes so
-        // it lands on this frame. the override goes with it: shift-`v`
-        // wins over config, so leaving it would make the command
-        // report a mode the screen does not show.
-        if let Some(mode) = video_request.take() {
-            cfg.video_output = mode;
-            video_over = None;
-            config::save_or_warn(&cfg, &mut notifications);
-        }
-        // what should be on the screen right now; the whole decision is
-        // `video::showing`, including the guard that keeps music on
-        // `vo=null`. ascii and a drawing vo are the two halves of the
-        // same answer, so they come from one call and cannot disagree.
-        let showing = video::showing(
-            video::Screen {
-                fullscreen: video_fullscreen,
-                minimized: player_minimized,
-                overlay,
-                is_video: now_playing_is_video(&now_playing),
-            },
-            video::effective(cfg.video_output, video_over),
-            art.protocol_type(),
-        );
-        let want_vo = showing.mpv_vo();
-        let size = guard
-            .terminal
-            .size()
-            .map(|s| (s.width, s.height))
-            .unwrap_or(video_geometry);
-        // which move, if any, is `video::handover`; this is only the
-        // ipc for it. nothing is seeked or reloaded either way: `vo` is
-        // settable live and mpv plays straight through the switch.
-        match video::handover(want_vo, video_vo, size, video_geometry) {
-            video::Move::Nothing => {}
-            video::Move::Arm { vo, size } => {
-                let armed = player
-                    .set_video_geometry(size.0, size.1)
-                    .and_then(|()| player.set_video_output(vo.mpv_name()));
-                match armed {
-                    Ok(()) => {
-                        video_vo = Some(vo);
-                        video_geometry = size;
-                        wim::trace_diag!(
-                            "video",
-                            "arm",
-                            &[
-                                ("vo", trace::Value::Label(vo.mpv_name())),
-                                ("w", trace::Value::Num(size.0 as f64)),
-                                ("h", trace::Value::Num(size.1 as f64)),
-                            ],
-                        );
-                    }
-                    Err(_) => {
-                        // leave the screen alone and stop asking, rather
-                        // than retrying the handover every frame.
-                        video_fullscreen = false;
-                        notifications.push(Severity::Alert, "video: mpv refused the video output");
-                        wim::trace_diag!("video", "arm-failed", &[]);
-                    }
-                }
-            }
-            video::Move::Disarm => {
-                let _ = player.set_video_output(video::Vo::Null.mpv_name());
-                video_vo = None;
-                let _ = guard.reclaim();
-                wim::trace_diag!("video", "disarm", &[]);
-            }
-            video::Move::Rebounce { vo, size } => {
-                let _ = player.set_video_output(video::Vo::Null.mpv_name());
-                let _ = player.set_video_geometry(size.0, size.1);
-                let _ = player.set_video_output(vo.mpv_name());
-                video_geometry = size;
-                wim::trace_diag!(
-                    "video",
-                    "rebounce",
-                    &[
-                        ("w", trace::Value::Num(size.0 as f64)),
-                        ("h", trace::Value::Num(size.1 as f64)),
-                    ],
-                );
-            }
-        }
-        // the ascii pane, driven off the same `elapsed_secs` every
-        // widget reads, so the picture and the scrubber cannot drift.
-        // the fifo is the clock: a paused player stops advancing this,
-        // so nothing is read and the frame instance blocks in `write`.
-        // a resolved stream url is media the frame source decodes the
-        // same way a local file is (docs/video.md: the server has to
-        // answer ranges, and the url goes to mpv on stdin, not argv);
-        // unresolved means resolution failed and there is nothing to
-        // show but the title.
-        let ascii_media = match &now_playing {
-            Some(SearchItem::LocalVideo { path, .. }) => Some(path.as_path()),
-            Some(SearchItem::TorBoxFile {
-                resolved_url: Some(url),
-                ..
-            }) => Some(Path::new(url.as_str())),
-            Some(SearchItem::WatchSource { url, .. }) => Some(Path::new(url.expose())),
-            _ => None,
-        };
-        // inline video: a video plays, the player view is up, and the
-        // screen is wim's — not fullscreen, where mpv's own vo (or the
-        // fullscreen ascii pane) owns the screen instead. the frames
-        // go on the art rect the last draw reserved; the first frame
-        // after a video starts has no rect yet, so the source starts a
-        // frame late rather than latching a refusal against a grid
-        // with no cells.
-        let inline_video = !video_fullscreen
-            && !player_minimized
-            && !overlay
-            && now_playing_is_video(&now_playing);
-        let (want_frames, frame_grid) = if showing.is_ascii() {
-            (
-                true,
-                framesource::Grid::for_area(Rect::new(0, 0, size.0, size.1), aspect),
-            )
-        } else if inline_video {
-            match inline_art_rect {
-                Some(rect) => (true, framesource::Grid::for_area(rect, aspect)),
-                None => (false, framesource::Grid::new(0, 0, aspect)),
-            }
-        } else {
-            (false, framesource::Grid::new(0, 0, aspect))
-        };
-        if let Err(e) = ascii.update(
-            want_frames,
-            ascii_media,
-            frame_grid, // an unknown position is the start of the file, which is
-            // what a just-loaded track is anyway.
-            elapsed_secs.unwrap_or(0.0),
-            // one ipc round trip per spawn, never per frame.
-            || {
-                framesource::ascii_fps(
-                    player
-                        .get_property("container-fps")
-                        .ok()
-                        .and_then(|v| v.as_f64()),
-                    cfg.ascii_fps,
-                )
-            },
-        ) {
-            // `Ascii` latches the file it failed on, so this is once per
-            // video and not once per frame.
-            notifications.push(Severity::Alert, format!("video: ascii frames failed: {e}"));
-            video_fullscreen = false;
-        }
+        // Native mpv owns all video rendering; Wim renders only its
+        // workspace status and transport controls.
         // cleared here and refilled by the draw below, so a mouse
         // event is always answered by the frame the user clicked on.
         // `hit::front` resolves the tier from the key cascade's own
@@ -1851,32 +1718,8 @@ fn main() -> anyhow::Result<()> {
             modal: hit::front(tiers),
             ..Default::default()
         };
-        // skipped outright while mpv owns the screen: a repaint from
-        // ratatui's buffer would overwrite the video with the ui that
-        // was on screen before the handover. `hits` stays as reset
-        // above, i.e. empty, which is the right answer for a click on a
-        // screen holding no wim widgets at all.
-        guard.draw_unless_video(video_vo.is_some(), |f| {
+        guard.terminal.draw(|f| {
             let area = f.area();
-
-            // fullscreen ascii video owns the whole screen, the same as
-            // a drawing vo would, except wim is the one painting so
-            // notifications still land on top; an alert behind the
-            // picture is an alert the user never sees. `active` alone
-            // is not the gate: the frame source also runs for inline
-            // video, where the ui draws around it and only the art
-            // rect holds frames — `showing` is the one decision that
-            // knows which of the two this frame is.
-            if showing.is_ascii() && ascii.active() {
-                ascii.paint(area, ui::raster::Tone::Mono, f.buffer_mut());
-                f.render_widget(
-                    NotificationOverlay {
-                        items: notifications.visible(),
-                    },
-                    area,
-                );
-                return;
-            }
 
             // onboarding takes the whole screen; no divider/status bar
             // competing with a guided first-run sequence.
@@ -2095,7 +1938,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 vdivider
             };
-            let junction_rows = ui::junctions::SidebarDivider {
+            let mut junction_rows = ui::junctions::SidebarDivider {
                 search: search_rect,
                 results_header_rows: &ui::results_list::header_rows(
                     &result_rows(&app),
@@ -2106,6 +1949,21 @@ fn main() -> anyhow::Result<()> {
                 bottom_rule_row: bottom.y,
             }
             .junctions(shade(NEAR_BLACK));
+            // The search box's right edge is physically drawn by this
+            // divider. Keep its complete three-cell wall in lockstep
+            // with the box border while editing; otherwise the corners
+            // and middle stroke disappear into the idle divider.
+            if app.editing_query {
+                ui::junctions::highlight_vertical_rows(
+                    &mut junction_rows,
+                    &[
+                        (search_rect.y, '┐'),
+                        (search_rect.y + 1, '│'),
+                        (search_rect.y + search_rect.height.saturating_sub(1), '┘'),
+                    ],
+                    shade(NEAR_WHITE),
+                );
+            }
             f.render_widget(
                 VerticalRule {
                     highlighted: sidebar_selected,
@@ -2178,10 +2036,8 @@ fn main() -> anyhow::Result<()> {
             // its own branch rasterizing a frame pulled off mpv, which
             // **could never produce one**: `screenshot-raw` does not
             // work over json ipc, and mpv draws video with its own
-            // terminal vo now. `draw_unless_video` means this only
-            // runs when mpv is *not* drawing (`video_output = "off"`,
-            // or mid-handover), where that branch painted an empty
-            // rect instead of the player.
+            // mpv owns the native video window; this remains Wim's
+            // status and transport panel for every media type.
             if show_full_player {
                 let item = now_playing.as_ref().expect("show_full_player implies Some");
                 // video gets the whole pane: the spectrum is music's
@@ -2213,6 +2069,11 @@ fn main() -> anyhow::Result<()> {
                 // keyed on the song's own id; until that lands those
                 // tracks show no art rather than the wrong one.
                 let has_context = previous_label.is_some() || next_label.is_some();
+                let video_status = format!(
+                    "VIDEO PLAYING IN SEPARATE MPV WINDOW · {} OPEN · {} FULLSCREEN",
+                    key_label(keymap.get(KeyAction::OpenVideoPlayer)),
+                    key_label(keymap.get(KeyAction::ToggleFullscreenVideo)),
+                );
                 let player_view = PlayerView {
                     title: &label(item),
                     // the cover rect becomes a countdown for a gap,
@@ -2231,22 +2092,11 @@ fn main() -> anyhow::Result<()> {
                     art: playing_art,
                     art_key: &coverart::art_key(item),
                     art_mode,
-                    // frames land on the art rect after this view; the
-                    // view reserves the rect and draws no cover under
-                    // them.
-                    video: inline_video,
-                    // why there is no picture yet (or why there never
-                    // will be): the source takes a moment to spawn,
-                    // and a file mpv refuses is latched so this is a
-                    // stable answer, not one per frame.
-                    video_note: if inline_video {
-                        if ascii.failed() {
-                            Some("VIDEO UNAVAILABLE")
-                        } else if !ascii.ready() {
-                            Some("loading video…")
-                        } else {
-                            None
-                        }
+                    // mpv owns frames; Wim reserves this area for an
+                    // actionable status card instead of release art.
+                    video: now_playing_is_video(&now_playing),
+                    video_note: if now_playing_is_video(&now_playing) {
+                        Some(&video_status)
                     } else {
                         None
                     },
@@ -2267,42 +2117,32 @@ fn main() -> anyhow::Result<()> {
                 };
                 f.render_widget(player_view, player_content);
                 // `has_art` is the one place the rule lives, so this is
-                // the same rect the view reserved — the contract the
-                // video frames and the `Full*` cover overlay both
-                // depend on.
-                let player_art_rect = ui::player::layout(
+                // the same rect the view reserved for cover art or the
+                // native-mpv status card.
+                let player_layout = ui::player::layout(
                     player_content,
                     ui::player::has_art(
-                        inline_video,
+                        now_playing_is_video(&now_playing),
                         playing_art.is_some(),
                         matches!(item, SearchItem::Silence { .. }),
                         art_mode,
                     ),
                     has_context,
                     aspect,
-                )
-                .and_then(|l| l.art);
-                if inline_video {
-                    // the picture for this frame, and the grid the
-                    // frame source decodes at on the next pass. painted
-                    // after the view and instead of the cover overlay:
-                    // the frames own the rect, and a cover under them
-                    // would be one frame of flicker.
-                    inline_art_rect = player_art_rect;
-                    if let Some(rect) = player_art_rect {
-                        ascii.paint(rect, ui::raster::Tone::Mono, f.buffer_mut());
-                    }
-                } else {
-                    inline_art_rect = None;
-                    if art_mode.is_full() {
-                        // same contract as the browse view: the widget
-                        // drew no ascii art, the real image goes on the
-                        // exact rect its own layout picked.
-                        if let (Some(protocol), Some(art_rect)) =
-                            (player_art.protocol(), player_art_rect)
-                        {
-                            f.render_stateful_widget(StatefulImage::default(), art_rect, protocol);
-                        }
+                );
+                let player_art_rect = player_layout.and_then(|l| l.art);
+                if now_playing_is_video(&now_playing) {
+                    hits.video_sync = player_layout
+                        .and_then(|l| ui::player::video_sync_target(l, player_content, true));
+                }
+                if art_mode.is_full() {
+                    // same contract as the browse view: the widget
+                    // drew no ascii art, the real image goes on the
+                    // exact rect its own layout picked.
+                    if let (Some(protocol), Some(art_rect)) =
+                        (player_art.protocol(), player_art_rect)
+                    {
+                        f.render_stateful_widget(StatefulImage::default(), art_rect, protocol);
                     }
                 }
 
@@ -2487,12 +2327,6 @@ fn main() -> anyhow::Result<()> {
                 // are drawn from.
                 let values = ui::settings_menu::FIELDS.map(|field| match field {
                     SettingsField::AlbumArt => format!("{art_mode_label} ('i' also cycles this)"),
-                    SettingsField::VideoOutput => ui::settings_menu::video_output_value(
-                        cfg.video_output,
-                        video_over,
-                        art.protocol_type(),
-                    ),
-                    SettingsField::AsciiFps => ui::settings_menu::ascii_fps_value(cfg.ascii_fps),
                     SettingsField::EqEnabled => {
                         if cfg.eq_enabled { "on" } else { "off" }.to_string()
                     }
@@ -2505,6 +2339,38 @@ fn main() -> anyhow::Result<()> {
                         format!("{} days played", cfg.cache_days_threshold)
                     }
                     SettingsField::CacheEvictionDays => format!("{} days", cfg.cache_eviction_days),
+                    SettingsField::OfflineCacheBudget => {
+                        format!("{} GB", cfg.offline_cache_max_bytes / 1_000_000_000)
+                    }
+                    SettingsField::OfflineDownloadBitrate => {
+                        let effective = cfg.effective_offline_download_bitrate_kbps();
+                        if effective == cfg.offline_download_bitrate_kbps {
+                            format!("{effective} kbps")
+                        } else {
+                            format!("{effective} kbps (budget cap)")
+                        }
+                    }
+                    SettingsField::OfflineDownloadFormat => format!(
+                        "{} ({})",
+                        cfg.offline_download_format,
+                        if cfg.offline_download_format == "flac" {
+                            "lossless"
+                        } else {
+                            "lossy"
+                        }
+                    ),
+                    SettingsField::RebuildDownloads => {
+                        let count = cache_index
+                            .lock()
+                            .ok()
+                            .map(|index| index.download_manifest().count())
+                            .unwrap_or(0);
+                        if settings_rebuild_pending {
+                            format!("confirm · {count} songs · enter again")
+                        } else {
+                            format!("{count} songs · enter to rebuild")
+                        }
+                    }
                     SettingsField::ScrobblePercent => {
                         format!("{:.0}%", cfg.scrobble.threshold_percent)
                     }
@@ -2667,6 +2533,20 @@ fn main() -> anyhow::Result<()> {
             hits.toasts = ui::notify::boxes(toasts, area);
             f.render_widget(NotificationOverlay { items: toasts }, area);
 
+            crossfade_layout = None;
+            if crossfade_open {
+                let layout = ui::crossfade::layout(area, bottom);
+                crossfade_layout = Some(layout);
+                f.render_widget(
+                    ui::crossfade::CrossfadePopup {
+                        layout,
+                        enabled: crossfade_enabled,
+                        seconds: cfg.crossfade_seconds,
+                    },
+                    area,
+                );
+            }
+
             if subtitle_menu_open {
                 let values = [
                     format!("{:+.1}s", cfg.subtitles.delay_secs),
@@ -2801,8 +2681,13 @@ fn main() -> anyhow::Result<()> {
                 continue;
             }
             if name == mpv::PROP_PLAYLIST_POS {
-                if let PosChange::Advanced(_) = play_queue.set_pos(value.as_i64().unwrap_or(-1)) {
-                    advanced_to = play_queue.current().cloned();
+                if let Some(next) = update_playlist_position(
+                    &mut play_queue,
+                    browse_view.as_mut(),
+                    app.shuffle,
+                    value.as_i64().unwrap_or(-1),
+                ) {
+                    advanced_to = Some(next);
                 }
             } else if name == mpv::PROP_IDLE_ACTIVE {
                 playlist_drained = value.as_bool().unwrap_or(false);
@@ -2842,6 +2727,13 @@ fn main() -> anyhow::Result<()> {
                 Drained::Cleared => now_playing = None,
                 Drained::Failed(why) => notifications.push(Severity::Error, why),
                 Drained::Restarted(first) => {
+                    if !app.shuffle {
+                        if let (Some(view), Some(previous)) =
+                            (&mut browse_view, now_playing.as_ref())
+                        {
+                            view.follow_restart(previous, &first);
+                        }
+                    }
                     // a loop-all restart is a track change, so it is
                     // the same hook the advance above uses.
                     let started = {
@@ -3513,6 +3405,9 @@ fn main() -> anyhow::Result<()> {
             // input is actually active, same priority order as key
             // handling below.
             if let Event::Paste(text) = &ev {
+                if crossfade_open {
+                    continue;
+                }
                 if let Some(ob) = &mut onboarding {
                     match ob.step {
                         Step::Navidrome => ob.login.current_mut().push_str(text),
@@ -3574,6 +3469,50 @@ fn main() -> anyhow::Result<()> {
             // opens a scrub from the bar's own cursor, and a click
             // on a control moves the cursor there first.
             if let Event::Mouse(m) = &ev {
+                if crossfade_open {
+                    if let Some(layout) = crossfade_layout {
+                        let kind = mouse_kind(m.kind);
+                        if kind == hit::Kind::Down
+                            && !crossfade_dragging
+                            && !ui::crossfade::contains(layout.popup, m.column, m.row)
+                        {
+                            crossfade_open = false;
+                            cfg.crossfade_enabled = crossfade_enabled;
+                            config::save_or_warn(&cfg, &mut notifications);
+                            continue;
+                        }
+                        if kind == hit::Kind::Down
+                            && layout
+                                .toggle
+                                .is_some_and(|r| ui::crossfade::contains(r, m.column, m.row))
+                        {
+                            crossfade_enabled = !crossfade_enabled;
+                            if !crossfade_enabled {
+                                fade_in_started_at = None;
+                                let _ = player.set_volume(base_volume);
+                            }
+                            cfg.crossfade_enabled = crossfade_enabled;
+                            config::save_or_warn(&cfg, &mut notifications);
+                        } else if let Some(slider) = layout.slider {
+                            if let Some(seconds) = ui::crossfade::drag_seconds(
+                                slider,
+                                &mut crossfade_dragging,
+                                kind,
+                                m.column,
+                                m.row,
+                            ) {
+                                cfg.crossfade_seconds = seconds;
+                                crossfade_enabled = true;
+                                cfg.crossfade_enabled = true;
+                                if kind == hit::Kind::Up {
+                                    crossfade_dragging = false;
+                                    config::save_or_warn(&cfg, &mut notifications);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let dragging = scrub.is_some();
                 let click = hit::Click {
                     kind: mouse_kind(m.kind),
@@ -3598,6 +3537,20 @@ fn main() -> anyhow::Result<()> {
                     }
                     continue;
                 }
+                // Toast rectangles are recorded from the exact frame
+                // painted, newest first. Clicking one dismisses that
+                // toast instead of forwarding the click to hidden UI.
+                if click.kind == hit::Kind::Down {
+                    if let Some(index) = hits.toasts.iter().position(|rect| {
+                        click.col >= rect.x
+                            && click.col < rect.x + rect.width
+                            && click.row >= rect.y
+                            && click.row < rect.y + rect.height
+                    }) {
+                        notifications.dismiss_visible(index);
+                        continue;
+                    }
+                }
                 let act = hit::act(&hits, click, dragging);
                 // a click lands somewhere specific, so unlike a key it
                 // cannot leak into a text box; what it does instead is
@@ -3615,6 +3568,26 @@ fn main() -> anyhow::Result<()> {
                 }
                 match act {
                     hit::Act::Nothing | hit::Act::Swallowed(_) => {}
+                    hit::Act::OpenSubtitleMenu => {
+                        subtitle_menu_open = true;
+                        focus = Focus::Workspace;
+                        if now_playing_is_video(&now_playing) {
+                            let model_ready = cfg
+                                .whisper_model_file
+                                .as_deref()
+                                .is_some_and(|path| std::path::Path::new(path).is_file());
+                            let track = player
+                                .selected_subtitle_track()
+                                .ok()
+                                .flatten()
+                                .map(|track| track.label)
+                                .unwrap_or_else(|| "no subtitle selected".into());
+                            alignment_status = format!(
+                                "{track} · local model {}",
+                                if model_ready { "ready" } else { "missing" }
+                            );
+                        }
+                    }
                     hit::Act::Focus(pane) => focus = pane,
                     hit::Act::Edit(which) => match which {
                         hit::TextBox::Query => {
@@ -3778,8 +3751,42 @@ fn main() -> anyhow::Result<()> {
                 // where nothing else claims it first (see app.rs),
                 // same as every other single-letter shortcut.
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if crossfade_open {
+                        cfg.crossfade_enabled = crossfade_enabled;
+                        config::save_or_warn(&cfg, &mut notifications);
+                    }
                     save_playback_state(&player, &play_queue);
                     break;
+                }
+
+                if crossfade_open {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                            crossfade_open = false;
+                            crossfade_dragging = false;
+                        }
+                        KeyCode::Left | KeyCode::Char('h') => {
+                            cfg.crossfade_seconds =
+                                config::crossfade_seconds(cfg.crossfade_seconds - 0.5);
+                            crossfade_enabled = true;
+                        }
+                        KeyCode::Right | KeyCode::Char('l') => {
+                            cfg.crossfade_seconds =
+                                config::crossfade_seconds(cfg.crossfade_seconds + 0.5);
+                            crossfade_enabled = true;
+                        }
+                        KeyCode::Char(' ') => {
+                            crossfade_enabled = !crossfade_enabled;
+                            if !crossfade_enabled {
+                                fade_in_started_at = None;
+                                let _ = player.set_volume(base_volume);
+                            }
+                        }
+                        _ => continue,
+                    }
+                    cfg.crossfade_enabled = crossfade_enabled;
+                    config::save_or_warn(&cfg, &mut notifications);
+                    continue;
                 }
 
                 if torbox_open {
@@ -3840,6 +3847,15 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     match key.code {
+                        KeyCode::Char('v') if torbox_workspace.page != Page::Setup => {
+                            torbox_workspace.spoilers_revealed =
+                                !torbox_workspace.spoilers_revealed;
+                        }
+                        KeyCode::Char('V') if torbox_workspace.page != Page::Setup => {
+                            cfg.watch_reveal_spoilers = !cfg.watch_reveal_spoilers;
+                            torbox_workspace.spoilers_revealed = cfg.watch_reveal_spoilers;
+                            config::save_or_warn(&cfg, &mut notifications);
+                        }
                         KeyCode::Esc if torbox_workspace.page == Page::Setup => {
                             torbox_workspace.page = Page::Search;
                         }
@@ -4035,6 +4051,21 @@ fn main() -> anyhow::Result<()> {
 
                 if watch_open {
                     use wim::watch_workspace::Page;
+                    if watch_workspace.confirm_torrent_add {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                let client = wim::torbox::Client::from_config(&cfg).map_err(|_| {
+                                    "configure torbox_token_file before adding a torrent".to_owned()
+                                });
+                                watch_workspace.confirm_torrent_add(client);
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                watch_workspace.cancel_torrent_add();
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Esc
                             if watch_workspace.page == Page::Search
@@ -4060,6 +4091,16 @@ fn main() -> anyhow::Result<()> {
                         }
                         KeyCode::Char('r') if watch_workspace.page != Page::Search => {
                             watch_workspace.spoilers_revealed = !watch_workspace.spoilers_revealed;
+                        }
+                        KeyCode::Char('R') if watch_workspace.page != Page::Search => {
+                            cfg.watch_reveal_spoilers = !cfg.watch_reveal_spoilers;
+                            watch_workspace.spoilers_revealed = cfg.watch_reveal_spoilers;
+                            config::save_or_warn(&cfg, &mut notifications);
+                            watch_workspace.message = Some(if cfg.watch_reveal_spoilers {
+                                "episode spoilers will be shown by default".into()
+                            } else {
+                                "episode spoilers are hidden by default".into()
+                            });
                         }
                         KeyCode::Char('[') if watch_workspace.page == Page::Episodes => {
                             watch_workspace.move_season(-1)
@@ -4110,6 +4151,9 @@ fn main() -> anyhow::Result<()> {
                                 watch_workspace.prepare_selected_source();
                             }
                         }
+                        KeyCode::Char('a') if watch_workspace.page == Page::Sources => {
+                            watch_workspace.arm_torrent_add();
+                        }
                         KeyCode::Backspace if watch_workspace.page == Page::Detail => {
                             watch_workspace.enter_search()
                         }
@@ -4139,6 +4183,8 @@ fn main() -> anyhow::Result<()> {
 
                 if onboarding.is_none() && key.code == KeyCode::Char('W') {
                     watch_open = true;
+                    watch_workspace.spoilers_revealed = cfg.watch_reveal_spoilers;
+                    torbox_workspace.spoilers_revealed = cfg.watch_reveal_spoilers;
                     if !watch_workspace.is_configured() && !watch_workspace.loading {
                         match std::env::var("WIM_STREMIO_ADDON_URL") {
                             Ok(url) if !url.trim().is_empty() => watch_workspace.configure(url),
@@ -4373,7 +4419,15 @@ fn main() -> anyhow::Result<()> {
                                     if nm.selected >= nm.connection_status.len() {
                                         nm.connection_status.resize(nm.selected + 1, None);
                                     }
-                                    nm.connection_status[nm.selected] = Some(result.is_ok());
+                                    nm.connection_status[nm.selected] = Some(match &result {
+                                        Ok(_) => wim::navmanager::ConnectionStatus::Online,
+                                        Err(message)
+                                            if wim::catalog::is_authentication_message(message) =>
+                                        {
+                                            wim::navmanager::ConnectionStatus::ConfigurationIssue
+                                        }
+                                        Err(_) => wim::navmanager::ConnectionStatus::Unreachable,
+                                    });
                                     nm.message = match result {
                                         Ok(msg) => format!("reconnected: {msg}"),
                                         Err(msg) => {
@@ -4416,7 +4470,8 @@ fn main() -> anyhow::Result<()> {
                                         edit_servers(&mut cfg, &servers_tx, |s| s.push(nav));
                                         config::save_or_warn(&cfg, &mut notifications);
                                         warn_plaintext_password(&cfg, &mut notifications);
-                                        nm.connection_status.push(Some(true));
+                                        nm.connection_status
+                                            .push(Some(wim::navmanager::ConnectionStatus::Online));
                                         nm.selected = cfg.navidrome_servers.len() - 1;
                                         nm.step = NavManagerStep::List;
                                         nm.message = format!("connected: {msg}");
@@ -4579,6 +4634,16 @@ fn main() -> anyhow::Result<()> {
                         config::save_or_warn(&cfg, &mut notifications);
                         continue;
                     }
+                    if key.code == KeyCode::Char('n') {
+                        match player.cycle_subtitle_track() {
+                            Ok(Some(note)) => notifications.push(Severity::Info, note),
+                            Ok(None) => notifications
+                                .push(Severity::Alert, "no subtitle tracks in this video"),
+                            Err(error) => notifications
+                                .push(Severity::Error, format!("subtitle track: {error}")),
+                        }
+                        continue;
+                    }
                     if key.code == KeyCode::Char('d') {
                         if let Some((preview, restore_sid)) = alignment_preview.take() {
                             if alignment_preview_loaded {
@@ -4590,6 +4655,15 @@ fn main() -> anyhow::Result<()> {
                             alignment_restore_sid = None;
                         } else {
                             alignment_status = "no alignment suggestion to reject".into();
+                        }
+                        continue;
+                    }
+                    if key.code == KeyCode::Char('x') {
+                        match player.toggle_subtitle_visibility() {
+                            Ok(true) => notifications.push(Severity::Info, "subtitles visible"),
+                            Ok(false) => notifications.push(Severity::Info, "subtitles hidden"),
+                            Err(error) => notifications
+                                .push(Severity::Error, format!("subtitle visibility: {error}")),
                         }
                         continue;
                     }
@@ -4698,6 +4772,17 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     if key.code == KeyCode::Char('p') {
+                        if alignment_for != alignment_item_key(now_playing.as_ref()) {
+                            if let Some((preview, restore_sid)) = alignment_preview.take() {
+                                if alignment_preview_loaded {
+                                    let _ = player.select_subtitle_id(restore_sid);
+                                }
+                                subtitle_align::discard_preview(&preview);
+                            }
+                            alignment_preview_loaded = false;
+                            alignment_status = "video changed; run alignment again".into();
+                            continue;
+                        }
                         if let Some((preview, _)) = alignment_preview.as_ref() {
                             let still_matches =
                                 player.selected_audio_ff_index().ok().flatten()
@@ -4726,6 +4811,22 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     if key.code == KeyCode::Char('y') {
+                        if !alignment_preview_loaded {
+                            alignment_status = "load the preview with p before accepting it".into();
+                            continue;
+                        }
+                        if alignment_for != alignment_item_key(now_playing.as_ref()) {
+                            if let Some((preview, restore_sid)) = alignment_preview.take() {
+                                let _ = player.select_subtitle_id(restore_sid);
+                                subtitle_align::discard_preview(&preview);
+                            }
+                            alignment_preview_loaded = false;
+                            alignment_restore_sid = None;
+                            alignment_audio_stream = None;
+                            alignment_for = None;
+                            alignment_status = "video changed; run alignment again".into();
+                            continue;
+                        }
                         if let Some((preview, _)) = alignment_preview.take() {
                             let selected_is_source_or_preview =
                                 player.selected_subtitle_track().ok().flatten().is_some_and(
@@ -4811,6 +4912,22 @@ fn main() -> anyhow::Result<()> {
                 }
                 if key.code == keymap.get(KeyAction::OpenSubtitleMenu) {
                     subtitle_menu_open = true;
+                    if now_playing_is_video(&now_playing) {
+                        let model_ready = cfg
+                            .whisper_model_file
+                            .as_deref()
+                            .is_some_and(|path| std::path::Path::new(path).is_file());
+                        let track = player
+                            .selected_subtitle_track()
+                            .ok()
+                            .flatten()
+                            .map(|track| track.label)
+                            .unwrap_or_else(|| "no subtitle selected".into());
+                        alignment_status = format!(
+                            "{track} · local model {}",
+                            if model_ready { "ready" } else { "missing" }
+                        );
+                    }
                     continue;
                 }
 
@@ -4845,15 +4962,68 @@ fn main() -> anyhow::Result<()> {
                     // match on the index, so inserting a row moved
                     // every adjuster under it onto the wrong setting.
                     let settings_field = || ui::settings_menu::field_at(settings_menu_selected);
+                    if settings_rebuild_pending
+                        && !(key.code == KeyCode::Enter
+                            && settings_field() == SettingsField::RebuildDownloads)
+                    {
+                        settings_rebuild_pending = false;
+                    }
                     if key.code == KeyCode::Esc
                         || key.code == keymap.get(KeyAction::OpenSettingsMenu)
                     {
+                        settings_rebuild_pending = false;
                         settings_menu_open = false;
                         cfg.crossfade_enabled = crossfade_enabled;
                         config::save_or_warn(&cfg, &mut notifications);
                         continue;
                     }
                     match key.code {
+                        KeyCode::Enter if settings_field() == SettingsField::RebuildDownloads => {
+                            if settings_rebuild_pending {
+                                settings_rebuild_pending = false;
+                                match wim::core::rebuild_cached_downloads(
+                                    &cache_index,
+                                    &cfg,
+                                    &mut downloading,
+                                    &download_tx,
+                                    &mut notifications,
+                                ) {
+                                    Ok(result) => {
+                                        warn_low_quality_download(
+                                            &cfg.offline_download_format,
+                                            cfg.effective_offline_download_bitrate_kbps(),
+                                            &mut notifications,
+                                        );
+                                        notifications.push(
+                                            if result.unavailable_servers > 0 {
+                                                Severity::Error
+                                            } else {
+                                                Severity::Alert
+                                            },
+                                            rebuild_status(
+                                                result.started,
+                                                result.unavailable_servers,
+                                                result.already_running,
+                                            ),
+                                        );
+                                    }
+                                    Err(error) => notifications.push(Severity::Error, error),
+                                }
+                            } else {
+                                settings_rebuild_pending = true;
+                                let count = cache_index
+                                    .lock()
+                                    .ok()
+                                    .map(|index| index.download_manifest().count())
+                                    .unwrap_or(0);
+                                notifications.push(
+                                    Severity::Alert,
+                                    format!(
+                                        "this will re-download up to {count} saved song(s) with current server quality; existing copies remain until replacements succeed. enter again to confirm"
+                                    ),
+                                );
+                            }
+                        }
                         KeyCode::Char('j') | KeyCode::Down => {
                             settings_menu_selected =
                                 (settings_menu_selected + 1) % ui::settings_menu::FIELD_COUNT;
@@ -4874,30 +5044,6 @@ fn main() -> anyhow::Result<()> {
                             if let Some(alert) = art.cycle() {
                                 notifications.push(Severity::Alert, alert);
                             }
-                        }
-                        // the video output is a cycle too, and a short
-                        // one, so both directions step it.
-                        KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right
-                            if settings_field() == SettingsField::VideoOutput =>
-                        {
-                            cfg.video_output = config::next_video_output(cfg.video_output);
-                            // the override would otherwise win and the
-                            // row the user just changed would have no
-                            // effect on the screen.
-                            video_over = None;
-                            config::save_or_warn(&cfg, &mut notifications);
-                        }
-                        KeyCode::Char('h') | KeyCode::Left
-                            if settings_field() == SettingsField::AsciiFps =>
-                        {
-                            cfg.ascii_fps = config::step_ascii_fps(cfg.ascii_fps, -1);
-                            config::save_or_warn(&cfg, &mut notifications);
-                        }
-                        KeyCode::Char('l') | KeyCode::Right
-                            if settings_field() == SettingsField::AsciiFps =>
-                        {
-                            cfg.ascii_fps = config::step_ascii_fps(cfg.ascii_fps, 1);
-                            config::save_or_warn(&cfg, &mut notifications);
                         }
                         KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right
                             if settings_field() == SettingsField::EqEnabled =>
@@ -4999,6 +5145,139 @@ fn main() -> anyhow::Result<()> {
                             if settings_field() == SettingsField::CacheEvictionDays =>
                         {
                             cfg.cache_eviction_days = (cfg.cache_eviction_days + 1).min(90);
+                        }
+                        KeyCode::Char('h') | KeyCode::Left
+                            if settings_field() == SettingsField::OfflineCacheBudget =>
+                        {
+                            cfg.offline_cache_max_bytes = cfg
+                                .offline_cache_max_bytes
+                                .saturating_sub(1_000_000_000)
+                                .max(1_000_000_000);
+                            cache::initialize_budget(cfg.offline_cache_max_bytes);
+                            if cfg.offline_download_format != "flac"
+                                && cfg.effective_offline_download_bitrate_kbps() <= 96
+                            {
+                                notifications.push(
+                                    Severity::Alert,
+                                    format!(
+                                        "low-storage quality warning: this cache budget caps lossy offline downloads at {} kbps; dismiss this alert or raise the budget",
+                                        cfg.effective_offline_download_bitrate_kbps()
+                                    ),
+                                );
+                            }
+                        }
+                        KeyCode::Char('l') | KeyCode::Right
+                            if settings_field() == SettingsField::OfflineCacheBudget =>
+                        {
+                            cfg.offline_cache_max_bytes =
+                                (cfg.offline_cache_max_bytes + 1_000_000_000).min(100_000_000_000);
+                            cache::initialize_budget(cfg.offline_cache_max_bytes);
+                            if cfg.offline_download_format != "flac"
+                                && cfg.effective_offline_download_bitrate_kbps() <= 96
+                            {
+                                notifications.push(
+                                    Severity::Alert,
+                                    format!(
+                                        "low-storage quality warning: this cache budget caps lossy offline downloads at {} kbps; dismiss this alert or raise the budget",
+                                        cfg.effective_offline_download_bitrate_kbps()
+                                    ),
+                                );
+                            }
+                        }
+                        KeyCode::Char('h') | KeyCode::Left
+                            if settings_field() == SettingsField::OfflineDownloadBitrate =>
+                        {
+                            cfg.offline_download_bitrate_kbps =
+                                match cfg.offline_download_bitrate_kbps {
+                                    320 => 256,
+                                    256 => 192,
+                                    192 => 128,
+                                    128 => 96,
+                                    96 => 64,
+                                    _ => 64,
+                                };
+                            if cfg.offline_download_format != "flac"
+                                && cfg.offline_download_bitrate_kbps <= 96
+                            {
+                                notifications.push(
+                                    Severity::Alert,
+                                    format!(
+                                        "low audio quality: offline downloads at {} kbps",
+                                        cfg.offline_download_bitrate_kbps
+                                    ),
+                                );
+                            }
+                        }
+                        KeyCode::Char('l') | KeyCode::Right
+                            if settings_field() == SettingsField::OfflineDownloadBitrate =>
+                        {
+                            cfg.offline_download_bitrate_kbps =
+                                match cfg.offline_download_bitrate_kbps {
+                                    64 => 96,
+                                    96 => 128,
+                                    128 => 192,
+                                    192 => 256,
+                                    _ => 320,
+                                };
+                            if cfg.offline_download_format != "flac"
+                                && cfg.offline_download_bitrate_kbps <= 96
+                            {
+                                notifications.push(
+                                    Severity::Alert,
+                                    format!(
+                                        "low audio quality: offline downloads at {} kbps",
+                                        cfg.offline_download_bitrate_kbps
+                                    ),
+                                );
+                            }
+                        }
+                        KeyCode::Char('h') | KeyCode::Left
+                            if settings_field() == SettingsField::OfflineDownloadFormat =>
+                        {
+                            cfg.offline_download_format =
+                                match cfg.offline_download_format.as_str() {
+                                    "opus" => "flac",
+                                    "aac" => "opus",
+                                    "mp3" => "aac",
+                                    _ => "mp3",
+                                }
+                                .into();
+                            if cfg.offline_download_format != "flac"
+                                && cfg.offline_download_bitrate_kbps <= 96
+                            {
+                                notifications.push(
+                                    Severity::Alert,
+                                    format!(
+                                        "low audio quality: {} offline downloads at {} kbps",
+                                        cfg.offline_download_format,
+                                        cfg.offline_download_bitrate_kbps
+                                    ),
+                                );
+                            }
+                        }
+                        KeyCode::Char('l') | KeyCode::Right
+                            if settings_field() == SettingsField::OfflineDownloadFormat =>
+                        {
+                            cfg.offline_download_format =
+                                match cfg.offline_download_format.as_str() {
+                                    "opus" => "aac",
+                                    "aac" => "mp3",
+                                    "mp3" => "flac",
+                                    _ => "opus",
+                                }
+                                .into();
+                            if cfg.offline_download_format != "flac"
+                                && cfg.offline_download_bitrate_kbps <= 96
+                            {
+                                notifications.push(
+                                    Severity::Alert,
+                                    format!(
+                                        "low audio quality: {} offline downloads at {} kbps",
+                                        cfg.offline_download_format,
+                                        cfg.offline_download_bitrate_kbps
+                                    ),
+                                );
+                            }
                         }
                         KeyCode::Char('h') | KeyCode::Left
                             if settings_field() == SettingsField::ScrobblePercent =>
@@ -5311,6 +5590,64 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                // `/` is the universal escape hatch to search. Do this
+                // before Move mode and pane-specific navigation consume
+                // ordinary keys, so it works regardless of current pane.
+                if key.code == KeyCode::Char('/') {
+                    input_mode = InputMode::Interact;
+                    focus = Focus::Sidebar;
+                    app.editing_query = true;
+                    if let Some(bv) = &mut browse_view {
+                        bv.filtering = false;
+                    }
+                    continue;
+                }
+
+                // Ctrl-X dismisses all current notifications without
+                // stealing an unmodified movement or text-entry key.
+                if key.code == KeyCode::Char('x')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !notifications.visible().is_empty()
+                {
+                    notifications.dismiss_all();
+                    continue;
+                }
+
+                if now_playing_is_video(&now_playing)
+                    && keymap::is_fullscreen_video_key(
+                        key.code,
+                        keymap.get(KeyAction::ToggleFullscreenVideo),
+                    )
+                {
+                    let fullscreen = player
+                        .get_property("fullscreen")
+                        .ok()
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
+                    if let Err(error) =
+                        player.set_property("fullscreen", serde_json::json!(!fullscreen))
+                    {
+                        notifications.push(Severity::Alert, format!("mpv fullscreen: {error}"));
+                    }
+                    continue;
+                }
+
+                if now_playing_is_video(&now_playing)
+                    && key.code == keymap.get(KeyAction::OpenVideoPlayer)
+                {
+                    match player.set_property("force-window", serde_json::json!(true)) {
+                        Ok(()) => notifications.push(
+                            Severity::Info,
+                            "mpv video window requested; use your window switcher if it is not raised",
+                        ),
+                        Err(error) => notifications.push(
+                            Severity::Alert,
+                            format!("could not focus mpv window: {error}; select the mpv window from your task switcher"),
+                        ),
+                    }
+                    continue;
+                }
+
                 // move mode owns the keyboard outright while it's
                 // active: the whole point is that wasd/arrows move
                 // focus and *nothing else happens*, so nothing below
@@ -5593,6 +5930,10 @@ fn main() -> anyhow::Result<()> {
                                         download_tx: &download_tx,
                                         downloading: &mut downloading,
                                         day_threshold: cfg.cache_days_threshold,
+                                        offline_download_bitrate_kbps: cfg
+                                            .effective_offline_download_bitrate_kbps(),
+                                        offline_download_format: &cfg.offline_download_format,
+                                        offline_cache_max_bytes: cfg.offline_cache_max_bytes,
                                         persist: cache::CacheIndex::save,
                                     };
                                     note_playback_started(&first, &mut dctx, &mut notifications);
@@ -5641,6 +5982,10 @@ fn main() -> anyhow::Result<()> {
                                     download_tx: &download_tx,
                                     downloading: &mut downloading,
                                     day_threshold: cfg.cache_days_threshold,
+                                    offline_download_bitrate_kbps: cfg
+                                        .effective_offline_download_bitrate_kbps(),
+                                    offline_download_format: &cfg.offline_download_format,
+                                    offline_cache_max_bytes: cfg.offline_cache_max_bytes,
                                     persist: cache::CacheIndex::save,
                                 };
                                 download_selected(
@@ -5747,9 +6092,16 @@ fn main() -> anyhow::Result<()> {
                         &app.corpus.remote_clients(),
                     );
                     for (nav, result) in cfg.navidrome_servers.iter().zip(&nm.connection_status) {
-                        if *result == Some(false) {
-                            notifications
-                                .push(Severity::Alert, format!("{} is unreachable", nav.url));
+                        match result {
+                            Some(wim::navmanager::ConnectionStatus::Unreachable) => notifications
+                                .push(Severity::Alert, format!("{} is unreachable", nav.url)),
+                            Some(wim::navmanager::ConnectionStatus::ConfigurationIssue) => {
+                                notifications.push(
+                                    Severity::Alert,
+                                    format!("{} has a configuration/credential problem", nav.url),
+                                )
+                            }
+                            Some(wim::navmanager::ConnectionStatus::Online) | None => {}
                         }
                     }
                     nav_manager = Some(nm);
@@ -5960,49 +6312,6 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                if key.code == keymap.get(KeyAction::ToggleFullscreenVideo)
-                    && now_playing_is_video(&now_playing)
-                {
-                    // `off` has no vo to hand the screen to, so the key
-                    // would blank the ui and show nothing; say which
-                    // option turns it on rather than doing that.
-                    if cfg.video_output == config::VideoOutput::Off {
-                        notifications
-                            .push(Severity::Alert, "video: video_output is off in config.toml");
-                    } else {
-                        video_fullscreen = !video_fullscreen;
-                    }
-                    continue;
-                }
-
-                // ascii frames are the one mode a terminal cannot be
-                // probed for, so it is a key rather than something
-                // `Auto` picks. it turns fullscreen on in the same
-                // press: the pane only draws fullscreen, so otherwise
-                // the first press looks like nothing happened.
-                if key.code == keymap.get(KeyAction::ToggleAsciiVideo)
-                    && now_playing_is_video(&now_playing)
-                {
-                    if cfg.video_output == config::VideoOutput::Off && video_over.is_none() {
-                        notifications
-                            .push(Severity::Alert, "video: video_output is off in config.toml");
-                    } else {
-                        video_over = video::toggle_ascii(cfg.video_output, video_over);
-                        let on = video::effective(cfg.video_output, video_over)
-                            == config::VideoOutput::Ascii;
-                        video_fullscreen = on || video_fullscreen;
-                        notifications.push(
-                            Severity::Info,
-                            if on {
-                                "video: text cells"
-                            } else {
-                                "video: back to the configured output"
-                            },
-                        );
-                    }
-                    continue;
-                }
-
                 if key.code == keymap.get(KeyAction::ToggleCrossfade) {
                     crossfade_enabled = !crossfade_enabled;
                     if !crossfade_enabled {
@@ -6113,6 +6422,10 @@ fn main() -> anyhow::Result<()> {
                             download_tx: &download_tx,
                             downloading: &mut downloading,
                             day_threshold: cfg.cache_days_threshold,
+                            offline_download_bitrate_kbps: cfg
+                                .effective_offline_download_bitrate_kbps(),
+                            offline_download_format: &cfg.offline_download_format,
+                            offline_cache_max_bytes: cfg.offline_cache_max_bytes,
                             persist: cache::CacheIndex::save,
                         };
                         download_selected(
@@ -6185,17 +6498,6 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
-    // mpv has to be gone before the guard hands the terminal back, so
-    // this exit path is ordered the other way round from the usual one.
-    // a vo entered the alternate screen on init and mpv only leaves it
-    // when the process exits, not when the vo is torn down (measured),
-    // so `Mpv`'s drop running after the guard's puts that ?1049l on the
-    // user's shell, where it restores a cursor position the shell never
-    // saved.
-    if video_vo.take().is_some() {
-        let _ = player.set_video_output(video::Vo::Null.mpv_name());
-        drop(player);
-    }
     drop(guard);
 
     Ok(())
@@ -6246,6 +6548,22 @@ mod download_policy_tests {
         assert!(!should_auto_download(5, 2, true, false));
         assert!(!should_auto_download(5, 2, false, true));
     }
+
+    #[test]
+    fn low_quality_warning_only_applies_to_lossy_profiles_at_or_below_96_kbps() {
+        assert!(low_quality_download_warning("opus", 64).is_some());
+        assert!(low_quality_download_warning("mp3", 96).is_some());
+        assert!(low_quality_download_warning("opus", 128).is_none());
+        assert!(low_quality_download_warning("flac", 64).is_none());
+    }
+
+    #[test]
+    fn rebuild_status_keeps_all_partial_outcome_counts() {
+        assert_eq!(
+            rebuild_status(2, 1, 3),
+            "rebuild: 2 started, 1 unavailable profile(s), 3 already running"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6275,6 +6593,25 @@ mod shellsong_wiring_tests {
     use std::path::PathBuf;
     use wim::browse::fixtures::{test_songs, test_view};
     use wim::library::{LocalTrack, MediaKind};
+
+    #[test]
+    fn sequential_positions_follow_and_scroll_but_shuffle_does_not() {
+        let tracks = test_songs(50);
+        let mut view = test_view(tracks.clone());
+        let mut queue = PlayQueue::default();
+        queue.reset(tracks);
+        assert!(update_playlist_position(&mut queue, Some(&mut view), false, 0).is_none());
+        for pos in 1..25 {
+            assert!(update_playlist_position(&mut queue, Some(&mut view), false, pos).is_some());
+            assert_eq!(view.selected, pos as usize);
+        }
+        let rows = ui::browse::rows(Rect::new(0, 0, 60, 12), &view, browse::ArtMode::Off, 2.0);
+        assert!(rows.tracks.1.contains(&Some(24)));
+        assert!(update_playlist_position(&mut queue, Some(&mut view), true, 25).is_some());
+        assert_eq!(view.selected, 24);
+        assert!(update_playlist_position(&mut queue, Some(&mut view), false, -1).is_none());
+        assert_eq!(view.selected, 24);
+    }
 
     #[test]
     fn a_browse_session_runs_from_the_selected_row_to_the_end() {
@@ -6834,103 +7171,21 @@ mod profile_delete_tests {
     }
 }
 
-/// `video()`'s host half, which needs a terminal and a console to
-/// reach any other way.
 #[cfg(test)]
-mod video_command_tests {
-    /// The command must clear the shift-`v` override with the mode it
-    /// sets. The override wins over config, so without this `video
-    /// (ascii)` would report a mode the screen does not show, which is
-    /// exactly the trap the settings menu's own row had to avoid.
+mod native_video_tests {
     #[test]
-    fn the_request_clears_the_runtime_override() {
+    fn mpv_owns_video_output_and_wim_advertises_the_controls() {
         let src = include_str!("main.rs");
-        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
-        let at = code
-            .find("video_request.take()")
-            .expect("nothing applies the video() request, so the command is inert");
-        let drain = &code[at..(at + 300).min(code.len())];
-        assert!(
-            drain.contains("video_over = None"),
-            "the override survives, so the command reports a mode the screen does not show:\n{drain}"
-        );
-        assert!(
-            drain.contains("cfg.video_output = mode"),
-            "the mode is not written:\n{drain}"
-        );
-        assert!(
-            drain.contains("save_or_warn"),
-            "the mode is set for this run only:\n{drain}"
-        );
-    }
-
-    /// Applied before the decision it changes, so the command lands on
-    /// the frame that answers it rather than the one after.
-    #[test]
-    fn the_request_is_applied_before_the_screen_decision() {
-        let src = include_str!("main.rs");
-        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
-        let drain = code
-            .find("video_request.take()")
-            .expect("nothing applies the request");
-        let decision = code
-            .find("let showing = video::showing(")
-            .expect("the screen decision moved");
-        assert!(
-            drain < decision,
-            "the request is applied after the frame that would have used it"
-        );
-    }
-
-    /// The torbox and watch menus cover the screen the same as every
-    /// `Tiers` modal, but they are handled before the tier cascade and
-    /// live only as locals in main, so nothing type-checked them into
-    /// the video decision. Leaving them out let mpv draw a fullscreen
-    /// video straight over the open menu — keys kept going to the
-    /// invisible menu while the screen showed only the video.
-    #[test]
-    fn the_torbox_and_watch_menus_take_the_screen_back_from_video() {
-        let src = include_str!("main.rs");
-        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
-        let at = code
-            .find("let overlay = tiers.covers_screen()")
-            .expect("the overlay decision moved");
-        let decision = &code[at..(at + 200).min(code.len())];
-        assert!(
-            decision.contains("torbox_open") && decision.contains("watch_open"),
-            "the torbox/watch menus do not take the screen back from video:\n{decision}"
-        );
+        assert!(src.contains("VIDEO PLAYING IN SEPARATE MPV WINDOW · {} OPEN · {} FULLSCREEN"));
+        assert!(src.contains("open / focus mpv video window"));
+        assert!(src.contains("fullscreen\", serde_json::json!(!fullscreen)"));
     }
 }
 
 /// The settings menu's video rows, whose wiring needs a terminal and a
 /// key press to reach any other way.
 #[cfg(test)]
-mod settings_video_tests {
-    /// Changing the output in the menu has to clear the runtime
-    /// override, or the row the user just changed has no effect on the
-    /// screen and the menu then has to explain itself with a
-    /// `(config: ...)` note about a value the user is actively
-    /// setting. Found by reasoning, not by a failure, so it is pinned
-    /// here rather than trusted.
-    #[test]
-    fn setting_the_output_clears_the_shift_v_override() {
-        let src = include_str!("main.rs");
-        let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
-        let at = code
-            .find("config::next_video_output(cfg.video_output)")
-            .expect("the settings menu no longer cycles the video output");
-        let arm = &code[at..(at + 400).min(code.len())];
-        assert!(
-            arm.contains("video_over = None;"),
-            "the override survives, so the setting does nothing:\n{arm}"
-        );
-        assert!(
-            arm.contains("config::save_or_warn"),
-            "the mode is changed for this run only:\n{arm}"
-        );
-    }
-
+mod settings_field_tests {
     /// The adjust keys match on the named field. They matched on the
     /// selected index before, so inserting a row (which this slice
     /// did, twice) moved every adjuster below it onto the wrong
@@ -6947,104 +7202,15 @@ mod settings_video_tests {
     }
 }
 
-/// The ascii video pane's wiring in the frame loop, which is three
-/// facts about how the draw and the vo handover agree with each other.
 #[cfg(test)]
-mod ascii_pane_tests {
-    /// The ascii pane's three wiring facts, which need a terminal and a
-    /// player to reach any other way. Reads the source above the test
-    /// modules, for the reason the test above records.
-    ///
-    /// What a behavioural test elsewhere cannot catch here is a
-    /// *bypass*: the pane re-deriving its own answer instead of taking
-    /// `showing`'s, or the draw falling through and painting the ui
-    /// under the frames.
+mod video_ui_tests {
     #[test]
-    fn the_loop_drives_the_ascii_pane_off_one_decision() {
+    fn video_status_card_reserves_a_picture_area_without_rendering_frames() {
         let src = include_str!("main.rs");
         let code = &src[..src.find("\n#[cfg(test)]").expect("a test module")];
-
-        assert!(
-            code.contains("let want_vo = showing.mpv_vo();"),
-            "the vo and the ascii pane are deciding separately, so they can disagree"
-        );
-
-        let at = code
-            .find("let inline_video = !video_fullscreen")
-            .expect("nothing drives the frame source, so the pane is dead code");
-        let decision = &code[at..(at + 900).min(code.len())];
-        assert!(
-            decision.contains("showing.is_ascii()"),
-            "the fullscreen pane re-derives whether ascii is wanted instead of taking it:\n{decision}"
-        );
-        assert!(
-            decision.contains("let (want_frames, frame_grid) = if showing.is_ascii() {"),
-            "the frames are driven by some decision other than the ones beside them:\n{decision}"
-        );
-        assert!(
-            decision.contains("inline_art_rect"),
-            "inline video decodes at some grid other than the rect it is painted on:\n{decision}"
-        );
-
-        // anchored at the decision, not file-wide: the key handler reads
-        // `effective` too, so a file-wide search here passes while the
-        // decision ignores the override entirely.
-        let at = code
-            .find("video::showing(")
-            .expect("nothing decides what is on the screen");
-        let decision = &code[at..(at + 400).min(code.len())];
-        assert!(
-            decision.contains("video::effective(cfg.video_output, video_over)"),
-            "the decision reads the config directly, so the ascii key does nothing:\n{decision}"
-        );
-
-        let at = code
-            .find("video::toggle_ascii(cfg.video_output, video_over)")
-            .expect("nothing toggles the mode, so it is config-only again");
-        let press = &code[at..(at + 500).min(code.len())];
-        assert!(
-            press.contains("video_fullscreen = on || video_fullscreen"),
-            "turning it on leaves the pane hidden, so the press looks like a no-op:\n{press}"
-        );
-
-        // `active` alone is not the fullscreen gate: the same source
-        // runs for inline video, where the ui draws around it and only
-        // the art rect holds frames.
-        let at = code
-            .find("if showing.is_ascii() && ascii.active() {")
-            .expect("the draw never checks for frames, so the ui is drawn over them");
-        let branch = &code[at..(at + 400).min(code.len())];
-        assert!(
-            branch.contains("ascii.paint("),
-            "it branches on frames and never paints them:\n{branch}"
-        );
-        assert!(
-            branch.contains("return;"),
-            "it paints frames and then falls through into the ui:\n{branch}"
-        );
-
-        // the inline paint: frames go on the rect the player view
-        // reserved, through the same `has_art` the view used, and the
-        // rect is handed back so the source decodes at the size the
-        // picture is painted at. anchored at the draw branch's
-        // `has_art` call — the loop body has its own `if inline_video`
-        // for the grid, which must not be mistaken for the paint.
-        let at = code
-            .find("ui::player::has_art(")
-            .expect("inline video never reserves the rect through the view's own rule");
-        let branch = &code[at..(at + 900).min(code.len())];
-        assert!(
-            branch.contains("if inline_video {"),
-            "the rect is reserved and never painted on:\n{branch}"
-        );
-        assert!(
-            branch.contains("ascii.paint(rect,"),
-            "the rect is reserved and never painted on:\n{branch}"
-        );
-        assert!(
-            branch.contains("inline_art_rect = player_art_rect;"),
-            "the grid the source decodes at is not the rect it painted:\n{branch}"
-        );
+        assert!(code.contains("video: now_playing_is_video(&now_playing)"));
+        assert!(!code.contains("framesource"));
+        assert!(!code.contains("ascii.paint"));
     }
 }
 

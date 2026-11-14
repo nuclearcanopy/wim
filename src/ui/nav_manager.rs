@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
 use crate::config::NavidromeConfig;
+use crate::navmanager::ConnectionStatus;
 use crate::theme::{shade, DIM, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::header::draw_header;
 use crate::ui::results_list::scroll_cues;
@@ -16,7 +17,7 @@ pub struct NavManagerListView<'a> {
     pub selected: usize,
     pub message: &'a str,
     /// Same index as `servers`; `None` = not tested this session.
-    pub connection_status: &'a [Option<bool>],
+    pub connection_status: &'a [Option<ConnectionStatus>],
 }
 
 impl Widget for NavManagerListView<'_> {
@@ -53,8 +54,9 @@ impl Widget for NavManagerListView<'_> {
             .enumerate()
             .map(|(i, server)| {
                 let status = match self.connection_status.get(i) {
-                    Some(Some(true)) => "✓ ",
-                    Some(Some(false)) => "✗ ",
+                    Some(Some(ConnectionStatus::Online)) => "✓ ",
+                    Some(Some(ConnectionStatus::Unreachable)) => "✗ ",
+                    Some(Some(ConnectionStatus::ConfigurationIssue)) => "! ",
                     _ => "  ",
                 };
                 format!("{status}{} ({})", server.url, server.username)
@@ -147,7 +149,7 @@ mod tests {
         area: Rect,
         buf: &mut Buffer,
         servers: &[NavidromeConfig],
-        status: &[Option<bool>],
+        status: &[Option<ConnectionStatus>],
         selected: usize,
     ) {
         NavManagerListView {
@@ -184,16 +186,28 @@ mod tests {
 
     #[test]
     fn each_profile_row_carries_its_url_username_and_connection_mark() {
-        let area = Rect::new(0, 0, 54, 10);
-        let mut buf = buffer(54, 10);
+        let area = Rect::new(0, 0, 54, 13);
+        let mut buf = buffer(54, 13);
         let servers = [
             server("https://a.example", "ana"),
             server("https://b.example", "bob"),
+            server("https://c.example", "cy"),
         ];
-        render(area, &mut buf, &servers, &[Some(true), Some(false)], 0);
+        render(
+            area,
+            &mut buf,
+            &servers,
+            &[
+                Some(ConnectionStatus::Online),
+                Some(ConnectionStatus::Unreachable),
+                Some(ConnectionStatus::ConfigurationIssue),
+            ],
+            0,
+        );
         let g = grid(&buf);
         assert!(g.contains("> ✓ https://a.example (ana)"), "{g}");
         assert!(g.contains("  ✗ https://b.example (bob)"), "{g}");
+        assert!(g.contains("  ! https://c.example (cy)"), "{g}");
         assert!(g.contains("  [ add new profile ]"), "{g}");
     }
 
@@ -232,7 +246,13 @@ mod tests {
         let mut buf = buffer(40, 12);
         let area = Rect::new(2, 1, 20, 8);
         let servers = [server("日本語テスト曲日本語テスト曲", "日本語")];
-        render(area, &mut buf, &servers, &[Some(true)], 0);
+        render(
+            area,
+            &mut buf,
+            &servers,
+            &[Some(ConnectionStatus::Online)],
+            0,
+        );
         assert_outside_untouched(&buf, area);
     }
 
@@ -241,7 +261,13 @@ mod tests {
         let mut buf = plated_buffer(44, 14);
         let area = Rect::new(2, 1, 40, 12);
         let servers = [server("https://a.example", "ana")];
-        render(area, &mut buf, &servers, &[Some(true)], 0);
+        render(
+            area,
+            &mut buf,
+            &servers,
+            &[Some(ConnectionStatus::Online)],
+            0,
+        );
         assert_no_bleed_through(&buf, area);
     }
 
@@ -270,7 +296,7 @@ mod tests {
     #[test]
     fn the_selected_profile_is_on_screen_at_every_selection() {
         let servers = many(12);
-        let status = vec![Some(true); servers.len()];
+        let status = vec![Some(ConnectionStatus::Online); servers.len()];
         for selected in 0..=servers.len() {
             let mut buf = buffer(54, 10);
             render(
@@ -328,7 +354,7 @@ mod tests {
                 Rect::new(0, 0, w, h),
                 &mut buf,
                 &servers,
-                &[Some(true), None],
+                &[Some(ConnectionStatus::Online), None],
                 2,
             );
         }
@@ -361,7 +387,15 @@ mod eyeball {
         let servers: Vec<NavidromeConfig> = (0..12)
             .map(|i| server(&format!("https://{i}.example"), &format!("user{i}")))
             .collect();
-        let status: Vec<Option<bool>> = (0..12).map(|i| Some(i % 2 == 0)).collect();
+        let status: Vec<Option<ConnectionStatus>> = (0..12)
+            .map(|i| {
+                Some(if i % 2 == 0 {
+                    ConnectionStatus::Online
+                } else {
+                    ConnectionStatus::Unreachable
+                })
+            })
+            .collect();
         for (w, h, selected) in [
             (54u16, 10u16, 12usize),
             (54, 10, 0),

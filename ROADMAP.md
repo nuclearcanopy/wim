@@ -401,6 +401,11 @@ measurements are what settled it.
 
 ## video in the workspace (maintainer spec, 2026-10-28)
 
+> **Superseded:** this historical plan describes terminal-rendered video,
+> which was removed in favor of mpv's native GPU-backed window. The current
+> behavior and architecture are in `docs/video.md` and `docs/architecture.md`;
+> none of the renderer tasks below are active.
+
 real video is the DEFAULT and stays the default. the ascii path is a
 thing the user turns on deliberately, never something they land in by
 accident.
@@ -433,16 +438,10 @@ accident.
       cursor position the shell never saved; `Mpv` is dropped before
       the guard when a vo was up.
       six guards were mutation-checked individually.
-- [ ] **in-workspace (sub-rect) video.** detailed in docs/video.md. the
-      real blocker is not mpv: ratatui owns a rectangle of cells and
-      diffs all of them with no concept of a hole, so both the render
-      path and the diff have to learn to skip a rect. beyond that,
-      `kitty` has `--vo-kitty-left/top` and `alt-screen=no` so it can
-      draw at an offset, but `tct` has neither and always paints from
-      the top-left of the alt screen it just entered; both emit
-      `ESC[2J` at init and neither can be told not to; and init-only
-      geometry makes every pane resize a vo bounce. realistic shape is
-      kitty-only sub-rect video with tct staying fullscreen.
+- [x] ~~**in-workspace (sub-rect) video.**~~ **Superseded:** native mpv
+      window ownership was chosen instead; the player workspace now
+      advertises the separate window and exposes subtitle sync. See
+      `docs/video.md` and `docs/subtitle-alignment.md`.
 - [x] **BLOCKER (for the pull-frames-ourselves route only): there is no
       working way to get frames out of mpv.** -- **closed as obsolete.**
       it gated a route that no longer exists: `FramePump` is deleted
@@ -543,12 +542,13 @@ and `in-workspace (sub-rect) video` is still kitty-only via
       about screenshots coming from the decoded/filtered frame is
       right, and is exactly why `vf=scale` works).
 
-- [ ] **video plays as real video in the workspace.** confirm the
-      maximized-song path actually shows a real video surface for a
-      video file, not the album-art fallback and not ascii.
-- [ ] **ascii video renderer, opt-in.** the frame source and the
-      rasterizer both exist (`framesource.rs`, and `ui::raster` needed
-      no change), so what is left is wiring.
+- [x] **video plays as real video in the workspace.** mpv owns the
+      native GPU-backed video window; Wim advertises that it is separate
+      and continues to provide transport controls.
+- [x] ~~**ascii video renderer, opt-in.**~~ **Superseded:** terminal
+      frame rendering was removed; do not restore the renderer.
+      Historical renderer implementation details below are retained as
+      audit notes only; they are not active follow-up work.
       - [x] **the opt-in itself.** `VideoOutput::Ascii` parses as
         `video_output = "ascii"`, and the decision grew a **third
         answer**: "mpv draws nothing" and "there is no video" were the
@@ -1821,11 +1821,9 @@ a measurement.
       meter with `set_char`, where the 8.9 -> 1.4 ns/cell finding
       applies; one row per frame and no bench, so it was not touched
       blind.
-- [ ] **`framesource` does not turn the unsharp pass off yet.** it is
-      69% of a 1:1 resample and the video path is exactly 1:1, so
-      `render_with(.., Sharpen::Off, ..)` is a 3.21x win sitting
-      uncollected. it is a visible picture change on the video pane,
-      so it wants the maintainer's eye rather than a quiet flip.
+- [x] ~~**`framesource` does not turn the unsharp pass off yet.**~~
+      Superseded with removal of the terminal frame renderer; there is
+      no `framesource` video path to optimize.
 - [x] **`wim --help` and `wim [FILE...]` work now.** both were
       written and tested, and both were **unreachable**: `cli.rs` was a
       private module of the shellswim bin crate, so `main.rs` could not
@@ -2105,15 +2103,18 @@ same-process ratios are quoted.
       comment claimed it was pinned to `AUTO_SYNC_INTERVAL`, coupling
       neither constant: the exact shape `docs/testing.md` records. It
       is that constant now, with an equality test.
-- [ ] **`stream_url` hand-builds its query without percent-encoding**,
-      unlike `get`, which goes through ureq's `query`. A username or
-      `transcode_format` containing `&`, `+` or a space produces a url
-      that 401s while the catalog works. Flagged rather than guessed
-      at: there is no encoder in the dependency tree.
-- [ ] **`test_navidrome_connectivity` collapses every failure to
-      `Some(false)`**, so a typo'd password and an unreachable host are
-      indistinguishable in the profile manager. The consumer and the
-      signature change are in main.rs.
+- [x] **`stream_url` hand-builds its query without percent-encoding**,
+      fixed by serializing every Subsonic query parameter with form URL
+      encoding and testing reserved characters in IDs and usernames.
+       unlike `get`, which goes through ureq's `query`. A username or
+       `transcode_format` containing `&`, `+` or a space produced a url
+       that 401s while the catalog works. Query pairs are now form-encoded
+       and reserved characters are round-trip tested.
+- [x] **`test_navidrome_connectivity` collapsed every failure to
+      `Some(false)`**, so a rejected credential and an unreachable host
+      looked alike. `ConnectionStatus` distinguishes online, network
+      failure, and configuration/authentication refusal; the manager's
+      `✓`/`✗`/`!` legend identifies them without exposing secret data.
 - [x] **`coverart::Cache` remembered "no cover" for a whole session.**
       `fetch` returned `Option`, so "the server has no cover" and "the
       request did not complete" arrived as the same `None` and were
@@ -2270,7 +2271,7 @@ needed, so the number is real and the work is scoped.
       after it, and the flagship "not one cell moved" test alternated
       the keymap per logo, re-keying the slot every iteration and
       hiding whether the logo was in the key at all.
-- [ ] ~~**`banner.rs` is the real per-frame logo cost.**~~ `logos.rs` is
+- [x] ~~**`banner.rs` is the real per-frame logo cost.**~~ `logos.rs` is
       compile-time data only, but the banner re-walks every line's
       width each frame (up to 50 rows for `figlet: doh`), plus a
       `Vec<(String, &str)>`, a `" ".repeat()` and a `format!` per menu
@@ -2299,7 +2300,7 @@ needed, so the number is real and the work is scoped.
       `queue.rs:281`, `suggestions.rs:264,335`, `browse.rs:402,455`,
       `undo_tree.rs:178,191,253`, `help.rs:286`, `eq_menu.rs:446`,
       `nav_manager.rs:94`, `ui/shellsong.rs:117,132,163,186,199`.
-- [ ] ~~**`textfit::truncate_into(&mut String, ..)`.**~~ Drawing an
+- [x] ~~**`textfit::truncate_into(&mut String, ..)`.**~~ Drawing an
       already-fitting row straight out of its buffer is 1.96x where
       rows fit and 0.82x where they do not, because the second case
       pays an extra width walk; the version that wins both is an
