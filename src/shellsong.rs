@@ -4771,6 +4771,7 @@ impl Ranker {
         };
         let ours = &self.entries;
         let base = &self.baseline;
+        let mut result = None;
         let saved = crate::fsutil::locked_update(&path, |current| {
             let theirs = current
                 .map(|bytes| parse_ranks(&String::from_utf8_lossy(&bytes)))
@@ -4788,10 +4789,18 @@ impl Ranker {
                 .map(|(name, s)| format!("{}\t{}\t{}", s.uses, s.last, name))
                 .collect::<Vec<_>>()
                 .join("\n");
+            result = Some(merged.entries);
             Ok(body.into_bytes())
         });
-        if saved.is_ok() {
-            self.baseline = self.entries.clone();
+        if let (Ok(()), Some(merged)) = (saved, result) {
+            // take on what the other console recorded too, so its uses
+            // order completions here and the next diff starts from what
+            // this process now holds
+            self.tick = self
+                .tick
+                .max(merged.values().map(|stat| stat.last).max().unwrap_or(0));
+            self.baseline = merged.clone();
+            self.entries = merged;
         }
     }
 }

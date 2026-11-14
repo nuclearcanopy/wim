@@ -540,6 +540,24 @@ mod format_version_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// `toml::Table::try_from` has to skip `None` fields rather than fail,
+    /// or a state saved with no position (a track that had not started)
+    /// would not save at all.
+    #[test]
+    fn a_state_with_absent_fields_still_saves_and_loads() {
+        let dir = dir("partial");
+        let path = dir.join("state.toml");
+        let state = PlaybackState {
+            now_playing_path: None,
+            queue_paths: vec!["/m/b.flac".into()],
+            position_secs: None,
+            volume: None,
+        };
+        save_to(&path, &state).unwrap();
+        assert_eq!(load_from(&path).0, Some(state));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_state_from_a_newer_wim_loads_and_is_copied_aside_before_being_replaced() {
         let dir = dir("newer");

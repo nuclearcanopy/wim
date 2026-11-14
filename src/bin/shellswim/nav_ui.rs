@@ -133,7 +133,7 @@ pub fn poll_connectivity(host: &mut Host, nm: Option<&mut NavManager>) {
     };
     host.pending_connectivity = None;
     let Ok(report) = outcome else { return };
-    for (url, status) in &report {
+    for (url, _, status) in &report {
         match status {
             Some(ConnectionStatus::Unreachable) => host
                 .notifications
@@ -148,12 +148,12 @@ pub fn poll_connectivity(host: &mut Host, nm: Option<&mut NavManager>) {
     let Some(nm) = nm else { return };
     nm.connection_status
         .resize(host.cfg.navidrome_servers.len(), None);
-    for (url, status) in report {
+    for (url, user, status) in report {
         if let Some(index) = host
             .cfg
             .navidrome_servers
             .iter()
-            .position(|server| server.url == url)
+            .position(|server| server.url == url && server.username == user)
         {
             nm.connection_status[index] = status;
         }
