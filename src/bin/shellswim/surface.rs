@@ -37,6 +37,8 @@ pub struct SwimSurface {
     pub eq_requested: bool,
     /// Same hand-off for the settings editor.
     pub settings_requested: bool,
+    /// Same hand-off for the undo tree.
+    pub undo_requested: bool,
     /// Starred items or suggestions the prompt should open as a list.
     pub list_requested: Option<ListWorkspace>,
     /// Interactive prompt requested a live lyrics display. One-shot
@@ -246,6 +248,7 @@ impl Borrowed<'_> {
     }
 
     fn print_undo(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
+        self.state.undo_requested = true;
         let rows = core.undo.rows(core.now);
         if rows.is_empty() {
             return op_fail("nothing has been done yet");
@@ -271,7 +274,7 @@ impl Borrowed<'_> {
             core.console
                 .note(format!("{current} {branch}{}{fork}{barrier}", row.label));
         }
-        op_note("undo history · use undo() and redo() to move".to_owned())
+        op_note("undo history · u/r walk it, h/l cross branches in the tree view".to_owned())
     }
 
     fn print_settings(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
