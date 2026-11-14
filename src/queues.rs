@@ -216,6 +216,10 @@ impl Entry {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SavedQueue {
+    /// The name as typed, kept so two names that fold to the same file
+    /// (`Rock!` and `rock?`) are noticed instead of one overwriting the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default)]
     pub entries: Vec<Entry>,
 }
@@ -273,11 +277,24 @@ pub fn save(name: &str, items: &[SearchItem]) -> Result<usize> {
     }
     let dir = dir()?;
     fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{slug}.toml"));
+    // distinct names can fold to one file; refuse rather than clobber
+    if let Some(existing) = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| toml::from_str::<SavedQueue>(&raw).ok())
+        .and_then(|queue| queue.name)
+    {
+        if existing.trim().to_lowercase() != name.trim().to_lowercase() {
+            anyhow::bail!(
+                "'{name}' would overwrite the saved queue '{existing}'; pick another name"
+            );
+        }
+    }
     let saved = SavedQueue {
         entries: items.iter().filter_map(entry_of).collect(),
+        name: Some(name.trim().to_string()),
     };
     let saved_count = saved.entries.len();
-    let path = dir.join(format!("{slug}.toml"));
     let toml = toml::to_string_pretty(&saved)?;
     crate::fsutil::atomic_write(&path, toml.as_bytes())?;
     Ok(saved_count)
@@ -556,6 +573,7 @@ mod tests {
         let entry = entry_of(&item).expect("a local track is one track");
         let toml = toml::to_string(&SavedQueue {
             entries: vec![entry],
+            ..Default::default()
         })
         .expect("serialises");
         assert!(!toml.contains("secs"), "{toml}");
@@ -696,6 +714,7 @@ album = "y"
         let loaded = rebuild(
             &SavedQueue {
                 entries: vec![entry],
+                ..Default::default()
             },
             &[],
         );
@@ -760,6 +779,7 @@ path = "{}"
         let loaded = rebuild(
             &SavedQueue {
                 entries: vec![remote("gone", "https://nav.example")],
+                ..Default::default()
             },
             &[],
         );
@@ -782,6 +802,7 @@ path = "{}"
         let loaded = rebuild(
             &SavedQueue {
                 entries: vec![entry],
+                ..Default::default()
             },
             &[],
         );
@@ -795,6 +816,7 @@ path = "{}"
         let loaded = rebuild(
             &SavedQueue {
                 entries: vec![Entry::default()],
+                ..Default::default()
             },
             &[],
         );
@@ -808,6 +830,7 @@ path = "{}"
     fn a_saved_entry_writes_its_kind_explicitly() {
         let toml = toml::to_string_pretty(&SavedQueue {
             entries: vec![remote("b", "https://nav.example")],
+            ..Default::default()
         })
         .unwrap();
         assert!(toml.contains("kind = \"remote\""), "{toml}");

@@ -824,6 +824,8 @@ fn empty_suggestions_reason(app: &app::App) -> String {
 /// What the results list should say instead of rendering nothing when
 /// there's nothing to show; a blank screen with no explanation is a
 /// dead end, never the right default.
+const AUTOSAVE_EVERY: Duration = Duration::from_secs(60);
+
 /// An add/reconnect of a Navidrome server running off the ui thread.
 struct PendingConnect {
     rx: mpsc::Receiver<Result<wim::catalog::FetchedCatalog, String>>,
@@ -1530,6 +1532,7 @@ fn main() -> anyhow::Result<()> {
     let mut queue_restored = false;
     let mut pending_connect: Option<PendingConnect> = None;
     let mut mpv_exit_reported = false;
+    let mut last_autosave = Instant::now();
     let mut seen_reply_timeouts = mpv::reply_timeouts();
     let mut last_input = Instant::now();
     let mut last_loop_top = Instant::now();
@@ -1545,6 +1548,15 @@ fn main() -> anyhow::Result<()> {
             if let Some(note) = wim::core::reconcile_queue_after_timeout(&player, &mut play_queue) {
                 notifications.push(Severity::Alert, note);
             }
+        }
+        // a crash or SIGKILL must not lose the queue and position
+        if player_initialized
+            && !mpv_exit_reported
+            && play_queue.current().is_some()
+            && last_autosave.elapsed() >= AUTOSAVE_EVERY
+        {
+            last_autosave = Instant::now();
+            save_playback_state(&player, &play_queue);
         }
         if !mpv_exit_reported {
             if let Some(status) = player.exited() {
