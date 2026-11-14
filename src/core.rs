@@ -396,8 +396,15 @@ pub fn silence_url(secs: u64) -> String {
 pub fn resolve_playable(item: &SearchItem, cache: &Arc<Mutex<CacheIndex>>) -> Option<String> {
     if let SearchItem::Song { id, client, .. } = item {
         if let Some(path) = cache.lock().ok().and_then(|mut idx| {
-            let before = idx.clone();
             let previous = idx.cached_path(id);
+            // a whole-index clone for rollback is only worth paying when
+            // this call can actually replace the path (a legacy plain
+            // file being rewrapped); an already-compressed entry cannot,
+            // and that is every ordinary play
+            let before = previous
+                .as_ref()
+                .is_some_and(|p| p.extension().is_none_or(|e| e != "zst"))
+                .then(|| idx.clone());
             let path = idx
                 .compressed_cached_path(id)
                 .unwrap_or_else(|_| previous.clone());
@@ -408,7 +415,9 @@ pub fn resolve_playable(item: &SearchItem, cache: &Arc<Mutex<CacheIndex>>) -> Op
                         let _ = std::fs::remove_file(old);
                     }
                 } else {
-                    *idx = before;
+                    if let Some(before) = before {
+                        *idx = before;
+                    }
                     let _ = std::fs::remove_file(&path);
                     return previous;
                 }

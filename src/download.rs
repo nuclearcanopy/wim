@@ -61,6 +61,44 @@ const CHUNK_SIZE: usize = 64 * 1024;
 /// `enrich::ENRICH_CONCURRENCY`.
 const DOWNLOAD_CONCURRENCY: usize = 4;
 
+/// Transfers in flight across every batch at once. Each batch already
+/// caps itself at `DOWNLOAD_CONCURRENCY`, but a second and third batch
+/// started before the first finished multiplied that without bound.
+const MAX_TRANSFERS: usize = 6;
+
+static ACTIVE_TRANSFERS: (std::sync::Mutex<usize>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// One of `MAX_TRANSFERS` process-wide download slots, held while a
+/// transfer runs and released when it drops, whatever way it ends.
+struct TransferSlot;
+
+impl TransferSlot {
+    fn acquire() -> Self {
+        let (lock, wake) = &ACTIVE_TRANSFERS;
+        let mut active = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *active >= MAX_TRANSFERS {
+            active = wake
+                .wait(active)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *active += 1;
+        TransferSlot
+    }
+}
+
+impl Drop for TransferSlot {
+    fn drop(&mut self) {
+        let (lock, wake) = &ACTIVE_TRANSFERS;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
+        wake.notify_one();
+    }
+}
+
 /// Stall budgets for one track. No overall deadline: a long flac on a
 /// slow link is legitimately minutes of transfer, so what has to be
 /// bounded is inactivity. A black-holing server trips the read timeout,
@@ -428,7 +466,13 @@ fn download_tracks(
                 let Some((id, label, url)) = tracks.get(index) else {
                     return;
                 };
-                let event = match download_one(agent, &sink.budget, id, url, sink.dest_for, &tx) {
+                // however many batches are running, only so many transfers
+                // are ever in flight at once
+                let downloaded = {
+                    let _slot = TransferSlot::acquire();
+                    download_one(agent, &sink.budget, id, url, sink.dest_for, &tx)
+                };
+                let event = match downloaded {
                     Ok((path, mut lease)) => {
                         let handoff = match sink.cache.lock() {
                             Ok(mut index) => {
@@ -1398,5 +1442,37 @@ mod tests {
                 server.peak(),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod transfer_slot_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn no_more_than_the_global_cap_run_at_once_across_threads() {
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = (0..MAX_TRANSFERS * 3)
+            .map(|_| {
+                let (running, peak) = (running.clone(), peak.clone());
+                thread::spawn(move || {
+                    let _slot = TransferSlot::acquire();
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(15));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(peak.load(Ordering::SeqCst) <= MAX_TRANSFERS);
+        assert!(
+            peak.load(Ordering::SeqCst) > 1,
+            "the slots serialised everything"
+        );
     }
 }
