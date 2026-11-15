@@ -16,7 +16,11 @@
             src = ./.;
             cargoLock = { lockFile = ./Cargo.lock; };
 
-            nativeBuildInputs = [ pkgs.makeWrapper ];
+            # newer nixpkgs tell zstd-sys to link the system libzstd through
+            # pkg-config, so both have to be there or the build script
+            # panics; older ones compiled the bundled copy and needed neither.
+            nativeBuildInputs = [ pkgs.makeWrapper pkgs.pkg-config ];
+            buildInputs = [ pkgs.zstd ];
 
             # the frame source spawns a real mpv and reads rawvideo
             # back off a fifo, so its tests need the binary at check
