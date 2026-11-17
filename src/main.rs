@@ -1004,7 +1004,7 @@ fn main() -> anyhow::Result<()> {
     // argument used to be ignored in silence, `--help` included, and
     // a path was ignored too, so an "open with wim" association did
     // nothing at all.
-    let run = match cli::parse_wim(std::env::args().skip(1)) {
+    let run = match cli::parse_wim(cli::argv()) {
         Ok(run) => run,
         Err(why) => {
             eprintln!("wim: {why}\n{}", cli::WIM_USAGE);

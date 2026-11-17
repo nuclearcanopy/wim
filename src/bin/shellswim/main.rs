@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
     // answered before anything else, so both work with no terminal, no
     // config and no server; `--version` exists to settle "am I running
     // the build I think I am".
-    let cli = match Cli::parse(std::env::args().skip(1)) {
+    let cli = match Cli::parse(wim::cli::argv()) {
         Ok(cli) => cli,
         Err(why) => {
             eprintln!("shellswim: {why}\n{}", cli::USAGE);

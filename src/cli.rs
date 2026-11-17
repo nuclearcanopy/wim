@@ -14,7 +14,20 @@
 //! identically, and `both_front_ends_answer_the_same_two_options`
 //! pins that they do.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
+
+/// Process arguments after argv[0]. `std::env::args()` panics on a
+/// non-UTF-8 argument (a file named in Latin-1, handed over by
+/// `xdg-open`); this converts lossily so it reaches the normal
+/// "cannot play" message instead.
+pub fn argv() -> impl Iterator<Item = String> {
+    lossy(std::env::args_os().skip(1))
+}
+
+fn lossy<I: IntoIterator<Item = OsString>>(args: I) -> impl Iterator<Item = String> {
+    args.into_iter().map(|a| a.to_string_lossy().into_owned())
+}
 
 /// What this invocation is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,9 +112,6 @@ impl Cli {
     }
 }
 
-// `wim`'s half, which the binary hosting this file does not call.
-// The allows go when it moves to `src/cli.rs` and `main.rs` calls it;
-// see the module doc.
 /// What `wim`'s argv asked for. Its own enum rather than a shape bent
 /// to fit `Run`: wim has no `-c` and takes any number of files, where
 /// a second script is an error.
@@ -112,9 +122,8 @@ pub enum WimRun {
     /// Explicitly resume the saved playback session.
     Resume,
     /// `wim a.flac b.mp3`: play the first and queue the rest. A media
-    /// player plays what it is handed; that is
-    /// what `xdg-open` and a desktop file association send, and what
-    /// mpv, vlc and mplayer all do.
+    /// player plays what it is handed; that is what `xdg-open` and a
+    /// desktop file association send, and what mpv, vlc and mplayer do.
     Play(Vec<PathBuf>),
     Version,
     Help,
@@ -274,6 +283,15 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, String> {
         Cli::parse(args.iter().map(|s| (*s).to_string()))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_argument_does_not_panic() {
+        use std::os::unix::ffi::OsStringExt;
+        let args = lossy([OsString::from_vec(b"caf\xe9.flac".to_vec())]).collect::<Vec<_>>();
+        assert_eq!(args, vec!["caf\u{fffd}.flac".to_string()]);
+        assert!(matches!(parse_wim(args), Ok(WimRun::Play(_))));
     }
 
     #[test]
