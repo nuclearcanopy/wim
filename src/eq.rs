@@ -9,6 +9,7 @@
 //! doesn't line up with the 10 bands asked for here).
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const BAND_HZ: [f64; 10] = [
     31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
@@ -451,6 +452,27 @@ pub fn build_af_filter(gains: &[f64; 10]) -> String {
 /// only long enough for astats to report one mono RMS per band, then
 /// `pan` selects the untouched dry channels for playback.
 pub fn build_player_af_filter(gains: &[f64; 10], enabled: bool, bands: usize) -> String {
+    build_player_af_filter_with(gains, enabled, bands, ANALYSIS.load(Ordering::Relaxed))
+}
+
+/// Whether the player's filter graph carries the spectrum/level analysis
+/// bank. A frontend that never draws a meter (shellswim) turns it off once
+/// at startup; the default keeps wim's graph unchanged.
+static ANALYSIS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_analysis(on: bool) {
+    ANALYSIS.store(on, Ordering::Relaxed);
+}
+
+/// `build_player_af_filter` with the analysis choice explicit. Off yields
+/// the same equalizer stages straight into stereo output, with no split,
+/// bandpass bank, merge or astats.
+pub fn build_player_af_filter_with(
+    gains: &[f64; 10],
+    enabled: bool,
+    bands: usize,
+    analysis: bool,
+) -> String {
     let bands = bands.clamp(4, 32);
     let mut stages = Vec::new();
     if enabled && !is_flat(gains) {
@@ -459,6 +481,10 @@ pub fn build_player_af_filter(gains: &[f64; 10], enabled: bool, bands: usize) ->
                 stages.push(format!("equalizer=f={hz}:width_type=o:width=1:g={g:.3}"));
             }
         }
+    }
+    if !analysis {
+        stages.push("aformat=channel_layouts=stereo".to_string());
+        return format!("@{LEVEL_METADATA_LABEL}:lavfi=[{}]", stages.join(","));
     }
     stages.push("aformat=channel_layouts=stereo,asplit=2[dry][analysis]".to_string());
 
@@ -582,6 +608,37 @@ mod tests {
         assert!(!disabled.contains("equalizer="));
         assert!(disabled.contains("asplit=2[dry][analysis]"));
         assert!(disabled.ends_with("pan=stereo|c0=c0|c1=c1]"));
+    }
+
+    #[test]
+    fn analysis_off_is_equalizer_and_stereo_only() {
+        let flat = build_player_af_filter_with(&[0.0; 10], true, 10, false);
+        assert_eq!(
+            flat,
+            format!("@{LEVEL_METADATA_LABEL}:lavfi=[aformat=channel_layouts=stereo]")
+        );
+        let gains = [6.0, 5.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let on = build_player_af_filter_with(&gains, true, 10, false);
+        let off = build_player_af_filter_with(&gains, false, 10, false);
+        for f in [&flat, &on, &off] {
+            for banned in ["astats", "bandpass", "asplit", "amerge", "pan="] {
+                assert!(!f.contains(banned), "{banned} in {f}");
+            }
+            assert!(f.contains("aformat=channel_layouts=stereo"));
+            assert!(f.starts_with(&format!("@{LEVEL_METADATA_LABEL}:lavfi=[")));
+            assert!(f.ends_with(']'));
+        }
+        assert!(on.contains("equalizer="));
+        assert!(!off.contains("equalizer="));
+    }
+
+    #[test]
+    fn analysis_on_matches_the_default_builder() {
+        let gains = [6.0, 5.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        assert_eq!(
+            build_player_af_filter_with(&gains, true, 10, true),
+            build_player_af_filter(&gains, true, 10)
+        );
     }
 
     /// Forward-applies `BAND_SPILL`, i.e. what the cascade realizes at

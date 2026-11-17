@@ -47,6 +47,41 @@ library and no servers, then sitting idle without playback. A separate,
 operator-assisted suite compares client resource use with a shared Navidrome
 library. Neither measures end-to-end search or time to audible playback.
 
+## wim optimization inventory
+
+Which of wim's optimizations shellswim gets. Shared means the code lives in
+the library crate and both frontends call it.
+
+Shared: mpv property observers, the async connector (spawn without waiting
+for the socket), batched IPC (`command_batch`), caches, `Ranking`, text
+width, the download cap, Subsonic client reuse, off-input-path resolves,
+observed mute. Added for shellswim: the prompt draws before the player
+answers (scan tests in `src/bin/shellswim/host.rs`), animation is capped at
+`anim::animation_wait` (30 fps, never faster than the display), and the
+player's filter graph omits the spectrum/level analysis bank
+(`eq::set_analysis(false)` in `Host::start`).
+
+wim only: the raster and album-art pipeline, the saved-queue restore, the
+graphics probe.
+
+First screen, `benchmarks/startup.py --runs 12`, release build, isolated
+XDG: shellswim median 2.72 ms (p95 3.07), wim median 3.00 ms (p95 3.22).
+
+Analysis switch, `mpv::bench::bench_analysis_cpu_on_vs_off` (10 bands,
+`ao=null`, sine source, alternating 3 rounds of 5 s, best of): mpv CPU 5
+ticks off against 35 on (100 ticks/s), 86% less, over the 25% bar, so it
+is kept. Whether the unmetered graph sounds identical is unverified by ear;
+the equalizer stages and stereo output are the same as before.
+
+Open follow-up: the shared core still sends one blocking IPC round trip per
+track when queueing (`core.rs`: `append_resolved`, `front_resolved`,
+`start_session`, `resync_upcoming`).
+
+Non-goals: no lazy one-shot mpv; no guard on overlay menus in the first
+~100 ms (`CONNECT_BUDGET` is 1 s); no `--resume` for shellswim;
+`reduced_motion` is not wired for shellswim (only `src/main.rs:1598` calls
+`set_reduced_motion`); idle-draw reduction stays open.
+
 ## Run the process benchmark
 
 Requires Linux with `/proc`, Python 3, mpv on `PATH`, and a built Wim binary.

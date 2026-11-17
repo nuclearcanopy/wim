@@ -1427,6 +1427,73 @@ mod bench {
         );
     }
 
+    /// With analysis off the graph must still be accepted by mpv and no
+    /// level or spectrum may ever be emitted.
+    #[test]
+    #[ignore]
+    fn analysis_off_graph_is_accepted_and_emits_no_levels() {
+        for analysis in [false, true] {
+            let mpv = Mpv::spawn().expect("mpv on PATH");
+            let _ = mpv.set_property("ao", json!("null"));
+            let _ = mpv.set_volume(0.0);
+            let af = crate::eq::build_player_af_filter_with(&[0.0; 10], true, 10, analysis);
+            mpv.set_af(&af).expect("set af accepted");
+            mpv.load_file("av://lavfi:sine=frequency=440:duration=10")
+                .expect("load");
+            mpv.observe_playback().expect("observe");
+            thread::sleep(Duration::from_millis(1500));
+            let mut playback = Playback::default();
+            while let Ok(event) = mpv.events().try_recv() {
+                if let Event::PropertyChange { name, value } = event {
+                    playback.apply(&name, &value);
+                }
+            }
+            assert!(mpv.child.lock().unwrap().try_wait().unwrap().is_none());
+            if analysis {
+                assert!(playback.spectrum(10).is_some(), "control must report");
+            } else {
+                assert!(playback.level().is_none());
+                assert!(playback.spectrum(10).is_none());
+            }
+        }
+    }
+
+    /// mpv child CPU (utime+stime, clock ticks) with the analysis bank on
+    /// and off, alternated in one process; best of 3 rounds of 5 s each.
+    #[test]
+    #[ignore]
+    fn bench_analysis_cpu_on_vs_off() {
+        fn ticks(pid: u32) -> u64 {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            let rest: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..].split(' ').collect();
+            rest[11].parse::<u64>().unwrap() + rest[12].parse::<u64>().unwrap()
+        }
+        let mpv = Mpv::spawn().expect("mpv on PATH");
+        let _ = mpv.set_property("ao", json!("null"));
+        let _ = mpv.set_volume(0.0);
+        mpv.load_file("av://lavfi:sine=frequency=440:duration=600")
+            .expect("load");
+        mpv.observe_playback().expect("observe");
+        let pid = mpv.child.lock().unwrap().id();
+        let mut best = [u64::MAX; 2];
+        for _ in 0..3 {
+            for (slot, analysis) in [(0, false), (1, true)] {
+                let af = crate::eq::build_player_af_filter_with(&[0.0; 10], true, 10, analysis);
+                mpv.set_af(&af).expect("set af");
+                thread::sleep(Duration::from_millis(500));
+                let before = ticks(pid);
+                thread::sleep(Duration::from_secs(5));
+                best[slot] = best[slot].min(ticks(pid) - before);
+            }
+        }
+        println!(
+            "mpv cpu over 5s (ticks, 100/s), best of 3: analysis off {} / on {} ({:.0}% less)",
+            best[0],
+            best[1],
+            100.0 * (1.0 - best[0] as f64 / best[1].max(1) as f64)
+        );
+    }
+
     /// Seven `sub-*` properties: one round trip each, or one for the
     /// whole pipelined batch.
     #[test]

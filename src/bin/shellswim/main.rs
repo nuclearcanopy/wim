@@ -341,7 +341,7 @@ fn prompt() -> anyhow::Result<()> {
         } else if !player_ready || host.app.loading_cached_catalog {
             Duration::from_millis(5)
         } else if animating {
-            frame.interval()
+            anim::animation_wait(frame)
         } else {
             anim::IDLE_POLL
         };
