@@ -4211,11 +4211,13 @@ shellswim declines each pane view **by name, pointing at wim's key**
 and never reaches the op table.
 
 **Measured, isolated XDG, machine under load:** wim's first frame
-364ms, shellswim's 420ms, of which `Mpv::spawn()` is ~400ms in both.
-Everything shellswim itself does costs ~4ms; it is usable in
-single-digit ms and then waits for mpv. **The obvious next move,
-leaving the prompt usable before mpv answers, is not done** and is the
-single biggest win available there.
+364ms, shellswim's 420ms, of which `Mpv::spawn()` was ~400ms in both.
+Commit 77839e4 made the prompt usable before mpv answers: the 400ms was
+the synchronous socket connect and player setup on the main thread, now
+done by the background connector after the first frame. shellswim's
+first screen is now ~3ms (`benchmarks/startup.py`, see
+`docs/performance.md`); a source-scan test keeps blocking player calls
+out of `Host::start` and the prompt's pre-loop path.
 
 Also measured and worth knowing: in wim the graphics probe answers at
 **1361ms, a full second after the first frame**, as a second reader on

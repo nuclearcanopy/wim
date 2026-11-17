@@ -125,6 +125,12 @@ pub const MIN_HZ: f32 = 24.0;
 /// direct manipulation (a scrub, move mode) is worth the display's rate.
 pub const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
+/// Poll timeout for ordinary animation: the display's interval, floored at
+/// `ANIMATION_FRAME_INTERVAL`. A slower display is not sped up.
+pub fn animation_wait(frame: FrameBudget) -> Duration {
+    frame.interval().max(ANIMATION_FRAME_INTERVAL)
+}
+
 /// Slowest-needed redraw interval for the idle banner (about 30 fps).
 pub const BANNER_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
@@ -358,6 +364,18 @@ mod tests {
         assert_eq!(FrameBudget::new(240.0), FrameBudget::new(MAX_HZ));
         let interval = FrameBudget::new(60.0).interval();
         assert!((interval.as_secs_f32() - 1.0 / 60.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ordinary_animation_is_capped_at_30fps_but_never_sped_up() {
+        for hz in [60.0, 144.0, 240.0] {
+            assert_eq!(
+                animation_wait(FrameBudget::new(hz)),
+                ANIMATION_FRAME_INTERVAL
+            );
+        }
+        let slow = animation_wait(FrameBudget::new(24.0));
+        assert!((slow.as_secs_f32() - 1.0 / 24.0).abs() < 1e-4);
     }
 
     /// Verbatim shape of `swaymsg -t get_outputs -r`, trimmed to the

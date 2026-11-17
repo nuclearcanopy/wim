@@ -386,6 +386,8 @@ impl Host {
     /// terminal: the scan and the catalog warm on their own threads
     /// and the prompt is usable before either answers.
     pub fn start() -> anyhow::Result<Host> {
+        // No meter is drawn here: skip the analysis bank in mpv's filter graph.
+        wim::eq::set_analysis(false);
         let first_run = !config::config_path()?.exists();
         let cfg = config::load_or_init()?;
         wim::trace_mark!("config loaded");
@@ -1502,5 +1504,72 @@ mod program_queue_tests {
             (&*waiting.pop_front().unwrap()) as *const Program,
             second_ptr
         );
+    }
+}
+
+/// The prompt must be usable before mpv answers. These scan the source (see
+/// docs/testing.md): a blocking player call slipped back into the start path
+/// costs ~100 ms on every launch and no behavioural test would notice.
+#[cfg(test)]
+mod startup_path_tests {
+    const HOST: &str = include_str!("host.rs");
+    const MAIN: &str = include_str!("main.rs");
+
+    /// The text from `header` to the next line that closes the function at
+    /// the same indentation.
+    fn function<'a>(source: &'a str, header: &str, indent: &str) -> &'a str {
+        let start = source
+            .find(header)
+            .unwrap_or_else(|| panic!("{header} not found"));
+        let closer = format!("\n{indent}}}\n");
+        let len = source[start..].find(&closer).expect("function end");
+        &source[start..start + len]
+    }
+
+    const BLOCKING: [&str; 7] = [
+        ".get_property(",
+        ".command(",
+        ".set_property(",
+        "command_batch(",
+        "wait_startup_",
+        "apply_player_setup_blocking",
+        ".recv()",
+    ];
+
+    #[test]
+    fn host_start_does_no_mpv_io() {
+        let body = function(HOST, "pub fn start() -> anyhow::Result<Host> {", "    ");
+        assert!(body.contains("Mpv::spawn()"), "scan lost its anchor");
+        for needle in BLOCKING {
+            assert!(!body.contains(needle), "Host::start must not call {needle}");
+        }
+    }
+
+    #[test]
+    fn prompt_draws_before_it_waits_for_mpv() {
+        let body = function(MAIN, "fn prompt() -> anyhow::Result<()> {", "");
+        let before_loop = &body[..body.find("    loop {").expect("prompt loop")];
+        assert!(before_loop.contains("begin_player_setup"));
+        for needle in ["apply_player_setup_blocking", "wait_startup_"] {
+            assert!(
+                !before_loop.contains(needle),
+                "prompt must not call {needle} before its first frame"
+            );
+        }
+    }
+
+    #[test]
+    fn one_shot_still_blocks_on_setup_by_design() {
+        let body = function(MAIN, "fn oneshot(cli: &Cli) -> anyhow::Result<()> {", "");
+        assert!(body.contains("apply_player_setup_blocking"));
+        assert!(body.contains("wait_startup_cache"));
+        assert!(body.contains("wait_startup_catalog"));
+    }
+
+    #[test]
+    fn animation_is_capped_at_the_shared_interval() {
+        let body = function(MAIN, "fn prompt() -> anyhow::Result<()> {", "");
+        assert!(body.contains("anim::animation_wait(frame)"));
+        assert!(!body.contains("frame.interval()"));
     }
 }

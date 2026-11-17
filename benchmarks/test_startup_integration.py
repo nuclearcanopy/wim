@@ -30,6 +30,8 @@ volume = 100
 held = False
 with conn, conn.makefile("rb") as lines:
     for line in lines:
+        if not line.strip():
+            continue  # wim guards each write with a leading newline
         request = json.loads(line)
         cmd = request["command"]
         error, data = "success", None

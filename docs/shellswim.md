@@ -198,13 +198,11 @@ wim, same machine, for comparison:
  1361.831ms  graphics probe answered
 ```
 
-two things to read off that. first, **`Mpv::spawn()` is ~400ms of
-both numbers** and is the only blocking call left in `Host::start`;
-everything shellswim itself does costs about 4ms, and the frame after
-mpv answers costs another 1ms. the honest statement is that shellswim
-starts in single-digit milliseconds and then waits for mpv. making the
-prompt usable *before* mpv answers is the obvious next move and is not
-done.
+two things to read off that. first, **`Mpv::spawn()` was ~400ms of
+both numbers** in this trace (history: the socket connect and player
+setup ran synchronously on the main thread). since commit 77839e4 the
+prompt is usable before mpv answers; the first screen is now about 3ms
+(median of 12 runs, `benchmarks/startup.py`). see `docs/performance.md`.
 
 second, wim's graphics probe answers at 1.36s, a full second after its
 own first frame, and for that whole second it is a second reader of
