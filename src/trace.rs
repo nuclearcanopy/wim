@@ -196,6 +196,8 @@ pub fn init_diagnostics() -> bool {
                 }
                 if let Ok(mut guard) = DIAG_FILE.lock() {
                     *guard = Some((file, Instant::now()));
+                    // new file, new origin: the sequence restarts too.
+                    DIAG_SEQ.store(0, Ordering::Relaxed);
                 }
                 true
             }
@@ -301,6 +303,24 @@ mod diag_tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "diagnostics are owner-only");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_new_diagnostics_session_restarts_the_sequence() {
+        let _guard = DIAG_TEST_LOCK.lock().unwrap();
+        let first = diag_file("seq-a");
+        let second = diag_file("seq-b");
+        std::env::set_var("WIM_DIAGNOSTICS_FILE", &first);
+        assert!(init_diagnostics());
+        diag("a", "one", &[]);
+        diag("a", "two", &[]);
+        std::env::set_var("WIM_DIAGNOSTICS_FILE", &second);
+        assert!(init_diagnostics());
+        diag("b", "one", &[]);
+        let contents = std::fs::read_to_string(&second).unwrap();
+        assert!(contents.contains("#000000 b/one"), "{contents:?}");
+        std::fs::remove_file(&first).ok();
+        std::fs::remove_file(&second).ok();
     }
 
     #[test]
