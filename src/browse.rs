@@ -720,6 +720,27 @@ impl Loader {
         }
     }
 
+    /// A page that is already a finished listing (a local album).
+    /// Invalidates first so a reply still in flight for the previous
+    /// view cannot land in this one.
+    pub fn open_listing(
+        &mut self,
+        title: &str,
+        subtitle: &str,
+        tracks: Vec<SearchItem>,
+    ) -> BrowseView {
+        self.invalidate();
+        let mut view = BrowseView {
+            title: title.to_string(),
+            subtitle: subtitle.to_string(),
+            show_track_artist: false,
+            ..BrowseView::loading(false)
+        };
+        view.set_tracks(tracks);
+        view.loading = false;
+        view
+    }
+
     /// Starts a new open: the generation moves, so every reply still in
     /// flight for the previous one is now stale. Split from `fetch` so
     /// tests can drive the two halves without a server.
@@ -1238,6 +1259,29 @@ pub(crate) mod tests {
         assert!(view.is_artist);
         assert!(view.loading);
         assert!(view.albums.is_empty() && view.tracks.is_empty());
+    }
+
+    #[test]
+    fn open_listing_replaces_the_view_and_invalidates_stale_replies() {
+        let mut loader = Loader::default();
+        let _old = loader.begin(&test_album("kid a")).unwrap();
+        let stale = loader.generation();
+        let opened = loader.open_listing("Record", "Band", songs_named(&["one", "two"]));
+        assert_ne!(stale, loader.generation());
+        assert_eq!(opened.title, "Record");
+        assert_eq!(opened.subtitle, "Band");
+        assert_eq!(opened.tracks.len(), 2);
+        assert!(!opened.loading, "a static listing is already complete");
+        let mut view = Some(opened);
+        loader.deliver(
+            stale,
+            Load::Tracks {
+                year: None,
+                tracks: songs_named(&["late"]),
+            },
+            &mut view,
+        );
+        assert_eq!(view.unwrap().tracks.len(), 2, "the stale reply is dropped");
     }
 
     #[test]

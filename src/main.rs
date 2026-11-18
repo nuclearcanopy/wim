@@ -112,6 +112,19 @@ fn open_browse(
     focus_open_browse(focus, player_minimized);
 }
 
+/// Same tail as `open_browse` for a page that is already built.
+fn show_listing(
+    opened: browse::BrowseView,
+    view: &mut Option<browse::BrowseView>,
+    browse_art: &mut ProtocolCache,
+    focus: &mut Focus,
+    player_minimized: &mut bool,
+) {
+    browse_art.clear();
+    *view = Some(opened);
+    focus_open_browse(focus, player_minimized);
+}
+
 fn focus_open_browse(focus: &mut Focus, player_minimized: &mut bool) {
     *player_minimized = true;
     // opening something to browse and then still needing a separate
@@ -279,6 +292,24 @@ impl Surface for WimSurface<'_> {
         open_browse(
             item,
             self.browse_loader,
+            self.browse_view,
+            self.browse_art,
+            self.focus,
+            self.player_minimized,
+        );
+        op_done()
+    }
+
+    fn open_listing(
+        &mut self,
+        title: &str,
+        subtitle: &str,
+        tracks: Vec<SearchItem>,
+        _core: &mut CoreCtx,
+    ) -> (Dispatch, Report) {
+        let opened = self.browse_loader.open_listing(title, subtitle, tracks);
+        show_listing(
+            opened,
             self.browse_view,
             self.browse_art,
             self.focus,

@@ -2033,6 +2033,32 @@ pub fn song_album_page(
         None => album_page(corpus, album, client),
     }
 }
+/// The local songs the corpus holds for one album, in path order so a
+/// track-numbered filename gives album order. Same album name by two
+/// artists stay apart; two `None` artists match each other. Lists what
+/// has been scanned so far.
+pub fn local_album_tracks(
+    corpus: &search::Corpus,
+    artist: &Option<String>,
+    album: &str,
+) -> Vec<SearchItem> {
+    let mut tracks: Vec<SearchItem> = corpus
+        .items()
+        .filter(|i| {
+            matches!(i, SearchItem::LocalMusic { artist: a, album: Some(b), .. }
+                if b == album && a == artist)
+        })
+        .cloned()
+        .collect();
+    tracks.sort_by(|a, b| match (a, b) {
+        (SearchItem::LocalMusic { path: a, .. }, SearchItem::LocalMusic { path: b, .. }) => {
+            a.cmp(b)
+        }
+        _ => std::cmp::Ordering::Equal,
+    });
+    tracks
+}
+
 /// Why `view()` finds no page for an item that has none.
 pub fn no_page_reason(item: &SearchItem) -> String {
     let name = item.primary_name();
@@ -3507,7 +3533,20 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                     artist,
                     client,
                 ),
-                SearchItem::LocalMusic { .. }
+                SearchItem::LocalMusic {
+                    artist,
+                    album: Some(album),
+                    ..
+                } => {
+                    let tracks = local_album_tracks(&core.app.corpus, artist, album);
+                    let (dispatch, report) =
+                        surf.open_listing(album, artist.as_deref().unwrap_or(""), tracks, core);
+                    return match report {
+                        Report::Failed(_) => (dispatch, report),
+                        _ => (dispatch, Report::Note(format!("opened {album}"))),
+                    };
+                }
+                SearchItem::LocalMusic { album: None, .. }
                 | SearchItem::LocalVideo { .. }
                 | SearchItem::TorBoxFile { .. }
                 | SearchItem::WatchSource { .. }
@@ -4915,6 +4954,19 @@ pub trait Surface {
     fn open_browse(&mut self, item: &SearchItem, core: &mut CoreCtx) -> (Dispatch, Report) {
         let _ = core;
         self.decline(&format!("page to open {} in", label(item)))
+    }
+
+    /// A static track listing as a page: a local album, which has no
+    /// server object to fetch.
+    fn open_listing(
+        &mut self,
+        title: &str,
+        subtitle: &str,
+        tracks: Vec<SearchItem>,
+        core: &mut CoreCtx,
+    ) -> (Dispatch, Report) {
+        let _ = (subtitle, tracks, core);
+        self.decline(&format!("page to open {title} in"))
     }
 
     /// Per-identity ops a newly started track asked for, for the

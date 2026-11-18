@@ -4792,3 +4792,10 @@ the order below is not a preference, it is a dependency.
       stack, so setting or clearing a timer never moves the cover.
       the idle poll stays at the display rate while a timer is pending
       so a paused player's countdown keeps ticking. wim only.
+- [x] **`view(q, ...)` on a local song opens its album listing.** a
+      `LocalMusic` with an album tag lists the corpus's local tracks
+      with the same album and artist, sorted by path; wim opens a
+      browse view (`Loader::open_listing`, which invalidates stale
+      replies first), shellswim lists in the console. videos,
+      silences, watch sources and untagged files fail by name.
+      `Surface::open_listing` is the new seam.
