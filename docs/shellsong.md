@@ -589,6 +589,25 @@ browse view claims it, then the bottom bar's focused field, otherwise
 the selected search result. that mirrors the app's own enter precedence
 exactly, which is the point.
 
+### torbox
+
+```
+torbox_search(query)                       search TorBox metadata, separate from local search
+torbox_status()                            test token-file connectivity; never prints the token
+torbox_list(service)                       list account items; service = torrent / usenet / web
+torbox_add(service, link)                  add a magnet, NZB link or web download
+torbox_play(service, id, file_id)          play one file of an account item
+torbox_queue(service, id, file_id)         queue one file by stable ids
+torbox_control(service, id, operation)     pause / resume / reannounce / delete
+```
+
+the token comes from `torbox_token_file` or `WIM_TORBOX_TOKEN_FILE`; with
+neither set these fail with "TorBox is not configured; set
+torbox_token_file". `torbox_add` and `torbox_control` change the remote
+account, so they are explicit, and `dry(...)` does not execute them.
+`torbox_play` and `torbox_queue` take the same two ids (item, then file).
+see `docs/torbox.md`.
+
 ### everything else
 
 ```
