@@ -227,6 +227,11 @@ struct WimSurface<'a> {
     /// (docs/undo.md).
     shellsong_queued: &'a mut Option<Box<shellsong::Program>>,
     bottombar_selected: Field,
+    scrub: &'a mut Option<Scrub>,
+    scrub_pending: &'a mut bool,
+    scrub_sent_at: &'a mut Option<Instant>,
+    elapsed_secs: Option<f64>,
+    duration_secs: Option<f64>,
 }
 
 impl Surface for WimSurface<'_> {
@@ -320,6 +325,21 @@ impl Surface for WimSurface<'_> {
 
     fn bar_field(&self) -> Option<Field> {
         Some(self.bottombar_selected)
+    }
+
+    fn open_scrub(&mut self, _core: &mut CoreCtx) -> (Dispatch, Report) {
+        if wim::transport::open_scrub(
+            wim::transport::ScrubAt::Position,
+            self.elapsed_secs,
+            self.duration_secs,
+            self.scrub,
+            self.scrub_pending,
+            self.scrub_sent_at,
+        ) {
+            op_done()
+        } else {
+            op_fail("nothing to scrub")
+        }
     }
 
     fn open_crossfade(&mut self) -> (Dispatch, Report) {
@@ -1833,6 +1853,16 @@ fn main() -> anyhow::Result<()> {
         }
         macro_rules! wim_surface {
             () => {
+                wim_surface!(@build (&mut scrub) (&mut scrub_pending) (&mut scrub_sent_at))
+            };
+            // for the two sites that hand `activate_transport` a
+            // `TransportCtx` already holding the scrub borrows. That
+            // path only presses ops, never `go()`, so the surface's own
+            // scrub slots are throwaways there.
+            (detached) => {
+                wim_surface!(@build (&mut None) (&mut false) (&mut None))
+            };
+            (@build $scrub:tt $pend:tt $sent:tt) => {
                 WimSurface {
                     focus: &mut focus,
                     browse_view: &mut browse_view,
@@ -1853,6 +1883,11 @@ fn main() -> anyhow::Result<()> {
                     undo_menu_open: &mut undo_menu_open,
                     shellsong_queued: &mut shellsong_queued,
                     bottombar_selected,
+                    scrub: $scrub,
+                    scrub_pending: $pend,
+                    scrub_sent_at: $sent,
+                    elapsed_secs: playback.elapsed_secs,
+                    duration_secs: playing_duration(now_playing.as_ref(), playback.duration_secs),
                 }
             };
         }
@@ -4373,7 +4408,7 @@ fn main() -> anyhow::Result<()> {
                                 playback.duration_secs,
                             ),
                         };
-                        let mut surf = wim_surface!();
+                        let mut surf = wim_surface!(detached);
                         let mut core = core_ctx!();
                         activate_transport(field, at, &mut core, &mut surf, &mut tctx);
                     }
@@ -6549,7 +6584,7 @@ fn main() -> anyhow::Result<()> {
                                     playback.duration_secs,
                                 ),
                             };
-                            let mut surf = wim_surface!();
+                            let mut surf = wim_surface!(detached);
                             let mut core = core_ctx!();
                             activate_transport(
                                 field,

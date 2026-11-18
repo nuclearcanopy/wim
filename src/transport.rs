@@ -66,21 +66,44 @@ pub fn activate_transport(
     // the scrubber. duration is captured by the caller, once, so each
     // step can clamp without asking mpv again; nothing loaded means
     // nothing to scrub, so the drag just doesn't open.
-    if let Some(elapsed) = ctx.elapsed_secs {
-        let open = Scrub {
-            target_secs: elapsed,
-            duration_secs: ctx.duration_secs,
-        };
-        // opening where it already is has nothing to seek to; opening
-        // where a pointer landed does, so only that one leaves a
-        // target for the coalescer to send.
-        *ctx.scrub = Some(match at {
-            ScrubAt::Position => open,
-            ScrubAt::Fraction(frac) => open.at_fraction(frac),
-        });
-        *ctx.scrub_pending = matches!(at, ScrubAt::Fraction(_));
-        *ctx.scrub_sent_at = None;
-    }
+    open_scrub(
+        at,
+        ctx.elapsed_secs,
+        ctx.duration_secs,
+        ctx.scrub,
+        ctx.scrub_pending,
+        ctx.scrub_sent_at,
+    );
+}
+
+/// Opens the scrub drag: the one place its state is built, shared by
+/// enter/click on the bar and `go()` on the progress field. Returns
+/// whether it opened; nothing loaded means nothing to scrub.
+pub fn open_scrub(
+    at: ScrubAt,
+    elapsed_secs: Option<f64>,
+    duration_secs: Option<f64>,
+    scrub: &mut Option<Scrub>,
+    scrub_pending: &mut bool,
+    scrub_sent_at: &mut Option<Instant>,
+) -> bool {
+    let Some(elapsed) = elapsed_secs else {
+        return false;
+    };
+    let open = Scrub {
+        target_secs: elapsed,
+        duration_secs,
+    };
+    // opening where it already is has nothing to seek to; opening
+    // where a pointer landed does, so only that one leaves a
+    // target for the coalescer to send.
+    *scrub = Some(match at {
+        ScrubAt::Position => open,
+        ScrubAt::Fraction(frac) => open.at_fraction(frac),
+    });
+    *scrub_pending = matches!(at, ScrubAt::Fraction(_));
+    *scrub_sent_at = None;
+    true
 }
 
 /// Finishes an open drag: one absolute seek to the target the bar has
@@ -162,5 +185,55 @@ mod tests {
         assert!(!now_playing_is_video(&Some(torbox(false))));
         std::fs::remove_file(&token_path).ok();
         std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn opening_a_scrub_from_the_bar_starts_at_the_current_position() {
+        let (mut scrub, mut pending, mut sent) = (None, true, Some(Instant::now()));
+        assert!(open_scrub(
+            ScrubAt::Position,
+            Some(42.0),
+            Some(200.0),
+            &mut scrub,
+            &mut pending,
+            &mut sent
+        ));
+        assert_eq!(
+            scrub,
+            Some(Scrub {
+                target_secs: 42.0,
+                duration_secs: Some(200.0)
+            })
+        );
+        assert!(!pending && sent.is_none());
+    }
+
+    #[test]
+    fn opening_a_scrub_with_nothing_loaded_does_nothing() {
+        let (mut scrub, mut pending, mut sent) = (None, false, None);
+        assert!(!open_scrub(
+            ScrubAt::Position,
+            None,
+            None,
+            &mut scrub,
+            &mut pending,
+            &mut sent
+        ));
+        assert!(scrub.is_none() && !pending);
+    }
+
+    #[test]
+    fn a_scrub_opened_at_a_fraction_leaves_a_pending_seek() {
+        let (mut scrub, mut pending, mut sent) = (None, false, None);
+        open_scrub(
+            ScrubAt::Fraction(0.5),
+            Some(10.0),
+            Some(200.0),
+            &mut scrub,
+            &mut pending,
+            &mut sent,
+        );
+        assert_eq!(scrub.unwrap().target_secs, 100.0);
+        assert!(pending);
     }
 }

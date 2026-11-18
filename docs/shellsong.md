@@ -1118,9 +1118,10 @@ future host) would have had to guess. they are decisions, not accidents:
   album's local tracks (wim: a browse view; shellswim: a console
   list). a video, a silence, a watch source or a song with no album
   tag fails by name.
-- `go()` on the bottom bar's progress field refuses: enter there is a
-  keyboard scrub drag, and an open console claims every key, so the
-  drag could never receive them. use `moveto(...)` or `seek(...)`.
+- `go()` on the bottom bar's progress field closes the console and
+  opens the keyboard scrub drag at the current position, exactly as
+  enter on the bar does; it does not seek. it fails with nothing
+  playing. `moveto(...)` and `seek(...)` remain the scripted way.
 
 ### routing
 
@@ -1165,10 +1166,8 @@ error beats a silent no-op:
   indexed album of that name it fails rather than guess.
 - `view(q, ...)` on a local file with **no album tag**, a video, a
   silence or a watch source: there is no album for the page to be.
-- `go()` with the bottom bar's **progress** field selected. enter
-  there opens a keyboard scrub drag, and the open console claims every
-  key the drag needs. it points at `moveto`/`seek` instead, which do
-  the same job without a mode.
+- `go()` on the progress field in a front-end with no scrubber
+  (shellswim): it declines by name.
 
 ### where things are stored
 
