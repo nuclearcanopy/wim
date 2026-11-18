@@ -6541,6 +6541,183 @@ mod seam_tests {
         assert_eq!(into, Intent::Front, "it must queue where it was asked to");
         assert_eq!(tracks.unwrap().len(), 2);
     }
+
+    /// A `Headless` that picks its selection and bar field, and
+    /// records the listing it was asked to open.
+    struct PageSurface {
+        selected: Option<SearchItem>,
+        bar: Option<Field>,
+        listed: Option<(String, String, usize)>,
+    }
+
+    impl Surface for PageSurface {
+        fn front_end(&self) -> &'static str {
+            "test"
+        }
+        fn selection(&self, _core: &CoreCtx) -> Option<SearchItem> {
+            self.selected.clone()
+        }
+        fn bar_field(&self) -> Option<Field> {
+            self.bar
+        }
+        fn open_listing(
+            &mut self,
+            title: &str,
+            subtitle: &str,
+            tracks: Vec<SearchItem>,
+            _core: &mut CoreCtx,
+        ) -> (Dispatch, Report) {
+            self.listed = Some((title.into(), subtitle.into(), tracks.len()));
+            op_done()
+        }
+    }
+
+    fn page_surface(selected: Option<SearchItem>, bar: Option<Field>) -> PageSurface {
+        PageSurface {
+            selected,
+            bar,
+            listed: None,
+        }
+    }
+
+    fn local_song(album: Option<&str>) -> SearchItem {
+        SearchItem::LocalMusic {
+            path: "/m/a/01.flac".into(),
+            title: "one".into(),
+            artist: Some("Band".into()),
+            album: album.map(String::from),
+        }
+    }
+
+    fn last_line(h: &Harness) -> crate::shellsong::Line {
+        h.console.lines.last().expect("a line").clone()
+    }
+
+    #[test]
+    #[ignore]
+    fn view_q_on_a_local_song_opens_its_album_listing() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let mut surf = page_surface(Some(local_song(Some("Record"))), None);
+        {
+            let mut core = h.ctx(&player);
+            apply_op(
+                Op::OpenPage(shellsong::Target::Selection),
+                &mut core,
+                &mut surf,
+            );
+        }
+        assert_ne!(last_line(&h).kind, crate::shellsong::LineKind::Error);
+        assert_eq!(surf.listed, Some(("Record".into(), "Band".into(), 0)));
+        assert!(last_line(&h).text.contains("opened Record"));
+    }
+
+    #[test]
+    #[ignore]
+    fn headless_declines_a_local_page_by_name() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        // Headless's selection is the head of an empty result set, so
+        // go through a surface that selects but does not list.
+        struct NoList(SearchItem);
+        impl Surface for NoList {
+            fn front_end(&self) -> &'static str {
+                "this front-end"
+            }
+            fn selection(&self, _core: &CoreCtx) -> Option<SearchItem> {
+                Some(self.0.clone())
+            }
+        }
+        let mut surf = NoList(local_song(Some("Record")));
+        {
+            let mut core = h.ctx(&player);
+            apply_op(
+                Op::OpenPage(shellsong::Target::Selection),
+                &mut core,
+                &mut surf,
+            );
+        }
+        let line = last_line(&h);
+        assert_eq!(line.kind, crate::shellsong::LineKind::Error);
+        assert!(line.text.contains("page to open Record"), "{}", line.text);
+    }
+
+    #[test]
+    fn local_album_tracks_groups_by_album_and_artist_sorted_by_path() {
+        use crate::library::{LocalTrack, MediaKind};
+        let mut c = search::Corpus::new();
+        let track = |path: &str, artist: Option<&str>, album: Option<&str>| LocalTrack {
+            path: path.into(),
+            title: path.into(),
+            artist: artist.map(String::from),
+            album: album.map(String::from),
+            duration_secs: None,
+            kind: MediaKind::Music,
+        };
+        c.add_local_tracks([
+            track("/m/r/02.flac", Some("Band"), Some("Record")),
+            track("/m/r/01.flac", Some("Band"), Some("Record")),
+            track("/m/o/01.flac", Some("Other"), Some("Record")),
+            track("/m/n/01.flac", None, Some("Record")),
+            track("/m/n/02.flac", None, Some("Record")),
+        ]);
+        let paths = |tracks: Vec<SearchItem>| -> Vec<String> {
+            tracks
+                .iter()
+                .map(|t| match t {
+                    SearchItem::LocalMusic { path, .. } => path.display().to_string(),
+                    other => panic!("not local: {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            paths(local_album_tracks(&c, &Some("Band".into()), "Record")),
+            ["/m/r/01.flac", "/m/r/02.flac"]
+        );
+        assert_eq!(
+            paths(local_album_tracks(&c, &None, "Record")),
+            ["/m/n/01.flac", "/m/n/02.flac"]
+        );
+    }
+
+    #[test]
+    fn local_album_tracks_ignores_other_albums_and_remote_items() {
+        use crate::library::{LocalTrack, MediaKind};
+        let mut c = search::Corpus::new();
+        c.add_local_tracks([
+            LocalTrack {
+                path: "/m/x.flac".into(),
+                title: "x".into(),
+                artist: Some("Band".into()),
+                album: Some("Else".into()),
+                duration_secs: None,
+                kind: MediaKind::Music,
+            },
+            LocalTrack {
+                path: "/m/v.mkv".into(),
+                title: "v".into(),
+                artist: Some("Band".into()),
+                album: Some("Record".into()),
+                duration_secs: None,
+                kind: MediaKind::Video,
+            },
+        ]);
+        assert!(local_album_tracks(&c, &Some("Band".into()), "Record").is_empty());
+    }
+
+    #[test]
+    fn a_local_song_without_an_album_tag_has_no_page() {
+        assert!(no_page_reason(&local_song(None)).contains("no album tag"));
+        let silence = SearchItem::Silence { secs: 5 };
+        assert!(no_page_reason(&silence).contains("silence has no page"));
+        let video = SearchItem::LocalVideo {
+            path: "/v/a.mkv".into(),
+            title: "a".into(),
+        };
+        assert!(no_page_reason(&video).contains("video"));
+    }
 }
 
 #[cfg(test)]
