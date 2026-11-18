@@ -20,6 +20,12 @@ pub fn set_reduced_motion(on: bool) {
     REDUCED_MOTION.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The one rule for turning reduced motion on, shared by wim and shellswim:
+/// the config key, or a non-empty `WIM_REDUCED_MOTION` other than `0`.
+pub fn reduced_motion_wanted(config: bool, env: Option<&std::ffi::OsStr>) -> bool {
+    config || env.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 pub fn reduced_motion() -> bool {
     REDUCED_MOTION.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -247,6 +253,17 @@ fn parse_hz_token(line: &str) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reduced_motion_wanted_follows_config_and_env() {
+        use super::reduced_motion_wanted as w;
+        use std::ffi::OsStr;
+        assert!(!w(false, None));
+        assert!(w(true, None));
+        assert!(w(false, Some(OsStr::new("1"))));
+        assert!(!w(false, Some(OsStr::new("0"))));
+        assert!(!w(false, Some(OsStr::new(""))));
+    }
+
     use super::*;
     use crate::theme::DIM;
 
