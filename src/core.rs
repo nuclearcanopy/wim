@@ -5077,29 +5077,6 @@ mod seam_tests {
     /// spawning one is ~400ms; the repo's convention for a test that
     /// needs mpv (see `mpv::tests`). Run it with
     /// `cargo test --lib seam -- --ignored`.
-    /// A front-end with no pages declines a static listing (a local
-    /// album) instead of panicking or silently dropping it.
-    #[test]
-    #[ignore]
-    fn a_surface_with_no_pages_declines_a_static_listing() {
-        let player = mpv::Mpv::spawn().expect("mpv on PATH");
-        let _ = player.set_property("ao", serde_json::json!("null"));
-        let mut h = Harness::new();
-        let mut surf = Headless;
-        let mut core = h.ctx(&player);
-        let (dispatch, report) = surf.open_listing(
-            "Record",
-            "Band",
-            crate::browse::tests::test_songs(3),
-            &mut core,
-        );
-        assert_eq!(dispatch, Dispatch::Continue);
-        match report {
-            Report::Failed(text) => assert!(text.contains("Record"), "{text}"),
-            _ => panic!("a declined listing must report a failure"),
-        }
-    }
-
     #[test]
     #[ignore]
     fn ops_apply_with_no_ui_state_at_all() {
@@ -5166,6 +5143,29 @@ mod seam_tests {
             before + 1,
             "one line per op, no more and no fewer"
         );
+    }
+
+    /// A front-end with no pages declines a static listing (a local
+    /// album) instead of panicking or silently dropping it.
+    #[test]
+    #[ignore]
+    fn a_surface_with_no_pages_declines_a_static_listing() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let mut surf = Headless;
+        let mut core = h.ctx(&player);
+        let (dispatch, report) = surf.open_listing(
+            "Record",
+            "Band",
+            crate::browse::tests::test_songs(3),
+            &mut core,
+        );
+        assert_eq!(dispatch, Dispatch::Continue);
+        match report {
+            Report::Failed(text) => assert!(text.contains("Record"), "{text}"),
+            _ => panic!("a declined listing must report a failure"),
+        }
     }
 
     /// `Env` is built with no pane state either: `Headless` answers
