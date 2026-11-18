@@ -437,8 +437,8 @@ that cannot arrive.
 ```
 
 searches, then opens the best match's page: an artist or album opens
-its own view. **a song opens the page it belongs to rather than
-playing**, because the verb is `view`, not `play`. that is intentional;
+its own view. **a song opens its album's page (by the server's id when
+known, else the indexed album by name) rather than playing**, because the verb is `view`, not `play`. that is intentional;
 `play(hex)` is how you play something.
 
 the query form searches, so it goes through the same await/resume path
@@ -1107,9 +1107,9 @@ future host) would have had to guess. they are decisions, not accidents:
   off it. `Env::queue_len` matches.
 - `view(now)` can only unminimize the player; the host has no separate
   "player screen" state, so it fails when nothing is playing.
-- `view(q, ...)` landing on a song can only open a page for an album
-  already indexed, since `SearchItem::Song` carries its album's name
-  and not an id. local files have no page.
+- `view(q, ...)` landing on a song opens its album by the server's id
+  when a response has said which album the song is on, else the indexed
+  album of that name; with neither it fails rather than guess.
 - `go()` on the bottom bar's progress field refuses: enter there is a
   keyboard scrub drag, and an open console claims every key, so the
   drag could never receive them. use `moveto(...)` or `seek(...)`.
@@ -1150,15 +1150,15 @@ is still merged into the corpus, it just does not hold the program up.
 reported through the console rather than faked, because a truthful
 error beats a silent no-op:
 
+- `view(q, ...)` landing on a **song** whose album is neither indexed
+  nor known to the server's id index. a song's page is its album's, and a
+  `SearchItem::Song` carries only its album's *name*: with no id learned
+  from an earlier response and no indexed album of that name, it fails
+  rather than guess.
 - `go()` with the bottom bar's **progress** field selected. enter
   there opens a keyboard scrub drag, and the open console claims every
   key the drag needs. it points at `moveto`/`seek` instead, which do
   the same job without a mode.
-- `view(q, ...)` landing on a **song** whose album is not indexed.
-  `OpenPage` opens an album/artist/playlist directly, and a song's own
-  page is its album's; a `SearchItem::Song` carries its album's *name*
-  but not its id, so the page can only be opened for an album already
-  in the corpus. a local file has no page at all.
 
 ### where things are stored
 
