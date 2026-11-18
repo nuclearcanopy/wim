@@ -7511,6 +7511,54 @@ mod item_state_tests {
         // album's name, not its id.
         assert!(album_page(&corpus, "some other album", &client).is_none());
     }
+
+    #[test]
+    fn a_song_with_a_known_album_id_opens_an_unindexed_album() {
+        let client = test_client();
+        let corpus = search::Corpus::new();
+        let page =
+            wim::core::song_album_page(&corpus, Some("al-9".into()), "album", "artist", &client);
+        match page {
+            Some(SearchItem::Album {
+                id, name, artist, ..
+            }) => {
+                assert_eq!(
+                    (id.as_str(), name.as_str(), artist.as_str()),
+                    ("al-9", "album", "artist")
+                );
+            }
+            other => panic!("expected an album page, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_song_with_no_known_id_falls_back_to_the_indexed_album_by_name() {
+        let client = test_client();
+        let mut corpus = search::Corpus::new();
+        corpus.add_subsonic_search_result(
+            wim::subsonic::SearchResult {
+                artists: Vec::new(),
+                albums: vec![wim::subsonic::Album {
+                    id: "al-1".into(),
+                    name: "album".into(),
+                    artist: "artist".into(),
+                }],
+                songs: Vec::new(),
+            },
+            &client,
+        );
+        for known in [None, Some("  ".to_string())] {
+            let page = wim::core::song_album_page(&corpus, known, "album", "artist", &client);
+            assert!(matches!(page, Some(SearchItem::Album { ref id, .. }) if id == "al-1"));
+        }
+    }
+
+    #[test]
+    fn a_song_with_neither_has_no_page() {
+        let client = test_client();
+        let corpus = search::Corpus::new();
+        assert!(wim::core::song_album_page(&corpus, None, "album", "artist", &client).is_none());
+    }
 }
 
 #[cfg(test)]

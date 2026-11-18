@@ -2013,6 +2013,46 @@ pub fn album_page(
         })
         .cloned()
 }
+/// The page a song opens: its album by the server's id when a response
+/// has said which album the song is on (exact, and works for an album
+/// the corpus never indexed), else the indexed album of that name.
+pub fn song_album_page(
+    corpus: &search::Corpus,
+    known_album_id: Option<String>,
+    album: &str,
+    artist: &str,
+    client: &Arc<subsonic::Client>,
+) -> Option<SearchItem> {
+    match known_album_id.filter(|id| !id.trim().is_empty()) {
+        Some(id) => Some(SearchItem::Album {
+            id,
+            name: album.to_string(),
+            artist: artist.to_string(),
+            client: client.clone(),
+        }),
+        None => album_page(corpus, album, client),
+    }
+}
+/// Why `view()` finds no page for an item that has none.
+pub fn no_page_reason(item: &SearchItem) -> String {
+    let name = item.primary_name();
+    match item {
+        SearchItem::LocalMusic { album: None, .. } => {
+            format!("no page for '{name}': it has no album tag")
+        }
+        SearchItem::LocalVideo { .. } | SearchItem::TorBoxFile { .. } => {
+            format!("no page for '{name}': a video or file has no page")
+        }
+        SearchItem::WatchSource { .. } => {
+            format!("no page for '{name}': a watch source has no page")
+        }
+        SearchItem::Silence { .. } => format!("no page for '{name}': a silence has no page"),
+        _ => format!(
+            "no page for '{name}': its album isn't indexed and the server hasn't said which album it is"
+        ),
+    }
+}
+
 /// What one op reported into the scrollback. `Described` takes
 /// `Op::describe()`, which is usually the right line; the host
 /// overrides with `Note` when it knows a better one (a track title, a
@@ -3454,9 +3494,19 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                 SearchItem::Album { .. }
                 | SearchItem::Artist { .. }
                 | SearchItem::Playlist { .. } => Some(item.clone()),
-                SearchItem::Song { album, client, .. } => {
-                    album_page(&core.app.corpus, album, client)
-                }
+                SearchItem::Song {
+                    id,
+                    album,
+                    artist,
+                    client,
+                    ..
+                } => song_album_page(
+                    &core.app.corpus,
+                    client.album_of_song(id),
+                    album,
+                    artist,
+                    client,
+                ),
                 SearchItem::LocalMusic { .. }
                 | SearchItem::LocalVideo { .. }
                 | SearchItem::TorBoxFile { .. }
@@ -3469,7 +3519,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
                     let dispatch = dispatch_action(Action::Play(page), core, surf);
                     (dispatch, Report::Note(format!("opened {name}")))
                 }
-                None => op_fail(format!("no page for '{}'", item.primary_name())),
+                None => op_fail(no_page_reason(&item)),
             }
         }
         Op::ClearConsole => {
