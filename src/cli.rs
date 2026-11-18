@@ -224,10 +224,13 @@ at the prompt:
   tab / shift+tab   cycle the completions for what you are typing
   right / ctrl+f    accept the greyed-out completion
   up / down         walk back through what you have run
+  pgup / pgdn       scroll the output a page
+  shift+up / down   scroll the output a line
+  K                 the keybinds menu (on an empty line)
   ?                 the command list, short
   help()            the command list, full
   dry(...)          say what a command would do, run nothing
-  quit() / ctrl+c   leave
+  quit() / ctrl+c / ctrl+d   leave
 
 shellswim has no panes, so the commands that open one (view(eq),
 view(settings), view(keybinds), view(starred), view(suggestions))
