@@ -625,8 +625,9 @@ quit()                  quit wim                               [exit]
 `sleep` reuses the crossfade volume ramp rather than cutting the audio
 dead: the last `crossfade_seconds` of the wait fade the volume down,
 then it pauses and puts the level back so unpausing later is not
-silent. A toast says so when it fires; there is no countdown on the
-player screen yet.
+silent. A toast says so when it fires. While a timer is pending the
+player screen shows `sleep · 29m40s` dim on its bottom row (above the
+spectrum, dropped when the pane is too short), ticking even while paused.
 
 ### per-identity settings
 
@@ -1158,7 +1159,6 @@ error beats a silent no-op:
   page is its album's; a `SearchItem::Song` carries its album's *name*
   but not its id, so the page can only be opened for an album already
   in the corpus. a local file has no page at all.
-- `sleep(...)` has no remaining-time readout on the player screen.
 
 ### where things are stored
 

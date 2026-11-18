@@ -1834,6 +1834,7 @@ fn main() -> anyhow::Result<()> {
             .map(|d| d.as_secs_f64());
         // mpv misreports a generated silence's length, so the entry is
         // asked first; see `core::playing_duration`.
+        let sleep_left = sleep_due.map(|d| d.saturating_sub(shellsong_now).as_secs_f64());
         let duration_secs = playing_duration(now_playing.as_ref(), playback.duration_secs);
         // the one answer to "what is playback doing right now", so
         // the bar can say why it isn't moving instead of leaving that
@@ -2390,6 +2391,7 @@ fn main() -> anyhow::Result<()> {
                     // target mid-drag, so the countdown follows a drag
                     // too rather than fighting it.
                     gap_remaining: gap_left,
+                    sleep_remaining: sleep_left,
                     gap: match item {
                         SearchItem::Silence { secs } => Some(Gap {
                             remaining_secs: *secs as f64
@@ -3781,6 +3783,8 @@ fn main() -> anyhow::Result<()> {
                 // paused player was redrawing at the display rate for nothing
                 || (now_playing.is_some() && !player_minimized && (!paused || pause_settling))
                 || scrub.is_some()
+                // a pending sleep timer's countdown ticks while paused
+                || (sleep_due.is_some() && now_playing.is_some() && !player_minimized)
                 // a gap counts down on screen, and mpv is paused
                 // through it, so none of the playback-driven
                 // conditions above would keep the frame rate up.
