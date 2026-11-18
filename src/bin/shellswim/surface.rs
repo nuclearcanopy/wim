@@ -151,6 +151,17 @@ impl Surface for Borrowed<'_> {
             core::Resolution::Fetching(name) => op_note(format!("resolving {name}...")),
         }
     }
+
+    fn open_listing(
+        &mut self,
+        title: &str,
+        _subtitle: &str,
+        tracks: Vec<SearchItem>,
+        core: &mut CoreCtx,
+    ) -> (Dispatch, Report) {
+        self.list_of(title.to_string(), tracks, core);
+        op_note(format!("opened {title}"))
+    }
 }
 
 impl Borrowed<'_> {
