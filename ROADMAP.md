@@ -4799,3 +4799,9 @@ the order below is not a preference, it is a dependency.
       replies first), shellswim lists in the console. videos,
       silences, watch sources and untagged files fail by name.
       `Surface::open_listing` is the new seam.
+- [x] **`go()` on the progress field opens the scrub drag.** mirrors
+      crossfade: the console closes and the keyboard drag opens at the
+      current position, through `transport::open_scrub`, which
+      `activate_transport` now shares so the drag state is built in one
+      place. fails with nothing playing; shellswim declines by name.
+      `moveto`/`seek` are unchanged. wim only.

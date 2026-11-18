@@ -3409,18 +3409,24 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             let Some(field) = surf.bar_field() else {
                 return surf.decline("bar control to press");
             };
-            if field == Field::Crossfade {
-                let result = surf.open_crossfade();
+            if field == Field::Crossfade || field == Field::Progress {
+                if field == Field::Progress && core.now_playing.is_none() {
+                    return op_fail("nothing is playing");
+                }
+                // both open something that wants the keys, so the
+                // console closes behind them.
+                let result = if field == Field::Crossfade {
+                    surf.open_crossfade()
+                } else {
+                    surf.open_scrub(core)
+                };
                 if !matches!(result.1, Report::Failed(_)) {
                     surf.close_console();
                 }
                 return result;
             }
             let Some(field_op) = op_for_field(field) else {
-                // enter on the scrubber opens a keyboard drag, which
-                // the open console would swallow every key of; the
-                // language has real seek commands instead.
-                return op_fail("use moveto(1m20s) or seek(+30s) to scrub from here");
+                return op_fail("that control has no command to press");
             };
             let closes = field_op.closes_console();
             let result = run_op(field_op, core, surf);
@@ -4996,6 +5002,13 @@ pub trait Surface {
         self.decline("crossfade menu")
     }
 
+    /// `go()` on the progress field: open the keyboard scrub drag at
+    /// the current position.
+    fn open_scrub(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
+        let _ = core;
+        self.decline("scrub drag")
+    }
+
     /// Light a bar control for a moment. Pure feedback; a front-end
     /// with no such affordance ignores it rather than declining,
     /// because the op itself did happen.
@@ -6548,6 +6561,7 @@ mod seam_tests {
         selected: Option<SearchItem>,
         bar: Option<Field>,
         listed: Option<(String, String, usize)>,
+        scrubbed: bool,
     }
 
     impl Surface for PageSurface {
@@ -6570,6 +6584,10 @@ mod seam_tests {
             self.listed = Some((title.into(), subtitle.into(), tracks.len()));
             op_done()
         }
+        fn open_scrub(&mut self, _core: &mut CoreCtx) -> (Dispatch, Report) {
+            self.scrubbed = true;
+            op_done()
+        }
     }
 
     fn page_surface(selected: Option<SearchItem>, bar: Option<Field>) -> PageSurface {
@@ -6577,6 +6595,7 @@ mod seam_tests {
             selected,
             bar,
             listed: None,
+            scrubbed: false,
         }
     }
 
@@ -6642,6 +6661,60 @@ mod seam_tests {
         let line = last_line(&h);
         assert_eq!(line.kind, crate::shellsong::LineKind::Error);
         assert!(line.text.contains("page to open Record"), "{}", line.text);
+    }
+
+    #[test]
+    #[ignore]
+    fn go_on_the_progress_field_declines_by_name_on_a_front_end_without_a_scrubber() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        struct Bar;
+        impl Surface for Bar {
+            fn front_end(&self) -> &'static str {
+                "this front-end"
+            }
+            fn bar_field(&self) -> Option<Field> {
+                Some(Field::Progress)
+            }
+        }
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::Go(GoTarget::BottomBarField), &mut core, &mut Bar);
+        }
+        let line = last_line(&h);
+        assert_eq!(line.kind, crate::shellsong::LineKind::Error);
+        assert!(line.text.contains("scrub drag"), "{}", line.text);
+    }
+
+    #[test]
+    #[ignore]
+    fn go_on_the_progress_field_with_nothing_playing_fails() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        h.now_playing = None;
+        let mut surf = page_surface(None, Some(Field::Progress));
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::Go(GoTarget::BottomBarField), &mut core, &mut surf);
+        }
+        assert!(!surf.scrubbed, "nothing to scrub, so no drag opens");
+        assert!(last_line(&h).text.contains("nothing is playing"));
+    }
+
+    #[test]
+    #[ignore]
+    fn go_on_the_progress_field_opens_the_scrub_when_something_plays() {
+        let player = mpv::Mpv::spawn().expect("mpv on PATH");
+        let _ = player.set_property("ao", serde_json::json!("null"));
+        let mut h = Harness::new();
+        let mut surf = page_surface(None, Some(Field::Progress));
+        {
+            let mut core = h.ctx(&player);
+            apply_op(Op::Go(GoTarget::BottomBarField), &mut core, &mut surf);
+        }
+        assert!(surf.scrubbed);
     }
 
     #[test]
