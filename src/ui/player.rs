@@ -9,6 +9,7 @@ use crate::theme::{shade, NEAR_BLACK, NEAR_WHITE};
 use crate::ui::albumart::CachedArt;
 use crate::ui::draw;
 use crate::ui::gap::{Gap, GapPanel};
+use crate::ui::progress::fmt_span;
 use crate::ui::textfit::{truncate_with_ellipsis, width};
 
 /// Rows at the bottom of the pane the spectrum owns (main.rs draws
@@ -62,6 +63,10 @@ pub struct PlayerLayout {
     /// Previous/next track line; the first thing a shrinking pane
     /// drops, since the queue view answers the same question.
     pub context_y: Option<u16>,
+    /// Sleep-timer countdown: the last row above the spectrum, and only
+    /// when that is strictly below everything else, so it never shifts
+    /// the cover.
+    pub sleep_y: Option<u16>,
 }
 
 /// `None` when nothing fits at all (a zero-width or zero-height pane).
@@ -130,11 +135,15 @@ pub fn layout(
         width: rect.width.min(20),
         height: 1,
     });
+    let last_used = context_y.unwrap_or(title_y);
+    let sleep_row = area.y + body_h - 1;
+    let sleep_y = (sleep_row > last_used).then_some(sleep_row);
     Some(PlayerLayout {
         art,
         video_sync,
         title_y,
         context_y,
+        sleep_y,
     })
 }
 
@@ -182,6 +191,8 @@ pub struct PlayerView<'a> {
     /// `ControlsBar::gap_remaining` for why this reads here rather
     /// than taking the cover panel.
     pub gap_remaining: Option<f64>,
+    /// Seconds left on a `sleep(...)` timer, drawn dim under the stack.
+    pub sleep_remaining: Option<f64>,
     pub loop_mode: LoopMode,
     pub shuffle_on: bool,
     pub speed: f64,
@@ -265,6 +276,10 @@ impl Widget for PlayerView<'_> {
         draw_centered(buf, area, l.title_y, title, shade(NEAR_WHITE));
         if let Some(y) = l.context_y {
             draw_centered(buf, area, y, &self.context_line(), shade(NEAR_BLACK));
+        }
+        if let (Some(secs), Some(y)) = (self.sleep_remaining, l.sleep_y) {
+            let text = format!("sleep · {}", fmt_span(secs.max(0.0).ceil() as u64));
+            draw_centered(buf, area, y, &text, shade(NEAR_BLACK));
         }
     }
 }
@@ -355,6 +370,7 @@ mod tests {
             duration_secs: Some(120.0),
             paused: false,
             gap_remaining: None,
+            sleep_remaining: None,
             loop_mode: LoopMode::Off,
             shuffle_on: false,
             speed: 1.0,
@@ -510,6 +526,32 @@ mod tests {
             );
             if let Some(y) = l.context_y {
                 assert!(y < h - METER_ROWS, "context on row {y} of {h}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pending_sleep_draws_its_remaining_time() {
+        let buf = render(60, 24, |v| v.sleep_remaining = Some(1799.2));
+        assert!(grid(&buf).contains("sleep · 30m"), "{}", grid(&buf));
+    }
+
+    #[test]
+    fn no_sleep_timer_draws_no_sleep_line() {
+        let buf = render(60, 24, |_| {});
+        assert!(!grid(&buf).contains("sleep"), "{}", grid(&buf));
+    }
+
+    #[test]
+    fn the_sleep_line_never_overlaps_the_title_or_meter_rows() {
+        for h in [40u16, 24, 20, 16, 12, 8, 4, 2, 1] {
+            let area = Rect::new(0, 0, 90, h);
+            let l = layout(area, true, true, 2.0).unwrap();
+            if let Some(y) = l.sleep_y {
+                assert!(y > l.title_y, "sleep on title row, h={h}");
+                assert!(y > l.context_y.unwrap_or(0), "sleep on context row, h={h}");
+                let body = if h > METER_ROWS { h - METER_ROWS } else { h };
+                assert!(y < body, "sleep row {y} in the meter, h={h}");
             }
         }
     }

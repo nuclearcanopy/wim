@@ -4786,3 +4786,9 @@ the order below is not a preference, it is a dependency.
       that does not resolve, and mpv hands af-metadata through as
       strings so `as_f64()` would have read every reading as absent
       anyway. the level meter had never worked.
+- [x] **`sleep(...)` remaining-time readout on the player screen.** a
+      dim `sleep · 29m40s` line on the last row above the spectrum,
+      drawn only when that row is strictly below the title/context
+      stack, so setting or clearing a timer never moves the cover.
+      the idle poll stays at the display rate while a timer is pending
+      so a paused player's countdown keeps ticking. wim only.
