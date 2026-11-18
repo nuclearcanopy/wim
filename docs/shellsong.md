@@ -867,6 +867,8 @@ history line; the two are reached by different keys on purpose.
 | `right` | accept, but only at the end of the line |
 | `ctrl+f` | accept, wherever the cursor is |
 | typing, `esc` | cancel an open menu |
+| `pgup` / `pgdn` | scroll the output back / forward a page |
+| `shift+up` / `shift+down` | scroll the output a line (plain up/down stay history recall) |
 
 with exactly one candidate, `tab` just takes it. while cycling, the
 candidates are listed under the input with the current one in brackets

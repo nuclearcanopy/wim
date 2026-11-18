@@ -192,8 +192,12 @@ const SECTIONS: &[(&str, &[(Key, &str)])] = &[
             (Key::Fixed("help()"), "list every command"),
             (Key::Fixed("play(x)"), "play or queue by name"),
             (Key::Fixed("view(queue)"), "open a screen by name"),
-            (Key::Fixed("tab"), "complete what you typed"),
+            (Key::Fixed("tab/s-tab"), "cycle completions"),
+            (Key::Fixed("right/ctrl+f"), "accept ghost"),
+            (Key::Fixed("esc"), "cancel menu / close"),
             (Key::Fixed("up / down"), "recall a past command"),
+            (Key::Fixed("pgup/pgdn"), "scroll by page"),
+            (Key::Fixed("shift+up/down"), "scroll by line"),
         ],
     ),
     (
