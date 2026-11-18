@@ -664,6 +664,31 @@ mod tests {
         buf
     }
 
+    /// A finished local album listing paints its title, subtitle and
+    /// every track at the sizes a pane really gets, with the selection
+    /// on a real row.
+    #[test]
+    fn a_static_listing_page_draws_title_subtitle_and_every_track() {
+        for (w, h) in [(40u16, 12u16), (80, 24), (120, 40)] {
+            let mut loader = crate::browse::Loader::default();
+            let tracks = test_songs(4);
+            let view = loader.open_listing("Record Title", "Band Name", tracks.clone());
+            assert!(view.selected < view.tracks.len(), "{w}x{h}");
+            let area = Rect::new(0, 0, w, h);
+            let buf = render_view(&view, area);
+            let text: Vec<String> = (0..h).map(|y| row_text(&buf, y)).collect();
+            let all = text.join("\n");
+            assert!(all.contains("Record Title"), "{w}x{h}\n{all}");
+            assert!(all.contains("Band Name"), "{w}x{h}\n{all}");
+            for t in &tracks {
+                let SearchItem::Song { title, .. } = t else {
+                    unreachable!()
+                };
+                assert!(all.contains(title.as_str()), "{title} at {w}x{h}\n{all}");
+            }
+        }
+    }
+
     fn test_albums(n: usize) -> Vec<SearchItem> {
         let client = test_client();
         (0..n)
@@ -769,6 +794,41 @@ mod tests {
         ] {
             let map = rows(area, &view, ArtMode::Off, 2.0);
             assert!(map.tracks.1.iter().flatten().count() <= 4, "{area:?}");
+        }
+    }
+
+    /// A finished static listing (a local album) draws its title,
+    /// subtitle and every track at the sizes a pane really gets.
+    #[test]
+    fn a_static_listing_renders_title_subtitle_and_every_track() {
+        for (w, h) in [(40u16, 12u16), (80, 24), (120, 40)] {
+            let mut view = test_view(test_songs(4));
+            view.title = "Record".to_string();
+            view.subtitle = "Band".to_string();
+            view.selected = 3;
+            let area = Rect::new(0, 0, w, h);
+            let buf = render_view(&view, area);
+            let screen: String = (0..h)
+                .map(|y| row_text(&buf, y))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(screen.contains("Record"), "{w}x{h}:\n{screen}");
+            assert!(screen.contains("Band"), "{w}x{h}:\n{screen}");
+            let (_, song_rows) = rows(area, &view, ArtMode::Off, 2.0).tracks;
+            for i in 0..4 {
+                assert!(
+                    screen.contains(&format!("song {i}")),
+                    "{w}x{h} lacks track {i}:\n{screen}"
+                );
+            }
+            let sel = song_rows
+                .iter()
+                .position(|r| *r == Some(3))
+                .unwrap_or_else(|| panic!("{w}x{h}: selection row not mapped"));
+            assert!(
+                sel < h as usize,
+                "{w}x{h}: selection row {sel} out of bounds"
+            );
         }
     }
 
