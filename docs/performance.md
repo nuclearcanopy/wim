@@ -79,8 +79,7 @@ track when queueing (`core.rs`: `append_resolved`, `front_resolved`,
 
 Non-goals: no lazy one-shot mpv; no guard on overlay menus in the first
 ~100 ms (`CONNECT_BUDGET` is 1 s); no `--resume` for shellswim;
-`reduced_motion` is not wired for shellswim (only `src/main.rs:1598` calls
-`set_reduced_motion`); idle-draw reduction stays open.
+idle-draw reduction stays open.
 
 ## Run the process benchmark
 

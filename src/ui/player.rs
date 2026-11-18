@@ -12,9 +12,10 @@ use crate::ui::gap::{Gap, GapPanel};
 use crate::ui::progress::fmt_span;
 use crate::ui::textfit::{truncate_with_ellipsis, width};
 
-/// Rows at the bottom of the pane the spectrum owns (main.rs draws
-/// it over whatever was there, on the same `main_content.height > 2`
-/// condition mirrored below), so the stack stops above them.
+/// Rows at the bottom of the pane reserved for the spectrum so the stack
+/// stops above them. The meter itself is now an 8-row right-edge strip
+/// (see `player_spectrum_layout`); this reserve is kept as the layout
+/// contract the tests assert.
 const METER_ROWS: u16 = 2;
 
 /// The cover is only drawn once it can be at least this big. Smaller
@@ -552,6 +553,64 @@ mod tests {
                 assert!(y > l.context_y.unwrap_or(0), "sleep on context row, h={h}");
                 let body = if h > METER_ROWS { h - METER_ROWS } else { h };
                 assert!(y < body, "sleep row {y} in the meter, h={h}");
+            }
+        }
+    }
+
+    /// The sleep row is drawn inside the content rect the spectrum strip
+    /// leaves over, whatever the pane size and band count.
+    #[test]
+    fn the_sleep_row_stays_clear_of_the_spectrum_strip() {
+        use crate::ui::visualizer::{player_spectrum_layout, SpectrumMeter};
+        let text = "sleep · 1m";
+        for w in [40u16, 60, 90] {
+            for h in [40u16, 24, 16, 12, 10, 8, 4] {
+                for bands in [10usize, 32] {
+                    let area = Rect::new(0, 0, w, h);
+                    let (content, spectrum) = player_spectrum_layout(area, bands);
+                    let keymap = Keymap::default();
+                    let cover = art();
+                    let mut v = view(&keymap, Some(&cover));
+                    v.sleep_remaining = Some(90.0);
+                    let l = layout(content, true, false, v.cell_aspect).unwrap();
+                    let mut buf = buffer(w, h);
+                    v.render(content, &mut buf);
+                    let levels = vec![1.0f32; bands];
+                    SpectrumMeter { levels: &levels }.render(spectrum, &mut buf);
+
+                    let rows: Vec<String> = grid(&buf).lines().map(String::from).collect();
+                    let found: Vec<(usize, usize)> = rows
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(y, r)| {
+                            let chars: Vec<char> = r.chars().collect();
+                            let pat: Vec<char> = text.chars().collect();
+                            chars
+                                .windows(pat.len())
+                                .position(|c| c == pat.as_slice())
+                                .map(|x| (x, y))
+                        })
+                        .collect();
+                    let ctx = format!("{w}x{h} bands={bands} {l:?}\n{}", rows.join("\n"));
+                    match l.sleep_y {
+                        Some(sy) => {
+                            assert_eq!(found.len(), 1, "sleep row not drawn: {ctx}");
+                            let (x, y) = found[0];
+                            assert_eq!(y as u16, sy, "{ctx}");
+                            assert!(sy > l.title_y, "{ctx}");
+                            assert!(sy > l.context_y.unwrap_or(0), "{ctx}");
+                            for dx in 0..text.chars().count() as u16 {
+                                let (cx, cy) = (x as u16 + dx, y as u16);
+                                let inside = cx >= spectrum.x
+                                    && cx < spectrum.x + spectrum.width
+                                    && cy >= spectrum.y
+                                    && cy < spectrum.y + spectrum.height;
+                                assert!(!inside, "cell ({cx},{cy}) in the spectrum: {ctx}");
+                            }
+                        }
+                        None => assert!(found.is_empty(), "{ctx}"),
+                    }
+                }
             }
         }
     }
