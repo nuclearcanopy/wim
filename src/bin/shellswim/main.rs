@@ -120,6 +120,10 @@ fn oneshot(cli: &Cli) -> anyhow::Result<()> {
 
 fn prompt() -> anyhow::Result<()> {
     let mut host = Host::start()?;
+    anim::set_reduced_motion(anim::reduced_motion_wanted(
+        host.cfg.reduced_motion,
+        std::env::var_os("WIM_REDUCED_MOTION").as_deref(),
+    ));
     host.interactive_prompt = true;
     let mut lyrics_setup = host.first_run.then(|| LyricsSetup {
         providers: host.cfg.lyrics.providers.clone(),

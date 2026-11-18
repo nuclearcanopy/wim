@@ -1646,10 +1646,10 @@ fn main() -> anyhow::Result<()> {
     // a thread, applied whenever it answers, so the first frame never
     // waits on a compositor. 60hz until then.
     let frame_rx = anim::spawn_probe();
-    wim::anim::set_reduced_motion(
-        cfg.reduced_motion
-            || std::env::var_os("WIM_REDUCED_MOTION").is_some_and(|v| !v.is_empty() && v != "0"),
-    );
+    wim::anim::set_reduced_motion(wim::anim::reduced_motion_wanted(
+        cfg.reduced_motion,
+        std::env::var_os("WIM_REDUCED_MOTION").as_deref(),
+    ));
     let mut frame = anim::FrameBudget::default();
     // Startup playback and queue restoration complete asynchronously.
     let mut first_frame_drawn = false;

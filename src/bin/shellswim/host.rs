@@ -1514,6 +1514,14 @@ mod program_queue_tests {
 mod startup_path_tests {
     const HOST: &str = include_str!("host.rs");
     const MAIN: &str = include_str!("main.rs");
+    const WIM_MAIN: &str = include_str!("../../main.rs");
+
+    /// `reduced_motion` must reach both binaries through the shared rule.
+    #[test]
+    fn both_binaries_wire_reduced_motion() {
+        assert!(WIM_MAIN.contains("reduced_motion_wanted("));
+        assert!(MAIN.contains("reduced_motion_wanted("));
+    }
 
     /// The text from `header` to the next line that closes the function at
     /// the same indentation.
