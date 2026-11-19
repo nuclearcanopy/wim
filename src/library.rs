@@ -978,18 +978,7 @@ mod tests {
     /// are busy during a bench run, so wall clock moves 2-3x between
     /// runs while the work done does not.
     fn best_cpu<T>(iters: u32, mut f: impl FnMut() -> T) -> (std::time::Duration, T) {
-        let cpu_now = || {
-            let mut ts = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            // SAFETY: clock_gettime only writes the timespec we hand it.
-            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
-            std::time::Duration::new(
-                u64::try_from(ts.tv_sec).unwrap_or(0),
-                u32::try_from(ts.tv_nsec).unwrap_or(0),
-            )
-        };
+        let cpu_now = crate::test_util::cpu_now;
         let mut best = std::time::Duration::MAX;
         let mut last = f();
         for _ in 0..iters {
@@ -1050,15 +1039,7 @@ mod tests {
         a: &mut dyn FnMut(),
         b: &mut dyn FnMut(),
     ) -> (f64, f64) {
-        let cpu_now = || {
-            let mut ts = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            // SAFETY: clock_gettime only writes the timespec we hand it.
-            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
-            ts.tv_sec as f64 * 1e6 + ts.tv_nsec as f64 / 1e3
-        };
+        let cpu_now = crate::test_util::cpu_now_us;
         let mut best = (f64::MAX, f64::MAX);
         let time = |f: &mut dyn FnMut()| {
             let at = cpu_now();
