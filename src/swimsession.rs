@@ -559,6 +559,96 @@ impl SwimSession {
             }
         }
     }
+
+    /// Time-driven playback: the between-track gap, fades, the sleep
+    /// timer, resume, and the scrobble threshold.
+    pub fn pump_timers(&mut self, player: &dyn Player) {
+        // the between-track gap, same mechanism as wim's loop: mpv
+        // holds at each file's end under `keep-open` and pauses
+        // itself, and this waits the gap out before advancing.
+        self.between_tracks.step(
+            player,
+            self.playback.eof_reached,
+            self.play_queue.upcoming_len() > 0,
+            Instant::now(),
+        );
+
+        // Keep time-based playback behavior live even while the prompt
+        // is idle or a command is waiting for network results.
+        let now = self.start.elapsed();
+        if let Some(ramp) = self.fade {
+            let _ = player.set_volume_nowait(ramp.level_at(now));
+            if ramp.finished(now) {
+                self.fade = None;
+            }
+        }
+        if self.crossfade_enabled {
+            if let Some(started) = self.fade_in_started_at {
+                let span = config::crossfade_seconds(self.cfg.crossfade_seconds);
+                let t = (started.elapsed().as_secs_f64() / span).clamp(0.0, 1.0);
+                let _ = player.set_volume_nowait(self.base_volume * t);
+                if t >= 1.0 {
+                    self.fade_in_started_at = None;
+                }
+            } else if let (Some(elapsed), Some(duration)) = (
+                self.playback.elapsed_secs,
+                core::playing_duration(self.play_queue.current(), self.playback.duration_secs),
+            ) {
+                let span = config::crossfade_seconds(self.cfg.crossfade_seconds);
+                let remaining = duration - elapsed;
+                if remaining <= span {
+                    let _ = player
+                        .set_volume_nowait(self.base_volume * (remaining / span).clamp(0.0, 1.0));
+                }
+            }
+        }
+        if self.resume_due.is_some_and(|due| now >= due) {
+            self.resume_due = None;
+            let _ = player.set_pause(false);
+            self.console.note("resumed".to_string());
+        }
+        if let Some(due) = self.sleep_due {
+            let fade =
+                Duration::from_secs_f64(config::crossfade_seconds(self.cfg.crossfade_seconds));
+            match crate::shellsong_host::sleep_step(due, fade, self.base_volume, now) {
+                crate::shellsong_host::SleepStep::Waiting => {}
+                crate::shellsong_host::SleepStep::Fading(level) => {
+                    let _ = player.set_volume_nowait(level);
+                }
+                crate::shellsong_host::SleepStep::Expired => {
+                    self.sleep_due = None;
+                    if !self.playback.paused {
+                        let _ = player.toggle_pause();
+                    }
+                    let _ = player.set_volume(self.base_volume);
+                    self.notifications
+                        .push(Severity::Info, "sleep timer: paused");
+                    self.console.note("slept".to_string());
+                }
+            }
+        }
+        if !self.scrobble.scrobbled {
+            if let (Some(item), Some(elapsed), Some(duration)) = (
+                self.play_queue.current(),
+                self.playback.elapsed_secs,
+                self.playback.duration_secs,
+            ) {
+                if crate::listenbrainz::should_scrobble(&self.cfg.scrobble, elapsed, duration) {
+                    let listened_at = self
+                        .scrobble
+                        .started_unix
+                        .unwrap_or_else(crate::listenbrainz::now_unix);
+                    core::fire_scrobble(
+                        &self.cfg,
+                        item,
+                        listened_at,
+                        self.scrobble.failed_tx.as_ref(),
+                    );
+                    self.scrobble.scrobbled = true;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
