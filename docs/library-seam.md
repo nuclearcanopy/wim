@@ -64,9 +64,14 @@ this was chosen over the other two candidates:
   focus, and `go(browse row)` reads the browse view before starting a
   session from it. a queue drained afterwards reorders all of that.
 - **a generic `Host` trait with the core as an associated type.**
-  rejected because the core is not polymorphic; there is exactly one
-  player. the polymorphism is on the presentation side only, which is
-  where the trait belongs.
+  rejected because the core is not polymorphic over the *host*. the
+  polymorphism there is on the presentation side only, which is where
+  that trait belongs. the *player* is a separate seam: the core takes
+  a `&dyn Player` (src/player.rs), implemented by `mpv::Mpv` on
+  desktop and by `FakePlayer` in tests, so a mobile front-end can
+  supply its own engine. `dyn` rather than a generic because
+  `CoreCtx` is built per op from borrowed handles and a type
+  parameter would spread through every signature for nothing.
 
 ## what each front-end honours
 
