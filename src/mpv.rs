@@ -491,6 +491,61 @@ fn sweep_stale_sockets(dir: &Path) {
     }
 }
 
+/// Where the socket goes when there is no `$XDG_RUNTIME_DIR`.
+/// Linux keeps the plain temp dir it always used. Elsewhere on unix
+/// (macOS, the BSDs) that is shared, so use a private `wim-<uid>` under
+/// it, created 0700 and verified ours. If someone else owns that name
+/// this is an error: falling back to the shared dir would defeat it.
+fn fallback_sock_dir() -> Result<PathBuf> {
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let dir = private_sock_dir_path(&std::env::temp_dir(), uid);
+        ensure_private_dir(&dir, uid)
+            .with_context(|| format!("mpv socket directory {} is not usable", dir.display()))?;
+        return Ok(dir);
+    }
+    #[cfg(not(all(unix, not(target_os = "linux"))))]
+    Ok(std::env::temp_dir())
+}
+
+/// `<tmp>/wim-<uid>`.
+#[cfg(unix)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn private_sock_dir_path(tmp: &Path, uid: u32) -> PathBuf {
+    tmp.join(format!("wim-{uid}"))
+}
+
+/// A directory is usable as ours only if it is a real directory (not a
+/// symlink) owned by the current user.
+#[cfg(unix)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn dir_is_ours(is_real_dir: bool, owner: u32, me: u32) -> bool {
+    is_real_dir && owner == me
+}
+
+/// Create `dir` with mode 0700, or accept an existing one that is ours
+/// (tightening its mode). Refuses anything someone else made.
+#[cfg(unix)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn ensure_private_dir(dir: &Path, me: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !dir_is_ours(meta.is_dir(), meta.uid(), me) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "exists but is not a directory owned by this user",
+        ));
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
 /// Distinguishes two `Mpv`s spawned by the same process. The app only
 /// ever spawns one, but naming the socket by pid alone meant a second
 /// spawn deleted the first one's socket and both mpvs then answered on
@@ -502,10 +557,13 @@ impl Mpv {
     pub fn spawn() -> Result<Self> {
         // $XDG_RUNTIME_DIR is a private 0700 directory; a predictable name
         // in shared /tmp lets another local user squat the path.
-        let sock_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        let sock_dir = match std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .filter(|dir| dir.is_dir())
-            .unwrap_or_else(std::env::temp_dir);
+        {
+            Some(dir) => dir,
+            None => fallback_sock_dir()?,
+        };
         let seq = SPAWN_SEQ.fetch_add(1, Ordering::SeqCst);
         #[cfg(unix)]
         let sock_path = sock_dir.join(format!("wim-mpv-{}-{}.sock", std::process::id(), seq));
@@ -1656,6 +1714,46 @@ mod bench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_dir_is_per_uid_under_temp() {
+        assert_eq!(
+            private_sock_dir_path(Path::new("/tmp"), 501),
+            PathBuf::from("/tmp/wim-501")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_ownership_check_rejects_other_users_and_non_dirs() {
+        assert!(dir_is_ours(true, 501, 501));
+        assert!(!dir_is_ours(true, 0, 501));
+        assert!(!dir_is_ours(false, 501, 501));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_dir_is_created_0700_reused_and_foreign_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        let base = std::env::temp_dir().join(format!("wim-mpvdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = base.join("wim-x");
+        ensure_private_dir(&dir, me).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        ensure_private_dir(&dir, me).unwrap();
+        // as a different user the same directory is someone else's
+        assert!(ensure_private_dir(&dir, me + 1).is_err());
+        // a symlink is not a directory of ours
+        let link = base.join("wim-link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(ensure_private_dir(&link, me).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn gray_color_keeps_r_g_b_identical_regardless_of_input() {
