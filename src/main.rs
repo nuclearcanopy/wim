@@ -101,6 +101,18 @@ fn open_browse(
     let Some(opened) = loader.open(item) else {
         return;
     };
+    show_listing(opened, view, browse_art, focus, player_minimized);
+}
+
+/// The tail of `open_browse`, also used directly for a page that is
+/// already built.
+fn show_listing(
+    opened: browse::BrowseView,
+    view: &mut Option<browse::BrowseView>,
+    browse_art: &mut ProtocolCache,
+    focus: &mut Focus,
+    player_minimized: &mut bool,
+) {
     // the previous view's cover must not sit under the new title; the
     // new one is built when `Loader::poll` hands the image over.
     browse_art.clear();
@@ -109,19 +121,6 @@ fn open_browse(
     // maximized. Without minimizing here, a running video keeps covering
     // the very browse view we just focused, so Enter appears to do
     // nothing and its inline frames stay stuck over the workspace.
-    focus_open_browse(focus, player_minimized);
-}
-
-/// Same tail as `open_browse` for a page that is already built.
-fn show_listing(
-    opened: browse::BrowseView,
-    view: &mut Option<browse::BrowseView>,
-    browse_art: &mut ProtocolCache,
-    focus: &mut Focus,
-    player_minimized: &mut bool,
-) {
-    browse_art.clear();
-    *view = Some(opened);
     focus_open_browse(focus, player_minimized);
 }
 
