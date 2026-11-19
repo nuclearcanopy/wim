@@ -96,7 +96,7 @@ jobs:
         working-directory: ios/WimCore
         run: |
           device=$(xcrun simctl list devices available | grep -m1 'iPhone' | sed 's/^ *//; s/ (.*//')
-          xcodebuild test -scheme WimCore \
+          xcodebuild test -scheme WimCore-Package \
             -destination "platform=iOS Simulator,name=${device:-iPhone 16}" \
             CODE_SIGNING_ALLOWED=NO
       - name: build the app for the simulator
