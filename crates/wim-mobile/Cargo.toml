@@ -7,3 +7,21 @@ description = "UniFFI bindings exposing the shellswim session to iOS and Android
 
 [lib]
 name = "wim_mobile"
+# staticlib for iOS (xcframework), cdylib for Android (.so), lib for tests
+# and the example.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[features]
+# `uniffi-bindgen` generates the Swift and Kotlin sources from the built
+# library; only that binary needs the cli dependencies.
+cli = ["uniffi/cli"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[dependencies]
+wim = { path = "../.." }
+uniffi = "0.32"
+anyhow = "1"
