@@ -2,4 +2,8 @@
 # `paste` is unmaintained (no known vulnerability). It is a proc-macro
 # dependency of `lofty` (latest 0.25 still uses it) and runs only at build
 # time; nothing in the shipped binary calls it. Revisit when lofty drops it.
-ignore = ["RUSTSEC-2024-0436"]
+#
+# `basic-toml` is unmaintained (no known vulnerability). It is pulled in by
+# askama_derive 0.16 via uniffi's optional `cli` feature, i.e. only the
+# uniffi-bindgen tool, never the shipped binaries. Revisit on a uniffi bump.
+ignore = ["RUSTSEC-2024-0436", "RUSTSEC-2026-0374"]
