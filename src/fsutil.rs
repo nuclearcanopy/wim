@@ -59,7 +59,7 @@ fn write_replacing(target: &Path, contents: &[u8], mode: u32) -> Result<()> {
             .with_context(|| format!("writing {}", target.display()))?;
         file.write_all(contents)?;
         file.sync_all()?;
-        fs::rename(&temp, target).with_context(|| format!("replacing {}", target.display()))?;
+        rename_over(&temp, target).with_context(|| format!("replacing {}", target.display()))?;
         // the new file is already in place; a filesystem that cannot
         // fsync a directory must not turn that into a reported failure
         #[cfg(unix)]
@@ -72,6 +72,27 @@ fn write_replacing(target: &Path, contents: &[u8], mode: u32) -> Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// `fs::rename`, retried on Windows: a rename over a file that another
+/// thread or a scanner has open for a moment fails with a sharing
+/// violation or access denied, and succeeds a few milliseconds later.
+fn rename_over(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut tries = 0;
+        loop {
+            match fs::rename(from, to) {
+                Err(e) if tries < 100 && matches!(e.raw_os_error(), Some(5 | 32)) => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                other => return other,
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    fs::rename(from, to)
 }
 
 /// An exclusive advisory lock on `<path>.lock`, released on drop. Taken
@@ -109,7 +130,32 @@ impl FileLock {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let mut lock = path.as_os_str().to_owned();
+            lock.push(".lock");
+            let lock = PathBuf::from(lock);
+            // share_mode(0) makes the open itself exclusive: a second
+            // opener gets a sharing violation until the holder drops.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                match fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .share_mode(0)
+                    .open(&lock)
+                {
+                    Ok(file) => return FileLock(Some(file)),
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return FileLock(None),
+                }
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = path;
             FileLock(None)
