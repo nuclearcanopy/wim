@@ -35,7 +35,6 @@ use wim::cli;
 mod host;
 mod nav_ui;
 mod settings;
-mod surface;
 mod torbox_ui;
 
 use cli::{Cli, Run};
@@ -168,7 +167,7 @@ fn prompt() -> anyhow::Result<()> {
     torbox.spoilers_revealed = host.cfg.watch_reveal_spoilers;
     let mut torbox_open = false;
     let mut nav: Option<wim::navmanager::NavManager> = None;
-    let mut list_view: Option<(surface::ListWorkspace, usize)> = None;
+    let mut list_view: Option<(wim::swimsurface::ListWorkspace, usize)> = None;
     let mut observing = Some(host.begin_player_setup());
     let mut player_observed = false;
     let mut cache_ready = false;
@@ -1033,7 +1032,7 @@ struct Screen<'a> {
     keybinds_refused: Option<&'a str>,
     eq: Option<EqScreen<'a>>,
     settings: Option<(&'a [String], usize)>,
-    list: Option<(&'a surface::ListWorkspace, usize)>,
+    list: Option<(&'a wim::swimsurface::ListWorkspace, usize)>,
     undo: Option<&'a [wim::undo::Row<'a>]>,
     watch: Option<&'a wim::watch_workspace::Workspace>,
     torbox: Option<&'a wim::torbox_workspace::Workspace>,

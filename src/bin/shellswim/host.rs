@@ -71,7 +71,7 @@ use wim::shellsong_host::{CorpusCandidates, Ramp, SearchSettle};
 use wim::ui::results_list::label;
 use wim::{app, cache, config, favorites, library, lyrics, mpv, search};
 
-use crate::surface::SwimSurface;
+use wim::swimsurface::SwimSurface;
 
 /// How long a one-shot waits for a command that is still resolving a
 /// name against a server. The language times its own await out at 8s;
@@ -929,7 +929,7 @@ impl Host {
                         for track in &tracks {
                             core.console.note(wim::ui::results_list::label(track));
                         }
-                        self.swim.list_requested = Some(crate::surface::ListWorkspace {
+                        self.swim.list_requested = Some(wim::swimsurface::ListWorkspace {
                             title: label.clone(),
                             rows: tracks
                                 .into_iter()

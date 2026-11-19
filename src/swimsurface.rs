@@ -6,11 +6,11 @@
 //! and `view(eq)` saying where the eq lives are very different
 //! answers, and only one of them is true. See docs/library-seam.md.
 
-use wim::core;
-use wim::core::{op_fail, op_note, CoreCtx, Dispatch, Report, SelectStep, Surface};
-use wim::search::SearchItem;
-use wim::shellsong::{Op, Program, ViewTarget};
-use wim::ui::results_list::label;
+use crate::core;
+use crate::core::{op_fail, op_note, CoreCtx, Dispatch, Report, SelectStep, Surface};
+use crate::search::SearchItem;
+use crate::shellsong::{Op, Program, ViewTarget};
+use crate::ui::results_list::label;
 
 /// A printed list that the prompt can also open as a workspace, where
 /// enter plays and `a` queues the selected row.
@@ -112,12 +112,12 @@ impl Surface for Borrowed<'_> {
             ViewTarget::Settings => self.print_settings(core),
             ViewTarget::Keybinds => {
                 self.state.keybinds_requested = true;
-                let keymap = wim::keymap::Keymap::from_overrides(&core.cfg.keybinds);
-                for action in wim::keymap::ALL_ACTIONS {
+                let keymap = crate::keymap::Keymap::from_overrides(&core.cfg.keybinds);
+                for action in crate::keymap::ALL_ACTIONS {
                     core.console.note(format!(
                         "{:>24}  {}",
                         action.label(),
-                        wim::keymap::key_label(keymap.get(*action))
+                        crate::keymap::key_label(keymap.get(*action))
                     ));
                 }
                 op_note("keybinds · K opens the editor".to_owned())
@@ -213,19 +213,19 @@ impl Borrowed<'_> {
 
     fn print_suggestions(&mut self, core: &mut CoreCtx) -> (Dispatch, Report) {
         let starred = core::suggestion_starred_keys(core.remote_starred, core.favorites);
-        let catalog = wim::suggest::Catalog::from_corpus(&core.app.corpus);
+        let catalog = crate::suggest::Catalog::from_corpus(&core.app.corpus);
         let cache = core
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let suggestions = wim::suggest::suggest(&wim::suggest::Request::new(
+        let suggestions = crate::suggest::suggest(&crate::suggest::Request::new(
             &catalog,
             &cache,
             &starred,
-            wim::cache::now_secs(),
+            crate::cache::now_secs(),
         ));
         drop(cache);
-        let count = wim::ui::suggestions::count(&suggestions);
+        let count = crate::ui::suggestions::count(&suggestions);
         if count == 0 {
             let reason = if core.app.corpus.is_empty() {
                 if core.app.scanning_library || core.app.syncing_servers {
@@ -262,17 +262,17 @@ impl Borrowed<'_> {
         let source = core
             .app
             .eq_source
-            .and_then(|source| wim::eq::source_name(source, &core.cfg.eq_custom_presets))
+            .and_then(|source| crate::eq::source_name(source, &core.cfg.eq_custom_presets))
             .unwrap_or("custom curve");
         core.console.note(format!(
             "equalizer: {} · {}",
             if core.cfg.eq_enabled { "on" } else { "off" },
             source
         ));
-        for (hz, gain) in wim::eq::BAND_HZ.iter().zip(core.app.eq_gains) {
+        for (hz, gain) in crate::eq::BAND_HZ.iter().zip(core.app.eq_gains) {
             core.console.note(format!("{hz:>5.0} Hz  {gain:+.1} dB"));
         }
-        let presets = wim::eq::PRESETS
+        let presets = crate::eq::PRESETS
             .iter()
             .map(|preset| preset.name)
             .chain(
@@ -494,7 +494,7 @@ mod tests {
 #[cfg(test)]
 mod queued_program {
     use super::*;
-    use wim::shellsong::{Level, Op};
+    use crate::shellsong::{Level, Op};
 
     /// The gap this closed: the default implementation drops the ops,
     /// and by the time it is called `identity_settings` has already
