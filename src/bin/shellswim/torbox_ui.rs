@@ -10,7 +10,7 @@ use crate::host::Host;
 
 pub fn open(host: &Host, tb: &mut Workspace) {
     if !tb.is_configured() {
-        tb.begin_setup(host.cfg.torbox_token_file.as_deref());
+        tb.begin_setup(host.session.cfg.torbox_token_file.as_deref());
     } else if tb.page == Page::Search {
         tb.begin_search_edit();
     }
@@ -35,8 +35,8 @@ pub fn paste(tb: &mut Workspace, text: &str) -> bool {
 pub fn poll(host: &mut Host, tb: &mut Workspace) {
     tb.poll();
     if let Some(path) = tb.take_configured_path() {
-        host.cfg.torbox_token_file = Some(path);
-        config::save_or_warn(&host.cfg, &mut host.notifications);
+        host.session.cfg.torbox_token_file = Some(path);
+        config::save_or_warn(&host.session.cfg, &mut host.notifications);
     }
     let _ = tb.take_setup_error();
 }
@@ -66,9 +66,9 @@ pub fn key(host: &mut Host, tb: &mut Workspace, open: &mut bool, code: KeyCode) 
             tb.spoilers_revealed = !tb.spoilers_revealed
         }
         KeyCode::Char('V') if tb.page != Page::Setup && !editing => {
-            host.cfg.watch_reveal_spoilers = !host.cfg.watch_reveal_spoilers;
-            tb.spoilers_revealed = host.cfg.watch_reveal_spoilers;
-            config::save_or_warn(&host.cfg, &mut host.notifications);
+            host.session.cfg.watch_reveal_spoilers = !host.session.cfg.watch_reveal_spoilers;
+            tb.spoilers_revealed = host.session.cfg.watch_reveal_spoilers;
+            config::save_or_warn(&host.session.cfg, &mut host.notifications);
         }
         KeyCode::Esc if tb.page == Page::Setup => tb.page = Page::Search,
         KeyCode::Esc if editing => tb.search_editing = false,
@@ -84,7 +84,7 @@ pub fn key(host: &mut Host, tb: &mut Workspace, open: &mut bool, code: KeyCode) 
         }
         KeyCode::Enter if editing => tb.search(),
         KeyCode::Char('/') if tb.page == Page::Search => tb.begin_search_edit(),
-        KeyCode::Char('c') => tb.begin_setup(host.cfg.torbox_token_file.as_deref()),
+        KeyCode::Char('c') => tb.begin_setup(host.session.cfg.torbox_token_file.as_deref()),
         KeyCode::Char('s') if tb.page != Page::Search => tb.begin_search_edit(),
         KeyCode::Up | KeyCode::Char('k') => tb.move_selection(-1),
         KeyCode::Down | KeyCode::Char('j') => tb.move_selection(1),

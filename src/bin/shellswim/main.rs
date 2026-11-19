@@ -95,9 +95,9 @@ fn oneshot(cli: &Cli) -> anyhow::Result<()> {
         _ => Vec::new(),
     };
     let mut host = Host::start()?;
-    host.wait_startup_cache()?;
+    host.session.wait_startup_cache()?;
     host.apply_player_setup_blocking();
-    host.wait_startup_catalog();
+    host.session.wait_startup_catalog();
     wim::trace_mark!("host ready (no terminal)");
     let failed = host.run_lines(&lines);
     for line in &host.session.console.lines {
@@ -119,16 +119,16 @@ fn oneshot(cli: &Cli) -> anyhow::Result<()> {
 
 fn prompt() -> anyhow::Result<()> {
     let mut host = Host::start()?;
-    anim::init_reduced_motion(host.cfg.reduced_motion);
+    anim::init_reduced_motion(host.session.cfg.reduced_motion);
     host.interactive_prompt = true;
     let mut lyrics_setup = host.first_run.then(|| LyricsSetup {
-        providers: host.cfg.lyrics.providers.clone(),
+        providers: host.session.cfg.lyrics.providers.clone(),
         key_file: String::new(),
     });
     // a brand-new install with nowhere to read music from is offered the
     // server form as soon as the lyrics choice is out of the way.
     let mut offer_servers =
-        host.cfg.library_paths.is_empty() && host.cfg.navidrome_servers.is_empty();
+        host.session.cfg.library_paths.is_empty() && host.session.cfg.navidrome_servers.is_empty();
 
     // the display's refresh rate decides how often the scrubber is
     // sampled, never how fast anything runs; one subprocess on a
@@ -143,8 +143,8 @@ fn prompt() -> anyhow::Result<()> {
     let mut guard = term::TerminalGuard::new(false)?;
     wim::trace_mark!("terminal ready");
 
-    let mut keymap = Keymap::from_overrides(&host.cfg.keybinds);
-    banner(&mut host.session.console, &host.cfg, &keymap);
+    let mut keymap = Keymap::from_overrides(&host.session.cfg.keybinds);
+    banner(&mut host.session.console, &host.session.cfg, &keymap);
     let mut first_frame = true;
     let mut queue_open = false;
     let mut queue_selected = 0usize;
@@ -158,13 +158,13 @@ fn prompt() -> anyhow::Result<()> {
     let mut settings_state = settings::SettingsState::default();
     let mut undo_open = false;
     let mut watch = wim::watch_workspace::Workspace::new();
-    watch.spoilers_revealed = host.cfg.watch_reveal_spoilers;
+    watch.spoilers_revealed = host.session.cfg.watch_reveal_spoilers;
     let mut watch_open = false;
     let mut torbox = wim::torbox_workspace::Workspace::new(
-        wim::torbox::Client::from_config(&host.cfg)
+        wim::torbox::Client::from_config(&host.session.cfg)
             .map_err(|_| "TorBox is not configured".to_string()),
     );
-    torbox.spoilers_revealed = host.cfg.watch_reveal_spoilers;
+    torbox.spoilers_revealed = host.session.cfg.watch_reveal_spoilers;
     let mut torbox_open = false;
     let mut nav: Option<wim::navmanager::NavManager> = None;
     let mut list_view: Option<(wim::swimsurface::ListWorkspace, usize)> = None;
@@ -198,7 +198,7 @@ fn prompt() -> anyhow::Result<()> {
             }
         }
         if !first_frame && !cache_ready && !cache_failed {
-            match host.poll_startup_cache() {
+            match host.session.poll_startup_cache() {
                 Ok(ready) => cache_ready = ready,
                 Err(error) => {
                     host.session.console.error = Some(error.to_string());
@@ -211,7 +211,7 @@ fn prompt() -> anyhow::Result<()> {
         if player_ready {
             host.pump();
         } else if !first_frame {
-            host.pump_library();
+            host.session.pump_library();
         }
         if let Ok(budget) = frame_rx.try_recv() {
             frame = budget;
@@ -220,7 +220,7 @@ fn prompt() -> anyhow::Result<()> {
         // never blocks: a command that searches suspends on
         // `AwaitResults` and resumes on a later frame, once the
         // results for its query have settled.
-        if player_ready && !host.app.loading_cached_catalog && host.step() == Drive::Quit {
+        if player_ready && !host.session.app.loading_cached_catalog && host.step() == Drive::Quit {
             break;
         }
         if std::mem::take(&mut host.session.swim.keybinds_requested) && host.interactive_prompt {
@@ -229,7 +229,10 @@ fn prompt() -> anyhow::Result<()> {
             keybinds_refused = None;
         }
         if std::mem::take(&mut host.session.swim.eq_requested) && host.interactive_prompt {
-            eq_menu.open(host.app.eq_source, host.cfg.eq_custom_presets.len());
+            eq_menu.open(
+                host.session.app.eq_source,
+                host.session.cfg.eq_custom_presets.len(),
+            );
         }
 
         if let Some(list) = host.session.swim.list_requested.take() {
@@ -284,7 +287,7 @@ fn prompt() -> anyhow::Result<()> {
                     (&host.lyrics_pane, active)
                 }),
                 setup: lyrics_setup.as_ref(),
-                subtitles: &host.cfg.subtitles,
+                subtitles: &host.session.cfg.subtitles,
                 queue_open,
                 queue_selected,
                 keymap: &keymap,
@@ -299,16 +302,16 @@ fn prompt() -> anyhow::Result<()> {
                 torbox: torbox_open.then_some(&torbox),
                 nav: nav
                     .as_ref()
-                    .map(|nm| (nm, host.cfg.navidrome_servers.as_slice())),
+                    .map(|nm| (nm, host.session.cfg.navidrome_servers.as_slice())),
                 list: list_view.as_ref().map(|(list, selected)| (list, *selected)),
                 settings: settings_values
                     .as_deref()
                     .map(|values| (values, settings_state.selected)),
                 eq: eq_menu.is_open().then(|| EqScreen {
-                    gains: &host.app.eq_gains,
-                    saved: &host.cfg.eq_custom_presets,
-                    source: host.app.eq_source,
-                    modified: host.app.eq_custom,
+                    gains: &host.session.app.eq_gains,
+                    saved: &host.session.cfg.eq_custom_presets,
+                    source: host.session.app.eq_source,
+                    modified: host.session.app.eq_custom,
                     selected: eq_menu.selected(),
                     state: eq_menu.state(),
                 }),
@@ -336,9 +339,9 @@ fn prompt() -> anyhow::Result<()> {
             || host.has_program_work()
             || host.session.console.cycle().is_some()
             || (now_playing.is_some() && !host.playback.paused);
-        let timeout = if host.has_cached_rows_pending() {
+        let timeout = if host.session.has_cached_rows_pending() {
             Duration::from_micros(1)
-        } else if !player_ready || host.app.loading_cached_catalog {
+        } else if !player_ready || host.session.app.loading_cached_catalog {
             Duration::from_millis(5)
         } else if animating {
             anim::animation_wait(frame)
@@ -402,14 +405,15 @@ fn prompt() -> anyhow::Result<()> {
                             setup.key_file.pop();
                         }
                         KeyCode::Enter => {
-                            host.cfg.lyrics.providers = setup.providers.clone();
+                            host.session.cfg.lyrics.providers = setup.providers.clone();
                             if !setup.key_file.trim().is_empty() {
-                                host.cfg
+                                host.session
+                                    .cfg
                                     .lyrics
                                     .api_key_files
                                     .insert("musixmatch".into(), setup.key_file.trim().to_owned());
                             }
-                            match config::save(&host.cfg) {
+                            match config::save(&host.session.cfg) {
                                 Ok(()) => {
                                     host.session.console.note("lyrics setup saved".to_owned())
                                 }
@@ -418,8 +422,8 @@ fn prompt() -> anyhow::Result<()> {
                                 }
                             }
                             host.lyrics_client = wim::lyrics::Client::with_providers(
-                                host.cfg.lyrics.providers.clone(),
-                                host.cfg.resolve_lyrics_api_keys(),
+                                host.session.cfg.lyrics.providers.clone(),
+                                host.session.cfg.resolve_lyrics_api_keys(),
                             );
                             host.first_run = false;
                             lyrics_setup = None;
@@ -446,7 +450,7 @@ fn prompt() -> anyhow::Result<()> {
                         || key.code == prompt_key(&keymap, KeyAction::OpenSubtitleMenu)
                     {
                         subtitle_menu_open = false;
-                        if let Err(error) = config::save(&host.cfg) {
+                        if let Err(error) = config::save(&host.session.cfg) {
                             host.session
                                 .console
                                 .fail(format!("saving subtitle settings: {error}"));
@@ -487,12 +491,12 @@ fn prompt() -> anyhow::Result<()> {
                             },
                             KeyCode::Char('h') | KeyCode::Left => {
                                 adjust_subtitle_field(
-                                    &mut host.cfg.subtitles,
+                                    &mut host.session.cfg.subtitles,
                                     subtitle_menu_selected,
                                     -1.0,
                                 );
-                                host.player.set_subtitle_style(&host.cfg.subtitles);
-                                if let Err(error) = config::save(&host.cfg) {
+                                host.player.set_subtitle_style(&host.session.cfg.subtitles);
+                                if let Err(error) = config::save(&host.session.cfg) {
                                     host.session
                                         .console
                                         .fail(format!("saving subtitle settings: {error}"));
@@ -500,12 +504,12 @@ fn prompt() -> anyhow::Result<()> {
                             }
                             KeyCode::Char('l') | KeyCode::Right => {
                                 adjust_subtitle_field(
-                                    &mut host.cfg.subtitles,
+                                    &mut host.session.cfg.subtitles,
                                     subtitle_menu_selected,
                                     1.0,
                                 );
-                                host.player.set_subtitle_style(&host.cfg.subtitles);
-                                if let Err(error) = config::save(&host.cfg) {
+                                host.player.set_subtitle_style(&host.session.cfg.subtitles);
+                                if let Err(error) = config::save(&host.session.cfg) {
                                     host.session
                                         .console
                                         .fail(format!("saving subtitle settings: {error}"));
@@ -531,8 +535,8 @@ fn prompt() -> anyhow::Result<()> {
                     if watch.confirm_torrent_add {
                         match key.code {
                             KeyCode::Char('y' | 'Y') => {
-                                let client =
-                                    wim::torbox::Client::from_config(&host.cfg).map_err(|_| {
+                                let client = wim::torbox::Client::from_config(&host.session.cfg)
+                                    .map_err(|_| {
                                         "configure torbox_token_file before adding a torrent"
                                             .to_owned()
                                     });
@@ -562,10 +566,11 @@ fn prompt() -> anyhow::Result<()> {
                             watch.spoilers_revealed = !watch.spoilers_revealed
                         }
                         KeyCode::Char('R') if watch.page != Page::Search => {
-                            host.cfg.watch_reveal_spoilers = !host.cfg.watch_reveal_spoilers;
-                            watch.spoilers_revealed = host.cfg.watch_reveal_spoilers;
-                            config::save_or_warn(&host.cfg, &mut host.notifications);
-                            watch.message = Some(if host.cfg.watch_reveal_spoilers {
+                            host.session.cfg.watch_reveal_spoilers =
+                                !host.session.cfg.watch_reveal_spoilers;
+                            watch.spoilers_revealed = host.session.cfg.watch_reveal_spoilers;
+                            config::save_or_warn(&host.session.cfg, &mut host.notifications);
+                            watch.message = Some(if host.session.cfg.watch_reveal_spoilers {
                                 "episode spoilers will be shown by default".into()
                             } else {
                                 "episode spoilers are hidden by default".into()
@@ -661,56 +666,72 @@ fn prompt() -> anyhow::Result<()> {
                         if let Some(mode) = eq_menu_editor_key(
                             key.code,
                             eq_menu.state_mut(),
-                            &mut host.cfg.eq_custom_presets,
-                            &mut host.app,
+                            &mut host.session.cfg.eq_custom_presets,
+                            &mut host.session.app,
                         ) {
-                            persist_eq(&mut host.cfg, &host.app, &mut host.notifications);
+                            persist_eq(
+                                &mut host.session.cfg,
+                                &host.session.app,
+                                &mut host.notifications,
+                            );
                             eq_menu.set_selected(match mode {
                                 eqm::EditorMode::Save => eqm::opening_selection(
-                                    host.app.eq_source,
-                                    host.cfg.eq_custom_presets.len(),
+                                    host.session.app.eq_source,
+                                    host.session.cfg.eq_custom_presets.len(),
                                 ),
                                 eqm::EditorMode::Rename(i) => eqm::PRESET_COUNT + i,
                             });
                         }
                         continue;
                     }
-                    let saved_len = host.cfg.eq_custom_presets.len();
+                    let saved_len = host.session.cfg.eq_custom_presets.len();
                     let at = eq_menu.cursor(saved_len);
                     if key.code != eqm::DELETE_KEY {
                         eq_menu.state_mut().disarm_delete();
                     }
                     if key.code == KeyCode::Esc {
                         eq_menu.close();
-                        persist_eq(&mut host.cfg, &host.app, &mut host.notifications);
+                        persist_eq(
+                            &mut host.session.cfg,
+                            &host.session.app,
+                            &mut host.notifications,
+                        );
                     } else if key.code == eqm::SAVE_KEY {
                         eq_menu.state_mut().editor = Some(eqm::NameEditor::save());
                         eq_menu.state_mut().message.clear();
                     } else if key.code == eqm::RENAME_KEY {
                         if let eqm::Cursor::Saved(i) = at {
-                            let current = host.cfg.eq_custom_presets.name_at(i).unwrap_or("");
+                            let current =
+                                host.session.cfg.eq_custom_presets.name_at(i).unwrap_or("");
                             eq_menu.state_mut().editor = Some(eqm::NameEditor::rename(i, current));
                             eq_menu.state_mut().message.clear();
                         } else {
-                            eq_menu.state_mut().message = eq_saved_row_hint(&host.cfg, "rename");
+                            eq_menu.state_mut().message =
+                                eq_saved_row_hint(&host.session.cfg, "rename");
                         }
                     } else if key.code == eqm::DELETE_KEY {
                         if let eqm::Cursor::Saved(i) = at {
                             let name = host
+                                .session
                                 .cfg
                                 .eq_custom_presets
                                 .name_at(i)
                                 .unwrap_or_default()
                                 .to_string();
                             if eq_menu.state_mut().delete.press(i) {
-                                host.cfg.eq_custom_presets.remove(i);
-                                host.app.eq_source =
-                                    wim::eq::source_after_removal(host.app.eq_source, i);
-                                host.app.eq_custom =
-                                    host.app.eq_source.is_some() && host.app.eq_custom;
-                                persist_eq(&mut host.cfg, &host.app, &mut host.notifications);
+                                host.session.cfg.eq_custom_presets.remove(i);
+                                host.session.app.eq_source =
+                                    wim::eq::source_after_removal(host.session.app.eq_source, i);
+                                host.session.app.eq_custom = host.session.app.eq_source.is_some()
+                                    && host.session.app.eq_custom;
+                                persist_eq(
+                                    &mut host.session.cfg,
+                                    &host.session.app,
+                                    &mut host.notifications,
+                                );
                                 eq_menu.set_selected(eq_menu.selected().min(
-                                    eqm::selectable_count(host.cfg.eq_custom_presets.len()) - 1,
+                                    eqm::selectable_count(host.session.cfg.eq_custom_presets.len())
+                                        - 1,
                                 ));
                                 eq_menu.state_mut().message = format!("deleted '{name}'");
                             } else {
@@ -720,11 +741,12 @@ fn prompt() -> anyhow::Result<()> {
                                 );
                             }
                         } else {
-                            eq_menu.state_mut().message = eq_saved_row_hint(&host.cfg, "delete");
+                            eq_menu.state_mut().message =
+                                eq_saved_row_hint(&host.session.cfg, "delete");
                         }
                     } else {
-                        let bands = host.cfg.visualizer_bands as usize;
-                        let enabled = host.cfg.eq_enabled;
+                        let bands = host.session.cfg.visualizer_bands as usize;
+                        let enabled = host.session.cfg.eq_enabled;
                         match key.code {
                             KeyCode::Char('j') | KeyCode::Down => eq_menu.set_selected(
                                 (eq_menu.selected() + 1).min(eqm::selectable_count(saved_len) - 1),
@@ -733,10 +755,10 @@ fn prompt() -> anyhow::Result<()> {
                                 eq_menu.set_selected(eq_menu.selected().saturating_sub(1))
                             }
                             KeyCode::Enter => core::apply_eq_row(
-                                &mut host.app,
+                                &mut host.session.app,
                                 &host.player,
                                 &mut host.notifications,
-                                &host.cfg.eq_custom_presets,
+                                &host.session.cfg.eq_custom_presets,
                                 eq_menu.selected(),
                                 enabled,
                                 bands,
@@ -750,7 +772,7 @@ fn prompt() -> anyhow::Result<()> {
                                 };
                                 if let eqm::Cursor::Band(band) = at {
                                     adjust_eq_band(
-                                        &mut host.app,
+                                        &mut host.session.app,
                                         &host.player,
                                         &mut host.notifications,
                                         band,
@@ -775,8 +797,8 @@ fn prompt() -> anyhow::Result<()> {
                             keybinds_refused = keymap.refusal(action, key.code);
                             if keybinds_refused.is_none() {
                                 keymap.set(action, key.code);
-                                host.cfg.keybinds = keymap.overrides();
-                                if let Err(error) = config::save(&host.cfg) {
+                                host.session.cfg.keybinds = keymap.overrides();
+                                if let Err(error) = config::save(&host.session.cfg) {
                                     host.session
                                         .console
                                         .fail(format!("saving keybinds: {error}"));
@@ -801,8 +823,8 @@ fn prompt() -> anyhow::Result<()> {
                             }
                             KeyCode::Char('0') => {
                                 keymap.reset(ALL_ACTIONS[keybinds_selected]);
-                                host.cfg.keybinds = keymap.overrides();
-                                if let Err(error) = config::save(&host.cfg) {
+                                host.session.cfg.keybinds = keymap.overrides();
+                                if let Err(error) = config::save(&host.session.cfg) {
                                     host.session
                                         .console
                                         .fail(format!("saving keybinds: {error}"));
@@ -810,8 +832,8 @@ fn prompt() -> anyhow::Result<()> {
                             }
                             KeyCode::Char('R') => {
                                 keymap.reset_all();
-                                host.cfg.keybinds = keymap.overrides();
-                                if let Err(error) = config::save(&host.cfg) {
+                                host.session.cfg.keybinds = keymap.overrides();
+                                if let Err(error) = config::save(&host.session.cfg) {
                                     host.session
                                         .console
                                         .fail(format!("saving keybinds: {error}"));
@@ -916,13 +938,13 @@ fn prompt() -> anyhow::Result<()> {
                 }
                 if key.code == KeyCode::Char('T') && host.session.console.input.is_empty() {
                     torbox_open = true;
-                    torbox.spoilers_revealed = host.cfg.watch_reveal_spoilers;
+                    torbox.spoilers_revealed = host.session.cfg.watch_reveal_spoilers;
                     torbox_ui::open(&host, &mut torbox);
                     continue;
                 }
                 if key.code == KeyCode::Char('W') && host.session.console.input.is_empty() {
                     watch_open = true;
-                    watch.spoilers_revealed = host.cfg.watch_reveal_spoilers;
+                    watch.spoilers_revealed = host.session.cfg.watch_reveal_spoilers;
                     if !watch.is_configured() && !watch.loading {
                         match std::env::var("WIM_STREMIO_ADDON_URL") {
                             Ok(url) if !url.trim().is_empty() => watch.configure(url),
@@ -939,7 +961,10 @@ fn prompt() -> anyhow::Result<()> {
                     continue;
                 }
                 if key.code == KeyCode::Char('E') && host.session.console.input.is_empty() {
-                    eq_menu.open(host.app.eq_source, host.cfg.eq_custom_presets.len());
+                    eq_menu.open(
+                        host.session.app.eq_source,
+                        host.session.cfg.eq_custom_presets.len(),
+                    );
                     continue;
                 }
                 if key.code == KeyCode::Char('K') && host.session.console.input.is_empty() {

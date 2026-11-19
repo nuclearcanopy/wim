@@ -21,7 +21,7 @@ pub struct SettingsState {
 }
 
 pub fn values(host: &Host, state: &SettingsState) -> Vec<String> {
-    let cfg = &host.cfg;
+    let cfg = &host.session.cfg;
     FIELDS
         .iter()
         .map(|field| match field {
@@ -86,7 +86,8 @@ fn on_off(value: bool) -> String {
 }
 
 fn downloaded_count(host: &Host) -> usize {
-    host.cache_index
+    host.session
+        .cache_index
         .lock()
         .ok()
         .map(|index| index.download_manifest().count())
@@ -94,14 +95,14 @@ fn downloaded_count(host: &Host) -> usize {
 }
 
 fn save(host: &mut Host) {
-    config::save_or_warn(&host.cfg, &mut host.notifications);
+    config::save_or_warn(&host.session.cfg, &mut host.notifications);
 }
 
 fn warn_low_quality(host: &mut Host) {
-    if host.cfg.offline_download_format != "flac"
-        && host.cfg.effective_offline_download_bitrate_kbps() <= 96
+    if host.session.cfg.offline_download_format != "flac"
+        && host.session.cfg.effective_offline_download_bitrate_kbps() <= 96
     {
-        let kbps = host.cfg.effective_offline_download_bitrate_kbps();
+        let kbps = host.session.cfg.effective_offline_download_bitrate_kbps();
         host.notifications.push(
             Severity::Alert,
             format!("low audio quality: offline downloads at {kbps} kbps"),
@@ -111,7 +112,7 @@ fn warn_low_quality(host: &mut Host) {
 
 fn set_filter(host: &mut Host, enabled: bool, bands: u8) -> bool {
     match host.player.set_af(&eq::build_player_af_filter(
-        &host.app.eq_gains,
+        &host.session.app.eq_gains,
         enabled,
         bands as usize,
     )) {
@@ -129,21 +130,21 @@ fn adjust(host: &mut Host, field: Field, forward: bool) {
     let sign = if forward { 1.0 } else { -1.0 };
     match field {
         Field::EqEnabled => {
-            if forward != host.cfg.eq_enabled
-                && set_filter(host, forward, host.cfg.visualizer_bands)
+            if forward != host.session.cfg.eq_enabled
+                && set_filter(host, forward, host.session.cfg.visualizer_bands)
             {
-                host.cfg.eq_enabled = forward;
+                host.session.cfg.eq_enabled = forward;
                 save(host);
             }
         }
         Field::VisualizerBands => {
             let bands = if forward {
-                (host.cfg.visualizer_bands + 1).min(32)
+                (host.session.cfg.visualizer_bands + 1).min(32)
             } else {
-                host.cfg.visualizer_bands.saturating_sub(1).max(4)
+                host.session.cfg.visualizer_bands.saturating_sub(1).max(4)
             };
-            if set_filter(host, host.cfg.eq_enabled, bands) {
-                host.cfg.visualizer_bands = bands;
+            if set_filter(host, host.session.cfg.eq_enabled, bands) {
+                host.session.cfg.visualizer_bands = bands;
                 save(host);
             }
         }
@@ -155,52 +156,61 @@ fn adjust(host: &mut Host, field: Field, forward: bool) {
             }
         }
         Field::CrossfadeSeconds => {
-            host.cfg.crossfade_seconds =
-                config::crossfade_seconds(host.cfg.crossfade_seconds + sign * 0.5);
+            host.session.cfg.crossfade_seconds =
+                config::crossfade_seconds(host.session.cfg.crossfade_seconds + sign * 0.5);
         }
         Field::CacheDaysThreshold => {
-            host.cfg.cache_days_threshold = if forward {
-                (host.cfg.cache_days_threshold + 1).min(20)
+            host.session.cfg.cache_days_threshold = if forward {
+                (host.session.cfg.cache_days_threshold + 1).min(20)
             } else {
-                host.cfg.cache_days_threshold.saturating_sub(1).max(1)
+                host.session
+                    .cfg
+                    .cache_days_threshold
+                    .saturating_sub(1)
+                    .max(1)
             };
         }
         Field::CacheEvictionDays => {
-            host.cfg.cache_eviction_days = if forward {
-                (host.cfg.cache_eviction_days + 1).min(90)
+            host.session.cfg.cache_eviction_days = if forward {
+                (host.session.cfg.cache_eviction_days + 1).min(90)
             } else {
-                host.cfg.cache_eviction_days.saturating_sub(1).max(1)
+                host.session
+                    .cfg
+                    .cache_eviction_days
+                    .saturating_sub(1)
+                    .max(1)
             };
         }
         Field::OfflineCacheBudget => {
-            host.cfg.offline_cache_max_bytes = if forward {
-                (host.cfg.offline_cache_max_bytes + 1_000_000_000).min(100_000_000_000)
+            host.session.cfg.offline_cache_max_bytes = if forward {
+                (host.session.cfg.offline_cache_max_bytes + 1_000_000_000).min(100_000_000_000)
             } else {
-                host.cfg
+                host.session
+                    .cfg
                     .offline_cache_max_bytes
                     .saturating_sub(1_000_000_000)
                     .max(1_000_000_000)
             };
-            wim::cache::initialize_budget(host.cfg.offline_cache_max_bytes);
+            wim::cache::initialize_budget(host.session.cfg.offline_cache_max_bytes);
             warn_low_quality(host);
         }
         Field::OfflineDownloadBitrate => {
-            host.cfg.offline_download_bitrate_kbps =
-                next_bitrate(host.cfg.offline_download_bitrate_kbps, forward);
+            host.session.cfg.offline_download_bitrate_kbps =
+                next_bitrate(host.session.cfg.offline_download_bitrate_kbps, forward);
             warn_low_quality(host);
         }
         Field::OfflineDownloadFormat => {
-            host.cfg.offline_download_format =
-                next_format(&host.cfg.offline_download_format, forward).into();
+            host.session.cfg.offline_download_format =
+                next_format(&host.session.cfg.offline_download_format, forward).into();
             warn_low_quality(host);
         }
         Field::ScrobblePercent => {
-            host.cfg.scrobble.threshold_percent =
-                (host.cfg.scrobble.threshold_percent + sign * 5.0).clamp(5.0, 100.0);
+            host.session.cfg.scrobble.threshold_percent =
+                (host.session.cfg.scrobble.threshold_percent + sign * 5.0).clamp(5.0, 100.0);
         }
         Field::ScrobbleSeconds => {
-            host.cfg.scrobble.threshold_seconds =
-                (host.cfg.scrobble.threshold_seconds + sign * 15.0).clamp(15.0, 600.0);
+            host.session.cfg.scrobble.threshold_seconds =
+                (host.session.cfg.scrobble.threshold_seconds + sign * 15.0).clamp(15.0, 600.0);
         }
         Field::AlbumArt
         | Field::RebuildDownloads
@@ -242,8 +252,8 @@ fn next_format(current: &str, forward: bool) -> &'static str {
 
 fn rebuild(host: &mut Host) {
     match wim::core::rebuild_cached_downloads(
-        &host.cache_index,
-        &host.cfg,
+        &host.session.cache_index,
+        &host.session.cfg,
         &mut host.downloading,
         &host.download_tx,
         &mut host.notifications,
@@ -288,7 +298,7 @@ pub fn key(host: &mut Host, state: &mut SettingsState, code: KeyCode, close_key:
             }
             KeyCode::Enter => {
                 let token = state.token_input.trim().to_string();
-                host.cfg.listenbrainz_user_token =
+                host.session.cfg.listenbrainz_user_token =
                     if token.is_empty() { None } else { Some(token) };
                 save(host);
                 state.token_editing = false;
@@ -304,7 +314,7 @@ pub fn key(host: &mut Host, state: &mut SettingsState, code: KeyCode, close_key:
     }
     if code == KeyCode::Esc || code == close_key {
         state.open = false;
-        host.cfg.crossfade_enabled = host.crossfade_enabled;
+        host.session.cfg.crossfade_enabled = host.crossfade_enabled;
         save(host);
         return;
     }

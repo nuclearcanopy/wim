@@ -5,9 +5,8 @@
 //! locals); `CoreCtx` is still built per use, because the borrow of
 //! the core and the borrow of the surface have to stay disjoint.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 /// The one `CoreCtx` literal, as a macro rather than a method: it
@@ -17,13 +16,13 @@ use std::time::{Duration, Instant};
 macro_rules! core_ctx {
     ($h:expr, $now:expr, $np:expr) => {
         CoreCtx {
-            cfg: &$h.cfg,
+            cfg: &$h.session.cfg,
             player: &$h.player,
-            app: &mut $h.app,
+            app: &mut $h.session.app,
             notifications: &mut $h.notifications,
             queue: &mut $h.play_queue,
             previous_track: &mut $h.previous_track,
-            cache: &$h.cache_index,
+            cache: &$h.session.cache_index,
             download_tx: &$h.download_tx,
             downloading: &mut $h.downloading,
             scrobble: &mut $h.scrobble,
@@ -47,7 +46,7 @@ macro_rules! core_ctx {
             fade: &mut $h.fade,
             sleep_due: &mut $h.sleep_due,
             resume_due: &mut $h.resume_due,
-            scan_rx: &mut $h.scan_rx,
+            scan_rx: &mut $h.session.scan_rx,
             remote_search_tx: &$h.remote_search_tx,
             settle: &mut $h.settle,
             saved_queues: &mut $h.saved_queues,
@@ -57,7 +56,7 @@ macro_rules! core_ctx {
     };
 }
 
-use wim::catalog::{self, BackgroundSyncResult};
+use wim::catalog;
 use wim::core::{
     self, BetweenTracks, CoreCtx, Drive, Intent, RemoteSearchOutcome, ScrobbleState, StarFailed,
     SubtitleOutcome, TrackResolver,
@@ -70,7 +69,7 @@ use wim::shellsong::{LineKind, Op, Program};
 use wim::shellsong_host::{CorpusCandidates, Ramp, SearchSettle};
 use wim::swimsession::SwimSession;
 use wim::ui::results_list::label;
-use wim::{app, cache, config, favorites, library, lyrics, mpv, search};
+use wim::{app, config, favorites, lyrics, mpv};
 
 /// How long a one-shot waits for a command that is still resolving a
 /// name against a server. The language times its own await out at 8s;
@@ -286,9 +285,7 @@ pub struct PlayerSetupResult {
 }
 
 pub struct Host {
-    pub cfg: config::Config,
     pub player: mpv::Mpv,
-    pub app: app::App,
     pub notifications: Notifications,
     /// A server being added or reconnected, answering off the ui thread.
     pub pending_connect: Option<crate::nav_ui::PendingConnect>,
@@ -299,10 +296,6 @@ pub struct Host {
     last_reconcile: Instant,
     pub play_queue: PlayQueue,
     pub previous_track: Option<SearchItem>,
-    pub cache_index: Arc<Mutex<cache::CacheIndex>>,
-    startup_cache: Option<Receiver<cache::CacheIndex>>,
-    warming_corpus: Option<search::WarmingCorpus>,
-    cached_entries: Option<search::CachedEntries>,
     pub download_tx: Sender<DownloadEvent>,
     pub download_rx: Receiver<DownloadEvent>,
     pub downloading: HashSet<String>,
@@ -310,10 +303,6 @@ pub struct Host {
     pub subtitle_rx: Receiver<SubtitleOutcome>,
     pub remote_search_tx: Sender<core::RemoteSearchQuery>,
     pub remote_search_result_rx: Receiver<RemoteSearchOutcome>,
-    pub scan_rx: Receiver<library::ScanBatch>,
-    sync_rx: Receiver<BackgroundSyncResult>,
-    pub servers_tx: Sender<Vec<config::NavidromeConfig>>,
-    server_reachable: HashMap<String, bool>,
     pub scrobble: ScrobbleState,
     scrobble_failed_rx: Receiver<core::ScrobbleFailed>,
     pub favorites: favorites::Favorites,
@@ -369,22 +358,8 @@ impl Host {
         let first_run = !config::config_path()?.exists();
         let cfg = config::load_or_init()?;
         wim::trace_mark!("config loaded");
-        let startup_cache = Some(cache::spawn_startup(
-            cfg.offline_cache_max_bytes,
-            Some(cfg.cache_eviction_days),
-        ));
-
-        // `rescan()` replaces this channel wholesale: the scan thread
-        // signs off by dropping its sender, so a finished one cannot
-        // be reused.
-        let (scan_tx, scan_rx) = mpsc::channel::<library::ScanBatch>();
-        library::spawn_scan(cfg.library_paths.clone(), scan_tx);
-        // last session's catalog, off disk, so the first prompt can
-        // already complete track names.
-        let warming_corpus = Some(search::spawn_warm_from_cache(&cfg.navidrome_servers));
-        let (sync_tx, sync_rx) = mpsc::channel::<BackgroundSyncResult>();
-        let (servers_tx, servers_rx) = mpsc::channel();
-        catalog::spawn_background_sync(cfg.navidrome_servers.clone(), sync_tx, servers_rx);
+        let session = SwimSession::new(cfg);
+        let cfg = &session.cfg;
 
         // returns as soon as mpv is forked; the socket wait is on a
         // connector thread. nothing below touches the player, so the
@@ -432,27 +407,12 @@ impl Host {
         setup_commands.extend(mpv::Mpv::subtitle_style_commands(&cfg.subtitles));
         wim::trace_mark!("mpv forked");
 
-        let mut app = app::App::new(search::Corpus::new());
-        app.scanning_library = true;
-        app.syncing_servers = !cfg.navidrome_servers.is_empty();
-        app.loading_cached_catalog = !cfg.navidrome_servers.is_empty();
-        let restored_eq = wim::eq::restore(
-            cfg.eq_preset.as_deref(),
-            cfg.eq_gains,
-            &cfg.eq_custom_presets,
-        );
-        app.eq_source = restored_eq.source;
-        app.eq_custom = restored_eq.modified;
-        app.eq_gains = restored_eq.gains;
-        if let Some(wim::eq::Source::Builtin(index)) = restored_eq.source {
-            app.eq_preset = index;
-        }
         // applied with the rest of the player setup, off the first frame
         setup_commands.push(vec![
             serde_json::json!("set_property"),
             serde_json::json!("af"),
             serde_json::json!(wim::eq::build_player_af_filter(
-                &app.eq_gains,
+                &session.app.eq_gains,
                 cfg.eq_enabled,
                 cfg.visualizer_bands as usize,
             )),
@@ -514,19 +474,12 @@ impl Host {
             }
             _ => None,
         };
-        let cache_index = Arc::new(Mutex::new(cache::CacheIndex::default()));
         Ok(Host {
             _instance_lock: instance_lock,
-            cfg,
             player,
-            app,
             notifications,
             play_queue: PlayQueue::default(),
             previous_track: None,
-            cache_index,
-            startup_cache,
-            warming_corpus,
-            cached_entries: None,
             download_tx,
             download_rx,
             downloading: HashSet::new(),
@@ -539,10 +492,6 @@ impl Host {
             subtitle_rx,
             remote_search_tx,
             remote_search_result_rx,
-            scan_rx,
-            sync_rx,
-            servers_tx,
-            server_reachable: HashMap::new(),
             scrobble: ScrobbleState {
                 failed_tx: Some(scrobble_failed_tx),
                 ..ScrobbleState::default()
@@ -580,7 +529,7 @@ impl Host {
             bindings: wim::shellsong_host::load_bindings(),
             scripts: wim::shellsong_host::script_names(),
             playback: mpv::Playback::default(),
-            session: SwimSession::new(),
+            session,
             torbox_tx,
             torbox_rx,
             torbox_pending: false,
@@ -642,107 +591,6 @@ impl Host {
             let outcome = Self::setup_outcome(&plan, &results);
             self.finish_player_setup(outcome);
         }
-    }
-
-    pub fn poll_startup_cache(&mut self) -> anyhow::Result<bool> {
-        let Some(rx) = &self.startup_cache else {
-            return Ok(true);
-        };
-        match rx.try_recv() {
-            Ok(index) => {
-                *self
-                    .cache_index
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = index;
-                self.startup_cache = None;
-                wim::trace_mark!("playback cache ready");
-                Ok(true)
-            }
-            Err(TryRecvError::Empty) => Ok(false),
-            Err(TryRecvError::Disconnected) => anyhow::bail!("playback cache startup failed"),
-        }
-    }
-
-    pub fn wait_startup_cache(&mut self) -> anyhow::Result<()> {
-        if let Some(rx) = self.startup_cache.take() {
-            let index = rx
-                .recv()
-                .map_err(|_| anyhow::anyhow!("playback cache startup failed"))?;
-            *self
-                .cache_index
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = index;
-        }
-        Ok(())
-    }
-
-    /// One-shots have no prompt to show while a catalog warms, and must
-    /// search the same cached library they did before startup was split.
-    pub fn wait_startup_catalog(&mut self) {
-        if let Some(warming) = self.warming_corpus.take() {
-            let mut cached = warming.take().into_cached_entries();
-            self.app
-                .corpus
-                .merge_cached_batch(&mut cached, usize::MAX, |client| {
-                    self.cfg
-                        .navidrome_servers
-                        .iter()
-                        .any(|nav| client.matches(nav))
-                });
-            self.app.resync_results();
-        }
-        self.app.loading_cached_catalog = false;
-    }
-
-    /// Warmed catalogs and local scans do not depend on mpv becoming ready.
-    pub fn pump_library(&mut self) {
-        if self
-            .warming_corpus
-            .as_ref()
-            .is_some_and(|warm| warm.is_finished())
-        {
-            self.cached_entries = self
-                .warming_corpus
-                .take()
-                .map(|warm| warm.take().into_cached_entries());
-        }
-        let mut changed = false;
-        if let Some(cached) = &mut self.cached_entries {
-            changed |= self.app.corpus.merge_cached_batch(
-                cached,
-                search::CACHED_ROWS_PER_FRAME,
-                |client| {
-                    self.cfg
-                        .navidrome_servers
-                        .iter()
-                        .any(|nav| client.matches(nav))
-                },
-            ) > 0;
-            if cached.is_empty() {
-                self.cached_entries = None;
-                self.app.loading_cached_catalog = false;
-            }
-        }
-        for _ in 0..8 {
-            match self.scan_rx.try_recv() {
-                Ok(batch) => {
-                    self.app.corpus.add_local_tracks(batch);
-                    changed = true;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    self.app.scanning_library = false;
-                    break;
-                }
-            }
-        }
-        if changed {
-            self.app.resync_results();
-        }
-    }
-
-    pub fn has_cached_rows_pending(&self) -> bool {
-        self.cached_entries.is_some()
     }
 
     /// The terminal's width, asked for when something is about to be
@@ -818,9 +666,9 @@ impl Host {
     /// network (see `shellsong::Candidates`).
     pub fn candidates(&self) -> CorpusCandidates<'_> {
         CorpusCandidates {
-            corpus: &self.app.corpus,
+            corpus: &self.session.app.corpus,
             saved: &self.saved_queues,
-            eq_presets: core::eq_preset_names(&self.cfg.eq_custom_presets),
+            eq_presets: core::eq_preset_names(&self.session.cfg.eq_custom_presets),
             vars: &self.session.vars,
             scripts: &self.scripts,
         }
@@ -1038,9 +886,9 @@ impl Host {
             // the same decision wim makes, from the same function.
             match core::drained(
                 &self.player,
-                &self.cache_index,
+                &self.session.cache_index,
                 &mut self.play_queue,
-                self.app.loop_mode,
+                self.session.app.loop_mode,
             ) {
                 core::Drained::Stale => {}
                 core::Drained::Cleared => self.session.console.note("queue finished".to_string()),
@@ -1060,7 +908,8 @@ impl Host {
         // Local and cached results are final once loading finishes; a
         // slow server's matches follow through the "...and from the
         // servers" lines below rather than holding these back.
-        let local_ready = !self.app.scanning_library && !self.app.loading_cached_catalog;
+        let local_ready =
+            !self.session.app.scanning_library && !self.session.app.loading_cached_catalog;
         // one-shots keep waiting for the settle window so a script's
         // output is complete; only the interactive prompt echoes early
         if self.session.swim.echo_results
@@ -1069,14 +918,15 @@ impl Host {
         {
             self.session.swim.echo_results = false;
             let mut shown = HashSet::new();
-            let lines = core::echo_lines(self.app.results(), &mut shown, self.console_width());
+            let lines =
+                core::echo_lines(self.session.app.results(), &mut shown, self.console_width());
             if lines.is_empty() {
                 self.session.console.note("no matches".to_string());
             }
             for line in lines {
                 self.session.console.note(line);
             }
-            self.echoed = Some((self.app.query.clone(), shown));
+            self.echoed = Some((self.session.app.query.clone(), shown));
         }
 
         // a track started, by advancing or by a loop-all restart.
@@ -1084,7 +934,7 @@ impl Host {
             // Keep video subtitle discovery aligned with Wim. The
             // lookup is dispatched to its worker thread and is a no-op
             // for audio or when no OpenSubtitles key is configured.
-            core::fire_subtitle_fetch(&self.cfg, &self.subtitle_tx, &track);
+            core::fire_subtitle_fetch(&self.session.cfg, &self.subtitle_tx, &track);
             if self.play_queue.current().is_some() {
                 self.session
                     .console
@@ -1137,7 +987,7 @@ impl Host {
         }
         if self.crossfade_enabled {
             if let Some(started) = self.fade_in_started_at {
-                let span = config::crossfade_seconds(self.cfg.crossfade_seconds);
+                let span = config::crossfade_seconds(self.session.cfg.crossfade_seconds);
                 let t = (started.elapsed().as_secs_f64() / span).clamp(0.0, 1.0);
                 let _ = self.player.set_volume_nowait(self.base_volume * t);
                 if t >= 1.0 {
@@ -1147,7 +997,7 @@ impl Host {
                 self.playback.elapsed_secs,
                 core::playing_duration(self.play_queue.current(), self.playback.duration_secs),
             ) {
-                let span = config::crossfade_seconds(self.cfg.crossfade_seconds);
+                let span = config::crossfade_seconds(self.session.cfg.crossfade_seconds);
                 let remaining = duration - elapsed;
                 if remaining <= span {
                     let _ = self
@@ -1162,8 +1012,9 @@ impl Host {
             self.session.console.note("resumed".to_string());
         }
         if let Some(due) = self.sleep_due {
-            let fade =
-                Duration::from_secs_f64(config::crossfade_seconds(self.cfg.crossfade_seconds));
+            let fade = Duration::from_secs_f64(config::crossfade_seconds(
+                self.session.cfg.crossfade_seconds,
+            ));
             match wim::shellsong_host::sleep_step(due, fade, self.base_volume, now) {
                 wim::shellsong_host::SleepStep::Waiting => {}
                 wim::shellsong_host::SleepStep::Fading(level) => {
@@ -1187,13 +1038,14 @@ impl Host {
                 self.playback.elapsed_secs,
                 self.playback.duration_secs,
             ) {
-                if wim::listenbrainz::should_scrobble(&self.cfg.scrobble, elapsed, duration) {
+                if wim::listenbrainz::should_scrobble(&self.session.cfg.scrobble, elapsed, duration)
+                {
                     let listened_at = self
                         .scrobble
                         .started_unix
                         .unwrap_or_else(wim::listenbrainz::now_unix);
                     core::fire_scrobble(
-                        &self.cfg,
+                        &self.session.cfg,
                         item,
                         listened_at,
                         self.scrobble.failed_tx.as_ref(),
@@ -1204,21 +1056,27 @@ impl Host {
         }
 
         // A local batch does not settle a pending remote search.
-        self.pump_library();
-        while let Ok(sync) = self.sync_rx.try_recv() {
-            self.app.syncing_servers = false;
+        self.session.pump_library();
+        while let Ok(sync) = self.session.sync_rx.try_recv() {
+            self.session.app.syncing_servers = false;
             match sync.result {
                 Ok((catalog, starred)) => {
-                    if let Some(warning) = catalog::merge_catalog_into_app(&mut self.app, catalog) {
+                    if let Some(warning) =
+                        catalog::merge_catalog_into_app(&mut self.session.app, catalog)
+                    {
                         self.notifications.push(Severity::Alert, warning);
                     }
                     self.remote_starred.extend(starred);
-                    if self.server_reachable.insert(sync.url.clone(), true) == Some(false) {
+                    if self.session.server_reachable.insert(sync.url.clone(), true) == Some(false) {
                         self.notifications
                             .push(Severity::Info, format!("{} is back online", sync.url));
                     }
                 }
-                Err(message) => match self.server_reachable.insert(sync.url.clone(), false) {
+                Err(message) => match self
+                    .session
+                    .server_reachable
+                    .insert(sync.url.clone(), false)
+                {
                     None => self
                         .notifications
                         .push(Severity::Error, format!("{}: {message}", sync.url)),
@@ -1232,10 +1090,11 @@ impl Host {
         }
         let mut answered = false;
         while let Ok(outcome) = self.remote_search_result_rx.try_recv() {
-            self.app
+            self.session
+                .app
                 .corpus
                 .add_subsonic_search_result(outcome.result, &outcome.client);
-            self.app.resync_results();
+            self.session.app.resync_results();
             // an answer is in, so the results for whatever was asked
             // are as complete as a program should wait for.
             self.settle.answered(&outcome.query);
@@ -1249,8 +1108,8 @@ impl Host {
         if answered {
             let avail = self.console_width();
             if let Some((query, shown)) = self.echoed.as_mut() {
-                if *query == self.app.query {
-                    let lines = core::echo_lines(self.app.results(), shown, avail);
+                if *query == self.session.app.query {
+                    let lines = core::echo_lines(self.session.app.results(), shown, avail);
                     if !lines.is_empty() {
                         self.session
                             .console
@@ -1318,7 +1177,7 @@ impl Host {
         let mut surf = self.session.swim.borrowed();
         let mut core = core_ctx!(self, now, now_playing);
         let tx = self.torbox_tx.clone();
-        let cfg = self.cfg.clone();
+        let cfg = self.session.cfg.clone();
         let pending = &mut self.torbox_pending;
         let outcome = core::drive_with(
             program,

@@ -36,10 +36,11 @@ pub fn poll(host: &mut Host, mut nm: Option<&mut NavManager>) {
     let PendingConnect { nav, reconnect, .. } = host.pending_connect.take().expect("set");
     let result = outcome
         .unwrap_or_else(|_| Err("connection attempt stopped unexpectedly".into()))
-        .map(|catalog| finish_navidrome_index(&mut host.app, catalog));
+        .map(|catalog| finish_navidrome_index(&mut host.session.app, catalog));
     if reconnect {
         // found by url now: the profile may have been removed meanwhile
         let index = host
+            .session
             .cfg
             .navidrome_servers
             .iter()
@@ -77,8 +78,10 @@ pub fn poll(host: &mut Host, mut nm: Option<&mut NavManager>) {
         Ok(message) => {
             host.notifications
                 .push(Severity::Info, format!("connected: {}", nav.url));
-            edit_servers(&mut host.cfg, &host.servers_tx, |servers| servers.push(nav));
-            config::save_or_warn(&host.cfg, &mut host.notifications);
+            edit_servers(&mut host.session.cfg, &host.session.servers_tx, |servers| {
+                servers.push(nav)
+            });
+            config::save_or_warn(&host.session.cfg, &mut host.notifications);
             let path = config::config_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "config.toml".to_string());
@@ -90,7 +93,7 @@ pub fn poll(host: &mut Host, mut nm: Option<&mut NavManager>) {
             );
             if let Some(nm) = nm.as_deref_mut() {
                 nm.connection_status.push(Some(ConnectionStatus::Online));
-                nm.selected = host.cfg.navidrome_servers.len() - 1;
+                nm.selected = host.session.cfg.navidrome_servers.len() - 1;
                 nm.step = NavManagerStep::List;
                 nm.message = format!("connected: {message}");
             }
@@ -111,12 +114,12 @@ const CHECKING_SERVERS: &str = "checking servers…";
 /// so a dead server cannot hold the prompt for its connect timeout.
 pub fn open(host: &mut Host) -> NavManager {
     let mut nm = NavManager::new();
-    nm.connection_status = vec![None; host.cfg.navidrome_servers.len()];
-    if !host.cfg.navidrome_servers.is_empty() {
+    nm.connection_status = vec![None; host.session.cfg.navidrome_servers.len()];
+    if !host.session.cfg.navidrome_servers.is_empty() {
         nm.message = CHECKING_SERVERS.into();
         host.pending_connectivity = Some(spawn_connectivity_check(
-            host.cfg.navidrome_servers.clone(),
-            host.app.corpus.remote_clients(),
+            host.session.cfg.navidrome_servers.clone(),
+            host.session.app.corpus.remote_clients(),
         ));
     }
     nm
@@ -147,9 +150,10 @@ pub fn poll_connectivity(host: &mut Host, nm: Option<&mut NavManager>) {
     }
     let Some(nm) = nm else { return };
     nm.connection_status
-        .resize(host.cfg.navidrome_servers.len(), None);
+        .resize(host.session.cfg.navidrome_servers.len(), None);
     for (url, user, status) in report {
         if let Some(index) = host
+            .session
             .cfg
             .navidrome_servers
             .iter()
@@ -176,7 +180,7 @@ pub fn paste(nm: &mut NavManager, text: &str) -> bool {
 pub fn key(host: &mut Host, nm: &mut NavManager, code: KeyCode, modifiers: KeyModifiers) -> bool {
     match &mut nm.step {
         NavManagerStep::List => {
-            let count = host.cfg.navidrome_servers.len();
+            let count = host.session.cfg.navidrome_servers.len();
             if code != KeyCode::Char('d') {
                 nm.pending_delete = None;
             }
@@ -187,13 +191,14 @@ pub fn key(host: &mut Host, nm: &mut NavManager, code: KeyCode, modifiers: KeyMo
                 KeyCode::Char('d') if nm.selected < count => {
                     if nm.pending_delete == Some(nm.selected) {
                         let at = nm.selected;
-                        edit_servers(&mut host.cfg, &host.servers_tx, |servers| {
+                        edit_servers(&mut host.session.cfg, &host.session.servers_tx, |servers| {
                             servers.remove(at);
                         });
                         nm.forget_status_at(at);
-                        host.app.syncing_servers = !host.cfg.navidrome_servers.is_empty();
-                        config::save_or_warn(&host.cfg, &mut host.notifications);
-                        nm.selected = nm.selected.min(host.cfg.navidrome_servers.len());
+                        host.session.app.syncing_servers =
+                            !host.session.cfg.navidrome_servers.is_empty();
+                        config::save_or_warn(&host.session.cfg, &mut host.notifications);
+                        nm.selected = nm.selected.min(host.session.cfg.navidrome_servers.len());
                         nm.pending_delete = None;
                         nm.message =
                             "profile removed (already-indexed items stay until restart)".into();
@@ -201,7 +206,7 @@ pub fn key(host: &mut Host, nm: &mut NavManager, code: KeyCode, modifiers: KeyMo
                         nm.pending_delete = Some(nm.selected);
                         nm.message = format!(
                             "press d again to remove {}",
-                            host.cfg.navidrome_servers[nm.selected].url
+                            host.session.cfg.navidrome_servers[nm.selected].url
                         );
                     }
                 }
@@ -209,7 +214,7 @@ pub fn key(host: &mut Host, nm: &mut NavManager, code: KeyCode, modifiers: KeyMo
                     nm.step = NavManagerStep::Add(LoginForm::new());
                 }
                 KeyCode::Enter if host.pending_connect.is_none() => {
-                    let nav = host.cfg.navidrome_servers[nm.selected].clone();
+                    let nav = host.session.cfg.navidrome_servers[nm.selected].clone();
                     nm.message = "connecting…".into();
                     host.pending_connect = Some(PendingConnect {
                         rx: spawn_navidrome_index(nav.clone()),
