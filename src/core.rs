@@ -14,6 +14,7 @@ use crate::app::{self, Action, LoopMode};
 use crate::cache::{self, CacheIndex};
 use crate::download::{self, DownloadEvent};
 use crate::notify::{Notifications, Severity};
+use crate::player::Player;
 use crate::playqueue::PlayQueue;
 use crate::search::SearchItem;
 use crate::shellsong::{self, Console, GoTarget, Op, Program, Target, ViewTarget};
@@ -23,7 +24,7 @@ use crate::trace;
 use crate::ui::controlsbar::Field;
 use crate::ui::results_list::label;
 use crate::{
-    browse, config, eq, favorites, library, listenbrainz, lyrics, mpv, namehint, opensubtitles,
+    browse, config, eq, favorites, library, listenbrainz, lyrics, namehint, opensubtitles,
     persistence, queues, search, shellsong_host, subsonic, ui, undo, Focus,
 };
 
@@ -90,7 +91,7 @@ pub enum Skipped {
 /// to skip to either. A skip past the end lands on the last track
 /// rather than refusing outright, since asking to go forward four with
 /// two left plainly means "the end".
-pub fn skip_next(player: &mpv::Mpv, queue: &PlayQueue, n: usize) -> Skipped {
+pub fn skip_next(player: &dyn Player, queue: &PlayQueue, n: usize) -> Skipped {
     let upcoming = queue.upcoming_len();
     if upcoming == 0 {
         return Skipped::AtTheEnd;
@@ -108,7 +109,7 @@ pub fn skip_next(player: &mpv::Mpv, queue: &PlayQueue, n: usize) -> Skipped {
     }
 }
 
-pub fn toggle_pause(player: &mpv::Mpv, between: &mut BetweenTracks) -> anyhow::Result<()> {
+pub fn toggle_pause(player: &dyn Player, between: &mut BetweenTracks) -> anyhow::Result<()> {
     if between.holding() {
         between.cancel();
         player.playlist_next()?;
@@ -208,7 +209,7 @@ impl BetweenTracks {
     /// queued after this track.
     pub fn step(
         &mut self,
-        player: &mpv::Mpv,
+        player: &dyn Player,
         eof: bool,
         more_to_play: bool,
         now: Instant,
@@ -1494,7 +1495,7 @@ pub fn start_tracking_playback(
 /// practice `playable_path` never actually returns `None` here; that
 /// arm only exists because `playable_path` is total over `SearchItem`.
 pub fn try_play(
-    player: &mpv::Mpv,
+    player: &dyn Player,
     item: &SearchItem,
     cache: &Arc<Mutex<CacheIndex>>,
 ) -> (String, bool, Option<u64>) {
@@ -1533,11 +1534,11 @@ pub fn video_track_mode(item: &SearchItem) -> &'static str {
     }
 }
 
-pub fn set_vid_for_item(player: &mpv::Mpv, item: &SearchItem) {
-    let _ = player.set_property("vid", serde_json::json!(video_track_mode(item)));
+pub fn set_vid_for_item(player: &dyn Player, item: &SearchItem) {
+    let _ = player.set_video_track(video_track_mode(item));
     // Give mpv's native window and window-manager task switcher the same
     // user-facing name Wim shows; never expose a torrent release filename.
-    let _ = player.set_property("force-media-title", serde_json::json!(label(item)));
+    let _ = player.set_media_title(&label(item));
 }
 /// Whether a playlist rewrite starts a fresh session (so "loop all"
 /// restarts from it) or just re-lays-out the session already running.
@@ -1555,7 +1556,7 @@ pub enum SessionStart {
 /// `items[0]`, since `queue` already knows it is at position 0 and will
 /// report mpv's confirming `playlist-pos` as `Unchanged`.
 pub fn load_playlist(
-    player: &mpv::Mpv,
+    player: &dyn Player,
     cache: &Arc<Mutex<CacheIndex>>,
     queue: &mut PlayQueue,
     items: Vec<SearchItem>,
@@ -1644,7 +1645,7 @@ pub fn record_appended(
 
 /// A timed-out batch may have been partly applied by mpv; reconcile then.
 fn reconcile_if_timed_out(
-    player: &mpv::Mpv,
+    player: &dyn Player,
     queue: &mut PlayQueue,
     errors: &[String],
 ) -> Option<String> {
@@ -1743,7 +1744,7 @@ impl Enqueued {
 }
 
 pub fn enqueue_track(
-    player: &mpv::Mpv,
+    player: &dyn Player,
     item: &SearchItem,
     cache: &Arc<Mutex<CacheIndex>>,
     queue: &mut PlayQueue,
@@ -1781,8 +1782,8 @@ pub fn enqueue_track(
 /// holds that were never recorded are removed from mpv, and recorded ones
 /// mpv never took are forgotten. Entries without an id fall back to
 /// comparing lengths. Returns what it did.
-pub fn reconcile_queue_after_timeout(player: &mpv::Mpv, queue: &mut PlayQueue) -> Option<String> {
-    let playlist = player.get_property("playlist").ok()?;
+pub fn reconcile_queue_after_timeout(player: &dyn Player, queue: &mut PlayQueue) -> Option<String> {
+    let playlist = player.playlist().ok()?;
     let entries = playlist.as_array()?;
     let mpv_ids: Vec<Option<u64>> = entries
         .iter()
@@ -1871,7 +1872,7 @@ fn reconcile_by_ids(
 /// `playlist-clear` keeps the current file and drops the rest, so both
 /// sides end up as `[current] + items` at position 0.
 pub fn resync_upcoming(
-    player: &mpv::Mpv,
+    player: &dyn Player,
     cache: &Arc<Mutex<CacheIndex>>,
     queue: &mut PlayQueue,
     items: Vec<SearchItem>,
@@ -1907,7 +1908,7 @@ pub fn resync_upcoming(
 /// Snapshots now-playing/queue/position/volume for next launch to
 /// resume. Best-effort: a failed save just means nothing to resume
 /// next time, not worth surfacing since we're already quitting.
-pub fn save_playback_state(player: &mpv::Mpv, queue: &PlayQueue) {
+pub fn save_playback_state(player: &dyn Player, queue: &PlayQueue) {
     // Launching to the title screen must not erase the previous session
     // when the user quits without starting playback. Keep the saved state
     // available for an explicit `wim --resume`.
@@ -1924,11 +1925,8 @@ pub fn save_playback_state(player: &mpv::Mpv, queue: &PlayQueue) {
             .iter()
             .filter_map(persistent_playable_path)
             .collect(),
-        position_secs: player
-            .get_property("time-pos")
-            .ok()
-            .and_then(|v| v.as_f64()),
-        volume: player.get_property("volume").ok().and_then(|v| v.as_f64()),
+        position_secs: player.time_pos(),
+        volume: player.volume(),
     };
     let _ = persistence::save(&state);
 }
@@ -2051,8 +2049,8 @@ pub fn shellsong_focus(focus: Focus) -> shellsong::Focus {
 }
 /// mpv's current volume, which `volume(+10%)` nudges from and a fade
 /// ramps away from. `None` only if the ipc read fails.
-pub fn current_volume(player: &mpv::Mpv) -> Option<f64> {
-    player.get_property("volume").ok().and_then(|v| v.as_f64())
+pub fn current_volume(player: &dyn Player) -> Option<f64> {
+    player.volume()
 }
 /// Whether `item` is starred right now, so `star()`/`unstar()` can set
 /// a state rather than flip one (`toggle_star` only flips).
@@ -2560,7 +2558,7 @@ pub fn eq_preset_names(saved: &eq::CustomPresets) -> Vec<String> {
 }
 pub fn apply_eq_row(
     app: &mut app::App,
-    player: &mpv::Mpv,
+    player: &dyn Player,
     notifications: &mut Notifications,
     saved: &eq::CustomPresets,
     row: usize,
@@ -2591,7 +2589,7 @@ pub fn apply_eq_row(
 /// the other.
 pub fn apply_eq_gains(
     app: &app::App,
-    player: &mpv::Mpv,
+    player: &dyn Player,
     notifications: &mut Notifications,
     enabled: bool,
     bands: usize,
@@ -2710,7 +2708,7 @@ pub fn spawn_background_search(
 /// that was left alone.
 pub struct CoreCtx<'a> {
     pub cfg: &'a config::Config,
-    pub player: &'a mpv::Mpv,
+    pub player: &'a dyn Player,
     /// The session: corpus, query and result list, plus the playback
     /// modes. The interpreter resolves names against the results in
     /// both binaries, so they are core; `selected` and the key
@@ -3134,11 +3132,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             // cache: this runs once per command, not per frame, and a
             // percent target must resolve against the duration as of
             // now rather than whatever the last pushed change said.
-            let reported = core
-                .player
-                .get_property(mpv::PROP_DURATION)
-                .ok()
-                .and_then(|v| v.as_f64());
+            let reported = core.player.duration();
             // through `playing_duration`, the same reading the
             // scrubber's target comes from: mpv reports ~1s for a
             // generated silence, so asking it directly put
@@ -3176,7 +3170,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
         // mpv's own `mute`, not volume 0: it is reversible without
         // having to remember the level, and `volume(...)` stays the one
         // thing that moves the level.
-        Op::Mute(on) => op_ipc(core.player.set_property("mute", serde_json::json!(on))),
+        Op::Mute(on) => op_ipc(core.player.set_mute(on)),
         Op::CycleLoop => {
             let mode = core.app.cycle_loop();
             let dispatch = dispatch_action(Action::SetLoop(mode), core, surf);
@@ -3270,10 +3264,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             if !is_video {
                 op_fail("no video is currently playing".to_string())
             } else {
-                match core
-                    .player
-                    .set_property("force-window", serde_json::json!(true))
-                {
+                match core.player.request_video_window() {
                     Ok(()) => op_note(
                         "mpv video window requested; use the window switcher if it is not raised"
                             .to_string(),
@@ -3704,10 +3695,7 @@ fn run_op(op: Op, core: &mut CoreCtx, surf: &mut dyn Surface) -> (Dispatch, Repo
             // a `playlist-pos` write, not a reload: mpv keeps the same
             // playlist so `entries` stays index-aligned with it (same
             // as enter in the queue view).
-            op_ipc(core.player.set_property(
-                "playlist-pos",
-                serde_json::json!(position.saturating_sub(1)),
-            ))
+            op_ipc(core.player.set_playlist_pos(position.saturating_sub(1)))
         }
         Op::Silence { secs, front } => {
             // no network and no expansion: a silence is already its
@@ -4282,7 +4270,7 @@ pub enum Drained {
 /// the whole decision is testable this way without spawning mpv for
 /// the half of it that never touches the socket.
 pub fn drained(
-    player: &mpv::Mpv,
+    player: &dyn Player,
     cache: &Arc<Mutex<CacheIndex>>,
     queue: &mut PlayQueue,
     loop_mode: LoopMode,
@@ -5131,6 +5119,7 @@ impl Surface for Headless {
 #[cfg(test)]
 mod seam_tests {
     use super::*;
+    use crate::mpv;
 
     /// The refusal a page-less front-end gives for a local album's
     /// listing. `open_listing` itself needs a `CoreCtx` (a live mpv),
@@ -5413,7 +5402,7 @@ mod seam_tests {
             }
         }
 
-        pub(super) fn ctx<'a>(&'a mut self, player: &'a mpv::Mpv) -> CoreCtx<'a> {
+        pub(super) fn ctx<'a>(&'a mut self, player: &'a dyn Player) -> CoreCtx<'a> {
             CoreCtx {
                 cfg: &self.cfg,
                 player,
@@ -7197,6 +7186,7 @@ mod scrobble_metadata_tests {
 #[cfg(test)]
 mod index_map_tests {
     use super::*;
+    use crate::mpv;
 
     fn headless_mpv() -> mpv::Mpv {
         let player = mpv::Mpv::spawn().expect("mpv on PATH");
@@ -7501,6 +7491,7 @@ mod index_map_tests {
 mod seek_length_tests {
     use super::seam_tests::Harness;
     use super::*;
+    use crate::mpv;
     use crate::shellsong::Pos;
 
     fn silence() -> SearchItem {
@@ -7610,6 +7601,7 @@ mod seek_length_tests {
 mod rememberable_setting_tests {
     use super::seam_tests::Harness;
     use super::*;
+    use crate::mpv;
     use crate::shellsong::{Setting, Tier};
 
     /// A saved curve exists only at runtime, so `eq(...)` resolves at
@@ -7829,6 +7821,7 @@ mod refused_move_tests {
 #[cfg(test)]
 mod skip_next_tests {
     use super::*;
+    use crate::mpv;
 
     fn silence(secs: u64) -> SearchItem {
         SearchItem::Silence { secs }
@@ -8071,6 +8064,7 @@ mod shared_toggle_tests {
 mod enqueue_status_tests {
     use super::seam_tests::Harness;
     use super::*;
+    use crate::mpv;
 
     /// A batch reports what went in, not what was asked for.
     ///
@@ -8616,5 +8610,76 @@ mod record_appended_tests {
         let (n, _) = record_appended(&mut q, pairs(&[7]), vec![Ok(None)]);
         assert_eq!(n, 1);
         assert_eq!(q.entry_ids(), &[None]);
+    }
+}
+
+/// Core functions driven through the `Player` seam with a `FakePlayer`:
+/// no mpv, so these run in the default test set.
+#[cfg(test)]
+mod fake_player_tests {
+    use super::*;
+    use crate::player::FakePlayer;
+
+    fn queue_of(n: usize) -> PlayQueue {
+        let mut q = PlayQueue::default();
+        q.reset(
+            (0..n)
+                .map(|s| SearchItem::Silence { secs: s as u64 + 1 })
+                .collect(),
+        );
+        q
+    }
+
+    #[test]
+    fn skip_next_issues_one_playlist_next_per_step() {
+        let player = FakePlayer::new();
+        let q = queue_of(3);
+        assert_eq!(skip_next(&player, &q, 2), Skipped::All);
+        assert_eq!(player.calls(), ["playlist_next()", "playlist_next()"]);
+    }
+
+    #[test]
+    fn skip_next_clamps_and_never_asks_the_player_at_the_end() {
+        let player = FakePlayer::new();
+        assert_eq!(
+            skip_next(&player, &queue_of(2), 5),
+            Skipped::Short { steps: 1 }
+        );
+        assert_eq!(player.calls(), ["playlist_next()"]);
+        let idle = FakePlayer::new();
+        assert_eq!(skip_next(&idle, &queue_of(1), 1), Skipped::AtTheEnd);
+        assert!(idle.calls().is_empty());
+    }
+
+    #[test]
+    fn skip_next_reports_a_player_failure() {
+        let player = FakePlayer::new();
+        player.fail("playlist_next");
+        assert!(matches!(
+            skip_next(&player, &queue_of(3), 1),
+            Skipped::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn set_vid_for_item_sets_track_mode_then_title() {
+        let player = FakePlayer::new();
+        let item = SearchItem::Silence { secs: 5 };
+        set_vid_for_item(&player, &item);
+        assert_eq!(
+            player.calls(),
+            [
+                format!("set_video_track({})", video_track_mode(&item)),
+                format!("set_media_title({})", label(&item)),
+            ]
+        );
+    }
+
+    #[test]
+    fn current_volume_reads_the_scripted_value() {
+        let player = FakePlayer::new();
+        assert_eq!(current_volume(&player), None);
+        player.script_read("volume", 42.0);
+        assert_eq!(current_volume(&player), Some(42.0));
     }
 }

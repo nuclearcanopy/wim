@@ -182,7 +182,7 @@ impl Snapshot {
         let _ = core.player.set_speed(self.speed);
         let _ = core.player.set_volume(self.base_volume);
         if let Some(muted) = self.muted {
-            let _ = core.player.set_property("mute", serde_json::json!(muted));
+            let _ = core.player.set_mute(muted);
         }
         apply_eq_gains(
             core.app,
@@ -1164,6 +1164,7 @@ impl Recorder {
 #[cfg(test)]
 mod restore {
     use super::*;
+    use crate::player::Player;
 
     use std::collections::HashSet;
     use std::sync::mpsc;
@@ -1284,7 +1285,7 @@ mod restore {
             }
         }
 
-        fn ctx<'a>(&'a mut self, player: &'a mpv::Mpv) -> CoreCtx<'a> {
+        fn ctx<'a>(&'a mut self, player: &'a dyn Player) -> CoreCtx<'a> {
             CoreCtx {
                 cfg: &self.cfg,
                 player,
