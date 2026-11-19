@@ -1,0 +1,3 @@
+// Checked in. Your team ID goes in Local.xcconfig (gitignored); copy
+// Local.xcconfig.example. CI builds without it, unsigned.
+#include? "Local.xcconfig"

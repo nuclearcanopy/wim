@@ -1,0 +1,35 @@
+# Generated into Shellswim.xcodeproj by `xcodegen` (brew install xcodegen).
+# The .xcodeproj is not committed.
+name: Shellswim
+options:
+  bundleIdPrefix: dev.loki
+  deploymentTarget:
+    iOS: "16.0"
+configFiles:
+  Debug: Config/Shellswim.xcconfig
+  Release: Config/Shellswim.xcconfig
+packages:
+  WimCore:
+    path: WimCore
+targets:
+  Shellswim:
+    type: application
+    platform: iOS
+    sources: [Shellswim]
+    dependencies:
+      - package: WimCore
+        product: WimCore
+      - package: WimCore
+        product: ShellswimKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.loki.shellswim
+        PRODUCT_NAME: shellswim
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: shellswim
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.9"
