@@ -133,6 +133,13 @@ exact implementations.
 
 - [ ] Measure idle/paused redraw rate, terminal bytes, wakeups, CPU, and input
   latency in normal, player, browse, search, and video screens.
+  Partial (006ba72, empty library, pty, single runs; details in
+  docs/performance.md "Phase 4 measurement note"): shellswim idle 0.2% CPU /
+  3.1 KB per 10 s; wim reduced-motion idle 0.5% / 2.5 KB; wim default motion
+  idle 0.8% / 640 KB (animation); wim reduced-motion with `/` focused
+  1.1% / 8.1 KB with ~2x idle wakeups. Rule (<1% CPU and <~5 KB/10 s): idle
+  passes except default-motion wim; search-focused wim fails and needs a
+  follow-up. Playback, paused, video and populated browse not measured.
 - [ ] Reduce needless redraws while preserving animation and prompt input; provide
   a wakeup path for background results if polling is relaxed.
 - [ ] Measure spectrum cost at disabled/default/high bands on T480; gate or lower

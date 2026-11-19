@@ -336,3 +336,46 @@ and shuffle paths without weakening that invariant.
 No design rewrite is approved by this document. Each architectural
 change should follow a measured bottleneck and preserve audio reliability,
 URL privacy, queue correctness, and supported-terminal behavior.
+
+#### Phase 4 measurement note (idle redraw cost)
+
+Measured at 006ba72 on the T480 (release build, `/tmp/opencode/wim-target`),
+in a pty (120x40, `TERM=xterm-256color`) with throwaway XDG dirs and an empty
+`library_paths`. Harness: a throwaway script (not committed; `bench.py` does
+not count bytes or focus states). 3 s settle, keys sent, 2 s settle, then 10 s
+measured; CPU is utime+stime of the process from `/proc/<pid>/stat`, bytes are
+what the pty master read. Wakeups come from a separate `strace -f -c` run and
+cover the whole ~15 s run including settle, so they are approximate, and
+strace inflates CPU (those CPU figures are discarded). Single run each.
+
+| binary / state | CPU (1 core) | bytes / 10 s | epoll_wait per s (approx) |
+|---|---|---|---|
+| wim, default motion, idle | 0.8% | 639,649 | ~32 |
+| wim, default motion, `/` search focused | 0.8% | 638,771 | ~31 |
+| wim, `WIM_REDUCED_MOTION=1`, idle | 0.5% | 2,500 | ~13 |
+| wim, reduced motion, `/` focused | 1.1% | 8,114 | ~28 |
+| wim, reduced motion, `/abc` typed | 1.2% | 8,089 | ~29 |
+| shellswim, default, idle | 0.2% | 3,108 | ~12 |
+| shellswim, `/` focused | 0.2% | 3,108 | ~11 |
+
+Not measured: a populated library, active playback, paused player, video, and
+the browse screen with content (no media in this environment). The empty-library
+idle screen stands in for "idle with no library". shellswim `/` and wim `/` were
+sent but not confirmed visually.
+
+Comparison with docs/audit-2026-11.md (B5: 2.5 KB and 0.03 s CPU per 10 s with
+reduced motion; 927 KB and 0.17 s at the start of the audit): reduced-motion
+idle bytes match (2.5 KB). Default-motion idle is 640 KB per 10 s, in line with
+the pre-B5 figure, i.e. the banner sweep/selection pulse still redraws about
+60 times a second by design. CPU here (0.5-0.8% = 0.05-0.08 s/s) is higher than
+the audit's 0.03 s per 10 s (0.3%) and the figures are single runs.
+
+Decision against the rule (CPU < 1% of a core and < ~5 KB per 10 s):
+- shellswim idle: passes, no change.
+- wim idle, reduced motion: passes, no change.
+- wim default motion: fails on bytes (640 KB); this is the animation, so any
+  change is a product choice (e.g. frame-rate cap or idle fade-out), not a bug.
+- wim reduced motion with search focused: fails on bytes (8.1 KB) and CPU is
+  1.1-1.2%, with roughly double the wakeups of idle. Something redraws or
+  wakes while the search box is focused (likely the cursor/prompt blink or a
+  poll interval); worth a follow-up investigation. No code was changed here.
