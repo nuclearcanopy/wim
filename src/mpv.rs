@@ -388,6 +388,9 @@ pub struct Mpv {
     child: Mutex<Child>,
     #[cfg_attr(not(unix), allow(dead_code))]
     sock_path: PathBuf,
+    /// where this mpv's pid is recorded for the next start to reap
+    #[cfg(all(unix, not(target_os = "linux")))]
+    pid_path: PathBuf,
     /// Resolved on the first command rather than at spawn.
     ///
     /// mpv creates its ipc socket 65-120ms after exec, which was 97%
@@ -458,7 +461,29 @@ fn reap_with_parent(cmd: &mut Command) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// FreeBSD has the equivalent in `procctl(PROC_PDEATHSIG_CTL)`; the
+/// pidfile sweep still backs it up. macOS and the other BSDs have
+/// nothing and rely on the pidfile alone.
+#[cfg(target_os = "freebsd")]
+fn reap_with_parent(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // safety: `pre_exec` runs between fork and exec; procctl is a syscall
+    // and nothing here allocates or takes a lock.
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut sig: libc::c_int = libc::SIGTERM;
+            libc::procctl(
+                libc::P_PID,
+                0,
+                libc::PROC_PDEATHSIG_CTL,
+                &mut sig as *mut libc::c_int as *mut libc::c_void,
+            );
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 fn reap_with_parent(_cmd: &mut Command) {}
 
 /// A wim killed with SIGKILL (or a crash) cannot unlink its mpv socket;
@@ -546,6 +571,103 @@ fn ensure_private_dir(dir: &Path, me: u32) -> std::io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
+/// Pidfiles stand in for `PR_SET_PDEATHSIG` where it does not exist
+/// (macOS and the BSDs): `wim-mpv-<wim pid>-<seq>.pid` holds mpv's pid
+/// and is removed on a clean drop. A wim killed outright leaves it
+/// behind, and the next start reaps the mpv if, and only if, the owning
+/// wim is gone and that pid is still a process named mpv.
+#[cfg(unix)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+mod pidfile {
+    use std::path::{Path, PathBuf};
+
+    pub fn file_name(wim_pid: u32, seq: u64) -> String {
+        format!("wim-mpv-{wim_pid}-{seq}.pid")
+    }
+
+    pub fn path(dir: &Path, wim_pid: u32, seq: u64) -> PathBuf {
+        dir.join(file_name(wim_pid, seq))
+    }
+
+    /// The owning wim pid out of a pidfile name, or None for any other file.
+    pub fn parse_owner(name: &str) -> Option<i32> {
+        let rest = name.strip_prefix("wim-mpv-")?.strip_suffix(".pid")?;
+        let (pid, seq) = rest.split_once('-')?;
+        seq.parse::<u64>().ok()?;
+        pid.parse::<i32>().ok().filter(|p| *p > 0)
+    }
+
+    /// The recorded mpv pid out of a pidfile's content.
+    pub fn parse_pid(content: &str) -> Option<i32> {
+        content.trim().parse::<i32>().ok().filter(|p| *p > 1)
+    }
+
+    /// `ps -o comm=` gives a bare name on the BSDs and a full path on
+    /// macOS; either way it is the last path component that counts.
+    pub fn is_mpv_name(comm: &str) -> bool {
+        comm.trim().rsplit('/').next() == Some("mpv")
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Verdict {
+        /// owner alive, or the pid is not (or no longer) an mpv: leave the process alone
+        Leave,
+        /// owner dead and the pid is still an mpv
+        Kill,
+    }
+
+    /// `comm` is the current name of the recorded pid, None if it is gone.
+    pub fn decide(owner_alive: bool, comm: Option<&str>) -> Verdict {
+        match comm {
+            Some(c) if !owner_alive && is_mpv_name(c) => Verdict::Kill,
+            _ => Verdict::Leave,
+        }
+    }
+
+    pub fn pid_exists(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the pid exists.
+        let r = unsafe { libc::kill(pid, 0) };
+        r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    pub fn comm_of(pid: i32) -> Option<String> {
+        let out = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !text.is_empty()).then_some(text)
+    }
+
+    /// Reap mpvs orphaned by dead wims, removing every pidfile whose
+    /// owner is gone.
+    pub fn sweep(dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(owner) = parse_owner(&name.to_string_lossy()) else {
+                continue;
+            };
+            if pid_exists(owner) {
+                continue;
+            }
+            let recorded = std::fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|c| parse_pid(&c));
+            if let Some(pid) = recorded {
+                let comm = comm_of(pid);
+                if decide(false, comm.as_deref()) == Verdict::Kill {
+                    // SAFETY: plain SIGTERM to a pid just verified to be an mpv.
+                    unsafe { libc::kill(pid, libc::SIGTERM) };
+                }
+            }
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Distinguishes two `Mpv`s spawned by the same process. The app only
 /// ever spawns one, but naming the socket by pid alone meant a second
 /// spawn deleted the first one's socket and both mpvs then answered on
@@ -572,6 +694,8 @@ impl Mpv {
         #[cfg(unix)]
         {
             sweep_stale_sockets(&sock_dir);
+            #[cfg(not(target_os = "linux"))]
+            pidfile::sweep(&sock_dir);
             let _ = std::fs::remove_file(&sock_path);
         }
         #[cfg(not(unix))]
@@ -619,6 +743,12 @@ impl Mpv {
         let child = cmd
             .spawn()
             .context("spawning mpv; is it installed and on PATH?")?;
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let pid_path = {
+            let path = pidfile::path(&sock_dir, std::process::id(), seq);
+            let _ = std::fs::write(&path, child.id().to_string());
+            path
+        };
 
         let pending: Arc<Mutex<HashMap<u64, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, event_rx) = mpsc::channel();
@@ -662,6 +792,8 @@ impl Mpv {
         Ok(Mpv {
             child: Mutex::new(child),
             sock_path,
+            #[cfg(all(unix, not(target_os = "linux")))]
+            pid_path,
             sock: Arc::new(Mutex::new(Link::Pending(link_rx))),
             next_id: Arc::new(AtomicU64::new(FIRST_COMMAND_ID)),
             pending,
@@ -1467,6 +1599,8 @@ impl Drop for Mpv {
         // mpv does not unlink it on exit, so every run left one behind.
         #[cfg(unix)]
         let _ = std::fs::remove_file(&self.sock_path);
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let _ = std::fs::remove_file(&self.pid_path);
     }
 }
 
@@ -1714,6 +1848,43 @@ mod bench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn pidfile_names_round_trip_and_reject_other_files() {
+        let n = pidfile::file_name(4242, 3);
+        assert_eq!(n, "wim-mpv-4242-3.pid");
+        assert_eq!(pidfile::parse_owner(&n), Some(4242));
+        assert_eq!(pidfile::parse_owner("wim-mpv-4242-3.sock"), None);
+        assert_eq!(pidfile::parse_owner("wim-mpv-x-3.pid"), None);
+        assert_eq!(pidfile::parse_owner("wim-mpv-0-3.pid"), None);
+        assert_eq!(pidfile::parse_owner("other.pid"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pidfile_content_parses_strictly() {
+        assert_eq!(pidfile::parse_pid("1234\n"), Some(1234));
+        assert_eq!(pidfile::parse_pid(""), None);
+        assert_eq!(pidfile::parse_pid("abc"), None);
+        assert_eq!(pidfile::parse_pid("1"), None);
+        assert_eq!(pidfile::parse_pid("-5"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_dead_owners_live_mpv_is_killed() {
+        use pidfile::Verdict::{Kill, Leave};
+        assert_eq!(pidfile::decide(false, Some("mpv")), Kill);
+        assert_eq!(
+            pidfile::decide(false, Some("/opt/homebrew/bin/mpv\n")),
+            Kill
+        );
+        assert_eq!(pidfile::decide(true, Some("mpv")), Leave);
+        assert_eq!(pidfile::decide(false, Some("firefox")), Leave);
+        assert_eq!(pidfile::decide(false, Some("mpv-wrapper")), Leave);
+        assert_eq!(pidfile::decide(false, None), Leave);
+    }
 
     #[cfg(unix)]
     #[test]
