@@ -14,6 +14,7 @@ use crate::core::{
 };
 use crate::download::DownloadEvent;
 use crate::notify::{Notifications, Severity};
+use crate::player::Player;
 use crate::playqueue::PlayQueue;
 use crate::search::SearchItem;
 use crate::shellsong::{Console, LineKind, Program};
@@ -419,6 +420,34 @@ impl SwimSession {
         match Program::parse_in(line, &world) {
             Ok(p) => self.submit_program(Box::new(p)),
             Err(e) => self.console.fail(e.to_string()),
+        }
+    }
+
+    /// Notes an mpv that timed out or exited, and reconciles the queue.
+    pub fn pump_player_health(&mut self, player: &dyn Player) {
+        if crate::mpv::reply_timeouts() != self.seen_reply_timeouts
+            && !self.mpv_exit_reported
+            && !player.background_active()
+            && self.last_reconcile.elapsed() >= Duration::from_secs(5)
+        {
+            self.last_reconcile = Instant::now();
+            if let Some(note) =
+                crate::core::reconcile_queue_after_timeout(player, &mut self.play_queue)
+            {
+                self.notifications.push(Severity::Alert, note);
+            }
+            self.seen_reply_timeouts = crate::mpv::reply_timeouts();
+        }
+        if !self.mpv_exit_reported {
+            if let Some(status) = player.exited() {
+                self.mpv_exit_reported = true;
+                self.notifications.push(
+                    Severity::Error,
+                    format!(
+                        "mpv exited ({status}); playback is unavailable until shellswim restarts"
+                    ),
+                );
+            }
         }
     }
 }

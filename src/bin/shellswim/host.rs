@@ -534,30 +534,7 @@ impl Host {
     /// Each one is a `try_recv`, so this is the whole reason nothing
     /// in shellswim blocks.
     pub fn pump(&mut self) {
-        if wim::mpv::reply_timeouts() != self.session.seen_reply_timeouts
-            && !self.session.mpv_exit_reported
-            && !self.player.background_active()
-            && self.session.last_reconcile.elapsed() >= Duration::from_secs(5)
-        {
-            self.session.last_reconcile = Instant::now();
-            if let Some(note) =
-                wim::core::reconcile_queue_after_timeout(&self.player, &mut self.session.play_queue)
-            {
-                self.session.notifications.push(Severity::Alert, note);
-            }
-            self.session.seen_reply_timeouts = wim::mpv::reply_timeouts();
-        }
-        if !self.session.mpv_exit_reported {
-            if let Some(status) = self.player.exited() {
-                self.session.mpv_exit_reported = true;
-                self.session.notifications.push(
-                    Severity::Error,
-                    format!(
-                        "mpv exited ({status}); playback is unavailable until shellswim restarts"
-                    ),
-                );
-            }
-        }
+        self.session.pump_player_health(&self.player);
         while let Ok(reply) = self.torbox_rx.try_recv() {
             self.torbox_pending = false;
             let now = self.session.start.elapsed();
