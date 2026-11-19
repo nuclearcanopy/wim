@@ -5,6 +5,10 @@ on:
     branches: [master]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -55,3 +59,27 @@ jobs:
             target/release/wim.exe
             target/release/shellswim.exe
           retention-days: 7
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: install mpv
+        run: brew install mpv
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: cargo build
+        run: cargo build --locked --bins
+      - name: cargo test
+        run: cargo test --locked
+      - name: add x86_64-apple-darwin target
+        run: rustup target add x86_64-apple-darwin
+      - name: cargo build (x86_64-apple-darwin)
+        run: cargo build --locked --target x86_64-apple-darwin --bins
+      - name: mpv integration tests (non-blocking)
+        continue-on-error: true
+        run: 'cargo test --locked -- --ignored mpv::'
