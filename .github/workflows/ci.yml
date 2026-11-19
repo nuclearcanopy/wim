@@ -99,6 +99,15 @@ jobs:
           xcodebuild test -scheme WimCore \
             -destination "platform=iOS Simulator,name=${device:-iPhone 16}" \
             CODE_SIGNING_ALLOWED=NO
+      - name: build the app for the simulator
+        working-directory: ios
+        run: |
+          brew install xcodegen
+          xcodegen generate
+          device=$(xcrun simctl list devices available | grep -m1 'iPhone' | sed 's/^ *//; s/ (.*//')
+          xcodebuild build -project Shellswim.xcodeproj -scheme Shellswim \
+            -destination "platform=iOS Simulator,name=${device:-iPhone 16}" \
+            CODE_SIGNING_ALLOWED=NO
 
   freebsd:
     runs-on: ubuntu-latest
