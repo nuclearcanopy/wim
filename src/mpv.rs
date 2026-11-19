@@ -529,10 +529,12 @@ fn fallback_sock_dir() -> Result<PathBuf> {
         let dir = private_sock_dir_path(&std::env::temp_dir(), uid);
         ensure_private_dir(&dir, uid)
             .with_context(|| format!("mpv socket directory {} is not usable", dir.display()))?;
-        return Ok(dir);
+        Ok(dir)
     }
     #[cfg(not(all(unix, not(target_os = "linux"))))]
-    Ok(std::env::temp_dir())
+    {
+        Ok(std::env::temp_dir())
+    }
 }
 
 /// `<tmp>/wim-<uid>`.
