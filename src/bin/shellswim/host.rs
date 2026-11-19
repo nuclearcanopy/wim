@@ -1519,8 +1519,8 @@ mod startup_path_tests {
     /// `reduced_motion` must reach both binaries through the shared rule.
     #[test]
     fn both_binaries_wire_reduced_motion() {
-        assert!(WIM_MAIN.contains("reduced_motion_wanted("));
-        assert!(MAIN.contains("reduced_motion_wanted("));
+        assert!(WIM_MAIN.contains("init_reduced_motion("));
+        assert!(MAIN.contains("init_reduced_motion("));
     }
 
     /// The text from `header` to the next line that closes the function at
