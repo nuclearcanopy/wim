@@ -40,3 +40,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo test (lib)
         run: cargo test --lib --locked
+      - name: cargo build (release bins)
+        run: cargo build --release --locked --bins
+      - name: check release binaries
+        shell: pwsh
+        run: |
+          foreach ($f in 'target\release\wim.exe', 'target\release\shellswim.exe') {
+            if (-not (Test-Path $f)) { throw "missing $f" }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wim-windows-x64-bins
+          path: |
+            target/release/wim.exe
+            target/release/shellswim.exe
+          retention-days: 7
