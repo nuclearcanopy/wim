@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -108,6 +109,45 @@ pub const PROP_SPECTRUM: &str = "af-metadata/wimlevel";
 /// this value; af being cleared or playback stopping both push an
 /// explicit "no value" that clears it immediately.
 const LEVEL_FRESH_FOR: Duration = Duration::from_millis(300);
+
+/// The IPC byte stream to mpv. mpv serves a Unix socket on unix and a
+/// named pipe (`\\.\pipe\NAME`) on Windows; a pipe opened as a file
+/// is a plain `Read + Write` handle with `try_clone`.
+///
+/// Windows trade-off: a `File` has no read or write timeout, so the
+/// reader thread blocks until mpv closes the pipe (child exit or kill
+/// ends it) and the 2s write timeout is not applied.
+#[cfg(unix)]
+type IpcStream = UnixStream;
+#[cfg(windows)]
+type IpcStream = std::fs::File;
+
+#[cfg(unix)]
+fn open_ipc(path: &Path) -> std::io::Result<IpcStream> {
+    UnixStream::connect(path)
+}
+
+#[cfg(windows)]
+fn open_ipc(path: &Path) -> std::io::Result<IpcStream> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn set_ipc_write_timeout(sock: &IpcStream, timeout: Duration) {
+    let _ = sock.set_write_timeout(Some(timeout));
+}
+
+#[cfg(windows)]
+fn set_ipc_write_timeout(_sock: &IpcStream, _timeout: Duration) {}
+
+/// Pipe name unique to this process and spawn.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn pipe_name(pid: u32, seq: u64) -> String {
+    format!(r"\\.\pipe\wim-mpv-{pid}-{seq}")
+}
 
 /// Property-change and other async events pushed by mpv over the IPC socket.
 #[derive(Debug, Clone)]
@@ -346,6 +386,7 @@ impl Drop for BackgroundCommand {
 /// matches how mpv is normally driven by external controllers.
 pub struct Mpv {
     child: Mutex<Child>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     sock_path: PathBuf,
     /// Resolved on the first command rather than at spawn.
     ///
@@ -364,8 +405,8 @@ pub struct Mpv {
 /// The ipc socket, before and after the connector thread finds it.
 enum Link {
     /// Waiting on the connector. The receiver yields exactly once.
-    Pending(Receiver<Result<UnixStream, String>>),
-    Live(UnixStream),
+    Pending(Receiver<Result<IpcStream, String>>),
+    Live(IpcStream),
     /// mpv never came up. Kept rather than retried: a connect that
     /// already spent its budget will not start working, and every
     /// later command should say the same thing instead of each paying
@@ -422,6 +463,7 @@ fn reap_with_parent(_cmd: &mut Command) {}
 
 /// A wim killed with SIGKILL (or a crash) cannot unlink its mpv socket;
 /// clear the ones whose owning pid is gone so they do not pile up.
+#[cfg(unix)]
 fn sweep_stale_sockets(dir: &Path) {
     #[cfg(unix)]
     {
@@ -447,8 +489,6 @@ fn sweep_stale_sockets(dir: &Path) {
             }
         }
     }
-    #[cfg(not(unix))]
-    let _ = dir;
 }
 
 /// Distinguishes two `Mpv`s spawned by the same process. The app only
@@ -466,13 +506,18 @@ impl Mpv {
             .map(PathBuf::from)
             .filter(|dir| dir.is_dir())
             .unwrap_or_else(std::env::temp_dir);
-        let sock_path = sock_dir.join(format!(
-            "wim-mpv-{}-{}.sock",
-            std::process::id(),
-            SPAWN_SEQ.fetch_add(1, Ordering::SeqCst)
-        ));
-        sweep_stale_sockets(&sock_dir);
-        let _ = std::fs::remove_file(&sock_path);
+        let seq = SPAWN_SEQ.fetch_add(1, Ordering::SeqCst);
+        #[cfg(unix)]
+        let sock_path = sock_dir.join(format!("wim-mpv-{}-{}.sock", std::process::id(), seq));
+        #[cfg(windows)]
+        let sock_path = PathBuf::from(pipe_name(std::process::id(), seq));
+        #[cfg(unix)]
+        {
+            sweep_stale_sockets(&sock_dir);
+            let _ = std::fs::remove_file(&sock_path);
+        }
+        #[cfg(not(unix))]
+        let _ = &sock_dir;
 
         let mut cmd = Command::new("mpv");
         cmd.arg("--idle=yes")
@@ -542,7 +587,7 @@ impl Mpv {
             };
             // A stalled mpv must not block a writer (holding the link lock)
             // forever. SO_SNDTIMEO only affects writes, not the reader.
-            let _ = sock.set_write_timeout(Some(Duration::from_secs(2)));
+            set_ipc_write_timeout(&sock, Duration::from_secs(2));
             thread::spawn(move || read_replies(reader_sock, reader_pending, event_tx));
             // the setup goes down the socket *before* it is published,
             // so a command the user typed in the first 70ms cannot
@@ -570,12 +615,12 @@ impl Mpv {
     /// Resolves the socket if the connector has finished, and runs `f`
     /// on it. The first caller pays whatever is left of mpv's startup;
     /// every one after it pays a mutex.
-    fn with_sock<R>(&self, f: impl FnOnce(&mut UnixStream) -> Result<R>) -> Result<R> {
+    fn with_sock<R>(&self, f: impl FnOnce(&mut IpcStream) -> Result<R>) -> Result<R> {
         with_sock(&self.sock, f)
     }
 }
 
-fn with_sock<R>(link: &Mutex<Link>, f: impl FnOnce(&mut UnixStream) -> Result<R>) -> Result<R> {
+fn with_sock<R>(link: &Mutex<Link>, f: impl FnOnce(&mut IpcStream) -> Result<R>) -> Result<R> {
     let mut guard = link.lock().unwrap();
     if let Link::Pending(rx) = &*guard {
         *guard = match rx.recv() {
@@ -595,13 +640,13 @@ fn with_sock<R>(link: &Mutex<Link>, f: impl FnOnce(&mut UnixStream) -> Result<R>
 /// this box. A flat 20ms sleep per attempt spent most of that asleep
 /// past the socket actually being ready, so back off instead: 1ms
 /// doubling to 20ms, same ~1s total budget.
-fn connect(sock_path: &Path) -> Result<UnixStream, String> {
+fn connect(sock_path: &Path) -> Result<IpcStream, String> {
     const CONNECT_BUDGET: Duration = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_millis(20);
     let mut waited = Duration::ZERO;
     let mut backoff = Duration::from_millis(1);
     loop {
-        match UnixStream::connect(sock_path) {
+        match open_ipc(sock_path) {
             Ok(s) => return Ok(s),
             Err(_) if waited < CONNECT_BUDGET => {
                 thread::sleep(backoff);
@@ -629,7 +674,7 @@ fn connect(sock_path: &Path) -> Result<UnixStream, String> {
 /// describes an mpv that has not started playing. That ordering is
 /// the front-end's to choose, so each one still calls
 /// `observe_playback` itself.
-fn write_setup(sock: &mut UnixStream) -> Result<(), String> {
+fn write_setup(sock: &mut IpcStream) -> Result<(), String> {
     let lines: Vec<Vec<Value>> = vec![vec![
         json!("set_property"),
         json!("replaygain"),
@@ -680,7 +725,7 @@ fn observe_commands() -> Vec<Vec<Value>> {
 
 /// The reply reader, formerly inline in `spawn`.
 fn read_replies(
-    reader_sock: UnixStream,
+    reader_sock: IpcStream,
     reader_pending: Arc<Mutex<HashMap<u64, Pending>>>,
     event_tx: Sender<Event>,
 ) {
@@ -1362,6 +1407,7 @@ impl Drop for Mpv {
             std::thread::sleep(Duration::from_millis(10));
         }
         // mpv does not unlink it on exit, so every run left one behind.
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.sock_path);
     }
 }
@@ -1771,7 +1817,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod reader_survives_garbage_tests {
     use super::*;
 
@@ -1806,6 +1852,24 @@ mod reader_survives_garbage_tests {
         drop(mpv_side);
         read_replies(wim_side, pending, event_tx);
         assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+    }
+}
+
+#[cfg(test)]
+mod pipe_name_tests {
+    use super::*;
+
+    #[test]
+    fn pipe_names_are_unique_per_pid_and_spawn() {
+        assert_eq!(pipe_name(7, 0), r"\\.\pipe\wim-mpv-7-0");
+        assert_ne!(pipe_name(7, 0), pipe_name(7, 1));
+        assert_ne!(pipe_name(7, 0), pipe_name(8, 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opening_a_missing_pipe_fails_without_panicking() {
+        assert!(open_ipc(Path::new(&pipe_name(u32::MAX, u64::MAX))).is_err());
     }
 }
 
