@@ -5,6 +5,11 @@ edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "terminal omniplayer for music and video"
 
+[workspace]
+members = [".", "crates/wim-mobile"]
+# plain `cargo build`/`cargo test` (and the nix build) stay on the root package.
+default-members = ["."]
+
 [lib]
 name = "wim"
 path = "src/lib.rs"
