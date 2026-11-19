@@ -104,6 +104,7 @@ jobs:
         run: |
           brew install xcodegen
           xcodegen generate
+          grep -q '<string>audio</string>' Config/Info.plist
           device=$(xcrun simctl list devices available | grep -m1 'iPhone' | sed 's/^ *//; s/ (.*//')
           xcodebuild build -project Shellswim.xcodeproj -scheme Shellswim \
             -destination "platform=iOS Simulator,name=${device:-iPhone 16}" \

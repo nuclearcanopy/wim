@@ -16,6 +16,11 @@ targets:
     type: application
     platform: iOS
     sources: [Shellswim]
+    # xcodegen writes this plist (gitignored) and Xcode merges the generated keys.
+    info:
+      path: Config/Info.plist
+      properties:
+        UIBackgroundModes: [audio]
     dependencies:
       - package: WimCore
         product: WimCore
