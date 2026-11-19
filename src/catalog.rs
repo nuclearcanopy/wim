@@ -408,13 +408,7 @@ pub fn test_navidrome_connectivity(
                     Err(_) => crate::navmanager::ConnectionStatus::ConfigurationIssue,
                     // Ping the client the app actually uses so this tests
                     // the same pool and resolved credentials.
-                    Ok(client) => match client.ping() {
-                        Ok(()) => crate::navmanager::ConnectionStatus::Online,
-                        Err(error) if is_authentication_failure(&error) => {
-                            crate::navmanager::ConnectionStatus::ConfigurationIssue
-                        }
-                        Err(_) => crate::navmanager::ConnectionStatus::Unreachable,
-                    },
+                    Ok(client) => crate::navmanager::ConnectionStatus::from(&client.reachability()),
                 })
             })
             .collect::<Vec<_>>()
@@ -455,10 +449,6 @@ pub fn spawn_connectivity_check(
     rx
 }
 
-fn is_authentication_failure(error: &anyhow::Error) -> bool {
-    is_authentication_message(&error.to_string())
-}
-
 pub fn is_authentication_message(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     [
@@ -474,7 +464,7 @@ pub fn is_authentication_message(message: &str) -> bool {
 
 #[cfg(test)]
 mod connectivity_error_tests {
-    use super::is_authentication_failure;
+    use super::is_authentication_message;
 
     #[test]
     fn auth_and_permission_refusals_are_not_reported_as_network_outages() {
@@ -484,17 +474,10 @@ mod connectivity_error_tests {
             "ping: http 401",
             "ping: http 403",
         ] {
-            assert!(
-                is_authentication_failure(&anyhow::anyhow!(message)),
-                "{message}"
-            );
+            assert!(is_authentication_message(message), "{message}");
         }
-        assert!(!is_authentication_failure(&anyhow::anyhow!(
-            "ping: http 502"
-        )));
-        assert!(!is_authentication_failure(&anyhow::anyhow!(
-            "ping: timed out"
-        )));
+        assert!(!is_authentication_message("ping: http 502"));
+        assert!(!is_authentication_message("ping: timed out"));
     }
 }
 
