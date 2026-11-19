@@ -3835,7 +3835,6 @@ fn main() -> anyhow::Result<()> {
         let pause_settling = paused_since.is_some_and(|at| at.elapsed() < PAUSE_SETTLE);
         let animating_beyond_banner = !tiers.static_modal()
             && (selection_pulsing
-                || app.editing_query
                 || console_open
                 // a program resumes a frame at a time, so dropping to
                 // the idle poll would make an awaited search crawl.
@@ -3857,6 +3856,9 @@ fn main() -> anyhow::Result<()> {
                 || between_tracks.holding()
                 || input_mode == InputMode::Move
                 || flash.is_some_and(|(_, at)| at.elapsed() < FLASH_DURATION));
+        // the caret is the only motion left: sleep to its next flip
+        // rather than redrawing at the animation rate for identical frames.
+        let caret_only = app.editing_query && !tiers.static_modal();
         let animating = animating_beyond_banner || (!tiers.static_modal() && banner_showing);
         let input_ready = player_initialized && !app.loading_cached_catalog;
         let timeout = if cached_entries.is_some() {
@@ -3878,6 +3880,8 @@ fn main() -> anyhow::Result<()> {
             // the banner's motions have 4s+ periods; presenting them at
             // the display rate only burns cpu and terminal bytes
             frame.interval().max(anim::BANNER_FRAME_INTERVAL)
+        } else if caret_only {
+            anim::until_next_blink(start.elapsed(), anim::CURSOR_BLINK).min(anim::IDLE_POLL)
         } else {
             anim::IDLE_POLL
         };
