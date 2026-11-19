@@ -138,7 +138,7 @@ pub fn known_protocol_in(term: &str, program: &str) -> Option<ProtocolType> {
     }
     if term == "xterm-kitty" || term == "xterm-ghostty" || program == "ghostty" {
         Some(ProtocolType::Kitty)
-    } else if program.contains("wezterm") {
+    } else if program.contains("wezterm") || program == "iterm.app" {
         Some(ProtocolType::Iterm2)
     } else {
         None
@@ -166,7 +166,11 @@ fn known_picker() -> Option<Picker> {
 /// The decision itself, split from reading the environment so it is
 /// testable without mutating process-wide state.
 pub fn graphics_plausible_in(term: &str, program: &str) -> bool {
-    let known_blind = |s: &str| s.to_lowercase().contains("alacritty");
+    // Apple's Terminal.app has no graphics protocol either
+    let known_blind = |s: &str| {
+        let s = s.to_lowercase();
+        s.contains("alacritty") || s == "apple_terminal"
+    };
     !(known_blind(term) || known_blind(program))
 }
 
@@ -182,6 +186,23 @@ mod graphics_probe_tests {
     fn a_terminal_with_no_graphics_protocol_is_not_probed() {
         assert!(!graphics_plausible_in("alacritty", ""));
         assert!(!graphics_plausible_in("xterm-256color", "Alacritty"));
+    }
+
+    #[test]
+    fn apple_terminal_is_not_probed_but_iterm_and_unknown_are() {
+        assert!(!graphics_plausible_in("xterm-256color", "Apple_Terminal"));
+        assert!(graphics_plausible_in("xterm-256color", "iTerm.app"));
+        assert!(graphics_plausible_in("xterm-256color", ""));
+    }
+
+    #[test]
+    fn iterm_maps_to_the_iterm2_protocol_except_under_tmux() {
+        assert_eq!(
+            known_protocol_in("xterm-256color", "iTerm.app"),
+            Some(ProtocolType::Iterm2)
+        );
+        assert_eq!(known_protocol_in("tmux-256color", "iTerm.app"), None);
+        assert_eq!(known_protocol_in("xterm-256color", "Apple_Terminal"), None);
     }
 
     #[test]
