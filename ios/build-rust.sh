@@ -17,6 +17,7 @@ done
 
 rm -rf "$out"
 ios/gen-swift.sh "target/$sim/release/libwim_mobile.a" "$out"
+mkdir -p "$pkg/Sources/WimCore"
 cp "$out/wim_mobile.swift" "$pkg/Sources/WimCore/"
 
 # xcframework headers: the module map must be named module.modulemap.
