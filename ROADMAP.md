@@ -549,6 +549,7 @@ and `in-workspace (sub-rect) video` is still kitty-only via
       frame rendering was removed; do not restore the renderer.
       Historical renderer implementation details below are retained as
       audit notes only; they are not active follow-up work.
+      Removed in ae844a4; mpv owns rendering. Kept here as history.
       - [x] **the opt-in itself.** `VideoOutput::Ascii` parses as
         `video_output = "ascii"`, and the decision grew a **third
         answer**: "mpv draws nothing" and "there is no video" were the
