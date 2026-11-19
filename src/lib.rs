@@ -49,6 +49,8 @@ pub mod subtitle_align;
 pub mod suggest;
 pub mod swimconsole;
 pub mod term;
+#[cfg(test)]
+mod test_util;
 pub mod theme;
 pub mod torbox;
 pub mod torbox_workspace;
