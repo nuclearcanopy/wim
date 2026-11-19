@@ -28,7 +28,7 @@ macro_rules! core_ctx {
             downloading: &mut $h.downloading,
             scrobble: &mut $h.scrobble,
             subtitle_tx: &$h.subtitle_tx,
-            console: &mut $h.console,
+            console: &mut $h.session.console,
             now: $now,
             now_playing: &$np,
             favorites: &mut $h.favorites,
@@ -66,9 +66,9 @@ use wim::download::DownloadEvent;
 use wim::notify::{Notifications, Severity};
 use wim::playqueue::{PlayQueue, PosChange};
 use wim::search::SearchItem;
-use wim::shellsong::{Console, LineKind, Op, Program};
+use wim::shellsong::{LineKind, Op, Program};
 use wim::shellsong_host::{CorpusCandidates, Ramp, SearchSettle};
-use wim::swimsession::place_submitted_program;
+use wim::swimsession::{place_submitted_program, SwimSession};
 use wim::ui::results_list::label;
 use wim::{app, cache, config, favorites, library, lyrics, mpv, search};
 
@@ -358,7 +358,7 @@ pub struct Host {
     /// so snapshotted rather than done per keystroke.
     pub scripts: Vec<String>,
     pub playback: mpv::Playback,
-    pub console: Console,
+    pub session: SwimSession,
     pub program: Option<Box<Program>>,
     queued_programs: VecDeque<Box<Program>>,
     pub swim: SwimSurface,
@@ -590,7 +590,7 @@ impl Host {
             bindings: wim::shellsong_host::load_bindings(),
             scripts: wim::shellsong_host::script_names(),
             playback: mpv::Playback::default(),
-            console: Console::new(),
+            session: SwimSession::new(),
             program: None,
             queued_programs: VecDeque::new(),
             swim: SwimSurface::default(),
@@ -644,7 +644,8 @@ impl Host {
             self.notifications.push(Severity::Alert, warning);
         }
         if let Some(error) = outcome.observe_error {
-            self.console.error = Some(format!("mpv will not report playback position: {error}"));
+            self.session.console.error =
+                Some(format!("mpv will not report playback position: {error}"));
         }
     }
 
@@ -955,7 +956,8 @@ impl Host {
                 self.remote_starred.insert(failed.id.clone());
             }
             let verb = if failed.wanted { "star" } else { "unstar" };
-            self.console
+            self.session
+                .console
                 .note(format!("couldn't {verb}: {}", failed.error));
         }
         while let Ok(failed) = self.scrobble_failed_rx.try_recv() {
@@ -979,22 +981,26 @@ impl Host {
                         let text = wim::core::lyrics_text(&l);
                         let count = text.lines().count();
                         for line in text.lines() {
-                            self.console.note(line.to_string());
+                            self.session.console.note(line.to_string());
                         }
                         if let Some(attribution) = l.attribution.as_deref() {
-                            self.console.note(attribution.to_owned());
+                            self.session.console.note(attribution.to_owned());
                         }
-                        self.console.note(format!("{count} lines for {track}"));
+                        self.session
+                            .console
+                            .note(format!("{count} lines for {track}"));
                         self.swim.lyrics_requested = false;
                     }
                 }
                 Ok(None) => {
                     self.swim.lyrics_requested = false;
-                    self.console.note(format!("no lyrics for {track}"));
+                    self.session.console.note(format!("no lyrics for {track}"));
                 }
                 Err(e) => {
                     self.swim.lyrics_requested = false;
-                    self.console.note(format!("lyrics lookup failed: {e}"));
+                    self.session
+                        .console
+                        .note(format!("lyrics lookup failed: {e}"));
                 }
             }
         }
@@ -1039,10 +1045,11 @@ impl Host {
                 self.app.loop_mode,
             ) {
                 core::Drained::Stale => {}
-                core::Drained::Cleared => self.console.note("queue finished".to_string()),
-                core::Drained::Failed(why) => self.console.fail(why),
+                core::Drained::Cleared => self.session.console.note("queue finished".to_string()),
+                core::Drained::Failed(why) => self.session.console.fail(why),
                 core::Drained::Restarted(track) => {
-                    self.console
+                    self.session
+                        .console
                         .note(format!("looped back to: {}", label(&track)));
                     advanced = Some(track);
                 }
@@ -1066,10 +1073,10 @@ impl Host {
             let mut shown = HashSet::new();
             let lines = core::echo_lines(self.app.results(), &mut shown, self.console_width());
             if lines.is_empty() {
-                self.console.note("no matches".to_string());
+                self.session.console.note("no matches".to_string());
             }
             for line in lines {
-                self.console.note(line);
+                self.session.console.note(line);
             }
             self.echoed = Some((self.app.query.clone(), shown));
         }
@@ -1081,7 +1088,9 @@ impl Host {
             // for audio or when no OpenSubtitles key is configured.
             core::fire_subtitle_fetch(&self.cfg, &self.subtitle_tx, &track);
             if self.play_queue.current().is_some() {
-                self.console.note(format!("now playing: {}", label(&track)));
+                self.session
+                    .console
+                    .note(format!("now playing: {}", label(&track)));
             }
             let now = self.start.elapsed();
             let np = Some(track.clone());
@@ -1100,7 +1109,7 @@ impl Host {
                 self.swim.queued = Some(Box::new(wim::shellsong::Program::of(started.ops)));
             }
             if let Some(bound) = started.bound {
-                self.console.note(bound);
+                self.session.console.note(bound);
             }
             if self.interactive_prompt && (self.lyrics_pane.is_open() || self.swim.lyrics_requested)
             {
@@ -1151,7 +1160,7 @@ impl Host {
         if self.resume_due.is_some_and(|due| now >= due) {
             self.resume_due = None;
             let _ = self.player.set_pause(false);
-            self.console.note("resumed".to_string());
+            self.session.console.note("resumed".to_string());
         }
         if let Some(due) = self.sleep_due {
             let fade =
@@ -1169,7 +1178,7 @@ impl Host {
                     let _ = self.player.set_volume(self.base_volume);
                     self.notifications
                         .push(Severity::Info, "sleep timer: paused");
-                    self.console.note("slept".to_string());
+                    self.session.console.note("slept".to_string());
                 }
             }
         }
@@ -1244,9 +1253,11 @@ impl Host {
                 if *query == self.app.query {
                     let lines = core::echo_lines(self.app.results(), shown, avail);
                     if !lines.is_empty() {
-                        self.console.note("...and from the servers:".to_string());
+                        self.session
+                            .console
+                            .note("...and from the servers:".to_string());
                         for line in lines {
-                            self.console.note(line);
+                            self.session.console.note(line);
                         }
                     }
                 }
@@ -1257,11 +1268,12 @@ impl Host {
                 DownloadEvent::Progress { .. } => {}
                 DownloadEvent::Done { id, label } => {
                     self.downloading.remove(&id);
-                    self.console.note(format!("downloaded: {label}"));
+                    self.session.console.note(format!("downloaded: {label}"));
                 }
                 DownloadEvent::Failed { id, label, error } => {
                     self.downloading.remove(&id);
-                    self.console
+                    self.session
+                        .console
                         .fail(format!("download failed for {label}: {error}"));
                 }
             }
@@ -1277,14 +1289,14 @@ impl Host {
                 // said rather than swallowed: only "no subtitles for
                 // this film" is silent now, so a refused key does not
                 // look like one.
-                core::SubtitleOutcome::Failed { why, .. } => self.console.fail(why),
+                core::SubtitleOutcome::Failed { why, .. } => self.session.console.fail(why),
             }
         }
         // notifications are wim's toast channel; an overlay here would
         // cover the thing it is talking about, so the text goes into
         // the scrollback, which is the only output shellswim has.
         for note in self.notifications.drain_text() {
-            self.console.note(note);
+            self.session.console.note(note);
         }
     }
 
@@ -1350,7 +1362,7 @@ impl Host {
             program,
         ) {
             Some(program) => self.program = Some(program),
-            None => self.console.note(format!(
+            None => self.session.console.note(format!(
                 "queued command ({} waiting)",
                 self.queued_programs.len()
             )),
@@ -1364,7 +1376,9 @@ impl Host {
     /// Parses a line against the live bindings and script directory,
     /// the same environment used by interactive submission.
     pub fn begin(&mut self, line: &str) {
-        self.console.push(LineKind::Command, line.to_string());
+        self.session
+            .console
+            .push(LineKind::Command, line.to_string());
         let read = |name: &str| wim::shellsong_host::read_script(name);
         let world = wim::shellsong::World {
             scope: &self.vars,
@@ -1372,7 +1386,7 @@ impl Host {
         };
         match Program::parse_in(line, &world) {
             Ok(p) => self.submit_program(Box::new(p)),
-            Err(e) => self.console.fail(e.to_string()),
+            Err(e) => self.session.console.fail(e.to_string()),
         }
     }
 
@@ -1391,7 +1405,9 @@ impl Host {
                 }
                 if self.has_program_work() {
                     if Instant::now() >= deadline {
-                        self.console.fail(format!("gave up waiting on '{line}'"));
+                        self.session
+                            .console
+                            .fail(format!("gave up waiting on '{line}'"));
                         self.program = None;
                         self.queued_programs.clear();
                         self.swim.queued = None;
@@ -1404,7 +1420,11 @@ impl Host {
         // one last drain, so a download or a track change that landed
         // on the way out still gets reported.
         self.pump();
-        self.console.lines.iter().any(|l| l.kind == LineKind::Error)
+        self.session
+            .console
+            .lines
+            .iter()
+            .any(|l| l.kind == LineKind::Error)
     }
 
     fn request_lyrics(&mut self, item: &SearchItem) {

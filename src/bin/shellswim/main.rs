@@ -100,7 +100,7 @@ fn oneshot(cli: &Cli) -> anyhow::Result<()> {
     host.wait_startup_catalog();
     wim::trace_mark!("host ready (no terminal)");
     let failed = host.run_lines(&lines);
-    for line in &host.console.lines {
+    for line in &host.session.console.lines {
         // the command is echoed by the console; a pipe wants the
         // answers, not the question.
         match line.kind {
@@ -144,7 +144,7 @@ fn prompt() -> anyhow::Result<()> {
     wim::trace_mark!("terminal ready");
 
     let mut keymap = Keymap::from_overrides(&host.cfg.keybinds);
-    banner(&mut host.console, &host.cfg, &keymap);
+    banner(&mut host.session.console, &host.cfg, &keymap);
     let mut first_frame = true;
     let mut queue_open = false;
     let mut queue_selected = 0usize;
@@ -190,7 +190,7 @@ fn prompt() -> anyhow::Result<()> {
                     wim::trace_mark!("player observed");
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    host.console.error = Some("mpv startup worker stopped".to_owned());
+                    host.session.console.error = Some("mpv startup worker stopped".to_owned());
                     observing = None;
                     player_observed = true;
                 }
@@ -201,7 +201,7 @@ fn prompt() -> anyhow::Result<()> {
             match host.poll_startup_cache() {
                 Ok(ready) => cache_ready = ready,
                 Err(error) => {
-                    host.console.error = Some(error.to_string());
+                    host.session.console.error = Some(error.to_string());
                     cache_failed = true;
                     cache_ready = true;
                 }
@@ -263,7 +263,7 @@ fn prompt() -> anyhow::Result<()> {
         draw(
             &mut guard,
             &Screen {
-                console: &host.console,
+                console: &host.session.console,
                 playback: &host.playback,
                 queue: &host.play_queue,
                 now_playing: &now_playing,
@@ -334,7 +334,7 @@ fn prompt() -> anyhow::Result<()> {
             || nav.is_some()
             || host.lyrics_pane.is_open()
             || host.has_program_work()
-            || host.console.cycle().is_some()
+            || host.session.console.cycle().is_some()
             || (now_playing.is_some() && !host.playback.paused);
         let timeout = if host.has_cached_rows_pending() {
             Duration::from_micros(1)
@@ -371,9 +371,9 @@ fn prompt() -> anyhow::Result<()> {
                 // `paste` recomputes the suggestion, so it takes the
                 // candidates too; a ghost-less paste was a real bug
                 // (docs/shellsong.md).
-                let mut console = std::mem::take(&mut host.console);
+                let mut console = std::mem::take(&mut host.session.console);
                 console.paste(&text, &host.candidates());
-                host.console = console;
+                host.session.console = console;
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 // ctrl+c and ctrl+d are a shell's own exits; `quit()`
@@ -410,8 +410,12 @@ fn prompt() -> anyhow::Result<()> {
                                     .insert("musixmatch".into(), setup.key_file.trim().to_owned());
                             }
                             match config::save(&host.cfg) {
-                                Ok(()) => host.console.note("lyrics setup saved".to_owned()),
-                                Err(error) => host.console.fail(format!("saving config: {error}")),
+                                Ok(()) => {
+                                    host.session.console.note("lyrics setup saved".to_owned())
+                                }
+                                Err(error) => {
+                                    host.session.console.fail(format!("saving config: {error}"))
+                                }
                             }
                             host.lyrics_client = wim::lyrics::Client::with_providers(
                                 host.cfg.lyrics.providers.clone(),
@@ -443,7 +447,8 @@ fn prompt() -> anyhow::Result<()> {
                     {
                         subtitle_menu_open = false;
                         if let Err(error) = config::save(&host.cfg) {
-                            host.console
+                            host.session
+                                .console
                                 .fail(format!("saving subtitle settings: {error}"));
                         }
                     } else {
@@ -459,19 +464,26 @@ fn prompt() -> anyhow::Result<()> {
                                     % wim::ui::subtitle_menu::FIELD_COUNT;
                             }
                             KeyCode::Char('n') => match host.player.cycle_subtitle_track() {
-                                Ok(Some(message)) => host.console.note(message),
-                                Ok(None) => host.console.note("no subtitle tracks in this video"),
-                                Err(error) => host.console.fail(format!("subtitle track: {error}")),
+                                Ok(Some(message)) => host.session.console.note(message),
+                                Ok(None) => host
+                                    .session
+                                    .console
+                                    .note("no subtitle tracks in this video"),
+                                Err(error) => host
+                                    .session
+                                    .console
+                                    .fail(format!("subtitle track: {error}")),
                             },
                             KeyCode::Char('x') => match host.player.toggle_subtitle_visibility() {
-                                Ok(visible) => host.console.note(if visible {
+                                Ok(visible) => host.session.console.note(if visible {
                                     "subtitles visible"
                                 } else {
                                     "subtitles hidden"
                                 }),
-                                Err(error) => {
-                                    host.console.fail(format!("subtitle visibility: {error}"))
-                                }
+                                Err(error) => host
+                                    .session
+                                    .console
+                                    .fail(format!("subtitle visibility: {error}")),
                             },
                             KeyCode::Char('h') | KeyCode::Left => {
                                 adjust_subtitle_field(
@@ -481,7 +493,8 @@ fn prompt() -> anyhow::Result<()> {
                                 );
                                 host.player.set_subtitle_style(&host.cfg.subtitles);
                                 if let Err(error) = config::save(&host.cfg) {
-                                    host.console
+                                    host.session
+                                        .console
                                         .fail(format!("saving subtitle settings: {error}"));
                                 }
                             }
@@ -493,7 +506,8 @@ fn prompt() -> anyhow::Result<()> {
                                 );
                                 host.player.set_subtitle_style(&host.cfg.subtitles);
                                 if let Err(error) = config::save(&host.cfg) {
-                                    host.console
+                                    host.session
+                                        .console
                                         .fail(format!("saving subtitle settings: {error}"));
                                 }
                             }
@@ -763,7 +777,9 @@ fn prompt() -> anyhow::Result<()> {
                                 keymap.set(action, key.code);
                                 host.cfg.keybinds = keymap.overrides();
                                 if let Err(error) = config::save(&host.cfg) {
-                                    host.console.fail(format!("saving keybinds: {error}"));
+                                    host.session
+                                        .console
+                                        .fail(format!("saving keybinds: {error}"));
                                 }
                             }
                         }
@@ -787,14 +803,18 @@ fn prompt() -> anyhow::Result<()> {
                                 keymap.reset(ALL_ACTIONS[keybinds_selected]);
                                 host.cfg.keybinds = keymap.overrides();
                                 if let Err(error) = config::save(&host.cfg) {
-                                    host.console.fail(format!("saving keybinds: {error}"));
+                                    host.session
+                                        .console
+                                        .fail(format!("saving keybinds: {error}"));
                                 }
                             }
                             KeyCode::Char('R') => {
                                 keymap.reset_all();
                                 host.cfg.keybinds = keymap.overrides();
                                 if let Err(error) = config::save(&host.cfg) {
-                                    host.console.fail(format!("saving keybinds: {error}"));
+                                    host.session
+                                        .console
+                                        .fail(format!("saving keybinds: {error}"));
                                 }
                             }
                             _ => {}
@@ -830,12 +850,14 @@ fn prompt() -> anyhow::Result<()> {
                                 .player
                                 .set_property("playlist-pos", serde_json::json!(queue_selected))
                             {
-                                host.console.fail(format!("error jumping: {error}"));
+                                host.session.console.fail(format!("error jumping: {error}"));
                             }
                         }
                         KeyCode::Char('d') if host.play_queue.remove(queue_selected) => {
                             if let Err(error) = host.player.playlist_remove(queue_selected) {
-                                host.console.fail(format!("error removing: {error}"));
+                                host.session
+                                    .console
+                                    .fail(format!("error removing: {error}"));
                             }
                             queue_selected = queue_selected
                                 .min(host.play_queue.entries().len().saturating_sub(1));
@@ -858,7 +880,7 @@ fn prompt() -> anyhow::Result<()> {
                                 if let Err(error) =
                                     host.player.playlist_move(queue_selected, target)
                                 {
-                                    host.console.fail(format!("error moving: {error}"));
+                                    host.session.console.fail(format!("error moving: {error}"));
                                 }
                                 queue_selected = target;
                             }
@@ -867,37 +889,38 @@ fn prompt() -> anyhow::Result<()> {
                     }
                     continue;
                 }
-                if key.code == keymap.get(KeyAction::OpenQueueView) && host.console.input.is_empty()
+                if key.code == keymap.get(KeyAction::OpenQueueView)
+                    && host.session.console.input.is_empty()
                 {
                     queue_open = true;
                     queue_selected = host.play_queue.pos().unwrap_or(0);
                     continue;
                 }
                 if key.code == prompt_key(&keymap, KeyAction::OpenSubtitleMenu)
-                    && host.console.input.is_empty()
+                    && host.session.console.input.is_empty()
                 {
                     subtitle_menu_open = true;
                     continue;
                 }
                 if key.code == prompt_key(&keymap, KeyAction::OpenSettingsMenu)
-                    && host.console.input.is_empty()
+                    && host.session.console.input.is_empty()
                 {
                     settings_state.open = true;
                     continue;
                 }
                 if key.code == prompt_key(&keymap, KeyAction::OpenNavManager)
-                    && host.console.input.is_empty()
+                    && host.session.console.input.is_empty()
                 {
                     nav = Some(nav_ui::open(&mut host));
                     continue;
                 }
-                if key.code == KeyCode::Char('T') && host.console.input.is_empty() {
+                if key.code == KeyCode::Char('T') && host.session.console.input.is_empty() {
                     torbox_open = true;
                     torbox.spoilers_revealed = host.cfg.watch_reveal_spoilers;
                     torbox_ui::open(&host, &mut torbox);
                     continue;
                 }
-                if key.code == KeyCode::Char('W') && host.console.input.is_empty() {
+                if key.code == KeyCode::Char('W') && host.session.console.input.is_empty() {
                     watch_open = true;
                     watch.spoilers_revealed = host.cfg.watch_reveal_spoilers;
                     if !watch.is_configured() && !watch.loading {
@@ -915,11 +938,11 @@ fn prompt() -> anyhow::Result<()> {
                     }
                     continue;
                 }
-                if key.code == KeyCode::Char('E') && host.console.input.is_empty() {
+                if key.code == KeyCode::Char('E') && host.session.console.input.is_empty() {
                     eq_menu.open(host.app.eq_source, host.cfg.eq_custom_presets.len());
                     continue;
                 }
-                if key.code == KeyCode::Char('K') && host.console.input.is_empty() {
+                if key.code == KeyCode::Char('K') && host.session.console.input.is_empty() {
                     keybinds_open = true;
                     keybinds_selected = 0;
                     keybinds_refused = None;
@@ -928,15 +951,15 @@ fn prompt() -> anyhow::Result<()> {
                 // '?' on an empty line is the short command list: the
                 // one thing a new user should not need the docs for.
                 // anywhere else it is a character like any other.
-                if key.code == KeyCode::Char('?') && host.console.input.is_empty() {
+                if key.code == KeyCode::Char('?') && host.session.console.input.is_empty() {
                     for line in core::short_help() {
-                        host.console.note(line);
+                        host.session.console.note(line);
                     }
                     continue;
                 }
-                let mut console = std::mem::take(&mut host.console);
+                let mut console = std::mem::take(&mut host.session.console);
                 let action = console.handle_key(key, &host.candidates());
-                host.console = console;
+                host.session.console = console;
                 match action {
                     ConsoleAction::Run(p) => {
                         host.settle.notified("", false, host.now());
