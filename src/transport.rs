@@ -9,8 +9,8 @@
 use std::time::Instant;
 
 use crate::core::{apply_op, CoreCtx, Surface};
-use crate::mpv;
 use crate::notify::{Notifications, Severity};
+use crate::player::Player;
 use crate::search::SearchItem;
 use crate::ui::controlsbar::{Field, Scrub};
 
@@ -112,7 +112,7 @@ pub fn open_scrub(
 /// same thing however the drag was being held.
 pub fn commit_scrub(
     target: Scrub,
-    player: &mpv::Mpv,
+    player: &dyn Player,
     notifications: &mut Notifications,
     scrub: &mut Option<Scrub>,
     scrub_pending: &mut bool,

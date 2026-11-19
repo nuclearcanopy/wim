@@ -195,7 +195,11 @@ impl FakePlayer {
 
     fn read(&self, method: &'static str) -> Option<f64> {
         self.calls.lock().unwrap().push(format!("{method}()"));
-        self.reads.lock().unwrap().get(method).and_then(Value::as_f64)
+        self.reads
+            .lock()
+            .unwrap()
+            .get(method)
+            .and_then(Value::as_f64)
     }
 }
 

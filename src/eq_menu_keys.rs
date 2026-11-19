@@ -9,7 +9,8 @@ use crossterm::event::KeyCode;
 
 use crate::core::apply_eq_gains;
 use crate::notify::Notifications;
-use crate::{app, config, eq, keymap, mpv, ui};
+use crate::player::Player;
+use crate::{app, config, eq, keymap, ui};
 
 /// One h/l nudge (`dir`: -1.0 or 1.0) on band `band`, 1 dB per step,
 /// clamped to `eq::GAIN_LIMIT`; touching any band diverges from
@@ -18,7 +19,7 @@ use crate::{app, config, eq, keymap, mpv, ui};
 /// cleared, so the menu can still say which curve this came from).
 pub fn adjust_eq_band(
     app: &mut app::App,
-    player: &mpv::Mpv,
+    player: &dyn Player,
     notifications: &mut Notifications,
     band: usize,
     dir: f64,
