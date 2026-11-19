@@ -7,7 +7,7 @@
 //! instance lock and the mpv child. Playback goes through `&dyn Player`
 //! arguments, never an mpv handle owned here.
 
-use crate::shellsong::Program;
+use crate::shellsong::{Console, Program};
 use std::collections::VecDeque;
 
 /// Where a submitted program goes: straight to the active slot, or
@@ -24,6 +24,24 @@ pub fn place_submitted_program(
         None
     } else {
         Some(program)
+    }
+}
+
+pub struct SwimSession {
+    pub console: Console,
+}
+
+impl SwimSession {
+    pub fn new() -> SwimSession {
+        SwimSession {
+            console: Console::new(),
+        }
+    }
+}
+
+impl Default for SwimSession {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
