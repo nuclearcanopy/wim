@@ -8,13 +8,18 @@
 //! arguments, never an mpv handle owned here.
 
 use crate::catalog::{self, BackgroundSyncResult};
-use crate::core::{self, BetweenTracks, ScrobbleState};
+use crate::core::{
+    self, BetweenTracks, RemoteSearchOutcome, ScrobbleState, StarFailed, SubtitleOutcome,
+    TrackResolver,
+};
+use crate::download::DownloadEvent;
 use crate::notify::{Notifications, Severity};
 use crate::playqueue::PlayQueue;
 use crate::search::SearchItem;
 use crate::shellsong::{Console, LineKind, Program};
+use crate::shellsong_host::{CorpusCandidates, SearchSettle};
 use crate::swimsurface::SwimSurface;
-use crate::{app, cache, config, favorites, library, mpv, search};
+use crate::{app, cache, config, favorites, library, lyrics, mpv, search};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -38,6 +43,32 @@ pub fn place_submitted_program(
 }
 
 pub struct SwimSession {
+    pub download_tx: mpsc::Sender<DownloadEvent>,
+    pub download_rx: Receiver<DownloadEvent>,
+    pub downloading: HashSet<String>,
+    pub subtitle_tx: mpsc::Sender<SubtitleOutcome>,
+    pub subtitle_rx: Receiver<SubtitleOutcome>,
+    pub remote_search_tx: mpsc::Sender<core::RemoteSearchQuery>,
+    pub remote_search_result_rx: Receiver<RemoteSearchOutcome>,
+    pub lyrics_client: lyrics::Client,
+    pub lyrics_loader: lyrics::Loader,
+    /// Whether a prompt is on screen; one-shots print rather than
+    /// open panes and echo only once a search settles.
+    pub interactive_prompt: bool,
+    pub track_resolver: TrackResolver,
+    pub star_tx: mpsc::Sender<StarFailed>,
+    pub star_rx: Receiver<StarFailed>,
+    /// The query whose results have been printed, and the names
+    /// already printed for it. Kept so a server answering after the
+    /// settle window prints only its *new* matches rather than
+    /// repeating the list or saying nothing at all.
+    pub echoed: Option<(String, HashSet<String>)>,
+    pub settle: SearchSettle,
+    pub saved_queues: Vec<String>,
+    pub bindings: crate::shellsong_host::Bindings,
+    /// `.shg` names behind `run(...)`'s completion; a directory read,
+    /// so snapshotted rather than done per keystroke.
+    pub scripts: Vec<String>,
     pub notifications: Notifications,
     pub mpv_exit_reported: bool,
     pub seen_reply_timeouts: u64,
@@ -121,7 +152,35 @@ impl SwimSession {
             app.eq_preset = index;
         }
         let (scrobble_failed_tx, scrobble_failed_rx) = mpsc::channel();
+        let (download_tx, download_rx) = mpsc::channel();
+        let (subtitle_tx, subtitle_rx) = mpsc::channel();
+        let (remote_search_tx, remote_search_rx) = mpsc::channel();
+        let (remote_search_result_tx, remote_search_result_rx) = mpsc::channel();
+        core::spawn_background_search(remote_search_rx, remote_search_result_tx);
+        let lyrics_client = lyrics::Client::with_providers(
+            cfg.lyrics.providers.clone(),
+            cfg.resolve_lyrics_api_keys(),
+        );
+        let (star_tx, star_rx) = mpsc::channel();
         SwimSession {
+            download_tx,
+            download_rx,
+            downloading: HashSet::new(),
+            subtitle_tx,
+            subtitle_rx,
+            remote_search_tx,
+            remote_search_result_rx,
+            lyrics_client,
+            lyrics_loader: lyrics::Loader::new(),
+            interactive_prompt: false,
+            track_resolver: TrackResolver::new(),
+            star_tx,
+            star_rx,
+            echoed: None,
+            settle: SearchSettle::default(),
+            saved_queues: Vec::new(),
+            bindings: crate::shellsong_host::load_bindings(),
+            scripts: crate::shellsong_host::script_names(),
             notifications: Notifications::default(),
             mpv_exit_reported: false,
             seen_reply_timeouts: mpv::reply_timeouts(),
@@ -288,6 +347,18 @@ impl SwimSession {
             if let Some(warning) = crate::subsonic::insecure_transport_warning(&server.url) {
                 self.notifications.push(Severity::Alert, warning);
             }
+        }
+    }
+
+    /// Local names the prompt completes against; never touches the
+    /// network (see `shellsong::Candidates`).
+    pub fn candidates(&self) -> CorpusCandidates<'_> {
+        CorpusCandidates {
+            corpus: &self.app.corpus,
+            saved: &self.saved_queues,
+            eq_presets: core::eq_preset_names(&self.cfg.eq_custom_presets),
+            vars: &self.vars,
+            scripts: &self.scripts,
         }
     }
 

@@ -255,8 +255,8 @@ fn rebuild(host: &mut Host) {
     match wim::core::rebuild_cached_downloads(
         &host.session.cache_index,
         &host.session.cfg,
-        &mut host.downloading,
-        &host.download_tx,
+        &mut host.session.downloading,
+        &host.session.download_tx,
         &mut host.session.notifications,
     ) {
         Ok(result) => {

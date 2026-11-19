@@ -120,7 +120,7 @@ fn oneshot(cli: &Cli) -> anyhow::Result<()> {
 fn prompt() -> anyhow::Result<()> {
     let mut host = Host::start()?;
     anim::init_reduced_motion(host.session.cfg.reduced_motion);
-    host.interactive_prompt = true;
+    host.session.interactive_prompt = true;
     let mut lyrics_setup = host.first_run.then(|| LyricsSetup {
         providers: host.session.cfg.lyrics.providers.clone(),
         key_file: String::new(),
@@ -223,12 +223,14 @@ fn prompt() -> anyhow::Result<()> {
         if player_ready && !host.session.app.loading_cached_catalog && host.step() == Drive::Quit {
             break;
         }
-        if std::mem::take(&mut host.session.swim.keybinds_requested) && host.interactive_prompt {
+        if std::mem::take(&mut host.session.swim.keybinds_requested)
+            && host.session.interactive_prompt
+        {
             keybinds_open = true;
             keybinds_selected = 0;
             keybinds_refused = None;
         }
-        if std::mem::take(&mut host.session.swim.eq_requested) && host.interactive_prompt {
+        if std::mem::take(&mut host.session.swim.eq_requested) && host.session.interactive_prompt {
             eq_menu.open(
                 host.session.app.eq_source,
                 host.session.cfg.eq_custom_presets.len(),
@@ -236,11 +238,12 @@ fn prompt() -> anyhow::Result<()> {
         }
 
         if let Some(list) = host.session.swim.list_requested.take() {
-            if host.interactive_prompt && !list.rows.is_empty() {
+            if host.session.interactive_prompt && !list.rows.is_empty() {
                 list_view = Some((list, 0));
             }
         }
-        if std::mem::take(&mut host.session.swim.undo_requested) && host.interactive_prompt {
+        if std::mem::take(&mut host.session.swim.undo_requested) && host.session.interactive_prompt
+        {
             undo_open = true;
         }
         if offer_servers && lyrics_setup.is_none() {
@@ -255,7 +258,9 @@ fn prompt() -> anyhow::Result<()> {
         torbox_ui::poll(&mut host, &mut torbox);
         let undo_now = host.now();
         let undo_rows = undo_open.then(|| host.session.undo.rows(undo_now));
-        if std::mem::take(&mut host.session.swim.settings_requested) && host.interactive_prompt {
+        if std::mem::take(&mut host.session.swim.settings_requested)
+            && host.session.interactive_prompt
+        {
             settings_state.open = true;
         }
         let settings_values = settings_state
@@ -376,7 +381,7 @@ fn prompt() -> anyhow::Result<()> {
                 // candidates too; a ghost-less paste was a real bug
                 // (docs/shellsong.md).
                 let mut console = std::mem::take(&mut host.session.console);
-                console.paste(&text, &host.candidates());
+                console.paste(&text, &host.session.candidates());
                 host.session.console = console;
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -422,7 +427,7 @@ fn prompt() -> anyhow::Result<()> {
                                     host.session.console.fail(format!("saving config: {error}"))
                                 }
                             }
-                            host.lyrics_client = wim::lyrics::Client::with_providers(
+                            host.session.lyrics_client = wim::lyrics::Client::with_providers(
                                 host.session.cfg.lyrics.providers.clone(),
                                 host.session.cfg.resolve_lyrics_api_keys(),
                             );
@@ -990,11 +995,11 @@ fn prompt() -> anyhow::Result<()> {
                     continue;
                 }
                 let mut console = std::mem::take(&mut host.session.console);
-                let action = console.handle_key(key, &host.candidates());
+                let action = console.handle_key(key, &host.session.candidates());
                 host.session.console = console;
                 match action {
                     ConsoleAction::Run(p) => {
-                        host.settle.notified("", false, host.now());
+                        host.session.settle.notified("", false, host.now());
                         host.submit_program(p);
                     }
                     // nothing to close: the console *is* the screen.
