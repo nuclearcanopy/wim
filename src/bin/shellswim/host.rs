@@ -23,19 +23,19 @@ macro_rules! core_ctx {
             queue: &mut $h.session.play_queue,
             previous_track: &mut $h.session.previous_track,
             cache: &$h.session.cache_index,
-            download_tx: &$h.download_tx,
-            downloading: &mut $h.downloading,
+            download_tx: &$h.session.download_tx,
+            downloading: &mut $h.session.downloading,
             scrobble: &mut $h.session.scrobble,
-            subtitle_tx: &$h.subtitle_tx,
+            subtitle_tx: &$h.session.subtitle_tx,
             console: &mut $h.session.console,
             now: $now,
             now_playing: &$np,
             favorites: &mut $h.session.favorites,
             remote_starred: &mut $h.session.remote_starred,
-            lyrics_client: &$h.lyrics_client,
-            lyrics_loader: &mut $h.lyrics_loader,
-            star_tx: &$h.star_tx,
-            track_resolver: &mut $h.track_resolver,
+            lyrics_client: &$h.session.lyrics_client,
+            lyrics_loader: &mut $h.session.lyrics_loader,
+            star_tx: &$h.session.star_tx,
+            track_resolver: &mut $h.session.track_resolver,
             base_volume: &mut $h.session.base_volume,
             muted: $h.session.playback.muted,
             crossfade_enabled: &mut $h.session.crossfade_enabled,
@@ -47,28 +47,25 @@ macro_rules! core_ctx {
             sleep_due: &mut $h.session.sleep_due,
             resume_due: &mut $h.session.resume_due,
             scan_rx: &mut $h.session.scan_rx,
-            remote_search_tx: &$h.remote_search_tx,
-            settle: &mut $h.settle,
-            saved_queues: &mut $h.saved_queues,
+            remote_search_tx: &$h.session.remote_search_tx,
+            settle: &mut $h.session.settle,
+            saved_queues: &mut $h.session.saved_queues,
             vars: &mut $h.session.vars,
-            bindings: &mut $h.bindings,
+            bindings: &mut $h.session.bindings,
         }
     };
 }
 
 use wim::catalog;
-use wim::core::{
-    self, CoreCtx, Drive, Intent, RemoteSearchOutcome, StarFailed, SubtitleOutcome, TrackResolver,
-};
+use wim::core::{self, CoreCtx, Drive, Intent};
 use wim::download::DownloadEvent;
 use wim::notify::Severity;
 use wim::playqueue::PosChange;
 use wim::search::SearchItem;
 use wim::shellsong::{LineKind, Op, Program};
-use wim::shellsong_host::{CorpusCandidates, SearchSettle};
 use wim::swimsession::SwimSession;
 use wim::ui::results_list::label;
-use wim::{app, config, lyrics, mpv};
+use wim::{app, config, mpv};
 
 /// How long a one-shot waits for a command that is still resolving a
 /// name against a server. The language times its own await out at 8s;
@@ -289,36 +286,12 @@ pub struct Host {
     pub pending_connect: Option<crate::nav_ui::PendingConnect>,
     pub pending_connectivity: Option<std::sync::mpsc::Receiver<wim::catalog::ConnectivityReport>>,
     _instance_lock: Option<std::fs::File>,
-    pub download_tx: Sender<DownloadEvent>,
-    pub download_rx: Receiver<DownloadEvent>,
-    pub downloading: HashSet<String>,
-    pub subtitle_tx: Sender<SubtitleOutcome>,
-    pub subtitle_rx: Receiver<SubtitleOutcome>,
-    pub remote_search_tx: Sender<core::RemoteSearchQuery>,
-    pub remote_search_result_rx: Receiver<RemoteSearchOutcome>,
-    pub lyrics_client: lyrics::Client,
-    pub lyrics_loader: lyrics::Loader,
     pub lyrics_pane: wim::lyricspane::LyricsPane,
     pub first_run: bool,
-    pub interactive_prompt: bool,
-    pub track_resolver: TrackResolver,
-    pub star_tx: mpsc::Sender<StarFailed>,
-    pub star_rx: mpsc::Receiver<StarFailed>,
     /// Kept alive for the player's lifetime; dropping it stops the relay.
     pub _media_proxy: Option<wim::media_proxy::MediaProxy>,
     pub proxy_ready: bool,
     player_setup: Option<PlayerSetup>,
-    /// The query whose results have been printed, and the names
-    /// already printed for it. Kept so a server answering after the
-    /// settle window prints only its *new* matches rather than
-    /// repeating the list or saying nothing at all.
-    echoed: Option<(String, HashSet<String>)>,
-    pub settle: SearchSettle,
-    pub saved_queues: Vec<String>,
-    pub bindings: wim::shellsong_host::Bindings,
-    /// `.shg` names behind `run(...)`'s completion; a directory read,
-    /// so snapshotted rather than done per keystroke.
-    pub scripts: Vec<String>,
     pub session: SwimSession,
     torbox_tx: Sender<TorBoxReply>,
     torbox_rx: Receiver<TorBoxReply>,
@@ -395,17 +368,6 @@ impl Host {
             )),
         ]);
 
-        let (download_tx, download_rx) = mpsc::channel();
-        let (subtitle_tx, subtitle_rx) = mpsc::channel();
-        let (remote_search_tx, remote_search_rx) = mpsc::channel();
-        let (remote_search_result_tx, remote_search_result_rx) = mpsc::channel();
-        core::spawn_background_search(remote_search_rx, remote_search_result_tx);
-
-        let lyrics_client = lyrics::Client::with_providers(
-            cfg.lyrics.providers.clone(),
-            cfg.resolve_lyrics_api_keys(),
-        );
-        let (star_tx, star_rx) = mpsc::channel();
         let (torbox_tx, torbox_rx) = mpsc::channel();
         session.push_startup_alerts(proxy_unavailable);
         let instance_lock = match wim::persistence::state_dir()
@@ -424,23 +386,10 @@ impl Host {
         Ok(Host {
             _instance_lock: instance_lock,
             player,
-            download_tx,
-            download_rx,
-            downloading: HashSet::new(),
             pending_connect: None,
             pending_connectivity: None,
-            subtitle_tx,
-            subtitle_rx,
-            remote_search_tx,
-            remote_search_result_rx,
-            lyrics_client,
-            lyrics_loader: lyrics::Loader::new(),
             lyrics_pane: wim::lyricspane::LyricsPane::default(),
             first_run,
-            interactive_prompt: false,
-            track_resolver: TrackResolver::new(),
-            star_tx,
-            star_rx,
             _media_proxy: media_proxy,
             proxy_ready: false,
             player_setup: Some(PlayerSetup {
@@ -448,11 +397,6 @@ impl Host {
                 proxy_index,
                 replaygain_index,
             }),
-            echoed: None,
-            settle: SearchSettle::default(),
-            saved_queues: Vec::new(),
-            bindings: wim::shellsong_host::load_bindings(),
-            scripts: wim::shellsong_host::script_names(),
             session,
             torbox_tx,
             torbox_rx,
@@ -586,18 +530,6 @@ impl Host {
         self.session.play_queue.current().cloned()
     }
 
-    /// Local names the prompt completes against; never touches the
-    /// network (see `shellsong::Candidates`).
-    pub fn candidates(&self) -> CorpusCandidates<'_> {
-        CorpusCandidates {
-            corpus: &self.session.app.corpus,
-            saved: &self.saved_queues,
-            eq_presets: core::eq_preset_names(&self.session.cfg.eq_custom_presets),
-            vars: &self.session.vars,
-            scripts: &self.scripts,
-        }
-    }
-
     /// Everything the background threads finished since the last call.
     /// Each one is a `try_recv`, so this is the whole reason nothing
     /// in shellswim blocks.
@@ -655,7 +587,7 @@ impl Host {
         // a queue batch resolved; the resolver already dropped any from
         // a superseded request, which here would append to the queue
         // rather than merely drawing something stale.
-        while let Some((into, label, tracks)) = self.track_resolver.poll() {
+        while let Some((into, label, tracks)) = self.session.track_resolver.poll() {
             let now = self.session.start.elapsed();
             let now_playing = self.session.play_queue.current().cloned();
             let mut surf = self.session.swim.borrowed();
@@ -719,7 +651,7 @@ impl Host {
         }
 
         // the server refused a star, so the optimistic flip goes back.
-        while let Ok(failed) = self.star_rx.try_recv() {
+        while let Ok(failed) = self.session.star_rx.try_recv() {
             if failed.wanted {
                 self.session.remote_starred.remove(&failed.id);
             } else {
@@ -740,11 +672,11 @@ impl Host {
         // a lyrics fetch landed. the loader has already dropped any
         // reply for a track the user moved past, so whatever arrives
         // belongs to the request still standing.
-        if let Some((track, result)) = self.lyrics_loader.poll() {
+        if let Some((track, result)) = self.session.lyrics_loader.poll() {
             match result {
                 Ok(Some(l)) => {
-                    self.lyrics_client.track_display(&l);
-                    if self.interactive_prompt && self.session.swim.lyrics_requested {
+                    self.session.lyrics_client.track_display(&l);
+                    if self.session.interactive_prompt && self.session.swim.lyrics_requested {
                         self.lyrics_pane.open_lyrics(&l, track);
                         self.session.swim.lyrics_requested = false;
                     } else {
@@ -841,8 +773,8 @@ impl Host {
         // one-shots keep waiting for the settle window so a script's
         // output is complete; only the interactive prompt echoes early
         if self.session.swim.echo_results
-            && ((self.interactive_prompt && local_ready)
-                || self.settle.settled(self.session.start.elapsed()))
+            && ((self.session.interactive_prompt && local_ready)
+                || self.session.settle.settled(self.session.start.elapsed()))
         {
             self.session.swim.echo_results = false;
             let mut shown = HashSet::new();
@@ -854,7 +786,7 @@ impl Host {
             for line in lines {
                 self.session.console.note(line);
             }
-            self.echoed = Some((self.session.app.query.clone(), shown));
+            self.session.echoed = Some((self.session.app.query.clone(), shown));
         }
 
         // a track started, by advancing or by a loop-all restart.
@@ -862,7 +794,7 @@ impl Host {
             // Keep video subtitle discovery aligned with Wim. The
             // lookup is dispatched to its worker thread and is a no-op
             // for audio or when no OpenSubtitles key is configured.
-            core::fire_subtitle_fetch(&self.session.cfg, &self.subtitle_tx, &track);
+            core::fire_subtitle_fetch(&self.session.cfg, &self.session.subtitle_tx, &track);
             if self.session.play_queue.current().is_some() {
                 self.session
                     .console
@@ -887,7 +819,7 @@ impl Host {
             if let Some(bound) = started.bound {
                 self.session.console.note(bound);
             }
-            if self.interactive_prompt
+            if self.session.interactive_prompt
                 && (self.lyrics_pane.is_open() || self.session.swim.lyrics_requested)
             {
                 self.request_lyrics(&track);
@@ -1024,7 +956,7 @@ impl Host {
             }
         }
         let mut answered = false;
-        while let Ok(outcome) = self.remote_search_result_rx.try_recv() {
+        while let Ok(outcome) = self.session.remote_search_result_rx.try_recv() {
             self.session
                 .app
                 .corpus
@@ -1032,7 +964,7 @@ impl Host {
             self.session.app.resync_results();
             // an answer is in, so the results for whatever was asked
             // are as complete as a program should wait for.
-            self.settle.answered(&outcome.query);
+            self.session.settle.answered(&outcome.query);
             answered = true;
         }
         // a server that answered *after* the settle window already
@@ -1042,7 +974,7 @@ impl Host {
         // else is an answer to a question nobody is looking at.
         if answered {
             let avail = self.console_width();
-            if let Some((query, shown)) = self.echoed.as_mut() {
+            if let Some((query, shown)) = self.session.echoed.as_mut() {
                 if *query == self.session.app.query {
                     let lines = core::echo_lines(self.session.app.results(), shown, avail);
                     if !lines.is_empty() {
@@ -1056,22 +988,22 @@ impl Host {
                 }
             }
         }
-        while let Ok(event) = self.download_rx.try_recv() {
+        while let Ok(event) = self.session.download_rx.try_recv() {
             match event {
                 DownloadEvent::Progress { .. } => {}
                 DownloadEvent::Done { id, label } => {
-                    self.downloading.remove(&id);
+                    self.session.downloading.remove(&id);
                     self.session.console.note(format!("downloaded: {label}"));
                 }
                 DownloadEvent::Failed { id, label, error } => {
-                    self.downloading.remove(&id);
+                    self.session.downloading.remove(&id);
                     self.session
                         .console
                         .fail(format!("download failed for {label}: {error}"));
                 }
             }
         }
-        while let Ok(sub) = self.subtitle_rx.try_recv() {
+        while let Ok(sub) = self.session.subtitle_rx.try_recv() {
             if !core::subtitle_belongs_to_playing(&sub, self.session.play_queue.current()) {
                 continue;
             }
@@ -1183,8 +1115,8 @@ impl Host {
         self.session.swim.lyrics_requested = true;
         let name = label(item);
         if let Some((server, id)) = core::lyrics_remote(item) {
-            self.lyrics_loader.request_subsonic(
-                &self.lyrics_client,
+            self.session.lyrics_loader.request_subsonic(
+                &self.session.lyrics_client,
                 server,
                 id,
                 name,
@@ -1194,8 +1126,8 @@ impl Host {
                 None,
             );
         } else if let Some(path) = core::lyrics_path(item) {
-            self.lyrics_loader.request_local(
-                &self.lyrics_client,
+            self.session.lyrics_loader.request_local(
+                &self.session.lyrics_client,
                 name,
                 &artist,
                 &title,
@@ -1204,8 +1136,14 @@ impl Host {
                 path,
             );
         } else {
-            self.lyrics_loader
-                .request(&self.lyrics_client, name, &artist, &title, &album, None);
+            self.session.lyrics_loader.request(
+                &self.session.lyrics_client,
+                name,
+                &artist,
+                &title,
+                &album,
+                None,
+            );
         }
     }
 }
