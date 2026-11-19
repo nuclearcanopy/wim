@@ -1,0 +1,3 @@
+# Tests include_str! these sources and search for "\n}\n"; a CRLF
+# checkout (Windows autocrlf) would break them.
+*.rs text eol=lf
