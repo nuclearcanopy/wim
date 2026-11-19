@@ -62,6 +62,18 @@ platform equivalent) and offers setup in the app. Local library paths default
 to `~/Music` and `~/Videos` when present. Use the in-app profile manager (`n`)
 to configure servers, or use the Home Manager module below.
 
+### Windows
+
+Download `wim-<version>-windows-x64-setup.exe` (installer) or
+`wim-<version>-windows-x64.zip` (portable) from the
+[Releases](../../releases) page; `SHA256SUMS` is attached for verification.
+mpv is bundled, so nothing else needs installing. The installer can optionally
+add wim to your `PATH`.
+
+The binaries are not code-signed, so Windows SmartScreen will warn: click
+"More info", then "Run anyway". Wim is a terminal app; run it in a terminal
+such as Windows Terminal (the Start menu shortcuts open one).
+
 ## Controls
 
 Press `?` in Wim for the full, current keymap; `K` opens keybinding settings.
