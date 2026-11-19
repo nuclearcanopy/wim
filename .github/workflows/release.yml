@@ -1,0 +1,113 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and upload artifacts only; do not publish a release
+        type: boolean
+        default: true
+
+env:
+  # The user must pin these. Use a fixed mpv Windows x64 build (not a "latest"
+  # URL) and the SHA256 of that exact file. The step fails while the
+  # placeholder is in place.
+  MPV_URL: https://example.invalid/REPLACE_WITH_PINNED_MPV_URL.7z
+  MPV_SHA256: REPLACE_WITH_PINNED_SHA256
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') { $tag = $env:GITHUB_REF_NAME }
+          else { $tag = 'v' + (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value }
+          $version = $tag -replace '^v', ''
+          "TAG=$tag" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "VERSION=$version" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Check tag matches Cargo.toml version
+        shell: pwsh
+        run: |
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($cargo -ne $env:VERSION) {
+            throw "Version mismatch: tag is $env:VERSION but Cargo.toml is $cargo"
+          }
+
+      - name: Build
+        run: cargo build --release --locked --bins
+
+      - name: Stage dist
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\wim.exe, target\release\shellswim.exe dist\
+
+      - name: Download and verify mpv
+        shell: pwsh
+        run: |
+          if ($env:MPV_SHA256 -eq 'REPLACE_WITH_PINNED_SHA256' -or $env:MPV_URL -like '*REPLACE_WITH_PINNED*') {
+            throw 'MPV_URL / MPV_SHA256 are placeholders. Pin an mpv build and its SHA256 in release.yml.'
+          }
+          $archive = Join-Path $env:RUNNER_TEMP 'mpv.7z'
+          Invoke-WebRequest -Uri $env:MPV_URL -OutFile $archive
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash
+          if ($actual -ne $env:MPV_SHA256.ToUpper()) {
+            throw "mpv SHA256 mismatch: expected $env:MPV_SHA256, got $actual"
+          }
+          $out = Join-Path $env:RUNNER_TEMP 'mpv'
+          7z x $archive "-o$out" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw '7z extraction failed' }
+          $exe = Get-ChildItem $out -Recurse -Filter mpv.exe | Select-Object -First 1
+          if (-not $exe) { throw 'mpv.exe not found in archive' }
+          Copy-Item (Join-Path $exe.Directory.FullName '*') dist\ -Recurse -Force
+          Copy-Item README.md, LICENSE dist\
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\* -DestinationPath "wim-$env:TAG-windows-x64.zip"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          iscc "/DMyVersion=$env:VERSION" packaging\windows\wim.iss
+          if ($LASTEXITCODE -ne 0) { throw 'iscc failed' }
+          Move-Item "dist-setup\wim-$env:VERSION-windows-x64-setup.exe" .
+
+      - name: SHA256SUMS
+        shell: pwsh
+        run: |
+          $files = "wim-$env:TAG-windows-x64.zip", "wim-$env:VERSION-windows-x64-setup.exe"
+          $files | ForEach-Object {
+            "$((Get-FileHash -Algorithm SHA256 $_).Hash.ToLower())  $_"
+          } | Out-File -Encoding ascii SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wim-windows-x64
+          path: |
+            wim-*-windows-x64.zip
+            wim-*-windows-x64-setup.exe
+            SHA256SUMS
+
+      - name: Publish release
+        if: github.ref_type == 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            wim-*-windows-x64.zip
+            wim-*-windows-x64-setup.exe
+            SHA256SUMS
+          generate_release_notes: true
