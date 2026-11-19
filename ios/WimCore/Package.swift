@@ -7,10 +7,15 @@ import PackageDescription
 let package = Package(
     name: "WimCore",
     platforms: [.iOS(.v16)],
-    products: [.library(name: "WimCore", targets: ["WimCore"])],
+    products: [
+        .library(name: "WimCore", targets: ["WimCore"]),
+        .library(name: "ShellswimKit", targets: ["ShellswimKit"]),
+    ],
     targets: [
         .binaryTarget(name: "wim_mobileFFI", path: "WimCore.xcframework"),
         .target(name: "WimCore", dependencies: ["wim_mobileFFI"]),
-        .testTarget(name: "WimCoreTests", dependencies: ["WimCore"]),
+        // Transcript store and Keychain helper; no Rust needed.
+        .target(name: "ShellswimKit"),
+        .testTarget(name: "WimCoreTests", dependencies: ["WimCore", "ShellswimKit"]),
     ]
 )
