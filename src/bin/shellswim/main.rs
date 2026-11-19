@@ -109,7 +109,7 @@ fn oneshot(cli: &Cli) -> anyhow::Result<()> {
             LineKind::Note => println!("{}", line.text),
         }
     }
-    core::save_playback_state(&host.player, &host.play_queue);
+    core::save_playback_state(&host.player, &host.session.play_queue);
     if failed {
         wim::cache::cleanup_playback_files();
         std::process::exit(1);
@@ -254,7 +254,7 @@ fn prompt() -> anyhow::Result<()> {
         watch.poll();
         torbox_ui::poll(&mut host, &mut torbox);
         let undo_now = host.now();
-        let undo_rows = undo_open.then(|| host.undo.rows(undo_now));
+        let undo_rows = undo_open.then(|| host.session.undo.rows(undo_now));
         if std::mem::take(&mut host.session.swim.settings_requested) && host.interactive_prompt {
             settings_state.open = true;
         }
@@ -267,11 +267,12 @@ fn prompt() -> anyhow::Result<()> {
             &mut guard,
             &Screen {
                 console: &host.session.console,
-                playback: &host.playback,
-                queue: &host.play_queue,
+                playback: &host.session.playback,
+                queue: &host.session.play_queue,
                 now_playing: &now_playing,
                 now: host.now(),
                 gap_remaining: host
+                    .session
                     .between_tracks
                     .remaining(Instant::now())
                     .map(|d| d.as_secs_f64()),
@@ -283,7 +284,7 @@ fn prompt() -> anyhow::Result<()> {
                     );
                     let active = host
                         .lyrics_pane
-                        .follow_playback(host.playback.elapsed_secs, Instant::now());
+                        .follow_playback(host.session.playback.elapsed_secs, Instant::now());
                     (&host.lyrics_pane, active)
                 }),
                 setup: lyrics_setup.as_ref(),
@@ -338,7 +339,7 @@ fn prompt() -> anyhow::Result<()> {
             || host.lyrics_pane.is_open()
             || host.has_program_work()
             || host.session.console.cycle().is_some()
-            || (now_playing.is_some() && !host.playback.paused);
+            || (now_playing.is_some() && !host.session.playback.paused);
         let timeout = if host.session.has_cached_rows_pending() {
             Duration::from_micros(1)
         } else if !player_ready || host.session.app.loading_cached_catalog {
@@ -569,7 +570,10 @@ fn prompt() -> anyhow::Result<()> {
                             host.session.cfg.watch_reveal_spoilers =
                                 !host.session.cfg.watch_reveal_spoilers;
                             watch.spoilers_revealed = host.session.cfg.watch_reveal_spoilers;
-                            config::save_or_warn(&host.session.cfg, &mut host.notifications);
+                            config::save_or_warn(
+                                &host.session.cfg,
+                                &mut host.session.notifications,
+                            );
                             watch.message = Some(if host.session.cfg.watch_reveal_spoilers {
                                 "episode spoilers will be shown by default".into()
                             } else {
@@ -672,7 +676,7 @@ fn prompt() -> anyhow::Result<()> {
                             persist_eq(
                                 &mut host.session.cfg,
                                 &host.session.app,
-                                &mut host.notifications,
+                                &mut host.session.notifications,
                             );
                             eq_menu.set_selected(match mode {
                                 eqm::EditorMode::Save => eqm::opening_selection(
@@ -694,7 +698,7 @@ fn prompt() -> anyhow::Result<()> {
                         persist_eq(
                             &mut host.session.cfg,
                             &host.session.app,
-                            &mut host.notifications,
+                            &mut host.session.notifications,
                         );
                     } else if key.code == eqm::SAVE_KEY {
                         eq_menu.state_mut().editor = Some(eqm::NameEditor::save());
@@ -727,7 +731,7 @@ fn prompt() -> anyhow::Result<()> {
                                 persist_eq(
                                     &mut host.session.cfg,
                                     &host.session.app,
-                                    &mut host.notifications,
+                                    &mut host.session.notifications,
                                 );
                                 eq_menu.set_selected(eq_menu.selected().min(
                                     eqm::selectable_count(host.session.cfg.eq_custom_presets.len())
@@ -757,7 +761,7 @@ fn prompt() -> anyhow::Result<()> {
                             KeyCode::Enter => core::apply_eq_row(
                                 &mut host.session.app,
                                 &host.player,
-                                &mut host.notifications,
+                                &mut host.session.notifications,
                                 &host.session.cfg.eq_custom_presets,
                                 eq_menu.selected(),
                                 enabled,
@@ -774,7 +778,7 @@ fn prompt() -> anyhow::Result<()> {
                                     adjust_eq_band(
                                         &mut host.session.app,
                                         &host.player,
-                                        &mut host.notifications,
+                                        &mut host.session.notifications,
                                         band,
                                         dir,
                                         enabled,
@@ -846,8 +850,8 @@ fn prompt() -> anyhow::Result<()> {
                 }
                 if queue_open {
                     let order = wim::ui::queue::selectable(
-                        host.play_queue.entries(),
-                        host.play_queue.pos(),
+                        host.session.play_queue.entries(),
+                        host.session.play_queue.pos(),
                     );
                     let at = order
                         .iter()
@@ -875,19 +879,22 @@ fn prompt() -> anyhow::Result<()> {
                                 host.session.console.fail(format!("error jumping: {error}"));
                             }
                         }
-                        KeyCode::Char('d') if host.play_queue.remove(queue_selected) => {
+                        KeyCode::Char('d') if host.session.play_queue.remove(queue_selected) => {
                             if let Err(error) = host.player.playlist_remove(queue_selected) {
                                 host.session
                                     .console
                                     .fail(format!("error removing: {error}"));
                             }
                             queue_selected = queue_selected
-                                .min(host.play_queue.entries().len().saturating_sub(1));
+                                .min(host.session.play_queue.entries().len().saturating_sub(1));
                         }
                         KeyCode::Char('J') | KeyCode::Char('K') => {
-                            let first_upcoming =
-                                host.play_queue.pos().map_or(0, |position| position + 1);
-                            let last = host.play_queue.entries().len().saturating_sub(1);
+                            let first_upcoming = host
+                                .session
+                                .play_queue
+                                .pos()
+                                .map_or(0, |position| position + 1);
+                            let last = host.session.play_queue.entries().len().saturating_sub(1);
                             let target = if key.code == KeyCode::Char('J') {
                                 queue_selected + 1
                             } else {
@@ -897,7 +904,7 @@ fn prompt() -> anyhow::Result<()> {
                                 && target >= first_upcoming
                                 && target <= last
                                 && target != queue_selected
-                                && host.play_queue.move_entry(queue_selected, target)
+                                && host.session.play_queue.move_entry(queue_selected, target)
                             {
                                 if let Err(error) =
                                     host.player.playlist_move(queue_selected, target)
@@ -915,7 +922,7 @@ fn prompt() -> anyhow::Result<()> {
                     && host.session.console.input.is_empty()
                 {
                     queue_open = true;
-                    queue_selected = host.play_queue.pos().unwrap_or(0);
+                    queue_selected = host.session.play_queue.pos().unwrap_or(0);
                     continue;
                 }
                 if key.code == prompt_key(&keymap, KeyAction::OpenSubtitleMenu)
@@ -999,7 +1006,7 @@ fn prompt() -> anyhow::Result<()> {
     }
 
     if player_observed && cache_ready {
-        core::save_playback_state(&host.player, &host.play_queue);
+        core::save_playback_state(&host.player, &host.session.play_queue);
     }
     drop(guard);
     Ok(())

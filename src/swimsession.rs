@@ -8,10 +8,14 @@
 //! arguments, never an mpv handle owned here.
 
 use crate::catalog::{self, BackgroundSyncResult};
+use crate::core::{self, BetweenTracks, ScrobbleState};
+use crate::notify::{Notifications, Severity};
+use crate::playqueue::PlayQueue;
+use crate::search::SearchItem;
 use crate::shellsong::{Console, LineKind, Program};
 use crate::swimsurface::SwimSurface;
-use crate::{app, cache, config, library, search};
-use std::collections::{HashMap, VecDeque};
+use crate::{app, cache, config, favorites, library, mpv, search};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -34,6 +38,32 @@ pub fn place_submitted_program(
 }
 
 pub struct SwimSession {
+    pub notifications: Notifications,
+    pub mpv_exit_reported: bool,
+    pub seen_reply_timeouts: u64,
+    pub last_reconcile: Instant,
+    pub play_queue: PlayQueue,
+    pub previous_track: Option<SearchItem>,
+    pub scrobble: ScrobbleState,
+    pub scrobble_failed_rx: Receiver<core::ScrobbleFailed>,
+    pub favorites: favorites::Favorites,
+    pub remote_starred: HashSet<String>,
+    /// Not read from the player: that is an ipc round trip on the
+    /// startup path for a value that is provably the ceiling at
+    /// start. A fresh mpv is at full volume (`a_fresh_mpv_starts_at_
+    /// full_volume` checks that against a real mpv).
+    pub base_volume: f64,
+    pub crossfade_enabled: bool,
+    pub between_tracks: BetweenTracks,
+    /// Per-identity settings the user has overridden by hand; see
+    /// `core::track_started`. shellswim applied none of these before.
+    pub overridden: crate::shellsong_host::Overridden,
+    pub resume_due: Option<Duration>,
+    pub undo: crate::undo::Recorder,
+    pub fade_in_started_at: Option<Instant>,
+    pub fade: Option<crate::shellsong_host::Ramp>,
+    pub sleep_due: Option<Duration>,
+    pub playback: mpv::Playback,
     pub cfg: config::Config,
     pub app: app::App,
     pub cache_index: Arc<Mutex<cache::CacheIndex>>,
@@ -90,7 +120,31 @@ impl SwimSession {
         if let Some(crate::eq::Source::Builtin(index)) = restored_eq.source {
             app.eq_preset = index;
         }
+        let (scrobble_failed_tx, scrobble_failed_rx) = mpsc::channel();
         SwimSession {
+            notifications: Notifications::default(),
+            mpv_exit_reported: false,
+            seen_reply_timeouts: mpv::reply_timeouts(),
+            last_reconcile: Instant::now(),
+            play_queue: PlayQueue::default(),
+            previous_track: None,
+            scrobble: ScrobbleState {
+                failed_tx: Some(scrobble_failed_tx),
+                ..ScrobbleState::default()
+            },
+            scrobble_failed_rx,
+            favorites: favorites::load(),
+            remote_starred: HashSet::new(),
+            base_volume: crate::shellsong_host::VOLUME_CEILING,
+            crossfade_enabled: cfg.crossfade_enabled,
+            between_tracks: BetweenTracks::new(cfg.gap_seconds),
+            overridden: crate::shellsong_host::Overridden::default(),
+            resume_due: None,
+            undo: crate::undo::Recorder::default(),
+            fade_in_started_at: None,
+            fade: None,
+            sleep_due: None,
+            playback: mpv::Playback::default(),
             cfg,
             app,
             cache_index: Arc::new(Mutex::new(cache::CacheIndex::default())),
@@ -209,6 +263,32 @@ impl SwimSession {
 
     pub fn has_cached_rows_pending(&self) -> bool {
         self.cached_entries.is_some()
+    }
+
+    /// What the config says is worth an alert at launch, in the order
+    /// the prompt has always shown them; `proxy_unavailable` is the
+    /// host's own finding about the media relay.
+    pub fn push_startup_alerts(&mut self, proxy_unavailable: Option<String>) {
+        let cfg = &self.cfg;
+        if cfg.offline_download_format != "flac"
+            && cfg.effective_offline_download_bitrate_kbps() <= 96
+        {
+            self.notifications.push(
+                Severity::Alert,
+                format!(
+                    "low offline audio quality: downloads will use {} kbps",
+                    cfg.effective_offline_download_bitrate_kbps()
+                ),
+            );
+        }
+        if let Some(warning) = proxy_unavailable {
+            self.notifications.push(Severity::Alert, warning);
+        }
+        for server in &cfg.navidrome_servers {
+            if let Some(warning) = crate::subsonic::insecure_transport_warning(&server.url) {
+                self.notifications.push(Severity::Alert, warning);
+            }
+        }
     }
 
     pub fn now(&self) -> Duration {

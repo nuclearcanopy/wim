@@ -28,7 +28,7 @@ pub fn values(host: &Host, state: &SettingsState) -> Vec<String> {
             Field::AlbumArt => "not available in shellswim".to_string(),
             Field::EqEnabled => on_off(cfg.eq_enabled),
             Field::VisualizerBands => format!("{} bands", cfg.visualizer_bands),
-            Field::Crossfade => on_off(host.crossfade_enabled),
+            Field::Crossfade => on_off(host.session.crossfade_enabled),
             Field::CrossfadeSeconds => format!("{:.1}s", cfg.crossfade_seconds),
             Field::CacheDaysThreshold => format!("{} days played", cfg.cache_days_threshold),
             Field::CacheEvictionDays => format!("{} days", cfg.cache_eviction_days),
@@ -95,7 +95,7 @@ fn downloaded_count(host: &Host) -> usize {
 }
 
 fn save(host: &mut Host) {
-    config::save_or_warn(&host.session.cfg, &mut host.notifications);
+    config::save_or_warn(&host.session.cfg, &mut host.session.notifications);
 }
 
 fn warn_low_quality(host: &mut Host) {
@@ -103,7 +103,7 @@ fn warn_low_quality(host: &mut Host) {
         && host.session.cfg.effective_offline_download_bitrate_kbps() <= 96
     {
         let kbps = host.session.cfg.effective_offline_download_bitrate_kbps();
-        host.notifications.push(
+        host.session.notifications.push(
             Severity::Alert,
             format!("low audio quality: offline downloads at {kbps} kbps"),
         );
@@ -118,7 +118,8 @@ fn set_filter(host: &mut Host, enabled: bool, bands: u8) -> bool {
     )) {
         Ok(()) => true,
         Err(error) => {
-            host.notifications
+            host.session
+                .notifications
                 .push(Severity::Error, format!("error setting eq: {error}"));
             false
         }
@@ -149,10 +150,10 @@ fn adjust(host: &mut Host, field: Field, forward: bool) {
             }
         }
         Field::Crossfade => {
-            host.crossfade_enabled = forward;
+            host.session.crossfade_enabled = forward;
             if !forward {
-                host.fade_in_started_at = None;
-                let _ = host.player.set_volume(host.base_volume);
+                host.session.fade_in_started_at = None;
+                let _ = host.player.set_volume(host.session.base_volume);
             }
         }
         Field::CrossfadeSeconds => {
@@ -256,7 +257,7 @@ fn rebuild(host: &mut Host) {
         &host.session.cfg,
         &mut host.downloading,
         &host.download_tx,
-        &mut host.notifications,
+        &mut host.session.notifications,
     ) {
         Ok(result) => {
             warn_low_quality(host);
@@ -270,7 +271,7 @@ fn rebuild(host: &mut Host) {
                     result.unavailable_servers
                 ));
             }
-            host.notifications.push(
+            host.session.notifications.push(
                 if result.unavailable_servers > 0 {
                     Severity::Error
                 } else {
@@ -279,7 +280,7 @@ fn rebuild(host: &mut Host) {
                 status,
             );
         }
-        Err(error) => host.notifications.push(Severity::Error, error),
+        Err(error) => host.session.notifications.push(Severity::Error, error),
     }
 }
 
@@ -314,7 +315,7 @@ pub fn key(host: &mut Host, state: &mut SettingsState, code: KeyCode, close_key:
     }
     if code == KeyCode::Esc || code == close_key {
         state.open = false;
-        host.session.cfg.crossfade_enabled = host.crossfade_enabled;
+        host.session.cfg.crossfade_enabled = host.session.crossfade_enabled;
         save(host);
         return;
     }
@@ -333,7 +334,7 @@ pub fn key(host: &mut Host, state: &mut SettingsState, code: KeyCode, close_key:
             Field::RebuildDownloads => {
                 state.rebuild_pending = true;
                 let count = downloaded_count(host);
-                host.notifications.push(
+                host.session.notifications.push(
                     Severity::Alert,
                     format!(
                         "this will re-download up to {count} saved song(s); existing copies remain until replacements succeed. enter again to confirm"
