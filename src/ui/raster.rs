@@ -715,9 +715,7 @@ fn group_rgb(mask: usize, q: [[u8; 3]; 4]) -> ([u8; 3], [u8; 3]) {
 }
 
 /// Reading the sampled grid back without a `Buffer`, for tests and
-/// diagnostics. Nothing on the render path calls these yet, hence the
-/// blanket allow (same documented gap as `cache::play_count`).
-#[allow(dead_code)]
+/// diagnostics. Nothing on the render path calls these.
 impl Raster {
     /// Cell columns the last `sample` was sized for.
     pub fn cols(&self) -> u16 {

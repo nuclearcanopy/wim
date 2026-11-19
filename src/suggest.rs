@@ -238,7 +238,6 @@ pub struct Suggestion {
     /// the documented output shape, and the one number a menu that
     /// later wants to show "why this ranked here" would read; the
     /// current menu renders rows in the order they arrive.
-    #[allow(dead_code)]
     pub score: f32,
 }
 
@@ -248,7 +247,6 @@ pub struct Section {
     /// reason itself (it needs it for headings it renders without a
     /// section), so this is carried for hosts that only have the
     /// section.
-    #[allow(dead_code)]
     pub title: String,
     pub reason: Reason,
     pub items: Vec<Suggestion>,
@@ -344,7 +342,6 @@ const ENRICHMENT_FORMAT: u32 = 1;
 impl EnrichmentCache {
     // the host loads rather than constructs; `new` is what this
     // module's own tests build their fixtures with.
-    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -488,7 +485,6 @@ pub struct Track {
     pub artist: String,
     /// Display name; the generators join through `track_album` instead,
     /// so this is only here to keep a `Track` self-describing.
-    #[allow(dead_code)]
     pub album: String,
     /// Empty unless the track came in through `ingest_songs`/
     /// `ingest_album`; `SearchItem` does not carry genre.
@@ -966,17 +962,14 @@ impl Catalog {
     // about ingest, not host api; nothing outside needs to ask the
     // catalog its size, since the host only ever hands it to
     // `suggest`.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.tracks.is_empty() && self.albums.is_empty() && self.artists.is_empty()
     }
 
-    #[allow(dead_code)]
     pub fn track_count(&self) -> usize {
         self.tracks.len()
     }
 
-    #[allow(dead_code)]
     pub fn artist_count(&self) -> usize {
         self.artists.len()
     }

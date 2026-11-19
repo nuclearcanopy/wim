@@ -1300,7 +1300,6 @@ impl CacheIndex {
     /// `record_play`'s return value instead of coming back for this,
     /// so like `play_count` it's here as the public read API for
     /// whatever UI surface later wants to show it.
-    #[allow(dead_code)]
     pub fn days_played(&self, id: &str) -> u32 {
         self.entries
             .get(id)
@@ -1330,7 +1329,6 @@ impl CacheIndex {
     // part of the public read API for whatever UI surface later wants
     // to show "played N times" (same documented gap as
     // `subsonic::Song::duration`).
-    #[allow(dead_code)]
     pub fn play_count(&self, id: &str) -> u32 {
         self.entries.get(id).map(|e| e.play_count).unwrap_or(0)
     }
