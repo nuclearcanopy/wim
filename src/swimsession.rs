@@ -15,11 +15,12 @@ use crate::core::{
 use crate::download::DownloadEvent;
 use crate::notify::{Notifications, Severity};
 use crate::player::Player;
-use crate::playqueue::PlayQueue;
+use crate::playqueue::{PlayQueue, PosChange};
 use crate::search::SearchItem;
 use crate::shellsong::{Console, LineKind, Program};
 use crate::shellsong_host::{CorpusCandidates, SearchSettle};
 use crate::swimsurface::SwimSurface;
+use crate::ui::results_list::label;
 use crate::{app, cache, config, favorites, library, lyrics, mpv, search};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -648,6 +649,61 @@ impl SwimSession {
                 }
             }
         }
+    }
+
+    /// Folds mpv events into the queue and playback state; returns the
+    /// track that started, by advancing or by a loop restart.
+    pub fn pump_player_events(&mut self, player: &dyn Player) -> Option<SearchItem> {
+        let mut drained = false;
+        let mut advanced: Option<SearchItem> = None;
+        while let Some(ev) = player.poll_event() {
+            let (name, value) = match ev {
+                mpv::Event::PropertyChange { name, value } => (name, value),
+                mpv::Event::StartFile {
+                    entry_id: Some(entry_id),
+                } => {
+                    if let PosChange::Advanced(_) = self.play_queue.set_playing_entry(entry_id) {
+                        advanced = self.play_queue.current().cloned();
+                    }
+                    continue;
+                }
+                mpv::Event::StartFile { entry_id: None } => continue,
+            };
+            if self.playback.apply(&name, &value) {
+                continue;
+            }
+            if name == mpv::PROP_PLAYLIST_POS {
+                if let PosChange::Advanced(_) =
+                    self.play_queue.set_pos(value.as_i64().unwrap_or(-1))
+                {
+                    advanced = self.play_queue.current().cloned();
+                }
+            } else if name == mpv::PROP_IDLE_ACTIVE {
+                // this was not handled at all, so a queue that ran out
+                // left the bar showing a track that had finished and
+                // `now_playing` never cleared.
+                drained = value.as_bool().unwrap_or(false);
+            }
+        }
+        if drained {
+            // the same decision wim makes, from the same function.
+            match core::drained(
+                player,
+                &self.cache_index,
+                &mut self.play_queue,
+                self.app.loop_mode,
+            ) {
+                core::Drained::Stale => {}
+                core::Drained::Cleared => self.console.note("queue finished".to_string()),
+                core::Drained::Failed(why) => self.console.fail(why),
+                core::Drained::Restarted(track) => {
+                    self.console
+                        .note(format!("looped back to: {}", label(&track)));
+                    advanced = Some(track);
+                }
+            }
+        }
+        advanced
     }
 }
 
