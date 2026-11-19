@@ -65,7 +65,8 @@ pub fn poll(host: &mut Host, mut nm: Option<&mut NavManager>) {
                 }
             }
             Err(message) => {
-                host.notifications
+                host.session
+                    .notifications
                     .push(Severity::Error, format!("{}: {message}", nav.url));
                 if let Some(nm) = nm.as_deref_mut() {
                     nm.message = message;
@@ -76,16 +77,17 @@ pub fn poll(host: &mut Host, mut nm: Option<&mut NavManager>) {
     }
     match result {
         Ok(message) => {
-            host.notifications
+            host.session
+                .notifications
                 .push(Severity::Info, format!("connected: {}", nav.url));
             edit_servers(&mut host.session.cfg, &host.session.servers_tx, |servers| {
                 servers.push(nav)
             });
-            config::save_or_warn(&host.session.cfg, &mut host.notifications);
+            config::save_or_warn(&host.session.cfg, &mut host.session.notifications);
             let path = config::config_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "config.toml".to_string());
-            host.notifications.push(
+            host.session.notifications.push(
                 Severity::Alert,
                 format!(
                     "password saved in cleartext (0600) at {path}; use password_file for a secret manager"
@@ -99,7 +101,8 @@ pub fn poll(host: &mut Host, mut nm: Option<&mut NavManager>) {
             }
         }
         Err(message) => {
-            host.notifications
+            host.session
+                .notifications
                 .push(Severity::Error, format!("{}: {message}", nav.url));
             if let Some(nm) = nm {
                 nm.message = format!("{message} (esc to go back)");
@@ -139,9 +142,10 @@ pub fn poll_connectivity(host: &mut Host, nm: Option<&mut NavManager>) {
     for (url, _, status) in &report {
         match status {
             Some(ConnectionStatus::Unreachable) => host
+                .session
                 .notifications
                 .push(Severity::Alert, format!("{url} is unreachable")),
-            Some(ConnectionStatus::ConfigurationIssue) => host.notifications.push(
+            Some(ConnectionStatus::ConfigurationIssue) => host.session.notifications.push(
                 Severity::Alert,
                 format!("{url} has a configuration/credential problem"),
             ),
@@ -197,7 +201,7 @@ pub fn key(host: &mut Host, nm: &mut NavManager, code: KeyCode, modifiers: KeyMo
                         nm.forget_status_at(at);
                         host.session.app.syncing_servers =
                             !host.session.cfg.navidrome_servers.is_empty();
-                        config::save_or_warn(&host.session.cfg, &mut host.notifications);
+                        config::save_or_warn(&host.session.cfg, &mut host.session.notifications);
                         nm.selected = nm.selected.min(host.session.cfg.navidrome_servers.len());
                         nm.pending_delete = None;
                         nm.message =

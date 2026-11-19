@@ -19,33 +19,33 @@ macro_rules! core_ctx {
             cfg: &$h.session.cfg,
             player: &$h.player,
             app: &mut $h.session.app,
-            notifications: &mut $h.notifications,
-            queue: &mut $h.play_queue,
-            previous_track: &mut $h.previous_track,
+            notifications: &mut $h.session.notifications,
+            queue: &mut $h.session.play_queue,
+            previous_track: &mut $h.session.previous_track,
             cache: &$h.session.cache_index,
             download_tx: &$h.download_tx,
             downloading: &mut $h.downloading,
-            scrobble: &mut $h.scrobble,
+            scrobble: &mut $h.session.scrobble,
             subtitle_tx: &$h.subtitle_tx,
             console: &mut $h.session.console,
             now: $now,
             now_playing: &$np,
-            favorites: &mut $h.favorites,
-            remote_starred: &mut $h.remote_starred,
+            favorites: &mut $h.session.favorites,
+            remote_starred: &mut $h.session.remote_starred,
             lyrics_client: &$h.lyrics_client,
             lyrics_loader: &mut $h.lyrics_loader,
             star_tx: &$h.star_tx,
             track_resolver: &mut $h.track_resolver,
-            base_volume: &mut $h.base_volume,
-            muted: $h.playback.muted,
-            crossfade_enabled: &mut $h.crossfade_enabled,
-            overridden: &mut $h.overridden,
-            undo: &mut $h.undo,
-            between_tracks: &mut $h.between_tracks,
-            fade_in_started_at: &mut $h.fade_in_started_at,
-            fade: &mut $h.fade,
-            sleep_due: &mut $h.sleep_due,
-            resume_due: &mut $h.resume_due,
+            base_volume: &mut $h.session.base_volume,
+            muted: $h.session.playback.muted,
+            crossfade_enabled: &mut $h.session.crossfade_enabled,
+            overridden: &mut $h.session.overridden,
+            undo: &mut $h.session.undo,
+            between_tracks: &mut $h.session.between_tracks,
+            fade_in_started_at: &mut $h.session.fade_in_started_at,
+            fade: &mut $h.session.fade,
+            sleep_due: &mut $h.session.sleep_due,
+            resume_due: &mut $h.session.resume_due,
             scan_rx: &mut $h.session.scan_rx,
             remote_search_tx: &$h.remote_search_tx,
             settle: &mut $h.settle,
@@ -58,18 +58,17 @@ macro_rules! core_ctx {
 
 use wim::catalog;
 use wim::core::{
-    self, BetweenTracks, CoreCtx, Drive, Intent, RemoteSearchOutcome, ScrobbleState, StarFailed,
-    SubtitleOutcome, TrackResolver,
+    self, CoreCtx, Drive, Intent, RemoteSearchOutcome, StarFailed, SubtitleOutcome, TrackResolver,
 };
 use wim::download::DownloadEvent;
-use wim::notify::{Notifications, Severity};
-use wim::playqueue::{PlayQueue, PosChange};
+use wim::notify::Severity;
+use wim::playqueue::PosChange;
 use wim::search::SearchItem;
 use wim::shellsong::{LineKind, Op, Program};
-use wim::shellsong_host::{CorpusCandidates, Ramp, SearchSettle};
+use wim::shellsong_host::{CorpusCandidates, SearchSettle};
 use wim::swimsession::SwimSession;
 use wim::ui::results_list::label;
-use wim::{app, config, favorites, lyrics, mpv};
+use wim::{app, config, lyrics, mpv};
 
 /// How long a one-shot waits for a command that is still resolving a
 /// name against a server. The language times its own await out at 8s;
@@ -286,16 +285,10 @@ pub struct PlayerSetupResult {
 
 pub struct Host {
     pub player: mpv::Mpv,
-    pub notifications: Notifications,
     /// A server being added or reconnected, answering off the ui thread.
     pub pending_connect: Option<crate::nav_ui::PendingConnect>,
     pub pending_connectivity: Option<std::sync::mpsc::Receiver<wim::catalog::ConnectivityReport>>,
-    mpv_exit_reported: bool,
     _instance_lock: Option<std::fs::File>,
-    seen_reply_timeouts: u64,
-    last_reconcile: Instant,
-    pub play_queue: PlayQueue,
-    pub previous_track: Option<SearchItem>,
     pub download_tx: Sender<DownloadEvent>,
     pub download_rx: Receiver<DownloadEvent>,
     pub downloading: HashSet<String>,
@@ -303,10 +296,6 @@ pub struct Host {
     pub subtitle_rx: Receiver<SubtitleOutcome>,
     pub remote_search_tx: Sender<core::RemoteSearchQuery>,
     pub remote_search_result_rx: Receiver<RemoteSearchOutcome>,
-    pub scrobble: ScrobbleState,
-    scrobble_failed_rx: Receiver<core::ScrobbleFailed>,
-    pub favorites: favorites::Favorites,
-    pub remote_starred: HashSet<String>,
     pub lyrics_client: lyrics::Client,
     pub lyrics_loader: lyrics::Loader,
     pub lyrics_pane: wim::lyricspane::LyricsPane,
@@ -319,29 +308,17 @@ pub struct Host {
     pub _media_proxy: Option<wim::media_proxy::MediaProxy>,
     pub proxy_ready: bool,
     player_setup: Option<PlayerSetup>,
-    pub base_volume: f64,
-    pub crossfade_enabled: bool,
-    pub between_tracks: BetweenTracks,
-    /// Per-identity settings the user has overridden by hand; see
-    /// `core::track_started`. shellswim applied none of these before.
-    pub overridden: wim::shellsong_host::Overridden,
-    pub resume_due: Option<Duration>,
     /// The query whose results have been printed, and the names
     /// already printed for it. Kept so a server answering after the
     /// settle window prints only its *new* matches rather than
     /// repeating the list or saying nothing at all.
     echoed: Option<(String, HashSet<String>)>,
-    pub undo: wim::undo::Recorder,
-    pub fade_in_started_at: Option<Instant>,
-    pub fade: Option<Ramp>,
-    pub sleep_due: Option<Duration>,
     pub settle: SearchSettle,
     pub saved_queues: Vec<String>,
     pub bindings: wim::shellsong_host::Bindings,
     /// `.shg` names behind `run(...)`'s completion; a directory read,
     /// so snapshotted rather than done per keystroke.
     pub scripts: Vec<String>,
-    pub playback: mpv::Playback,
     pub session: SwimSession,
     torbox_tx: Sender<TorBoxReply>,
     torbox_rx: Receiver<TorBoxReply>,
@@ -358,7 +335,7 @@ impl Host {
         let first_run = !config::config_path()?.exists();
         let cfg = config::load_or_init()?;
         wim::trace_mark!("config loaded");
-        let session = SwimSession::new(cfg);
+        let mut session = SwimSession::new(cfg);
         let cfg = &session.cfg;
 
         // returns as soon as mpv is forked; the socket wait is on a
@@ -424,49 +401,19 @@ impl Host {
         let (remote_search_result_tx, remote_search_result_rx) = mpsc::channel();
         core::spawn_background_search(remote_search_rx, remote_search_result_tx);
 
-        // not read from mpv: that is an ipc round trip, so it would
-        // put the 65-120ms socket wait back on the startup path for a
-        // value that is provably 100 here. `--no-config` means no
-        // mpv.conf can have set it and nothing has loaded a file yet,
-        // so mpv is at its documented default; `a_fresh_mpv_starts_at_
-        // full_volume` checks that against a real mpv rather than
-        // trusting it.
-        let base_volume = wim::shellsong_host::VOLUME_CEILING;
-        let crossfade_enabled = cfg.crossfade_enabled;
-        let gap_at_start = cfg.gap_seconds;
         let lyrics_client = lyrics::Client::with_providers(
             cfg.lyrics.providers.clone(),
             cfg.resolve_lyrics_api_keys(),
         );
         let (star_tx, star_rx) = mpsc::channel();
-        let (scrobble_failed_tx, scrobble_failed_rx) = mpsc::channel();
         let (torbox_tx, torbox_rx) = mpsc::channel();
-        let mut notifications = Notifications::default();
-        if cfg.offline_download_format != "flac"
-            && cfg.effective_offline_download_bitrate_kbps() <= 96
-        {
-            notifications.push(
-                Severity::Alert,
-                format!(
-                    "low offline audio quality: downloads will use {} kbps",
-                    cfg.effective_offline_download_bitrate_kbps()
-                ),
-            );
-        }
-        if let Some(warning) = proxy_unavailable {
-            notifications.push(Severity::Alert, warning);
-        }
-        for server in &cfg.navidrome_servers {
-            if let Some(warning) = wim::subsonic::insecure_transport_warning(&server.url) {
-                notifications.push(Severity::Alert, warning);
-            }
-        }
+        session.push_startup_alerts(proxy_unavailable);
         let instance_lock = match wim::persistence::state_dir()
             .map(|dir| wim::fsutil::claim_instance_lock(&dir))
         {
             Ok(wim::fsutil::InstanceLock::Held(file)) => Some(file),
             Ok(wim::fsutil::InstanceLock::Contended) => {
-                notifications.push(
+                session.notifications.push(
                     Severity::Alert,
                     "another wim is running; play history, favorites and command history are merged, but the saved queue, resume position and settings are whichever wim saves last",
                 );
@@ -477,28 +424,15 @@ impl Host {
         Ok(Host {
             _instance_lock: instance_lock,
             player,
-            notifications,
-            play_queue: PlayQueue::default(),
-            previous_track: None,
             download_tx,
             download_rx,
             downloading: HashSet::new(),
             pending_connect: None,
             pending_connectivity: None,
-            mpv_exit_reported: false,
-            seen_reply_timeouts: wim::mpv::reply_timeouts(),
-            last_reconcile: Instant::now(),
             subtitle_tx,
             subtitle_rx,
             remote_search_tx,
             remote_search_result_rx,
-            scrobble: ScrobbleState {
-                failed_tx: Some(scrobble_failed_tx),
-                ..ScrobbleState::default()
-            },
-            scrobble_failed_rx,
-            favorites: favorites::load(),
-            remote_starred: HashSet::new(),
             lyrics_client,
             lyrics_loader: lyrics::Loader::new(),
             lyrics_pane: wim::lyricspane::LyricsPane::default(),
@@ -514,21 +448,11 @@ impl Host {
                 proxy_index,
                 replaygain_index,
             }),
-            base_volume,
-            crossfade_enabled,
-            between_tracks: BetweenTracks::new(gap_at_start),
-            overridden: wim::shellsong_host::Overridden::default(),
-            resume_due: None,
             echoed: None,
-            undo: wim::undo::Recorder::default(),
-            fade_in_started_at: None,
-            fade: None,
-            sleep_due: None,
             settle: SearchSettle::default(),
             saved_queues: Vec::new(),
             bindings: wim::shellsong_host::load_bindings(),
             scripts: wim::shellsong_host::script_names(),
-            playback: mpv::Playback::default(),
             session,
             torbox_tx,
             torbox_rx,
@@ -576,7 +500,7 @@ impl Host {
     pub fn finish_player_setup(&mut self, outcome: PlayerSetupResult) {
         self.proxy_ready = outcome.proxy_ready;
         for warning in outcome.warnings {
-            self.notifications.push(Severity::Alert, warning);
+            self.session.notifications.push(Severity::Alert, warning);
         }
         if let Some(error) = outcome.observe_error {
             self.session.console.error =
@@ -622,7 +546,7 @@ impl Host {
     /// `queue(...)` would for that item.
     pub fn act_on_item(&mut self, item: SearchItem, queue: bool) {
         let now = self.session.start.elapsed();
-        let now_playing = self.play_queue.current().cloned();
+        let now_playing = self.session.play_queue.current().cloned();
         let mut surf = self.session.swim.borrowed();
         let mut core = core_ctx!(self, now, now_playing);
         let action = if queue {
@@ -637,7 +561,7 @@ impl Host {
     /// redo from the tree record, refuse at barriers and report alike.
     pub fn apply_one(&mut self, op: wim::shellsong::Op) {
         let now = self.session.start.elapsed();
-        let now_playing = self.play_queue.current().cloned();
+        let now_playing = self.session.play_queue.current().cloned();
         let mut surf = self.session.swim.borrowed();
         let mut core = core_ctx!(self, now, now_playing);
         let _ = core::apply_op(op, &mut core, &mut surf);
@@ -646,7 +570,7 @@ impl Host {
     /// Crosses to a sibling branch of the undo tree and restores it.
     pub fn switch_undo_branch(&mut self, delta: isize) {
         let now = self.session.start.elapsed();
-        let now_playing = self.play_queue.current().cloned();
+        let now_playing = self.session.play_queue.current().cloned();
         let mut core = core_ctx!(self, now, now_playing);
         match core.undo.switch_branch(delta) {
             Some(snapshot) => {
@@ -659,7 +583,7 @@ impl Host {
     }
 
     pub fn now_playing(&self) -> Option<SearchItem> {
-        self.play_queue.current().cloned()
+        self.session.play_queue.current().cloned()
     }
 
     /// Local names the prompt completes against; never touches the
@@ -678,23 +602,23 @@ impl Host {
     /// Each one is a `try_recv`, so this is the whole reason nothing
     /// in shellswim blocks.
     pub fn pump(&mut self) {
-        if wim::mpv::reply_timeouts() != self.seen_reply_timeouts
-            && !self.mpv_exit_reported
+        if wim::mpv::reply_timeouts() != self.session.seen_reply_timeouts
+            && !self.session.mpv_exit_reported
             && !self.player.background_active()
-            && self.last_reconcile.elapsed() >= Duration::from_secs(5)
+            && self.session.last_reconcile.elapsed() >= Duration::from_secs(5)
         {
-            self.last_reconcile = Instant::now();
+            self.session.last_reconcile = Instant::now();
             if let Some(note) =
-                wim::core::reconcile_queue_after_timeout(&self.player, &mut self.play_queue)
+                wim::core::reconcile_queue_after_timeout(&self.player, &mut self.session.play_queue)
             {
-                self.notifications.push(Severity::Alert, note);
+                self.session.notifications.push(Severity::Alert, note);
             }
-            self.seen_reply_timeouts = wim::mpv::reply_timeouts();
+            self.session.seen_reply_timeouts = wim::mpv::reply_timeouts();
         }
-        if !self.mpv_exit_reported {
+        if !self.session.mpv_exit_reported {
             if let Some(status) = self.player.exited() {
-                self.mpv_exit_reported = true;
-                self.notifications.push(
+                self.session.mpv_exit_reported = true;
+                self.session.notifications.push(
                     Severity::Error,
                     format!(
                         "mpv exited ({status}); playback is unavailable until shellswim restarts"
@@ -705,7 +629,7 @@ impl Host {
         while let Ok(reply) = self.torbox_rx.try_recv() {
             self.torbox_pending = false;
             let now = self.session.start.elapsed();
-            let now_playing = self.play_queue.current().cloned();
+            let now_playing = self.session.play_queue.current().cloned();
             let mut surf = self.session.swim.borrowed();
             let mut core = core_ctx!(self, now, now_playing);
             match reply.result {
@@ -733,7 +657,7 @@ impl Host {
         // rather than merely drawing something stale.
         while let Some((into, label, tracks)) = self.track_resolver.poll() {
             let now = self.session.start.elapsed();
-            let now_playing = self.play_queue.current().cloned();
+            let now_playing = self.session.play_queue.current().cloned();
             let mut surf = self.session.swim.borrowed();
             let mut core = core_ctx!(self, now, now_playing);
             match tracks {
@@ -797,17 +721,17 @@ impl Host {
         // the server refused a star, so the optimistic flip goes back.
         while let Ok(failed) = self.star_rx.try_recv() {
             if failed.wanted {
-                self.remote_starred.remove(&failed.id);
+                self.session.remote_starred.remove(&failed.id);
             } else {
-                self.remote_starred.insert(failed.id.clone());
+                self.session.remote_starred.insert(failed.id.clone());
             }
             let verb = if failed.wanted { "star" } else { "unstar" };
             self.session
                 .console
                 .note(format!("couldn't {verb}: {}", failed.error));
         }
-        while let Ok(failed) = self.scrobble_failed_rx.try_recv() {
-            self.notifications.push(
+        while let Ok(failed) = self.session.scrobble_failed_rx.try_recv() {
+            self.session.notifications.push(
                 Severity::Error,
                 format!("ListenBrainz {} failed: {}", failed.kind, failed.error),
             );
@@ -859,21 +783,25 @@ impl Host {
                 mpv::Event::StartFile {
                     entry_id: Some(entry_id),
                 } => {
-                    if let PosChange::Advanced(_) = self.play_queue.set_playing_entry(entry_id) {
-                        advanced = self.play_queue.current().cloned();
+                    if let PosChange::Advanced(_) =
+                        self.session.play_queue.set_playing_entry(entry_id)
+                    {
+                        advanced = self.session.play_queue.current().cloned();
                     }
                     continue;
                 }
                 mpv::Event::StartFile { entry_id: None } => continue,
             };
-            if self.playback.apply(&name, &value) {
+            if self.session.playback.apply(&name, &value) {
                 continue;
             }
             if name == mpv::PROP_PLAYLIST_POS {
-                if let PosChange::Advanced(_) =
-                    self.play_queue.set_pos(value.as_i64().unwrap_or(-1))
+                if let PosChange::Advanced(_) = self
+                    .session
+                    .play_queue
+                    .set_pos(value.as_i64().unwrap_or(-1))
                 {
-                    advanced = self.play_queue.current().cloned();
+                    advanced = self.session.play_queue.current().cloned();
                 }
             } else if name == mpv::PROP_IDLE_ACTIVE {
                 // this was not handled at all, so a queue that ran out
@@ -887,7 +815,7 @@ impl Host {
             match core::drained(
                 &self.player,
                 &self.session.cache_index,
-                &mut self.play_queue,
+                &mut self.session.play_queue,
                 self.session.app.loop_mode,
             ) {
                 core::Drained::Stale => {}
@@ -935,7 +863,7 @@ impl Host {
             // lookup is dispatched to its worker thread and is a no-op
             // for audio or when no OpenSubtitles key is configured.
             core::fire_subtitle_fetch(&self.session.cfg, &self.subtitle_tx, &track);
-            if self.play_queue.current().is_some() {
+            if self.session.play_queue.current().is_some() {
                 self.session
                     .console
                     .note(format!("now playing: {}", label(&track)));
@@ -969,78 +897,83 @@ impl Host {
         // the between-track gap, same mechanism as wim's loop: mpv
         // holds at each file's end under `keep-open` and pauses
         // itself, and this waits the gap out before advancing.
-        self.between_tracks.step(
+        self.session.between_tracks.step(
             &self.player,
-            self.playback.eof_reached,
-            self.play_queue.upcoming_len() > 0,
+            self.session.playback.eof_reached,
+            self.session.play_queue.upcoming_len() > 0,
             Instant::now(),
         );
 
         // Keep time-based playback behavior live even while the prompt
         // is idle or a command is waiting for network results.
         let now = self.session.start.elapsed();
-        if let Some(ramp) = self.fade {
+        if let Some(ramp) = self.session.fade {
             let _ = self.player.set_volume_nowait(ramp.level_at(now));
             if ramp.finished(now) {
-                self.fade = None;
+                self.session.fade = None;
             }
         }
-        if self.crossfade_enabled {
-            if let Some(started) = self.fade_in_started_at {
+        if self.session.crossfade_enabled {
+            if let Some(started) = self.session.fade_in_started_at {
                 let span = config::crossfade_seconds(self.session.cfg.crossfade_seconds);
                 let t = (started.elapsed().as_secs_f64() / span).clamp(0.0, 1.0);
-                let _ = self.player.set_volume_nowait(self.base_volume * t);
+                let _ = self.player.set_volume_nowait(self.session.base_volume * t);
                 if t >= 1.0 {
-                    self.fade_in_started_at = None;
+                    self.session.fade_in_started_at = None;
                 }
             } else if let (Some(elapsed), Some(duration)) = (
-                self.playback.elapsed_secs,
-                core::playing_duration(self.play_queue.current(), self.playback.duration_secs),
+                self.session.playback.elapsed_secs,
+                core::playing_duration(
+                    self.session.play_queue.current(),
+                    self.session.playback.duration_secs,
+                ),
             ) {
                 let span = config::crossfade_seconds(self.session.cfg.crossfade_seconds);
                 let remaining = duration - elapsed;
                 if remaining <= span {
-                    let _ = self
-                        .player
-                        .set_volume_nowait(self.base_volume * (remaining / span).clamp(0.0, 1.0));
+                    let _ = self.player.set_volume_nowait(
+                        self.session.base_volume * (remaining / span).clamp(0.0, 1.0),
+                    );
                 }
             }
         }
-        if self.resume_due.is_some_and(|due| now >= due) {
-            self.resume_due = None;
+        if self.session.resume_due.is_some_and(|due| now >= due) {
+            self.session.resume_due = None;
             let _ = self.player.set_pause(false);
             self.session.console.note("resumed".to_string());
         }
-        if let Some(due) = self.sleep_due {
+        if let Some(due) = self.session.sleep_due {
             let fade = Duration::from_secs_f64(config::crossfade_seconds(
                 self.session.cfg.crossfade_seconds,
             ));
-            match wim::shellsong_host::sleep_step(due, fade, self.base_volume, now) {
+            match wim::shellsong_host::sleep_step(due, fade, self.session.base_volume, now) {
                 wim::shellsong_host::SleepStep::Waiting => {}
                 wim::shellsong_host::SleepStep::Fading(level) => {
                     let _ = self.player.set_volume_nowait(level);
                 }
                 wim::shellsong_host::SleepStep::Expired => {
-                    self.sleep_due = None;
-                    if !self.playback.paused {
+                    self.session.sleep_due = None;
+                    if !self.session.playback.paused {
                         let _ = self.player.toggle_pause();
                     }
-                    let _ = self.player.set_volume(self.base_volume);
-                    self.notifications
+                    let _ = self.player.set_volume(self.session.base_volume);
+                    self.session
+                        .notifications
                         .push(Severity::Info, "sleep timer: paused");
                     self.session.console.note("slept".to_string());
                 }
             }
         }
-        if !self.scrobble.scrobbled {
+        if !self.session.scrobble.scrobbled {
             if let (Some(item), Some(elapsed), Some(duration)) = (
-                self.play_queue.current(),
-                self.playback.elapsed_secs,
-                self.playback.duration_secs,
+                self.session.play_queue.current(),
+                self.session.playback.elapsed_secs,
+                self.session.playback.duration_secs,
             ) {
                 if wim::listenbrainz::should_scrobble(&self.session.cfg.scrobble, elapsed, duration)
                 {
                     let listened_at = self
+                        .session
                         .scrobble
                         .started_unix
                         .unwrap_or_else(wim::listenbrainz::now_unix);
@@ -1048,9 +981,9 @@ impl Host {
                         &self.session.cfg,
                         item,
                         listened_at,
-                        self.scrobble.failed_tx.as_ref(),
+                        self.session.scrobble.failed_tx.as_ref(),
                     );
-                    self.scrobble.scrobbled = true;
+                    self.session.scrobble.scrobbled = true;
                 }
             }
         }
@@ -1064,11 +997,12 @@ impl Host {
                     if let Some(warning) =
                         catalog::merge_catalog_into_app(&mut self.session.app, catalog)
                     {
-                        self.notifications.push(Severity::Alert, warning);
+                        self.session.notifications.push(Severity::Alert, warning);
                     }
-                    self.remote_starred.extend(starred);
+                    self.session.remote_starred.extend(starred);
                     if self.session.server_reachable.insert(sync.url.clone(), true) == Some(false) {
-                        self.notifications
+                        self.session
+                            .notifications
                             .push(Severity::Info, format!("{} is back online", sync.url));
                     }
                 }
@@ -1078,9 +1012,10 @@ impl Host {
                     .insert(sync.url.clone(), false)
                 {
                     None => self
+                        .session
                         .notifications
                         .push(Severity::Error, format!("{}: {message}", sync.url)),
-                    Some(true) => self.notifications.push(
+                    Some(true) => self.session.notifications.push(
                         Severity::Alert,
                         format!("{} went offline: {message}", sync.url),
                     ),
@@ -1137,7 +1072,7 @@ impl Host {
             }
         }
         while let Ok(sub) = self.subtitle_rx.try_recv() {
-            if !core::subtitle_belongs_to_playing(&sub, self.play_queue.current()) {
+            if !core::subtitle_belongs_to_playing(&sub, self.session.play_queue.current()) {
                 continue;
             }
             match sub {
@@ -1153,7 +1088,7 @@ impl Host {
         // notifications are wim's toast channel; an overlay here would
         // cover the thing it is talking about, so the text goes into
         // the scrollback, which is the only output shellswim has.
-        for note in self.notifications.drain_text() {
+        for note in self.session.notifications.drain_text() {
             self.session.console.note(note);
         }
     }
@@ -1173,7 +1108,7 @@ impl Host {
             return Drive::Done;
         };
         let now = self.session.start.elapsed();
-        let now_playing = self.play_queue.current().cloned();
+        let now_playing = self.session.play_queue.current().cloned();
         let mut surf = self.session.swim.borrowed();
         let mut core = core_ctx!(self, now, now_playing);
         let tx = self.torbox_tx.clone();

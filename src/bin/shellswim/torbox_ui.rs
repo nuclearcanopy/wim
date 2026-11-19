@@ -36,7 +36,7 @@ pub fn poll(host: &mut Host, tb: &mut Workspace) {
     tb.poll();
     if let Some(path) = tb.take_configured_path() {
         host.session.cfg.torbox_token_file = Some(path);
-        config::save_or_warn(&host.session.cfg, &mut host.notifications);
+        config::save_or_warn(&host.session.cfg, &mut host.session.notifications);
     }
     let _ = tb.take_setup_error();
 }
@@ -68,7 +68,7 @@ pub fn key(host: &mut Host, tb: &mut Workspace, open: &mut bool, code: KeyCode) 
         KeyCode::Char('V') if tb.page != Page::Setup && !editing => {
             host.session.cfg.watch_reveal_spoilers = !host.session.cfg.watch_reveal_spoilers;
             tb.spoilers_revealed = host.session.cfg.watch_reveal_spoilers;
-            config::save_or_warn(&host.session.cfg, &mut host.notifications);
+            config::save_or_warn(&host.session.cfg, &mut host.session.notifications);
         }
         KeyCode::Esc if tb.page == Page::Setup => tb.page = Page::Search,
         KeyCode::Esc if editing => tb.search_editing = false,
