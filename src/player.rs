@@ -59,6 +59,18 @@ pub trait Player {
 
     /// Ask the engine to push the properties the render path reads.
     fn observe_playback(&self) -> Result<()>;
+
+    // host loop
+    /// `set_volume` without waiting for the engine's answer; for ramps
+    /// that run every frame.
+    fn set_volume_nowait(&self, vol: f64) -> Result<()>;
+    fn sub_add(&self, path: &str) -> Result<()>;
+    /// The next pending engine event, if any; never blocks.
+    fn poll_event(&self) -> Option<crate::mpv::Event>;
+    /// Why the engine stopped on its own, once it has.
+    fn exited(&self) -> Option<String>;
+    /// Whether a background command batch is still running.
+    fn background_active(&self) -> bool;
 }
 
 impl Player for Mpv {
@@ -138,6 +150,21 @@ impl Player for Mpv {
     }
     fn observe_playback(&self) -> Result<()> {
         Mpv::observe_playback(self)
+    }
+    fn set_volume_nowait(&self, vol: f64) -> Result<()> {
+        Mpv::set_volume_nowait(self, vol)
+    }
+    fn sub_add(&self, path: &str) -> Result<()> {
+        Mpv::sub_add(self, path)
+    }
+    fn poll_event(&self) -> Option<crate::mpv::Event> {
+        self.events().try_recv().ok()
+    }
+    fn exited(&self) -> Option<String> {
+        Mpv::exited(self)
+    }
+    fn background_active(&self) -> bool {
+        Mpv::background_active(self)
     }
 }
 
@@ -284,5 +311,20 @@ impl Player for FakePlayer {
     }
     fn observe_playback(&self) -> Result<()> {
         self.rec("observe_playback", String::new())
+    }
+    fn set_volume_nowait(&self, vol: f64) -> Result<()> {
+        self.rec("set_volume_nowait", vol.to_string())
+    }
+    fn sub_add(&self, path: &str) -> Result<()> {
+        self.rec("sub_add", path.to_string())
+    }
+    fn poll_event(&self) -> Option<crate::mpv::Event> {
+        None
+    }
+    fn exited(&self) -> Option<String> {
+        None
+    }
+    fn background_active(&self) -> bool {
+        false
     }
 }
