@@ -705,6 +705,28 @@ impl SwimSession {
         }
         advanced
     }
+
+    /// A settled search prints what it found into the console.
+    pub fn pump_echo(&mut self, width: usize) {
+        let local_ready = !self.app.scanning_library && !self.app.loading_cached_catalog;
+        // one-shots keep waiting for the settle window so a script's
+        // output is complete; only the interactive prompt echoes early
+        if self.swim.echo_results
+            && ((self.interactive_prompt && local_ready)
+                || self.settle.settled(self.start.elapsed()))
+        {
+            self.swim.echo_results = false;
+            let mut shown = HashSet::new();
+            let lines = core::echo_lines(self.app.results(), &mut shown, width);
+            if lines.is_empty() {
+                self.console.note("no matches".to_string());
+            }
+            for line in lines {
+                self.console.note(line);
+            }
+            self.echoed = Some((self.app.query.clone(), shown));
+        }
+    }
 }
 
 #[cfg(test)]

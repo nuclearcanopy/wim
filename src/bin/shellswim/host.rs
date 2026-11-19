@@ -5,7 +5,6 @@
 //! locals); `CoreCtx` is still built per use, because the borrow of
 //! the core and the borrow of the surface have to stay disjoint.
 
-use std::collections::HashSet;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -670,27 +669,7 @@ impl Host {
         // Local and cached results are final once loading finishes; a
         // slow server's matches follow through the "...and from the
         // servers" lines below rather than holding these back.
-        let local_ready =
-            !self.session.app.scanning_library && !self.session.app.loading_cached_catalog;
-        // one-shots keep waiting for the settle window so a script's
-        // output is complete; only the interactive prompt echoes early
-        if self.session.swim.echo_results
-            && ((self.session.interactive_prompt && local_ready)
-                || self.session.settle.settled(self.session.start.elapsed()))
-        {
-            self.session.swim.echo_results = false;
-            let mut shown = HashSet::new();
-            let lines =
-                core::echo_lines(self.session.app.results(), &mut shown, self.console_width());
-            if lines.is_empty() {
-                self.session.console.note("no matches".to_string());
-            }
-            for line in lines {
-                self.session.console.note(line);
-            }
-            self.session.echoed = Some((self.session.app.query.clone(), shown));
-        }
-
+        self.session.pump_echo(self.console_width());
         // a track started, by advancing or by a loop-all restart.
         if let Some(track) = advanced {
             // Keep video subtitle discovery aligned with Wim. The
