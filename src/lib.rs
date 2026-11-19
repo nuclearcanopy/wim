@@ -49,6 +49,7 @@ pub mod subsonic;
 pub mod subtitle_align;
 pub mod suggest;
 pub mod swimconsole;
+pub mod swimsession;
 pub mod swimsurface;
 pub mod term;
 #[cfg(test)]
