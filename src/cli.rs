@@ -487,7 +487,12 @@ mod tests {
     /// the block read as broken.
     #[test]
     fn every_help_line_fits_a_plain_terminal() {
+        // The real config path is the machine's (a long one on macOS and
+        // Windows), not the help's, so measure a typical Linux one.
+        let typical = "~/.config/wim/config.toml";
+        let real = config_display();
         for text in [wim_help(), help(), WIM_USAGE.to_string(), USAGE.to_string()] {
+            let text = text.replace(&real, typical);
             for line in text.lines() {
                 assert!(
                     crate::ui::textfit::width(line) <= 80,
