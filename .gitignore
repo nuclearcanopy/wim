@@ -1,3 +1,7 @@
 /target
 /result
 __pycache__/
+
+# iOS app: local signing config and generated project
+ios/Config/Local.xcconfig
+ios/Shellswim.xcodeproj/
