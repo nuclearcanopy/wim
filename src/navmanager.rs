@@ -3,6 +3,7 @@
 //! replaces an existing profile, so there's no "did that just erase my
 //! setup?" ambiguity the way a single always-blank login form had.
 
+use crate::subsonic::Reachability;
 use crate::ui::login::LoginForm;
 
 pub enum NavManagerStep {
@@ -15,6 +16,26 @@ pub enum ConnectionStatus {
     Online,
     Unreachable,
     ConfigurationIssue,
+}
+
+impl From<&Reachability> for ConnectionStatus {
+    /// What the row's mark can say: refusals that the user fixes in the
+    /// profile (credentials, 401/403, an unbuildable profile) are
+    /// `ConfigurationIssue`; everything else that is not a success is
+    /// `Unreachable`, including a server that answered with some other
+    /// fault, which is not the profile's doing.
+    fn from(reachability: &Reachability) -> Self {
+        match reachability {
+            Reachability::Online => ConnectionStatus::Online,
+            Reachability::CredentialsRefused { .. }
+            | Reachability::HttpError { status: 401 | 403 }
+            | Reachability::Unusable { .. } => ConnectionStatus::ConfigurationIssue,
+            Reachability::ApiRefused { .. }
+            | Reachability::HttpError { .. }
+            | Reachability::NotSubsonic
+            | Reachability::Unreachable { .. } => ConnectionStatus::Unreachable,
+        }
+    }
 }
 
 pub struct NavManager {
@@ -66,6 +87,41 @@ impl Default for NavManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reachability_maps_onto_the_three_marks() {
+        use ConnectionStatus::*;
+        let why = || "x".to_string();
+        for (reachability, want) in [
+            (Reachability::Online, Online),
+            (
+                Reachability::CredentialsRefused { code: 40 },
+                ConfigurationIssue,
+            ),
+            (
+                Reachability::CredentialsRefused { code: 41 },
+                ConfigurationIssue,
+            ),
+            (
+                Reachability::CredentialsRefused { code: 50 },
+                ConfigurationIssue,
+            ),
+            (Reachability::HttpError { status: 401 }, ConfigurationIssue),
+            (Reachability::HttpError { status: 403 }, ConfigurationIssue),
+            (Reachability::Unusable { why: why() }, ConfigurationIssue),
+            (Reachability::HttpError { status: 500 }, Unreachable),
+            (Reachability::ApiRefused { code: Some(30) }, Unreachable),
+            (Reachability::ApiRefused { code: None }, Unreachable),
+            (Reachability::NotSubsonic, Unreachable),
+            (Reachability::Unreachable { why: why() }, Unreachable),
+        ] {
+            assert_eq!(
+                ConnectionStatus::from(&reachability),
+                want,
+                "{reachability:?}"
+            );
+        }
+    }
 
     #[test]
     fn removing_a_row_keeps_later_badges_on_their_own_rows() {
