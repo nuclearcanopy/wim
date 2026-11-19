@@ -1,0 +1,9 @@
+[package]
+name = "wim-mobile"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "UniFFI bindings exposing the shellswim session to iOS and Android"
+
+[lib]
+name = "wim_mobile"
