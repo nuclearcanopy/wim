@@ -68,6 +68,7 @@ use wim::playqueue::{PlayQueue, PosChange};
 use wim::search::SearchItem;
 use wim::shellsong::{Console, LineKind, Op, Program};
 use wim::shellsong_host::{CorpusCandidates, Ramp, SearchSettle};
+use wim::swimsession::place_submitted_program;
 use wim::ui::results_list::label;
 use wim::{app, cache, config, favorites, library, lyrics, mpv, search};
 
@@ -269,20 +270,6 @@ fn launch_torbox_op(op: Op, cfg: config::Config, tx: Sender<TorBoxReply>) {
         let result = run_torbox_op(&cfg, op);
         let _ = tx.send(TorBoxReply { label, result });
     });
-}
-
-fn place_submitted_program(
-    active: bool,
-    core_waiting: bool,
-    waiting: &mut VecDeque<Box<Program>>,
-    program: Box<Program>,
-) -> Option<Box<Program>> {
-    if active || core_waiting || !waiting.is_empty() {
-        waiting.push_back(program);
-        None
-    } else {
-        Some(program)
-    }
 }
 
 /// The mpv configuration `Host::start` collects instead of applying,
@@ -1454,56 +1441,6 @@ impl Host {
             self.lyrics_loader
                 .request(&self.lyrics_client, name, &artist, &title, &album, None);
         }
-    }
-}
-
-#[cfg(test)]
-mod program_queue_tests {
-    use super::*;
-
-    #[test]
-    fn a_submission_waits_behind_the_active_program_without_replacing_it() {
-        let mut waiting = VecDeque::new();
-        let submitted = Box::new(Program::of(vec![Op::ClearConsole]));
-        let submitted_ptr = (&*submitted) as *const Program;
-        let active = place_submitted_program(true, false, &mut waiting, submitted);
-
-        assert!(active.is_none());
-        assert_eq!(waiting.len(), 1);
-        assert_eq!(
-            (&*waiting.pop_front().unwrap()) as *const Program,
-            submitted_ptr
-        );
-    }
-
-    #[test]
-    fn a_submission_waits_behind_a_track_binding_even_when_idle() {
-        let mut waiting = VecDeque::new();
-        let submitted = Box::new(Program::of(vec![Op::ClearConsole]));
-
-        assert!(place_submitted_program(false, true, &mut waiting, submitted).is_none());
-        assert_eq!(waiting.len(), 1);
-    }
-
-    #[test]
-    fn later_submissions_keep_fifo_order_behind_core_work() {
-        let mut waiting = VecDeque::new();
-        let first = Box::new(Program::of(vec![Op::ClearConsole]));
-        let second = Box::new(Program::of(vec![Op::ClearQueue]));
-        let first_ptr = (&*first) as *const Program;
-        let second_ptr = (&*second) as *const Program;
-
-        assert!(place_submitted_program(false, true, &mut waiting, first).is_none());
-        assert!(place_submitted_program(false, false, &mut waiting, second).is_none());
-        assert_eq!(waiting.len(), 2);
-        assert_eq!(
-            (&*waiting.pop_front().unwrap()) as *const Program,
-            first_ptr
-        );
-        assert_eq!(
-            (&*waiting.pop_front().unwrap()) as *const Program,
-            second_ptr
-        );
     }
 }
 
