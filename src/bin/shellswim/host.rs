@@ -58,7 +58,6 @@ macro_rules! core_ctx {
 
 use wim::core::{self, CoreCtx, Drive, Intent};
 use wim::notify::Severity;
-use wim::playqueue::PosChange;
 use wim::search::SearchItem;
 use wim::shellsong::{LineKind, Op, Program};
 use wim::swimsession::SwimSession;
@@ -664,61 +663,7 @@ impl Host {
             }
         }
 
-        let mut drained = false;
-        let mut advanced: Option<SearchItem> = None;
-        while let Ok(ev) = self.player.events().try_recv() {
-            let (name, value) = match ev {
-                mpv::Event::PropertyChange { name, value } => (name, value),
-                mpv::Event::StartFile {
-                    entry_id: Some(entry_id),
-                } => {
-                    if let PosChange::Advanced(_) =
-                        self.session.play_queue.set_playing_entry(entry_id)
-                    {
-                        advanced = self.session.play_queue.current().cloned();
-                    }
-                    continue;
-                }
-                mpv::Event::StartFile { entry_id: None } => continue,
-            };
-            if self.session.playback.apply(&name, &value) {
-                continue;
-            }
-            if name == mpv::PROP_PLAYLIST_POS {
-                if let PosChange::Advanced(_) = self
-                    .session
-                    .play_queue
-                    .set_pos(value.as_i64().unwrap_or(-1))
-                {
-                    advanced = self.session.play_queue.current().cloned();
-                }
-            } else if name == mpv::PROP_IDLE_ACTIVE {
-                // this was not handled at all, so a queue that ran out
-                // left the bar showing a track that had finished and
-                // `now_playing` never cleared.
-                drained = value.as_bool().unwrap_or(false);
-            }
-        }
-        if drained {
-            // the same decision wim makes, from the same function.
-            match core::drained(
-                &self.player,
-                &self.session.cache_index,
-                &mut self.session.play_queue,
-                self.session.app.loop_mode,
-            ) {
-                core::Drained::Stale => {}
-                core::Drained::Cleared => self.session.console.note("queue finished".to_string()),
-                core::Drained::Failed(why) => self.session.console.fail(why),
-                core::Drained::Restarted(track) => {
-                    self.session
-                        .console
-                        .note(format!("looped back to: {}", label(&track)));
-                    advanced = Some(track);
-                }
-            }
-        }
-
+        let advanced = self.session.pump_player_events(&self.player);
         // a settled search prints what it found. shellswim has no
         // sidebar, so `search(x)` used to answer with a count and
         // nothing else, which is no answer at all.
