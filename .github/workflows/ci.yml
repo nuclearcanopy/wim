@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [master, ci/cross-platform]
+    branches: [master, ci/cross-platform, feat/ios-m3a]
   pull_request:
 
 concurrency:
