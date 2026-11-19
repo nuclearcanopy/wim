@@ -56,9 +56,7 @@ macro_rules! core_ctx {
     };
 }
 
-use wim::catalog;
 use wim::core::{self, CoreCtx, Drive, Intent};
-use wim::download::DownloadEvent;
 use wim::notify::Severity;
 use wim::playqueue::PosChange;
 use wim::search::SearchItem;
@@ -627,25 +625,7 @@ impl Host {
             }
         }
 
-        // the server refused a star, so the optimistic flip goes back.
-        while let Ok(failed) = self.session.star_rx.try_recv() {
-            if failed.wanted {
-                self.session.remote_starred.remove(&failed.id);
-            } else {
-                self.session.remote_starred.insert(failed.id.clone());
-            }
-            let verb = if failed.wanted { "star" } else { "unstar" };
-            self.session
-                .console
-                .note(format!("couldn't {verb}: {}", failed.error));
-        }
-        while let Ok(failed) = self.session.scrobble_failed_rx.try_recv() {
-            self.session.notifications.push(
-                Severity::Error,
-                format!("ListenBrainz {} failed: {}", failed.kind, failed.error),
-            );
-        }
-
+        self.session.pump_failures();
         // a lyrics fetch landed. the loader has already dropped any
         // reply for a track the user moved past, so whatever arrives
         // belongs to the request still standing.
@@ -899,101 +879,8 @@ impl Host {
 
         // A local batch does not settle a pending remote search.
         self.session.pump_library();
-        while let Ok(sync) = self.session.sync_rx.try_recv() {
-            self.session.app.syncing_servers = false;
-            match sync.result {
-                Ok((catalog, starred)) => {
-                    if let Some(warning) =
-                        catalog::merge_catalog_into_app(&mut self.session.app, catalog)
-                    {
-                        self.session.notifications.push(Severity::Alert, warning);
-                    }
-                    self.session.remote_starred.extend(starred);
-                    if self.session.server_reachable.insert(sync.url.clone(), true) == Some(false) {
-                        self.session
-                            .notifications
-                            .push(Severity::Info, format!("{} is back online", sync.url));
-                    }
-                }
-                Err(message) => match self
-                    .session
-                    .server_reachable
-                    .insert(sync.url.clone(), false)
-                {
-                    None => self
-                        .session
-                        .notifications
-                        .push(Severity::Error, format!("{}: {message}", sync.url)),
-                    Some(true) => self.session.notifications.push(
-                        Severity::Alert,
-                        format!("{} went offline: {message}", sync.url),
-                    ),
-                    Some(false) => {}
-                },
-            }
-        }
-        let mut answered = false;
-        while let Ok(outcome) = self.session.remote_search_result_rx.try_recv() {
-            self.session
-                .app
-                .corpus
-                .add_subsonic_search_result(outcome.result, &outcome.client);
-            self.session.app.resync_results();
-            // an answer is in, so the results for whatever was asked
-            // are as complete as a program should wait for.
-            self.session.settle.answered(&outcome.query);
-            answered = true;
-        }
-        // a server that answered *after* the settle window already
-        // missed the echo, so its matches are printed as they land
-        // rather than silently enriching a list that is on screen and
-        // now wrong. only for the query still being shown: anything
-        // else is an answer to a question nobody is looking at.
-        if answered {
-            let avail = self.console_width();
-            if let Some((query, shown)) = self.session.echoed.as_mut() {
-                if *query == self.session.app.query {
-                    let lines = core::echo_lines(self.session.app.results(), shown, avail);
-                    if !lines.is_empty() {
-                        self.session
-                            .console
-                            .note("...and from the servers:".to_string());
-                        for line in lines {
-                            self.session.console.note(line);
-                        }
-                    }
-                }
-            }
-        }
-        while let Ok(event) = self.session.download_rx.try_recv() {
-            match event {
-                DownloadEvent::Progress { .. } => {}
-                DownloadEvent::Done { id, label } => {
-                    self.session.downloading.remove(&id);
-                    self.session.console.note(format!("downloaded: {label}"));
-                }
-                DownloadEvent::Failed { id, label, error } => {
-                    self.session.downloading.remove(&id);
-                    self.session
-                        .console
-                        .fail(format!("download failed for {label}: {error}"));
-                }
-            }
-        }
-        while let Ok(sub) = self.session.subtitle_rx.try_recv() {
-            if !core::subtitle_belongs_to_playing(&sub, self.session.play_queue.current()) {
-                continue;
-            }
-            match sub {
-                core::SubtitleOutcome::Ready(ready) => {
-                    let _ = self.player.sub_add(&ready.path);
-                }
-                // said rather than swallowed: only "no subtitles for
-                // this film" is silent now, so a refused key does not
-                // look like one.
-                core::SubtitleOutcome::Failed { why, .. } => self.session.console.fail(why),
-            }
-        }
+        self.session
+            .pump_replies(&self.player, self.console_width());
         // notifications are wim's toast channel; an overlay here would
         // cover the thing it is talking about, so the text goes into
         // the scrollback, which is the only output shellswim has.
