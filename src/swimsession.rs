@@ -450,6 +450,115 @@ impl SwimSession {
             }
         }
     }
+
+    /// Reports star and scrobble failures that came back from workers.
+    pub fn pump_failures(&mut self) {
+        // the server refused a star, so the optimistic flip goes back.
+        while let Ok(failed) = self.star_rx.try_recv() {
+            if failed.wanted {
+                self.remote_starred.remove(&failed.id);
+            } else {
+                self.remote_starred.insert(failed.id.clone());
+            }
+            let verb = if failed.wanted { "star" } else { "unstar" };
+            self.console
+                .note(format!("couldn't {verb}: {}", failed.error));
+        }
+        while let Ok(failed) = self.scrobble_failed_rx.try_recv() {
+            self.notifications.push(
+                Severity::Error,
+                format!("ListenBrainz {} failed: {}", failed.kind, failed.error),
+            );
+        }
+    }
+
+    /// Applies catalog syncs, remote searches, downloads and subtitles
+    /// that finished since the last call.
+    pub fn pump_replies(&mut self, player: &dyn Player, width: usize) {
+        while let Ok(sync) = self.sync_rx.try_recv() {
+            self.app.syncing_servers = false;
+            match sync.result {
+                Ok((catalog, starred)) => {
+                    if let Some(warning) = catalog::merge_catalog_into_app(&mut self.app, catalog) {
+                        self.notifications.push(Severity::Alert, warning);
+                    }
+                    self.remote_starred.extend(starred);
+                    if self.server_reachable.insert(sync.url.clone(), true) == Some(false) {
+                        self.notifications
+                            .push(Severity::Info, format!("{} is back online", sync.url));
+                    }
+                }
+                Err(message) => match self.server_reachable.insert(sync.url.clone(), false) {
+                    None => self
+                        .notifications
+                        .push(Severity::Error, format!("{}: {message}", sync.url)),
+                    Some(true) => self.notifications.push(
+                        Severity::Alert,
+                        format!("{} went offline: {message}", sync.url),
+                    ),
+                    Some(false) => {}
+                },
+            }
+        }
+        let mut answered = false;
+        while let Ok(outcome) = self.remote_search_result_rx.try_recv() {
+            self.app
+                .corpus
+                .add_subsonic_search_result(outcome.result, &outcome.client);
+            self.app.resync_results();
+            // an answer is in, so the results for whatever was asked
+            // are as complete as a program should wait for.
+            self.settle.answered(&outcome.query);
+            answered = true;
+        }
+        // a server that answered *after* the settle window already
+        // missed the echo, so its matches are printed as they land
+        // rather than silently enriching a list that is on screen and
+        // now wrong. only for the query still being shown: anything
+        // else is an answer to a question nobody is looking at.
+        if answered {
+            let avail = width;
+            if let Some((query, shown)) = self.echoed.as_mut() {
+                if *query == self.app.query {
+                    let lines = core::echo_lines(self.app.results(), shown, avail);
+                    if !lines.is_empty() {
+                        self.console.note("...and from the servers:".to_string());
+                        for line in lines {
+                            self.console.note(line);
+                        }
+                    }
+                }
+            }
+        }
+        while let Ok(event) = self.download_rx.try_recv() {
+            match event {
+                DownloadEvent::Progress { .. } => {}
+                DownloadEvent::Done { id, label } => {
+                    self.downloading.remove(&id);
+                    self.console.note(format!("downloaded: {label}"));
+                }
+                DownloadEvent::Failed { id, label, error } => {
+                    self.downloading.remove(&id);
+                    self.console
+                        .fail(format!("download failed for {label}: {error}"));
+                }
+            }
+        }
+        while let Ok(sub) = self.subtitle_rx.try_recv() {
+            if !core::subtitle_belongs_to_playing(&sub, self.play_queue.current()) {
+                continue;
+            }
+            match sub {
+                core::SubtitleOutcome::Ready(ready) => {
+                    let _ = player.sub_add(&ready.path);
+                }
+                // said rather than swallowed: only "no subtitles for
+                // this film" is silent now, so a refused key does not
+                // look like one.
+                core::SubtitleOutcome::Failed { why, .. } => self.console.fail(why),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
