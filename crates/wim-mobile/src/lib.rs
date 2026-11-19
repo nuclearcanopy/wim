@@ -5,3 +5,5 @@ uniffi::setup_scaffolding!();
 
 mod types;
 pub use types::{Bubble, BubbleKind, PlatformPlayer, WimConfig, WimError};
+mod emulator;
+pub use emulator::PlaylistEmulator;
