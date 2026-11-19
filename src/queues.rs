@@ -761,9 +761,10 @@ secs = 900
 [[entries]]
 title = "a video essay"
 kind = "stream"
-path = "{}"
+path = {}
 "#,
-            real.display()
+            // A toml value, so backslashes in a Windows path are escaped.
+            toml::Value::String(real.display().to_string())
         );
         let saved: SavedQueue =
             toml::from_str(&raw).expect("one unreadable entry must still parse");
