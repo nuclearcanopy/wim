@@ -119,7 +119,7 @@ mod tests {
 
 #[cfg(any(feature = "dev-telemetry", test))]
 use std::fs::{File, OpenOptions};
-#[cfg(any(feature = "dev-telemetry", test))]
+#[cfg(all(unix, any(feature = "dev-telemetry", test)))]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(any(feature = "dev-telemetry", test))]
 use std::sync::Mutex;
@@ -176,17 +176,17 @@ pub fn init_diagnostics() -> bool {
         if path.is_empty() {
             return false;
         }
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&path)
-        {
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&path) {
             Ok(file) => {
                 // `mode` applies only to files this call creates. A file
                 // that already exists keeps whatever it was made with, so
                 // tighten it rather than trust it — the log is owner-only
                 // by contract, not just by default.
+                #[cfg(unix)]
                 if let Ok(meta) = file.metadata() {
                     let mut perms = meta.permissions();
                     if perms.mode() & 0o777 != 0o600 {
@@ -264,6 +264,7 @@ macro_rules! trace_diag {
 #[cfg(test)]
 mod diag_tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     /// The diag globals are process-wide, so the tests serialize on
@@ -300,8 +301,11 @@ mod diag_tests {
         let second = lines.next().unwrap();
         assert!(second.contains("video/arm vo=tct"), "{second:?}");
         assert!(lines.next().is_none(), "exactly two events: {contents:?}");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "diagnostics are owner-only");
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "diagnostics are owner-only");
+        }
         std::fs::remove_file(&path).ok();
     }
 
@@ -369,6 +373,7 @@ mod diag_tests {
     /// `mode(0o600)` only applies at creation. A file created looser
     /// by someone else is tightened on open, so the log is owner-only
     /// even when it did not start that way.
+    #[cfg(unix)]
     #[test]
     fn a_loose_existing_file_is_tightened_on_open() {
         let _guard = DIAG_TEST_LOCK.lock().unwrap();
