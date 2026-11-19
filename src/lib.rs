@@ -37,6 +37,7 @@ pub mod onboarding;
 pub mod opensubtitles;
 pub mod persistence;
 pub mod playback_status;
+pub mod player;
 pub mod playqueue;
 pub mod queues;
 pub mod safenet;
