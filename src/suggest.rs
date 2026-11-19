@@ -4202,20 +4202,7 @@ mod cost {
         out
     }
 
-    /// Process cpu time in microseconds, same clock and the same
-    /// reason as `cache::tests::best_each_cpu`: this box's other cores
-    /// are not idle during a bench run (load average 19 observed), so
-    /// the wall clock moves several-fold between batches while the
-    /// work done does not.
-    fn cpu_now() -> f64 {
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: clock_gettime only writes the timespec we hand it.
-        unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
-        ts.tv_sec as f64 * 1e6 + ts.tv_nsec as f64 / 1e3
-    }
+    use crate::test_util::cpu_now_us as cpu_now;
 
     /// `best`, on the cpu clock. For single-threaded candidates only;
     /// anything pooled has to be read on the wall clock, since cpu

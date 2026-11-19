@@ -2,7 +2,6 @@
 
 /// Process CPU time (unix: `CLOCK_PROCESS_CPUTIME_ID`).
 /// Non-unix fallback: wall time since first call, as there is no libc.
-#[allow(dead_code)] // until call sites convert
 pub(crate) fn cpu_now() -> std::time::Duration {
     #[cfg(unix)]
     {
@@ -25,7 +24,6 @@ pub(crate) fn cpu_now() -> std::time::Duration {
 }
 
 /// `cpu_now` in microseconds, for the f64 benches.
-#[allow(dead_code)] // until call sites convert
 pub(crate) fn cpu_now_us() -> f64 {
     cpu_now().as_secs_f64() * 1e6
 }
