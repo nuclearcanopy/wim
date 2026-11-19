@@ -8,6 +8,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -33,7 +34,16 @@ enum Act {
     Stop,
 }
 
+/// A generated silence has no url to hand the engine: it is a timer
+/// (mpv's lavfi source would need ffmpeg filters the phone lacks).
+struct Silence {
+    secs: f64,
+    elapsed: f64,
+}
+
 struct State {
+    silence: Option<Silence>,
+    last_tick: Instant,
     entries: Vec<Entry>,
     pos: Option<usize>,
     next_id: u64,
@@ -72,7 +82,13 @@ impl State {
         self.paused = false;
         self.time = Some(0.0);
         self.duration = None;
-        self.acts.push(Act::Load(url));
+        self.silence = silence_secs(&url).map(|secs| Silence { secs, elapsed: 0.0 });
+        if let Some(silence) = &self.silence {
+            self.duration = Some(silence.secs);
+            self.acts.push(Act::Stop);
+        } else {
+            self.acts.push(Act::Load(url));
+        }
         self.events
             .push_back(Event::StartFile { entry_id: Some(id) });
         self.prop(PROP_PLAYLIST_POS, json!(i));
@@ -93,6 +109,7 @@ impl State {
     /// The playlist ran out: mpv reports an idle, empty player.
     fn go_idle(&mut self) {
         self.entries.clear();
+        self.silence = None;
         self.pos = None;
         self.time = None;
         self.duration = None;
@@ -100,6 +117,11 @@ impl State {
         self.prop(PROP_TIME_POS, Value::Null);
         self.prop(PROP_IDLE_ACTIVE, json!(true));
     }
+}
+
+/// The seconds in `wim::core::silence_url`'s output.
+fn silence_secs(url: &str) -> Option<f64> {
+    url.strip_prefix("av://lavfi:anullsrc=d=")?.parse().ok()
 }
 
 pub struct PlaylistEmulator {
@@ -116,6 +138,8 @@ impl PlaylistEmulator {
         PlaylistEmulator {
             native,
             state: Mutex::new(State {
+                silence: None,
+                last_tick: Instant::now(),
                 entries: Vec::new(),
                 pos: None,
                 next_id: 0,
@@ -152,11 +176,30 @@ impl PlaylistEmulator {
     /// The engine's position report.
     pub fn on_time(&self, secs: f64, duration: f64) {
         self.with(|s| {
+            if s.silence.is_some() {
+                return;
+            }
             s.time = Some(secs);
             s.prop(PROP_TIME_POS, json!(secs));
             if duration > 0.0 {
                 s.duration = Some(duration);
                 s.prop(PROP_DURATION, json!(duration));
+            }
+        });
+    }
+
+    /// Advances a silence by `dt` of playing time; it ends by itself.
+    pub fn run_clock(&self, dt: Duration) {
+        self.with(|s| {
+            let Some(silence) = s.silence.as_mut().filter(|_| !s.paused) else {
+                return;
+            };
+            silence.elapsed = (silence.elapsed + dt.as_secs_f64()).min(silence.secs);
+            let (elapsed, over) = (silence.elapsed, silence.elapsed >= silence.secs);
+            s.time = Some(elapsed);
+            s.prop(PROP_TIME_POS, json!(elapsed));
+            if over {
+                s.advance(true);
             }
         });
     }
@@ -259,7 +302,9 @@ impl Player for PlaylistEmulator {
         self.with(|s| {
             if s.pos.is_some() && s.paused != paused {
                 s.paused = paused;
-                s.acts.push(if paused { Act::Pause } else { Act::Play });
+                if s.silence.is_none() {
+                    s.acts.push(if paused { Act::Pause } else { Act::Play });
+                }
                 s.prop(PROP_PAUSE, json!(paused));
             }
             Ok(())
@@ -276,7 +321,10 @@ impl Player for PlaylistEmulator {
             let base = if relative { s.time.unwrap_or(0.0) } else { 0.0 };
             let target = (base + seconds).max(0.0);
             s.time = Some(target);
-            s.acts.push(Act::Seek(target));
+            match s.silence.as_mut() {
+                Some(silence) => silence.elapsed = target.min(silence.secs),
+                None => s.acts.push(Act::Seek(target)),
+            }
             s.prop(PROP_TIME_POS, json!(target));
             Ok(())
         })
@@ -346,6 +394,8 @@ impl Player for PlaylistEmulator {
         Err(decline("subtitles"))
     }
     fn poll_event(&self) -> Option<Event> {
+        let dt = self.with(|s| std::mem::replace(&mut s.last_tick, Instant::now()).elapsed());
+        self.run_clock(dt);
         self.with(|s| s.events.pop_front())
     }
     fn exited(&self) -> Option<String> {
