@@ -1648,8 +1648,17 @@ fn reconcile_if_timed_out(
     queue: &mut PlayQueue,
     errors: &[String],
 ) -> Option<String> {
+    reconcile_when_timed_out(errors, || reconcile_queue_after_timeout(player, queue))
+}
+
+/// The trigger of `reconcile_if_timed_out`, with the reconcile injected
+/// so it can be tested without an mpv.
+fn reconcile_when_timed_out(
+    errors: &[String],
+    reconcile: impl FnOnce() -> Option<String>,
+) -> Option<String> {
     if errors.iter().any(|e| e.contains("timed out")) {
-        reconcile_queue_after_timeout(player, queue)
+        reconcile()
     } else {
         None
     }
@@ -8503,6 +8512,40 @@ mod reconcile_by_id_tests {
         assert_eq!(removed, vec![4, 3]);
         reconcile_by_ids(&mut q, &[None], None, |_| {});
         assert_eq!(q.entries().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod reconcile_trigger_tests {
+    use super::*;
+
+    /// "timed out waiting for mpv reply" is what `mpv.rs` produces for a
+    /// reply deadline; a batch error carrying it must reconcile.
+    #[test]
+    fn a_timed_out_batch_error_triggers_the_reconcile() {
+        let errors = vec![
+            "mpv refused: bad path".to_string(),
+            "timed out waiting for mpv reply".to_string(),
+        ];
+        let mut calls = 0;
+        let note = reconcile_when_timed_out(&errors, || {
+            calls += 1;
+            Some("reconciled".to_string())
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(note.as_deref(), Some("reconciled"));
+    }
+
+    #[test]
+    fn a_batch_without_a_timeout_does_not_reconcile() {
+        for errors in [
+            vec![],
+            vec!["mpv refused: bad path".to_string()],
+            vec!["error: no such file".to_string()],
+        ] {
+            let note = reconcile_when_timed_out(&errors, || panic!("must not reconcile"));
+            assert!(note.is_none());
+        }
     }
 }
 
