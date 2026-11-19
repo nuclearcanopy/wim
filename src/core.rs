@@ -813,13 +813,39 @@ pub fn append_resolved(tracks: &[SearchItem], core: &mut CoreCtx) {
     // after queueing nine and never mentioned the three.
     let mut queued = 0usize;
     let mut skipped = 0usize;
-    for t in tracks {
-        match enqueue_track(core.player, t, core.cache, core.queue, core.app.shuffle) {
-            Enqueued::Queued { .. } => queued += 1,
-            Enqueued::NotPlayable => skipped += 1,
-            Enqueued::Failed(why) => {
-                skipped += 1;
-                core.notifications.push(Severity::Error, why);
+    if core.app.shuffle {
+        // shuffle places each entry at a random slot, so it stays per-item.
+        for t in tracks {
+            match enqueue_track(core.player, t, core.cache, core.queue, true) {
+                Enqueued::Queued { .. } => queued += 1,
+                Enqueued::NotPlayable => skipped += 1,
+                Enqueued::Failed(why) => {
+                    skipped += 1;
+                    core.notifications.push(Severity::Error, why);
+                }
+            }
+        }
+    } else {
+        // in order, so one batched IPC round trip replaces one per track.
+        let mut playable = Vec::with_capacity(tracks.len());
+        for t in tracks {
+            match resolve_playable(t, core.cache) {
+                Some(path) => playable.push((t.clone(), path)),
+                None => skipped += 1,
+            }
+        }
+        if !playable.is_empty() {
+            let paths: Vec<String> = playable.iter().map(|(_, p)| p.clone()).collect();
+            let results = core.player.playlist_append_batch(&paths);
+            let (accepted, errors) = record_appended(core.queue, playable, results);
+            queued += accepted;
+            skipped += errors.len();
+            for why in &errors {
+                core.notifications
+                    .push(Severity::Error, format!("error queuing file: {why}"));
+            }
+            if let Some(note) = reconcile_if_timed_out(core.player, core.queue, &errors) {
+                core.notifications.push(Severity::Alert, note);
             }
         }
     }
@@ -1554,32 +1580,79 @@ pub fn load_playlist(
     // only what mpv actually took is stored, which is the whole point:
     // storing an item mpv refused puts every later index off by one.
     // each kept entry carries the id mpv answered its `loadfile` with.
-    let mut kept = Vec::with_capacity(playable.len());
-    let mut ids = Vec::with_capacity(playable.len());
-    let mut refused = 0;
-    for (i, (item, path)) in playable.into_iter().enumerate() {
-        // index 0 is already loaded, by `try_play` above.
-        if i == 0 {
-            kept.push(item);
-            ids.push(first_id);
-        } else {
-            match player.playlist_append(&path) {
-                Ok(id) => {
-                    kept.push(item);
-                    ids.push(id);
-                }
-                Err(_) => refused += 1,
-            }
-        }
+    let mut playable = playable.into_iter();
+    // index 0 is already loaded, by `try_play` above.
+    let first_item = playable.next().map(|(item, _)| item);
+    let rest: Vec<(SearchItem, String)> = playable.collect();
+    let paths: Vec<String> = rest.iter().map(|(_, p)| p.clone()).collect();
+    let results = if paths.is_empty() {
+        Vec::new()
+    } else {
+        player.playlist_append_batch(&paths)
+    };
+    let mut kept: Vec<SearchItem> = first_item.into_iter().collect();
+    let mut ids = vec![first_id];
+    let (accepted, errors) = split_accepted(rest, results);
+    for (item, id) in accepted {
+        kept.push(item);
+        ids.push(id);
     }
+    let refused = errors.len();
     match session {
         SessionStart::New => queue.reset_with_ids(kept, ids),
         SessionStart::Keep => queue.rebuild_with_ids(kept, ids),
     }
-    (
-        format!("{status}{}", lost_note(dropped.len() + refused)),
-        true,
-    )
+    let mut status = format!("{status}{}", lost_note(dropped.len() + refused));
+    if let Some(note) = reconcile_if_timed_out(player, queue, &errors) {
+        status = format!("{status}; {note}");
+    }
+    (status, true)
+}
+
+/// Pairs each batch result with its item, keeping only what mpv accepted
+/// (with its entry id, in order) and the error text of what it refused.
+fn split_accepted(
+    playable: Vec<(SearchItem, String)>,
+    results: Vec<anyhow::Result<Option<u64>>>,
+) -> (Vec<(SearchItem, Option<u64>)>, Vec<String>) {
+    let mut accepted = Vec::with_capacity(playable.len());
+    let mut errors = Vec::new();
+    for ((item, _), result) in playable.into_iter().zip(results) {
+        match result {
+            Ok(id) => accepted.push((item, id)),
+            Err(e) => errors.push(e.to_string()),
+        }
+    }
+    (accepted, errors)
+}
+
+/// Records a batched append in `queue`: only entries mpv accepted, in
+/// order, with their ids. Returns how many were recorded and the error
+/// text of the rest. Never shuffles; the batch path is for shuffle off.
+pub fn record_appended(
+    queue: &mut PlayQueue,
+    playable: Vec<(SearchItem, String)>,
+    results: Vec<anyhow::Result<Option<u64>>>,
+) -> (usize, Vec<String>) {
+    let (accepted, errors) = split_accepted(playable, results);
+    let count = accepted.len();
+    for (item, id) in accepted {
+        queue.append_with_id(item, id, false);
+    }
+    (count, errors)
+}
+
+/// A timed-out batch may have been partly applied by mpv; reconcile then.
+fn reconcile_if_timed_out(
+    player: &mpv::Mpv,
+    queue: &mut PlayQueue,
+    errors: &[String],
+) -> Option<String> {
+    if errors.iter().any(|e| e.contains("timed out")) {
+        reconcile_queue_after_timeout(player, queue)
+    } else {
+        None
+    }
 }
 
 /// Splits `items` into the ones mpv can be handed a path for, paired
@@ -1798,31 +1871,29 @@ pub fn resync_upcoming(
         return format!("error resyncing queue: {e}");
     }
     let (playable, dropped) = resolve_all(items, cache);
-    let mut kept = Vec::with_capacity(playable.len());
-    let mut ids = Vec::with_capacity(playable.len());
-    let mut failure = None;
-    for (item, path) in playable {
-        match player.playlist_append(&path) {
-            Ok(id) => {
-                kept.push(item);
-                ids.push(id);
-            }
-            Err(e) => {
-                failure = Some(e.to_string());
-                break;
-            }
-        }
-    }
-    // updated even when an append failed partway, because mpv has
+    let paths: Vec<String> = playable.iter().map(|(_, p)| p.clone()).collect();
+    let results = if paths.is_empty() {
+        Vec::new()
+    } else {
+        player.playlist_append_batch(&paths)
+    };
+    let (accepted, errors) = split_accepted(playable, results);
+    let (kept, ids): (Vec<_>, Vec<_>) = accepted.into_iter().unzip();
+    // updated even when part of the batch failed, because mpv has
     // *already been cleared*: returning early and leaving `entries` as
     // it was would be exactly the desync this function exists to
     // prevent, and a worse one than the skip bug (every index wrong,
     // not just the ones after a gap).
     queue.replace_upcoming_with_ids(kept, ids);
-    match failure {
-        Some(e) => format!("error resyncing queue: {e}"),
-        None => format!("shuffled{}", lost_note(dropped.len())),
+    let mut status = if errors.is_empty() {
+        format!("shuffled{}", lost_note(dropped.len()))
+    } else {
+        format!("error resyncing queue: {} entries failed", errors.len())
+    };
+    if let Some(note) = reconcile_if_timed_out(player, queue, &errors) {
+        status = format!("{status}; {note}");
     }
+    status
 }
 /// Snapshots now-playing/queue/position/volume for next launch to
 /// resume. Best-effort: a failed save just means nothing to resume
@@ -5243,11 +5314,11 @@ mod seam_tests {
     /// audit recorded as wanting exactly this.
     pub(super) struct Harness {
         cfg: config::Config,
-        app: app::App,
+        pub(super) app: app::App,
         pub(super) notifications: Notifications,
         pub(super) queue: PlayQueue,
         previous_track: Option<SearchItem>,
-        cache: Arc<Mutex<CacheIndex>>,
+        pub(super) cache: Arc<Mutex<CacheIndex>>,
         download_tx: mpsc::Sender<DownloadEvent>,
         _download_rx: mpsc::Receiver<DownloadEvent>,
         downloading: HashSet<String>,
@@ -7198,6 +7269,121 @@ mod index_map_tests {
 
     #[test]
     #[ignore]
+    fn a_batched_load_playlist_keeps_both_sides_in_step() {
+        let player = headless_mpv();
+        let cache = empty_cache();
+        let mut queue = PlayQueue::default();
+        let items = vec![silence(1), silence(2), an_album(), silence(3), silence(4)];
+        let (status, played) = load_playlist(&player, &cache, &mut queue, items, SessionStart::New);
+        assert!(played, "{status}");
+        assert!(status.contains("(1 skipped)"), "{status}");
+        assert_both_sides_agree(&player, &queue, &cache);
+        assert_eq!(lengths(&queue), vec![1, 2, 3, 4]);
+        assert_eq!(queue.pos(), Some(0));
+        let ids = queue.entry_ids();
+        assert!(ids.iter().all(Option::is_some), "{ids:?}");
+    }
+
+    #[test]
+    #[ignore]
+    fn a_batched_resync_keeps_both_sides_in_step() {
+        let player = headless_mpv();
+        let cache = empty_cache();
+        let mut queue = PlayQueue::default();
+        let (status, played) = load_playlist(
+            &player,
+            &cache,
+            &mut queue,
+            vec![silence(1), silence(2), silence(3)],
+            SessionStart::New,
+        );
+        assert!(played, "{status}");
+        let status = resync_upcoming(
+            &player,
+            &cache,
+            &mut queue,
+            vec![silence(6), silence(5), an_album(), silence(4)],
+        );
+        assert!(status.starts_with("shuffled"), "{status}");
+        assert_both_sides_agree(&player, &queue, &cache);
+        assert_eq!(lengths(&queue), vec![1, 6, 5, 4]);
+        assert!(queue.entry_ids().iter().all(Option::is_some));
+    }
+
+    fn append_resolved_in_step(shuffle: bool) {
+        use super::seam_tests::Harness;
+        let player = headless_mpv();
+        let mut h = Harness::new();
+        h.app.shuffle = shuffle;
+        let (status, played) = load_playlist(
+            &player,
+            &h.cache,
+            &mut h.queue,
+            vec![silence(1)],
+            SessionStart::New,
+        );
+        assert!(played, "{status}");
+        let tracks = vec![silence(2), an_album(), silence(3), silence(4), silence(5)];
+        {
+            let mut core = h.ctx(&player);
+            append_resolved(&tracks, &mut core);
+        }
+        let said = h.notifications.drain_text().join(" | ");
+        assert!(said.contains("queued 4 tracks"), "{said}");
+        assert!(said.contains("skipped"), "{said}");
+        assert_both_sides_agree(&player, &h.queue, &h.cache);
+        let mut got = lengths(&h.queue);
+        assert_eq!(got[0], 1, "the playing track stays first");
+        if !shuffle {
+            assert_eq!(got, vec![1, 2, 3, 4, 5]);
+        }
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2, 3, 4, 5]);
+        assert!(h.queue.entry_ids().iter().all(Option::is_some));
+    }
+
+    #[test]
+    #[ignore]
+    fn a_batched_append_resolved_keeps_both_sides_in_step() {
+        append_resolved_in_step(false);
+    }
+
+    #[test]
+    #[ignore]
+    fn a_shuffled_append_resolved_keeps_both_sides_in_step() {
+        append_resolved_in_step(true);
+    }
+
+    /// Prints microseconds to queue N silences one by one versus in one
+    /// batch, best of 5, alternating in one process.
+    #[test]
+    #[ignore]
+    fn batch_vs_sequential_queue_cost() {
+        let player = headless_mpv();
+        for n in [50usize, 200] {
+            let paths: Vec<String> = (1..=n as u64)
+                .map(|s| resolve_playable(&silence(s), &empty_cache()).expect("silence resolves"))
+                .collect();
+            let (mut seq_best, mut batch_best) = (u128::MAX, u128::MAX);
+            for _ in 0..5 {
+                player.playlist_clear().expect("clear");
+                let t = Instant::now();
+                for p in &paths {
+                    player.playlist_append(p).expect("append");
+                }
+                seq_best = seq_best.min(t.elapsed().as_micros());
+                player.playlist_clear().expect("clear");
+                let t = Instant::now();
+                let results = player.playlist_append_batch(&paths);
+                batch_best = batch_best.min(t.elapsed().as_micros());
+                assert!(results.iter().all(Result::is_ok));
+            }
+            println!("N={n}: sequential {seq_best} us, batch {batch_best} us");
+        }
+    }
+
+    #[test]
+    #[ignore]
     fn an_unplayable_entry_never_reaches_the_index_map() {
         let player = headless_mpv();
         let cache = empty_cache();
@@ -8317,5 +8503,75 @@ mod reconcile_by_id_tests {
         assert_eq!(removed, vec![4, 3]);
         reconcile_by_ids(&mut q, &[None], None, |_| {});
         assert_eq!(q.entries().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod record_appended_tests {
+    use super::*;
+
+    fn pairs(secs: &[u64]) -> Vec<(SearchItem, String)> {
+        secs.iter()
+            .map(|&s| (SearchItem::Silence { secs: s }, format!("p{s}")))
+            .collect()
+    }
+
+    fn secs(q: &PlayQueue) -> Vec<u64> {
+        q.entries()
+            .iter()
+            .map(|i| match i {
+                SearchItem::Silence { secs } => *secs,
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn all_ok_keeps_order_and_ids() {
+        let mut q = PlayQueue::default();
+        let (n, errs) = record_appended(
+            &mut q,
+            pairs(&[1, 2, 3]),
+            vec![Ok(Some(10)), Ok(Some(11)), Ok(Some(12))],
+        );
+        assert_eq!((n, errs.len()), (3, 0));
+        assert_eq!(secs(&q), vec![1, 2, 3]);
+        assert_eq!(q.entry_ids(), &[Some(10), Some(11), Some(12)]);
+    }
+
+    #[test]
+    fn a_failed_middle_entry_is_dropped_and_ids_line_up() {
+        let mut q = PlayQueue::default();
+        let (n, errs) = record_appended(
+            &mut q,
+            pairs(&[1, 2, 3]),
+            vec![Ok(Some(10)), Err(anyhow::anyhow!("boom")), Ok(Some(12))],
+        );
+        assert_eq!(n, 2);
+        assert_eq!(errs, vec!["boom".to_string()]);
+        assert_eq!(secs(&q), vec![1, 3]);
+        assert_eq!(q.entry_ids(), &[Some(10), Some(12)]);
+    }
+
+    #[test]
+    fn all_err_leaves_the_queue_unchanged() {
+        let mut q = PlayQueue::default();
+        let (n, errs) = record_appended(
+            &mut q,
+            pairs(&[1, 2]),
+            vec![Err(anyhow::anyhow!("a")), Err(anyhow::anyhow!("b"))],
+        );
+        assert_eq!(n, 0);
+        assert_eq!(errs.len(), 2);
+        assert!(q.entries().is_empty());
+        assert!(q.entry_ids().is_empty());
+    }
+
+    #[test]
+    fn a_missing_id_is_stored_as_none() {
+        let mut q = PlayQueue::default();
+        let (n, _) = record_appended(&mut q, pairs(&[7]), vec![Ok(None)]);
+        assert_eq!(n, 1);
+        assert_eq!(q.entry_ids(), &[None]);
     }
 }

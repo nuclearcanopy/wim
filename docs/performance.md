@@ -73,9 +73,30 @@ ticks off against 35 on (100 ticks/s), 86% less, over the 25% bar, so it
 is kept. Whether the unmetered graph sounds identical is unverified by ear;
 the equalizer stages and stereo output are the same as before.
 
-Open follow-up: the shared core still sends one blocking IPC round trip per
-track when queueing (`core.rs`: `append_resolved`, `front_resolved`,
-`start_session`, `resync_upcoming`).
+Queue batching: `load_playlist` (so `start_session`), `resync_upcoming` and
+`append_resolved` with shuffle off now send one `playlist_append_batch`
+(pipelined `loadfile ... append-play`, one wait) instead of one blocking
+round trip per track. `record_appended` records only the entries mpv accepted,
+in order with their ids, so the queue still equals mpv's playlist; a batch
+error containing "timed out" triggers `reconcile_queue_after_timeout`. A
+partial resync failure now reports a failed-entry count.
+
+Benchmark (`batch_vs_sequential_queue_cost`, release, headless mpv, best of 5,
+microseconds to queue N silences):
+
+| N | sequential | batch |
+|---|-----------:|------:|
+| 50 | 1370 | 976 |
+| 200 | 5432 | 3239 |
+
+The batch is about 1.4x to 1.7x faster, not flat in N: on an idle local socket
+a round trip is ~27 us, far below the ~2 ms assumed earlier, and mpv still
+handles each `loadfile` itself. The 200-track cost is ~3 ms either way, so
+this removes a latency risk under a loaded mpv rather than a visible stall.
+
+Remaining: `front_resolved` and shuffle-on `append_resolved` stay per-item
+(each entry needs its own `playlist-move`). A `loadfile` insert-next-play path
+could batch `front_resolved`, but needs live confirmation.
 
 Non-goals: no lazy one-shot mpv; no guard on overlay menus in the first
 ~100 ms (`CONNECT_BUDGET` is 1 s); no `--resume` for shellswim;
