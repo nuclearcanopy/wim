@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [master]
+    branches: [master, ci/cross-platform]
   pull_request:
 
 concurrency:
