@@ -83,3 +83,19 @@ jobs:
       - name: mpv integration tests (non-blocking)
         continue-on-error: true
         run: 'cargo test --locked -- --ignored mpv::'
+
+  freebsd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cross-platform-actions/action@v1.8.0
+        with:
+          operating_system: freebsd
+          architecture: x86-64
+          version: '14.5'
+          shell: sh
+          run: |
+            sudo pkg install -y rust mpv pkgconf
+            cargo build --locked --bins
+            cargo test --locked --lib
