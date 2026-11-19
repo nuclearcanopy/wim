@@ -932,12 +932,11 @@ impl Ty {
         }
     }
 
-    /// Keywords this type accepts. Unused: the parser's own error path
-    /// reaches `Words::options` directly, and completion goes through
-    /// `completes`. Kept because every other `Ty` accessor is here and
-    /// a type that accepts keywords without a way to list them is the
-    /// surprising half of the pair.
-    #[allow(dead_code)]
+    /// Keywords this type accepts. The parser's own error path reaches
+    /// `Words::options` directly, and completion goes through
+    /// `completes`; this is here because every other
+    /// `Ty` accessor is, and a type that accepts keywords without a way
+    /// to list them is the surprising half of the pair.
     pub fn options(self) -> &'static [&'static str] {
         match self {
             Ty::Words(w) => w.options(),

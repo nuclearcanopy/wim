@@ -299,7 +299,6 @@ pub struct Song {
     // parsed for fidelity to the api response but not read anywhere
     // yet; same documented gap as LocalTrack::duration_secs (see
     // library.rs): SearchItem::Song doesn't carry duration either.
-    #[allow(dead_code)]
     pub duration: Option<u32>,
     /// Every genre tag the server has for this track, in server order
     /// (empty when untagged). Navidrome reports both a legacy single
@@ -343,7 +342,6 @@ pub struct ArtistAlbumTracks {
     /// `index` into the album list it already has, so nothing reads
     /// this yet; it stays because an event that says only "some
     /// album's songs" is a worse thing to hand a consumer.
-    #[allow(dead_code)]
     pub album: ArtistAlbum,
     pub songs: Vec<Song>,
 }
