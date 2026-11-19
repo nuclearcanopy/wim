@@ -208,6 +208,7 @@ const BOTH: &str = "give either -c or a script, not both";
 pub const USAGE: &str = "usage: shellswim [-c|--command COMMAND | SCRIPT.shg] [--version] [--help]";
 
 pub fn help() -> String {
+    let config = config_display();
     format!(
         "{USAGE}
 
@@ -238,17 +239,26 @@ say so and name wim instead. view(queue), view(history),
 view(playlists), view(index) and view(help) print here, and
 view(now) and view(lyrics) print instead of opening a pane.
 
-  config   ~/.config/wim/config.toml, shared with wim
+  config   {config}, shared with wim
   trace    WIM_STARTUP_TRACE=1 cargo run -F dev-telemetry --bin shellswim"
     )
 }
 
 pub const WIM_USAGE: &str = "usage: wim [--resume | FILE...] [--version] [--help]";
 
+/// The real config path for help text, or a generic name when the
+/// platform has no config dir.
+fn config_display() -> String {
+    crate::config::config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "config.toml (no config dir found)".into())
+}
+
 /// What a file argument does, spelled once: the help says it and `main.rs` does it.
 pub const PLAY_FILES: &str = "a file argument starts playback; the rest are queued behind it";
 
 pub fn wim_help() -> String {
+    let config = config_display();
     format!(
         "{WIM_USAGE}
 
@@ -274,7 +284,7 @@ in the app:
   :        the shellsong console
   tab      move focus between the panes
 
-  config   ~/.config/wim/config.toml ($XDG_CONFIG_HOME), shared with shellswim
+  config   {config}, shared with shellswim
   color    WIM_COLOR=semantic adds colour; NO_COLOR=1 forces it off
   trace    WIM_STARTUP_TRACE=1 cargo run -F dev-telemetry --bin wim"
     )
@@ -501,6 +511,13 @@ mod tests {
         ] {
             assert!(h.contains(needed), "wim --help must mention {needed:?}");
         }
+    }
+
+    #[test]
+    fn help_prints_the_real_config_path() {
+        let want = config_display();
+        assert!(help().contains(&want));
+        assert!(wim_help().contains(&want));
     }
 
     #[test]
