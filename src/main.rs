@@ -1887,6 +1887,23 @@ fn main() -> anyhow::Result<()> {
                 }
             };
         }
+        // the one bottom-bar activation, shared by a click and by enter
+        // (`activate_transport`); it builds the transport context and a
+        // detached surface, so the caller only supplies field and target.
+        macro_rules! activate_bar {
+            ($field:expr, $at:expr) => {{
+                let mut tctx = TransportCtx {
+                    scrub: &mut scrub,
+                    scrub_pending: &mut scrub_pending,
+                    scrub_sent_at: &mut scrub_sent_at,
+                    elapsed_secs: playback.elapsed_secs,
+                    duration_secs: playing_duration(now_playing.as_ref(), playback.duration_secs),
+                };
+                let mut surf = wim_surface!(detached);
+                let mut core = core_ctx!();
+                activate_transport($field, $at, &mut core, &mut surf, &mut tctx);
+            }};
+        }
 
         // read before this frame's `tick` (which runs after the draw),
         // so the countdown is at most one frame behind. it is a
@@ -4392,25 +4409,9 @@ fn main() -> anyhow::Result<()> {
                             Some(frac) => ScrubAt::Fraction(frac),
                             None => ScrubAt::Position,
                         };
-                        // the cursor moves onto what was clicked and
-                        // then the one activation path runs, so a
-                        // click and enter on the same glyph are the
-                        // same operation (`activate_transport`).
                         focus = Focus::BottomBar;
                         bottombar_selected = field;
-                        let mut tctx = TransportCtx {
-                            scrub: &mut scrub,
-                            scrub_pending: &mut scrub_pending,
-                            scrub_sent_at: &mut scrub_sent_at,
-                            elapsed_secs: playback.elapsed_secs,
-                            duration_secs: playing_duration(
-                                now_playing.as_ref(),
-                                playback.duration_secs,
-                            ),
-                        };
-                        let mut surf = wim_surface!(detached);
-                        let mut core = core_ctx!();
-                        activate_transport(field, at, &mut core, &mut surf, &mut tctx);
+                        activate_bar!(field, at);
                     }
                     // the drag redraws from the pending target and the
                     // seek stays coalesced behind it, exactly as a
@@ -6574,25 +6575,7 @@ fn main() -> anyhow::Result<()> {
                         Some(Nav::Inert) => continue,
                         Some(Nav::Activate) => {
                             let field = bottombar_selected;
-                            let mut tctx = TransportCtx {
-                                scrub: &mut scrub,
-                                scrub_pending: &mut scrub_pending,
-                                scrub_sent_at: &mut scrub_sent_at,
-                                elapsed_secs: playback.elapsed_secs,
-                                duration_secs: playing_duration(
-                                    now_playing.as_ref(),
-                                    playback.duration_secs,
-                                ),
-                            };
-                            let mut surf = wim_surface!(detached);
-                            let mut core = core_ctx!();
-                            activate_transport(
-                                field,
-                                ScrubAt::Position,
-                                &mut core,
-                                &mut surf,
-                                &mut tctx,
-                            );
+                            activate_bar!(field, ScrubAt::Position);
                             continue;
                         }
                         None => {}
