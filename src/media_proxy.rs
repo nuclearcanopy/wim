@@ -80,6 +80,13 @@ impl MediaProxy {
                 while !thread_stop.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            // macOS and the BSDs hand back an accepted socket
+                            // that inherited the listener's O_NONBLOCK, so
+                            // the first read failed with WouldBlock and the
+                            // connection was dropped; the relay is blocking.
+                            if stream.set_nonblocking(false).is_err() {
+                                continue;
+                            }
                             if active.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
                                 active.fetch_sub(1, Ordering::AcqRel);
                                 drop(stream);
