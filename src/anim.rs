@@ -68,6 +68,18 @@ pub fn blink(elapsed: Duration, half_period: Duration) -> bool {
     (elapsed.as_nanos() / half).is_multiple_of(2)
 }
 
+/// Time left until `blink` next flips, floored at 1ms so a poll never
+/// spins. Lets a screen whose only motion is the caret sleep to the
+/// edge instead of redrawing at the animation rate.
+pub fn until_next_blink(elapsed: Duration, half_period: Duration) -> Duration {
+    let half = half_period.as_nanos();
+    if half == 0 {
+        return Duration::from_millis(1);
+    }
+    let into = elapsed.as_nanos() % half;
+    Duration::from_nanos((half - into) as u64).max(Duration::from_millis(1))
+}
+
 /// 1.0 the moment something happened, falling linearly to 0.0 after
 /// `duration` and staying there; transient acknowledgments (the
 /// bottom bar's field flash, focus tails).
@@ -322,6 +334,30 @@ mod tests {
         assert!((phase(secs(1.0), period) - 0.25).abs() < 1e-5);
         assert!(phase(secs(4.0), period).abs() < 1e-5);
         assert!((phase(secs(5.0), period) - 0.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn until_next_blink_lands_on_the_flip() {
+        let half = Duration::from_millis(530);
+        assert_eq!(until_next_blink(Duration::ZERO, half), half);
+        assert_eq!(
+            until_next_blink(Duration::from_millis(500), half),
+            Duration::from_millis(30)
+        );
+        // floored, and never zero on an exact edge or zero period
+        assert_eq!(
+            until_next_blink(Duration::from_micros(529_500), half),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            until_next_blink(Duration::ZERO, Duration::ZERO),
+            Duration::from_millis(1)
+        );
+        for ms in [0u64, 100, 529, 530, 1000, 1590] {
+            let e = Duration::from_millis(ms);
+            let d = until_next_blink(e, half);
+            assert_ne!(blink(e, half), blink(e + d, half), "at {ms}ms");
+        }
     }
 
     #[test]
