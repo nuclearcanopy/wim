@@ -26,6 +26,15 @@ pub fn reduced_motion_wanted(config: bool, env: Option<&std::ffi::OsStr>) -> boo
     config || env.is_some_and(|v| !v.is_empty() && v != "0")
 }
 
+/// Applies the shared rule to the config key and the environment; what both
+/// binaries call once at startup.
+pub fn init_reduced_motion(config: bool) {
+    set_reduced_motion(reduced_motion_wanted(
+        config,
+        std::env::var_os("WIM_REDUCED_MOTION").as_deref(),
+    ));
+}
+
 pub fn reduced_motion() -> bool {
     REDUCED_MOTION.load(std::sync::atomic::Ordering::Relaxed)
 }
