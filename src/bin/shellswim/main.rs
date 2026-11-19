@@ -223,21 +223,21 @@ fn prompt() -> anyhow::Result<()> {
         if player_ready && !host.app.loading_cached_catalog && host.step() == Drive::Quit {
             break;
         }
-        if std::mem::take(&mut host.swim.keybinds_requested) && host.interactive_prompt {
+        if std::mem::take(&mut host.session.swim.keybinds_requested) && host.interactive_prompt {
             keybinds_open = true;
             keybinds_selected = 0;
             keybinds_refused = None;
         }
-        if std::mem::take(&mut host.swim.eq_requested) && host.interactive_prompt {
+        if std::mem::take(&mut host.session.swim.eq_requested) && host.interactive_prompt {
             eq_menu.open(host.app.eq_source, host.cfg.eq_custom_presets.len());
         }
 
-        if let Some(list) = host.swim.list_requested.take() {
+        if let Some(list) = host.session.swim.list_requested.take() {
             if host.interactive_prompt && !list.rows.is_empty() {
                 list_view = Some((list, 0));
             }
         }
-        if std::mem::take(&mut host.swim.undo_requested) && host.interactive_prompt {
+        if std::mem::take(&mut host.session.swim.undo_requested) && host.interactive_prompt {
             undo_open = true;
         }
         if offer_servers && lyrics_setup.is_none() {
@@ -252,7 +252,7 @@ fn prompt() -> anyhow::Result<()> {
         torbox_ui::poll(&mut host, &mut torbox);
         let undo_now = host.now();
         let undo_rows = undo_open.then(|| host.undo.rows(undo_now));
-        if std::mem::take(&mut host.swim.settings_requested) && host.interactive_prompt {
+        if std::mem::take(&mut host.session.swim.settings_requested) && host.interactive_prompt {
             settings_state.open = true;
         }
         let settings_values = settings_state
@@ -433,7 +433,7 @@ fn prompt() -> anyhow::Result<()> {
                     match key.code {
                         KeyCode::Esc => {
                             host.lyrics_pane.close();
-                            host.swim.lyrics_requested = false;
+                            host.session.swim.lyrics_requested = false;
                         }
                         KeyCode::Char('j') | KeyCode::Down => host.lyrics_pane.scroll_by(1),
                         KeyCode::Char('k') | KeyCode::Up => host.lyrics_pane.scroll_by(-1),

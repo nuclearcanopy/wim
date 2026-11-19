@@ -5,7 +5,7 @@
 //! locals); `CoreCtx` is still built per use, because the borrow of
 //! the core and the borrow of the surface have to stay disjoint.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -51,7 +51,7 @@ macro_rules! core_ctx {
             remote_search_tx: &$h.remote_search_tx,
             settle: &mut $h.settle,
             saved_queues: &mut $h.saved_queues,
-            vars: &mut $h.vars,
+            vars: &mut $h.session.vars,
             bindings: &mut $h.bindings,
         }
     };
@@ -68,11 +68,9 @@ use wim::playqueue::{PlayQueue, PosChange};
 use wim::search::SearchItem;
 use wim::shellsong::{LineKind, Op, Program};
 use wim::shellsong_host::{CorpusCandidates, Ramp, SearchSettle};
-use wim::swimsession::{place_submitted_program, SwimSession};
+use wim::swimsession::SwimSession;
 use wim::ui::results_list::label;
 use wim::{app, cache, config, favorites, library, lyrics, mpv, search};
-
-use wim::swimsurface::SwimSurface;
 
 /// How long a one-shot waits for a command that is still resolving a
 /// name against a server. The language times its own await out at 8s;
@@ -350,19 +348,12 @@ pub struct Host {
     pub sleep_due: Option<Duration>,
     pub settle: SearchSettle,
     pub saved_queues: Vec<String>,
-    /// The live `let` bindings and the per-identity settings, both
-    /// read once here and written back by the ops that change them.
-    pub vars: wim::shellsong::Scope,
     pub bindings: wim::shellsong_host::Bindings,
     /// `.shg` names behind `run(...)`'s completion; a directory read,
     /// so snapshotted rather than done per keystroke.
     pub scripts: Vec<String>,
     pub playback: mpv::Playback,
     pub session: SwimSession,
-    pub program: Option<Box<Program>>,
-    queued_programs: VecDeque<Box<Program>>,
-    pub swim: SwimSurface,
-    pub start: Instant,
     torbox_tx: Sender<TorBoxReply>,
     torbox_rx: Receiver<TorBoxReply>,
     torbox_pending: bool,
@@ -586,15 +577,10 @@ impl Host {
             sleep_due: None,
             settle: SearchSettle::default(),
             saved_queues: Vec::new(),
-            vars: wim::shellsong_host::load_vars(),
             bindings: wim::shellsong_host::load_bindings(),
             scripts: wim::shellsong_host::script_names(),
             playback: mpv::Playback::default(),
             session: SwimSession::new(),
-            program: None,
-            queued_programs: VecDeque::new(),
-            swim: SwimSurface::default(),
-            start: Instant::now(),
             torbox_tx,
             torbox_rx,
             torbox_pending: false,
@@ -769,15 +755,27 @@ impl Host {
     }
 
     pub fn now(&self) -> Duration {
-        self.start.elapsed()
+        self.session.now()
+    }
+
+    pub fn submit_program(&mut self, program: Box<Program>) {
+        self.session.submit_program(program);
+    }
+
+    pub fn has_program_work(&self) -> bool {
+        self.session.has_program_work()
+    }
+
+    pub fn begin(&mut self, line: &str) {
+        self.session.begin(line);
     }
 
     /// Plays or queues one chosen item exactly as `play(...)` /
     /// `queue(...)` would for that item.
     pub fn act_on_item(&mut self, item: SearchItem, queue: bool) {
-        let now = self.start.elapsed();
+        let now = self.session.start.elapsed();
         let now_playing = self.play_queue.current().cloned();
-        let mut surf = self.swim.borrowed();
+        let mut surf = self.session.swim.borrowed();
         let mut core = core_ctx!(self, now, now_playing);
         let action = if queue {
             app::Action::Queued(item)
@@ -790,16 +788,16 @@ impl Host {
     /// Runs one op through the same path the prompt uses, so undo and
     /// redo from the tree record, refuse at barriers and report alike.
     pub fn apply_one(&mut self, op: wim::shellsong::Op) {
-        let now = self.start.elapsed();
+        let now = self.session.start.elapsed();
         let now_playing = self.play_queue.current().cloned();
-        let mut surf = self.swim.borrowed();
+        let mut surf = self.session.swim.borrowed();
         let mut core = core_ctx!(self, now, now_playing);
         let _ = core::apply_op(op, &mut core, &mut surf);
     }
 
     /// Crosses to a sibling branch of the undo tree and restores it.
     pub fn switch_undo_branch(&mut self, delta: isize) {
-        let now = self.start.elapsed();
+        let now = self.session.start.elapsed();
         let now_playing = self.play_queue.current().cloned();
         let mut core = core_ctx!(self, now, now_playing);
         match core.undo.switch_branch(delta) {
@@ -823,7 +821,7 @@ impl Host {
             corpus: &self.app.corpus,
             saved: &self.saved_queues,
             eq_presets: core::eq_preset_names(&self.cfg.eq_custom_presets),
-            vars: &self.vars,
+            vars: &self.session.vars,
             scripts: &self.scripts,
         }
     }
@@ -858,9 +856,9 @@ impl Host {
         }
         while let Ok(reply) = self.torbox_rx.try_recv() {
             self.torbox_pending = false;
-            let now = self.start.elapsed();
+            let now = self.session.start.elapsed();
             let now_playing = self.play_queue.current().cloned();
-            let mut surf = self.swim.borrowed();
+            let mut surf = self.session.swim.borrowed();
             let mut core = core_ctx!(self, now, now_playing);
             match reply.result {
                 Ok(TorBoxPayload::Lines(lines)) => {
@@ -886,9 +884,9 @@ impl Host {
         // a superseded request, which here would append to the queue
         // rather than merely drawing something stale.
         while let Some((into, label, tracks)) = self.track_resolver.poll() {
-            let now = self.start.elapsed();
+            let now = self.session.start.elapsed();
             let now_playing = self.play_queue.current().cloned();
-            let mut surf = self.swim.borrowed();
+            let mut surf = self.session.swim.borrowed();
             let mut core = core_ctx!(self, now, now_playing);
             match tracks {
                 Ok(tracks) if tracks.is_empty() => core
@@ -917,7 +915,7 @@ impl Host {
                         for track in &tracks {
                             core.console.note(wim::ui::results_list::label(track));
                         }
-                        self.swim.list_requested = Some(wim::swimsurface::ListWorkspace {
+                        self.session.swim.list_requested = Some(wim::swimsurface::ListWorkspace {
                             title: label.clone(),
                             rows: tracks
                                 .into_iter()
@@ -974,9 +972,9 @@ impl Host {
             match result {
                 Ok(Some(l)) => {
                     self.lyrics_client.track_display(&l);
-                    if self.interactive_prompt && self.swim.lyrics_requested {
+                    if self.interactive_prompt && self.session.swim.lyrics_requested {
                         self.lyrics_pane.open_lyrics(&l, track);
-                        self.swim.lyrics_requested = false;
+                        self.session.swim.lyrics_requested = false;
                     } else {
                         let text = wim::core::lyrics_text(&l);
                         let count = text.lines().count();
@@ -989,15 +987,15 @@ impl Host {
                         self.session
                             .console
                             .note(format!("{count} lines for {track}"));
-                        self.swim.lyrics_requested = false;
+                        self.session.swim.lyrics_requested = false;
                     }
                 }
                 Ok(None) => {
-                    self.swim.lyrics_requested = false;
+                    self.session.swim.lyrics_requested = false;
                     self.session.console.note(format!("no lyrics for {track}"));
                 }
                 Err(e) => {
-                    self.swim.lyrics_requested = false;
+                    self.session.swim.lyrics_requested = false;
                     self.session
                         .console
                         .note(format!("lyrics lookup failed: {e}"));
@@ -1065,11 +1063,11 @@ impl Host {
         let local_ready = !self.app.scanning_library && !self.app.loading_cached_catalog;
         // one-shots keep waiting for the settle window so a script's
         // output is complete; only the interactive prompt echoes early
-        if self.swim.echo_results
+        if self.session.swim.echo_results
             && ((self.interactive_prompt && local_ready)
-                || self.settle.settled(self.start.elapsed()))
+                || self.settle.settled(self.session.start.elapsed()))
         {
-            self.swim.echo_results = false;
+            self.session.swim.echo_results = false;
             let mut shown = HashSet::new();
             let lines = core::echo_lines(self.app.results(), &mut shown, self.console_width());
             if lines.is_empty() {
@@ -1092,26 +1090,27 @@ impl Host {
                     .console
                     .note(format!("now playing: {}", label(&track)));
             }
-            let now = self.start.elapsed();
+            let now = self.session.start.elapsed();
             let np = Some(track.clone());
             let started = {
-                let mut surf = self.swim.borrowed();
+                let mut surf = self.session.swim.borrowed();
                 let mut core = core_ctx!(self, now, np);
                 let s = core::track_started(&track, &mut core);
                 let _ = &mut surf;
                 s
             };
             // through the same slot `queue_program` writes, so the
-            // two routes cannot diverge: assigning `self.program`
+            // two routes cannot diverge: assigning `self.session.program`
             // here used to cut a typed program short on a track
             // change, where the slot waits its turn instead.
             if !started.ops.is_empty() {
-                self.swim.queued = Some(Box::new(wim::shellsong::Program::of(started.ops)));
+                self.session.swim.queued = Some(Box::new(wim::shellsong::Program::of(started.ops)));
             }
             if let Some(bound) = started.bound {
                 self.session.console.note(bound);
             }
-            if self.interactive_prompt && (self.lyrics_pane.is_open() || self.swim.lyrics_requested)
+            if self.interactive_prompt
+                && (self.lyrics_pane.is_open() || self.session.swim.lyrics_requested)
             {
                 self.request_lyrics(&track);
             }
@@ -1129,7 +1128,7 @@ impl Host {
 
         // Keep time-based playback behavior live even while the prompt
         // is idle or a command is waiting for network results.
-        let now = self.start.elapsed();
+        let now = self.session.start.elapsed();
         if let Some(ramp) = self.fade {
             let _ = self.player.set_volume_nowait(ramp.level_at(now));
             if ramp.finished(now) {
@@ -1310,19 +1309,13 @@ impl Host {
         // the same rule wim's loop uses: a program the core queued
         // starts only once nothing else is running, so bound settings
         // cannot interrupt something the user typed.
-        if self.program.is_none() {
-            self.program = self
-                .swim
-                .queued
-                .take()
-                .or_else(|| self.queued_programs.pop_front());
-        }
-        let Some(program) = self.program.as_mut() else {
+        self.session.take_next_program();
+        let Some(program) = self.session.program.as_mut() else {
             return Drive::Done;
         };
-        let now = self.start.elapsed();
+        let now = self.session.start.elapsed();
         let now_playing = self.play_queue.current().cloned();
-        let mut surf = self.swim.borrowed();
+        let mut surf = self.session.swim.borrowed();
         let mut core = core_ctx!(self, now, now_playing);
         let tx = self.torbox_tx.clone();
         let cfg = self.cfg.clone();
@@ -1346,48 +1339,9 @@ impl Host {
             },
         );
         if outcome != Drive::Await {
-            self.program = None;
+            self.session.program = None;
         }
         outcome
-    }
-
-    /// Retain every submitted program. Shellsong programs may await a
-    /// search or remote operation for several frames, so replacing the
-    /// active slot would silently discard the user's earlier command.
-    pub fn submit_program(&mut self, program: Box<Program>) {
-        match place_submitted_program(
-            self.program.is_some(),
-            self.swim.queued.is_some(),
-            &mut self.queued_programs,
-            program,
-        ) {
-            Some(program) => self.program = Some(program),
-            None => self.session.console.note(format!(
-                "queued command ({} waiting)",
-                self.queued_programs.len()
-            )),
-        }
-    }
-
-    pub fn has_program_work(&self) -> bool {
-        self.program.is_some() || !self.queued_programs.is_empty() || self.swim.queued.is_some()
-    }
-
-    /// Parses a line against the live bindings and script directory,
-    /// the same environment used by interactive submission.
-    pub fn begin(&mut self, line: &str) {
-        self.session
-            .console
-            .push(LineKind::Command, line.to_string());
-        let read = |name: &str| wim::shellsong_host::read_script(name);
-        let world = wim::shellsong::World {
-            scope: &self.vars,
-            read: Some(&read),
-        };
-        match Program::parse_in(line, &world) {
-            Ok(p) => self.submit_program(Box::new(p)),
-            Err(e) => self.session.console.fail(e.to_string()),
-        }
     }
 
     /// Runs lines to completion for a one-shot. Returns whether
@@ -1400,7 +1354,7 @@ impl Host {
             while self.has_program_work() {
                 self.pump();
                 if self.step() == Drive::Quit {
-                    self.program = None;
+                    self.session.program = None;
                     break;
                 }
                 if self.has_program_work() {
@@ -1408,9 +1362,7 @@ impl Host {
                         self.session
                             .console
                             .fail(format!("gave up waiting on '{line}'"));
-                        self.program = None;
-                        self.queued_programs.clear();
-                        self.swim.queued = None;
+                        self.session.abandon_programs();
                         break;
                     }
                     std::thread::sleep(ONESHOT_TICK);
@@ -1430,11 +1382,11 @@ impl Host {
     fn request_lyrics(&mut self, item: &SearchItem) {
         let Some((artist, title, album)) = core::lyrics_query(item) else {
             self.lyrics_pane.close();
-            self.swim.lyrics_requested = false;
+            self.session.swim.lyrics_requested = false;
             return;
         };
         self.lyrics_pane.close();
-        self.swim.lyrics_requested = true;
+        self.session.swim.lyrics_requested = true;
         let name = label(item);
         if let Some((server, id)) = core::lyrics_remote(item) {
             self.lyrics_loader.request_subsonic(
