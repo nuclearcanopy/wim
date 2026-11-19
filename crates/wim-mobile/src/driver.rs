@@ -102,6 +102,24 @@ impl Driver {
         }
     }
 
+    /// Blocks until the playback cache, the warmed catalog and the
+    /// local scan have landed, as the one-shot shellswim does. Tests
+    /// and the example need it; an app has a human's typing delay.
+    pub fn wait_ready(&mut self) {
+        let _ = self.session.wait_startup_cache();
+        self.session.wait_startup_catalog();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self.session.app.scanning_library && std::time::Instant::now() < end {
+            self.session.pump_library();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Whether a submitted command is still running or waiting.
+    pub fn busy(&self) -> bool {
+        self.active.is_some() || !self.pending.is_empty() || self.session.has_program_work()
+    }
+
     /// Queues one command; ids start at 1 (0 means "nobody asked").
     pub fn submit(&mut self, text: &str) -> u64 {
         self.next_id += 1;

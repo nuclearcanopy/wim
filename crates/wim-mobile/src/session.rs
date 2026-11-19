@@ -18,7 +18,7 @@ pub struct WimSession {
 
 /// Points everything `wim` finds through `dirs` at the app's own
 /// directory: on iOS and Android there is no usual home to write to.
-fn confine_to(data_dir: &str) -> Result<(), WimError> {
+pub fn confine_to(data_dir: &str) -> Result<(), WimError> {
     let root = std::path::Path::new(data_dir);
     for (var, sub) in [
         ("HOME", ""),
@@ -98,6 +98,16 @@ impl WimSession {
 }
 
 impl WimSession {
+    /// See `Driver::busy`.
+    pub fn busy(&self) -> bool {
+        self.driver.lock().unwrap().busy()
+    }
+
+    /// See `Driver::wait_ready`.
+    pub fn wait_ready(&self) {
+        self.driver.lock().unwrap().wait_ready();
+    }
+
     /// The seam tests and the example use: any `Player`, any config.
     pub fn from_parts(
         cfg: Config,

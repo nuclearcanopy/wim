@@ -10,4 +10,5 @@ pub use emulator::PlaylistEmulator;
 mod driver;
 mod session;
 pub use driver::Driver;
+pub use session::confine_to;
 pub use session::WimSession;
