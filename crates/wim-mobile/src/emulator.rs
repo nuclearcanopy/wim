@@ -39,6 +39,8 @@ enum Act {
 struct Silence {
     secs: f64,
     elapsed: f64,
+    /// The last position pushed as an event; see `run_clock`.
+    reported: f64,
 }
 
 struct State {
@@ -82,7 +84,11 @@ impl State {
         self.paused = false;
         self.time = Some(0.0);
         self.duration = None;
-        self.silence = silence_secs(&url).map(|secs| Silence { secs, elapsed: 0.0 });
+        self.silence = silence_secs(&url).map(|secs| Silence {
+            secs,
+            elapsed: 0.0,
+            reported: 0.0,
+        });
         if let Some(silence) = &self.silence {
             self.duration = Some(silence.secs);
             self.acts.push(Act::Stop);
@@ -196,6 +202,12 @@ impl PlaylistEmulator {
             };
             silence.elapsed = (silence.elapsed + dt.as_secs_f64()).min(silence.secs);
             let (elapsed, over) = (silence.elapsed, silence.elapsed >= silence.secs);
+            // quarter-second steps: `poll_event` runs this on every
+            // call, and an event per call would never drain.
+            if !over && elapsed - silence.reported < 0.25 {
+                return;
+            }
+            silence.reported = elapsed;
             s.time = Some(elapsed);
             s.prop(PROP_TIME_POS, json!(elapsed));
             if over {
