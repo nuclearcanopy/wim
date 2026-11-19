@@ -112,3 +112,26 @@ fn a_silence_is_a_timer_not_a_load() {
         "{said:?}"
     );
 }
+
+#[test]
+fn new_local_plays_a_folder_through_the_native_engine() {
+    let _g = serial();
+    let dir = std::env::temp_dir().join(format!("wim-mobile-local-{}", std::process::id()));
+    let music = dir.join("music");
+    std::fs::create_dir_all(&music).unwrap();
+    std::fs::write(music.join("crest.mp3"), b"").unwrap();
+    let native = Arc::new(Native::default());
+    let s = WimSession::new_local(
+        dir.join("home").to_string_lossy().into_owned(),
+        music.to_string_lossy().into_owned(),
+        native.clone(),
+    )
+    .unwrap();
+    let id = s.submit("play(crest)".into());
+    answer(&s, id);
+    assert!(
+        native.loads().iter().any(|l| l.contains("crest")),
+        "{:?}",
+        native.calls()
+    );
+}

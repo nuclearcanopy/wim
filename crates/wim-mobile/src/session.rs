@@ -61,6 +61,25 @@ impl WimSession {
         Ok(Self::from_parts(cfg, emulator.clone(), Some(emulator)))
     }
 
+    /// A session over a folder of local audio files instead of a
+    /// server. For offline use and for tests that have no Navidrome.
+    #[uniffi::constructor]
+    pub fn new_local(
+        data_dir: String,
+        library_path: String,
+        player: Arc<dyn PlatformPlayer>,
+    ) -> Result<Arc<WimSession>, WimError> {
+        confine_to(&data_dir)?;
+        let cfg = Config {
+            library_paths: vec![library_path],
+            ..Config::default()
+        };
+        let emulator = Arc::new(PlaylistEmulator::new(player));
+        let session = Self::from_parts(cfg, emulator.clone(), Some(emulator));
+        session.wait_ready();
+        Ok(session)
+    }
+
     /// Queues one command (one line) and returns its id.
     pub fn submit(&self, text: String) -> u64 {
         self.driver.lock().unwrap().submit(&text)
