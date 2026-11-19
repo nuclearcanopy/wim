@@ -7,6 +7,8 @@ pkg=ios/WimCore
 out=target/ios-gen
 device=aarch64-apple-ios
 sim=aarch64-apple-ios-sim
+# C deps (zstd-sys) and rustc must agree on the minimum iOS, or the link fails.
+export IPHONEOS_DEPLOYMENT_TARGET=16.0
 
 rustup target add "$device" "$sim"
 for t in "$device" "$sim"; do
