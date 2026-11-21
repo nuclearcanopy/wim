@@ -1135,10 +1135,21 @@ mod tests {
         let head = buf.cell((4, 0)).unwrap().fg;
         let buffered = buf.cell((6, 0)).unwrap().fg;
         let unplayed = buf.cell((12, 0)).unwrap().fg;
-        assert_eq!(played, shade(BRIGHT));
-        assert_eq!(head, shade(BRIGHT));
-        assert_eq!(buffered, shade(MID));
-        assert_eq!(unplayed, shade(DIM));
+        // semantic mode paints these cells with state hues instead
+        let (p, h, b, u) = if semantic_mode() {
+            (
+                crate::theme::PLAYED,
+                crate::theme::ACCENT,
+                crate::theme::BUFFERED,
+                crate::theme::UNPLAYED,
+            )
+        } else {
+            (shade(BRIGHT), shade(BRIGHT), shade(MID), shade(DIM))
+        };
+        assert_eq!(played, p);
+        assert_eq!(head, h);
+        assert_eq!(buffered, b);
+        assert_eq!(unplayed, u);
     }
 
     /// A status that explains a motionless bar takes the mode line
@@ -1529,9 +1540,15 @@ mod tests {
         });
         // the head glyph changes, so the mode is visible in the bar
         // and not only in the plate behind it.
-        assert_eq!(fg_of(&selected, 1, TRACK_HEAD), shade(BRIGHT));
+        // semantic mode keeps the head on the accent hue either way
+        let (head, drag_head) = if semantic_mode() {
+            (crate::theme::ACCENT, crate::theme::ACCENT)
+        } else {
+            (shade(BRIGHT), shade(WHITE))
+        };
+        assert_eq!(fg_of(&selected, 1, TRACK_HEAD), head);
         assert!(!grid(&selected).contains(TRACK_HEAD_DRAG));
-        assert_eq!(fg_of(&dragging, 1, TRACK_HEAD_DRAG), shade(WHITE));
+        assert_eq!(fg_of(&dragging, 1, TRACK_HEAD_DRAG), drag_head);
         assert!(!grid(&dragging).contains(TRACK_HEAD));
         assert_eq!(bg_of(&dragging, 1, TRACK_HEAD_DRAG), shade(SCRUB_BG));
         const { assert!(SCRUB_BG > SELECT_BG) };
