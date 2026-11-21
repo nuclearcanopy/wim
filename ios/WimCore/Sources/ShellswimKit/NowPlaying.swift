@@ -19,7 +19,7 @@ public enum NowPlaying {
         var d: [String: Any] = [
             MPMediaItemPropertyTitle: title,
             MPNowPlayingInfoPropertyElapsedPlaybackTime:
-                elapsed.isFinite ? max(elapsed, 0) : 0,
+                elapsed.isFinite ? max(elapsed, 0.0) : 0.0,
             MPNowPlayingInfoPropertyPlaybackRate: playing ? 1.0 : 0.0,
         ]
         if let duration, duration.isFinite, duration > 0 {
