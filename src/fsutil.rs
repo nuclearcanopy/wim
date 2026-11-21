@@ -111,8 +111,27 @@ impl FileLock {
         }
         #[cfg(not(unix))]
         {
-            let _ = path;
-            FileLock(None)
+            // no flock here, but std has an equivalent lock on the handle
+            let mut lock = path.as_os_str().to_owned();
+            lock.push(".lock");
+            let Ok(file) = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(PathBuf::from(lock))
+            else {
+                return FileLock(None);
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                if file.try_lock().is_ok() {
+                    return FileLock(Some(file));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return FileLock(None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
     }
 }
