@@ -21,17 +21,25 @@ struct ChatView: View {
                         if let id { proxy.scrollTo(id, anchor: .bottom) }
                     }
                 }
-                Divider()
-                HStack {
-                    TextField("command", text: $model.input)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit { model.send() }
-                    Button("Send") { model.send() }
+                GlassGroup(spacing: 8) {
+                    HStack(spacing: 8) {
+                        TextField("command", text: $model.input)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .onSubmit { model.send() }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .glassSurface(Capsule())
+                        Button { model.send() } label: {
+                            Image(systemName: "arrow.up").font(.body.weight(.semibold))
+                        }
+                        .glassCircleButton()
+                        .accessibilityLabel("Send")
                         .disabled(model.input.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
                 }
-                .padding(8)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
             }
             .navigationTitle("shellswim")
             .toolbar {
@@ -54,21 +62,22 @@ struct BubbleView: View {
             if item.role == .user { Spacer(minLength: 40) }
             Text(item.text)
                 .font(.system(.body, design: .monospaced))
-                .foregroundStyle(item.role == .user ? Color.white : item.role == .error ? Color.red : Color.primary)
+                .foregroundStyle(Color.primary)
                 .italic(item.role == .system)
-                .padding(8)
-                .background(background, in: RoundedRectangle(cornerRadius: 12))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .glassSurface(RoundedRectangle(cornerRadius: 18, style: .continuous), tint: tint)
                 .textSelection(.enabled)
             if item.role != .user { Spacer(minLength: 40) }
         }
     }
 
-    private var background: Color {
+    /// Light tints keep the primary-colour text readable on glass.
+    private var tint: Color? {
         switch item.role {
-        case .user: return .blue
-        case .reply: return Color(.secondarySystemBackground)
-        case .system: return Color(.tertiarySystemBackground)
-        case .error: return Color.red.opacity(0.15)
+        case .user: return Color.blue.opacity(0.45)
+        case .reply, .system: return nil
+        case .error: return Color.red.opacity(0.3)
         }
     }
 }
