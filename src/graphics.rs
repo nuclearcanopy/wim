@@ -429,6 +429,16 @@ impl ProtocolCache {
     }
 }
 
+/// The pair of keys the two protocol caches hold, owned so a frame can
+/// compare it with the last one. A change (including to or from `None`)
+/// means the terminal's image layer is stale and needs a full repaint.
+pub fn drawn_art_state(
+    player: Option<&str>,
+    browse: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    (player.map(str::to_owned), browse.map(str::to_owned))
+}
+
 #[cfg(test)]
 mod protocol_cache_tests {
     use super::*;
@@ -442,6 +452,16 @@ mod protocol_cache_tests {
         c.ensure(None, "a".into(), || image::DynamicImage::new_rgb8(1, 1));
         assert!(c.key().is_none());
         assert!(c.protocol().is_none());
+    }
+
+    /// Swapping to another album, or to none, must read as a change
+    /// to the frame loop, which repaints the screen on it.
+    #[test]
+    fn a_swap_or_a_drop_changes_the_drawn_state() {
+        let a = drawn_art_state(Some("a"), None);
+        assert_ne!(a, drawn_art_state(Some("b"), None));
+        assert_ne!(a, drawn_art_state(None, None));
+        assert_eq!(a, drawn_art_state(Some("a"), None));
     }
 
     /// The expensive half is the image, so a hit must not build it.

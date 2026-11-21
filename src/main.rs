@@ -1634,6 +1634,7 @@ fn main() -> anyhow::Result<()> {
     // terminal otherwise races the event loop for the first keystrokes.
     let mut art = ArtProbe::deferred(cfg.album_art);
     let mut last_drawn_art_mode = art.mode();
+    let mut last_drawn_art: (Option<String>, Option<String>) = (None, None);
     wim::trace_mark!("terminal ready");
     // rebuilt (not re-encoded every frame) whenever the open view's
     // art or the art mode changes; `ratatui-image` owns the actual
@@ -2033,6 +2034,16 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             _ => browse_art.clear(),
+        }
+        // a protocol image lives on the terminal, not in ratatui's cell
+        // buffer, so swapping the cover (or dropping it for a track with
+        // no art) can leave every cell identical and nothing gets sent:
+        // the previous track's picture would stay on screen. Whenever
+        // the held images change, wipe the screen so the diff repaints.
+        let drawn_art = wim::graphics::drawn_art_state(player_art.key(), browse_art.key());
+        if drawn_art != last_drawn_art {
+            guard.clear()?;
+            last_drawn_art = drawn_art;
         }
         if let Ok(detected) = frame_rx.try_recv() {
             frame = detected;
