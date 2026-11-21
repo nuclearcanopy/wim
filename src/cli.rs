@@ -487,7 +487,11 @@ mod tests {
     /// the block read as broken.
     #[test]
     fn every_help_line_fits_a_plain_terminal() {
+        // the config path is platform-specific and can be arbitrarily
+        // long, so measure the line with a fixed-width stand-in for it
+        let config = config_display();
         for text in [wim_help(), help(), WIM_USAGE.to_string(), USAGE.to_string()] {
+            let text = text.replace(&config, "<config path>");
             for line in text.lines() {
                 assert!(
                     crate::ui::textfit::width(line) <= 80,
