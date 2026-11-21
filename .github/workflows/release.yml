@@ -17,10 +17,92 @@ env:
   MPV_SHA256: f259b5fd4b5c395617c948a4fadcdf55bba1c5282fb7c13e88626b3f71072baf
 
 jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check tag matches Cargo.toml version
+        id: v
+        run: |
+          cargo_v=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$cargo_v" ]; then
+            echo "Version mismatch: tag is $GITHUB_REF_NAME but Cargo.toml is $cargo_v" >&2
+            exit 1
+          fi
+          echo "version=$cargo_v" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - name: Build
+        run: cargo build --release --locked --bins
+      - name: Package
+        run: packaging/unix/package.sh linux-x86_64
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wim-linux-x86_64
+          path: wim-v*-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  macos:
+    needs: meta
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            label: macos-aarch64
+          - target: x86_64-apple-darwin
+            label: macos-x86_64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --bins --target ${{ matrix.target }}
+      - name: Package
+        run: packaging/unix/package.sh ${{ matrix.label }} target/${{ matrix.target }}/release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wim-${{ matrix.label }}
+          path: wim-v*-${{ matrix.label }}.tar.gz
+          if-no-files-found: error
+
+  freebsd:
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: cross-platform-actions/action@30cde56b87a128507bebea9531205087890ee360 # v1.8.0
+        with:
+          operating_system: freebsd
+          architecture: x86-64
+          version: '14.5'
+          shell: sh
+          run: |
+            sudo pkg install -y rust pkgconf
+            cargo build --release --locked --bins
+            packaging/unix/package.sh freebsd-x86_64
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wim-freebsd-x86_64
+          path: wim-v*-freebsd-x86_64.tar.gz
+          if-no-files-found: error
+
   windows:
     runs-on: windows-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -85,28 +167,30 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'iscc failed' }
           Move-Item "dist-setup\wim-$env:VERSION-windows-x64-setup.exe" .
 
-      - name: SHA256SUMS
-        shell: pwsh
-        run: |
-          $files = "wim-$env:TAG-windows-x64.zip", "wim-$env:VERSION-windows-x64-setup.exe"
-          $files | ForEach-Object {
-            "$((Get-FileHash -Algorithm SHA256 $_).Hash.ToLower())  $_"
-          } | Out-File -Encoding ascii SHA256SUMS
-
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wim-windows-x64
           path: |
             wim-*-windows-x64.zip
             wim-*-windows-x64-setup.exe
-            SHA256SUMS
 
-      - name: Publish release
-        if: github.ref_type == 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
-        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+  publish:
+    needs: [meta, linux, macos, freebsd, windows]
+    if: github.ref_type == 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          files: |
-            wim-*-windows-x64.zip
-            wim-*-windows-x64-setup.exe
-            SHA256SUMS
+          path: assets
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: assets
+        run: |
+          sha256sum -- *.tar.gz *.zip *.exe > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        with:
+          files: assets/*
           generate_release_notes: true
