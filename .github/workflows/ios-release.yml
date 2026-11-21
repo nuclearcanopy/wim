@@ -1,9 +1,15 @@
 name: ios-release
 
-# Manual only: the iOS app lives on a feature branch, not master.
+# The iOS app lives on a feature branch, not master, so GitHub cannot register
+# workflow_dispatch for this file until it is on the default branch. Until
+# then, editing this file on feat/ios-m3a triggers a run via the push filter.
 # Publishes an unsigned IPA and a SideStore/AltStore source to the rolling
 # `ios-latest` prerelease.
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/ios-m3a]
+    paths: [.github/workflows/ios-release.yml]
 
 concurrency:
   group: ios-release
