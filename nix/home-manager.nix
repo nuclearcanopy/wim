@@ -75,6 +75,18 @@ in
   options.programs.wim = {
     enable = mkEnableOption "wim, the terminal omniplayer";
 
+    mutableConfig = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Install config.toml as a writable file instead of a read-only store
+        symlink, so settings changed in-app can be saved (needed on NixOS,
+        where the symlink makes saving fail). The declared config is copied
+        in only when config.toml is missing or still a symlink; it is also
+        kept at config.nix-default.toml for comparison.
+      '';
+    };
+
     package = mkOption {
       type = types.package;
       default = wimPackage;
@@ -374,36 +386,8 @@ in
     };
   };
 
-  config = mkIf cfg.enable {
-    assertions = [
-      {
-        assertion = cfg.eqGains == null || builtins.length cfg.eqGains == 10;
-        message = "programs.wim.eqGains must have exactly 10 entries (one per eq::BAND_HZ band) when set.";
-      }
-      {
-        assertion = lib.all (p: builtins.length p.gains == 10) cfg.eqCustomPresets;
-        message = "every programs.wim.eqCustomPresets entry must have exactly 10 gains (one per eq::BAND_HZ band).";
-      }
-      {
-        # wim resolves a name against the built-ins first and refuses
-        # to save over one (eq::NameCheck::Builtin), so a custom curve
-        # sharing a built-in's name would simply be unreachable.
-        assertion = lib.all
-          (p: !(lib.elem (lib.toLower p.name) builtinEqPresets))
-          cfg.eqCustomPresets;
-        message = "programs.wim.eqCustomPresets names must not be one of the built-ins (${lib.concatStringsSep ", " builtinEqPresets}); wim resolves those first.";
-      }
-      {
-        assertion = lib.length (lib.unique (map (p: lib.toLower p.name) cfg.eqCustomPresets))
-          == lib.length cfg.eqCustomPresets;
-        message = "programs.wim.eqCustomPresets names must be unique (wim compares them case-insensitively).";
-      }
-    ];
-
-    home.packages = [ cfg.package ]
-      ++ lib.optionals (cfg.whisperModelFile != null) [ pkgs.ffmpeg pkgs.whisper-cpp ];
-
-    xdg.configFile."wim/config.toml".source = tomlFormat.generate "wim-config.toml" ({
+  config = mkIf cfg.enable (let
+    generatedConfig = tomlFormat.generate "wim-config.toml" ({
       lyrics = {
         inherit (cfg.lyrics) providers;
         api_key_files = lib.mapAttrs (_: toString) cfg.lyrics.apiKeyFiles;
@@ -460,5 +444,48 @@ in
     } // lib.optionalAttrs (cfg.eqCustomPresets != [ ]) {
       eq_custom_presets = map (p: { inherit (p) name gains; }) cfg.eqCustomPresets;
     });
-  };
+  in {
+    assertions = [
+      {
+        assertion = cfg.eqGains == null || builtins.length cfg.eqGains == 10;
+        message = "programs.wim.eqGains must have exactly 10 entries (one per eq::BAND_HZ band) when set.";
+      }
+      {
+        assertion = lib.all (p: builtins.length p.gains == 10) cfg.eqCustomPresets;
+        message = "every programs.wim.eqCustomPresets entry must have exactly 10 gains (one per eq::BAND_HZ band).";
+      }
+      {
+        # wim resolves a name against the built-ins first and refuses
+        # to save over one (eq::NameCheck::Builtin), so a custom curve
+        # sharing a built-in's name would simply be unreachable.
+        assertion = lib.all
+          (p: !(lib.elem (lib.toLower p.name) builtinEqPresets))
+          cfg.eqCustomPresets;
+        message = "programs.wim.eqCustomPresets names must not be one of the built-ins (${lib.concatStringsSep ", " builtinEqPresets}); wim resolves those first.";
+      }
+      {
+        assertion = lib.length (lib.unique (map (p: lib.toLower p.name) cfg.eqCustomPresets))
+          == lib.length cfg.eqCustomPresets;
+        message = "programs.wim.eqCustomPresets names must be unique (wim compares them case-insensitively).";
+      }
+    ];
+
+    home.packages = [ cfg.package ]
+      ++ lib.optionals (cfg.whisperModelFile != null) [ pkgs.ffmpeg pkgs.whisper-cpp ];
+
+    xdg.configFile."wim/config.toml" = mkIf (!cfg.mutableConfig) { source = generatedConfig; };
+    xdg.configFile."wim/config.nix-default.toml" = mkIf cfg.mutableConfig { source = generatedConfig; };
+
+    # Seed a writable config.toml (wim saves in-app settings back to it).
+    # Only a missing file or a leftover store symlink is replaced; an
+    # existing regular file keeps in-app changes. Diff it against
+    # config.nix-default.toml to see what the declaration now says.
+    home.activation.wimMutableConfig = mkIf cfg.mutableConfig (lib.hm.dag.entryAfter [ "linkGeneration" ] ''
+      f="${config.xdg.configHome}/wim/config.toml"
+      if [ ! -e "$f" ] || [ -L "$f" ]; then
+        run rm -f "$f"
+        run install -Dm600 ${generatedConfig} "$f"
+      fi
+    '');
+  });
 }
