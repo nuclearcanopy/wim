@@ -11,11 +11,10 @@ on:
         default: true
 
 env:
-  # The user must pin these. Use a fixed mpv Windows x64 build (not a "latest"
-  # URL) and the SHA256 of that exact file. The step fails while the
-  # placeholder is in place.
-  MPV_URL: https://example.invalid/REPLACE_WITH_PINNED_MPV_URL.7z
-  MPV_SHA256: REPLACE_WITH_PINNED_SHA256
+  # Pinned mpv Windows x64 build: shinchiro/mpv-winbuild-cmake release
+  # 20261111 (mpv git bcde6b93cc). Details in docs/release.md.
+  MPV_URL: https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261111/mpv-x86_64-20261111-git-bcde6b93cc.7z
+  MPV_SHA256: f259b5fd4b5c395617c948a4fadcdf55bba1c5282fb7c13e88626b3f71072baf
 
 jobs:
   windows:
