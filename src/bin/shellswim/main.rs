@@ -871,10 +871,8 @@ fn prompt() -> anyhow::Result<()> {
                                 queue_selected = *next;
                             }
                         }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            if at > 0 {
-                                queue_selected = order[at - 1];
-                            }
+                        KeyCode::Char('k') | KeyCode::Up if at > 0 => {
+                            queue_selected = order[at - 1];
                         }
                         KeyCode::Enter if order.contains(&queue_selected) => {
                             if let Err(error) = host
