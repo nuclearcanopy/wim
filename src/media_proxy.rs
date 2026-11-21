@@ -162,6 +162,9 @@ fn handle_client(
     origins: &[AllowedOrigin],
     expected_auth: &str,
 ) -> io::Result<()> {
+    // BSD/macOS accepted sockets inherit the listener's non-blocking mode;
+    // the relay below relies on blocking reads with timeouts
+    client.set_nonblocking(false)?;
     client.set_write_timeout(Some(Duration::from_secs(15)))?;
     let head = read_head(&mut client)?;
     let request = std::str::from_utf8(&head).map_err(invalid_data)?;
