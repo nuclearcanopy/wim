@@ -1700,6 +1700,8 @@ mod bench {
 
     /// mpv child CPU (utime+stime, clock ticks) with the analysis bank on
     /// and off, alternated in one process; best of 3 rounds of 5 s each.
+    /// Reads `/proc/<pid>/stat`, so it only exists on Linux.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore]
     fn bench_analysis_cpu_on_vs_off() {
