@@ -90,6 +90,14 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - name: select Xcode 26 (iOS 26 SDK for Liquid Glass APIs)
+        run: |
+          printf '%s\n' /Applications/Xcode*.app
+          x=$(printf '%s\n' /Applications/Xcode_26*.app | sort -V | tail -n 1)
+          sudo xcode-select -s "$x/Contents/Developer"
+          xcodebuild -version
+          xcodebuild -showsdks
+          xcodebuild -showsdks | grep -q 'iphonesimulator26'
       - name: build core, bindings and xcframework
         run: ios/build-rust.sh
       - name: XCTest on an iPhone simulator
