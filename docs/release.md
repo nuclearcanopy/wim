@@ -1,9 +1,21 @@
 # Release
 
-Pushing a `v*` tag runs `.github/workflows/release.yml` (windows-latest): builds
-`wim.exe`/`shellswim.exe`, bundles mpv, builds a zip and an Inno Setup installer,
-writes `SHA256SUMS`, and publishes all three to the GitHub Release. The tag must
-match the `Cargo.toml` version. Only Windows artifacts are built.
+Pushing a `v*` tag runs `.github/workflows/release.yml`. The tag must match the
+`Cargo.toml` version (checked in the `meta` job and the Windows job). Jobs:
+
+- `linux`: ubuntu-latest, `wim-v<ver>-linux-x86_64.tar.gz`.
+- `macos`: macos-latest, one tarball per arch (`macos-aarch64`, `macos-x86_64`,
+  both `cargo build --release --target ...`; no universal binary).
+- `freebsd`: FreeBSD 14.5 VM (same pinned action as ci.yml),
+  `wim-v<ver>-freebsd-x86_64.tar.gz`.
+- `windows`: zip and Inno Setup installer with bundled mpv (below).
+- `publish`: the only job with `contents: write`. Downloads all artifacts,
+  writes `SHA256SUMS` over every asset and creates the GitHub release.
+
+Tarballs hold `wim`, `shellswim`, `README.md` and `LICENSE`
+(`packaging/unix/package.sh`). Unix builds do not bundle mpv.
+Manual `workflow_dispatch` runs default to `dry_run`: they build and upload
+artifacts but never publish. iOS, Android and signing are not part of this flow.
 
 ## Pinned mpv
 
