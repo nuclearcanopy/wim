@@ -1,0 +1,111 @@
+name: ios-release
+
+# Manual only: the iOS app lives on a feature branch, not master.
+# Publishes an unsigned IPA and a SideStore/AltStore source to the rolling
+# `ios-latest` prerelease.
+on: workflow_dispatch
+
+concurrency:
+  group: ios-release
+  cancel-in-progress: false
+
+jobs:
+  ios-release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ios-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - name: select Xcode 26 (iOS 26 SDK for Liquid Glass APIs)
+        run: |
+          printf '%s\n' /Applications/Xcode*.app
+          x=$(printf '%s\n' /Applications/Xcode_26*.app | sort -V | tail -n 1)
+          sudo xcode-select -s "$x/Contents/Developer"
+          xcodebuild -version
+          xcodebuild -showsdks
+          xcodebuild -showsdks | grep -q 'iphonesimulator26'
+      - name: build core (device and simulator), bindings and xcframework
+        run: ios/build-rust.sh
+      - name: build unsigned app for iOS devices
+        working-directory: ios
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          brew install xcodegen
+          xcodegen generate
+          # Single source of truth for the version: the crate in Cargo.toml.
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml | head -n 1)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          xcodebuild build -project Shellswim.xcodeproj -scheme Shellswim \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            MARKETING_VERSION="$version" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=
+      - name: check Info.plist and package the unsigned IPA
+        run: |
+          app=$(find "$RUNNER_TEMP/dd/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' | head -n 1)
+          test -n "$app"
+          plist="$app/Info.plist"
+          pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$plist"; }
+          test "$(pb CFBundleIdentifier)" = dev.loki.shellswim
+          test "$(pb CFBundleShortVersionString)" = "$VERSION"
+          test "$(pb CFBundleVersion)" = "${{ github.run_number }}"
+          pb UIBackgroundModes | grep -q audio
+          min=$(pb MinimumOSVersion)
+          echo "MIN_OS=$min" >> "$GITHUB_ENV"
+          echo "id=$(pb CFBundleIdentifier) version=$VERSION build=${{ github.run_number }} minos=$min"
+          rm -rf Payload Shellswim-unsigned.ipa
+          mkdir Payload
+          ditto "$app" Payload/Shellswim.app
+          zip -qry Shellswim-unsigned.ipa Payload
+          unzip -l Shellswim-unsigned.ipa | head -n 8
+      - name: generate SideStore source
+        env:
+          REPO: ${{ github.repository }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 - <<'PY'
+          import datetime, json, os
+          repo = os.environ["REPO"]
+          base = f"https://github.com/{repo}/releases/download/ios-latest"
+          date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          size = os.path.getsize("Shellswim-unsigned.ipa")
+          desc = "Terminal omniplayer for music and video, as a native iOS client."
+          version = {
+              "version": os.environ["VERSION"],
+              "buildVersion": os.environ["BUILD_NUMBER"],
+              "date": date,
+              "downloadURL": f"{base}/Shellswim-unsigned.ipa",
+              "localizedDescription": desc,
+              "size": size,
+              "minOSVersion": os.environ["MIN_OS"],
+          }
+          app = {
+              "name": "Shellswim",
+              "bundleIdentifier": "dev.loki.shellswim",
+              "developerName": repo.split("/")[0],
+              "subtitle": "wim for iOS",
+              "localizedDescription": desc,
+              "version": version["version"],
+              "versionDate": date,
+              "downloadURL": version["downloadURL"],
+              "size": size,
+              "versions": [version],
+          }
+          src = {"name": "Shellswim", "identifier": "dev.loki.shellswim.source", "apps": [app]}
+          json.dump(src, open("altstore-source.json", "w"), indent=2)
+          PY
+          python3 -m json.tool altstore-source.json
+      - name: publish rolling ios-latest prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Shellswim iOS (rolling)" --prerelease --latest=false \
+            --notes "Unsigned IPA for SideStore, built from $GITHUB_SHA (run ${{ github.run_number }}). Source: https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/altstore-source.json" \
+            Shellswim-unsigned.ipa altstore-source.json
