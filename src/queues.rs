@@ -761,7 +761,7 @@ secs = 900
 [[entries]]
 title = "a video essay"
 kind = "stream"
-path = "{}"
+path = '{}'
 "#,
             real.display()
         );
