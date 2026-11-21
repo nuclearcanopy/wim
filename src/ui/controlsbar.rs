@@ -38,11 +38,13 @@ pub const GLYPH_CROSSFADE: &str = "⋈FADE";
 pub const GLYPH_PREVIOUS: &str = "|◂";
 pub const GLYPH_NEXT: &str = "▸|";
 const TRACK_DONE: char = '━'; // U+2501 box drawings heavy horizontal
-const TRACK_LEFT: char = '─'; // U+2500 box drawings light horizontal
+/// The unplayed portion of the track. Same glyph as buffered; the two
+/// are told apart by colour (unloaded is greyed), not by line style.
+const TRACK_LEFT: char = '═'; // U+2550 box drawings double horizontal
 /// The buffered-but-not-yet-played portion of the track: media mpv
 /// has fetched ahead of the position (see `mpv::PROP_CACHE_AHEAD`).
-/// Between the heavy played run and the light unplayed one, so the
-/// three states read at a glance: played / downloaded / neither.
+/// Between the heavy played run and the unloaded one, so the three
+/// states read at a glance: played / downloaded / neither.
 const TRACK_BUFFERED: char = '═'; // U+2550 box drawings double horizontal
 pub const TRACK_HEAD: char = '●'; // U+25CF black circle
 pub const TRACK_HEAD_DRAG: char = '◆'; // U+25C6 black diamond
@@ -799,6 +801,33 @@ fn draw_placed(
     }
 }
 
+/// Blends `from` toward `to` by `t` (`0.0..=1.0`) per RGB channel.
+/// Non-RGB colours cannot be interpolated, so they step: `from` below
+/// `t = 0.5`, `to` from there up.
+fn blend(from: Color, to: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    match (from, to) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+            Color::Rgb(mix(r1, r2), mix(g1, g2), mix(b1, b2))
+        }
+        _ if t < 0.5 => from,
+        _ => to,
+    }
+}
+
+/// Fade weight toward the unloaded grey for cell `i` when the last
+/// loaded cell is `edge`: a 3-cell ramp centred on the edge.
+fn fade_toward_unloaded(i: usize, edge: usize) -> f32 {
+    match i as isize - edge as isize {
+        -1 => 0.25,
+        0 => 0.5,
+        1 => 0.75,
+        d if d < -1 => 0.0,
+        _ => 1.0,
+    }
+}
+
 struct TrackPaint {
     frac: f64,
     dragging: bool,
@@ -815,6 +844,8 @@ fn draw_track_cells(buf: &mut Buffer, x: u16, y: u16, cells: usize, paint: Track
         .map(|b| ((b.clamp(0.0, 1.0) * (cells - 1) as f64).round() as usize).min(cells - 1));
     let semantic =
         paint.level > DIM && crate::theme::color_mode() == crate::theme::ColorMode::Semantic;
+    // Last loaded cell: the buffered end, else the head.
+    let edge = buffered_end.map_or(pos, |end| end.max(pos));
     for i in 0..cells {
         let (glyph, brightness) = match i.cmp(&pos) {
             Ordering::Less => (TRACK_DONE, paint.level),
@@ -839,18 +870,25 @@ fn draw_track_cells(buf: &mut Buffer, x: u16, y: u16, cells: usize, paint: Track
             } else {
                 brightness.min(paint.level)
             };
-            let color = if semantic {
-                match i.cmp(&pos) {
+            let (loaded, grey) = if semantic {
+                let loaded = match i.cmp(&pos) {
                     Ordering::Less => crate::theme::PLAYED,
-                    Ordering::Equal if paint.dragging => crate::theme::ACCENT,
                     Ordering::Equal => crate::theme::ACCENT,
                     Ordering::Greater if buffered_end.is_some_and(|end| i <= end) => {
                         crate::theme::BUFFERED
                     }
                     Ordering::Greater => crate::theme::UNPLAYED,
-                }
+                };
+                (loaded, crate::theme::UNPLAYED)
             } else {
-                shade(brightness)
+                (shade(brightness), shade(DIM))
+            };
+            // The head keeps its own colour; every other cell fades
+            // toward grey around the loaded edge.
+            let color = if i == pos {
+                loaded
+            } else {
+                blend(loaded, grey, fade_toward_unloaded(i, edge))
             };
             cell.set_fg(color);
             if let Some(bg) = paint.bg {
@@ -1008,10 +1046,16 @@ mod tests {
         assert_eq!(cells[7], TRACK_BUFFERED, "the buffered end is inclusive");
         assert_eq!(cells[8], TRACK_BUFFERED, "the buffered end is inclusive");
         assert_eq!(cells[9], TRACK_LEFT, "past the buffered end, plain");
-        // no report (a local file) keeps the ordinary two tones.
+        // no report (a local file) has no buffered run: played, head,
+        // then unloaded cells, which share the buffered glyph and are
+        // told apart only by colour, so pin the exact text.
         let mut plain = String::new();
         track_into(&mut plain, 0.25, 16, false, None);
-        assert!(!plain.contains(TRACK_BUFFERED), "{plain:?}");
+        let expected: String = std::iter::repeat_n(TRACK_DONE, 4)
+            .chain(std::iter::once(TRACK_HEAD))
+            .chain(std::iter::repeat_n(TRACK_LEFT, 11))
+            .collect();
+        assert_eq!(plain, expected);
         // the buffered portion can never reach behind the head: what
         // is played is played, and clamping keeps the head's cell the
         // head's.
@@ -1020,6 +1064,55 @@ mod tests {
         let cells: Vec<char> = over.chars().collect();
         assert_eq!(cells[8], TRACK_HEAD);
         assert!(cells[..8].iter().all(|&c| c == TRACK_DONE), "{over:?}");
+    }
+
+    fn semantic_mode() -> bool {
+        crate::theme::color_mode() == crate::theme::ColorMode::Semantic
+    }
+
+    #[test]
+    fn blend_interpolates_rgb_and_steps_otherwise() {
+        let a = Color::Rgb(0, 100, 200);
+        let b = Color::Rgb(100, 0, 100);
+        assert_eq!(blend(a, b, 0.0), a);
+        assert_eq!(blend(a, b, 1.0), b);
+        assert_eq!(blend(a, b, 0.5), Color::Rgb(50, 50, 150));
+        assert_eq!(blend(Color::Red, b, 0.25), Color::Red);
+        assert_eq!(blend(Color::Red, b, 0.75), b);
+    }
+
+    #[test]
+    fn the_loaded_edge_fades_over_three_cells() {
+        let w: Vec<f32> = (3..=7).map(|i| fade_toward_unloaded(i, 5)).collect();
+        assert_eq!(w, [0.0, 0.25, 0.5, 0.75, 1.0]);
+
+        let mut buf = buffer(20, 1);
+        draw_track_cells(
+            &mut buf,
+            0,
+            0,
+            20,
+            TrackPaint {
+                frac: 0.0,
+                dragging: false,
+                buffered: Some(10.0 / 19.0),
+                level: BRIGHT,
+                bg: None,
+            },
+        );
+        let fg = |x| buf.cell((x, 0)).unwrap().fg;
+        let (b, g) = if semantic_mode() {
+            (crate::theme::BUFFERED, crate::theme::UNPLAYED)
+        } else {
+            (shade(MID), shade(DIM))
+        };
+        assert_eq!(fg(8), b);
+        assert_eq!(fg(9), blend(b, g, 0.25));
+        assert_eq!(fg(10), blend(b, g, 0.5));
+        assert_eq!(fg(11), blend(g, g, 0.75));
+        assert_eq!(fg(12), g);
+        assert_eq!(buf.cell((10, 0)).unwrap().symbol(), "═");
+        assert_eq!(buf.cell((11, 0)).unwrap().symbol(), "═");
     }
 
     #[test]
